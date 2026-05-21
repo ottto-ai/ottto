@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ottto-protocol",
+  "crates/ottto-core",
+  "crates/ottto-service",
+  "crates/ottto-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+authors = ["Ottto Team"]
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+cc = "1"
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.3"
+libc = "0.2"
+notify = "8"
+notify-debouncer-full = "0.6"
+plist = "1"
+security-framework = "3.7"
+security-framework-sys = "2.17"
+rusqlite = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+toml_edit = "0.22"
+ureq = { version = "2", features = ["json"] }

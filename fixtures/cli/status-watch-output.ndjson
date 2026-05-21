@@ -1,0 +1,2 @@
+{"command":"status","event":"progress","protocol_version":11,"request_id":"req_01HXSTATUS","stage":"request_started"}
+{"event":"final","exit_code":0,"ok":true,"payload":{"daemon":"running","protocol_version":11},"request_id":"req_01HXSTATUS"}

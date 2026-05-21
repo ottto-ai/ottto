@@ -1,0 +1,1280 @@
+{
+  "candidate_file_count": 177,
+  "content_sha256": "b1043c3a3ea23575fa722cfe145a6c586756b62a7529f58bbca947abfe24de1f",
+  "files": [
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": ".github/dependabot.yml",
+      "sha256": "51d39c60deeb9c9f0a299716f9672a265ae6effb04bb753e41096d7db70b6b5d",
+      "size_bytes": 960
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": ".github/workflows/ci.yml",
+      "sha256": "bae069ec85ed093c35b4501676ba9f331dd4d3155ca54a02c7eebff94543d0ea",
+      "size_bytes": 3030
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "CODE_OF_CONDUCT.md",
+      "sha256": "9576cea2ca3203a7dd64935abf026510fbab8ffa2132f9260a375f57606bb20e",
+      "size_bytes": 1001
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "CONTRIBUTING.md",
+      "sha256": "3c0d2fccd30fd415b806c3dce8e3183153301d54f010e9384e7d751d0d895c1c",
+      "size_bytes": 1896
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "Cargo.lock",
+      "sha256": "97511fe3a65c9bb582168e45e5004a24d199a698770f555afbbbef6080315ca0",
+      "size_bytes": 38111
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "Cargo.toml",
+      "sha256": "9e95449d2fd54e51e83b026d908ce552e32cfce6aa73c4e18d61d142f8b576b4",
+      "size_bytes": 748
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "size_bytes": 11357
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "NOTICE",
+      "sha256": "8a8078fa7af5d9f0b276600ce2f5c6ef3a4ad07d925f24133d201c2e88673e84",
+      "size_bytes": 243
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "README.md",
+      "sha256": "0a6a3159ee9094ecc0358b507ec11e19c0816807338e8a6173b259e3dd28eb63",
+      "size_bytes": 38466
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "SECURITY.md",
+      "sha256": "4b5a7b982f8eaa4aadfc1f8c064c3ac27cf7c86a45aec3a9768d2ba67e70096a",
+      "size_bytes": 1720
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "SUPPORT.md",
+      "sha256": "d5f0faea98be14fbfcf044ec7cf6b6c5005a5ce4a673349001c521ff91806afd",
+      "size_bytes": 1635
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "TRADEMARKS.md",
+      "sha256": "2e10dc0a462e4bb4786d43ca41cdaf7468499980cba84289276e207432b4ca86",
+      "size_bytes": 1241
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "agent-adapters/claude-code-skill/SKILL.md",
+      "sha256": "ab56ca46ee0c3095d93f2d57123364a477be588eca2b355e818072731d08e940",
+      "size_bytes": 5981
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "agent-adapters/codex-skill/SKILL.md",
+      "sha256": "ce4ad4a1dd7b551730ac9d82d38bf88ac61218bb18cdba796ca56c2393f997b0",
+      "size_bytes": 6318
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "agent-adapters/codex-skill/agents/openai.yaml",
+      "sha256": "8da477e8cf888c2f40646f7c2ac930ef8e328174755f986520bf9abd34a71ce4",
+      "size_bytes": 217
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/README.md",
+      "sha256": "3729cb0fc2ac25ce73477ccca01fd3c6081f6645d59704900699d636b541bc63",
+      "size_bytes": 10359
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/registry.generated.json",
+      "sha256": "5c30a909e3204a969ad04f384b2604348d4b6098f7b5d9a2bf7e0f48eca1decd",
+      "size_bytes": 8035
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/POLICY.md",
+      "sha256": "99dcd91f3cddaf4ed1bdd48a2389d26b92404eed79f73930b21a052e8b268220",
+      "size_bytes": 1489
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/README.md",
+      "sha256": "36d6c7431125867f4f233437e6c960e16663e9fb9909f3dd37173f8e26bd915b",
+      "size_bytes": 757
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/local_sessions/collector.toml",
+      "sha256": "802cadf9c35c364970d5ed4a137617ba9f194079d4a7f8b92a3c00c657a62709",
+      "size_bytes": 492
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/local_sessions/fixtures/minimal-evidence.json",
+      "sha256": "b6b4c4efec8c1db9d736e747b3e3fa337317f3c71ea13f85d96975641a5c260c",
+      "size_bytes": 2153
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/otel_config/collector.toml",
+      "sha256": "a0859fe1ced162e24294f25522549372f15b2bb730a8af0042c786f1cf276cac",
+      "size_bytes": 437
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/otel_config/fixtures/minimal-evidence.json",
+      "sha256": "57598c5419490794d0dbb744702c8ae1122bcc7676f8278bbb4c37656e5e2422",
+      "size_bytes": 1259
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/quota_status/collector.toml",
+      "sha256": "b9ca9c6c47336835f54a52ba4851f7d076114177b19ad0875d27e1206037e8b7",
+      "size_bytes": 424
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/quota_status/fixtures/minimal-evidence.json",
+      "sha256": "54b850069783053872d09effc69b075439741a0ecb841c323e7e07e2e75d4b7b",
+      "size_bytes": 1197
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/fixtures/local_sessions/minimal-session.jsonl",
+      "sha256": "49cb27099b880cc5a63c4e7948d53393e08444a962ffa6094d49bdd5a748c970",
+      "size_bytes": 410
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/source.toml",
+      "sha256": "98dac76fadf88115fd155d6c09f025a272b325f80a63691e26c2b76a43e82006",
+      "size_bytes": 384
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/POLICY.md",
+      "sha256": "1279998789a96ae35428870b37c7e2b3b99a642291824d3aee6ff6970aa52677",
+      "size_bytes": 2181
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/README.md",
+      "sha256": "98d1d44349bb212f0465e1323554d598b2ccd0422a2e360877610b02d6ae2b59",
+      "size_bytes": 874
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/local_sessions/collector.toml",
+      "sha256": "d355a16389318125546be535555cd94e1f9597847e8df65e5b8d129ae524e8c7",
+      "size_bytes": 486
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json",
+      "sha256": "6e1d3a4bec2a8587d5acfa725c303bf2237a94bbe06553fdf3d2231882c86210",
+      "size_bytes": 2065
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/otel_config/collector.toml",
+      "sha256": "87acf308670924b490db54493383ace08b6c4d82634cbcae1a2d4e39668123c3",
+      "size_bytes": 431
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/otel_config/fixtures/minimal-evidence.json",
+      "sha256": "8ad9bb3820ad22e01ed8f2cd4990cbe520c4a5d2df84d1f28a710f98807d006d",
+      "size_bytes": 1241
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/quota_status/collector.toml",
+      "sha256": "b97f295887ad2b54b550466b723b2e768e8fb888aeb7865e9ae56d7fb78f36b3",
+      "size_bytes": 481
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/quota_status/fixtures/minimal-evidence.json",
+      "sha256": "9100415e2d46fd7f779453ce49eb96a3387d1ed5656c6a06ccc7ee861c2c30e2",
+      "size_bytes": 1149
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/fixtures/local_sessions/minimal-session.jsonl",
+      "sha256": "0c3fb14a9dd3885ca513d69aff1526487d35bb16d47050db77178cfe3c04f390",
+      "size_bytes": 430
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/source.toml",
+      "sha256": "654d14ddbfc920fac5f4c749b2056a6c97f23966aebfd0f2566dbcc68fd9e807",
+      "size_bytes": 366
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/POLICY.md",
+      "sha256": "65da48d1d06bc2f627be7e4405497ab235f5fbd919071b685288d1977f67f7d6",
+      "size_bytes": 1558
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/README.md",
+      "sha256": "ccb412a7e879c0876a3c866af9d474ae928276b26ef5bf03337411ef9efc116e",
+      "size_bytes": 855
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/live_batches/collector.toml",
+      "sha256": "3903a962bc2d2d973b1f458e8afd2532eb420f26535080fce0dfe5a739a00a4f",
+      "size_bytes": 416
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/live_batches/fixtures/minimal-evidence.json",
+      "sha256": "b6e0d5ee2cb0c350d845f308b4f1635510afcd41d8b814dc1e1445232dede80e",
+      "size_bytes": 1463
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/local_sessions/collector.toml",
+      "sha256": "2e613142fc46605d5adbabafa95e5ab054adc74abaa7fdf62a6aa885eb91442c",
+      "size_bytes": 481
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/local_sessions/fixtures/minimal-evidence.json",
+      "sha256": "300feaffc4fd18837ffd090f8f523f16cdd577edc9400dd2fd247f24ff84b91a",
+      "size_bytes": 2180
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/route_status/collector.toml",
+      "sha256": "bedef6b6453fefe82156cb80c2fda3dd21241efe54df6eee2a1cb90cfd204440",
+      "size_bytes": 418
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/route_status/fixtures/minimal-evidence.json",
+      "sha256": "c08f70f38d9acf9d04810918577259f7f83117adb7c594f5b28741af73ad3d1f",
+      "size_bytes": 1272
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/fixtures/local_sessions/minimal-session.jsonl",
+      "sha256": "2c5fcc9b7628228e67dc1941465ecd39dbc3ebe328703a3fa38474538dde6844",
+      "size_bytes": 645
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/source.toml",
+      "sha256": "da1885058d4ffd216de43c541ee310fd19f9da4f6e4c552088b2bd6d43bde0b7",
+      "size_bytes": 356
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/Cargo.lock",
+      "sha256": "cf06b78c1432acdd27575e9895bcd5b7e726cf72c690495235833f54eb99ce7e",
+      "size_bytes": 4839
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/Cargo.toml",
+      "sha256": "7aab9f8e3f967bad0d698c1653e9392f4d5f85d6b63f8a0b62b1186ed0e31c4e",
+      "size_bytes": 95
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-cli/Cargo.toml",
+      "sha256": "35e3dc445d9425dd82d76f64fead1162c56158d4917b765d688435c0ceed671e",
+      "size_bytes": 398
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-cli/src/main.rs",
+      "sha256": "512466b8756a9fff00a80709a9b75b82bc4bad8fb2e52190b894e6d284857d88",
+      "size_bytes": 67403
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-connector-sdk/Cargo.toml",
+      "sha256": "9e22ed69a6c31b9b47b02ede869799f562ce91c75db6e788621e337a97051ff0",
+      "size_bytes": 255
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-connector-sdk/src/lib.rs",
+      "sha256": "2119aaf4cd19ca346004089b40e209cac3dd26dc71a00938f936ad95bab48202",
+      "size_bytes": 12540
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-connector-testkit/Cargo.toml",
+      "sha256": "7b4db4ae0ff8f129aabd684dd4883455c3652858ab3740af8565fec43306b895",
+      "size_bytes": 409
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-connector-testkit/src/lib.rs",
+      "sha256": "8a8f5b851c65cca2fe6b4824b49b6e5b586c2312e6fa6f0b7f7eb082b68e5157",
+      "size_bytes": 24220
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-connector-testkit/tests/first_party_sources.rs",
+      "sha256": "1c370d4f977db16ecaa00fec49a03fb8645a26d55e8fb25add5693f5c3c2e9a3",
+      "size_bytes": 15378
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/Cargo.toml",
+      "sha256": "8711c5c8a205a26854e6108632c051ca3417f438c2260cfe4555aeed99fd3248",
+      "size_bytes": 472
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/account_store.rs",
+      "sha256": "2138b738dcaf4065bbba3c93f578cb2589cfbebc92f91b3adc6c52c7e0bf59ab",
+      "size_bytes": 15049
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/claude_statusline.rs",
+      "sha256": "1461cff1b342c87f3041ce62ad349bb421ac30f192141f150a25290409cea35b",
+      "size_bytes": 6986
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/lib.rs",
+      "sha256": "061f168293292aa6a40eed9bfb9d7a7283b4c3310bf1553269263af5948accbb",
+      "size_bytes": 2114
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/lifecycle.rs",
+      "sha256": "815bdf7f6a7bba8d4c2e7afaa5ac10a58b6fa0be70fa86800a2a0facc5629ad0",
+      "size_bytes": 18951
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/local_client.rs",
+      "sha256": "5c9ba2fede3ab166fb48ef2b104c428d5d8cd1190070949444dd11acdf00f6c4",
+      "size_bytes": 1919
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/local_service.rs",
+      "sha256": "4a262c7fb6d250297f4ad706921e359120a0774769c9eb69b3c35adb280adacc",
+      "size_bytes": 4390
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/redaction.rs",
+      "sha256": "47cc09ed6f8d60e59c164183c2b678cfc78fc56df25aafddd688ea6056ee14de",
+      "size_bytes": 7275
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/status.rs",
+      "sha256": "fe8463c802061a6d041811af590b3af90c2f0d111695a08331f29f57cb2fed06",
+      "size_bytes": 4249
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-core/src/token_store.rs",
+      "sha256": "97d90160cf8ce93fffc8dae242f225d1aa63e9977af438266d515065f493b5ea",
+      "size_bytes": 18686
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-protocol/Cargo.toml",
+      "sha256": "d80bd29cecb394f8d8a0e7c85741f5d1347cda3e25139cc6f1954368fe71455d",
+      "size_bytes": 272
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-protocol/src/lib.rs",
+      "sha256": "cdfeaeaddee7cf0d251d1b0e7615dd8ee6ef4c50c5e108cc0c49a8c7906f3d26",
+      "size_bytes": 65930
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/Cargo.toml",
+      "sha256": "f38d9c0f643f7a170d9b65b9b6564ca5c3c8a12848eae304911561f5c81fb1b1",
+      "size_bytes": 825
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/build.rs",
+      "sha256": "76779f18187b443ce3d1803b20647a5f7bc4585fa9d32b9ee035522a63872775",
+      "size_bytes": 223
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/adaptive_collector.rs",
+      "sha256": "da2dd803c347ba12ef3b59dbaad18d74f316da8f80192b43e979cd64635d198a",
+      "size_bytes": 7940
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/claude_env.rs",
+      "sha256": "e217a1dac36190925d7d84020c56297a8a4af4ab983ad5662d25de289e0c93c7",
+      "size_bytes": 2589
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/codex_toml.rs",
+      "sha256": "3c3307b7867e3353318f2250d0eeb21a38ad4e00639049d279a55d202bca2930",
+      "size_bytes": 3567
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/detection.rs",
+      "sha256": "6b678ee5488f738b4055e4a82370d899f9a423363a5a5d08d30d54c64a491eae",
+      "size_bytes": 7764
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/fence.rs",
+      "sha256": "a9563236663f9df307d2962c79d699c506fa97d3c4f38f14ae5dd186e8000a82",
+      "size_bytes": 23610
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_configs/mod.rs",
+      "sha256": "7c117b55cbfdae836e9943f087b9cf35dc58030a27a5acf98d3efda4eab87b60",
+      "size_bytes": 74
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/agent_status.rs",
+      "sha256": "3ae32d04fd2eddbb89a4c83220f87d68f60c76f7eb09ee77a27b4b66a662386c",
+      "size_bytes": 109700
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/command_env.rs",
+      "sha256": "fe7aa7bdc42c5055f6deab8a3154ad1b36308edc72a14253b5aa7b80203b55e6",
+      "size_bytes": 3943
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/control.rs",
+      "sha256": "bc14f2e27a675c7a52f54bcab3ae76781077e8cac9050e4549f379f34f2fb72a",
+      "size_bytes": 273993
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/keychain.rs",
+      "sha256": "99670484404bced0a81f4a9b7a1e2732b27ae6ac9c33273816dc655dd2207c60",
+      "size_bytes": 21697
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/lib.rs",
+      "sha256": "65cd5fd53457e46a72ca4b898a73fcb8790a084983cf7830b3d8f5b27b61f0a5",
+      "size_bytes": 72479
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/macos_service.rs",
+      "sha256": "5864881a74d2902d7636940586a398a77ca61f4cab0279af8da547d519cb9259",
+      "size_bytes": 7538
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/main.rs",
+      "sha256": "5e855b14a028dd6af732f9506e37115e69afc9fa467fa10e4c89554b21fc23bf",
+      "size_bytes": 15675
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/otlp_relay.rs",
+      "sha256": "4bea9e801318ba3a0fd283e14b1e3d23f8cc3f222e25a8430757be318573f03a",
+      "size_bytes": 22836
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_client.rs",
+      "sha256": "95951dc876e7e01a74aef9723f96ca13d71849404b8a6d582cf371324b8fe860",
+      "size_bytes": 8628
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_sync.rs",
+      "sha256": "e0c56f58977bb7bca63bfe1a5ff0b352825d1fa087d2c1eb311abf2499e87871",
+      "size_bytes": 17549
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_watcher.rs",
+      "sha256": "9ad688ddc3cd67ff5103b86b3d0e250c3b8b535d42061895f26c1523a8da1222",
+      "size_bytes": 2459
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots.rs",
+      "sha256": "7c1abadec15a28f82c1509ad1d4102bba9f164a64c1669ecf0fe697e02fdd925",
+      "size_bytes": 114132
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/unix_socket.rs",
+      "sha256": "05a6f678551e184cd61ead874965781fc97b3a6737309bd3ae6b0411b22c94f8",
+      "size_bytes": 11601
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/xpc_mach.rs",
+      "sha256": "1c6e8de734caeb6af609aa66690602dd1b199ec52fe7e31de762632d74d38893",
+      "size_bytes": 2614
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/xpc_shim.c",
+      "sha256": "6870e6d77118d3ee61bd5918dc51c847b0a6dc8a8996ca0778b586d1808183ef",
+      "size_bytes": 2542
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/README.md",
+      "sha256": "a9c39cc8f1a14f7cb234c68dd1b2b33b227a68e09028e21d691364c3340d8e61",
+      "size_bytes": 1952
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/agent-adapters.md",
+      "sha256": "44accbadbe78c127c32a82de96e2ebf77144dedc88050c34c0fe2a89d34a6c22",
+      "size_bytes": 1897
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/connectors.md",
+      "sha256": "3b71ebda6b1cfd333a384bb4894251b6c3097290e3d6cbed24db83d108329798",
+      "size_bytes": 1866
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/diagnostics.md",
+      "sha256": "5af8adf383cf92e9e0b932204d1da68d1f737b7fdc5eb15ff5ee94ca4e47c945",
+      "size_bytes": 1240
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/examples.md",
+      "sha256": "e7faf487d8f1088546774815d6312b1cfb63fc04aa9fa2b2b861c0add30ff71f",
+      "size_bytes": 1461
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/install.md",
+      "sha256": "65d8c25857e983720a8c78cd05d363e398b1d99e26d34e82be259c8b69963c84",
+      "size_bytes": 2030
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/privacy.md",
+      "sha256": "2ea0176c25bf7ab2de2c918a94fd7a540fa0c80ed3ff025b775cf00bb26683f3",
+      "size_bytes": 2140
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/release-verification.md",
+      "sha256": "26668b688606b8d0de095c10e11f76faa0293ebd289eb806a636436fbbaa7c9f",
+      "size_bytes": 4578
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/setup.md",
+      "sha256": "241c300cf1ee1ade83982cb64d87cb6aeede45a43a14a3df64f704cc66c42c18",
+      "size_bytes": 2044
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/support.md",
+      "sha256": "8f7cc566f06e93fe58e5586be3fba990c0a7332756fb84b4eea7aa8bec8fcb20",
+      "size_bytes": 4220
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/troubleshooting.md",
+      "sha256": "119a89e739e4fefce883e291c99958eb9f288e44c6b64a850e4297ba6e2737f6",
+      "size_bytes": 2141
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/daemon-unavailable-error.json",
+      "sha256": "6a453175bb524283b305a785b2bd7196ffa65722a50026c6dcc8cc8005930931",
+      "size_bytes": 257
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/daemon-unavailable-watch-output.ndjson",
+      "sha256": "7060d2022f4e2a6574cf3d4528f9c0ae3435f0f0badce52e35a02f626879a270",
+      "size_bytes": 408
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/diagnostics-collect-request.json",
+      "sha256": "eb8a1b74d45f2a2f053f7487d1193b4ae51bd6038b92ed85c273914f079712be",
+      "size_bytes": 188
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/diagnostics-upload-request.json",
+      "sha256": "29cf3a9aeab08ad5a9dc0a1f4cd094c446484cb86a78922c4655a726a898b8bb",
+      "size_bytes": 358
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/help-contract.txt",
+      "sha256": "e5586ee71ee93be1ff1caadfdf50ef8df3dba45d5b5f7fe99372edb1fd422337",
+      "size_bytes": 13242
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/setup-browser-claim-output.json",
+      "sha256": "7e1f7994422e2f7badfd831aa3f8eb8827de5cff4295e5cbf3d1a17f7ff96399",
+      "size_bytes": 650
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/setup-claim-request.json",
+      "sha256": "51b902fc55eb5eb018c0ce925b0a64361b4333b40a1ef1ffad64374a3c6cd62a",
+      "size_bytes": 241
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/setup-needs-user-action-output.json",
+      "sha256": "4b5e2e8f4f7af3342fbe615e79ffa016aacb0ae8ebab3a011047f1304a243e78",
+      "size_bytes": 417
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/setup-timed-out-output.json",
+      "sha256": "74cec9552f8b6a582187df6df39bd8f7b668523da1e5b53ddd23cc809b75df8f",
+      "size_bytes": 365
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/status-json-output.json",
+      "sha256": "5af19f6c81a781aceee86250f724b7a77cdf1b17f220b618c219cf64efec2b2a",
+      "size_bytes": 52
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/status-watch-output.ndjson",
+      "sha256": "dd99c84c0b1fab2fab9e93e33d0a1d75b6ca92716203b5606e7a4e2f1cf50d10",
+      "size_bytes": 243
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/control/status-request.json",
+      "sha256": "44053f09df9e80efc4dd60e1c26299fc742d20ea17336227295d9d4bb6586702",
+      "size_bytes": 111
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/control/status-response.json",
+      "sha256": "28a2960a5a90b1e6a9b0b877c1b7a7e88505b04ad9e918910f48b0ab7c594079",
+      "size_bytes": 140
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/diagnostics/redacted-bundle.json",
+      "sha256": "294e49c883dac37dfeaf5e7f99f8a5967dad093da3f953bb169a6b46e37c24d4",
+      "size_bytes": 3082
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/setup/claim-run.json",
+      "sha256": "8d7bf97fc6f6fc8124546d0dedc18942889584aa8429af2b7fe59731d92d9895",
+      "size_bytes": 925
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/source-health/codex-needs-repair.json",
+      "sha256": "9b07bf4ebb1b0411f0d1873f444bbb674d72caa188153e3ed3c80185f37487e5",
+      "size_bytes": 5560
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/status/macos-empty.json",
+      "sha256": "993da5c6b366c4e0e0f93511cbb0e592c39a669828358bf27352ec6a77a2ecd9",
+      "size_bytes": 953
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "homebrew/README.md",
+      "sha256": "51d335617a5cf57b753860ac419d925e28cbd0fad19527b266c5c10a22217da5",
+      "size_bytes": 3622
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "public-export/README.md",
+      "sha256": "bbb478df46bf6a25331ea09d5d047a908da91d610093af17e4d5e3ade661e083",
+      "size_bytes": 11500
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "public-export/deny-patterns.tsv",
+      "sha256": "7c7f1d98b17275712c55af1435ec22dcc06e5f8abcc15e00ab9c1c0049ee740c",
+      "size_bytes": 1490
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "public-export/path-map.tsv",
+      "sha256": "cf7575a730f74bd2ffdbb94056bcc5c5b4bcb1d9e6f92d1d4843fa135d45aaca",
+      "size_bytes": 2172
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "public-export/rewrite-rules.tsv",
+      "sha256": "f38c7514174b9baf3e990db8cd518401a5854292ff4d3307b1c96adfd896256d",
+      "size_bytes": 96
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "public-export/roots.txt",
+      "sha256": "54e8756b1079b43b0983837ad909cc7c081e9a22e4f8e2e14173711ed1773496",
+      "size_bytes": 455
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "release/README.md",
+      "sha256": "7fdda4ee2f936350ec4cb64eefd1db28a0761e84dac516436c4bacfabdb3dfcc",
+      "size_bytes": 21526
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "release/manifest.schema.json",
+      "sha256": "f429af42ab386f7034a73548a77aa068d235e8cb95c283f2d1dca39e1e512ed5",
+      "size_bytes": 9363
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "schemas/collector-fixture.schema.json",
+      "sha256": "83dd807c4bbfc3e2e5ff1c17b632e4dd6e831cad4d38e47400d8d01a3e5b0f96",
+      "size_bytes": 1982
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "schemas/collector-manifest.schema.json",
+      "sha256": "87ec72283a9463ed675b6080077ca6e6af7beeb697ec9f579e67171f0ca9bfe5",
+      "size_bytes": 2489
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "schemas/connector-registry.schema.json",
+      "sha256": "bcdec119817b15079111aee0339ca81c75166382c80038f34efa4f063761e93f",
+      "size_bytes": 4682
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "schemas/source-manifest.schema.json",
+      "sha256": "bca564f1121ddb28654f1287f70bb15bd0609ae734eef7ea6c083329663384f4",
+      "size_bytes": 1819
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/check_macos_resource_bundle_guard.sh",
+      "sha256": "ee69c3a2cead10efcf1e297346ae599722b62ff90df29496fdc9f2490e4ed9c0",
+      "size_bytes": 1764
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/cyclonedx_sbom.sh",
+      "sha256": "f575f5ec1ab7870d906214a3b194f40d8052a55ec2377ee09e8891f1a3d33715",
+      "size_bytes": 2295
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/dev_e2e_smoke.sh",
+      "sha256": "2ecb593f6a4511fe5f31d57cce1d86e744db4ad3b74d2a027b645e9916d1098c",
+      "size_bytes": 6613
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/homebrew_formula.sh",
+      "sha256": "aa87253c693ed6af3064e3d4aeb5c684952aa4fb7607f68e60cd247262a8e6ba",
+      "size_bytes": 8658
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/hosted_native_installer.sh",
+      "sha256": "22388dcf516af08aec58562119c2a4679de561ffd46321ef6f9b0dd2f604f540",
+      "size_bytes": 14473
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_dev_install.sh",
+      "sha256": "e0697c9e3c653a1850dfa4c9082328879da361b908bf8289d928c090daf4ee02",
+      "size_bytes": 7261
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_installer_qa.sh",
+      "sha256": "798d94384a97fed39faa1483c99e30e7777975aff80c825ca107fb5706d33517",
+      "size_bytes": 3596
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_launch_smoke.sh",
+      "sha256": "4c9fbc799554bf89dde93b586dff618b580d38872a7a834d65b90e5df598b45b",
+      "size_bytes": 5397
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_notarize.sh",
+      "sha256": "5b694707beb3fa9cfbf7a0884b9fe8628f315d7a6c1cef8e25fae310bda17d35",
+      "size_bytes": 5235
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_package.sh",
+      "sha256": "4a08487d602c39b50259e89739c3085649c227ac17d63623fa21dcaa03577912",
+      "size_bytes": 26591
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_public_rc_evidence_template.sh",
+      "sha256": "22d1e7cb646005c2aad8307b0e9831facc085269baa16595fee499a1a6a18cd9",
+      "size_bytes": 6525
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_public_rc_gate.sh",
+      "sha256": "479e67133479aaab09fc60aa44edd00c5ab03bb058e5134e02ef463f22af63f6",
+      "size_bytes": 10499
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_release_gate.sh",
+      "sha256": "e213ffb3837874130b50d5d0349617b5c5a8def1326bb175b2f3daf9154bf904",
+      "size_bytes": 17773
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_signing_readiness.sh",
+      "sha256": "e794978b2c10d0269c97cfb91f6928fbc30a647181fe258a4531553a5c0e3c53",
+      "size_bytes": 4419
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_stable_closeout_gate.sh",
+      "sha256": "9bc375786d4d029dc0ff1b06eab0965f034799b5900fe768def3c221c7647d50",
+      "size_bytes": 10117
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_stable_preflight.sh",
+      "sha256": "70847831f75ccf2687f975ed641951911ec3af2fb13147ec5664f22bfc03b471",
+      "size_bytes": 21886
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_stable_qa_evidence_template.sh",
+      "sha256": "6659f1242e39d3f5faa9dc4951b10c543ecf7b6f673707c297a8b7ce9030821b",
+      "size_bytes": 9098
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_bootstrap_plan.sh",
+      "sha256": "a8c87fff2af29aec23e6039f8a34ca976bc2398b1ff19934f38ff6899046d074",
+      "size_bytes": 16439
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_contract_check.sh",
+      "sha256": "4598d7eb43c52f6ea747214237148a7925ae0d117f3dd5a191201084b757e0b4",
+      "size_bytes": 29388
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_cutover_closeout.sh",
+      "sha256": "b73c85ba494322a80e59fc68b7e35b7791745a6019f373bb52ee2be36af8cf77",
+      "size_bytes": 23506
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_export_bundle.sh",
+      "sha256": "7f3a0154ed73059ba6a7fa2195383783a960eebd8b959c0e4dbf566e97e303f7",
+      "size_bytes": 18183
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_export_check.sh",
+      "sha256": "668ae9f210663b2c895e4d88f2b781125f58874db0e1aa3e9fd63f385b433794",
+      "size_bytes": 6831
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_manifest_check.sh",
+      "sha256": "b338fc204879df00fb7811197812482b6229c5b924e93ba3ba0cd46fb6317d56",
+      "size_bytes": 8738
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_secret_scan.sh",
+      "sha256": "bab5ec086cc89ab82266aad5c4fa33d47b16fde0f93426c1a09b1e416035f05e",
+      "size_bytes": 10837
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_skeleton_check.sh",
+      "sha256": "04468f095ee19eac2419c9639ee889b380807437ef17781d6c36cb0be80644e6",
+      "size_bytes": 7782
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/public_repo_surface_ci.sh",
+      "sha256": "6a829eb9cba84b73f39988eba66e77d368a30d8484ea890be845341c57009b53",
+      "size_bytes": 6665
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_cyclonedx_sbom.sh",
+      "sha256": "b69c42ef6f9ad346090a434bf5a6e4728370620b7cfbb68c46786236fbe2bf74",
+      "size_bytes": 796
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_homebrew_formula.sh",
+      "sha256": "a9c2e68ab93a0079f8fa37fbdc3e80c69557934dcb8d2814c3bf1ba71b7cf1ad",
+      "size_bytes": 7019
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_hosted_native_installer.sh",
+      "sha256": "cf0fdea38acf45fcd993b6da0286d3af7ff11068e7cc48a7784c1ab6001ce227",
+      "size_bytes": 8555
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_notarize_filter.sh",
+      "sha256": "56dfaeac65d695879f70ac52cd3025a163e16dbb80379f8815f12007bc3254f0",
+      "size_bytes": 5922
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_public_rc_gate.sh",
+      "sha256": "e1c63b5a986aaa4cc483d053e43343cb24eb9cd05ac1e66c8ce1305765910529",
+      "size_bytes": 15622
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_release_gate.sh",
+      "sha256": "c5f8642190cc1c40e9fc56e1addc70de79ce8831e62fd68110770b0f09656639",
+      "size_bytes": 15302
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_resource_bundle_guard.sh",
+      "sha256": "ca7e93113fa4ddbd7113502d195e3ac249e52b5537f4500c062666955530c4d5",
+      "size_bytes": 1482
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_signing_readiness.sh",
+      "sha256": "39ed1acf6ccf53ca2e9ea8f89a2c154b597fef6d81970719709418d94905b36f",
+      "size_bytes": 2087
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_stable_closeout_gate.sh",
+      "sha256": "dbc6e6e4d18be5cc19dcaf00526bb8c07ec176fb36ee59843244f9a3e2acdd34",
+      "size_bytes": 13672
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_stable_preflight.sh",
+      "sha256": "5fe7994eecd2925c16ebc195f97a1025d8d7c6f656872e3288a7f00207f8d42d",
+      "size_bytes": 11768
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_stable_qa_evidence_template.sh",
+      "sha256": "b6f961a2adb9a910690ca6066576e62aa8abbe2d06ca5666b8a9b771f7a7d68e",
+      "size_bytes": 9658
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_bootstrap_plan.sh",
+      "sha256": "2fc2f7eb2467fe767707c0bd1f887d97fa1a42bea4b17f31a756dde325fb064f",
+      "size_bytes": 5493
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_contract_check.sh",
+      "sha256": "b82f1bc7cd5adc8c2db0c31a0a97a710195ac6fc75306efc5429bca753b67b0e",
+      "size_bytes": 11011
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_cutover_closeout.sh",
+      "sha256": "f7301c744e9e760aa5fd124a30805731a6e9bb5f2f73c853c97a361e652fb5e7",
+      "size_bytes": 7464
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_export_bundle.sh",
+      "sha256": "d5ef9a91cdd52fdd41668c2ef5240c4c3da878eec33d31b00d9fda31821ce00c",
+      "size_bytes": 11397
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_export_check.sh",
+      "sha256": "97c61172979739b29ddf00df45a51c0b204b2aedc6d6b1779d8192edef399b50",
+      "size_bytes": 3386
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_manifest_check.sh",
+      "sha256": "43e3679518cff91f0055ac8772e6f6c337f3fb783c9806da78bb41441fdbb3c1",
+      "size_bytes": 3962
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_secret_scan.sh",
+      "sha256": "1c6aa49435e92b0e99e325e0b8425e29a47b28d2dcf8a246332861d941d0e024",
+      "size_bytes": 3572
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_skeleton_check.sh",
+      "sha256": "240d635d1a843afb1f96930c5666e8beacadf5157fdb2df8d8c3894c4ece1372",
+      "size_bytes": 1478
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_surface_ci.sh",
+      "sha256": "3c6d6d416a1e77c9d0be78966cc30f641cb1eb1ca8f2f41c7f3c5d2f3ac96403",
+      "size_bytes": 1374
+    }
+  ],
+  "generated_at": "2026-05-21T19:34:07+00:00",
+  "generated_by": "public_repo_export_bundle.sh",
+  "output_file_count": 178,
+  "public_roots": [
+    ".github/dependabot.yml",
+    ".github/workflows/ci.yml",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "TRADEMARKS.md",
+    "agent-adapters/claude-code-skill/",
+    "agent-adapters/codex-skill/",
+    "connectors/",
+    "crates/",
+    "crates/Cargo.lock",
+    "crates/Cargo.toml",
+    "crates/ottto-connector-sdk/",
+    "crates/ottto-connector-testkit/",
+    "docs/",
+    "fixtures/",
+    "homebrew/",
+    "public-export/",
+    "release/",
+    "schemas/",
+    "scripts/"
+  ],
+  "rewrites_applied": {},
+  "schema_version": 1,
+  "source_commit": "3175937c2292cf4a468af8be775ff2e240a9643b"
+}

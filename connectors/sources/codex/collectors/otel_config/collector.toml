@@ -1,0 +1,18 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "otel_config"
+display_name = "Live telemetry config"
+
+operations = ["detect", "verify", "repair", "diagnostics"]
+data_source_kind = "live_telemetry"
+default_state = "requires_setup"
+
+review_tier = "official"
+maturity = "writes_config"
+risk_classes = ["network_calls"]
+
+uploads_raw_content = false
+emits = [
+  "source_descriptors",
+  "telemetry_records"
+]

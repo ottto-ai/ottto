@@ -1,0 +1,18 @@
+schema_version = "collector_manifest.v1"
+source_id = "pi"
+collector_id = "live_batches"
+display_name = "Live usage batches"
+
+operations = ["collect_usage", "verify", "diagnostics"]
+data_source_kind = "live_telemetry"
+default_state = "requires_setup"
+
+review_tier = "official"
+maturity = "beta"
+risk_classes = ["network_calls"]
+
+uploads_raw_content = false
+emits = [
+  "telemetry_records",
+  "source_plan_profiles"
+]

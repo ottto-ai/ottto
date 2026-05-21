@@ -1,0 +1,121 @@
+{
+  "bundle_id": "diag_01HXREDACTED",
+  "machine_id": "machine_01HXLOCALMAC",
+  "created_at": "2026-05-05T09:05:00Z",
+  "upload": {
+    "requested": false,
+    "status": "local_only",
+    "approval_required": true,
+    "approved": false,
+    "retention": {
+      "accepted": false,
+      "text": "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request."
+    },
+    "authorization": "not_requested",
+    "support_claim_provided": false
+  },
+  "redaction": {
+    "policy_version": 1,
+    "covered_surfaces": [
+      "diagnostics",
+      "support_output",
+      "agent_output",
+      "setup_error",
+      "command_output"
+    ],
+    "redacted_categories": [
+      "local_path",
+      "secret_token",
+      "account_identifier",
+      "machine_identifier",
+      "raw_prompt",
+      "command_output"
+    ],
+    "redacted_fields": [
+      "installation.launch_agent_path",
+      "security.auth_header"
+    ],
+    "preserved_fields": [
+      "bundle_id",
+      "machine_id",
+      "created_at",
+      "runtime.daemon_state",
+      "runtime.daemon_running",
+      "runtime.socket_reachable",
+      "runtime.xpc_reachable",
+      "runtime.source_count",
+      "versions.cli_version",
+      "versions.daemon_version",
+      "versions.protocol_version",
+      "installation.launch_agent_loaded",
+      "installation.launch_agent_path_drift",
+      "installation.stale_registrations",
+      "repair.safe_repair_actions",
+      "repair.repair_backup_metadata",
+      "security.keychain_item_count"
+    ]
+  },
+  "sections": [
+    {
+      "name": "runtime",
+      "status": "succeeded",
+      "items": {
+        "daemon_state": "Running",
+        "daemon_running": true,
+        "socket_reachable": true,
+        "xpc_reachable": true,
+        "source_count": 1
+      }
+    },
+    {
+      "name": "versions",
+      "status": "succeeded",
+      "items": {
+        "app_version": "unknown",
+        "cli_version": "0.1.0",
+        "daemon_version": "0.1.0",
+        "protocol_version": 11,
+        "build_id": "dev",
+        "version_mismatch": false
+      }
+    },
+    {
+      "name": "installation",
+      "status": "succeeded",
+      "items": {
+        "launch_agent_loaded": true,
+        "launch_agent_path": "[path]",
+        "launch_agent_path_drift": false,
+        "stale_registrations": [],
+        "manifest_hash_status": "unknown",
+        "manifest_hash_mismatch": false
+      }
+    },
+    {
+      "name": "repair",
+      "status": "succeeded",
+      "items": {
+        "safe_repair_actions": [
+          "repair_source_config",
+          "collect_diagnostics",
+          "uninstall_plan",
+          "uninstall_execute_confirmed"
+        ],
+        "repair_backup_metadata": {
+          "required": true,
+          "restore_available": false,
+          "restore_operation": "uninstall_restore",
+          "cloud_credentials_untouched": true
+        }
+      }
+    },
+    {
+      "name": "security",
+      "status": "succeeded",
+      "items": {
+        "keychain_item_count": 0,
+        "auth_header": "[REDACTED]"
+      }
+    }
+  ]
+}

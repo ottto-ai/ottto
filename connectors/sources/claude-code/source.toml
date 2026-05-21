@@ -1,0 +1,23 @@
+schema_version = "source_manifest.v1"
+source_id = "claude_code"
+app_slug = "claude_code"
+display_name = "Claude Code"
+publisher = "ottto"
+review_tier = "official"
+maturity = "stable"
+
+operations = [
+  "detect",
+  "verify",
+  "repair",
+  "collect_usage",
+  "monitor_quota",
+  "upload_snapshot",
+  "diagnostics"
+]
+
+collectors = [
+  "local_sessions",
+  "otel_config",
+  "quota_status"
+]

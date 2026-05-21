@@ -1,0 +1,51 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "otel_config",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "source_descriptors",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "otel_config",
+        "telemetry_owner": "local_daemon",
+        "default_state": "requires_setup",
+        "operations": [
+          "detect",
+          "verify",
+          "repair",
+          "diagnostics"
+        ]
+      }
+    },
+    {
+      "record_type": "telemetry_records",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "otel_config",
+        "telemetry_enabled": true,
+        "exporter": "otlp",
+        "endpoint_host_hash": "otel_endpoint_sha256_fixture",
+        "headers_configured": true,
+        "observed_at": "2026-05-20T08:02:00Z"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Telemetry setup state, endpoint host hash, and non-secret exporter metadata only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

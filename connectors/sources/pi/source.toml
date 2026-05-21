@@ -1,0 +1,23 @@
+schema_version = "source_manifest.v1"
+source_id = "pi"
+app_slug = "pi"
+display_name = "Pi"
+publisher = "ottto"
+review_tier = "official"
+maturity = "beta"
+
+operations = [
+  "detect",
+  "verify",
+  "repair",
+  "collect_usage",
+  "monitor_quota",
+  "upload_snapshot",
+  "diagnostics"
+]
+
+collectors = [
+  "local_sessions",
+  "live_batches",
+  "route_status"
+]

@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "daemon_unavailable",
+    "message": "ottto-service is unavailable at /tmp/ottto.sock: connection refused",
+    "retryable": true,
+    "details": {
+      "autostart_attempted": false,
+      "socket": "/tmp/ottto.sock"
+    }
+  }
+}

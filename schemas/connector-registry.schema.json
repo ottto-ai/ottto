@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ottto.net/schemas/connector-registry.schema.json",
+  "title": "Ottto connector registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sources"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "connector_registry.v1"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "app_slug",
+        "display_name",
+        "publisher",
+        "review_tier",
+        "maturity",
+        "operations",
+        "manifest_path",
+        "collectors"
+      ],
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+        },
+        "app_slug": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "publisher": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "review_tier": {
+          "$ref": "#/$defs/review_tier"
+        },
+        "maturity": {
+          "$ref": "#/$defs/maturity"
+        },
+        "operations": {
+          "$ref": "#/$defs/operations"
+        },
+        "manifest_path": {
+          "type": "string",
+          "pattern": "^connectors/sources/.+/source\\.toml$"
+        },
+        "collectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/collector"
+          }
+        }
+      }
+    },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collector_id",
+        "display_name",
+        "operations",
+        "data_source_kind",
+        "default_state",
+        "review_tier",
+        "maturity",
+        "risk_classes",
+        "uploads_raw_content",
+        "emits",
+        "manifest_path"
+      ],
+      "properties": {
+        "collector_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "operations": {
+          "$ref": "#/$defs/operations"
+        },
+        "data_source_kind": {
+          "$ref": "#/$defs/data_source_kind"
+        },
+        "default_state": {
+          "$ref": "#/$defs/default_state"
+        },
+        "review_tier": {
+          "$ref": "#/$defs/review_tier"
+        },
+        "maturity": {
+          "$ref": "#/$defs/maturity"
+        },
+        "uploads_raw_content": {
+          "type": "boolean"
+        },
+        "risk_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/risk_class"
+          }
+        },
+        "emits": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,96}$"
+          }
+        },
+        "manifest_path": {
+          "type": "string",
+          "pattern": "^connectors/sources/.+/collectors/.+/collector\\.toml$"
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "detect",
+          "verify",
+          "repair",
+          "collect_usage",
+          "monitor_quota",
+          "upload_snapshot",
+          "diagnostics",
+          "uninstall_restore"
+        ]
+      }
+    },
+    "review_tier": {
+      "type": "string",
+      "enum": [
+        "official",
+        "ottto_labs",
+        "reviewed_community",
+        "community",
+        "custom_local"
+      ]
+    },
+    "maturity": {
+      "type": "string",
+      "enum": [
+        "stable",
+        "beta",
+        "experimental",
+        "undocumented_surface",
+        "writes_config",
+        "local_only"
+      ]
+    },
+    "data_source_kind": {
+      "type": "string",
+      "enum": [
+        "local_enriched",
+        "live_telemetry",
+        "integration_connector",
+        "cloud_billing_connector"
+      ]
+    },
+    "default_state": {
+      "type": "string",
+      "enum": [
+        "enabled",
+        "requires_setup",
+        "disabled"
+      ]
+    },
+    "risk_class": {
+      "type": "string",
+      "enum": [
+        "auth_adjacent",
+        "network_calls",
+        "hidden_credential_read",
+        "raw_prompt_or_output"
+      ]
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "protocol_version": 11,
+  "daemon_version": "0.1.0",
+  "machine": {
+    "machine_id": "machine_01HXLOCALMAC",
+    "installation_id": "install_01HXLOCALMAC",
+    "display_name": "Ron's MacBook Pro",
+    "hostname": "rons-macbook-pro.local",
+    "os": "macos",
+    "arch": "arm64",
+    "local_platform_version": "0.1.0"
+  },
+  "account": {
+    "state": "not_connected",
+    "user": null,
+    "organization": null,
+    "connected_at": null,
+    "last_refreshed_at": null,
+    "message": null
+  },
+  "daemon": "running",
+  "relay": {
+    "state": "connected",
+    "endpoint": "https://relay.ottto.net/v1/local",
+    "last_connected_at": "2026-05-05T09:00:00Z",
+    "last_error": null
+  },
+  "sources": [],
+  "update": {
+    "current_version": "0.1.0",
+    "latest_version": null,
+    "channel": "dev",
+    "status": "unknown",
+    "gate": "unknown",
+    "install_owner": "unknown",
+    "checked_at": null
+  },
+  "generated_at": "2026-05-05T09:00:05Z"
+}

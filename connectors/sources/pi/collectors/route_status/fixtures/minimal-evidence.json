@@ -1,0 +1,50 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "pi",
+  "collector_id": "route_status",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "agent_status_snapshots",
+      "sample": {
+        "source_id": "pi",
+        "collector_id": "route_status",
+        "status": "ok",
+        "model_provider": "openai",
+        "billing_provider": "openai",
+        "billing_channel": "subscription",
+        "auth_mode": "oauth",
+        "subscription_product": "chatgpt_plus",
+        "observed_at": "2026-05-20T08:12:00Z"
+      }
+    },
+    {
+      "record_type": "source_plan_profiles",
+      "sample": {
+        "source_id": "pi",
+        "collector_id": "route_status",
+        "plan_label": "ChatGPT Plus",
+        "model_provider": "openai",
+        "billing_provider": "openai",
+        "gateway_provider": null,
+        "confidence": "observed"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Explicit non-secret route, provider, selector, and subscription evidence only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

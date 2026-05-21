@@ -1,0 +1,14 @@
+{
+  "request_id": "req_cli_diagnostics_upload_fixture",
+  "protocol_version": 11,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "diagnostics_collect",
+  "upload": true,
+  "upload_approval": {
+    "approved": true,
+    "retention_disclosure_accepted": true,
+    "support_claim": "support_123"
+  },
+  "api_base_url": "http://127.0.0.1:43199"
+}

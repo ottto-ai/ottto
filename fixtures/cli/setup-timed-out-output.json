@@ -1,0 +1,17 @@
+{
+  "status": "timed_out",
+  "setup_run_id": "setup_01HXTIMEOUT",
+  "claim_code_provided": true,
+  "source_count": 1,
+  "detected_sources": [
+    {
+      "source": "codex",
+      "state": "waiting_for_telemetry",
+      "readiness_percent": 90,
+      "missing_fields": ["fresh_telemetry"]
+    }
+  ],
+  "next_question": null,
+  "next_action": null,
+  "actions": []
+}

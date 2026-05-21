@@ -1,0 +1,36 @@
+{
+  "setup_run_id": "setup_01HXCLAIM",
+  "machine_id": "machine_01HXLOCALMAC",
+  "sources": ["codex", "claude_code"],
+  "status": "waiting_for_approval",
+  "events": [
+    {
+      "event_id": "event_001",
+      "step": "claim_machine",
+      "status": "succeeded",
+      "source": null,
+      "message": {
+        "code": "machine_claimed",
+        "text": "Machine claim created."
+      },
+      "occurred_at": "2026-05-05T09:01:00Z",
+      "metadata": {
+        "setup_code": "[REDACTED]"
+      }
+    },
+    {
+      "event_id": "event_002",
+      "step": "request_approval",
+      "status": "waiting",
+      "source": "codex",
+      "message": {
+        "code": "approval_required",
+        "text": "Waiting for user approval before writing Codex config."
+      },
+      "occurred_at": "2026-05-05T09:01:04Z",
+      "metadata": {}
+    }
+  ],
+  "created_at": "2026-05-05T09:00:55Z",
+  "updated_at": "2026-05-05T09:01:04Z"
+}

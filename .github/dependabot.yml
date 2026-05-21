@@ -1,0 +1,52 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci(deps)
+    labels:
+      - ci
+      - dependencies
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      runtime-cargo:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps(runtime)
+    labels:
+      - rust
+      - dependencies
+
+  - package-ecosystem: cargo
+    directory: /crates
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      connector-cargo:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps(connectors)
+    labels:
+      - rust
+      - dependencies

@@ -1,0 +1,46 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "quota_status",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "agent_status_snapshots",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "quota_status",
+        "status": "ok",
+        "quota_window": "weekly",
+        "remaining_ratio": 0.64,
+        "reset_at": "2026-05-21T00:00:00Z",
+        "observed_at": "2026-05-20T08:03:00Z"
+      }
+    },
+    {
+      "record_type": "source_plan_profiles",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "quota_status",
+        "plan_label": "ChatGPT Plus",
+        "quota_basis": "local_status_snapshot",
+        "confidence": "observed"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Quota window metadata, reset timestamps, remaining ratios, and plan profile evidence only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

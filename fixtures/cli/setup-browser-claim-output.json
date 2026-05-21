@@ -1,0 +1,23 @@
+{
+  "status": "waiting_for_browser",
+  "setup_run_id": null,
+  "claim_code_provided": false,
+  "claim_code": "claim_01HXBROWSER",
+  "claim_url": "https://ottto.net/setup/claim?code=claim_01HXBROWSER&nonce=nonce_123",
+  "expires_at": "2026-05-21T12:00:00Z",
+  "browser_opened": false,
+  "browser_open_error": null,
+  "wait": {
+    "enabled": false,
+    "timeout_seconds": 300
+  },
+  "source_count": 0,
+  "detected_sources": [],
+  "next_question": null,
+  "next_action": {
+    "type": "browser_claim",
+    "claim_code": "claim_01HXBROWSER",
+    "claim_url": "https://ottto.net/setup/claim?code=claim_01HXBROWSER&nonce=nonce_123"
+  },
+  "actions": []
+}

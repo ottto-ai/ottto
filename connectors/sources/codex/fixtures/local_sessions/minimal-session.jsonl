@@ -1,0 +1,2 @@
+{"type":"session_meta","session_id":"codex_fixture_session","source":"codex","started_at":"2026-05-20T08:00:00Z","workspace_hash":"workspace_sha256_fixture"}
+{"type":"event_msg","session_id":"codex_fixture_session","payload":{"role":"assistant","info":{"model":"gpt-5.4","total_token_usage":{"input_tokens":1200,"cached_input_tokens":300,"output_tokens":220},"selector_context":{"service_tier":"standard","batch_mode":"false"}}}}

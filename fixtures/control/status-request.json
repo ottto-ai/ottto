@@ -1,0 +1,6 @@
+{
+  "request_id": "req_01HXSTATUS",
+  "protocol_version": 11,
+  "token": "[REDACTED]",
+  "command": "status"
+}

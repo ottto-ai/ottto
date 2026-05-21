@@ -1,0 +1,706 @@
+use crate::control::handle_request;
+use crate::snapshot_client::load_snapshot_device_credentials;
+use crate::snapshots::SnapshotSource;
+use crate::LocalDaemon;
+use anyhow::{anyhow, Context, Result};
+use base64::Engine;
+use ottto_core::FileConnectionStore;
+use ottto_protocol::{
+    LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
+};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const CLAUDE_CODE_RELAY_PORT: u16 = 43119;
+pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
+pub const CODEX_RELAY_SOURCE: &str = "codex";
+pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
+
+const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+const MAX_OTLP_BODY_BYTES: usize = 25 * 1024 * 1024;
+const RELAY_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayTokenResponse {
+    token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RelayTokenCacheKey {
+    api_base_url: String,
+    source: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRelayToken {
+    token: String,
+    refresh_after: SystemTime,
+}
+
+static RELAY_TOKEN_CACHE: OnceLock<Mutex<BTreeMap<RelayTokenCacheKey, CachedRelayToken>>> =
+    OnceLock::new();
+static UPSTREAM_HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
+    spawn_source_relay(daemon, SnapshotSource::ClaudeCode, CLAUDE_CODE_RELAY_PORT)
+}
+
+pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
+    spawn_local_otlp_relay(daemon)
+}
+
+fn spawn_source_relay(
+    daemon: LocalDaemon,
+    source: SnapshotSource,
+    port: u16,
+) -> Result<SocketAddr> {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let listener = match TcpListener::bind(bind_addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = daemon.set_relay_state_for_trusted_client(RelayState {
+                state: RelayRuntimeState::Failed,
+                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                last_connected_at: None,
+                last_error: Some(StableMessage {
+                    code: "relay_bind_failed".to_string(),
+                    text: format!("Could not bind local OTLP relay on 127.0.0.1:{port}."),
+                }),
+            });
+            return Err(error).context("bind local OTLP relay");
+        }
+    };
+    let local_addr = listener.local_addr()?;
+    let endpoint = format!("http://{local_addr}");
+    let _ = daemon.set_relay_state_for_trusted_client(RelayState {
+        state: RelayRuntimeState::Connected,
+        endpoint: Some(endpoint.clone()),
+        last_connected_at: Some(current_rfc3339()),
+        last_error: None,
+    });
+
+    thread::spawn(move || {
+        for incoming in listener.incoming() {
+            match incoming {
+                Ok(stream) => {
+                    let client_daemon = daemon.clone();
+                    thread::spawn(move || {
+                        if let Err(error) = handle_client(stream, source, client_daemon) {
+                            eprintln!("local OTLP relay request failed: {error}");
+                        }
+                    });
+                }
+                Err(error) => {
+                    eprintln!("local OTLP relay listener failed: {error}");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(local_addr)
+}
+
+fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDaemon) -> Result<()> {
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            write_json_response(
+                &mut stream,
+                400,
+                json!({"error":"bad_request","message": error.to_string()}),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if request.path == "/control" {
+        return handle_control_request(&mut stream, &daemon, request);
+    }
+
+    if request.method == "GET" && request.path == "/healthz" {
+        return write_json_response(&mut stream, 200, relay_health_payload(source));
+    }
+
+    if request.method != "POST"
+        || !matches!(
+            request.path.as_str(),
+            "/v1/logs" | "/v1/metrics" | "/v1/traces"
+        )
+    {
+        return write_json_response(
+            &mut stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local relay endpoint"}),
+        );
+    }
+
+    let request_source = source_from_request(&request).unwrap_or(source);
+    match forward_otlp_request(request_source, &request) {
+        Ok(response) => write_raw_response(
+            &mut stream,
+            response.status,
+            &response.content_type,
+            &response.body,
+        ),
+        Err(error) => write_json_response(
+            &mut stream,
+            502,
+            json!({"error":"relay_forward_failed","message": error.to_string()}),
+        ),
+    }
+}
+
+fn handle_control_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if let Some(origin) = origin {
+        if !is_allowed_control_origin(origin) {
+            return write_json_response(
+                stream,
+                403,
+                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto control"}),
+            );
+        }
+    }
+    let cors_headers = control_cors_headers(origin);
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "POST" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local control endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    let control_request = match serde_json::from_slice::<LocalControlRequest>(&request.body) {
+        Ok(request) => request,
+        Err(error) => {
+            return write_json_response_with_headers(
+                stream,
+                400,
+                json!({"error":"bad_request","message": format!("Invalid local control request: {error}")}),
+                &cors_headers,
+            )
+        }
+    };
+    if !matches!(
+        &control_request.command,
+        LocalControlCommand::TelemetryControl { .. }
+    ) {
+        return write_json_response_with_headers(
+            stream,
+            400,
+            json!({"error":"unsupported_command","message":"Browser local control only accepts telemetry_control"}),
+            &cors_headers,
+        );
+    }
+
+    let response = handle_request(daemon, control_request);
+    write_json_response_with_headers(stream, 200, serde_json::to_value(response)?, &cors_headers)
+}
+
+fn control_cors_headers(origin: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (
+            "Access-Control-Allow-Methods".to_string(),
+            "POST, OPTIONS".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Headers".to_string(),
+            "Content-Type".to_string(),
+        ),
+        (
+            "Access-Control-Allow-Private-Network".to_string(),
+            "true".to_string(),
+        ),
+        ("Access-Control-Max-Age".to_string(), "300".to_string()),
+        (
+            "Vary".to_string(),
+            "Origin, Access-Control-Request-Private-Network".to_string(),
+        ),
+    ];
+    if let Some(origin) = origin {
+        headers.push((
+            "Access-Control-Allow-Origin".to_string(),
+            origin.to_string(),
+        ));
+    }
+    headers
+}
+
+fn is_allowed_control_origin(origin: &str) -> bool {
+    matches!(origin, "https://ottto.net" | "https://www.ottto.net")
+        || is_loopback_origin(origin, "http", "localhost")
+        || is_loopback_origin(origin, "http", "127.0.0.1")
+        || is_loopback_origin(origin, "https", "localhost")
+        || is_loopback_origin(origin, "https", "127.0.0.1")
+}
+
+fn is_loopback_origin(origin: &str, scheme: &str, host: &str) -> bool {
+    let prefix = format!("{scheme}://{host}");
+    let Some(suffix) = origin.strip_prefix(&prefix) else {
+        return false;
+    };
+    suffix.is_empty()
+        || suffix
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn source_from_request(request: &HttpRequest) -> Option<SnapshotSource> {
+    request
+        .headers
+        .get(&LOCAL_RELAY_HEADER.to_ascii_lowercase())
+        .and_then(|value| source_from_relay_header(value))
+}
+
+fn source_from_relay_header(value: &str) -> Option<SnapshotSource> {
+    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        CODEX_RELAY_SOURCE => Some(SnapshotSource::Codex),
+        CLAUDE_CODE_RELAY_SOURCE => Some(SnapshotSource::ClaudeCode),
+        _ => None,
+    }
+}
+
+struct ForwardResponse {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+fn forward_otlp_request(source: SnapshotSource, request: &HttpRequest) -> Result<ForwardResponse> {
+    let api_base_url = current_api_base_url();
+    let relay_token = cached_relay_token(&api_base_url, source)?;
+    let response = send_otlp_request(&api_base_url, &relay_token, request)?;
+    if response.status != 401 {
+        return Ok(response);
+    }
+
+    evict_cached_relay_token(&api_base_url, source)?;
+    let relay_token = cached_relay_token(&api_base_url, source)?;
+    send_otlp_request(&api_base_url, &relay_token, request)
+}
+
+fn send_otlp_request(
+    api_base_url: &str,
+    relay_token: &str,
+    request: &HttpRequest,
+) -> Result<ForwardResponse> {
+    let url = format!("{}{}", api_base_url.trim_end_matches('/'), request.path);
+    let content_type = request
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("application/x-protobuf");
+    let mut upstream = upstream_http_agent()
+        .post(&url)
+        .set("Accept", "application/json")
+        .set("Authorization", &format!("Bearer {relay_token}"))
+        .set("Content-Type", content_type);
+    if let Some(encoding) = request.headers.get("content-encoding") {
+        upstream = upstream.set("Content-Encoding", encoding);
+    }
+
+    match upstream.send_bytes(&request.body) {
+        Ok(response) => response_from_ureq(response),
+        Err(ureq::Error::Status(_, response)) => response_from_ureq(response),
+        Err(ureq::Error::Transport(error)) => Err(anyhow!("upstream transport failed: {error}")),
+    }
+}
+
+fn cached_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<String> {
+    let key = RelayTokenCacheKey {
+        api_base_url: api_base_url.trim_end_matches('/').to_string(),
+        source: source.api_slug(),
+    };
+    let now = SystemTime::now();
+    if let Some(token) = {
+        let cache = relay_token_cache()
+            .lock()
+            .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
+        cache
+            .get(&key)
+            .filter(|entry| entry.refresh_after > now)
+            .map(|entry| entry.token.clone())
+    } {
+        return Ok(token);
+    }
+
+    let token = issue_relay_token(api_base_url, source)?;
+    let refresh_after = relay_token_refresh_after(&token, now);
+    let mut cache = relay_token_cache()
+        .lock()
+        .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
+    cache.insert(
+        key,
+        CachedRelayToken {
+            token: token.clone(),
+            refresh_after,
+        },
+    );
+    Ok(token)
+}
+
+fn evict_cached_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<()> {
+    let key = RelayTokenCacheKey {
+        api_base_url: api_base_url.trim_end_matches('/').to_string(),
+        source: source.api_slug(),
+    };
+    let mut cache = relay_token_cache()
+        .lock()
+        .map_err(|_| anyhow!("relay token cache lock poisoned"))?;
+    cache.remove(&key);
+    Ok(())
+}
+
+fn relay_token_cache() -> &'static Mutex<BTreeMap<RelayTokenCacheKey, CachedRelayToken>> {
+    RELAY_TOKEN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn upstream_http_agent() -> &'static ureq::Agent {
+    UPSTREAM_HTTP_AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+}
+
+fn relay_token_refresh_after(token: &str, now: SystemTime) -> SystemTime {
+    relay_token_expires_at(token)
+        .and_then(|expires_at| expires_at.checked_sub(RELAY_TOKEN_REFRESH_SKEW))
+        .filter(|refresh_after| *refresh_after > now)
+        .unwrap_or(now)
+}
+
+fn relay_token_expires_at(token: &str) -> Option<SystemTime> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = value.get("exp")?.as_u64()?;
+    Some(UNIX_EPOCH + Duration::from_secs(exp))
+}
+
+fn response_from_ureq(response: ureq::Response) -> Result<ForwardResponse> {
+    let status = response.status();
+    let content_type = response
+        .header("content-type")
+        .unwrap_or("application/json")
+        .to_string();
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut body)
+        .context("read upstream response")?;
+    Ok(ForwardResponse {
+        status,
+        content_type,
+        body,
+    })
+}
+
+fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<String> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let url = format!(
+        "{}/api/v1/telemetry/devices/{}/relay-token",
+        api_base_url.trim_end_matches('/'),
+        device.device_id
+    );
+    let response: RelayTokenResponse = upstream_http_agent()
+        .post(&url)
+        .set("Accept", "application/json")
+        .set("X-Ottto-Device-Secret", &device_secret)
+        .send_json(json!({ "source": source.api_slug() }))
+        .map_err(|error| anyhow!("issue relay token failed: {error}"))?
+        .into_json()
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+    Ok(response.token)
+}
+
+fn current_api_base_url() -> String {
+    FileConnectionStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .map(|binding| binding.api_base_url)
+        .or_else(|| std::env::var("OTTTO_API_BASE_URL").ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
+}
+
+fn relay_health_payload(source: SnapshotSource) -> serde_json::Value {
+    let api_base_url = current_api_base_url();
+    let device_id = load_snapshot_device_credentials()
+        .ok()
+        .map(|(device, _)| device.device_id)
+        .unwrap_or_else(|| "missing".to_string());
+    json!({
+        "ok": device_id != "missing",
+        "source": source.api_slug(),
+        "state_fingerprint": state_fingerprint(source, &api_base_url, &device_id),
+    })
+}
+
+fn state_fingerprint(source: SnapshotSource, api_base_url: &str, device_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.api_slug().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(api_base_url.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_id.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .context("read request line")?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().ok_or_else(|| anyhow!("missing method"))?;
+    let path = parts.next().ok_or_else(|| anyhow!("missing path"))?;
+    if !path.starts_with('/') {
+        return Err(anyhow!("invalid path"));
+    }
+
+    let mut headers = BTreeMap::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).context("read header")?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let content_length = headers
+        .get("content-length")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .context("parse content-length")?
+        .unwrap_or(0);
+    if content_length > MAX_OTLP_BODY_BYTES {
+        return Err(anyhow!("request body too large"));
+    }
+    let mut body = vec![0; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).context("read body")?;
+    }
+
+    Ok(HttpRequest {
+        method: method.to_ascii_uppercase(),
+        path: path.to_string(),
+        headers,
+        body,
+    })
+}
+
+fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) -> Result<()> {
+    write_json_response_with_headers(stream, status, body, &[])
+}
+
+fn write_json_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    body: serde_json::Value,
+    headers: &[(String, String)],
+) -> Result<()> {
+    let body = serde_json::to_vec(&body)?;
+    write_raw_response_with_headers(stream, status, "application/json", &body, headers)
+}
+
+fn write_raw_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    write_raw_response_with_headers(stream, status, content_type, body, &[])
+}
+
+fn write_raw_response_with_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        status,
+        reason_phrase(status),
+        content_type,
+        body.len()
+    )?;
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "\r\n")?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
+fn current_rfc3339() -> String {
+    Command::new("/bin/date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_fingerprint_is_short_and_stable() {
+        let first = state_fingerprint(
+            SnapshotSource::ClaudeCode,
+            "https://ottto.test/backend",
+            "device_1",
+        );
+        let second = state_fingerprint(
+            SnapshotSource::ClaudeCode,
+            "https://ottto.test/backend",
+            "device_1",
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 16);
+    }
+
+    #[test]
+    fn relay_source_header_routes_codex_separately_from_claude_code() {
+        assert_eq!(
+            source_from_relay_header("codex"),
+            Some(SnapshotSource::Codex)
+        );
+        assert_eq!(
+            source_from_relay_header("claude_code"),
+            Some(SnapshotSource::ClaudeCode)
+        );
+        assert_eq!(
+            source_from_relay_header("CLAUDE-CODE"),
+            Some(SnapshotSource::ClaudeCode)
+        );
+        assert_eq!(source_from_relay_header("unknown"), None);
+    }
+
+    #[test]
+    fn control_origin_allowlist_accepts_production_and_loopback_only() {
+        assert!(is_allowed_control_origin("https://ottto.net"));
+        assert!(is_allowed_control_origin("http://localhost:3000"));
+        assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
+        assert!(!is_allowed_control_origin("https://ottto.net.evil"));
+        assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn control_cors_headers_allow_private_network_preflight() {
+        let headers = control_cors_headers(Some("https://ottto.net"))
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("https://ottto.net")
+        );
+        assert_eq!(
+            headers
+                .get("Access-Control-Allow-Private-Network")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            headers.get("Vary").map(String::as_str),
+            Some("Origin, Access-Control-Request-Private-Network")
+        );
+    }
+
+    #[test]
+    fn relay_token_expiry_is_read_from_jwt_payload_without_verification() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
+        let token = format!("header.{payload}.signature");
+
+        assert_eq!(
+            relay_token_expires_at(&token),
+            Some(UNIX_EPOCH + Duration::from_secs(4_102_444_800))
+        );
+    }
+
+    #[test]
+    fn relay_token_refreshes_before_expiry() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1090}"#);
+        let token = format!("header.{payload}.signature");
+
+        assert_eq!(
+            relay_token_refresh_after(&token, now),
+            UNIX_EPOCH + Duration::from_secs(1_060)
+        );
+    }
+
+    #[test]
+    fn relay_token_with_near_expiry_refreshes_immediately() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1020}"#);
+        let token = format!("header.{payload}.signature");
+
+        assert_eq!(relay_token_refresh_after(&token, now), now);
+    }
+}

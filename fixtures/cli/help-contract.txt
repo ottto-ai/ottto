@@ -1,0 +1,264 @@
+### ottto --help
+Ottto local platform CLI for developers, support, CI, and AI agents
+
+Usage: ottto [OPTIONS] <COMMAND>
+
+Commands:
+  status        Show daemon, account, relay, update, and app health
+  apps          List apps or refresh app setup status
+  agent-status  Refresh one source status using the lower-level source noun
+  setup         Connect this Mac through a browser claim
+  login         Sign in and connect this Mac through a browser claim
+  account       Show the Ottto account connected to this Mac
+  logout        Disconnect this Mac from Ottto
+  doctor        Run daemon health checks and print current status
+  fix           Apply daemon-approved repair for one app
+  verify        Verify one app and publish safe setup status
+  diagnostics   Collect local-only or approved support diagnostics
+  update        Check owner-aware update state and instructions
+  uninstall     Remove Ottto local runtime state for this user
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto status --help
+Show daemon, account, relay, update, and app health
+
+Usage: ottto status [OPTIONS]
+
+Options:
+      --json                  Print one final JSON object and no human summary text
+      --socket <SOCKET>       Override the ottto-service Unix socket path
+      --refresh-agent-status  Refresh Codex, Claude Code, and Pi status before returning
+      --token <TOKEN>         Override the local-control token for CLI and agent requests
+      --no-autostart          Do not kickstart the standard per-user ottto-service
+      --watch                 Emit NDJSON progress events and a final event; requires --json
+  -h, --help                  Print help
+### ottto apps --help
+List apps or refresh app setup status
+
+Usage: ottto apps [OPTIONS] [COMMAND]
+
+Commands:
+  detect  Refresh all supported app statuses
+  status  Refresh and return one app status
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto apps detect --help
+Refresh all supported app statuses
+
+Usage: ottto apps detect [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto apps status --help
+Refresh and return one app status
+
+Usage: ottto apps status [OPTIONS] --app <APP>
+
+Options:
+      --app <APP>        App to refresh [possible values: codex, claude-code, pi]
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --json             Print one final JSON object and no human summary text
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto agent-status --help
+Refresh one source status using the lower-level source noun
+
+Usage: ottto agent-status [OPTIONS] <--source <SOURCE>|--app <APP>>
+
+Options:
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  Source to operate on [possible values: codex, claude-code, pi]
+      --app <APP>        App to operate on [possible values: codex, claude-code, pi]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --json             Print one final JSON object and no human summary text
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto setup --help
+Connect this Mac through a browser claim
+
+Usage: ottto setup [OPTIONS]
+
+Options:
+      --claim-code <CLAIM_CODE>  Browser claim code from the Ottto Apps page
+      --socket <SOCKET>          Override the ottto-service Unix socket path
+      --no-browser               Do not open the browser; print the claim URL and code
+      --token <TOKEN>            Override the local-control token for CLI and agent requests
+      --no-autostart             Do not kickstart the standard per-user ottto-service
+      --no-wait                  Return after starting or attaching setup without waiting
+      --timeout <SECONDS>        Seconds to wait for browser approval and setup progress [default: 300]
+      --watch                    Emit NDJSON progress events and a final event; requires --json
+      --json                     Print one final JSON object and no human summary text
+  -h, --help                     Print help
+### ottto login --help
+Sign in and connect this Mac through a browser claim
+
+Usage: ottto login [OPTIONS]
+
+Options:
+      --claim-code <CLAIM_CODE>  Browser claim code from the Ottto Apps page
+      --socket <SOCKET>          Override the ottto-service Unix socket path
+      --no-browser               Do not open the browser; print the claim URL and code
+      --token <TOKEN>            Override the local-control token for CLI and agent requests
+      --no-autostart             Do not kickstart the standard per-user ottto-service
+      --no-wait                  Return after starting or attaching setup without waiting
+      --timeout <SECONDS>        Seconds to wait for browser approval and setup progress [default: 300]
+      --watch                    Emit NDJSON progress events and a final event; requires --json
+      --json                     Print one final JSON object and no human summary text
+  -h, --help                     Print help
+### ottto account --help
+Show the Ottto account connected to this Mac
+
+Usage: ottto account [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto logout --help
+Disconnect this Mac from Ottto
+
+Usage: ottto logout [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --local-only       Clear local credentials without first disconnecting this Mac in Ottto
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto doctor --help
+Run daemon health checks and print current status
+
+Usage: ottto doctor [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto fix --help
+Apply daemon-approved repair for one app
+
+Usage: ottto fix [OPTIONS] <--source <SOURCE>|--app <APP>>
+
+Options:
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  Source to operate on [possible values: codex, claude-code, pi]
+      --app <APP>        App to operate on [possible values: codex, claude-code, pi]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --json             Print one final JSON object and no human summary text
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto verify --help
+Verify one app and publish safe setup status
+
+Usage: ottto verify [OPTIONS] <--source <SOURCE>|--app <APP>>
+
+Options:
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  Source to operate on [possible values: codex, claude-code, pi]
+      --app <APP>        App to operate on [possible values: codex, claude-code, pi]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --json             Print one final JSON object and no human summary text
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto diagnostics --help
+Collect local-only or approved support diagnostics
+
+Usage: ottto diagnostics [OPTIONS] <COMMAND>
+
+Commands:
+  collect  Collect a redacted diagnostics bundle
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto diagnostics collect --help
+Collect a redacted diagnostics bundle
+
+Usage: ottto diagnostics collect [OPTIONS]
+
+Options:
+      --json                           Print one final JSON object and no human summary text
+      --socket <SOCKET>                Override the ottto-service Unix socket path
+      --token <TOKEN>                  Override the local-control token for CLI and agent requests
+      --upload                         Request backend diagnostics upload after collection
+      --approve-upload                 Confirm diagnostics upload approval
+      --no-autostart                   Do not kickstart the standard per-user ottto-service
+      --accept-retention-disclosure    Accept the support retention disclosure
+      --watch                          Emit NDJSON progress events and a final event; requires --json
+      --support-claim <SUPPORT_CLAIM>  Support claim authorizing upload
+  -h, --help                           Print help
+### ottto update --help
+Check owner-aware update state and instructions
+
+Usage: ottto update [OPTIONS] [COMMAND]
+
+Commands:
+  check  Check the release manifest without applying an update
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto update check --help
+Check the release manifest without applying an update
+
+Usage: ottto update check [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto uninstall --help
+Remove Ottto local runtime state for this user
+
+Usage: ottto uninstall [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help

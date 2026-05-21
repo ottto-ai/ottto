@@ -1,0 +1,268 @@
+{
+  "schema_version": "connector_registry.v1",
+  "sources": [
+    {
+      "source_id": "claude_code",
+      "app_slug": "claude_code",
+      "display_name": "Claude Code",
+      "publisher": "ottto",
+      "review_tier": "official",
+      "maturity": "stable",
+      "operations": [
+        "detect",
+        "verify",
+        "repair",
+        "collect_usage",
+        "monitor_quota",
+        "upload_snapshot",
+        "diagnostics"
+      ],
+      "manifest_path": "connectors/sources/claude-code/source.toml",
+      "collectors": [
+        {
+          "collector_id": "local_sessions",
+          "display_name": "Local sessions",
+          "operations": [
+            "collect_usage",
+            "upload_snapshot",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "stable",
+          "risk_classes": [],
+          "uploads_raw_content": false,
+          "emits": [
+            "local_usage_snapshots",
+            "local_usage_collector_statuses",
+            "local_usage_session_titles",
+            "local_usage_workspace_labels"
+          ],
+          "manifest_path": "connectors/sources/claude-code/collectors/local_sessions/collector.toml"
+        },
+        {
+          "collector_id": "otel_config",
+          "display_name": "Live telemetry config",
+          "operations": [
+            "detect",
+            "verify",
+            "repair",
+            "diagnostics"
+          ],
+          "data_source_kind": "live_telemetry",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "writes_config",
+          "risk_classes": [
+            "network_calls"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "source_descriptors",
+            "telemetry_records"
+          ],
+          "manifest_path": "connectors/sources/claude-code/collectors/otel_config/collector.toml"
+        },
+        {
+          "collector_id": "quota_status",
+          "display_name": "Status-line quota",
+          "operations": [
+            "detect",
+            "monitor_quota",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "stable",
+          "risk_classes": [
+            "auth_adjacent"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "agent_status_snapshots",
+            "source_plan_profiles"
+          ],
+          "manifest_path": "connectors/sources/claude-code/collectors/quota_status/collector.toml"
+        }
+      ]
+    },
+    {
+      "source_id": "codex",
+      "app_slug": "codex",
+      "display_name": "Codex",
+      "publisher": "ottto",
+      "review_tier": "official",
+      "maturity": "stable",
+      "operations": [
+        "detect",
+        "verify",
+        "repair",
+        "collect_usage",
+        "monitor_quota",
+        "upload_snapshot",
+        "diagnostics"
+      ],
+      "manifest_path": "connectors/sources/codex/source.toml",
+      "collectors": [
+        {
+          "collector_id": "local_sessions",
+          "display_name": "Local sessions",
+          "operations": [
+            "collect_usage",
+            "upload_snapshot",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "stable",
+          "risk_classes": [],
+          "uploads_raw_content": false,
+          "emits": [
+            "local_usage_snapshots",
+            "local_usage_collector_statuses",
+            "local_usage_session_titles",
+            "local_usage_workspace_labels"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/local_sessions/collector.toml"
+        },
+        {
+          "collector_id": "otel_config",
+          "display_name": "Live telemetry config",
+          "operations": [
+            "detect",
+            "verify",
+            "repair",
+            "diagnostics"
+          ],
+          "data_source_kind": "live_telemetry",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "writes_config",
+          "risk_classes": [
+            "network_calls"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "source_descriptors",
+            "telemetry_records"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/otel_config/collector.toml"
+        },
+        {
+          "collector_id": "quota_status",
+          "display_name": "Quota and status",
+          "operations": [
+            "detect",
+            "monitor_quota",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "undocumented_surface",
+          "risk_classes": [
+            "auth_adjacent",
+            "network_calls",
+            "hidden_credential_read"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "agent_status_snapshots",
+            "source_plan_profiles"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/quota_status/collector.toml"
+        }
+      ]
+    },
+    {
+      "source_id": "pi",
+      "app_slug": "pi",
+      "display_name": "Pi",
+      "publisher": "ottto",
+      "review_tier": "official",
+      "maturity": "beta",
+      "operations": [
+        "detect",
+        "verify",
+        "repair",
+        "collect_usage",
+        "monitor_quota",
+        "upload_snapshot",
+        "diagnostics"
+      ],
+      "manifest_path": "connectors/sources/pi/source.toml",
+      "collectors": [
+        {
+          "collector_id": "live_batches",
+          "display_name": "Live usage batches",
+          "operations": [
+            "collect_usage",
+            "verify",
+            "diagnostics"
+          ],
+          "data_source_kind": "live_telemetry",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [
+            "network_calls"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "telemetry_records",
+            "source_plan_profiles"
+          ],
+          "manifest_path": "connectors/sources/pi/collectors/live_batches/collector.toml"
+        },
+        {
+          "collector_id": "local_sessions",
+          "display_name": "Local sessions",
+          "operations": [
+            "collect_usage",
+            "upload_snapshot",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [],
+          "uploads_raw_content": false,
+          "emits": [
+            "local_usage_snapshots",
+            "local_usage_collector_statuses",
+            "local_usage_session_titles",
+            "local_usage_workspace_labels"
+          ],
+          "manifest_path": "connectors/sources/pi/collectors/local_sessions/collector.toml"
+        },
+        {
+          "collector_id": "route_status",
+          "display_name": "Route status",
+          "operations": [
+            "detect",
+            "verify",
+            "monitor_quota",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [
+            "auth_adjacent"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "agent_status_snapshots",
+            "source_plan_profiles"
+          ],
+          "manifest_path": "connectors/sources/pi/collectors/route_status/collector.toml"
+        }
+      ]
+    }
+  ]
+}

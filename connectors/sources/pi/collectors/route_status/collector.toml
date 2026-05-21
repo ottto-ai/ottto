@@ -1,0 +1,18 @@
+schema_version = "collector_manifest.v1"
+source_id = "pi"
+collector_id = "route_status"
+display_name = "Route status"
+
+operations = ["detect", "verify", "monitor_quota", "diagnostics"]
+data_source_kind = "local_enriched"
+default_state = "enabled"
+
+review_tier = "official"
+maturity = "beta"
+risk_classes = ["auth_adjacent"]
+
+uploads_raw_content = false
+emits = [
+  "agent_status_snapshots",
+  "source_plan_profiles"
+]

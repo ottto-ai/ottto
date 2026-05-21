@@ -1,0 +1,8 @@
+{
+  "request_id": "req_cli_diagnostics_collect_fixture",
+  "protocol_version": 11,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "diagnostics_collect",
+  "upload": false
+}

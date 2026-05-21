@@ -1,0 +1,17 @@
+# scope	regex	description
+path	(^|/)docs/dev(/|$)	Private session notes and planning docs are not public export inputs.
+path	(^|/)docs/ai(/|$)	Private AI KB docs are not public export inputs.
+path	(^|/)backend(/|$)	Private backend code is not part of the public local runtime export.
+path	(^|/)frontend(/|$)	Private frontend code is not part of the public local runtime export.
+path	(^|/)infra(/|$)	Private infrastructure code is not part of the public local runtime export.
+path	(^|/)dist(/|$)	Build artifacts must not be exported.
+path	(^|/)target(/|$)	Rust build output must not be exported.
+content	/Users/ronshub	Local operator paths must not appear in public export candidates.
+content	/var/folders/[A-Za-z0-9._/ -]+	Local temporary filesystem paths must not appear in public export candidates.
+content	docs/dev/	Private session-note links must not appear in public export candidates.
+content	docs/ai/	Private AI KB links must not appear in public export candidates.
+content	OTTTO_QA_DEMO_PASSWORD	Demo credential variables must not appear in public export candidates.
+content	AWS_SECRET_ACCESS_KEY	AWS secret variables must not appear in public export candidates.
+content	GITHUB_TOKEN=	GitHub token assignments must not appear in public export candidates.
+content	BEGIN (RSA|DSA|EC|OPENSSH|PRIVATE) KEY	Private key material must not appear in public export candidates.
+content	Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}	Bearer credentials must not appear in public export candidates.

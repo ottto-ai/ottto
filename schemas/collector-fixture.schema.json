@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ottto.net/schemas/collector-fixture.schema.json",
+  "title": "Ottto collector fixture v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_id",
+    "collector_id",
+    "input_fixture_paths",
+    "emitted_records",
+    "upload_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "collector_fixture.v1"
+    },
+    "source_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "collector_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{1,63}$"
+    },
+    "input_fixture_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "emitted_records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/emitted_record"
+      }
+    },
+    "upload_policy": {
+      "$ref": "#/$defs/upload_policy"
+    }
+  },
+  "$defs": {
+    "emitted_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "sample"
+      ],
+      "properties": {
+        "record_type": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,96}$"
+        },
+        "sample": {
+          "type": "object"
+        }
+      }
+    },
+    "upload_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uploads_raw_content",
+        "boundary",
+        "redacts"
+      ],
+      "properties": {
+        "uploads_raw_content": {
+          "type": "boolean"
+        },
+        "boundary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "redacts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

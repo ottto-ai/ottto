@@ -1,0 +1,2 @@
+{"command":"status","event":"progress","protocol_version":11,"request_id":"req_cli_error_fixture","stage":"request_started"}
+{"error":{"code":"daemon_unavailable","details":{"autostart_attempted":false,"socket":"/tmp/ottto.sock"},"message":"ottto-service is unavailable at /tmp/ottto.sock: connection refused","retryable":true},"event":"final","exit_code":10,"ok":false,"request_id":"req_cli_error_fixture"}

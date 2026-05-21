@@ -1,0 +1,10 @@
+[package]
+name = "ottto-connector-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Ottto Team"]
+description = "Shared manifest constants and validation helpers for Ottto source and collector packages."
+
+[lib]
+path = "src/lib.rs"

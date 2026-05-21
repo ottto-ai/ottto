@@ -1,0 +1,28 @@
+# source_prefix	destination_prefix	reason
+.github/dependabot.yml	.github	Public repository root file is already in export shape.
+.github/workflows/ci.yml	.github/workflows	Public repository root file is already in export shape.
+CODE_OF_CONDUCT.md	.	Public repository root file is already in export shape.
+CONTRIBUTING.md	.	Public repository root file is already in export shape.
+Cargo.lock	.	Public repository root file is already in export shape.
+Cargo.toml	.	Public repository root file is already in export shape.
+LICENSE	.	Public repository root file is already in export shape.
+NOTICE	.	Public repository root file is already in export shape.
+README.md	.	Public repository root file is already in export shape.
+SECURITY.md	.	Public repository root file is already in export shape.
+SUPPORT.md	.	Public repository root file is already in export shape.
+TRADEMARKS.md	.	Public repository root file is already in export shape.
+agent-adapters/claude-code-skill/	agent-adapters/claude-code-skill/	Public repository root is already in export shape.
+agent-adapters/codex-skill/	agent-adapters/codex-skill/	Public repository root is already in export shape.
+connectors/	connectors/	Public repository root is already in export shape.
+crates/	crates/	Public repository root is already in export shape.
+crates/Cargo.lock	crates	Public repository root file is already in export shape.
+crates/Cargo.toml	crates	Public repository root file is already in export shape.
+crates/ottto-connector-sdk/	crates/ottto-connector-sdk/	Public repository root is already in export shape.
+crates/ottto-connector-testkit/	crates/ottto-connector-testkit/	Public repository root is already in export shape.
+docs/	docs/	Public repository root is already in export shape.
+fixtures/	fixtures/	Public repository root is already in export shape.
+homebrew/	homebrew/	Public repository root is already in export shape.
+public-export/	public-export/	Public repository root is already in export shape.
+release/	release/	Public repository root is already in export shape.
+schemas/	schemas/	Public repository root is already in export shape.
+scripts/	scripts/	Public repository root is already in export shape.

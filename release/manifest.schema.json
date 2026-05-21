@@ -1,0 +1,372 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ottto.net/schemas/ottto-local-platform-release-manifest.schema.json",
+  "title": "Ottto Local Platform Release Manifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "product",
+    "version",
+    "channel",
+    "commit",
+    "generated_at",
+    "min_supported_version",
+    "min_protocol_version",
+    "supported_install_owners",
+    "rollback",
+    "supply_chain",
+    "quality_gates",
+    "artifacts"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "product": {
+      "type": "string",
+      "const": "ottto-local-platform"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "channel": {
+      "type": "string",
+      "enum": ["dev", "preview", "stable"]
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "min_supported_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "min_protocol_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "supported_install_owners": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": ["hosted_installer", "app_bundle", "homebrew"]
+      },
+      "uniqueItems": true
+    },
+    "rollback": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "immutable_prefix",
+        "latest_manifest_url",
+        "preserve_failed_version",
+        "operator_steps",
+        "verification"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "const": "channel_latest_pointer"
+        },
+        "immutable_prefix": {
+          "type": "string",
+          "format": "uri"
+        },
+        "latest_manifest_url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "preserve_failed_version": {
+          "type": "boolean",
+          "const": true
+        },
+        "operator_steps": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "verification": {
+          "type": "object",
+          "required": [
+            "release_gate",
+            "stable_preflight",
+            "installed_smoke"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "release_gate": {
+              "type": "string",
+              "minLength": 1
+            },
+            "stable_preflight": {
+              "type": "string",
+              "minLength": 1
+            },
+            "installed_smoke": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "supply_chain": {
+      "type": "object",
+      "required": ["slsa_build", "sbom"],
+      "additionalProperties": false,
+      "properties": {
+        "slsa_build": {
+          "type": "object",
+          "required": [
+            "spec_version",
+            "level",
+            "predicate_type",
+            "repository",
+            "signer_workflow",
+            "subjects",
+            "attested",
+            "verified",
+            "verification_command"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "spec_version": {
+              "type": "string",
+              "const": "1.2"
+            },
+            "level": {
+              "type": "string",
+              "enum": ["build_l1", "build_l2", "build_l3"]
+            },
+            "predicate_type": {
+              "type": "string",
+              "const": "https://slsa.dev/provenance/v1"
+            },
+            "repository": {
+              "type": "string",
+              "minLength": 1
+            },
+            "signer_workflow": {
+              "type": "string",
+              "minLength": 1
+            },
+            "subjects": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            },
+            "attested": {
+              "type": "boolean"
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "attestation_url": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        },
+        "sbom": {
+          "type": "object",
+          "required": [
+            "format",
+            "spec_version",
+            "predicate_type",
+            "path",
+            "url",
+            "sha256",
+            "attested",
+            "verified",
+            "verification_command"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "format": {
+              "type": "string",
+              "const": "cyclonedx-json"
+            },
+            "spec_version": {
+              "type": "string",
+              "const": "1.7"
+            },
+            "predicate_type": {
+              "type": "string",
+              "const": "https://cyclonedx.org/bom"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "attested": {
+              "type": "boolean"
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_command": {
+              "type": "string",
+              "minLength": 1
+            },
+            "attestation_url": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        }
+      }
+    },
+    "quality_gates": {
+      "type": "object",
+      "required": ["packaged_app_launch"],
+      "additionalProperties": true,
+      "properties": {
+        "packaged_app_launch": {
+          "type": "object"
+        },
+        "public_release_candidate": {
+          "type": "object",
+          "required": ["status", "evidence_path", "preview_manifest_sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["not_run", "passed"]
+            },
+            "checked_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "evidence_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "preview_manifest_sha256": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "stable_clean_machine_qa": {
+          "type": "object",
+          "required": ["status", "evidence_path", "required_install_owners"],
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["not_run", "passed"]
+            },
+            "checked_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "evidence_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required_install_owners": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": ["hosted_installer", "app_bundle", "homebrew"]
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "platform",
+          "arch",
+          "path",
+          "url",
+          "sha256",
+          "signed",
+          "notarized",
+          "gatekeeper_assessed"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["macos_app", "cli", "daemon"]
+          },
+          "platform": {
+            "type": "string",
+            "enum": ["macos", "windows", "linux"]
+          },
+          "arch": {
+            "type": "string",
+            "enum": ["arm64", "x86_64", "universal"]
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "verification_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "signed": {
+            "type": "boolean"
+          },
+          "notarized": {
+            "type": "boolean"
+          },
+          "gatekeeper_assessed": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,112 @@
+name: Public CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust contracts
+    timeout-minutes: 40
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Rust format
+        run: cargo fmt --all --check
+
+      - name: Connector format
+        run: cargo fmt --manifest-path crates/Cargo.toml --all --check
+
+      - name: Runtime clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Connector clippy
+        run: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets --locked -- -D warnings
+
+      - name: Runtime tests
+        run: cargo test --workspace --locked
+
+      - name: Connector tests
+        run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
+
+      - name: Connector package tests
+        run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
+
+  public-surface:
+    name: Public surface checks
+    timeout-minutes: 30
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install script prerequisites
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            brew install jq
+          fi
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            brew install shellcheck
+          fi
+
+      - name: Public surface gate
+        run: bash scripts/public_repo_surface_ci.sh
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+
+  rust-advisories:
+    name: Rust advisory audit
+    timeout-minutes: 20
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Runtime advisory audit
+        run: cargo audit --deny warnings
+
+      - name: Connector advisory audit
+        run: cargo audit --deny warnings
+        working-directory: crates

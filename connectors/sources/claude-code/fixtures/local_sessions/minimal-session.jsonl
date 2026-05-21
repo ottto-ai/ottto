@@ -1,0 +1,2 @@
+{"type":"summary","session_id":"claude_fixture_session","source":"claude_code","started_at":"2026-05-20T08:05:00Z","workspace_hash":"workspace_sha256_fixture"}
+{"type":"assistant","session_id":"claude_fixture_session","message":{"usage":{"input_tokens":900,"cache_read_input_tokens":250,"cache_creation":{"ephemeral_5m_input_tokens":80,"ephemeral_1h_input_tokens":20},"output_tokens":180,"speed":"standard"}}}
