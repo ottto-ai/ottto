@@ -14,9 +14,9 @@ usage() {
   cat <<'USAGE'
 Usage: macos_dev_install.sh [options]
 
-Installs a dev/preview Ottto local-platform package after verifying its release
-manifest and artifact checksums. This path is intended for internal QA and
-trusted testers before Developer ID signing/notarization is available.
+Installs a dev/preview/stable-candidate Ottto local-platform package after
+verifying its release manifest and artifact checksums. This path is intended for
+internal QA and trusted testers before stable customer promotion.
 
 Options:
   --manifest <path>          Release manifest. Default: dist/macos/release-manifest.json
@@ -173,7 +173,7 @@ copy_app_artifact() {
 
 channel="$(jq -r '.channel' "$MANIFEST")"
 if [[ "$channel" == "stable" ]]; then
-  echo "macos_dev_install.sh is for dev/preview builds. Use the signed stable local-platform package path for stable manifests." >&2
+  echo "macos_dev_install.sh is for dev/preview/stable-candidate builds. Use the signed stable local-platform package path for stable manifests." >&2
   exit 2
 fi
 

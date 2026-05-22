@@ -308,13 +308,23 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+gatekeeper_assessment_type() {
+  local kind="$1"
+  if [[ "$kind" == "macos_app" ]]; then
+    printf 'execute'
+  else
+    printf 'install'
+  fi
+}
+
 gatekeeper_assessed() {
-  local target="$1"
+  local kind="$1"
+  local target="$2"
   if [[ "$SIGNED" != "true" ]] || ! command -v spctl >/dev/null 2>&1; then
     printf 'false'
     return
   fi
-  if spctl --assess --type execute --verbose "$target" >/dev/null 2>&1; then
+  if spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$target" >/dev/null 2>&1; then
     printf 'true'
   else
     printf 'false'
@@ -326,9 +336,9 @@ APP_SHA="$(sha256_file "$APP_DMG")"
 CLI_SHA="$(sha256_file "$CLI_ZIP")"
 DAEMON_SHA="$(sha256_file "$DAEMON_ZIP")"
 SBOM_SHA="$(sha256_file "$SBOM_PATH")"
-APP_GATEKEEPER="$(gatekeeper_assessed "$APP_BUNDLE")"
-CLI_GATEKEEPER="$(gatekeeper_assessed "$OUTPUT_DIR/ottto")"
-DAEMON_GATEKEEPER="$(gatekeeper_assessed "$OUTPUT_DIR/ottto-service")"
+APP_GATEKEEPER="$(gatekeeper_assessed macos_app "$APP_BUNDLE")"
+CLI_GATEKEEPER="$(gatekeeper_assessed cli "$OUTPUT_DIR/ottto")"
+DAEMON_GATEKEEPER="$(gatekeeper_assessed daemon "$OUTPUT_DIR/ottto-service")"
 
 jq -n \
   --arg version "$VERSION" \
@@ -712,8 +722,8 @@ if manifest.get("schema_version") != 1:
 if manifest.get("product") != "ottto-local-platform":
     raise SystemExit("Unexpected release manifest product")
 channel = manifest.get("channel")
-if channel not in {"dev", "preview"}:
-    raise SystemExit("This installer only accepts dev/preview manifests")
+if channel not in {"dev", "preview", "stable-candidate"}:
+    raise SystemExit("This installer only accepts dev/preview/stable-candidate manifests")
 
 with open(version_path, "w", encoding="utf-8") as out:
     out.write(str(manifest.get("version", "unknown")))

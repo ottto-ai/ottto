@@ -18,7 +18,8 @@ A stable macOS release must fail unless every local-platform artifact is:
 - signed with hardened runtime and a secure timestamp
 - notarized
 - stapled where Apple supports stapling
-- accepted by Gatekeeper assessment
+- accepted by Gatekeeper assessment, using the app execution assessment for
+  `Ottto.app` and the install assessment for standalone CLI/service executables
 
 Development and preview builds are ad-hoc signed for internal bundle integrity,
 but their manifests must still mark `signed: false` and `notarized: false`
@@ -54,9 +55,9 @@ per-user LaunchAgent:
   --write-launch-agent
 ```
 
-`macos_package.sh` also emits `dist/macos/install-macos-dev.sh` for the hosted
-dev/preview channel. `/apps` copies this command for trusted testers while
-stable signing is unavailable:
+`macos_package.sh` also emits `dist/macos/install-macos-dev.sh` for hosted
+dev/preview builds and internal stable-candidate RCs. `/apps` copies this
+command for trusted testers while stable signing is unavailable:
 
 ```bash
 curl -fsSL https://ottto.net/install.sh | bash
@@ -68,15 +69,15 @@ curl -fsSL https://ottto.net/install.sh | bash
 `NEXT_PUBLIC_OTTTO_LOCAL_PLATFORM_RELEASE_CHANNEL` /
 `NEXT_PUBLIC_OTTTO_LOCAL_PLATFORM_RELEASE_BASE_URL`.
 
-The hosted preview installer downloads `release-manifest.json`, verifies
-checksums for the app, CLI, and daemon archives, quits an already-running
-preview Companion, installs into user-scoped locations, clears quarantine for
-that explicit preview install, bootstraps `ottto-service`, waits for the CLI
-status path to reach the daemon, retries bootstrap once if launchd is slow, and opens
-`Ottto.app`.
+The hosted preview/stable-candidate installer downloads
+`release-manifest.json`, verifies checksums for the app, CLI, and daemon
+archives, quits an already-running Companion, installs into user-scoped
+locations, clears quarantine for that explicit internal install, bootstraps
+`ottto-service`, waits for the CLI status path to reach the daemon, retries
+bootstrap once if launchd is slow, and opens `Ottto.app`.
 
-For a full installed dev/preview smoke after installing and bootstrapping the
-LaunchAgent, run:
+For a full installed dev/preview/stable-candidate smoke after installing and
+bootstrapping the LaunchAgent, run:
 
 ```bash
 ./scripts/dev_e2e_smoke.sh
@@ -87,11 +88,11 @@ setup claim handoff, Codex verification command, diagnostics redaction, and app
 launch. It is the current preview-build substitute for production
 notarization/Gatekeeper validation until Developer ID credentials are available.
 
-For internal QA on local dev/preview artifacts, `--clear-quarantine` removes
-the quarantine attribute from installed artifacts. The hosted preview installer
-does this by default because running the installer command is already the
-explicit tester action. Stable customer releases must rely on Developer ID
-signing and notarization instead.
+For internal QA on local dev/preview/stable-candidate artifacts,
+`--clear-quarantine` removes the quarantine attribute from installed artifacts.
+The hosted internal installer does this by default because running the installer
+command is already the explicit tester action. Stable customer releases must
+rely on Developer ID signing and notarization instead.
 
 ## Dev And Preview Publish
 

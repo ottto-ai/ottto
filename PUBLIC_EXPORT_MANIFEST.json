@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 178,
-  "content_sha256": "cf4798b57e7b7e90ea9b496e92a58b3963a0643dc23fc0e75030fe2a77967709",
+  "candidate_file_count": 179,
+  "content_sha256": "76d61ffc5c604718a487592caa9c4ff97cfb29cd823538ef1198ecfe595eafc5",
   "files": [
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "7b7c76df42ecb662b86ec374df2876bbb6b3bd62bc2807e54b3051c3aee17f0c",
-      "size_bytes": 21558
+      "sha256": "eafe6185500aa86e1b4ade5e28d5782698907a128a0369f7b8aefafd77ad750a",
+      "size_bytes": 21752
     },
     {
       "executable": false,
@@ -958,8 +958,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_dev_install.sh",
-      "sha256": "e0697c9e3c653a1850dfa4c9082328879da361b908bf8289d928c090daf4ee02",
-      "size_bytes": 7261
+      "sha256": "719f9f7195b6a50f21292aa7682ed4d1a06dabc86025d3e50dd8b74a96ca191d",
+      "size_bytes": 7274
     },
     {
       "executable": true,
@@ -979,15 +979,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_notarize.sh",
-      "sha256": "5b694707beb3fa9cfbf7a0884b9fe8628f315d7a6c1cef8e25fae310bda17d35",
-      "size_bytes": 5235
+      "sha256": "629c24a3d886461c7cb604e83c2c2d4719d10df26214cc04c58cc3c8e78d092a",
+      "size_bytes": 5413
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "afa64eaff697fbba8ee7359433288b6cbc5906b43d43f7fc7d8035a29d3f96db",
-      "size_bytes": 27080
+      "sha256": "87a4dc7f040eb9c2947071c1be560f472c776431a9b310085d72cb31b01ce3eb",
+      "size_bytes": 27334
     },
     {
       "executable": true,
@@ -1007,8 +1007,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_release_gate.sh",
-      "sha256": "0a339791772481a4423baaf736fabb2fc16fbe73588e6e1a567f1c2e0a8ecf8a",
-      "size_bytes": 17809
+      "sha256": "e4ee6750775e22bf2505c0b575bb4608310de46765ee3a6253d0125ac4c30174",
+      "size_bytes": 17987
     },
     {
       "executable": true,
@@ -1028,8 +1028,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_preflight.sh",
-      "sha256": "61e99d819e542e33aeece520548fc128ea21667764d2ed569b6f48813fafaf13",
-      "size_bytes": 21787
+      "sha256": "d3290382c88c38bff077bbfa16c2cb542656cdcb333058d0c3bd182981ff8486",
+      "size_bytes": 21965
     },
     {
       "executable": true,
@@ -1098,8 +1098,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "6a5a6b96aa6201567d4028968c991e3a4d487cf7060397188b55859d5f961c21",
-      "size_bytes": 6757
+      "sha256": "cc8b09eed7b87b5092ae15c779229cbab72a8f8485c9620fd3b343f21a936df3",
+      "size_bytes": 6856
     },
     {
       "executable": true,
@@ -1125,9 +1125,16 @@
     {
       "executable": true,
       "mode": "0755",
+      "path": "scripts/test_macos_installer_channel_policy.sh",
+      "sha256": "8a1f6ab29c0314dfe13fe5c3ff47cdd6a538391617e3b9b2b73e0f84b24c7323",
+      "size_bytes": 762
+    },
+    {
+      "executable": true,
+      "mode": "0755",
       "path": "scripts/test_macos_notarize_filter.sh",
-      "sha256": "56dfaeac65d695879f70ac52cd3025a163e16dbb80379f8815f12007bc3254f0",
-      "size_bytes": 5922
+      "sha256": "00a7f8412e5750f532a50e8646d82aa18128a3801457e09406f7ba6993e1628a",
+      "size_bytes": 6398
     },
     {
       "executable": true,
@@ -1249,9 +1256,9 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-22T13:50:07+00:00",
+  "generated_at": "2026-05-22T21:39:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 179,
+  "output_file_count": 180,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1283,5 +1290,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d1f5bd50e2260b60922b0c9f2032ea8ac8a5f13d"
+  "source_commit": "022c0ab5d9db9ed25254df7f515943e42912e5e5"
 }

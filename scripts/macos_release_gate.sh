@@ -139,6 +139,15 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+gatekeeper_assessment_type() {
+  local kind="$1"
+  if [[ "$kind" == "macos_app" ]]; then
+    printf 'execute'
+  else
+    printf 'install'
+  fi
+}
+
 manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"
 resolve_manifest_file() {
   local manifest_path="$1"
@@ -443,7 +452,7 @@ while IFS= read -r artifact; do
       fi
     fi
     if [[ "$CHANNEL" == "stable" ]] && command -v spctl >/dev/null 2>&1; then
-      if ! spctl --assess --type execute --verbose "$verification_path" >/dev/null 2>&1; then
+      if ! spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null 2>&1; then
         echo "Gatekeeper assessment failed for $name" >&2
         failures=$((failures + 1))
       fi

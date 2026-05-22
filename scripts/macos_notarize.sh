@@ -97,6 +97,15 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+gatekeeper_assessment_type() {
+  local kind="$1"
+  if [[ "$kind" == "macos_app" ]]; then
+    printf 'execute'
+  else
+    printf 'install'
+  fi
+}
+
 matches_filter() {
   local name="$1"
   local kind="$2"
@@ -170,7 +179,7 @@ while IFS= read -r artifact; do
     xcrun stapler validate "$verification_path"
   fi
 
-  spctl --assess --type execute --verbose "$verification_path" >/dev/null
+  spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null
   sha256="$(sha256_file "$path")"
   jq \
     --argjson index "$index" \

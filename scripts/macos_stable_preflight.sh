@@ -90,6 +90,15 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+gatekeeper_assessment_type() {
+  local kind="$1"
+  if [[ "$kind" == "macos_app" ]]; then
+    printf 'execute'
+  else
+    printf 'install'
+  fi
+}
+
 failures=0
 fail() {
   echo "$1" >&2
@@ -520,7 +529,7 @@ while IFS= read -r artifact; do
     fi
   fi
 
-  if ! spctl --assess --type execute --verbose "$verification_path" >/dev/null 2>&1; then
+  if ! spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null 2>&1; then
     fail "Gatekeeper assessment failed for $name"
   fi
 done < <(jq -c '.artifacts[]' "$MANIFEST")

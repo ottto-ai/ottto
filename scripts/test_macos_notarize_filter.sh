@@ -162,6 +162,14 @@ if ! grep -q "ottto-service-macos-arm64.zip" "$LOG"; then
   echo "Expected artifact filter to submit daemon ZIP" >&2
   exit 1
 fi
+if ! grep -q "spctl --assess --type install .*ottto$" "$LOG"; then
+  echo "Expected CLI Gatekeeper assessment to use install policy" >&2
+  exit 1
+fi
+if ! grep -q "spctl --assess --type install .*ottto-service$" "$LOG"; then
+  echo "Expected daemon Gatekeeper assessment to use install policy" >&2
+  exit 1
+fi
 
 NO_MATCH_MANIFEST="$TMP_DIR/no-match-manifest.json"
 write_manifest "$NO_MATCH_MANIFEST"
@@ -191,6 +199,10 @@ if grep -q "notarytool submit" "$VALIDATE_ONLY_LOG"; then
 fi
 if ! grep -q "stapler staple .*Ottto-macos-arm64.dmg" "$VALIDATE_ONLY_LOG"; then
   echo "Expected validate-only mode to staple the selected app DMG" >&2
+  exit 1
+fi
+if ! grep -q "spctl --assess --type execute .*Ottto.app$" "$VALIDATE_ONLY_LOG"; then
+  echo "Expected app Gatekeeper assessment to use execute policy" >&2
   exit 1
 fi
 if [[ "$(jq -r '.artifacts[0].notarized' "$VALIDATE_ONLY_MANIFEST")" != "true" ]]; then
