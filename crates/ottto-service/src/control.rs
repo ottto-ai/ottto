@@ -3371,9 +3371,11 @@ fn claude_code_relay_env(machine: &MachineIdentity) -> Vec<(&'static str, String
     );
     vec![
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_string()),
+        ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1".to_string()),
         ("CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS", "10000".to_string()),
         ("OTEL_METRICS_EXPORTER", "otlp".to_string()),
         ("OTEL_LOGS_EXPORTER", "otlp".to_string()),
+        ("OTEL_TRACES_EXPORTER", "otlp".to_string()),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_string()),
         (
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
@@ -4523,8 +4525,10 @@ fn claude_code_settings_has_relay_env(body: &str) -> bool {
     );
     let expected = [
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_string()),
+        ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1".to_string()),
         ("OTEL_METRICS_EXPORTER", "otlp".to_string()),
         ("OTEL_LOGS_EXPORTER", "otlp".to_string()),
+        ("OTEL_TRACES_EXPORTER", "otlp".to_string()),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_string()),
         (
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
@@ -7149,6 +7153,16 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             Some("1")
         );
         assert_eq!(
+            env.get("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA")
+                .and_then(|value| value.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("OTEL_TRACES_EXPORTER")
+                .and_then(|value| value.as_str()),
+            Some("otlp")
+        );
+        assert_eq!(
             env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
                 .and_then(|value| value.as_str()),
             Some("http://127.0.0.1:43119/v1/logs")
@@ -7203,7 +7217,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
 
     #[test]
     fn claude_code_statusline_detection_rejects_env_only_setup() {
-        let body = r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"1","CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS":"10000","OTEL_METRICS_EXPORTER":"otlp","OTEL_LOGS_EXPORTER":"otlp","OTEL_EXPORTER_OTLP_PROTOCOL":"http/protobuf","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"http://127.0.0.1:43119/v1/logs","OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"http://127.0.0.1:43119/v1/metrics","OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"http://127.0.0.1:43119/v1/traces","OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","OTEL_RESOURCE_ATTRIBUTES":"service.name=claude-code,ottto.source=claude_code,ottto.machine_id=machine_test"}}"#;
+        let body = r#"{"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"1","CLAUDE_CODE_ENHANCED_TELEMETRY_BETA":"1","CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS":"10000","OTEL_METRICS_EXPORTER":"otlp","OTEL_LOGS_EXPORTER":"otlp","OTEL_TRACES_EXPORTER":"otlp","OTEL_EXPORTER_OTLP_PROTOCOL":"http/protobuf","OTEL_EXPORTER_OTLP_LOGS_ENDPOINT":"http://127.0.0.1:43119/v1/logs","OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"http://127.0.0.1:43119/v1/metrics","OTEL_EXPORTER_OTLP_TRACES_ENDPOINT":"http://127.0.0.1:43119/v1/traces","OTEL_EXPORTER_OTLP_HEADERS":"X-Ottto-Local-Relay=claude_code","OTEL_RESOURCE_ATTRIBUTES":"service.name=claude-code,ottto.source=claude_code,ottto.machine_id=machine_test"}}"#;
 
         assert!(claude_code_settings_has_relay_env(body));
         assert!(!claude_code_settings_has_statusline_helper(body));
