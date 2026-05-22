@@ -95,8 +95,9 @@ fn sync_once(home: &Path, support_dir: &Path) -> Result<()> {
     let api_base_url = snapshot_api_base_url();
     let client = SnapshotApiClient::new(api_base_url);
 
+    let mut failed_sources = Vec::new();
     for source in enabled_snapshot_sources(&device) {
-        sync_source(
+        if let Err(error) = sync_source(
             &client,
             &device,
             &device_secret,
@@ -104,7 +105,20 @@ fn sync_once(home: &Path, support_dir: &Path) -> Result<()> {
             &machine_id,
             home,
             support_dir,
-        )?;
+        ) {
+            eprintln!(
+                "local snapshot sync skipped for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+            failed_sources.push(source.api_slug());
+        }
+    }
+    if !failed_sources.is_empty() {
+        return Err(anyhow!(
+            "local snapshot sync failed for {} source(s)",
+            failed_sources.len()
+        ));
     }
     Ok(())
 }
@@ -415,6 +429,20 @@ fn safe_error(error: &anyhow::Error) -> &'static str {
         "relay device credentials are unavailable"
     } else if text.contains("machine identity") {
         "machine identity is unavailable"
+    } else if text.contains("issue relay token failed") {
+        "relay token request failed"
+    } else if text.contains("get activity hint failed") {
+        "activity hint request failed"
+    } else if text.contains("upload agent status failed") {
+        "agent status upload failed"
+    } else if text.contains("scan local snapshots") {
+        "local snapshot scan failed"
+    } else if text.contains("upload local snapshots")
+        || text.contains("upload snapshot batch failed")
+    {
+        "local snapshot upload failed"
+    } else if text.contains("report snapshot status failed") {
+        "local collector status upload failed"
     } else {
         "sync failed"
     }
@@ -517,5 +545,21 @@ mod tests {
             "http://127.0.0.1:4318"
         );
         assert_eq!(normalize_api_base_url(None, None), DEFAULT_API_BASE_URL);
+    }
+
+    #[test]
+    fn safe_error_reports_sync_phase_without_raw_details() {
+        assert_eq!(
+            safe_error(&anyhow!("upload agent status failed: HTTP 500")),
+            "agent status upload failed"
+        );
+        assert_eq!(
+            safe_error(&anyhow!("upload local snapshots: request timed out")),
+            "local snapshot upload failed"
+        );
+        assert_eq!(
+            safe_error(&anyhow!("issue relay token failed: rejected")),
+            "relay token request failed"
+        );
     }
 }

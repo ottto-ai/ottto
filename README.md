@@ -574,6 +574,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `ottto agent-status --source <source> --json` or
   `ottto apps status --app <app> --json`, and locald collectors that redact raw
   command output, secrets, and absolute local paths before backend publication.
+  Background source snapshot sync is source-isolated: a scan or upload failure
+  for one local app logs that source and continues with the remaining granted
+  sources, so a broken Codex session scan cannot prevent Claude Code agent
+  status from reaching the backend. Sync logs report phase-level safe causes
+  such as agent-status upload, activity-hint request, local scan, or snapshot
+  upload failure without exposing raw response bodies or local paths.
   Public CLI affordances use `apps` and `--app`; typed daemon protocol payloads
   keep `SourceHealth`, `SourceKind`, and `source` fields.
   Codex keeps `codex login status` as the local diagnostic source and can carry
