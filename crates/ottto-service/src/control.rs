@@ -3033,6 +3033,17 @@ fn patch_codex_config_at(
     path: &Path,
     backup_root: &Path,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    if path.exists()
+        && fs::read_to_string(path)
+            .ok()
+            .as_deref()
+            .is_some_and(codex_config_has_relay_otel)
+    {
+        return Ok(ConfigPatchResult {
+            created: false,
+            backup_created: false,
+        });
+    }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
     let body = render_codex_relay_toml_block();
     let write = codex_toml::upsert_fence(path, &body).map_err(agent_config_error)?;
@@ -7023,7 +7034,7 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
-    fn patch_codex_config_rejects_existing_unfenced_otel_table() {
+    fn patch_codex_config_accepts_existing_unfenced_relay_otel_table() {
         let root = std::env::temp_dir().join(format!(
             "ottto-codex-config-inline-test-{}",
             std::process::id()
@@ -7037,20 +7048,23 @@ X-API-Key = "otel_redacted"
 
 [otel]
 environment = "prod"
-exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/logs", protocol = "binary", headers = { "x-ottto-relay-token" = "otrelay_redacted" } } }
-trace_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/traces", protocol = "binary", headers = { "x-ottto-relay-token" = "otrelay_redacted" } } }
-metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics", protocol = "binary", headers = { "x-ottto-relay-token" = "otrelay_redacted" } } }
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/logs", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
+trace_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/traces", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
+metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics", protocol = "binary", headers = { "X-Ottto-Local-Relay" = "codex" } } }
 "#,
         )
         .expect("write config");
         let original = fs::read_to_string(&path).expect("read original config");
 
         let backup_root = root.join("backups");
-        let error = patch_codex_config_at(&path, &backup_root).expect_err("reject duplicate otel");
+        let result = patch_codex_config_at(&path, &backup_root).expect("compatible relay config");
         let body = fs::read_to_string(&path).expect("read config");
 
-        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+        assert!(!result.created);
+        assert!(!result.backup_created);
         assert_eq!(body, original);
+        assert!(!backup_root.exists());
         let _ = fs::remove_dir_all(&root);
     }
 
