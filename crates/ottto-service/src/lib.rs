@@ -937,8 +937,7 @@ fn source_slug(source: &SourceKind) -> &'static str {
     }
 }
 
-const CONNECTOR_REGISTRY_JSON: &str =
-    include_str!("../../../../../connectors/registry.generated.json");
+const CONNECTOR_REGISTRY_JSON: &str = include_str!(env!("OTTTO_CONNECTOR_REGISTRY_PATH"));
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

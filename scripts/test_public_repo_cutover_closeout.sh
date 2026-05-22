@@ -12,6 +12,13 @@ target="$tmp_dir/ottto-target"
 bundle="$tmp_dir/bundle"
 apply_report="$tmp_dir/apply-report.json"
 closeout_report="$tmp_dir/closeout-report.json"
+source_root="$(git -C "$ROOT" rev-parse --show-toplevel)"
+expected_private_contracts=false
+expected_contract_scope="public_only"
+if [[ -d "$source_root/backend" && -d "$source_root/frontend" ]]; then
+  expected_private_contracts=true
+  expected_contract_scope="public_private"
+fi
 mkdir -p "$target"
 git -C "$target" init -q
 git -C "$target" config user.email "test@example.com"
@@ -27,7 +34,7 @@ git -C "$target" remote add origin git@github.com:ottto-ai/ottto.git
 
 "$target/scripts/public_repo_cutover_closeout.sh" \
   --target-dir "$target" \
-  --source-repo-root "$(git -C "$ROOT" rev-parse --show-toplevel)" \
+  --source-repo-root "$source_root" \
   --bootstrap-report "$apply_report" \
   --report "$closeout_report" \
   --skip-surface-ci \
@@ -35,11 +42,13 @@ git -C "$target" remote add origin git@github.com:ottto-ai/ottto.git
 
 grep -q "ready_to_commit=true" /tmp/public-cutover-closeout.out
 test -f "$closeout_report"
-python3 - "$closeout_report" <<'PY'
+python3 - "$closeout_report" "$expected_private_contracts" "$expected_contract_scope" <<'PY'
 import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_private_contracts = sys.argv[2] == "true"
+expected_contract_scope = sys.argv[3]
 assert report["schema_version"] == 1
 assert report["generated_by"] == "public_repo_cutover_closeout.sh"
 assert report["mode"] == "target_closeout"
@@ -66,9 +75,9 @@ assert report["checks"] == {
 }
 assert report["source"]["provided"] is True
 assert report["source"]["head"]
-assert report["source"]["private_consumer_contracts"] is True
+assert report["source"]["private_consumer_contracts"] is expected_private_contracts
 assert report["source"]["secret_scan_scope"] == "target_and_source_history"
-assert report["source"]["contract_scope"] == "public_private"
+assert report["source"]["contract_scope"] == expected_contract_scope
 assert report["target"]["status_count"] > 0
 for encoded in json.dumps(report).split('"'):
     assert "/private/" not in encoded
