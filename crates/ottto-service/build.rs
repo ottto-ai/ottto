@@ -13,10 +13,7 @@ fn main() {
     let registry_path = registry_path
         .canonicalize()
         .expect("connector registry path is canonical");
-    println!(
-        "cargo:rerun-if-changed={}",
-        registry_path.to_string_lossy()
-    );
+    println!("cargo:rerun-if-changed={}", registry_path.to_string_lossy());
     println!(
         "cargo:rustc-env=OTTTO_CONNECTOR_REGISTRY_PATH={}",
         registry_path.to_string_lossy()
