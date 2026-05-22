@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
-MAC_APP_ROOT="${OTTTO_MACOS_APP_ROOT:-$REPO_ROOT/tools/ottto-macos-app}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$ROOT" ]]; then
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+MAC_APP_ROOT="${OTTTO_MACOS_APP_ROOT:-$ROOT/tools/ottto-macos-app}"
 SOURCES_DIR="$MAC_APP_ROOT/Sources"
 ALLOWED_FILE="$SOURCES_DIR/OtttoCompanion/Theme/ResourceBundles.swift"
 

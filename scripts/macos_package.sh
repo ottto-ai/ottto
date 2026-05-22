@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
-MAC_APP_ROOT="$REPO_ROOT/tools/ottto-macos-app"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$ROOT" ]]; then
+  ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+MAC_APP_ROOT="${OTTTO_MACOS_APP_ROOT:-$ROOT/tools/ottto-macos-app}"
 
 VERSION="0.1.0-dev"
 CHANNEL="dev"
@@ -110,7 +113,17 @@ if [[ "$RELEASE_CHANNEL_URL_ROOT" == "$ARTIFACT_BASE_URL" ]]; then
   RELEASE_CHANNEL_URL_ROOT="https://install.ottto.net/ottto-local-platform/releases/$CHANNEL"
 fi
 LATEST_MANIFEST_URL="$RELEASE_CHANNEL_URL_ROOT/latest/release-manifest.json"
-COMMIT="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)"
+if [[ ! -d "$MAC_APP_ROOT" ]]; then
+  echo "macOS app root does not exist: $MAC_APP_ROOT" >&2
+  echo "Set OTTTO_MACOS_APP_ROOT to the OtttoCompanion Swift package root." >&2
+  exit 2
+fi
+if [[ ! -f "$MAC_APP_ROOT/Package.swift" ]]; then
+  echo "macOS app root is missing Package.swift: $MAC_APP_ROOT" >&2
+  exit 2
+fi
+
+COMMIT="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
 MIN_PROTOCOL_VERSION="${OTTTO_MIN_PROTOCOL_VERSION:-$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' "$ROOT/crates/ottto-protocol/src/lib.rs" | head -n1)}"
 if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
   echo "Could not determine local protocol version" >&2
