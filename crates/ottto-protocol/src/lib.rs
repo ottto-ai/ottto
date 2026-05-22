@@ -1188,7 +1188,24 @@ pub struct UpdateState {
 pub enum ReleaseChannel {
     Dev,
     Preview,
+    #[serde(rename = "stable-candidate")]
+    StableCandidate,
     Stable,
+}
+
+#[cfg(test)]
+mod release_channel_tests {
+    use super::ReleaseChannel;
+
+    #[test]
+    fn stable_candidate_uses_public_channel_slug() {
+        let encoded = serde_json::to_string(&ReleaseChannel::StableCandidate)
+            .expect("serialize stable-candidate channel");
+        assert_eq!(encoded, "\"stable-candidate\"");
+        let decoded: ReleaseChannel = serde_json::from_str("\"stable-candidate\"")
+            .expect("deserialize stable-candidate channel");
+        assert_eq!(decoded, ReleaseChannel::StableCandidate);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

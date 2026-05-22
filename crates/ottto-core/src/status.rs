@@ -60,6 +60,7 @@ pub fn compiled_release_channel() -> ReleaseChannel {
 pub fn release_channel_from_str(value: &str) -> ReleaseChannel {
     match value {
         "stable" => ReleaseChannel::Stable,
+        "stable-candidate" => ReleaseChannel::StableCandidate,
         "preview" => ReleaseChannel::Preview,
         _ => ReleaseChannel::Dev,
     }
@@ -125,6 +126,10 @@ mod tests {
     fn release_channel_from_str_defaults_to_dev() {
         assert_eq!(release_channel_from_str("dev"), ReleaseChannel::Dev);
         assert_eq!(release_channel_from_str("preview"), ReleaseChannel::Preview);
+        assert_eq!(
+            release_channel_from_str("stable-candidate"),
+            ReleaseChannel::StableCandidate
+        );
         assert_eq!(release_channel_from_str("stable"), ReleaseChannel::Stable);
         assert_eq!(release_channel_from_str("unexpected"), ReleaseChannel::Dev);
     }

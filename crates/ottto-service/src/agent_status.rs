@@ -1307,16 +1307,11 @@ fn collect_model_status_from_output(output: &CommandOutput, provider: &str) -> A
 
 pub(crate) fn read_pi_smoke_routes() -> Vec<PiModelRoute> {
     if let Some(settings) = read_pi_agent_settings() {
-        let routes = collect_pi_routes_from_settings(&settings);
-        if !routes.is_empty() {
-            return routes;
+        if let Some(route) = collect_default_pi_smoke_route_from_settings(&settings) {
+            return vec![route];
         }
     }
-    collect_pi_routes_from_output(&run_command_capture(
-        "pi",
-        &["--list-models"],
-        COMMAND_TIMEOUT,
-    ))
+    Vec::new()
 }
 
 fn collect_pi_model_status(
@@ -1415,6 +1410,7 @@ fn collect_pi_model_status_from_settings(
     }
 }
 
+#[cfg(test)]
 fn collect_pi_routes_from_settings(settings: &Value) -> Vec<PiModelRoute> {
     let default_provider = first_json_string(
         settings,
@@ -1453,6 +1449,25 @@ fn collect_pi_routes_from_settings(settings: &Value) -> Vec<PiModelRoute> {
         );
     }
     routes
+}
+
+fn collect_default_pi_smoke_route_from_settings(settings: &Value) -> Option<PiModelRoute> {
+    let default_provider = first_json_string(
+        settings,
+        &["defaultProvider", "default_provider", "provider"],
+    );
+    let default_model = first_json_string(settings, &["defaultModel", "default_model", "model"]);
+    let default_thinking = first_json_string(
+        settings,
+        &[
+            "defaultThinkingLevel",
+            "default_thinking_level",
+            "thinkingLevel",
+        ],
+    );
+    let provider = default_provider.as_deref()?;
+    let model = default_model.as_deref()?;
+    PiModelRoute::new(provider, model, default_thinking.as_deref())
 }
 
 fn collect_pi_enabled_model_routes(
@@ -1654,27 +1669,6 @@ fn collect_pi_model_status_from_output(
         available_model_details: details,
         context_window_tokens: None,
     }
-}
-
-fn collect_pi_routes_from_output(output: &CommandOutput) -> Vec<PiModelRoute> {
-    let mut routes = Vec::new();
-    let mut seen = BTreeSet::new();
-    if output.command_found && output.success {
-        let text = command_output_text(output);
-        for line in text.lines() {
-            let Some(detail) = parse_pi_model_table_line(line, None) else {
-                continue;
-            };
-            let Some(provider) = detail.provider.as_deref() else {
-                continue;
-            };
-            push_pi_model_route(provider, &detail.id, None, &mut seen, &mut routes);
-            if routes.len() >= MAX_AVAILABLE_MODELS {
-                break;
-            }
-        }
-    }
-    routes
 }
 
 fn parse_pi_model_table_line(
@@ -2943,6 +2937,27 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             routes[1].classification.source_category.as_deref(),
             Some("google_cloud_vertex")
         );
+    }
+
+    #[test]
+    fn pi_smoke_route_prefers_default_model_only() {
+        let settings = serde_json::json!({
+            "defaultProvider": "google-vertex",
+            "defaultModel": "gemini-3.1-pro-preview-customtools",
+            "defaultThinkingLevel": "high",
+            "enabledModels": [
+                "google-vertex/gemini-3.1-pro-preview-customtools:xhigh",
+                "google-vertex/gemini-3.1-pro-preview:xhigh",
+                "google-vertex/gemini-2.5-pro:xhigh"
+            ]
+        });
+
+        let route = collect_default_pi_smoke_route_from_settings(&settings)
+            .expect("default Pi smoke route");
+
+        assert_eq!(route.provider, "google-vertex");
+        assert_eq!(route.model, "gemini-3.1-pro-preview-customtools");
+        assert_eq!(route.thinking_level.as_deref(), Some("high"));
     }
 
     #[test]

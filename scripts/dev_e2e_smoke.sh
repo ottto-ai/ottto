@@ -141,8 +141,8 @@ json_assert "$status_json" \
   '.daemon == "running" and (.protocol_version | type == "number" and . >= 5) and .machine.os == "macos" and (.machine.arch | type == "string" and length > 0)' \
   "CLI doctor reaches ottto-service and returns current macOS machine status"
 json_assert "$status_json" \
-  '.update.channel == "dev" or .update.channel == "preview"' \
-  "installed build is a dev/preview channel, not stable"
+  '.update.channel == "dev" or .update.channel == "preview" or .update.channel == "stable-candidate"' \
+  "installed build is a dev/preview/stable-candidate channel, not stable"
 
 if [[ -n "$CLAIM_CODE" ]]; then
   setup_json="$tmp_dir/setup.json"

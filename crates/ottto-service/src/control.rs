@@ -308,7 +308,9 @@ fn handle_command(
             if refresh_agent_status {
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
-            to_value(status_for(daemon, &authorization)?)
+            let mut status = status_for(daemon, &authorization)?;
+            status.update.install_owner = detect_install_owner();
+            to_value(status)
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
         LocalControlCommand::AgentStatusRefresh { source } => {
@@ -1734,6 +1736,7 @@ fn release_channel_slug(channel: &ReleaseChannel) -> &'static str {
     match channel {
         ReleaseChannel::Dev => "dev",
         ReleaseChannel::Preview => "preview",
+        ReleaseChannel::StableCandidate => "stable-candidate",
         ReleaseChannel::Stable => "stable",
     }
 }
@@ -5989,6 +5992,10 @@ mod tests {
         assert_eq!(
             default_release_manifest_url(&ReleaseChannel::Preview),
             "https://install.ottto.net/ottto-local-platform/releases/preview/latest/release-manifest.json"
+        );
+        assert_eq!(
+            default_release_manifest_url(&ReleaseChannel::StableCandidate),
+            "https://install.ottto.net/ottto-local-platform/releases/stable-candidate/latest/release-manifest.json"
         );
         assert_eq!(
             default_release_manifest_url(&ReleaseChannel::Stable),
