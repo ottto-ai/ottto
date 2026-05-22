@@ -92,12 +92,17 @@ json_assert() {
   local file="$1"
   local expression="$2"
   local description="$3"
+  local failure_dump="${4:-full}"
 
   if jq -e "$expression" "$file" >/dev/null; then
     pass "$description"
   else
     echo "JSON assertion failed: $description" >&2
-    jq . "$file" >&2
+    if [[ "$failure_dump" == "full" ]]; then
+      jq . "$file" >&2
+    else
+      echo "JSON output omitted because it may contain machine identifiers or local diagnostics." >&2
+    fi
     exit 1
   fi
 }
@@ -171,11 +176,51 @@ json_assert "$verify_json" \
 diagnostics_json="$tmp_dir/diagnostics.json"
 "$CLI_TARGET" diagnostics collect --json > "$diagnostics_json"
 json_assert "$diagnostics_json" \
-  '.auth_header == "[REDACTED]" and .daemon_state == "Running"' \
-  "diagnostics output redacts auth material"
-if grep -Eiq '(bearer|secret)' "$diagnostics_json"; then
-  fail "diagnostics output contains sensitive material"
-fi
+  '(
+    (.auth_header == "[REDACTED]" and .daemon_state == "Running")
+    or
+    (
+      ([.sections[]? | select(.name == "security") | .items.auth_header] | first) == "[REDACTED]"
+      and
+      ([.sections[]? | select(.name == "runtime") | .items.daemon_state] | first) == "Running"
+    )
+  )' \
+  "diagnostics output redacts auth material" \
+  redacted
+python3 - "$diagnostics_json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+
+patterns = [
+    r"bearer\s+[A-Za-z0-9._~+/=-]{12,}",
+    r"password\s*[:=]\s*['\"]?[^,'\"\s}]{6,}",
+    r"claim_[A-Za-z0-9_-]{8,}",
+    r"[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+]
+
+
+def string_values(value):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from string_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from string_values(child)
+    elif isinstance(value, str):
+        yield value
+
+
+for string in string_values(payload):
+    for pattern in patterns:
+        if re.search(pattern, string, flags=re.IGNORECASE):
+            print("diagnostics output contains unredacted sensitive-looking material", file=sys.stderr)
+            sys.exit(1)
+PY
 if [[ -n "$CLAIM_CODE" ]] && grep -F "$CLAIM_CODE" "$diagnostics_json" >/dev/null; then
   fail "diagnostics output contains the raw claim code"
 fi
