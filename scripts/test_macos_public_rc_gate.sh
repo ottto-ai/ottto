@@ -51,9 +51,9 @@ cat > "$app_contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key>
   <string>Ottto</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0-preview.1</string>
+  <string>0.1.0-stable-candidate.1</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0-preview.1</string>
+  <string>0.1.0-stable-candidate.1</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
 </dict>
@@ -72,9 +72,9 @@ cli_zip="$TMP_DIR/ottto-macos-arm64.zip"
 daemon_zip="$TMP_DIR/ottto-service-macos-arm64.zip"
 sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
 launch_evidence="$TMP_DIR/packaged-app-launch-smoke.json"
-printf 'fake preview app dmg\n' > "$app_dmg"
-printf 'fake preview cli archive\n' > "$cli_zip"
-printf 'fake preview daemon archive\n' > "$daemon_zip"
+printf 'fake stable-candidate app dmg\n' > "$app_dmg"
+printf 'fake stable-candidate cli archive\n' > "$cli_zip"
+printf 'fake stable-candidate daemon archive\n' > "$daemon_zip"
 jq -n '{bomFormat: "CycloneDX", specVersion: "1.7", version: 1}' > "$sbom"
 jq -n '{
   schema_version: 1,
@@ -83,17 +83,17 @@ jq -n '{
   checked_at: "2026-05-21T00:00:00Z",
   wait_seconds: 1,
   bundle_id: "net.ottto.Companion",
-  bundle_version: "0.1.0-preview.1",
-  bundle_short_version: "0.1.0-preview.1",
+  bundle_version: "0.1.0-stable-candidate.1",
+  bundle_short_version: "0.1.0-stable-candidate.1",
   executable_name: "Ottto",
   process_survived_wait: true,
   crash_reports: []
 }' > "$launch_evidence"
 
-write_preview_manifest() {
+write_candidate_manifest() {
   local channel="$1"
   local manifest="$2"
-  local version="0.1.0-preview.1"
+  local version="0.1.0-stable-candidate.1"
   local prefix="https://install.ottto.net/ottto-local-platform/releases/$channel/$version"
 
   jq -n \
@@ -172,8 +172,8 @@ write_preview_manifest() {
           checked_at: "2026-05-21T00:00:00Z",
           wait_seconds: 1,
           bundle_id: "net.ottto.Companion",
-          bundle_version: "0.1.0-preview.1",
-          bundle_short_version: "0.1.0-preview.1",
+          bundle_version: "0.1.0-stable-candidate.1",
+          bundle_short_version: "0.1.0-stable-candidate.1",
           executable_name: "Ottto",
           process_survived_wait: true,
           crash_reports: [],
@@ -227,12 +227,12 @@ write_preview_manifest() {
 write_stable_binding_manifest() {
   local manifest="$1"
   local commit="$2"
-  local preview_sha="$3"
+  local candidate_sha="$3"
   local evidence_path="$4"
 
   jq -n \
     --arg commit "$commit" \
-    --arg preview_sha "$preview_sha" \
+    --arg candidate_sha "$candidate_sha" \
     --arg evidence_path "$evidence_path" \
     '{
       schema_version: 1,
@@ -242,66 +242,66 @@ write_stable_binding_manifest() {
       commit: $commit,
       min_protocol_version: 11,
       quality_gates: {
-        public_release_candidate: {
+        stable_candidate_rc: {
           status: "passed",
           evidence_path: $evidence_path,
-          preview_manifest_sha256: $preview_sha
+          candidate_manifest_sha256: $candidate_sha
         }
       }
     }' > "$manifest"
 }
 
-preview_manifest="$TMP_DIR/preview-release-manifest.json"
-write_preview_manifest "preview" "$preview_manifest"
-preview_sha="$(sha256_file "$preview_manifest")"
-template_evidence="$TMP_DIR/template-public-release-candidate-qa.json"
+candidate_manifest="$TMP_DIR/stable-candidate-release-manifest.json"
+write_candidate_manifest "stable-candidate" "$candidate_manifest"
+candidate_sha="$(sha256_file "$candidate_manifest")"
+template_evidence="$TMP_DIR/template-stable-candidate-rc-qa.json"
 "$TEMPLATE" \
-  --preview-manifest "$preview_manifest" \
+  --candidate-manifest "$candidate_manifest" \
   --output "$template_evidence" \
   --checked-at "2026-05-21T00:00:00Z" >/dev/null
 jq -e \
-  --arg preview_sha "$preview_sha" \
+  --arg candidate_sha "$candidate_sha" \
   '.local_platform.runtime == "ottto-service"
    and .local_platform.service_label == "net.ottto.service"
-   and .local_platform.version == "0.1.0-preview.1"
-   and .local_platform.release_channel == "preview"
+   and .local_platform.version == "0.1.0-stable-candidate.1"
+   and .local_platform.release_channel == "stable-candidate"
    and .local_platform.protocol_version == 11
-   and .local_platform.release_manifest_sha256 == $preview_sha' \
+   and .local_platform.release_manifest_sha256 == $candidate_sha' \
   "$template_evidence" >/dev/null
 expect_failure "unfilled template evidence" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$template_evidence"
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$template_evidence"
 
-stale_protocol_manifest="$TMP_DIR/stale-protocol-preview-release-manifest.json"
-jq '.min_protocol_version = 10' "$preview_manifest" > "$stale_protocol_manifest"
-if "$TEMPLATE" --preview-manifest "$stale_protocol_manifest" --output - >/tmp/macos-public-rc-template.out 2>&1; then
-  echo "Expected public RC template generation to reject stale protocol manifests" >&2
+stale_protocol_manifest="$TMP_DIR/stale-protocol-stable-candidate-release-manifest.json"
+jq '.min_protocol_version = 10' "$candidate_manifest" > "$stale_protocol_manifest"
+if "$TEMPLATE" --candidate-manifest "$stale_protocol_manifest" --output - >/tmp/macos-public-rc-template.out 2>&1; then
+  echo "Expected stable-candidate RC template generation to reject stale protocol manifests" >&2
   exit 1
 fi
 grep -q "min_protocol_version must be 11" /tmp/macos-public-rc-template.out
 
-passed_evidence="$TMP_DIR/public-release-candidate-qa.json"
+passed_evidence="$TMP_DIR/stable-candidate-rc-qa.json"
 jq \
   --arg macos_version "14.7" \
   '.status = "passed"
    | .environment.macos_version = $macos_version
    | .environment.arch = "arm64"
    | .checks |= with_entries(.value = "passed")
-   | .operator_notes = ["redacted preview release-candidate evidence"]' \
+   | .operator_notes = ["redacted stable-candidate RC evidence"]' \
   "$template_evidence" > "$passed_evidence"
-"$GATE" --preview-manifest "$preview_manifest" --evidence "$passed_evidence" >/dev/null
+"$GATE" --candidate-manifest "$candidate_manifest" --evidence "$passed_evidence" >/dev/null
 
-expect_failure "stale protocol preview manifest rejected" \
-  "$GATE" --preview-manifest "$stale_protocol_manifest" --evidence "$passed_evidence"
-grep -q "preview manifest min_protocol_version must be 11" /tmp/macos-public-rc-gate.out
+expect_failure "stale protocol stable-candidate manifest rejected" \
+  "$GATE" --candidate-manifest "$stale_protocol_manifest" --evidence "$passed_evidence"
+grep -q "stable-candidate manifest min_protocol_version must be 11" /tmp/macos-public-rc-gate.out
 
 stable_binding="$TMP_DIR/stable-manifest.json"
 write_stable_binding_manifest \
   "$stable_binding" \
   "abcdef123456" \
-  "$preview_sha" \
-  "public-release-candidate-qa.json"
+  "$candidate_sha" \
+  "stable-candidate-rc-qa.json"
 "$GATE" \
-  --preview-manifest "$preview_manifest" \
+  --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$stable_binding" >/dev/null
 
@@ -309,92 +309,92 @@ bad_stable_protocol="$TMP_DIR/bad-stable-protocol-manifest.json"
 jq '.min_protocol_version = 10' "$stable_binding" > "$bad_stable_protocol"
 expect_failure "stable binding stale protocol rejected" \
   "$GATE" \
-  --preview-manifest "$preview_manifest" \
+  --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_protocol"
 grep -q "stable manifest min_protocol_version must be 11" /tmp/macos-public-rc-gate.out
 
 dev_manifest="$TMP_DIR/dev-release-manifest.json"
-write_preview_manifest "dev" "$dev_manifest"
+write_candidate_manifest "dev" "$dev_manifest"
 expect_failure "dev manifest rejected" \
-  "$GATE" --preview-manifest "$dev_manifest" --evidence "$passed_evidence"
+  "$GATE" --candidate-manifest "$dev_manifest" --evidence "$passed_evidence"
 
 stable_channel_manifest="$TMP_DIR/stable-channel-release-manifest.json"
-write_preview_manifest "stable" "$stable_channel_manifest"
-expect_failure "stable manifest rejected as preview candidate" \
-  "$GATE" --preview-manifest "$stable_channel_manifest" --evidence "$passed_evidence"
+write_candidate_manifest "stable" "$stable_channel_manifest"
+expect_failure "stable manifest rejected as stable-candidate candidate" \
+  "$GATE" --candidate-manifest "$stable_channel_manifest" --evidence "$passed_evidence"
 
-bad_sha_evidence="$TMP_DIR/bad-sha-public-release-candidate-qa.json"
-jq '.preview_manifest.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
+bad_sha_evidence="$TMP_DIR/bad-sha-stable-candidate-rc-qa.json"
+jq '.candidate_manifest.sha256 = "0000000000000000000000000000000000000000000000000000000000000000"' \
   "$passed_evidence" > "$bad_sha_evidence"
-expect_failure "bad evidence preview SHA" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$bad_sha_evidence"
+expect_failure "bad evidence stable-candidate SHA" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_sha_evidence"
 
-bad_runtime_evidence="$TMP_DIR/bad-runtime-public-release-candidate-qa.json"
+bad_runtime_evidence="$TMP_DIR/bad-runtime-stable-candidate-rc-qa.json"
 jq '.local_platform.runtime = "ottto-cli"' \
   "$passed_evidence" > "$bad_runtime_evidence"
 expect_failure "bad local-platform runtime" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$bad_runtime_evidence"
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_runtime_evidence"
 grep -q "local_platform.runtime must be ottto-service" /tmp/macos-public-rc-gate.out
 
-bad_protocol_evidence="$TMP_DIR/bad-protocol-public-release-candidate-qa.json"
+bad_protocol_evidence="$TMP_DIR/bad-protocol-stable-candidate-rc-qa.json"
 jq '.local_platform.protocol_version = 10' \
   "$passed_evidence" > "$bad_protocol_evidence"
 expect_failure "bad local-platform protocol" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$bad_protocol_evidence"
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_protocol_evidence"
 grep -q "local_platform.protocol_version must be 11" /tmp/macos-public-rc-gate.out
 
-bad_runtime_sha_evidence="$TMP_DIR/bad-runtime-sha-public-release-candidate-qa.json"
+bad_runtime_sha_evidence="$TMP_DIR/bad-runtime-sha-stable-candidate-rc-qa.json"
 jq '.local_platform.release_manifest_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
   "$passed_evidence" > "$bad_runtime_sha_evidence"
 expect_failure "bad local-platform manifest SHA" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$bad_runtime_sha_evidence"
-grep -q "local_platform.release_manifest_sha256 does not match preview manifest" /tmp/macos-public-rc-gate.out
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_runtime_sha_evidence"
+grep -q "local_platform.release_manifest_sha256 does not match stable-candidate manifest" /tmp/macos-public-rc-gate.out
 
-unsigned_preview_manifest="$TMP_DIR/unsigned-preview-release-manifest.json"
+unsigned_candidate_manifest="$TMP_DIR/unsigned-stable-candidate-release-manifest.json"
 jq '(.artifacts[] | select(.kind == "cli")).signed = false' \
-  "$preview_manifest" > "$unsigned_preview_manifest"
-expect_failure "unsigned preview manifest rejected" \
-  "$GATE" --preview-manifest "$unsigned_preview_manifest" --evidence "$passed_evidence"
+  "$candidate_manifest" > "$unsigned_candidate_manifest"
+expect_failure "unsigned stable-candidate manifest rejected" \
+  "$GATE" --candidate-manifest "$unsigned_candidate_manifest" --evidence "$passed_evidence"
 grep -q "not marked signed" /tmp/macos-public-rc-gate.out
 
-unnotarized_preview_manifest="$TMP_DIR/unnotarized-preview-release-manifest.json"
+unnotarized_candidate_manifest="$TMP_DIR/unnotarized-stable-candidate-release-manifest.json"
 jq '(.artifacts[] | select(.kind == "daemon")).notarized = false' \
-  "$preview_manifest" > "$unnotarized_preview_manifest"
-expect_failure "unnotarized preview manifest rejected" \
-  "$GATE" --preview-manifest "$unnotarized_preview_manifest" --evidence "$passed_evidence"
+  "$candidate_manifest" > "$unnotarized_candidate_manifest"
+expect_failure "unnotarized stable-candidate manifest rejected" \
+  "$GATE" --candidate-manifest "$unnotarized_candidate_manifest" --evidence "$passed_evidence"
 grep -q "not marked notarized" /tmp/macos-public-rc-gate.out
 
-not_gatekeeper_preview_manifest="$TMP_DIR/not-gatekeeper-preview-release-manifest.json"
+not_gatekeeper_candidate_manifest="$TMP_DIR/not-gatekeeper-stable-candidate-release-manifest.json"
 jq '(.artifacts[] | select(.kind == "macos_app")).gatekeeper_assessed = false' \
-  "$preview_manifest" > "$not_gatekeeper_preview_manifest"
-expect_failure "not-gatekeeper preview manifest rejected" \
-  "$GATE" --preview-manifest "$not_gatekeeper_preview_manifest" --evidence "$passed_evidence"
+  "$candidate_manifest" > "$not_gatekeeper_candidate_manifest"
+expect_failure "not-gatekeeper stable-candidate manifest rejected" \
+  "$GATE" --candidate-manifest "$not_gatekeeper_candidate_manifest" --evidence "$passed_evidence"
 grep -q "not marked Gatekeeper-assessed" /tmp/macos-public-rc-gate.out
 
-private_path_evidence="$TMP_DIR/private-path-public-release-candidate-qa.json"
+private_path_evidence="$TMP_DIR/private-path-stable-candidate-rc-qa.json"
 private_root="/""Users"
 private_repo_name="coding-agents-""observability"
 private_path="$private_root/operator/private/$private_repo_name"
 jq --arg private_path "$private_path" '.operator_notes += [$private_path]' \
   "$passed_evidence" > "$private_path_evidence"
 expect_failure "private path evidence" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$private_path_evidence"
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$private_path_evidence"
 
-missing_check_evidence="$TMP_DIR/missing-check-public-release-candidate-qa.json"
+missing_check_evidence="$TMP_DIR/missing-check-stable-candidate-rc-qa.json"
 jq 'del(.checks.verify_codex)' "$passed_evidence" > "$missing_check_evidence"
 expect_failure "missing required check" \
-  "$GATE" --preview-manifest "$preview_manifest" --evidence "$missing_check_evidence"
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$missing_check_evidence"
 
 bad_stable_sha="$TMP_DIR/bad-stable-sha-manifest.json"
 write_stable_binding_manifest \
   "$bad_stable_sha" \
   "abcdef123456" \
   "1111111111111111111111111111111111111111111111111111111111111111" \
-  "public-release-candidate-qa.json"
-expect_failure "stable binding preview SHA mismatch" \
+  "stable-candidate-rc-qa.json"
+expect_failure "stable binding stable-candidate SHA mismatch" \
   "$GATE" \
-  --preview-manifest "$preview_manifest" \
+  --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_sha"
 
@@ -402,11 +402,11 @@ bad_stable_path="$TMP_DIR/bad-stable-path-manifest.json"
 write_stable_binding_manifest \
   "$bad_stable_path" \
   "abcdef123456" \
-  "$preview_sha" \
-  "different-public-release-candidate-qa.json"
+  "$candidate_sha" \
+  "different-stable-candidate-rc-qa.json"
 expect_failure "stable binding evidence path mismatch" \
   "$GATE" \
-  --preview-manifest "$preview_manifest" \
+  --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_path"
 

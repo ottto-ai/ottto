@@ -197,12 +197,12 @@ manifest_dir = manifest_path.parent
 REQUIRED_CHECKS = [
     "release_gate",
     "public_surface_ci",
-    "published_manifest_download",
+    "candidate_manifest_download",
     "artifact_checksums",
     "artifact_signatures",
     "notarization",
     "gatekeeper_assessment",
-    "hosted_preview_installer",
+    "hosted_candidate_installer",
     "app_launch",
     "service_ready",
     "status_json",
@@ -274,90 +274,90 @@ if not re.fullmatch(r"[0-9a-f]{7,40}", stable_commit):
 
 quality_gates = require_object(manifest.get("quality_gates"), "quality_gates")
 gate = require_object(
-    quality_gates.get("public_release_candidate"),
-    "quality_gates.public_release_candidate",
+    quality_gates.get("stable_candidate_rc"),
+    "quality_gates.stable_candidate_rc",
 )
 if gate.get("status") != "passed":
-    die("quality_gates.public_release_candidate.status must be passed")
+    die("quality_gates.stable_candidate_rc.status must be passed")
 evidence_reference = require_string(
     gate.get("evidence_path"),
-    "quality_gates.public_release_candidate.evidence_path",
+    "quality_gates.stable_candidate_rc.evidence_path",
 )
-preview_manifest_sha = require_string(
-    gate.get("preview_manifest_sha256"),
-    "quality_gates.public_release_candidate.preview_manifest_sha256",
+candidate_manifest_sha = require_string(
+    gate.get("candidate_manifest_sha256"),
+    "quality_gates.stable_candidate_rc.candidate_manifest_sha256",
 )
-if not re.fullmatch(r"[0-9a-f]{64}", preview_manifest_sha):
-    die("quality_gates.public_release_candidate.preview_manifest_sha256 is invalid")
+if not re.fullmatch(r"[0-9a-f]{64}", candidate_manifest_sha):
+    die("quality_gates.stable_candidate_rc.candidate_manifest_sha256 is invalid")
 
 evidence_path = resolve_reference(evidence_reference)
 if not evidence_path.is_file():
-    die(f"public release-candidate evidence is missing: {evidence_reference}")
+    die(f"stable-candidate RC evidence is missing: {evidence_reference}")
 
 evidence_text = evidence_path.read_text(encoding="utf-8")
 if SECRET_PATTERN.search(evidence_text):
-    die("public release-candidate evidence contains private path or secret-like material")
+    die("stable-candidate RC evidence contains private path or secret-like material")
 try:
     evidence = json.loads(evidence_text)
 except json.JSONDecodeError as error:
-    die(f"public release-candidate evidence has invalid JSON: {error}")
+    die(f"stable-candidate RC evidence has invalid JSON: {error}")
 
-evidence = require_object(evidence, "public release-candidate evidence")
+evidence = require_object(evidence, "stable-candidate RC evidence")
 if contains_placeholder(evidence):
-    die("public release-candidate evidence still contains template placeholders")
+    die("stable-candidate RC evidence still contains template placeholders")
 if evidence.get("schema_version") != 1:
-    die("public release-candidate evidence schema_version must be 1")
-if evidence.get("gate") != "public_release_candidate":
-    die("public release-candidate evidence gate must be public_release_candidate")
+    die("stable-candidate RC evidence schema_version must be 1")
+if evidence.get("gate") != "stable_candidate_rc":
+    die("stable-candidate RC evidence gate must be stable_candidate_rc")
 if evidence.get("status") != "passed":
-    die("public release-candidate evidence status must be passed")
+    die("stable-candidate RC evidence status must be passed")
 
-preview = require_object(
-    evidence.get("preview_manifest"),
-    "public release-candidate evidence preview_manifest",
+candidate = require_object(
+    evidence.get("candidate_manifest"),
+    "stable-candidate RC evidence candidate_manifest",
 )
-if preview.get("product") != "ottto-local-platform":
-    die("public release-candidate evidence product must be ottto-local-platform")
-if preview.get("channel") != "preview":
-    die("public release-candidate evidence preview channel must be preview")
-if preview.get("commit") != stable_commit:
-    die("public release-candidate evidence commit must match stable manifest commit")
-if preview.get("sha256") != preview_manifest_sha:
-    die("public release-candidate evidence preview SHA must match stable manifest gate")
+if candidate.get("product") != "ottto-local-platform":
+    die("stable-candidate RC evidence product must be ottto-local-platform")
+if candidate.get("channel") != "stable-candidate":
+    die("stable-candidate RC evidence candidate channel must be stable-candidate")
+if candidate.get("commit") != stable_commit:
+    die("stable-candidate RC evidence commit must match stable manifest commit")
+if candidate.get("sha256") != candidate_manifest_sha:
+    die("stable-candidate RC evidence candidate SHA must match stable manifest gate")
 
 environment = require_object(
     evidence.get("environment"),
-    "public release-candidate evidence environment",
+    "stable-candidate RC evidence environment",
 )
 local_platform = require_object(
     evidence.get("local_platform"),
-    "public release-candidate evidence local_platform",
+    "stable-candidate RC evidence local_platform",
 )
 if environment.get("host_kind") not in {"trusted_internal_macos", "clean_macos"}:
-    die("public release-candidate evidence host_kind is invalid")
+    die("stable-candidate RC evidence host_kind is invalid")
 if environment.get("arch") not in {"arm64", "x86_64", "universal"}:
-    die("public release-candidate evidence arch is invalid")
-require_string(environment.get("macos_version"), "public release-candidate evidence macos_version")
+    die("stable-candidate RC evidence arch is invalid")
+require_string(environment.get("macos_version"), "stable-candidate RC evidence macos_version")
 if local_platform.get("runtime") != "ottto-service":
-    die("public release-candidate evidence local_platform.runtime must be ottto-service")
+    die("stable-candidate RC evidence local_platform.runtime must be ottto-service")
 if local_platform.get("service_label") != "net.ottto.service":
-    die("public release-candidate evidence local_platform.service_label must be net.ottto.service")
-if local_platform.get("version") != preview.get("version"):
-    die("public release-candidate evidence local_platform.version must match preview version")
-if local_platform.get("release_channel") != "preview":
-    die("public release-candidate evidence local_platform.release_channel must be preview")
+    die("stable-candidate RC evidence local_platform.service_label must be net.ottto.service")
+if local_platform.get("version") != candidate.get("version"):
+    die("stable-candidate RC evidence local_platform.version must match candidate version")
+if local_platform.get("release_channel") != "stable-candidate":
+    die("stable-candidate RC evidence local_platform.release_channel must be stable-candidate")
 if local_platform.get("protocol_version") != 11:
-    die("public release-candidate evidence local_platform.protocol_version must be 11")
-if local_platform.get("release_manifest_sha256") != preview_manifest_sha:
-    die("public release-candidate evidence local_platform.release_manifest_sha256 must match preview manifest")
+    die("stable-candidate RC evidence local_platform.protocol_version must be 11")
+if local_platform.get("release_manifest_sha256") != candidate_manifest_sha:
+    die("stable-candidate RC evidence local_platform.release_manifest_sha256 must match candidate manifest")
 
-checks = require_object(evidence.get("checks"), "public release-candidate evidence checks")
+checks = require_object(evidence.get("checks"), "stable-candidate RC evidence checks")
 for check in REQUIRED_CHECKS:
     if checks.get(check) != "passed":
-        die(f"public release-candidate evidence is missing passed check: {check}")
+        die(f"stable-candidate RC evidence is missing passed check: {check}")
 PY
 then
-  fail "Stable manifest public release-candidate quality gate is not satisfied"
+  fail "Stable manifest stable-candidate RC quality gate is not satisfied"
 fi
 
 slsa_spec_version="$(jq -r '.supply_chain.slsa_build.spec_version // empty' "$MANIFEST")"

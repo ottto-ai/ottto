@@ -23,6 +23,8 @@ jq -e '
   and (.properties.rollback.required | index("immutable_prefix"))
   and (.properties.rollback.required | index("latest_manifest_url"))
   and (.properties.rollback.properties.preserve_failed_version.const == true)
+  and (.properties.channel.enum | index("stable-candidate"))
+  and (.properties.quality_gates.properties.stable_candidate_rc.required | index("candidate_manifest_sha256"))
   and (.properties.supply_chain.properties.slsa_build.properties.predicate_type.const == "https://slsa.dev/provenance/v1")
   and (.properties.supply_chain.properties.sbom.properties.predicate_type.const == "https://cyclonedx.org/bom")
 ' "$SCHEMA" >/dev/null
@@ -170,6 +172,11 @@ write_manifest() {
 dev_manifest="$TMP_DIR/dev-manifest.json"
 write_manifest "dev" "$sha" "false" "false" "false" "$dev_manifest"
 "$GATE" --manifest "$dev_manifest" >/dev/null
+
+stable_candidate_manifest="$TMP_DIR/stable-candidate-manifest.json"
+jq '.channel = "stable-candidate" | .version = "0.1.0-stable-candidate.1"' \
+  "$dev_manifest" > "$stable_candidate_manifest"
+"$GATE" --manifest "$stable_candidate_manifest" >/dev/null
 
 missing_owner_manifest="$TMP_DIR/missing-owner-manifest.json"
 jq 'del(.supported_install_owners)' "$dev_manifest" > "$missing_owner_manifest"

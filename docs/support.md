@@ -115,7 +115,7 @@ Before public-v1 closeout support is marked ready, verify that:
   this support runbook;
 - `SUPPORT.md` routes users to redacted public issues, product support,
   diagnostics, and security reporting;
-- public release-candidate, stable clean-machine, production `/apps`, public
+- stable-candidate RC, stable clean-machine, production `/apps`, public
   cutover, private runtime pin, docs, source-card, and board handoff evidence
   gates are green;
 - evidence records contain only redacted pass/fail facts and stable artifact

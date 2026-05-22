@@ -43,15 +43,15 @@ access reports also require `checked_at` to be at or after the reported GitHub
 event, and final closeout requires its `checked_at` to be at or after each
 component access report.
 
-Stable preflight also requires a passing, redacted public release-candidate
-evidence record from a preview manifest built from the same commit, so stable
-publication cannot skip preview artifact trust, installer, setup, diagnostics,
-update, rollback, and static install-owner checks. The public release-candidate
-gate rejects preview macOS artifacts that are not marked signed, notarized, and
-Gatekeeper-assessed, and its evidence skeleton requires explicit signature,
-notarization, Gatekeeper, and local-runtime pass/fail facts bound to
-`ottto-service`, `net.ottto.service`, protocol v11, the preview
-version/channel, and preview release-manifest SHA-256.
+Stable preflight also requires a passing, redacted internal stable-candidate RC
+evidence record from a `stable-candidate` manifest built from the same commit,
+so stable publication cannot skip candidate artifact trust, installer, setup,
+diagnostics, update, rollback, and static install-owner checks. The
+stable-candidate RC gate rejects candidate macOS artifacts that are not marked
+signed, notarized, and Gatekeeper-assessed, and its evidence skeleton requires
+explicit signature, notarization, Gatekeeper, and local-runtime pass/fail facts
+bound to `ottto-service`, `net.ottto.service`, protocol v11, the
+stable-candidate version/channel, and candidate release-manifest SHA-256.
 Stable closeout then requires clean-machine evidence for each advertised install
 owner, including setup, app detection, Codex verify/fix, diagnostics, logout,
 update/upgrade, uninstall, reinstall, post-reinstall status, and owner-specific
@@ -175,9 +175,9 @@ to copy the generated root-shaped bundle into a temporary git checkout and run
 the same public-surface gate that the exported GitHub Actions workflow uses:
 schema/registry validation, shellcheck, export tests, manifest/skeleton,
 secret-scan, contract checks, release/installer dry-run tests, and a
-self-exported bundle verification. This includes release manifest, public RC,
-stable preflight, stable closeout, stable QA template, Homebrew, hosted
-installer, and CycloneDX SBOM generator tests.
+self-exported bundle verification. This includes release manifest,
+stable-candidate RC, stable preflight, stable closeout, stable QA template,
+Homebrew, hosted installer, and CycloneDX SBOM generator tests.
 The skeleton gate also requires `docs/support.md`, the public support runbook
 covering redacted triage, diagnostics, escalation, data boundaries, and
 public-v1 closeout readiness.

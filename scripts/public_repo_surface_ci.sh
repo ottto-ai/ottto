@@ -171,7 +171,7 @@ run_step "test public skeleton check" bash scripts/test_public_repo_skeleton_che
 run_step "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
 run_step "test public contract check" bash scripts/test_public_repo_contract_check.sh
 run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
-run_step "test public release candidate gate" bash scripts/test_macos_public_rc_gate.sh
+run_step "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
 run_step "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
 run_step "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
 run_step "test stable QA evidence template" bash scripts/test_macos_stable_qa_evidence_template.sh

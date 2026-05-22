@@ -23,29 +23,29 @@ sha="$(shasum -a 256 "$artifact" | awk '{print $1}')"
 sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
 jq -n '{bomFormat: "CycloneDX", specVersion: "1.7", version: 1}' > "$sbom"
 sbom_sha="$(shasum -a 256 "$sbom" | awk '{print $1}')"
-preview_manifest="$TMP_DIR/preview-release-manifest.json"
+candidate_manifest="$TMP_DIR/stable-candidate-release-manifest.json"
 jq -n '{
   schema_version: 1,
   product: "ottto-local-platform",
-  version: "0.1.0-preview.1",
-  channel: "preview",
+  version: "0.1.0-stable-candidate.1",
+  channel: "stable-candidate",
   commit: "abcdef123456"
-}' > "$preview_manifest"
-preview_sha="$(shasum -a 256 "$preview_manifest" | awk '{print $1}')"
-public_rc_evidence="$TMP_DIR/public-release-candidate-qa.json"
+}' > "$candidate_manifest"
+candidate_sha="$(shasum -a 256 "$candidate_manifest" | awk '{print $1}')"
+candidate_rc_evidence="$TMP_DIR/stable-candidate-rc-qa.json"
 jq -n \
-  --arg preview_sha "$preview_sha" \
+  --arg candidate_sha "$candidate_sha" \
   '{
     schema_version: 1,
-    gate: "public_release_candidate",
+    gate: "stable_candidate_rc",
     status: "passed",
     checked_at: "2026-05-10T00:00:00Z",
-    preview_manifest: {
+    candidate_manifest: {
       product: "ottto-local-platform",
-      channel: "preview",
-      version: "0.1.0-preview.1",
+      channel: "stable-candidate",
+      version: "0.1.0-stable-candidate.1",
       commit: "abcdef123456",
-      sha256: $preview_sha
+      sha256: $candidate_sha
     },
     environment: {
       host_kind: "trusted_internal_macos",
@@ -55,20 +55,20 @@ jq -n \
     local_platform: {
       runtime: "ottto-service",
       service_label: "net.ottto.service",
-      version: "0.1.0-preview.1",
-      release_channel: "preview",
+      version: "0.1.0-stable-candidate.1",
+      release_channel: "stable-candidate",
       protocol_version: 11,
-      release_manifest_sha256: $preview_sha
+      release_manifest_sha256: $candidate_sha
     },
     checks: {
       release_gate: "passed",
       public_surface_ci: "passed",
-      published_manifest_download: "passed",
+      candidate_manifest_download: "passed",
       artifact_checksums: "passed",
       artifact_signatures: "passed",
       notarization: "passed",
       gatekeeper_assessment: "passed",
-      hosted_preview_installer: "passed",
+      hosted_candidate_installer: "passed",
       app_launch: "passed",
       service_ready: "passed",
       status_json: "passed",
@@ -80,7 +80,7 @@ jq -n \
       stable_formula_static: "passed",
       stable_hosted_installer_static: "passed"
     }
-  }' > "$public_rc_evidence"
+  }' > "$candidate_rc_evidence"
 
 write_manifest() {
   local channel="$1"
@@ -97,8 +97,8 @@ write_manifest() {
     --arg sbom_sha "$sbom_sha" \
     --arg rollback_immutable_prefix "https://install.ottto.net/ottto-local-platform/releases/$channel/0.1.0" \
     --arg rollback_latest_manifest_url "https://install.ottto.net/ottto-local-platform/releases/$channel/latest/release-manifest.json" \
-    --arg public_rc_evidence "$public_rc_evidence" \
-    --arg preview_sha "$preview_sha" \
+    --arg candidate_rc_evidence "$candidate_rc_evidence" \
+    --arg candidate_sha "$candidate_sha" \
     '{
       schema_version: 1,
       product: "ottto-local-platform",
@@ -154,11 +154,11 @@ write_manifest() {
         }
       },
       quality_gates: {
-        public_release_candidate: {
+        stable_candidate_rc: {
           status: "passed",
           checked_at: "2026-05-10T00:00:00Z",
-          evidence_path: $public_rc_evidence,
-          preview_manifest_sha256: $preview_sha
+          evidence_path: $candidate_rc_evidence,
+          candidate_manifest_sha256: $candidate_sha
         }
       },
       artifacts: [
@@ -261,29 +261,29 @@ if "$PREFLIGHT" --manifest "$bad_sbom_sha_manifest" --dry-run >/dev/null 2>&1; t
   exit 1
 fi
 
-missing_public_rc_manifest="$TMP_DIR/missing-public-rc-manifest.json"
-jq 'del(.quality_gates.public_release_candidate)' "$stable_manifest" > "$missing_public_rc_manifest"
-if "$PREFLIGHT" --manifest "$missing_public_rc_manifest" --dry-run >/dev/null 2>&1; then
-  echo "Expected missing public release-candidate evidence gate to fail stable preflight" >&2
+missing_candidate_rc_manifest="$TMP_DIR/missing-stable-candidate-rc-manifest.json"
+jq 'del(.quality_gates.stable_candidate_rc)' "$stable_manifest" > "$missing_candidate_rc_manifest"
+if "$PREFLIGHT" --manifest "$missing_candidate_rc_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected missing stable-candidate RC evidence gate to fail stable preflight" >&2
   exit 1
 fi
 
-failed_public_rc_manifest="$TMP_DIR/failed-public-rc-manifest.json"
-jq '.quality_gates.public_release_candidate.status = "not_run"' \
-  "$stable_manifest" > "$failed_public_rc_manifest"
-if "$PREFLIGHT" --manifest "$failed_public_rc_manifest" --dry-run >/dev/null 2>&1; then
-  echo "Expected failed public release-candidate evidence gate to fail stable preflight" >&2
+failed_candidate_rc_manifest="$TMP_DIR/failed-stable-candidate-rc-manifest.json"
+jq '.quality_gates.stable_candidate_rc.status = "not_run"' \
+  "$stable_manifest" > "$failed_candidate_rc_manifest"
+if "$PREFLIGHT" --manifest "$failed_candidate_rc_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected failed stable-candidate RC evidence gate to fail stable preflight" >&2
   exit 1
 fi
 
-bad_public_rc_runtime="$TMP_DIR/public-release-candidate-bad-runtime-qa.json"
-jq '.local_platform.protocol_version = 10' "$public_rc_evidence" > "$bad_public_rc_runtime"
-bad_public_rc_runtime_manifest="$TMP_DIR/public-rc-bad-runtime-manifest.json"
-jq --arg evidence "$bad_public_rc_runtime" \
-  '.quality_gates.public_release_candidate.evidence_path = $evidence' \
-  "$stable_manifest" > "$bad_public_rc_runtime_manifest"
-if "$PREFLIGHT" --manifest "$bad_public_rc_runtime_manifest" --dry-run >/dev/null 2>&1; then
-  echo "Expected public release-candidate runtime binding mismatch to fail stable preflight" >&2
+bad_candidate_rc_runtime="$TMP_DIR/stable-candidate-rc-bad-runtime-qa.json"
+jq '.local_platform.protocol_version = 10' "$candidate_rc_evidence" > "$bad_candidate_rc_runtime"
+bad_candidate_rc_runtime_manifest="$TMP_DIR/stable-candidate-rc-bad-runtime-manifest.json"
+jq --arg evidence "$bad_candidate_rc_runtime" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$bad_candidate_rc_runtime_manifest"
+if "$PREFLIGHT" --manifest "$bad_candidate_rc_runtime_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected stable-candidate RC runtime binding mismatch to fail stable preflight" >&2
   exit 1
 fi
 
@@ -294,10 +294,10 @@ if "$PREFLIGHT" --manifest "$bad_protocol_manifest" --dry-run >/dev/null 2>&1; t
   exit 1
 fi
 
-commit_mismatch_manifest="$TMP_DIR/public-rc-commit-mismatch-manifest.json"
+commit_mismatch_manifest="$TMP_DIR/stable-candidate-rc-commit-mismatch-manifest.json"
 jq '.commit = "abcdef999999"' "$stable_manifest" > "$commit_mismatch_manifest"
 if "$PREFLIGHT" --manifest "$commit_mismatch_manifest" --dry-run >/dev/null 2>&1; then
-  echo "Expected public release-candidate preview commit mismatch to fail stable preflight" >&2
+  echo "Expected stable-candidate RC commit mismatch to fail stable preflight" >&2
   exit 1
 fi
 

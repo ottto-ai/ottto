@@ -58,28 +58,28 @@ The attestation subject must match the artifact digest. The SLSA provenance must
 use the expected source repository, workflow, commit, and Build L2-or-better
 predicate.
 
-## Verify Public Release Candidate
+## Verify Stable Candidate RC
 
-Before a stable public release, the same commit must first pass preview
-release-candidate QA. Generate a redacted evidence skeleton from the preview
-manifest, fill real pass/fail facts, and run:
+Before a stable public release, the same commit must first pass internal
+stable-candidate RC QA. Generate a redacted evidence skeleton from the exact
+`stable-candidate` manifest, fill real pass/fail facts, and run:
 
 ```bash
 macos_public_rc_gate.sh \
-  --preview-manifest release-manifest.json \
-  --evidence public-release-candidate-qa.json
+  --candidate-manifest release-manifest.json \
+  --evidence stable-candidate-rc-qa.json
 ```
 
-Stable preflight requires `quality_gates.public_release_candidate.status:
-passed`, the preview manifest SHA-256, and an evidence file whose preview commit
-matches the stable manifest commit. The preview manifest must mark every macOS
-artifact as signed, notarized, and Gatekeeper-assessed, and the evidence must
-include passed `artifact_signatures`, `notarization`, and
+Stable preflight requires `quality_gates.stable_candidate_rc.status: passed`,
+the candidate manifest SHA-256, and an evidence file whose candidate commit
+matches the stable manifest commit. The stable-candidate manifest must mark
+every macOS artifact as signed, notarized, and Gatekeeper-assessed, and the
+evidence must include passed `artifact_signatures`, `notarization`, and
 `gatekeeper_assessment` checks. It must also bind the exercised local runtime to
-`ottto-service`, `net.ottto.service`, protocol v11, the preview version/channel,
-and the preview release-manifest SHA-256. The evidence must not include private
-repo paths, local user paths, raw claim/setup tokens, account or machine
-identifiers, passwords, API keys, or bearer credentials.
+`ottto-service`, `net.ottto.service`, protocol v11, the stable-candidate
+version/channel, and the candidate release-manifest SHA-256. The evidence must
+not include private repo paths, local user paths, raw claim/setup tokens,
+account or machine identifiers, passwords, API keys, or bearer credentials.
 
 ## Verify Installed Runtime
 

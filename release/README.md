@@ -136,36 +136,37 @@ provenance and SBOM attestations. `macos_release_gate.sh`,
 `macos_stable_preflight.sh`, and the publish helper reject manifests missing
 the public-v1 update, rollback, SBOM, and supply-chain fields.
 
-Before cutting a stable build, publish a preview release candidate from the
-same commit and attach redacted public release-candidate evidence. Generate the
-evidence skeleton from the exact preview manifest:
+Before cutting a stable build, build an internal stable-candidate RC from the
+same commit and attach redacted stable-candidate evidence. Generate the
+evidence skeleton from the exact `stable-candidate` manifest:
 
 ```bash
 ./scripts/macos_public_rc_evidence_template.sh \
-  --preview-manifest dist/macos/release-manifest.json \
-  --output dist/macos/public-release-candidate-qa.json
+  --candidate-manifest dist/macos/release-manifest.json \
+  --output dist/macos/stable-candidate-rc-qa.json
 ```
 
-Fill only redacted pass/fail facts after preview QA, then run:
+Fill only redacted pass/fail facts after internal stable-candidate RC QA, then
+run:
 
 ```bash
 ./scripts/macos_public_rc_gate.sh \
-  --preview-manifest dist/macos/release-manifest.json \
-  --evidence dist/macos/public-release-candidate-qa.json
+  --candidate-manifest dist/macos/release-manifest.json \
+  --evidence dist/macos/stable-candidate-rc-qa.json
 ```
 
-The gate runs the preview `macos_release_gate.sh`, binds evidence to the exact
-preview manifest SHA-256, rejects placeholders, private paths, and secret-like
-material, and requires preview checks for public surface CI, published manifest
-download, artifact checksums, hosted preview installer, app launch, service
-readiness, `status --json`, browser-claim setup, Codex verification,
-diagnostics redaction, update check, rollback notes, and static stable formula
-and hosted-installer review. The evidence must also bind the exercised local
-runtime to `ottto-service`, `net.ottto.service`, protocol v11, the preview
-version/channel, and preview release-manifest SHA-256. Stable preflight refuses
-a stable manifest unless `quality_gates.public_release_candidate` points at
-passing evidence from a preview manifest with the same commit and local-runtime
-binding.
+The gate runs the candidate `macos_release_gate.sh`, binds evidence to the
+exact candidate manifest SHA-256, rejects placeholders, private paths, and
+secret-like material, and requires candidate checks for public surface CI,
+candidate manifest download, artifact checksums, hosted candidate installer,
+app launch, service readiness, `status --json`, browser-claim setup, Codex
+verification, diagnostics redaction, update check, rollback notes, and static
+stable formula and hosted-installer review. The evidence must also bind the
+exercised local runtime to `ottto-service`, `net.ottto.service`, protocol v11,
+the stable-candidate version/channel, and candidate release-manifest SHA-256.
+Stable preflight refuses a stable manifest unless
+`quality_gates.stable_candidate_rc` points at passing evidence from a
+stable-candidate manifest with the same commit and local-runtime binding.
 
 To produce a distribution-signed package, pass a Developer ID identity:
 
@@ -338,9 +339,9 @@ AWS/CDN prerequisites before publish:
 
 ## Stable Artifact Checklist
 
-1. Publish a preview release candidate from the same commit and run
+1. Build an internal stable-candidate RC from the same commit and run
    `macos_public_rc_gate.sh` with passing redacted
-   `public-release-candidate-qa.json` evidence.
+   `stable-candidate-rc-qa.json` evidence.
 2. Build stable artifacts with `macos_package.sh --channel stable` and the
    Developer ID identity.
 3. Submit the generated archives with `macos_notarize.sh`.
@@ -356,9 +357,9 @@ AWS/CDN prerequisites before publish:
 7. Confirm SLSA provenance uses `https://slsa.dev/provenance/v1`, reaches SLSA
    Build L2 or better, covers every artifact plus `release-manifest.json` and
    the SBOM, and has verified GitHub attestation evidence.
-8. Update `quality_gates.public_release_candidate` in the stable manifest to
-   point at the passing public release-candidate evidence file and the preview
-   manifest SHA-256 from the same commit.
+8. Update `quality_gates.stable_candidate_rc` in the stable manifest to point
+   at the passing stable-candidate RC evidence file and the candidate manifest
+   SHA-256 from the same commit.
 9. Run `macos_release_gate.sh` and `macos_stable_preflight.sh` against the exact
    manifest to publish.
 10. Generate the Homebrew tap formula from the exact manifest and run the tap QA

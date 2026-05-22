@@ -70,7 +70,7 @@ if [[ "$product" != "ottto-local-platform" ]]; then
 fi
 
 CHANNEL="$(jq -r '.channel' "$MANIFEST")"
-if [[ "$CHANNEL" != "dev" && "$CHANNEL" != "preview" && "$CHANNEL" != "stable" ]]; then
+if [[ "$CHANNEL" != "dev" && "$CHANNEL" != "preview" && "$CHANNEL" != "stable-candidate" && "$CHANNEL" != "stable" ]]; then
   echo "Invalid release channel: $CHANNEL" >&2
   exit 1
 fi

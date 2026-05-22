@@ -34,7 +34,7 @@
     },
     "channel": {
       "type": "string",
-      "enum": ["dev", "preview", "stable"]
+      "enum": ["dev", "preview", "stable-candidate", "stable"]
     },
     "commit": {
       "type": "string",
@@ -252,9 +252,9 @@
         "packaged_app_launch": {
           "type": "object"
         },
-        "public_release_candidate": {
+        "stable_candidate_rc": {
           "type": "object",
-          "required": ["status", "evidence_path", "preview_manifest_sha256"],
+          "required": ["status", "evidence_path", "candidate_manifest_sha256"],
           "additionalProperties": false,
           "properties": {
             "status": {
@@ -269,7 +269,7 @@
               "type": "string",
               "minLength": 1
             },
-            "preview_manifest_sha256": {
+            "candidate_manifest_sha256": {
               "type": "string",
               "minLength": 1
             }

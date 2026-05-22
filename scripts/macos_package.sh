@@ -20,7 +20,7 @@ Usage: macos_package.sh [options]
 
 Options:
   --version <version>        Release version. Default: 0.1.0-dev
-  --channel <channel>        dev, preview, or stable. Default: dev
+  --channel <channel>        dev, preview, stable-candidate, or stable. Default: dev
   --output-dir <path>        Output directory. Default: tools/ottto-local-platform/dist/macos
   --sign-identity <identity> Developer ID signing identity.
   --artifact-base-url <url>  Public URL prefix for generated artifacts.
@@ -73,9 +73,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$CHANNEL" in
-  dev|preview|stable) ;;
+  dev|preview|stable-candidate|stable) ;;
   *)
-    echo "--channel must be dev, preview, or stable" >&2
+    echo "--channel must be dev, preview, stable-candidate, or stable" >&2
     exit 2
     ;;
 esac
@@ -420,10 +420,10 @@ jq -n \
           evidence_path: $launch_smoke_path
         }
       } + (if $channel == "stable" then {
-        public_release_candidate: {
+        stable_candidate_rc: {
           status: "not_run",
-          evidence_path: "public-release-candidate-qa.json",
-          preview_manifest_sha256: "not_run"
+          evidence_path: "stable-candidate-rc-qa.json",
+          candidate_manifest_sha256: "not_run"
         },
         stable_clean_machine_qa: {
           status: "not_run",
