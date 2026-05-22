@@ -119,73 +119,64 @@ pub enum ConnectorTestkitError {
 impl fmt::Display for ConnectorTestkitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateId { kind, id } => write!(formatter, "duplicate {} id '{}'", kind, id),
+            Self::DuplicateId { kind, id } => write!(formatter, "duplicate {kind} id '{id}'"),
             Self::ForbiddenField { field } => {
                 write!(
                     formatter,
-                    "field '{}' is forbidden in connector manifest v1",
-                    field
+                    "field '{field}' is forbidden in connector manifest v1"
                 )
             }
             Self::InvalidEmitName { field, value } => {
-                write!(formatter, "invalid {} emit name '{}'", field, value)
+                write!(formatter, "invalid {field} emit name '{value}'")
             }
             Self::InvalidManifestId { field, value } => {
-                write!(formatter, "invalid {} manifest id '{}'", field, value)
+                write!(formatter, "invalid {field} manifest id '{value}'")
             }
-            Self::EmptyField { field } => write!(formatter, "{} must not be empty", field),
-            Self::EmptyValues { field } => write!(formatter, "{} must not be empty", field),
+            Self::EmptyField { field } => write!(formatter, "{field} must not be empty"),
+            Self::EmptyValues { field } => write!(formatter, "{field} must not be empty"),
             Self::UnsupportedValue { field, value } => {
-                write!(formatter, "unsupported {} value '{}'", field, value)
+                write!(formatter, "unsupported {field} value '{value}'")
             }
             Self::RawContentUploadAllowed { collector_id } => write!(
                 formatter,
-                "collector '{}' must not upload raw content in the safe v1 testkit",
-                collector_id
+                "collector '{collector_id}' must not upload raw content in the safe v1 testkit"
             ),
             Self::RiskyDefaultEnabled {
                 collector_id,
                 reason,
             } => write!(
                 formatter,
-                "collector '{}' must not default-enable risky collection: {}",
-                collector_id, reason
+                "collector '{collector_id}' must not default-enable risky collection: {reason}"
             ),
             Self::UploadPolicyMismatch { expected, actual } => write!(
                 formatter,
-                "fixture upload policy mismatch: expected uploads_raw_content={}, got {}",
-                expected, actual
+                "fixture upload policy mismatch: expected uploads_raw_content={expected}, got {actual}"
             ),
             Self::MissingRequiredRedactionClass { class } => {
                 write!(
                     formatter,
-                    "fixture upload policy is missing redaction class '{}'",
-                    class
+                    "fixture upload policy is missing redaction class '{class}'"
                 )
             }
             Self::RecordTypeMismatch { expected, actual } => write!(
                 formatter,
-                "fixture emitted record types mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "fixture emitted record types mismatch: expected {expected:?}, got {actual:?}"
             ),
             Self::RawContentKey { path } => {
                 write!(
                     formatter,
-                    "fixture sample exposes raw content key '{}'",
-                    path
+                    "fixture sample exposes raw content key '{path}'"
                 )
             }
             Self::SourceMismatch { expected, actual } => {
                 write!(
                     formatter,
-                    "source mismatch: expected '{}', got '{}'",
-                    expected, actual
+                    "source mismatch: expected '{expected}', got '{actual}'"
                 )
             }
             Self::CollectorMismatch { expected, actual } => write!(
                 formatter,
-                "collector mismatch: expected '{}', got '{}'",
-                expected, actual
+                "collector mismatch: expected '{expected}', got '{actual}'"
             ),
         }
     }
@@ -361,7 +352,7 @@ pub fn assert_collector_fixture_contract(
 
 pub fn assert_sample_key_path_safe(path: &str) -> Result<(), ConnectorTestkitError> {
     let exposes_raw_key = path
-        .split(|char| matches!(char, '.' | '[' | ']'))
+        .split(['.', '[', ']'])
         .filter(|part| !part.is_empty())
         .any(is_forbidden_sample_key);
     if exposes_raw_key {

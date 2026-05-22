@@ -414,7 +414,7 @@ fn collect_sample_key_paths(value: &Value, prefix: &str, paths: &mut Vec<String>
                 let path = if prefix.is_empty() {
                     key.clone()
                 } else {
-                    format!("{}.{}", prefix, key)
+                    format!("{prefix}.{key}")
                 };
                 paths.push(path.clone());
                 collect_sample_key_paths(child, &path, paths);
@@ -422,7 +422,7 @@ fn collect_sample_key_paths(value: &Value, prefix: &str, paths: &mut Vec<String>
         }
         Value::Array(items) => {
             for (index, child) in items.iter().enumerate() {
-                let path = format!("{}[{}]", prefix, index);
+                let path = format!("{prefix}[{index}]");
                 collect_sample_key_paths(child, &path, paths);
             }
         }

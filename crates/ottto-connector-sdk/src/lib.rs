@@ -298,9 +298,7 @@ pub fn is_forbidden_v1_field(field_name: &str) -> bool {
 }
 
 pub fn is_required_redaction_class(value: &str) -> bool {
-    REQUIRED_REDACTION_CLASSES
-        .iter()
-        .any(|required| *required == value)
+    REQUIRED_REDACTION_CLASSES.contains(&value)
 }
 
 pub fn is_forbidden_sample_key(value: &str) -> bool {
