@@ -404,6 +404,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   predicate `https://cyclonedx.org/bom`, SLSA provenance predicate
   `https://slsa.dev/provenance/v1`, Build L2 or better, and subject coverage for
   every artifact plus `release-manifest.json` and the SBOM.
+- a dispatch-only protected macOS stable release workflow that builds, signs,
+  notarizes, attests, binds supply-chain metadata, CMS-signs the final manifest,
+  and uploads artifacts without CDN write permissions or stable-channel
+  promotion.
 - a notarization helper that submits the generated macOS archives and updates
   manifest notarization flags only after Apple validation and local Gatekeeper
   assessment pass

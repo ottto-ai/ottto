@@ -52,11 +52,20 @@ expected repository and subject digest from the release manifest:
 
 ```bash
 gh attestation verify <artifact> --repo <owner>/<repo>
+gh attestation verify <artifact> --repo <owner>/<repo> \
+  --predicate-type https://cyclonedx.org/bom
 ```
 
 The attestation subject must match the artifact digest. The SLSA provenance must
 use the expected source repository, workflow, commit, and Build L2-or-better
 predicate.
+
+Stable manifests should be bound with `macos_attestation_bind.sh` using the
+published `subject.checksums.txt`; the helper updates only the SLSA and SBOM
+manifest fields and refuses `verified=true` if GitHub attestation verification
+fails. Verify `release-manifest.json.sig` with
+`macos_manifest_signature.sh verify --manifest release-manifest.json` before
+trusting the manifest as the stable release record.
 
 ## Verify Stable Candidate RC
 

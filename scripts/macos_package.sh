@@ -371,7 +371,7 @@ jq -n \
   --arg sbom_file "$(basename "$SBOM_PATH")" \
   --arg manifest_file "release-manifest.json" \
   --arg repository "${OTTTO_RELEASE_REPOSITORY:-ottto-ai/ottto}" \
-  --arg signer_workflow "${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/ottto-local-platform-release.yml}" \
+  --arg signer_workflow "${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/macos-stable-release.yml}" \
   --arg launch_smoke_path "$LAUNCH_SMOKE_EVIDENCE" \
   --argjson signed "$SIGNED" \
   --argjson notarized "$NOTARIZED" \

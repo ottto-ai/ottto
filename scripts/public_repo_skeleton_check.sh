@@ -101,6 +101,7 @@ done
 required_files=(
   ".github/dependabot.yml"
   ".github/workflows/ci.yml"
+  ".github/workflows/macos-stable-release.yml"
   "CODE_OF_CONDUCT.md"
   "CONTRIBUTING.md"
   "Cargo.lock"
@@ -149,6 +150,8 @@ done
 required_executables=(
   "scripts/homebrew_formula.sh"
   "scripts/hosted_native_installer.sh"
+  "scripts/macos_attestation_bind.sh"
+  "scripts/macos_manifest_signature.sh"
   "scripts/macos_release_gate.sh"
   "scripts/macos_public_rc_evidence_template.sh"
   "scripts/macos_public_rc_gate.sh"
@@ -173,6 +176,9 @@ required_executables=(
   "scripts/test_public_repo_skeleton_check.sh"
   "scripts/test_public_repo_surface_ci.sh"
   "scripts/test_macos_public_rc_gate.sh"
+  "scripts/test_macos_attestation_bind.sh"
+  "scripts/test_macos_manifest_signature.sh"
+  "scripts/test_macos_stable_release_workflow.sh"
   "scripts/test_macos_stable_qa_evidence_template.sh"
 )
 
@@ -215,6 +221,10 @@ require_grep 'github-actions' ".github/dependabot.yml" "GitHub Actions dependenc
 require_grep 'package-ecosystem: cargo' ".github/dependabot.yml" "Cargo dependency hygiene"
 require_grep 'cargo clippy' ".github/workflows/ci.yml" "Rust clippy CI"
 require_grep 'public_repo_surface_ci\.sh' ".github/workflows/ci.yml" "public surface CI gate"
+require_grep 'workflow_dispatch' ".github/workflows/macos-stable-release.yml" "stable release manual dispatch"
+require_grep 'macos-stable-release' ".github/workflows/macos-stable-release.yml" "stable release protected environment"
+require_grep 'macos_attestation_bind\.sh' ".github/workflows/macos-stable-release.yml" "stable release attestation binding"
+require_grep 'macos_manifest_signature\.sh' ".github/workflows/macos-stable-release.yml" "stable release manifest signature"
 require_grep 'public_repo_contract_check\.sh' "scripts/public_repo_surface_ci.sh" "public contract CI gate"
 require_grep 'public_repo_cutover_closeout\.sh' "scripts/public_repo_surface_ci.sh" "public cutover closeout CI gate"
 require_grep 'public_repo_manifest_check\.sh' "scripts/public_repo_surface_ci.sh" "public manifest CI gate"

@@ -132,10 +132,22 @@ app-bundled installs without self-overwriting files managed by another owner.
 The manifest also carries a `supply_chain` block for SLSA Build Track
 provenance and CycloneDX SBOM evidence. `macos_package.sh` generates
 `ottto-local-platform-sbom.cdx.json` and records it in the manifest; the release
-workflow writes `subject.checksums.txt` and calls `actions/attest@v4` for build
-provenance and SBOM attestations. `macos_release_gate.sh`,
-`macos_stable_preflight.sh`, and the publish helper reject manifests missing
-the public-v1 update, rollback, SBOM, and supply-chain fields.
+workflow writes `subject.checksums.txt`, calls `actions/attest@v4` for build
+provenance and SBOM attestations, verifies those attestations with
+`gh attestation verify`, and runs `macos_attestation_bind.sh` before any stable
+preflight can pass. `macos_release_gate.sh`, `macos_stable_preflight.sh`, and
+the publish helper reject manifests missing the public-v1 update, rollback,
+SBOM, and supply-chain fields.
+
+The dispatch-only `.github/workflows/macos-stable-release.yml` workflow builds
+stable-candidate or stable macOS artifacts on a protected signing runner,
+notarizes them, creates SLSA/SBOM GitHub attestations, binds the verified
+supply-chain manifest fields, signs `release-manifest.json` with
+`macos_manifest_signature.sh`, and uploads workflow artifacts. It is output-only:
+`publish_intent` is fixed to `none`, it has no CDN/AWS write permissions, and it
+never promotes the stable channel pointer. Final publication remains a private,
+manual operator step after stable preflight and clean-machine closeout evidence
+are green.
 
 Before cutting a stable build, build an internal stable-candidate RC from the
 same commit and attach redacted stable-candidate evidence. Generate the
@@ -275,8 +287,8 @@ stable `latest` installer pointer can safely serve this exact wrapper because
 its embedded default base URL stays pinned to the immutable versioned prefix.
 
 For stable releases, the generated supply-chain defaults are intentionally not
-publishable. After the GitHub-hosted release workflow or trusted stable release
-workflow creates attestations, verify each native artifact with GitHub CLI:
+publishable. After the trusted stable release workflow creates attestations,
+verify each native artifact with GitHub CLI:
 
 ```bash
 gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
@@ -286,10 +298,30 @@ gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
   --predicate-type https://cyclonedx.org/bom
 ```
 
-Then update the exact manifest to `supply_chain.slsa_build.level=build_l2` or
-better and set both SLSA/SBOM `attested=true` and `verified=true`, preserving
-the verification commands and the CycloneDX SBOM URL/SHA. Stable preflight
-fails while these fields still describe only local Build L1 metadata.
+Then bind the exact manifest with the same subject checksum file:
+
+```bash
+./scripts/macos_attestation_bind.sh \
+  --manifest dist/macos/release-manifest.json \
+  --subject-checksums dist/macos/subject.checksums.txt \
+  --repo ottto-ai/ottto \
+  --signer-workflow .github/workflows/macos-stable-release.yml
+```
+
+The binder updates only `supply_chain.slsa_build` and `supply_chain.sbom`, sets
+Build L2 verified metadata only after `gh attestation verify` succeeds for the
+release subjects, and leaves stable preflight red while those fields still
+describe only local Build L1 metadata.
+
+After attestation binding, sign and verify the final manifest bytes:
+
+```bash
+./scripts/macos_manifest_signature.sh sign \
+  --manifest dist/macos/release-manifest.json \
+  --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"
+./scripts/macos_manifest_signature.sh verify \
+  --manifest dist/macos/release-manifest.json
+```
 
 To check whether the current Mac has the non-secret Apple toolchain before any
 signing private key or notarization credential exists, run:
@@ -464,6 +496,8 @@ A stable release record should include:
 - generated Homebrew formula diff and clean-Mac Homebrew install, service,
   update, and uninstall evidence
 - generated hosted native installer diff plus dry-run/static test evidence
+- `release-manifest.json.sig` CMS signature verification for the final
+  manifest bytes
 - clean-Mac hosted native installer evidence that Gatekeeper accepts the native
   artifact and that app launch, LaunchAgent creation, service readiness, and
   uninstall behavior are owned by the native app path

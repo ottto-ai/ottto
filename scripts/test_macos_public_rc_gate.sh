@@ -142,7 +142,7 @@ write_candidate_manifest() {
           level: "build_l1",
           predicate_type: "https://slsa.dev/provenance/v1",
           repository: "ottto-ai/ottto",
-          signer_workflow: ".github/workflows/ottto-local-platform-release.yml",
+          signer_workflow: ".github/workflows/macos-stable-release.yml",
           subjects: [
             "Ottto-macos-arm64.dmg",
             "ottto-macos-arm64.zip",
