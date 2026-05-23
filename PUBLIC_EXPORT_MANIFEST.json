@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "43b7d27d6c63fac90f2df380226ad7f3fd1baaa46e130211ad0c3796c360917c",
+  "content_sha256": "abf41b667ce4e3d27e212b48519486bf96cf4f606dee6cc2af5632c505542fc3",
   "files": [
     {
       "executable": false,
@@ -937,8 +937,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/cyclonedx_sbom.sh",
-      "sha256": "f575f5ec1ab7870d906214a3b194f40d8052a55ec2377ee09e8891f1a3d33715",
-      "size_bytes": 2295
+      "sha256": "c8311ff022de601cade867ddb21ca40d27e34797f592f5218853164268fc6795",
+      "size_bytes": 2694
     },
     {
       "executable": true,
@@ -1126,8 +1126,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_cyclonedx_sbom.sh",
-      "sha256": "b69c42ef6f9ad346090a434bf5a6e4728370620b7cfbb68c46786236fbe2bf74",
-      "size_bytes": 796
+      "sha256": "072dd98740933676c948fca9ffa40529e14fead7dab396db852d8ad5c04be2ae",
+      "size_bytes": 907
     },
     {
       "executable": true,
@@ -1298,7 +1298,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-23T11:33:55+00:00",
+  "generated_at": "2026-05-23T12:25:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 186,
   "public_roots": [
@@ -1333,5 +1333,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d9d20448b6783365766cb41a67fc1971480f805c"
+  "source_commit": "4b57b715a943450716e3c2fc57301f39240f58b8"
 }

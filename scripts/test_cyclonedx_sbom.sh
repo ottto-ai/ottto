@@ -20,6 +20,7 @@ sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
 
 jq -e '
   .bomFormat == "CycloneDX"
+  and (.serialNumber | test("^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
   and .specVersion == "1.7"
   and .metadata.component.name == "ottto-local-platform"
   and .metadata.component.version == "0.1.0-test"
