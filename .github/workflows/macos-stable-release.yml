@@ -1,0 +1,273 @@
+name: macOS Stable Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable or stable-candidate version to build.
+        required: true
+        type: string
+      channel:
+        description: Release channel to package.
+        required: true
+        type: choice
+        options:
+          - stable-candidate
+          - stable
+      artifact_base_url:
+        description: Immutable HTTPS release prefix for workflow artifacts.
+        required: true
+        type: string
+      publish_intent:
+        description: Public workflow output only; CDN publication is manual and private.
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+
+concurrency:
+  group: macos-stable-release-${{ github.ref }}-${{ inputs.channel }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build-sign-notarize:
+    name: Build, sign, notarize, attest
+    if: github.ref == 'refs/heads/main'
+    environment: macos-stable-release
+    timeout-minutes: 180
+    # After AWS EC2 Mac migration, set OTTTO_MACOS_STABLE_RUNNER_LABELS to
+    # ["self-hosted","macOS","ottto-signing-mac","ottto-cloud-mac"].
+    runs-on: ${{ fromJSON(vars.OTTTO_MACOS_STABLE_RUNNER_LABELS || '["self-hosted","macOS","ottto-signing-mac","ottto-release-bootstrap"]') }}
+    env:
+      OTTTO_MACOS_CODESIGN_IDENTITY: ${{ secrets.OTTTO_MACOS_CODESIGN_IDENTITY }}
+      OTTTO_NOTARY_PROFILE: ${{ secrets.OTTTO_NOTARY_PROFILE }}
+      OTTTO_NOTARY_WAIT_TIMEOUT: ${{ vars.OTTTO_NOTARY_WAIT_TIMEOUT || '30m' }}
+      OTTTO_RELEASE_REPOSITORY: ${{ github.repository }}
+      OTTTO_RELEASE_SIGNER_WORKFLOW: .github/workflows/macos-stable-release.yml
+      OTTTO_STABLE_CANDIDATE_RC_EVIDENCE: ${{ vars.OTTTO_STABLE_CANDIDATE_RC_EVIDENCE || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Enforce dispatch policy
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "macOS stable releases are workflow_dispatch only." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "macOS stable releases must run from main." >&2
+            exit 1
+          fi
+          if [[ "${{ inputs.publish_intent }}" != "none" ]]; then
+            echo "The public workflow never publishes or promotes release channels." >&2
+            exit 1
+          fi
+          case "${{ inputs.channel }}" in
+            stable-candidate|stable) ;;
+            *)
+              echo "Unsupported release channel: ${{ inputs.channel }}" >&2
+              exit 1
+              ;;
+          esac
+          case "${{ inputs.artifact_base_url }}" in
+            https://*)
+              if [[ "${{ inputs.artifact_base_url }}" == *"/latest"* ]]; then
+                echo "artifact_base_url must be an immutable versioned prefix." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "artifact_base_url must use HTTPS." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Check signing runner readiness
+        run: |
+          set -euo pipefail
+          for command in jq shasum swift cargo ditto hdiutil plutil codesign spctl xcrun gh security; do
+            command -v "$command" >/dev/null 2>&1 || {
+              echo "Required command not found: $command" >&2
+              exit 2
+            }
+          done
+          test -n "$OTTTO_MACOS_CODESIGN_IDENTITY" || {
+            echo "OTTTO_MACOS_CODESIGN_IDENTITY is required." >&2
+            exit 2
+          }
+          test -n "$OTTTO_NOTARY_PROFILE" || {
+            echo "OTTTO_NOTARY_PROFILE is required." >&2
+            exit 2
+          }
+          security find-identity -v -p codesigning | grep -F "$OTTTO_MACOS_CODESIGN_IDENTITY" >/dev/null
+          xcrun notarytool history --keychain-profile "$OTTTO_NOTARY_PROFILE" >/dev/null
+
+      - name: Package signed macOS artifacts
+        run: |
+          set -euo pipefail
+          scripts/macos_package.sh \
+            --version "${{ inputs.version }}" \
+            --channel "${{ inputs.channel }}" \
+            --artifact-base-url "${{ inputs.artifact_base_url }}"
+
+      - name: Notarize and staple artifacts
+        run: |
+          set -euo pipefail
+          scripts/macos_notarize.sh \
+            --manifest dist/macos/release-manifest.json \
+            --keychain-profile "$OTTTO_NOTARY_PROFILE" \
+            --timeout "$OTTTO_NOTARY_WAIT_TIMEOUT"
+
+      - name: Bind stable-candidate RC evidence
+        if: inputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          test -n "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
+            echo "OTTTO_STABLE_CANDIDATE_RC_EVIDENCE must point to redacted stable-candidate RC evidence for stable releases." >&2
+            exit 1
+          }
+          test -f "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
+            echo "Stable-candidate RC evidence file does not exist: $OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" >&2
+            exit 1
+          }
+          cp "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" dist/macos/stable-candidate-rc-qa.json
+          candidate_sha="$(jq -r '.candidate_manifest.sha256 // empty' dist/macos/stable-candidate-rc-qa.json)"
+          if [[ ! "$candidate_sha" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Stable-candidate RC evidence is missing candidate_manifest.sha256." >&2
+            exit 1
+          fi
+          jq \
+            --arg evidence_path "stable-candidate-rc-qa.json" \
+            --arg candidate_sha "$candidate_sha" \
+            --arg checked_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            '.quality_gates.stable_candidate_rc = {
+              status: "passed",
+              checked_at: $checked_at,
+              evidence_path: $evidence_path,
+              candidate_manifest_sha256: $candidate_sha
+            }' \
+            dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
+          mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
+
+      - name: Generate attestation subject checksums
+        run: |
+          set -euo pipefail
+          (
+            cd dist/macos
+            shasum -a 256 \
+              Ottto-macos-*.dmg \
+              ottto-macos-*.zip \
+              ottto-service-macos-*.zip \
+              ottto-local-platform-sbom.cdx.json \
+              release-manifest.json > subject.checksums.txt
+          )
+
+      - name: Create provenance attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+
+      - name: Create SBOM attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+
+      - name: Bind verified attestation metadata
+        run: |
+          set -euo pipefail
+          scripts/macos_attestation_bind.sh \
+            --manifest dist/macos/release-manifest.json \
+            --subject-checksums dist/macos/subject.checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow .github/workflows/macos-stable-release.yml
+
+      - name: Regenerate checksums for bound manifest
+        run: |
+          set -euo pipefail
+          (
+            cd dist/macos
+            shasum -a 256 \
+              Ottto-macos-*.dmg \
+              ottto-macos-*.zip \
+              ottto-service-macos-*.zip \
+              ottto-local-platform-sbom.cdx.json \
+              release-manifest.json > subject.checksums.txt
+          )
+
+      - name: Create final provenance attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+
+      - name: Create final SBOM attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-checksums: dist/macos/subject.checksums.txt
+          sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
+
+      - name: Verify final attestations and manifest binding
+        run: |
+          set -euo pipefail
+          scripts/macos_attestation_bind.sh \
+            --manifest dist/macos/release-manifest.json \
+            --subject-checksums dist/macos/subject.checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow .github/workflows/macos-stable-release.yml
+          scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
+
+      - name: Generate stable install artifacts
+        if: inputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          scripts/homebrew_formula.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/homebrew/ottto.rb
+          scripts/hosted_native_installer.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/install-macos.sh
+
+      - name: Sign and verify release manifest
+        run: |
+          set -euo pipefail
+          scripts/macos_manifest_signature.sh sign \
+            --manifest dist/macos/release-manifest.json \
+            --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"
+          scripts/macos_manifest_signature.sh verify \
+            --manifest dist/macos/release-manifest.json
+
+      - name: Run stable preflight
+        if: inputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          scripts/macos_stable_preflight.sh \
+            --manifest dist/macos/release-manifest.json \
+            --sign-identity "$OTTTO_MACOS_CODESIGN_IDENTITY" \
+            --keychain-profile "$OTTTO_NOTARY_PROFILE"
+
+      - name: Upload release workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}
+          if-no-files-found: error
+          path: |
+            dist/macos/Ottto-macos-*.dmg
+            dist/macos/ottto-macos-*.zip
+            dist/macos/ottto-service-macos-*.zip
+            dist/macos/ottto-local-platform-sbom.cdx.json
+            dist/macos/release-manifest.json
+            dist/macos/release-manifest.json.sig
+            dist/macos/subject.checksums.txt
+            dist/macos/install-macos.sh
+            dist/macos/homebrew/ottto.rb
