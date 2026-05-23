@@ -269,9 +269,15 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
   sign_code() {
     codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$1"
   }
+  sign_container() {
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$1"
+  }
   SIGNED="true"
 else
   sign_code() {
+    codesign --force --sign - "$1"
+  }
+  sign_container() {
     codesign --force --sign - "$1"
   }
 fi
@@ -296,6 +302,7 @@ mkdir -p "$DMG_STAGING"
 ditto "$APP_BUNDLE" "$DMG_STAGING/Ottto.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 hdiutil create -volname "Ottto" -srcfolder "$DMG_STAGING" -ov -format UDZO "$APP_DMG" >/dev/null
+sign_container "$APP_DMG"
 rm -rf "$DMG_STAGING"
 CLI_ZIP="$OUTPUT_DIR/ottto-macos-$ARCH.zip"
 DAEMON_ZIP="$OUTPUT_DIR/ottto-service-macos-$ARCH.zip"

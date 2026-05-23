@@ -5,6 +5,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+if ! grep -Fq "sign_container \"\$APP_DMG\"" "$ROOT/scripts/macos_package.sh"; then
+  echo "Package script must code-sign the DMG before notarization." >&2
+  exit 1
+fi
+if ! grep -Fq "codesign --force --timestamp --sign \"\$SIGN_IDENTITY\" \"\$1\"" "$ROOT/scripts/macos_package.sh"; then
+  echo "Package script must use Developer ID timestamp signing for container artifacts." >&2
+  exit 1
+fi
+
 repo="$TMP_DIR/public-ottto"
 mkdir -p "$repo/scripts" "$repo/crates/ottto-protocol/src"
 cp "$ROOT/scripts/macos_package.sh" "$repo/scripts/macos_package.sh"
