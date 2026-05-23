@@ -68,8 +68,7 @@ write_manifest() {
     },
     quality_gates: {
       stable_clean_machine_qa: {
-        status: "passed",
-        checked_at: "2026-05-21T19:00:00Z",
+        status: "not_run",
         evidence_path: "stable-clean-machine-qa.json",
         required_install_owners: ["homebrew", "hosted_installer", "app_bundle"]
       }

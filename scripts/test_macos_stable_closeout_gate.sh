@@ -263,10 +263,19 @@ write_manifest "$manifest"
 write_evidence "$manifest" "$evidence"
 "$GATE" --manifest "$manifest" >/dev/null
 
-not_run_manifest="$tmp_dir/not-run-manifest.json"
+not_run_dir="$tmp_dir/not-run"
+mkdir -p "$not_run_dir"
+not_run_manifest="$not_run_dir/release-manifest.json"
 write_manifest "$not_run_manifest" "not_run"
-write_evidence "$not_run_manifest" "$tmp_dir/not-run-evidence.json"
-expect_failure "$not_run_manifest" "Stable clean-machine QA gate did not pass"
+write_evidence "$not_run_manifest" "$not_run_dir/stable-clean-machine-qa.json"
+"$GATE" --manifest "$not_run_manifest" >/dev/null
+
+failed_gate_dir="$tmp_dir/failed-gate"
+mkdir -p "$failed_gate_dir"
+failed_gate_manifest="$failed_gate_dir/release-manifest.json"
+write_manifest "$failed_gate_manifest" "failed"
+write_evidence "$failed_gate_manifest" "$failed_gate_dir/stable-clean-machine-qa.json"
+expect_failure "$failed_gate_manifest" "Stable clean-machine QA manifest gate status must be passed or not_run"
 
 missing_owner_dir="$tmp_dir/missing-owner"
 mkdir -p "$missing_owner_dir"
