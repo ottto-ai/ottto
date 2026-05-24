@@ -14,7 +14,7 @@ use toml_edit::{DocumentMut, Item};
 
 pub const COLLECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v12";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v13";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v5";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v4";
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 1_000;
@@ -47,7 +47,10 @@ impl SnapshotSource {
 
     pub fn default_roots(self, home: &Path) -> Vec<PathBuf> {
         match self {
-            SnapshotSource::Codex => vec![home.join(".codex").join("sessions")],
+            SnapshotSource::Codex => vec![
+                home.join(".codex").join("sessions"),
+                home.join(".codex").join("archived_sessions"),
+            ],
             SnapshotSource::ClaudeCode => vec![home.join(".claude").join("projects")],
             SnapshotSource::Pi => {
                 if let Some(override_dir) = std::env::var_os("PI_CODING_AGENT_DIR") {
@@ -80,6 +83,8 @@ pub struct SnapshotItem {
     pub cache_creation_5m_tokens: u64,
     pub cache_creation_1h_tokens: u64,
     pub reasoning_output_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unattributed_total_tokens: u64,
     pub request_count: u64,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub activity_buckets: Vec<SnapshotActivityBucket>,
@@ -115,6 +120,8 @@ pub struct SnapshotModelUsage {
     pub cache_creation_5m_tokens: u64,
     pub cache_creation_1h_tokens: u64,
     pub reasoning_output_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub unattributed_total_tokens: u64,
     pub request_count: u64,
     pub selector_context: BTreeMap<String, String>,
     pub selector_sources: BTreeMap<String, String>,
@@ -125,6 +132,14 @@ pub struct SnapshotProvenance {
     pub collector: String,
     pub source_file_count: u64,
     pub input_token_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_archived: Option<bool>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,6 +220,7 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
         "cache_creation_1h_tokens": item.cache_creation_1h_tokens,
         "reasoning_output_tokens": item.reasoning_output_tokens,
+        "unattributed_total_tokens": item.unattributed_total_tokens,
         "request_count": item.request_count,
         "model_usage": &item.model_usage,
         "activity_buckets": &item.activity_buckets,
@@ -224,6 +240,7 @@ struct UsageTotals {
     cache_creation_5m_tokens: u64,
     cache_creation_1h_tokens: u64,
     reasoning_output_tokens: u64,
+    unattributed_total_tokens: u64,
     request_count: u64,
 }
 
@@ -238,6 +255,7 @@ impl UsageTotals {
             + self.cache_read_tokens
             + self.cache_creation_5m_tokens
             + self.cache_creation_1h_tokens
+            + self.unattributed_total_tokens
     }
 
     fn add(&mut self, other: &UsageTotals) {
@@ -247,6 +265,7 @@ impl UsageTotals {
         self.cache_creation_5m_tokens += other.cache_creation_5m_tokens;
         self.cache_creation_1h_tokens += other.cache_creation_1h_tokens;
         self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.unattributed_total_tokens += other.unattributed_total_tokens;
         self.request_count += other.request_count;
     }
 
@@ -257,6 +276,7 @@ impl UsageTotals {
             && self.cache_creation_5m_tokens >= previous.cache_creation_5m_tokens
             && self.cache_creation_1h_tokens >= previous.cache_creation_1h_tokens
             && self.reasoning_output_tokens >= previous.reasoning_output_tokens
+            && self.unattributed_total_tokens >= previous.unattributed_total_tokens
             && self.request_count >= previous.request_count
     }
 
@@ -271,6 +291,8 @@ impl UsageTotals {
                 - previous.cache_creation_1h_tokens,
             reasoning_output_tokens: self.reasoning_output_tokens
                 - previous.reasoning_output_tokens,
+            unattributed_total_tokens: self.unattributed_total_tokens
+                - previous.unattributed_total_tokens,
             request_count: self.request_count - previous.request_count,
         }
     }
@@ -328,6 +350,7 @@ struct ActivityBucketAccumulator {
 #[derive(Debug, Clone, Default)]
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
+    state_threads: BTreeMap<String, CodexStateThread>,
     sidecar_fingerprint: String,
     default_selector: SelectorCapture,
 }
@@ -336,6 +359,16 @@ struct CodexTitleMetadata {
 struct CodexTitleCandidate {
     title: String,
     source: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexStateThread {
+    title: Option<String>,
+    tokens_used: u64,
+    archived: bool,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -622,6 +655,7 @@ impl SnapshotAccumulator {
                 cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
                 cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
                 reasoning_output_tokens: row.usage.reasoning_output_tokens,
+                unattributed_total_tokens: row.usage.unattributed_total_tokens,
                 request_count: row.usage.request_count,
                 selector_context: row.selector_context,
                 selector_sources: row.selector_sources,
@@ -647,6 +681,7 @@ impl SnapshotAccumulator {
             cache_creation_5m_tokens: self.totals.cache_creation_5m_tokens,
             cache_creation_1h_tokens: self.totals.cache_creation_1h_tokens,
             reasoning_output_tokens: self.totals.reasoning_output_tokens,
+            unattributed_total_tokens: self.totals.unattributed_total_tokens,
             request_count,
             model_usage,
             activity_buckets,
@@ -672,6 +707,8 @@ impl SnapshotAccumulator {
                     SnapshotSource::ClaudeCode => Some("uncached".to_string()),
                     SnapshotSource::Pi => Some("uncached".to_string()),
                 },
+                state_total_tokens: None,
+                state_archived: None,
             },
         };
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
@@ -716,7 +753,7 @@ pub fn scan_source_roots(
         }
         scanned_file_count += 1;
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
-        let parsed = match source {
+        let mut parsed = match source {
             SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata(
                 &candidate.path,
                 collected_at,
@@ -734,6 +771,11 @@ pub fn scan_source_roots(
                 source_file_fingerprint.clone(),
             )?,
         };
+        if source == SnapshotSource::Codex {
+            if let Some(snapshot) = parsed.as_mut() {
+                apply_codex_state_evidence(snapshot, &codex_title_metadata);
+            }
+        }
         let last_snapshot_fingerprint = parsed
             .as_ref()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
@@ -741,6 +783,9 @@ pub fn scan_source_roots(
         if let Some(snapshot) = parsed {
             snapshots.push(snapshot);
         }
+    }
+    if source == SnapshotSource::Codex {
+        append_codex_state_only_snapshots(&mut snapshots, &codex_title_metadata, collected_at);
     }
     Ok(SourceScanResult {
         source,
@@ -753,6 +798,103 @@ pub fn scan_source_roots(
         scanned_session_count: snapshots.len(),
         snapshots,
     })
+}
+
+fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
+    let Some(thread) = metadata.state_threads.get(item.source_session_id.as_str()) else {
+        return;
+    };
+    if thread.tokens_used == 0 {
+        return;
+    }
+    item.provenance.state_total_tokens = Some(thread.tokens_used);
+    item.provenance.state_archived = Some(thread.archived);
+    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
+}
+
+fn append_codex_state_only_snapshots(
+    snapshots: &mut Vec<SnapshotItem>,
+    metadata: &CodexTitleMetadata,
+    collected_at: &str,
+) {
+    let covered_session_ids: BTreeSet<String> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.source_session_id.clone())
+        .collect();
+    for (source_session_id, thread) in &metadata.state_threads {
+        if thread.tokens_used == 0 || covered_session_ids.contains(source_session_id) {
+            continue;
+        }
+        snapshots.push(codex_state_only_snapshot(
+            source_session_id,
+            thread,
+            collected_at,
+        ));
+    }
+}
+
+fn codex_state_only_snapshot(
+    source_session_id: &str,
+    thread: &CodexStateThread,
+    collected_at: &str,
+) -> SnapshotItem {
+    let model = thread
+        .model
+        .clone()
+        .and_then(normalize_title)
+        .unwrap_or_else(|| "unknown".to_string());
+    let display_name = thread
+        .title
+        .clone()
+        .and_then(|title| normalize_display_title(title, "session_index"));
+    let model_usage = vec![SnapshotModelUsage {
+        model,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        unattributed_total_tokens: thread.tokens_used,
+        request_count: 0,
+        selector_context: BTreeMap::new(),
+        selector_sources: BTreeMap::new(),
+    }];
+    let has_display_name = display_name.is_some();
+    let mut item = SnapshotItem {
+        source_session_id: source_session_id.to_string(),
+        snapshot_fingerprint: String::new(),
+        status: "final".to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        unattributed_total_tokens: thread.tokens_used,
+        request_count: 0,
+        model_usage,
+        activity_buckets: Vec::new(),
+        session_display_name: display_name,
+        session_display_name_source: has_display_name.then(|| "session_index".to_string()),
+        source_started_at: thread.created_at.clone(),
+        source_ended_at: None,
+        source_last_activity_at: thread.updated_at.clone(),
+        collected_at: collected_at.to_string(),
+        workspace_hash: None,
+        workspace_display_label: None,
+        workspace_label_source: None,
+        source_file_fingerprint: None,
+        provenance: SnapshotProvenance {
+            collector: "codex_state_sqlite".to_string(),
+            source_file_count: 1,
+            input_token_scope: Some("total_only".to_string()),
+            state_total_tokens: Some(thread.tokens_used),
+            state_archived: Some(thread.archived),
+        },
+    };
+    item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
+    item
 }
 
 pub fn parse_codex_jsonl_file(
@@ -1322,6 +1464,7 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
             .unwrap_or_default(),
         cache_creation_1h_tokens: 0,
         reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
+        unattributed_total_tokens: 0,
         request_count: u64_at(root, &["request_count"])
             .or_else(|| u64_at(root, &["requests"]))
             .unwrap_or(1),
@@ -1474,6 +1617,7 @@ fn pi_message_end_usage(value: &Value) -> Option<UsageTotals> {
         cache_creation_5m_tokens: cache_5m,
         cache_creation_1h_tokens: cache_1h,
         reasoning_output_tokens: u64_at(usage, &["reasoning"]).unwrap_or_default(),
+        unattributed_total_tokens: 0,
         request_count: 1,
     };
     Some(totals)
@@ -1519,6 +1663,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         cache_creation_5m_tokens: cache_5m,
         cache_creation_1h_tokens: cache_1h,
         reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
+        unattributed_total_tokens: 0,
         request_count: 1,
     };
     Some(usage)
@@ -1579,6 +1724,7 @@ impl CodexTitleMetadata {
             let state_path = codex_dir.join("state_5.sqlite");
             sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
             load_codex_sqlite_titles(&state_path, &mut metadata.titles);
+            load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
 
             let index_path = codex_dir.join("session_index.jsonl");
             sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
@@ -1634,6 +1780,89 @@ fn load_codex_sqlite_titles(path: &Path, titles: &mut BTreeMap<String, CodexTitl
     for row in rows.flatten() {
         insert_codex_sidecar_title(titles, row.0, Some(row.1), "session_index", false);
     }
+}
+
+fn load_codex_sqlite_state_threads(
+    path: &Path,
+    state_threads: &mut BTreeMap<String, CodexStateThread>,
+) {
+    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return;
+    };
+    let columns = sqlite_table_columns(&connection, "threads");
+    if !columns.contains("id") || !columns.contains("tokens_used") {
+        return;
+    }
+
+    let sql = format!(
+        "SELECT id, {}, {}, {}, {}, {}, {}, {}, {} FROM threads WHERE tokens_used > 0",
+        sqlite_select_expr(&columns, "title", "NULL"),
+        sqlite_select_expr(&columns, "tokens_used", "0"),
+        sqlite_select_expr(&columns, "archived", "0"),
+        sqlite_select_expr(&columns, "created_at", "NULL"),
+        sqlite_select_expr(&columns, "updated_at", "NULL"),
+        sqlite_select_expr(&columns, "created_at_ms", "NULL"),
+        sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
+        sqlite_select_expr(&columns, "model", "NULL"),
+    );
+    let Ok(mut statement) = connection.prepare(sql.as_str()) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let title: Option<String> = row.get(1)?;
+        let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2).unwrap_or_default());
+        let archived = row.get::<_, i64>(3).unwrap_or_default() != 0;
+        let created_at =
+            codex_state_timestamp(row.get(6).ok().flatten(), row.get(4).ok().flatten());
+        let updated_at =
+            codex_state_timestamp(row.get(7).ok().flatten(), row.get(5).ok().flatten());
+        let model: Option<String> = row.get(8)?;
+        Ok((
+            id,
+            CodexStateThread {
+                title,
+                tokens_used,
+                archived,
+                created_at,
+                updated_at,
+                model,
+            },
+        ))
+    }) else {
+        return;
+    };
+    for (id, thread) in rows.flatten() {
+        state_threads.insert(id, thread);
+    }
+}
+
+fn sqlite_table_columns(connection: &Connection, table_name: &str) -> BTreeSet<String> {
+    let Ok(mut statement) = connection.prepare(format!("PRAGMA table_info({table_name})").as_str())
+    else {
+        return BTreeSet::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+        return BTreeSet::new();
+    };
+    rows.flatten().collect()
+}
+
+fn sqlite_select_expr(columns: &BTreeSet<String>, column: &str, fallback: &str) -> String {
+    if columns.contains(column) {
+        column.to_string()
+    } else {
+        format!("{fallback} AS {column}")
+    }
+}
+
+fn non_negative_i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
+}
+
+fn codex_state_timestamp(ms: Option<i64>, seconds: Option<i64>) -> Option<String> {
+    let timestamp_ms = ms.or_else(|| seconds.map(|value| value.saturating_mul(1_000)))?;
+    Some(format_rfc3339_millis(timestamp_ms))
 }
 
 fn load_codex_config_selector(path: &Path) -> SelectorCapture {
@@ -2261,6 +2490,72 @@ mod tests {
     }
 
     #[test]
+    fn codex_default_roots_include_active_and_archived_sessions() {
+        let home = temp_dir("codex-default-roots");
+        let roots = SnapshotSource::Codex.default_roots(&home);
+
+        assert_eq!(
+            roots,
+            vec![
+                home.join(".codex").join("sessions"),
+                home.join(".codex").join("archived_sessions"),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_scan_reads_active_and_archived_session_roots() {
+        let codex_dir = temp_dir("codex-active-archived");
+        let sessions_dir = codex_dir.join("sessions");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::create_dir_all(&archived_dir).expect("create archived dir");
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-14T10-00-00-019e253c-aaaa-7000-9000-aaaaaaaaaaaa.jsonl",
+            ),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-aaaa-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":5},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write active fixture");
+        fs::write(
+            archived_dir.join(
+                "rollout-2026-05-14T11-00-00-019e253c-bbbb-7000-9000-bbbbbbbbbbbb.jsonl",
+            ),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T11:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-bbbb-7000-9000-bbbbbbbbbbbb\"}}\n",
+                "{\"timestamp\":\"2026-05-14T11:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":6},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write archived fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &[sessions_dir, archived_dir],
+            &mut index,
+            "2026-05-14T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+
+        let session_ids: BTreeSet<_> = scan
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.as_str())
+            .collect();
+        assert_eq!(scan.snapshots.len(), 2);
+        assert!(session_ids.contains("019e253c-aaaa-7000-9000-aaaaaaaaaaaa"));
+        assert!(session_ids.contains("019e253c-bbbb-7000-9000-bbbbbbbbbbbb"));
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
     fn codex_parser_extracts_current_jsonl_shape_without_prompts() {
         let path = temp_file("codex");
         fs::write(
@@ -2494,6 +2789,124 @@ mod tests {
         assert_eq!(
             item.session_display_name_source.as_deref(),
             Some("session_index")
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn codex_state_sqlite_supplies_total_only_fallback_snapshots() {
+        let codex_dir = temp_dir("codex-state-total-only");
+        let sessions_dir = codex_dir.join("sessions");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::create_dir_all(&archived_dir).expect("create archived dir");
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-14T10-00-00-019e253c-7777-7000-9000-aaaaaaaaaaaa.jsonl",
+            ),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-7777-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":6},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(
+                concat!(
+                    "CREATE TABLE threads (",
+                    "id TEXT PRIMARY KEY, title TEXT NOT NULL, tokens_used INTEGER NOT NULL, ",
+                    "archived INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ",
+                    "created_at_ms INTEGER, updated_at_ms INTEGER, model TEXT)",
+                ),
+                [],
+            )
+            .expect("create threads");
+        connection
+            .execute(
+                concat!(
+                    "INSERT INTO threads (id, title, tokens_used, archived, created_at, updated_at, ",
+                    "created_at_ms, updated_at_ms, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                ),
+                (
+                    "019e253c-7777-7000-9000-aaaaaaaaaaaa",
+                    "Matched JSONL",
+                    37_i64,
+                    0_i64,
+                    1_777_777_000_i64,
+                    1_777_777_100_i64,
+                    1_777_777_000_000_i64,
+                    1_777_777_100_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert matched thread");
+        connection
+            .execute(
+                concat!(
+                    "INSERT INTO threads (id, title, tokens_used, archived, created_at, updated_at, ",
+                    "created_at_ms, updated_at_ms, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                ),
+                (
+                    "019e253c-8888-7000-9000-bbbbbbbbbbbb",
+                    "Archived State Only",
+                    1_234_i64,
+                    1_i64,
+                    1_777_777_200_i64,
+                    1_777_777_300_i64,
+                    1_777_777_200_000_i64,
+                    1_777_777_300_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert state-only thread");
+        drop(connection);
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &[sessions_dir, archived_dir],
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+
+        assert_eq!(scan.snapshots.len(), 2);
+        let matched = scan
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == "019e253c-7777-7000-9000-aaaaaaaaaaaa")
+            .expect("matched snapshot");
+        assert_eq!(matched.input_tokens, 30);
+        assert_eq!(matched.unattributed_total_tokens, 0);
+        assert_eq!(matched.provenance.state_total_tokens, Some(37));
+        assert_eq!(matched.provenance.state_archived, Some(false));
+
+        let state_only = scan
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == "019e253c-8888-7000-9000-bbbbbbbbbbbb")
+            .expect("state-only snapshot");
+        assert_eq!(state_only.input_tokens, 0);
+        assert_eq!(state_only.output_tokens, 0);
+        assert_eq!(state_only.cache_read_tokens, 0);
+        assert_eq!(state_only.unattributed_total_tokens, 1_234);
+        assert_eq!(state_only.model_usage[0].unattributed_total_tokens, 1_234);
+        assert_eq!(
+            state_only.provenance.collector.as_str(),
+            "codex_state_sqlite"
+        );
+        assert_eq!(
+            state_only.provenance.input_token_scope.as_deref(),
+            Some("total_only")
+        );
+        assert_eq!(state_only.provenance.state_archived, Some(true));
+        assert_eq!(state_only.source_file_fingerprint, None);
+        assert_eq!(
+            state_only.session_display_name.as_deref(),
+            Some("Archived State Only")
         );
 
         let _ = fs::remove_dir_all(codex_dir);
