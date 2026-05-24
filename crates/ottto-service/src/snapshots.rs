@@ -9,13 +9,14 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub const COLLECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SNAPSHOT_SCHEMA_VERSION: u16 = 4;
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v10";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v3";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v3";
+pub const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v12";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v5";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v4";
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 1_000;
 pub const BACKFILL_WINDOW_DAYS: u64 = 183;
 
@@ -81,6 +82,7 @@ pub struct SnapshotItem {
     pub reasoning_output_tokens: u64,
     pub request_count: u64,
     pub model_usage: Vec<SnapshotModelUsage>,
+    pub activity_buckets: Vec<SnapshotActivityBucket>,
     pub session_display_name: Option<String>,
     pub session_display_name_source: Option<String>,
     pub source_started_at: Option<String>,
@@ -94,6 +96,14 @@ pub struct SnapshotItem {
     pub workspace_label_source: Option<String>,
     pub source_file_fingerprint: Option<String>,
     pub provenance: SnapshotProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotActivityBucket {
+    pub bucket_start: String,
+    pub request_count: u64,
+    pub first_activity_at: Option<String>,
+    pub last_activity_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +207,7 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "reasoning_output_tokens": item.reasoning_output_tokens,
         "request_count": item.request_count,
         "model_usage": &item.model_usage,
+        "activity_buckets": &item.activity_buckets,
         "title": &item.session_display_name,
         "title_source": &item.session_display_name_source,
         "workspace_display_label": &item.workspace_display_label,
@@ -307,6 +318,13 @@ struct ModelSelectorUsage {
     usage: UsageTotals,
 }
 
+#[derive(Debug, Clone)]
+struct ActivityBucketAccumulator {
+    request_count: u64,
+    first_activity_at: String,
+    last_activity_at: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
@@ -336,6 +354,7 @@ struct SnapshotAccumulator {
     latest_cumulative_usage: Option<UsageTotals>,
     totals: UsageTotals,
     model_usage: BTreeMap<(String, String), ModelSelectorUsage>,
+    activity_buckets: BTreeMap<String, ActivityBucketAccumulator>,
 }
 
 impl SnapshotAccumulator {
@@ -355,6 +374,7 @@ impl SnapshotAccumulator {
             latest_cumulative_usage: None,
             totals: UsageTotals::default(),
             model_usage: BTreeMap::new(),
+            activity_buckets: BTreeMap::new(),
         }
     }
 
@@ -382,6 +402,47 @@ impl SnapshotAccumulator {
         {
             self.last_activity_at = Some(timestamp);
         }
+    }
+
+    fn note_activity(&mut self, timestamp: Option<String>, request_count: u64) {
+        if request_count == 0 {
+            return;
+        }
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+        let Some((bucket_start, normalized_timestamp)) = activity_bucket_from_timestamp(&timestamp)
+        else {
+            return;
+        };
+        match self.activity_buckets.get_mut(&bucket_start) {
+            Some(bucket) => {
+                bucket.request_count += request_count;
+                if normalized_timestamp < bucket.first_activity_at {
+                    bucket.first_activity_at = normalized_timestamp.clone();
+                }
+                if normalized_timestamp > bucket.last_activity_at {
+                    bucket.last_activity_at = normalized_timestamp;
+                }
+            }
+            None => {
+                self.activity_buckets.insert(
+                    bucket_start,
+                    ActivityBucketAccumulator {
+                        request_count,
+                        first_activity_at: normalized_timestamp.clone(),
+                        last_activity_at: normalized_timestamp,
+                    },
+                );
+            }
+        }
+    }
+
+    fn activity_bucket_request_count(&self) -> u64 {
+        self.activity_buckets
+            .values()
+            .map(|bucket| bucket.request_count)
+            .sum()
     }
 
     fn set_title(&mut self, title: Option<String>, source: &str) {
@@ -493,9 +554,9 @@ impl SnapshotAccumulator {
         model: Option<String>,
         usage: UsageTotals,
         selector: SelectorCapture,
-    ) {
+    ) -> Option<UsageTotals> {
         if usage.is_zero() {
-            return;
+            return None;
         }
         let model = model
             .or_else(|| self.latest_model.clone())
@@ -512,14 +573,15 @@ impl SnapshotAccumulator {
         self.latest_cumulative_usage = Some(usage.clone());
         self.totals = usage;
         if delta.is_zero() {
-            return;
+            return None;
         }
         let selector = if selector.is_empty() {
             self.current_selector.clone()
         } else {
             selector
         };
-        self.add_model_usage(model, selector, delta);
+        self.add_model_usage(model, selector, delta.clone());
+        Some(delta)
     }
 
     fn into_item(
@@ -528,6 +590,12 @@ impl SnapshotAccumulator {
         collected_at: &str,
         source_file_fingerprint: String,
     ) -> Option<SnapshotItem> {
+        let activity_request_count = self.activity_bucket_request_count();
+        let request_count = if activity_request_count > 0 {
+            activity_request_count
+        } else {
+            self.totals.request_count
+        };
         let source_session_id = self
             .source_session_id
             .or_else(|| {
@@ -559,6 +627,16 @@ impl SnapshotAccumulator {
                 selector_sources: row.selector_sources,
             })
             .collect();
+        let activity_buckets: Vec<SnapshotActivityBucket> = self
+            .activity_buckets
+            .into_iter()
+            .map(|(bucket_start, bucket)| SnapshotActivityBucket {
+                bucket_start,
+                request_count: bucket.request_count,
+                first_activity_at: Some(bucket.first_activity_at),
+                last_activity_at: Some(bucket.last_activity_at),
+            })
+            .collect();
         let mut item = SnapshotItem {
             source_session_id,
             snapshot_fingerprint: String::new(),
@@ -569,8 +647,9 @@ impl SnapshotAccumulator {
             cache_creation_5m_tokens: self.totals.cache_creation_5m_tokens,
             cache_creation_1h_tokens: self.totals.cache_creation_1h_tokens,
             reasoning_output_tokens: self.totals.reasoning_output_tokens,
-            request_count: self.totals.request_count,
+            request_count,
             model_usage,
+            activity_buckets,
             session_display_name: self.title,
             session_display_name_source: self.title_source,
             source_started_at: self.started_at,
@@ -1084,11 +1163,10 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             .or_else(|| string_at(value, &["session_id"]))
             .or_else(|| string_at(value, &["sessionId"]));
     }
-    accumulator.note_time(
-        string_at(value, &["timestamp"])
-            .or_else(|| string_at(value, &["time"]))
-            .or_else(|| string_at(value, &["created_at"])),
-    );
+    let timestamp = string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["time"]))
+        .or_else(|| string_at(value, &["created_at"]));
+    accumulator.note_time(timestamp.clone());
     accumulator.set_title(codex_transcript_title(value), "transcript_title");
     accumulator.set_first_prompt_title(codex_first_user_prompt(value));
     accumulator.set_model(
@@ -1104,14 +1182,22 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
     if let Some(usage) = codex_total_usage(value) {
-        accumulator.set_cumulative_usage_with_selector(
+        let has_explicit_request_count = codex_total_usage_has_request_count(value);
+        if let Some(delta) = accumulator.set_cumulative_usage_with_selector(
             string_at(value, &["token_count", "info", "model"])
                 .or_else(|| string_at(value, &["payload", "info", "model"]))
                 .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
             selector,
-        );
+        ) {
+            let activity_request_count = if has_explicit_request_count {
+                delta.request_count
+            } else {
+                1
+            };
+            accumulator.note_activity(timestamp, activity_request_count);
+        }
     }
 }
 
@@ -1178,11 +1264,10 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["session_id"]))
             .or_else(|| string_at(value, &["conversation_id"]));
     }
-    accumulator.note_time(
-        string_at(value, &["timestamp"])
-            .or_else(|| string_at(value, &["created_at"]))
-            .or_else(|| string_at(value, &["message", "created_at"])),
-    );
+    let timestamp = string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["created_at"]))
+        .or_else(|| string_at(value, &["message", "created_at"]));
+    accumulator.note_time(timestamp.clone());
     accumulator.set_title(
         string_at(value, &["summary"])
             .or_else(|| string_at(value, &["title"]))
@@ -1200,6 +1285,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["workspace"])),
     );
     if let Some(usage) = claude_code_delta_usage(value) {
+        let request_count = usage.request_count;
         accumulator.add_usage_with_selector(
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
@@ -1207,6 +1293,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             usage,
             claude_code_selector_from_line(value),
         );
+        accumulator.note_activity(timestamp, request_count);
     }
 }
 
@@ -1245,6 +1332,20 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
     Some(usage)
 }
 
+fn codex_total_usage_has_request_count(value: &Value) -> bool {
+    let Some(root) = value
+        .pointer("/token_count/info/total_token_usage")
+        .or_else(|| value.pointer("/payload/info/total_token_usage"))
+        .or_else(|| value.pointer("/payload/total_token_usage"))
+        .or_else(|| value.pointer("/total_token_usage"))
+    else {
+        return false;
+    };
+    u64_at(root, &["request_count"])
+        .or_else(|| u64_at(root, &["requests"]))
+        .is_some()
+}
+
 fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     let event_type = string_at(value, &["type"]);
     match event_type.as_deref() {
@@ -1272,14 +1373,17 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             accumulator.note_time(pi_timestamp_field(value));
         }
         Some("message_end") => {
+            let timestamp = pi_message_end_timestamp(value);
             let model = string_at(value, &["message", "model"]);
             accumulator.set_model(model.clone());
             if let Some(usage) = pi_message_end_usage(value) {
+                let request_count = usage.request_count;
                 let mut selector = accumulator.current_selector.clone();
                 selector.merge(pi_selector_from_message_end(value));
                 accumulator.add_usage_with_selector(model, usage, selector);
+                accumulator.note_activity(timestamp.clone(), request_count);
             }
-            accumulator.note_time(pi_message_end_timestamp(value));
+            accumulator.note_time(timestamp);
         }
         _ => {}
     }
@@ -1324,6 +1428,18 @@ fn format_rfc3339_millis(ms: i64) -> String {
     let second = time_of_day % 60;
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
+    let parsed = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    let utc = parsed.to_offset(time::UtcOffset::UTC);
+    let bucket_seconds = utc.unix_timestamp().div_euclid(3600) * 3600;
+    let bucket_start = OffsetDateTime::from_unix_timestamp(bucket_seconds)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()?;
+    let normalized_timestamp = utc.format(&Rfc3339).ok()?;
+    Some((bucket_start, normalized_timestamp))
 }
 
 // Howard Hinnant's civil_from_days. Returns (year, month, day) from days since 1970-01-01.
@@ -2178,12 +2294,65 @@ mod tests {
         assert_eq!(item.cache_read_tokens, 40);
         assert_eq!(item.output_tokens, 25);
         assert_eq!(item.reasoning_output_tokens, 7);
+        assert_eq!(item.request_count, 3);
+        assert_eq!(
+            item.activity_buckets,
+            vec![SnapshotActivityBucket {
+                bucket_start: "2026-05-06T10:00:00Z".to_string(),
+                request_count: 3,
+                first_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
+                last_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
+            }]
+        );
         assert_eq!(item.model_usage[0].model, "gpt-5.5");
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
             Some("inclusive_cached")
         );
         assert!(item.workspace_hash.is_some());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_uses_observed_usage_events_when_request_count_is_missing() {
+        let path = temp_file("codex-observed-activity");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-2222-7580-afe7-e8d4f969b0f7\"}}\n",
+                "{\"timestamp\":\"2026-05-06T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":40,\"output_tokens\":25},\"model_context_window\":258400}}}\n",
+                "{\"timestamp\":\"2026-05-06T11:04:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":150,\"cached_input_tokens\":60,\"output_tokens\":35},\"model_context_window\":258400}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-06T11:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .expect("snapshot");
+
+        assert_eq!(item.request_count, 2);
+        assert_eq!(
+            item.activity_buckets,
+            vec![
+                SnapshotActivityBucket {
+                    bucket_start: "2026-05-06T10:00:00Z".to_string(),
+                    request_count: 1,
+                    first_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
+                    last_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
+                },
+                SnapshotActivityBucket {
+                    bucket_start: "2026-05-06T11:00:00Z".to_string(),
+                    request_count: 1,
+                    first_activity_at: Some("2026-05-06T11:04:00Z".to_string()),
+                    last_activity_at: Some("2026-05-06T11:04:00Z".to_string()),
+                },
+            ]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -2564,6 +2733,15 @@ mod tests {
         assert_eq!(item.input_tokens, 300);
         assert_eq!(item.output_tokens, 90);
         assert_eq!(item.request_count, 2);
+        assert_eq!(
+            item.activity_buckets,
+            vec![SnapshotActivityBucket {
+                bucket_start: "2026-05-19T10:00:00Z".to_string(),
+                request_count: 2,
+                first_activity_at: Some("2026-05-19T10:02:00Z".to_string()),
+                last_activity_at: Some("2026-05-19T10:03:00Z".to_string()),
+            }]
+        );
         assert_eq!(item.model_usage.len(), 2);
         let standard = item
             .model_usage
@@ -2820,10 +2998,94 @@ mod tests {
         assert_eq!(item.cache_creation_1h_tokens, 0);
         assert_eq!(item.output_tokens, 14);
         assert_eq!(item.request_count, 2);
+        assert_eq!(
+            item.activity_buckets,
+            vec![SnapshotActivityBucket {
+                bucket_start: "2026-05-06T10:00:00Z".to_string(),
+                request_count: 2,
+                first_activity_at: Some("2026-05-06T10:01:00Z".to_string()),
+                last_activity_at: Some("2026-05-06T10:02:00Z".to_string()),
+            }]
+        );
         assert_eq!(item.model_usage[0].model, "claude-sonnet-4-6");
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
             Some("uncached")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_activity_count_includes_zero_token_usage_events() {
+        let path = temp_file("claude-zero-token-activity");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-zero\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-05-06T10:02:00Z\",\"sessionId\":\"claude-session-zero\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-06T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .expect("snapshot");
+
+        assert_eq!(item.request_count, 2);
+        assert_eq!(
+            item.activity_buckets,
+            vec![SnapshotActivityBucket {
+                bucket_start: "2026-05-06T10:00:00Z".to_string(),
+                request_count: 2,
+                first_activity_at: Some("2026-05-06T10:01:00Z".to_string()),
+                last_activity_at: Some("2026-05-06T10:02:00Z".to_string()),
+            }]
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_builds_distinct_hourly_activity_buckets() {
+        let path = temp_file("claude-activity-buckets");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:59:59Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-05-06T11:00:01Z\",\"sessionId\":\"claude-session-buckets\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-06T11:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .expect("snapshot");
+
+        assert_eq!(
+            item.activity_buckets,
+            vec![
+                SnapshotActivityBucket {
+                    bucket_start: "2026-05-06T10:00:00Z".to_string(),
+                    request_count: 1,
+                    first_activity_at: Some("2026-05-06T10:59:59Z".to_string()),
+                    last_activity_at: Some("2026-05-06T10:59:59Z".to_string()),
+                },
+                SnapshotActivityBucket {
+                    bucket_start: "2026-05-06T11:00:00Z".to_string(),
+                    request_count: 1,
+                    first_activity_at: Some("2026-05-06T11:00:01Z".to_string()),
+                    last_activity_at: Some("2026-05-06T11:00:01Z".to_string()),
+                },
+            ]
         );
 
         let _ = fs::remove_file(path);
@@ -3000,6 +3262,8 @@ mod tests {
         assert_eq!(item.cache_creation_5m_tokens, 5);
         assert_eq!(item.cache_creation_1h_tokens, 0);
         assert_eq!(item.request_count, 2);
+        assert_eq!(item.activity_buckets.len(), 1);
+        assert_eq!(item.activity_buckets[0].request_count, 2);
         assert_eq!(item.model_usage.len(), 1);
         assert_eq!(item.model_usage[0].model, "gemini-2.5-pro");
         assert_eq!(item.model_usage[0].input_tokens, 150);
