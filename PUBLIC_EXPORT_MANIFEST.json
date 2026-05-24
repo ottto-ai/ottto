@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "907c053bc8b392abb1aae8da9807b55d9ef59cfbce1fb0ecefc0e66b3e285507",
+  "content_sha256": "b2dff9461b3044718c1b6bb94b7e456429d3b7bbb35dd78af81352d2eec9a52c",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "8e089a07990d39df16f1390369598cae66053bbb4ec14a05306d722c6cef9cd3",
-      "size_bytes": 39202
+      "sha256": "66934dd91d50d3721964b6d3222681e3e1db2b0e6febefa82e7da789c9a5330b",
+      "size_bytes": 39677
     },
     {
       "executable": false,
@@ -622,8 +622,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7c1abadec15a28f82c1509ad1d4102bba9f164a64c1669ecf0fe697e02fdd925",
-      "size_bytes": 114132
+      "sha256": "c9418f19de8e2038405c2c7bb1f0b6108d6ea94f1037162f5378846f046e7a20",
+      "size_bytes": 124875
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/install.md",
-      "sha256": "65d8c25857e983720a8c78cd05d363e398b1d99e26d34e82be259c8b69963c84",
-      "size_bytes": 2030
+      "sha256": "97fc958a6fc22a125543d386e81da67dea5064440257c07fb8211316aa36a26c",
+      "size_bytes": 2120
     },
     {
       "executable": false,
@@ -699,8 +699,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "c35d160a1b00c896ea7508b85171f53bcd0117d65f78df4ede6622c4658bba5c",
-      "size_bytes": 5120
+      "sha256": "424097cc3fa0c38935b64c85ebc425960bba73a8936472fbee6128381801e276",
+      "size_bytes": 5426
     },
     {
       "executable": false,
@@ -951,15 +951,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/homebrew_formula.sh",
-      "sha256": "aa87253c693ed6af3064e3d4aeb5c684952aa4fb7607f68e60cd247262a8e6ba",
-      "size_bytes": 8658
+      "sha256": "b998d395f00370d049c7fe79587ab05892ad8ae33af11000129dd32af5832eac",
+      "size_bytes": 8519
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/hosted_native_installer.sh",
-      "sha256": "22388dcf516af08aec58562119c2a4679de561ffd46321ef6f9b0dd2f604f540",
-      "size_bytes": 14473
+      "sha256": "a3b4e493b83e57ae328c036490b74b0899c2c0207eed7bfbafd2bf04bc4b3b4d",
+      "size_bytes": 15469
     },
     {
       "executable": true,
@@ -1007,8 +1007,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "9b5cc5c20ebeea513ae00696bc65f50d123bbe4de74063443e318aea5da48197",
-      "size_bytes": 27499
+      "sha256": "8c75ad84df1636e360c4deeb72e0770cc9e29d6acdb4ae8aef0f5487524e0d9f",
+      "size_bytes": 28612
     },
     {
       "executable": true,
@@ -1049,8 +1049,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_preflight.sh",
-      "sha256": "d3290382c88c38bff077bbfa16c2cb542656cdcb333058d0c3bd182981ff8486",
-      "size_bytes": 21965
+      "sha256": "0eb4c63d0ce62b38503d9f7471d29647075610a2655702c9842c07b85b2444c6",
+      "size_bytes": 23267
     },
     {
       "executable": true,
@@ -1133,15 +1133,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_homebrew_formula.sh",
-      "sha256": "a9c2e68ab93a0079f8fa37fbdc3e80c69557934dcb8d2814c3bf1ba71b7cf1ad",
-      "size_bytes": 7019
+      "sha256": "ab4a715022410c16c760e363705382eeeac15f9a8e45950d346fd929b0f88d7e",
+      "size_bytes": 7110
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_hosted_native_installer.sh",
-      "sha256": "cf0fdea38acf45fcd993b6da0286d3af7ff11068e7cc48a7784c1ab6001ce227",
-      "size_bytes": 8555
+      "sha256": "dc1646769eefa7759c68172f63fc6af7cc2e2256f466903bed8a2eac8028a334",
+      "size_bytes": 9270
     },
     {
       "executable": true,
@@ -1217,8 +1217,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_preflight.sh",
-      "sha256": "c8cbaa475320e0e737103947eb43f2775a79d07971f5962c3ba1c825fa48a265",
-      "size_bytes": 11882
+      "sha256": "ba604c2c2086835a6293b60bcb1bddc1d4a00f0b979ee3db649cde30cba7cde8",
+      "size_bytes": 12274
     },
     {
       "executable": true,
@@ -1298,7 +1298,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-24T11:12:19+00:00",
+  "generated_at": "2026-05-24T21:02:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 186,
   "public_roots": [
@@ -1333,5 +1333,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "62984300929fc398a9f116ed6d46c95033f6faf9"
+  "source_commit": "9a083fc9ba36ba24058ac2d9d1154e0ad6895212"
 }
