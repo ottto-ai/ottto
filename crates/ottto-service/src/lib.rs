@@ -82,7 +82,7 @@ pub enum LocalApiError {
     AuthClaimMismatch,
     #[error("setup-run connection is missing")]
     SetupRunConnectionMissing,
-    #[error("this Mac is attached to a different setup run; reopen Companion from Ottto")]
+    #[error("this Mac is attached to a different setup run; open the Ottto app from Ottto")]
     SetupRunConnectionMismatch,
     #[error("invalid local control request: {0}")]
     InvalidRequest(String),
