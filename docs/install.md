@@ -34,11 +34,11 @@ brew uninstall ottto
 The formula must pin immutable artifact URLs and SHA-256 hashes from the stable
 release manifest. Do not self-overwrite a Homebrew-managed install.
 
-## Hosted Native Installer Owner
+## Verified Native DMG Helper
 
-When a stable release advertises a hosted installer, download the public
-installer from the release notes and verify the published checksum before
-running it:
+When a stable release advertises a verified native installer helper, download
+the public script from the release notes and verify the published checksum
+before running it:
 
 ```bash
 curl -fsSL <published-install-macos-url> -o install-macos.sh
@@ -47,8 +47,9 @@ sh install-macos.sh
 ottto status --json
 ```
 
-The hosted wrapper verifies and opens the signed native DMG or PKG. It must not
-install mutable shell payloads, clear quarantine, or bootstrap launchd itself.
+The helper verifies and opens the signed native DMG or PKG. It must not install
+mutable shell payloads, clear quarantine, or bootstrap launchd itself. After the
+user installs from the DMG or PKG, the runtime install owner is `app_bundle`.
 
 ## Direct Native Package
 

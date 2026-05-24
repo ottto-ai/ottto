@@ -9,10 +9,11 @@ usage() {
   cat <<'USAGE'
 Usage: hosted_native_installer.sh --manifest <release-manifest.json> --output <install-macos.sh> [options]
 
-Generates the Ottto stable hosted installer wrapper from a stable local-platform
-release manifest. The generated wrapper verifies the immutable signed and
-notarized native DMG/PKG, then opens it. It does not install mutable shell
-payloads, clear quarantine, or bootstrap launchd jobs.
+Generates the Ottto stable verified native installer helper from a stable
+local-platform release manifest. The generated wrapper verifies the immutable
+signed and notarized native DMG/PKG, then opens it. It does not install mutable
+shell payloads, clear quarantine, or bootstrap launchd jobs, so the runtime
+install owner remains app_bundle after the user installs from the DMG/PKG.
 
 Options:
   --manifest <path>   Stable release manifest to read.
@@ -87,7 +88,8 @@ version="$(jq -r '.version // empty' "$MANIFEST")"
 channel="$(jq -r '.channel // empty' "$MANIFEST")"
 rollback_immutable_prefix="$(jq -r '.rollback.immutable_prefix // empty' "$MANIFEST")"
 rollback_latest_manifest_url="$(jq -r '.rollback.latest_manifest_url // empty' "$MANIFEST")"
-hosted_supported="$(jq -r '(.supported_install_owners // []) | index("hosted_installer") != null' "$MANIFEST")"
+app_bundle_supported="$(jq -r '(.supported_install_owners // []) | index("app_bundle") != null' "$MANIFEST")"
+verified_installer_owner="$(jq -r '.install_methods.verified_native_installer.runtime_install_owner // empty' "$MANIFEST")"
 
 if [[ -z "$BASE_URL" ]]; then
   BASE_URL="$rollback_immutable_prefix"
@@ -100,13 +102,16 @@ if [[ "$product" != "ottto-local-platform" ]]; then
   fail "Unexpected release manifest product: $product"
 fi
 if [[ "$channel" != "stable" ]]; then
-  fail "Hosted native installer generation requires channel=stable, got: $channel"
+  fail "Verified native installer helper generation requires channel=stable, got: $channel"
 fi
 if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){1,3}([_+.-][A-Za-z0-9]+)?$ ]]; then
   fail "Stable release version is not installer-safe: $version"
 fi
-if [[ "$hosted_supported" != "true" ]]; then
-  fail "Release manifest does not advertise hosted_installer as a supported install owner"
+if [[ "$app_bundle_supported" != "true" ]]; then
+  fail "Release manifest does not advertise app_bundle as a supported install owner"
+fi
+if [[ -n "$verified_installer_owner" && "$verified_installer_owner" != "app_bundle" ]]; then
+  fail "Verified native installer helper must bind to runtime_install_owner=app_bundle"
 fi
 if [[ "$rollback_immutable_prefix" != https://* || "$rollback_immutable_prefix" != *"/stable/$version" ]]; then
   fail "Stable rollback immutable_prefix must be the HTTPS stable versioned prefix: $rollback_immutable_prefix"
@@ -115,13 +120,13 @@ if [[ "$rollback_latest_manifest_url" != https://* || "$rollback_latest_manifest
   fail "Stable rollback latest_manifest_url must be the HTTPS stable latest manifest: $rollback_latest_manifest_url"
 fi
 if [[ "$BASE_URL" != https://* ]]; then
-  fail "Hosted native installer base URL must use HTTPS: $BASE_URL"
+  fail "Verified native installer helper base URL must use HTTPS: $BASE_URL"
 fi
 if [[ "$BASE_URL" == *"/latest"* || "$BASE_URL" == *"/latest/"* ]]; then
-  fail "Hosted native installer base URL must be immutable, not latest: $BASE_URL"
+  fail "Verified native installer helper base URL must be immutable, not latest: $BASE_URL"
 fi
 if [[ -n "$rollback_immutable_prefix" && "${BASE_URL%/}" != "${rollback_immutable_prefix%/}" ]]; then
-  fail "Hosted native installer base URL must match rollback immutable_prefix: $BASE_URL"
+  fail "Verified native installer helper base URL must match rollback immutable_prefix: $BASE_URL"
 fi
 
 safe_literal "version" "$version"
@@ -148,31 +153,31 @@ if [[ -n "$app_artifact" ]]; then
   app_gatekeeper="$(artifact_field "$app_artifact" gatekeeper_assessed)"
 
   if [[ "$app_arch" != "arm64" ]]; then
-    fail "Hosted native installer currently supports only arm64 macOS artifacts: $app_arch"
+    fail "Verified native installer helper currently supports only arm64 macOS artifacts: $app_arch"
   fi
   if [[ "$app_url" != https://* ]]; then
-    fail "Hosted native installer artifact URL must use HTTPS: $app_url"
+    fail "Verified native installer helper artifact URL must use HTTPS: $app_url"
   fi
   if [[ "$app_url" == *"/latest/"* ]]; then
-    fail "Hosted native installer artifact URL must point at an immutable versioned artifact, not latest: $app_url"
+    fail "Verified native installer helper artifact URL must point at an immutable versioned artifact, not latest: $app_url"
   fi
   if [[ -n "$rollback_immutable_prefix" && "$app_url" != "${rollback_immutable_prefix%/}/"* ]]; then
-    fail "Hosted native installer artifact URL is outside rollback immutable_prefix: $app_url"
+    fail "Verified native installer helper artifact URL is outside rollback immutable_prefix: $app_url"
   fi
   if [[ "$app_url" != *.dmg && "$app_url" != *.pkg ]]; then
-    fail "Hosted native installer artifact must be a native DMG or PKG: $app_url"
+    fail "Verified native installer helper artifact must be a native DMG or PKG: $app_url"
   fi
   if [[ ! "$app_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    fail "Hosted native installer artifact SHA-256 is invalid: $app_sha"
+    fail "Verified native installer helper artifact SHA-256 is invalid: $app_sha"
   fi
   if [[ "$app_signed" != "true" ]]; then
-    fail "Hosted native installer artifact is not marked signed"
+    fail "Verified native installer helper artifact is not marked signed"
   fi
   if [[ "$app_notarized" != "true" ]]; then
-    fail "Hosted native installer artifact is not marked notarized"
+    fail "Verified native installer helper artifact is not marked notarized"
   fi
   if [[ "$app_gatekeeper" != "true" ]]; then
-    fail "Hosted native installer artifact has not passed Gatekeeper assessment"
+    fail "Verified native installer helper artifact has not passed Gatekeeper assessment"
   fi
 
   safe_literal "app URL" "$app_url"
@@ -180,7 +185,7 @@ if [[ -n "$app_artifact" ]]; then
 fi
 
 if [[ "$failures" -gt 0 ]]; then
-  echo "Hosted native installer generation failed with $failures issue(s)." >&2
+  echo "Verified native installer helper generation failed with $failures issue(s)." >&2
   exit 1
 fi
 
@@ -201,8 +206,8 @@ Usage: install-macos.sh [options]
 
 Downloads the Ottto stable release manifest, verifies the signed/notarized
 native DMG or PKG checksum and Gatekeeper state, then opens the native artifact.
-This wrapper does not install mutable shell payloads, clear quarantine, or
-bootstrap launchd jobs.
+This helper does not install mutable shell payloads, clear quarantine, or
+bootstrap launchd jobs; after installation, the runtime owner is app_bundle.
 
 Options:
   --base-url <url>       Immutable HTTPS release prefix. Default is embedded.
@@ -318,15 +323,20 @@ if manifest.get("schema_version") != 1:
 if manifest.get("product") != "ottto-local-platform":
     fail("Unexpected release manifest product")
 if manifest.get("channel") != "stable":
-    fail("Hosted native installer refuses channel not stable")
+    fail("Verified native installer helper refuses channel not stable")
 
 version = str(manifest.get("version") or "")
 if not re.fullmatch(r"[0-9]+([.][0-9]+){1,3}([_+.-][A-Za-z0-9]+)?", version):
     fail("Stable release version is not installer-safe")
 
 owners = manifest.get("supported_install_owners") or []
-if "hosted_installer" not in owners:
-    fail("Release manifest does not advertise hosted_installer support")
+if "app_bundle" not in owners:
+    fail("Release manifest does not advertise app_bundle support")
+
+verified_installer = (manifest.get("install_methods") or {}).get("verified_native_installer") or {}
+runtime_owner = verified_installer.get("runtime_install_owner")
+if runtime_owner is not None and runtime_owner != "app_bundle":
+    fail("Verified native installer helper must bind to runtime_install_owner=app_bundle")
 
 rollback = manifest.get("rollback") or {}
 prefix = str(rollback.get("immutable_prefix") or "").rstrip("/")
@@ -351,29 +361,29 @@ url = str(artifact.get("url") or "")
 sha = str(artifact.get("sha256") or "")
 arch = str(artifact.get("arch") or "")
 if arch != "arm64":
-    fail("Hosted native installer currently supports only arm64 macOS artifacts")
+    fail("Verified native installer helper currently supports only arm64 macOS artifacts")
 if not url.startswith("https://"):
-    fail("Hosted native installer artifact URL must use HTTPS")
+    fail("Verified native installer helper artifact URL must use HTTPS")
 if "/latest/" in url:
-    fail("Hosted native installer artifact URL must be immutable, not latest")
+    fail("Verified native installer helper artifact URL must be immutable, not latest")
 if not url.startswith(prefix + "/"):
-    fail("Hosted native installer artifact URL is outside rollback immutable_prefix")
+    fail("Verified native installer helper artifact URL is outside rollback immutable_prefix")
 if not re.fullmatch(r"[0-9a-f]{64}", sha):
-    fail("Hosted native installer artifact SHA-256 is invalid")
+    fail("Verified native installer helper artifact SHA-256 is invalid")
 if artifact.get("signed") is not True:
-    fail("Hosted native installer requires signed artifacts")
+    fail("Verified native installer helper requires signed artifacts")
 if artifact.get("notarized") is not True:
-    fail("Hosted native installer requires notarized artifacts")
+    fail("Verified native installer helper requires notarized artifacts")
 if artifact.get("gatekeeper_assessed") is not True:
-    fail("Hosted native installer requires Gatekeeper-assessed artifacts")
+    fail("Verified native installer helper requires Gatekeeper-assessed artifacts")
 
 parsed = urlparse(url)
 filename = PurePosixPath(parsed.path).name
 if not re.fullmatch(r"[A-Za-z0-9._+-]+", filename):
-    fail("Hosted native installer artifact filename is not safe")
+    fail("Verified native installer helper artifact filename is not safe")
 ext = PurePosixPath(filename).suffix.lower().lstrip(".")
 if ext not in {"dmg", "pkg"}:
-    fail("Hosted native installer artifact must be a native DMG or PKG")
+    fail("Verified native installer helper artifact must be a native DMG or PKG")
 
 print("\t".join([version, url, sha, filename, ext]))
 PY
@@ -447,4 +457,4 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 
 chmod 0755 "$OUTPUT"
-echo "Wrote hosted native installer: $OUTPUT"
+echo "Wrote verified native installer helper: $OUTPUT"

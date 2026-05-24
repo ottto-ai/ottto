@@ -12,7 +12,8 @@ Usage: homebrew_formula.sh --manifest <release-manifest.json> --output <Formula/
 
 Generates the Ottto Homebrew formula from a stable local-platform release
 manifest. The generator refuses manifests that are not signed, notarized,
-Gatekeeper-assessed, immutable-prefix pinned, and advertised for Homebrew.
+Gatekeeper-assessed, and immutable-prefix pinned. A formula may be generated for
+QA before Homebrew is advertised as a supported install owner.
 
 Options:
   --manifest <path>   Stable release manifest to read.
@@ -91,7 +92,6 @@ version="$(jq -r '.version // empty' "$MANIFEST")"
 channel="$(jq -r '.channel // empty' "$MANIFEST")"
 rollback_immutable_prefix="$(jq -r '.rollback.immutable_prefix // empty' "$MANIFEST")"
 rollback_latest_manifest_url="$(jq -r '.rollback.latest_manifest_url // empty' "$MANIFEST")"
-homebrew_supported="$(jq -r '(.supported_install_owners // []) | index("homebrew") != null' "$MANIFEST")"
 
 if [[ "$schema_version" != "1" ]]; then
   fail "Unsupported release manifest schema_version: $schema_version"
@@ -104,9 +104,6 @@ if [[ "$channel" != "stable" ]]; then
 fi
 if [[ ! "$version" =~ ^[0-9]+([.][0-9]+){1,3}([_+.-][A-Za-z0-9]+)?$ ]]; then
   fail "Stable release version is not formula-safe: $version"
-fi
-if [[ "$homebrew_supported" != "true" ]]; then
-  fail "Release manifest does not advertise Homebrew as a supported install owner"
 fi
 if [[ "$rollback_immutable_prefix" != https://* || "$rollback_immutable_prefix" != *"/stable/$version" ]]; then
   fail "Stable rollback immutable_prefix must be the HTTPS stable versioned prefix: $rollback_immutable_prefix"
@@ -214,9 +211,9 @@ class Ottto < Formula
   desc "Local Ottto CLI and per-user service"
   homepage "${HOMEPAGE}"
   url "${cli_url}"
+  version "${version}"
   sha256 "${cli_sha}"
   license "${LICENSE}"
-  version "${version}"
 
   depends_on arch: :arm64
   depends_on macos: :sonoma
@@ -238,7 +235,12 @@ class Ottto < Formula
 
   service do
     name macos: "net.ottto.service"
-    run [opt_bin/"ottto-service", "serve", "--socket", "#{Dir.home}/Library/Application Support/Ottto/ottto-service.sock"]
+    run [
+      opt_bin/"ottto-service",
+      "serve",
+      "--socket",
+      "#{Dir.home}/Library/Application Support/Ottto/ottto-service.sock",
+    ]
     keep_alive true
     environment_variables PATH: std_service_path_env
     log_path "#{Dir.home}/Library/Logs/Ottto/ottto-service.log"

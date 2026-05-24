@@ -122,6 +122,10 @@ rollback_operator_step_count="$(jq '.rollback.operator_steps // [] | length' "$M
 rollback_release_gate="$(jq -r '.rollback.verification.release_gate // empty' "$MANIFEST")"
 rollback_stable_preflight="$(jq -r '.rollback.verification.stable_preflight // empty' "$MANIFEST")"
 rollback_installed_smoke="$(jq -r '.rollback.verification.installed_smoke // empty' "$MANIFEST")"
+verified_installer_path="$(jq -r '.install_methods.verified_native_installer.path // empty' "$MANIFEST")"
+verified_installer_url="$(jq -r '.install_methods.verified_native_installer.url // empty' "$MANIFEST")"
+verified_installer_latest_url="$(jq -r '.install_methods.verified_native_installer.latest_url // empty' "$MANIFEST")"
+verified_installer_runtime_owner="$(jq -r '.install_methods.verified_native_installer.runtime_install_owner // empty' "$MANIFEST")"
 
 if [[ "$schema_version" != "1" ]]; then
   fail "Unsupported release manifest schema_version: $schema_version"
@@ -167,6 +171,18 @@ if [[ "$rollback_operator_step_count" -lt 3 ]]; then
 fi
 if [[ -z "$rollback_release_gate" || -z "$rollback_stable_preflight" || -z "$rollback_installed_smoke" ]]; then
   fail "Stable rollback verification metadata is incomplete"
+fi
+if [[ "$verified_installer_path" != "install-macos.sh" ]]; then
+  fail "Stable manifest install_methods.verified_native_installer.path must be install-macos.sh"
+fi
+if [[ "$verified_installer_url" != https://* || "$verified_installer_url" != "$rollback_immutable_prefix/install-macos.sh" ]]; then
+  fail "Stable manifest verified native installer URL must use the rollback immutable prefix: $verified_installer_url"
+fi
+if [[ "$verified_installer_latest_url" != https://* || "$verified_installer_latest_url" != *"/stable/latest/install-macos.sh" ]]; then
+  fail "Stable manifest verified native installer latest_url must point at stable latest: $verified_installer_latest_url"
+fi
+if [[ "$verified_installer_runtime_owner" != "app_bundle" ]]; then
+  fail "Stable manifest verified native installer must bind runtime_install_owner=app_bundle"
 fi
 
 manifest_dir="$(cd "$(dirname "$MANIFEST")" && pwd)"

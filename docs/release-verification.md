@@ -10,6 +10,7 @@ A stable release manifest must include:
 - immutable artifact URLs;
 - SHA-256 for every artifact;
 - install-owner metadata;
+- optional install-method metadata for helpers that are not runtime owners;
 - rollback metadata;
 - signing, notarization, stapling, and Gatekeeper state for macOS artifacts;
 - CycloneDX SBOM URL and SHA-256;
@@ -126,9 +127,12 @@ output or local identifiers into the evidence file. Then run:
 macos_stable_closeout_gate.sh --manifest release-manifest.json
 ```
 
-The gate checks that Homebrew, hosted installer, and direct app-bundle install
-paths passed the required owner-specific trust checks and the full lifecycle
-matrix when those owners are advertised: install, service/app readiness,
+The gate checks that every advertised runtime owner passed the required
+owner-specific trust checks and the full lifecycle matrix. The verified native
+installer helper is not a runtime owner; it verifies and opens the native
+DMG/PKG and then binds to the `app_bundle` owner after installation. Homebrew
+must remain absent from `supported_install_owners` until its clean-machine
+lifecycle evidence passes. Owner checks include: install, service/app readiness,
 browser setup claim, app detection, Codex verify, doctor, fix, diagnostics,
 logout, update check, upgrade, uninstall, reinstall, and post-reinstall status.
 The evidence file must match the exact manifest version, commit, and SHA-256,

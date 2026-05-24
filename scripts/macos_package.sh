@@ -113,6 +113,17 @@ if [[ "$RELEASE_CHANNEL_URL_ROOT" == "$ARTIFACT_BASE_URL" ]]; then
   RELEASE_CHANNEL_URL_ROOT="https://install.ottto.net/ottto-local-platform/releases/$CHANNEL"
 fi
 LATEST_MANIFEST_URL="$RELEASE_CHANNEL_URL_ROOT/latest/release-manifest.json"
+if [[ -n "${OTTTO_SUPPORTED_INSTALL_OWNERS_JSON:-}" ]]; then
+  SUPPORTED_INSTALL_OWNERS_JSON="$OTTTO_SUPPORTED_INSTALL_OWNERS_JSON"
+elif [[ "$CHANNEL" == "stable" ]]; then
+  SUPPORTED_INSTALL_OWNERS_JSON='["app_bundle"]'
+else
+  SUPPORTED_INSTALL_OWNERS_JSON='["hosted_installer", "app_bundle", "homebrew"]'
+fi
+if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' <<<"$SUPPORTED_INSTALL_OWNERS_JSON" >/dev/null; then
+  echo "OTTTO_SUPPORTED_INSTALL_OWNERS_JSON must be a non-empty JSON string array" >&2
+  exit 2
+fi
 if [[ ! -d "$MAC_APP_ROOT" ]]; then
   echo "macOS app root does not exist: $MAC_APP_ROOT" >&2
   echo "Set OTTTO_MACOS_APP_ROOT to the OtttoCompanion Swift package root." >&2
@@ -377,9 +388,13 @@ jq -n \
   --arg daemon_file "$(basename "$DAEMON_ZIP")" \
   --arg sbom_file "$(basename "$SBOM_PATH")" \
   --arg manifest_file "release-manifest.json" \
+  --arg installer_file "install-macos.sh" \
+  --arg verified_installer_url "$ARTIFACT_BASE_URL/install-macos.sh" \
+  --arg verified_installer_latest_url "$RELEASE_CHANNEL_URL_ROOT/latest/install-macos.sh" \
   --arg repository "${OTTTO_RELEASE_REPOSITORY:-ottto-ai/ottto}" \
   --arg signer_workflow "${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/macos-stable-release.yml}" \
   --arg launch_smoke_path "$LAUNCH_SMOKE_EVIDENCE" \
+  --argjson supported_install_owners "$SUPPORTED_INSTALL_OWNERS_JSON" \
   --argjson signed "$SIGNED" \
   --argjson notarized "$NOTARIZED" \
   --argjson app_gatekeeper "$APP_GATEKEEPER" \
@@ -395,7 +410,16 @@ jq -n \
     generated_at: $generated_at,
     min_supported_version: $min_supported_version,
     min_protocol_version: $min_protocol_version,
-    supported_install_owners: ["hosted_installer", "app_bundle", "homebrew"],
+    supported_install_owners: $supported_install_owners,
+    install_methods: (if $channel == "stable" then {
+      verified_native_installer: {
+        kind: "verified_native_installer",
+        path: $installer_file,
+        url: $verified_installer_url,
+        latest_url: $verified_installer_latest_url,
+        runtime_install_owner: "app_bundle"
+      }
+    } else {} end),
     rollback: {
       strategy: "channel_latest_pointer",
       immutable_prefix: $rollback_immutable_prefix,
@@ -458,7 +482,7 @@ jq -n \
         stable_clean_machine_qa: {
           status: "not_run",
           evidence_path: "stable-clean-machine-qa.json",
-          required_install_owners: ["hosted_installer", "app_bundle", "homebrew"]
+          required_install_owners: $supported_install_owners
         }
       } else {} end)),
     artifacts: [

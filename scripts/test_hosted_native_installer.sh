@@ -39,7 +39,16 @@ write_manifest() {
       generated_at: "2026-05-21T00:00:00Z",
       min_supported_version: "0.1.0",
       min_protocol_version: 11,
-      supported_install_owners: ["hosted_installer", "app_bundle", "homebrew"],
+      supported_install_owners: ["app_bundle"],
+      install_methods: {
+        verified_native_installer: {
+          kind: "verified_native_installer",
+          path: "install-macos.sh",
+          url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/install-macos.sh",
+          latest_url: "https://install.ottto.net/ottto-local-platform/releases/stable/latest/install-macos.sh",
+          runtime_install_owner: "app_bundle"
+        }
+      },
       rollback: {
         strategy: "channel_latest_pointer",
         immutable_prefix: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0",
@@ -126,7 +135,7 @@ assert_not_contains() {
 expect_generation_failure() {
   local manifest="$1"
   if "$GENERATOR" --manifest "$manifest" --output "$TMP_DIR/should-not-exist.sh" >/dev/null 2>&1; then
-    echo "Expected hosted native installer generation to fail for $manifest" >&2
+    echo "Expected verified native installer helper generation to fail for $manifest" >&2
     exit 1
   fi
 }
@@ -140,10 +149,10 @@ installer="$TMP_DIR/install-macos.sh"
 bash -n "$installer"
 assert_contains "$installer" 'Usage: install-macos.sh'
 assert_contains "$installer" 'https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0'
-assert_contains "$installer" 'Hosted native installer refuses channel not stable'
-assert_contains "$installer" 'Hosted native installer requires signed artifacts'
-assert_contains "$installer" 'Hosted native installer requires notarized artifacts'
-assert_contains "$installer" 'Hosted native installer requires Gatekeeper-assessed artifacts'
+assert_contains "$installer" 'Verified native installer helper refuses channel not stable'
+assert_contains "$installer" 'Verified native installer helper requires signed artifacts'
+assert_contains "$installer" 'Verified native installer helper requires notarized artifacts'
+assert_contains "$installer" 'Verified native installer helper requires Gatekeeper-assessed artifacts'
 assert_contains "$installer" 'shasum -a 256'
 assert_contains "$installer" 'xcrun stapler validate'
 assert_contains "$installer" 'spctl --assess --type open --context context:primary-signature'
@@ -151,7 +160,7 @@ assert_contains "$installer" 'spctl --assess --type install'
 assert_contains "$installer" 'hdiutil verify'
 # shellcheck disable=SC2016
 assert_contains "$installer" 'open "$artifact_path"'
-assert_contains "$installer" 'This wrapper does not install mutable shell payloads'
+assert_contains "$installer" 'This helper does not install mutable shell payloads'
 assert_not_contains "$installer" 'install -m'
 assert_not_contains "$installer" 'xattr -dr com.apple.quarantine'
 assert_not_contains "$installer" 'launchctl bootstrap'
@@ -168,10 +177,15 @@ dev_manifest="$TMP_DIR/dev-manifest.json"
 write_manifest "$dev_manifest" dev
 expect_generation_failure "$dev_manifest"
 
-missing_hosted_manifest="$TMP_DIR/missing-hosted-manifest.json"
-jq '.supported_install_owners = ["app_bundle", "homebrew"]' \
-  "$stable_manifest" > "$missing_hosted_manifest"
-expect_generation_failure "$missing_hosted_manifest"
+missing_app_bundle_manifest="$TMP_DIR/missing-app-bundle-manifest.json"
+jq '.supported_install_owners = ["homebrew"]' \
+  "$stable_manifest" > "$missing_app_bundle_manifest"
+expect_generation_failure "$missing_app_bundle_manifest"
+
+wrong_helper_owner_manifest="$TMP_DIR/wrong-helper-owner-manifest.json"
+jq '.install_methods.verified_native_installer.runtime_install_owner = "hosted_installer"' \
+  "$stable_manifest" > "$wrong_helper_owner_manifest"
+expect_generation_failure "$wrong_helper_owner_manifest"
 
 latest_url_manifest="$TMP_DIR/latest-url-manifest.json"
 jq '(.artifacts[] | select(.kind == "macos_app")).url = "https://install.ottto.net/ottto-local-platform/releases/stable/latest/Ottto-macos-arm64.dmg"' \

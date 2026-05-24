@@ -108,7 +108,16 @@ write_manifest() {
       generated_at: "2026-05-10T00:00:00Z",
       min_supported_version: "0.1.0",
       min_protocol_version: 11,
-      supported_install_owners: ["hosted_installer", "app_bundle", "homebrew"],
+      supported_install_owners: ["app_bundle"],
+      install_methods: {
+        verified_native_installer: {
+          kind: "verified_native_installer",
+          path: "install-macos.sh",
+          url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/install-macos.sh",
+          latest_url: "https://install.ottto.net/ottto-local-platform/releases/stable/latest/install-macos.sh",
+          runtime_install_owner: "app_bundle"
+        }
+      },
       rollback: {
         strategy: "channel_latest_pointer",
         immutable_prefix: $rollback_immutable_prefix,

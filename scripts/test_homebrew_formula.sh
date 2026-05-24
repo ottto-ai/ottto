@@ -138,6 +138,7 @@ formula="$TMP_DIR/Formula/ottto.rb"
 assert_contains "$formula" 'class Ottto < Formula'
 assert_contains "$formula" 'license "Apache-2.0"'
 assert_contains "$formula" 'url "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-macos-arm64.zip"'
+assert_contains "$formula" 'version "0.1.0"'
 assert_contains "$formula" "sha256 \"$CLI_SHA\""
 assert_contains "$formula" 'resource "ottto-service" do'
 assert_contains "$formula" 'url "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-service-macos-arm64.zip"'
@@ -160,7 +161,7 @@ expect_generation_failure "$dev_manifest"
 missing_homebrew_manifest="$TMP_DIR/missing-homebrew-manifest.json"
 jq '.supported_install_owners = ["hosted_installer", "app_bundle"]' \
   "$stable_manifest" > "$missing_homebrew_manifest"
-expect_generation_failure "$missing_homebrew_manifest"
+"$GENERATOR" --manifest "$missing_homebrew_manifest" --output "$TMP_DIR/qa-only-ottto.rb" >/dev/null
 
 latest_url_manifest="$TMP_DIR/latest-url-manifest.json"
 jq '(.artifacts[] | select(.kind == "cli")).url = "https://install.ottto.net/ottto-local-platform/releases/stable/latest/ottto-macos-arm64.zip"' \
