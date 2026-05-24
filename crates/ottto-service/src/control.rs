@@ -1828,10 +1828,10 @@ fn cli_error(error: LocalApiError) -> CliError {
 fn cli_error_message(error: &LocalApiError) -> String {
     match error {
         LocalApiError::SetupRunConnectionMissing => {
-            "Setup needs browser approval. Reopen Companion from Ottto, or run setup with a fresh claim code.".to_string()
+            "Setup needs browser approval. Open the Ottto app from Ottto, or run setup with a fresh claim code.".to_string()
         }
         LocalApiError::TimedOut(_) => {
-            "Timed out waiting for setup to complete. Reopen Companion from Ottto and retry.".to_string()
+            "Timed out waiting for setup to complete. Open the Ottto app from Ottto and retry.".to_string()
         }
         LocalApiError::Backend(backend) => {
             let diagnostics_upload = backend.endpoint.contains("/diagnostics/");
@@ -1842,7 +1842,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if body.contains("expired") {
-                return "Setup run expired. Reopen Companion from Ottto to attach an active setup run.".to_string();
+                return "Setup run expired. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
             if backend.status == Some(401) || backend.status == Some(403) {
                 if diagnostics_upload {
@@ -1851,7 +1851,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                 if logout_disconnect {
                     return "Ottto rejected the cloud logout for this Mac. Reconnect from ottto.net/apps or use `ottto logout --local-only` only to clear local state.".to_string();
                 }
-                return "Ottto rejected the local setup request. Reopen Companion from Ottto to attach an active setup run.".to_string();
+                return "Ottto rejected the local setup request. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
             match backend.kind {
                 BackendErrorKind::Unreachable if logout_disconnect => {
@@ -7424,7 +7424,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
 
         assert_eq!(
             error.message,
-            "Setup run expired. Reopen Companion from Ottto to attach an active setup run."
+            "Setup run expired. Open the Ottto app from Ottto to attach an active setup run."
         );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
