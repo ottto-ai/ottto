@@ -473,7 +473,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `~/.pi/agent/sessions/**/*.jsonl`, streamed line-by-line and reduced to safe
   usage/title/model/timestamp/selector hashes instead of response, tool output,
   command output, or raw local paths. The Codex parser version
-  `codex_jsonl:v10` reads current `event_msg` title updates,
+  `codex_jsonl:v11` reads current `event_msg` title updates,
   `payload.info.total_token_usage` totals, and selector fields such as
   `service_tier`, `actual_service_tier`, `fast_mode`, `batch_mode`,
   `inference_geo`, `context_bucket`, and cache TTL aliases from direct or
@@ -487,11 +487,14 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   first-user-prompt fallback. The fallback rejects setup/system text, AGENTS and
   environment blocks, pasted plans, command-looking text, raw ids, generic
   labels, and tool/function names such as `exec_command` or `write_stdin`.
-  Claude Code parser version `claude_code_jsonl:v3` carries
+  Claude Code parser version `claude_code_jsonl:v4` carries
   `message.usage.speed`, service tier, residency, batch, and context aliases
-  into selector context. Pi parser version `pi_jsonl:v3` carries
+  into selector context. Pi parser version `pi_jsonl:v4` carries
   `ottto-selector` / `ottto.selector` custom entries and per-message selector
-  aliases into subsequent assistant-message usage rows. Parser-versioned file
+  aliases into subsequent assistant-message usage rows. All three parsers emit
+  content-free hourly activity buckets from persisted request/usage event
+  timestamps; polling cadence affects freshness only and no wall-clock activity
+  is inferred. Parser-versioned file
   fingerprints plus Codex sidecar/config metadata fingerprints force a reparse
   of recent files when title or selector sources change. The daemon starts the
   snapshot sync loop beside the local OTLP relay,
@@ -499,7 +502,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   six months by default with stricter backend windows allowed, caps each
   app/source at 1000 recent files, strips filtered session titles or path-free
   workspace labels before upload when the effective backend org/user activity
-  hint disables them, uploads changed snapshots in schema-v4 batches, and
+  hint disables them, uploads changed snapshots in schema-v5 batches, and
   reports collector status and cap-hit metadata without exposing local paths.
   Policy-disabled metadata uses a policy-scoped scan index so later re-enabling
   titles or labels can re-upload unchanged local files with the newly allowed
@@ -514,7 +517,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   upload, collector status, and backend activity-hints, with missing relay
   device credentials logged as a safe local skip instead of leaking paths or
   secrets
-- local protocol version 11 and local snapshot schema version 4 as clean
+- local protocol version 11 and local snapshot schema version 5 as clean
   cutovers. Local control requests must include `protocol_version: 11`, and
   backend local snapshot batch/status endpoints reject stale internal schema
   versions instead of compatibility-mapping them. Protocol v11 adds
