@@ -52,6 +52,8 @@ require_grep 'scripts/macos_notarize\.sh' 'notarization step'
 require_grep 'scripts/macos_attestation_bind\.sh' 'attestation binding step'
 require_grep 'scripts/macos_manifest_signature\.sh sign' 'manifest signature step'
 require_grep 'scripts/macos_stable_preflight\.sh' 'stable preflight step'
+require_grep 'dist/macos/packaged-app-launch-smoke\.json' 'packaged launch smoke evidence upload'
+require_grep 'dist/macos/stable-candidate-rc-qa\.json' 'stable-candidate RC evidence upload'
 deny_grep 'aws s3|cloudfront|stable/latest|promote_latest|local-platform publish' 'public workflow must not publish or promote stable/latest'
 
 python3 - "$WORKFLOW" <<'PY'

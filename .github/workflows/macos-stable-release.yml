@@ -266,6 +266,8 @@ jobs:
             dist/macos/ottto-macos-*.zip
             dist/macos/ottto-service-macos-*.zip
             dist/macos/ottto-local-platform-sbom.cdx.json
+            dist/macos/packaged-app-launch-smoke.json
+            dist/macos/stable-candidate-rc-qa.json
             dist/macos/release-manifest.json
             dist/macos/release-manifest.json.sig
             dist/macos/subject.checksums.txt
