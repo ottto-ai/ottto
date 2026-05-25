@@ -97,6 +97,28 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+stapler_retry() {
+  local action="$1"
+  local target="$2"
+  local attempt
+  local max_attempts="${OTTTO_STAPLER_MAX_ATTEMPTS:-5}"
+  local sleep_seconds="${OTTTO_STAPLER_RETRY_SECONDS:-8}"
+
+  for attempt in $(seq 1 "$max_attempts"); do
+    if xcrun stapler "$action" "$target"; then
+      return 0
+    fi
+    if [[ "$attempt" -eq "$max_attempts" ]]; then
+      break
+    fi
+    echo "stapler $action failed for $target; retrying in ${sleep_seconds}s ($attempt/$max_attempts)." >&2
+    sleep "$sleep_seconds"
+  done
+
+  echo "stapler $action failed for $target after $max_attempts attempt(s)." >&2
+  return 1
+}
+
 gatekeeper_assessment_type() {
   local kind="$1"
   if [[ "$kind" == "macos_app" ]]; then
@@ -211,15 +233,15 @@ while IFS= read -r artifact; do
       ditto -c -k --keepParent "$verification_path" "$app_notary_zip"
       notary_submit "$app_notary_zip"
       rm -f "$app_notary_zip"
-      xcrun stapler staple "$verification_path"
-      xcrun stapler validate "$verification_path"
+      stapler_retry staple "$verification_path"
+      stapler_retry validate "$verification_path"
       rebuild_dmg_from_app "$verification_path" "$path"
       notary_submit "$path"
     fi
-    xcrun stapler staple "$path"
-    xcrun stapler validate "$path"
-    xcrun stapler staple "$verification_path"
-    xcrun stapler validate "$verification_path"
+    stapler_retry staple "$path"
+    stapler_retry validate "$path"
+    stapler_retry staple "$verification_path"
+    stapler_retry validate "$verification_path"
   elif [[ "$VALIDATE_ONLY" != "true" ]]; then
     notary_submit "$path"
   fi
