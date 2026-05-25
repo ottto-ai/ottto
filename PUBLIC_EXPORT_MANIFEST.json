@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "5380d62e03c8cda22f852b8c16d03b1d3aedf878fa275fb71a60ce0e00d124a6",
+  "content_sha256": "c8d30a55dfaee3c678062ea76ea11b5007ad6ef8142e3c9f8ca85dfdb8ed6281",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "66934dd91d50d3721964b6d3222681e3e1db2b0e6febefa82e7da789c9a5330b",
-      "size_bytes": 39677
+      "sha256": "c66c5411fdea2d737a64a76da459d7483d4340002d0385bc87bb1cc47f30e642",
+      "size_bytes": 40388
     },
     {
       "executable": false,
@@ -363,8 +363,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "512466b8756a9fff00a80709a9b75b82bc4bad8fb2e52190b894e6d284857d88",
-      "size_bytes": 67403
+      "sha256": "8dbce42a1e3bdb53b99f408e20f284139d2932cee60d29678ec1abc97774b919",
+      "size_bytes": 67737
     },
     {
       "executable": false,
@@ -426,8 +426,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lib.rs",
-      "sha256": "061f168293292aa6a40eed9bfb9d7a7283b4c3310bf1553269263af5948accbb",
-      "size_bytes": 2114
+      "sha256": "487832ac19166a0198f561899dc9e8b33acc8974d6e718e19964dd06b1a16ff9",
+      "size_bytes": 2138
     },
     {
       "executable": false,
@@ -447,8 +447,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/local_service.rs",
-      "sha256": "4a262c7fb6d250297f4ad706921e359120a0774769c9eb69b3c35adb280adacc",
-      "size_bytes": 4390
+      "sha256": "d57d4d291056da672ad9fdcad07333c264d3aa1035a0c82959918a5e183a38a1",
+      "size_bytes": 5907
     },
     {
       "executable": false,
@@ -461,8 +461,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/status.rs",
-      "sha256": "86b23889b7ae24107cf07eeb586746fda8a0d4251c0611b9f8ee28ef16966eea",
-      "size_bytes": 4445
+      "sha256": "c5abcc06f59155aeb73e59ab733aef15d91af83e0e94fc9d199869cc5e978368",
+      "size_bytes": 4488
     },
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "e38aeefd15a4871fd694274349029804441d0d65dd61c70cd8b406cf090d96e7",
-      "size_bytes": 66536
+      "sha256": "9ecedbb1c32e4fa0cd35b5c0da6d1b0b9006b00ed89e98644a7a5da6c40cc0e4",
+      "size_bytes": 67401
     },
     {
       "executable": false,
@@ -559,8 +559,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "8c232605bbb6f10f8ce798f8b7bed8ad0dd6ae788498bba805cf3da2af3b5d8b",
-      "size_bytes": 275586
+      "sha256": "97d62f6a598fd500adc75856ef909c9b28b469dc586be19bf0e9190ca8715193",
+      "size_bytes": 279423
     },
     {
       "executable": false,
@@ -573,22 +573,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "1b6ab2dadce9ae1442176babab2ac5297e47745e8f747e475b87acafa3ee4495",
-      "size_bytes": 72463
+      "sha256": "ea9584c6f654ee4f81c9c527f9b406792a971a8fac9a5364a9d55f0996736740",
+      "size_bytes": 75339
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/macos_service.rs",
-      "sha256": "5864881a74d2902d7636940586a398a77ca61f4cab0279af8da547d519cb9259",
-      "size_bytes": 7538
+      "sha256": "c153cc73689c22b415ac67c5eb8e18d73e2061b07ce58adc81325d53c778fa4b",
+      "size_bytes": 19895
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "5e855b14a028dd6af732f9506e37115e69afc9fa467fa10e4c89554b21fc23bf",
-      "size_bytes": 15675
+      "sha256": "0dc2917eb97099fafcc1e6b8aa97401ceaaea3b996bfe37f3ea7e0b95bb4f78a",
+      "size_bytes": 17257
     },
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/unix_socket.rs",
-      "sha256": "05a6f678551e184cd61ead874965781fc97b3a6737309bd3ae6b0411b22c94f8",
-      "size_bytes": 11601
+      "sha256": "3f166c1cbeffd8a73d6203f5fe88fe9d34af23a3e9625b628e131de41aad77bf",
+      "size_bytes": 11729
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/install.md",
-      "sha256": "97fc958a6fc22a125543d386e81da67dea5064440257c07fb8211316aa36a26c",
-      "size_bytes": 2120
+      "sha256": "30e60e68ad825dd6763155e8cdcb8f543473a904fa26d2297467872c966f35bb",
+      "size_bytes": 2789
     },
     {
       "executable": false,
@@ -699,8 +699,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "424097cc3fa0c38935b64c85ebc425960bba73a8936472fbee6128381801e276",
-      "size_bytes": 5426
+      "sha256": "bfeaea022efb9717e25ebf18e067985fbd6fecca3c796841733436f2b2bf7128",
+      "size_bytes": 5818
     },
     {
       "executable": false,
@@ -951,8 +951,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/homebrew_formula.sh",
-      "sha256": "57136fca5eab8d338f9e6825fdbacb5f59f8658b15c933b51f559a9dec1524b1",
-      "size_bytes": 8555
+      "sha256": "d56d01c4d7ba05d1ed3609777a5af74cd440b00e2c0ef0e52dfaae26da076f1c",
+      "size_bytes": 8710
     },
     {
       "executable": true,
@@ -1042,8 +1042,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_closeout_gate.sh",
-      "sha256": "c65002a9f93ddbf8702ade59040087f458718a4aaa46850d61ffea15d08481bf",
-      "size_bytes": 10177
+      "sha256": "b32358fd437853dc2bd57116dc836488834a270e060da87bf7098bdde1ddfb03",
+      "size_bytes": 10449
     },
     {
       "executable": true,
@@ -1056,8 +1056,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_qa_evidence_template.sh",
-      "sha256": "6659f1242e39d3f5faa9dc4951b10c543ecf7b6f673707c297a8b7ce9030821b",
-      "size_bytes": 9098
+      "sha256": "7865e1cb0977c5e1ee8e16a995068b85e205cd22ae944770977e8070f967ba62",
+      "size_bytes": 9377
     },
     {
       "executable": true,
@@ -1133,8 +1133,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_homebrew_formula.sh",
-      "sha256": "96d450936c4c15a93006ca0dddc4bc783598acda9ec9a8d6ded29a14c7c5e2b1",
-      "size_bytes": 7167
+      "sha256": "0a40dc6af41d0b2d36140b5e2f178cc85cbe1fdf9c683f952118fe1a477c9af0",
+      "size_bytes": 7263
     },
     {
       "executable": true,
@@ -1210,8 +1210,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_closeout_gate.sh",
-      "sha256": "968101dc748bf41cc63374d3b9e7ec894eeeeba374fe61c28ceb676bf3da9f29",
-      "size_bytes": 14082
+      "sha256": "0fbc95c57b309eaf2d6a24cd3445bfa93e11105c5d20cf9054d85577698edba7",
+      "size_bytes": 14445
     },
     {
       "executable": true,
@@ -1224,8 +1224,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_qa_evidence_template.sh",
-      "sha256": "d36b4f920e192557936501ecfb7901e44cb60a0f688a0ee550ac1ef2e1e11dfe",
-      "size_bytes": 9607
+      "sha256": "5a9cdc982c01ca1f06343c18bab96d2c091cec27c13669481077f39f98d449ec",
+      "size_bytes": 10389
     },
     {
       "executable": true,
