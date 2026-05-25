@@ -40,6 +40,37 @@ exit 0
 SH
 chmod +x "$FAKE_BIN/spctl"
 
+cat > "$FAKE_BIN/ditto" <<'SH'
+#!/usr/bin/env sh
+printf 'ditto %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+dest=""
+for arg in "$@"; do
+  dest="$arg"
+done
+case "$dest" in
+  *.zip)
+    printf 'fake zip\n' > "$dest"
+    ;;
+  *)
+    mkdir -p "$dest"
+    ;;
+esac
+exit 0
+SH
+chmod +x "$FAKE_BIN/ditto"
+
+cat > "$FAKE_BIN/hdiutil" <<'SH'
+#!/usr/bin/env sh
+printf 'hdiutil %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+dest=""
+for arg in "$@"; do
+  dest="$arg"
+done
+printf 'rebuilt dmg\n' > "$dest"
+exit 0
+SH
+chmod +x "$FAKE_BIN/hdiutil"
+
 make_artifact() {
   local path="$1"
   printf 'artifact:%s\n' "$(basename "$path")" > "$path"
@@ -168,6 +199,38 @@ if ! grep -q "spctl --assess --type install .*ottto$" "$LOG"; then
 fi
 if ! grep -q "spctl --assess --type install .*ottto-service$" "$LOG"; then
   echo "Expected daemon Gatekeeper assessment to use install policy" >&2
+  exit 1
+fi
+
+APP_MANIFEST="$TMP_DIR/app-manifest.json"
+APP_LOG="$TMP_DIR/app.log"
+write_manifest "$APP_MANIFEST"
+OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARIZE_TEST_LOG="$APP_LOG" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$APP_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-name Ottto.app >/dev/null
+
+if ! grep -q "ditto -c -k --keepParent .*Ottto.app .*ottto-app-notary.*\\.zip" "$APP_LOG"; then
+  echo "Expected app bundle to be zipped for notarization before DMG rebuild" >&2
+  exit 1
+fi
+if ! grep -q "hdiutil create -volname Ottto -srcfolder .* -ov -format UDZO .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
+  echo "Expected app DMG to be rebuilt after app stapling" >&2
+  exit 1
+fi
+if ! grep -q "codesign --force --timestamp --sign Developer ID Application: Test .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
+  echo "Expected rebuilt app DMG to be signed before notarization" >&2
+  exit 1
+fi
+if [[ "$(grep -c "notarytool submit" "$APP_LOG")" -ne 2 ]]; then
+  echo "Expected app bundle zip and rebuilt DMG to be submitted for notarization" >&2
+  exit 1
+fi
+if [[ "$(jq -r '.artifacts[0].notarized' "$APP_MANIFEST")" != "true" ]]; then
+  echo "Expected app artifact to be marked notarized" >&2
   exit 1
 fi
 

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "397753df2776e593fe6f624539985ae6a782481aaae575c9244a7776bfd1a3b9",
+  "content_sha256": "5380d62e03c8cda22f852b8c16d03b1d3aedf878fa275fb71a60ce0e00d124a6",
   "files": [
     {
       "executable": false,
@@ -1000,8 +1000,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_notarize.sh",
-      "sha256": "629c24a3d886461c7cb604e83c2c2d4719d10df26214cc04c58cc3c8e78d092a",
-      "size_bytes": 5413
+      "sha256": "13a851babcee5895e9498b465e8866d9f741354d9b6f1a1e4a7cf9b5747adbcf",
+      "size_bytes": 6750
     },
     {
       "executable": true,
@@ -1168,8 +1168,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_notarize_filter.sh",
-      "sha256": "00a7f8412e5750f532a50e8646d82aa18128a3801457e09406f7ba6993e1628a",
-      "size_bytes": 6398
+      "sha256": "fe8a4d023dc347b8420e517838ffcd8affda65f9a5c8b16a0237bb0f9245af29",
+      "size_bytes": 8179
     },
     {
       "executable": true,

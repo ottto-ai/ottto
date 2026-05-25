@@ -106,6 +106,46 @@ gatekeeper_assessment_type() {
   fi
 }
 
+notary_submit() {
+  local archive="$1"
+  local -a submit_args
+  submit_args=(notarytool submit "$archive" --keychain-profile "$KEYCHAIN_PROFILE" --wait)
+  if [[ -n "$NOTARY_WAIT_TIMEOUT" ]]; then
+    submit_args+=(--timeout "$NOTARY_WAIT_TIMEOUT")
+  fi
+  xcrun "${submit_args[@]}"
+}
+
+mktemp_zip_path() {
+  local prefix="$1"
+  local path
+  path="$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")"
+  rm -f "$path"
+  printf '%s.zip' "$path"
+}
+
+rebuild_dmg_from_app() {
+  local app_bundle="$1"
+  local dmg_path="$2"
+  local sign_identity="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
+
+  require_command ditto
+  require_command hdiutil
+  if [[ -z "$sign_identity" ]]; then
+    echo "OTTTO_MACOS_CODESIGN_IDENTITY is required to rebuild signed app DMGs." >&2
+    exit 2
+  fi
+
+  local staging
+  staging="$(mktemp -d)"
+  ditto "$app_bundle" "$staging/$(basename "$app_bundle")"
+  ln -s /Applications "$staging/Applications"
+  rm -f "$dmg_path"
+  hdiutil create -volname "Ottto" -srcfolder "$staging" -ov -format UDZO "$dmg_path" >/dev/null
+  rm -rf "$staging"
+  codesign --force --timestamp --sign "$sign_identity" "$dmg_path"
+}
+
 matches_filter() {
   local name="$1"
   local kind="$2"
@@ -164,19 +204,24 @@ while IFS= read -r artifact; do
   fi
 
   codesign --verify --strict --verbose=2 "$verification_path" >/dev/null
-  if [[ "$VALIDATE_ONLY" != "true" ]]; then
-    submit_args=(notarytool submit "$path" --keychain-profile "$KEYCHAIN_PROFILE" --wait)
-    if [[ -n "$NOTARY_WAIT_TIMEOUT" ]]; then
-      submit_args+=(--timeout "$NOTARY_WAIT_TIMEOUT")
-    fi
-    xcrun "${submit_args[@]}"
-  fi
 
   if [[ "$kind" == "macos_app" ]]; then
+    if [[ "$VALIDATE_ONLY" != "true" ]]; then
+      app_notary_zip="$(mktemp_zip_path ottto-app-notary)"
+      ditto -c -k --keepParent "$verification_path" "$app_notary_zip"
+      notary_submit "$app_notary_zip"
+      rm -f "$app_notary_zip"
+      xcrun stapler staple "$verification_path"
+      xcrun stapler validate "$verification_path"
+      rebuild_dmg_from_app "$verification_path" "$path"
+      notary_submit "$path"
+    fi
     xcrun stapler staple "$path"
     xcrun stapler validate "$path"
     xcrun stapler staple "$verification_path"
     xcrun stapler validate "$verification_path"
+  elif [[ "$VALIDATE_ONLY" != "true" ]]; then
+    notary_submit "$path"
   fi
 
   spctl --assess --type "$(gatekeeper_assessment_type "$kind")" --verbose "$verification_path" >/dev/null
