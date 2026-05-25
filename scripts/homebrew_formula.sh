@@ -257,6 +257,7 @@ class Ottto < Formula
 
       Update this Homebrew-managed install:
         brew update && brew upgrade ottto
+        brew services restart ottto
 
       Stop and uninstall:
         brew services stop ottto

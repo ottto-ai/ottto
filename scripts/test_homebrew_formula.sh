@@ -147,6 +147,7 @@ assert_contains "$formula" 'bin.install daemons.fetch(0) => "ottto-service"'
 assert_contains "$formula" 'name macos: "net.ottto.service"'
 assert_contains "$formula" 'brew services start ottto'
 assert_contains "$formula" 'brew update && brew upgrade ottto'
+assert_contains "$formula" 'brew services restart ottto'
 assert_contains "$formula" 'brew services stop ottto'
 assert_not_contains "$formula" '/latest/ottto-macos-arm64.zip'
 
