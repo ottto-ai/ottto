@@ -1,8 +1,9 @@
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
-    ingest_claude_statusline_payload, kickstart_macos_launch_agent, local_lifecycle_home_dir,
-    request_unix_socket, UninstallExecutionOptions, OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
+    ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
+    local_lifecycle_home_dir, request_unix_socket, UninstallExecutionOptions,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval, LocalControlCommand,
@@ -502,6 +503,7 @@ fn request_like(invocation: &Invocation, command: LocalControlCommand) -> LocalC
         protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
         token: invocation.request.token.clone(),
         client_kind: invocation.request.client_kind.clone(),
+        client_install_owner: invocation.request.client_install_owner,
         command,
     }
 }
@@ -965,6 +967,11 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
             protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
             token: Some(token),
             client_kind: Some(ottto_protocol::LocalClientKind::Cli),
+            client_install_owner: std::env::current_exe()
+                .ok()
+                .as_deref()
+                .map(install_owner_for_path)
+                .filter(|owner| *owner != ottto_protocol::InstallOwner::Unknown),
             command: local_command(cli.command),
         },
         output_mode,

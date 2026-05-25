@@ -53,16 +53,20 @@ required_checks_for_owner() {
         formula_syntax \
         install \
         service_start \
+        app_launch_preserves_owner \
         status_json \
         setup_browser_claim \
         apps_detect_json \
         verify_codex_json \
         doctor_json \
+        doctor_owner_drift_json \
         fix_codex_json \
         diagnostics_collect_json \
         logout_json \
         update_check \
+        update_check_owner_json \
         upgrade \
+        post_upgrade_app_relaunch_preserves_owner \
         uninstall \
         reinstall \
         post_reinstall_status_json
@@ -96,15 +100,18 @@ required_checks_for_owner() {
         install \
         app_launch \
         service_ready \
+        homebrew_second_install_safe_refusal \
         status_json \
         setup_browser_claim \
         apps_detect_json \
         verify_codex_json \
         doctor_json \
+        doctor_owner_drift_json \
         fix_codex_json \
         diagnostics_collect_json \
         logout_json \
         update_check \
+        update_check_owner_json \
         upgrade \
         uninstall \
         reinstall \

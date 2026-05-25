@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ottto_protocol::InstallOwner;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -20,6 +21,23 @@ pub fn user_launchctl_domain() -> String {
 
 pub fn macos_launch_agent_target() -> String {
     format!("{}/{}", user_launchctl_domain(), MACOS_LAUNCH_AGENT_LABEL)
+}
+
+pub fn install_owner_for_path(path: &Path) -> InstallOwner {
+    let value = path.to_string_lossy();
+    if value.contains(".app/Contents/") {
+        return InstallOwner::AppBundle;
+    }
+    if value.contains("/.ottto/bin/") {
+        return InstallOwner::HostedInstaller;
+    }
+    if value.contains("/Cellar/")
+        || value.contains("/opt/homebrew/")
+        || value.contains("/usr/local/Homebrew/")
+    {
+        return InstallOwner::Homebrew;
+    }
+    InstallOwner::Unknown
 }
 
 pub fn kickstart_macos_launch_agent() -> Result<()> {
@@ -144,6 +162,36 @@ mod tests {
         assert_eq!(
             launch_agent_path_from_home(Path::new("/Users/test")),
             PathBuf::from("/Users/test/Library/LaunchAgents/net.ottto.service.plist")
+        );
+    }
+
+    #[test]
+    fn install_owner_detection_routes_known_install_paths() {
+        assert_eq!(
+            install_owner_for_path(Path::new(
+                "/opt/homebrew/Cellar/ottto/0.1.0/bin/ottto-service"
+            )),
+            InstallOwner::Homebrew
+        );
+        assert_eq!(
+            install_owner_for_path(Path::new(
+                "/usr/local/Homebrew/Cellar/ottto/0.1.0/bin/ottto-service"
+            )),
+            InstallOwner::Homebrew
+        );
+        assert_eq!(
+            install_owner_for_path(Path::new("/Users/test/.ottto/bin/ottto-service")),
+            InstallOwner::HostedInstaller
+        );
+        assert_eq!(
+            install_owner_for_path(Path::new(
+                "/Applications/Ottto.app/Contents/Helpers/ottto-service"
+            )),
+            InstallOwner::AppBundle
+        );
+        assert_eq!(
+            install_owner_for_path(Path::new("/tmp/Ottto.app-helper/ottto-service")),
+            InstallOwner::Unknown
         );
     }
 }

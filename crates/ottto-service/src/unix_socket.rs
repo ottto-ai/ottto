@@ -187,6 +187,7 @@ mod tests {
                 protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -229,6 +230,7 @@ mod tests {
                 protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -257,6 +259,7 @@ mod tests {
             protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
             token: Some("token".to_string()),
             client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
             },

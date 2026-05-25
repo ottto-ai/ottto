@@ -20,6 +20,7 @@ pub fn empty_status(machine: MachineIdentity, now: impl Into<String>) -> DaemonS
             last_error: None,
         },
         sources: Vec::new(),
+        service_owner: Default::default(),
         update: UpdateState {
             current_version: compiled_release_version(),
             latest_version: None,

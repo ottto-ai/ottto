@@ -90,6 +90,8 @@ pub struct DaemonStatus {
     pub machine: MachineIdentity,
     pub account: LocalAccountBinding,
     pub daemon: DaemonRuntimeState,
+    #[serde(default)]
+    pub service_owner: ServiceOwnerState,
     pub relay: RelayState,
     pub sources: Vec<SourceHealth>,
     pub update: UpdateState,
@@ -1183,6 +1185,28 @@ pub struct UpdateState {
     pub update_instructions: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ServiceOwnerState {
+    #[serde(default)]
+    pub daemon_owner: InstallOwner,
+    #[serde(default)]
+    pub plist_owner: InstallOwner,
+    #[serde(default)]
+    pub loaded_owner: InstallOwner,
+    #[serde(default)]
+    pub client_owner: InstallOwner,
+    #[serde(default)]
+    pub owner_drift: bool,
+    #[serde(default)]
+    pub plist_exists: bool,
+    #[serde(default)]
+    pub launchd_loaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseChannel {
@@ -1267,6 +1291,8 @@ pub struct LocalControlRequest {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_kind: Option<LocalClientKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_install_owner: Option<InstallOwner>,
     #[serde(flatten)]
     pub command: LocalControlCommand,
 }

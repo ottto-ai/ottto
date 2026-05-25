@@ -265,6 +265,8 @@ class Ottto < Formula
 
       The Homebrew service owns launchd label net.ottto.service and the default
       per-user socket at ~/Library/Application Support/Ottto/ottto-service.sock.
+      If Ottto.app is also installed, leave service lifecycle with Homebrew; the
+      app connects to the Homebrew-owned service instead of replacing it.
     EOS
   end
 

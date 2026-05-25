@@ -13,9 +13,9 @@ use crate::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
-    execute_local_uninstall, generate_control_token, local_lifecycle_home_dir,
-    plan_local_uninstall, redact_inline, release_channel_from_str, ControlTokenStore,
-    FileAccountStore, FileConnectionStore, FileDeviceStore, KeychainSecretStore,
+    execute_local_uninstall, generate_control_token, install_owner_for_path,
+    local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
+    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore, KeychainSecretStore,
     LocalConnectionBinding, LocalDeviceBinding, UninstallExecutionOptions, OTTTO_CLIENT_NAME,
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
@@ -27,10 +27,10 @@ use ottto_protocol::{
     LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
     LocalClientKind, LocalControlCommand, LocalControlRequest, LocalControlResponse,
     MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel, SecretString,
-    SourceKind, SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
-    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    ServiceOwnerState, SourceKind, SourceRouteVerificationResult, SourceVerificationResult,
+    SourceVerificationStatus, StableMessage, TelemetryControlAction, UninstallExecutionResult,
+    UpdateGate, UpdateState, UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE,
+    LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -115,7 +115,10 @@ pub fn handle_request_with_peer(
         };
     }
     let authorization = request_authorization(&request, peer.as_ref());
-    match handle_command(daemon, authorization, request.command) {
+    let client_install_owner = request
+        .client_install_owner
+        .unwrap_or(InstallOwner::Unknown);
+    match handle_command(daemon, authorization, request.command, client_install_owner) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -300,6 +303,7 @@ fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
     command: LocalControlCommand,
+    client_install_owner: InstallOwner,
 ) -> Result<serde_json::Value, LocalApiError> {
     match command {
         LocalControlCommand::Status {
@@ -310,6 +314,7 @@ fn handle_command(
             }
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
+            status.service_owner = service_owner_state(client_install_owner);
             to_value(status)
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
@@ -1688,22 +1693,100 @@ fn detect_install_owner() -> InstallOwner {
         .unwrap_or(InstallOwner::Unknown)
 }
 
-fn install_owner_for_path(path: &Path) -> InstallOwner {
-    let value = path.to_string_lossy();
-    if value.contains(".app/Contents/") {
-        return InstallOwner::AppBundle;
+fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
+    let daemon_owner = detect_install_owner();
+    let owner_state = local_lifecycle_home_dir().ok().map(|home| {
+        let plist_path = crate::macos_service::launch_agent_path(&home);
+        crate::macos_service::inspect_launch_agent_owner(
+            &plist_path,
+            std::env::current_exe().ok().as_deref(),
+        )
+    });
+    let (plist_owner, loaded_owner, plist_exists, launchd_loaded, mut owner_drift) =
+        if let Some(owner_state) = owner_state {
+            (
+                owner_state.plist_owner,
+                owner_state.loaded_owner,
+                owner_state.plist_exists,
+                owner_state.loaded,
+                owner_state.owner_drift,
+            )
+        } else {
+            (
+                InstallOwner::Unknown,
+                InstallOwner::Unknown,
+                false,
+                false,
+                false,
+            )
+        };
+
+    owner_drift |= known_owner_conflict(client_owner, daemon_owner)
+        || known_owner_conflict(client_owner, plist_owner)
+        || known_owner_conflict(client_owner, loaded_owner);
+
+    ServiceOwnerState {
+        daemon_owner,
+        plist_owner,
+        loaded_owner,
+        client_owner,
+        owner_drift,
+        plist_exists,
+        launchd_loaded,
+        repair_command: owner_repair_command(preferred_repair_owner(
+            client_owner,
+            loaded_owner,
+            plist_owner,
+            daemon_owner,
+        ))
+        .map(ToString::to_string),
+        detail: Some(owner_state_detail(owner_drift, client_owner, daemon_owner)),
     }
-    if value.contains("/.ottto/bin/") {
-        return InstallOwner::HostedInstaller;
-    }
-    if value.contains("/Cellar/")
-        || value.contains("/opt/homebrew/")
-        || value.contains("/usr/local/Homebrew/")
-        || value.contains("/Homebrew/")
-    {
-        return InstallOwner::Homebrew;
+}
+
+fn known_owner_conflict(left: InstallOwner, right: InstallOwner) -> bool {
+    left != InstallOwner::Unknown && right != InstallOwner::Unknown && left != right
+}
+
+fn preferred_repair_owner(
+    client_owner: InstallOwner,
+    loaded_owner: InstallOwner,
+    plist_owner: InstallOwner,
+    daemon_owner: InstallOwner,
+) -> InstallOwner {
+    for owner in [loaded_owner, plist_owner, daemon_owner, client_owner] {
+        if owner != InstallOwner::Unknown {
+            return owner;
+        }
     }
     InstallOwner::Unknown
+}
+
+fn owner_repair_command(owner: InstallOwner) -> Option<&'static str> {
+    match owner {
+        InstallOwner::Homebrew => Some("brew services restart ottto"),
+        InstallOwner::HostedInstaller => Some("rerun the Ottto installer"),
+        InstallOwner::AppBundle => Some("quit and relaunch the Ottto app"),
+        InstallOwner::Unknown => None,
+    }
+}
+
+fn owner_state_detail(
+    owner_drift: bool,
+    client_owner: InstallOwner,
+    daemon_owner: InstallOwner,
+) -> String {
+    if owner_drift {
+        return format!(
+            "LaunchAgent owner drift detected between {} client and {} daemon.",
+            install_owner_label(client_owner),
+            install_owner_label(daemon_owner)
+        );
+    }
+    format!(
+        "LaunchAgent owner is {}.",
+        install_owner_label(daemon_owner)
+    )
 }
 
 fn commits_equivalent(local: &str, remote: &str) -> bool {
@@ -5566,6 +5649,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -5589,6 +5673,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("bad-token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -5618,6 +5703,7 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     token: Some("bad-token".to_string()),
                     client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
                     command,
                 },
             );
@@ -5642,6 +5728,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::AuthReset { local_only: false },
             },
         );
@@ -5676,6 +5763,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::AuthReset { local_only: false },
             },
         );
@@ -5736,6 +5824,7 @@ mod tests {
                 protocol_version: 10,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -6032,6 +6121,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -6052,6 +6142,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
                 },
@@ -6074,6 +6165,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::UninstallPlan,
             },
         );
@@ -6099,6 +6191,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::UninstallExecute { confirm: false },
             },
         );
@@ -6119,6 +6212,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: false,
                     upload_approval: None,
@@ -6153,6 +6247,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: true,
                     upload_approval: None,
@@ -6176,6 +6271,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: true,
                     upload_approval: Some(DiagnosticsUploadApproval {
@@ -6203,6 +6299,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: true,
                     upload_approval: Some(DiagnosticsUploadApproval {
@@ -6232,6 +6329,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: true,
                     upload_approval: Some(DiagnosticsUploadApproval {
@@ -6290,6 +6388,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: Some("token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
                 command: LocalControlCommand::DiagnosticsCollect {
                     upload: true,
                     upload_approval: Some(DiagnosticsUploadApproval {
@@ -6340,6 +6439,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::EnableTelemetry,
                     source: SourceKind::Codex,
@@ -6468,6 +6568,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::DisableTelemetry,
                     source: SourceKind::Codex,
@@ -6529,6 +6630,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::DisableTelemetry,
                     source: SourceKind::Codex,
@@ -6576,6 +6678,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::Status,
                     source: SourceKind::Codex,
@@ -6688,6 +6791,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::Status,
                     source: SourceKind::Codex,
@@ -6717,6 +6821,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::DisableTelemetry,
                     source: SourceKind::Codex,
@@ -6750,6 +6855,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::Status,
                     source: SourceKind::Codex,
@@ -6779,6 +6885,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 token: None,
                 client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
                 command: LocalControlCommand::TelemetryControl {
                     action: TelemetryControlAction::EnableTelemetry,
                     source: SourceKind::Codex,

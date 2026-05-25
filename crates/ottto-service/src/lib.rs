@@ -599,11 +599,20 @@ impl LocalDaemon {
         let home = local_lifecycle_home_dir().ok();
         let launch_agent_path_value = if home.is_some() { "[path]" } else { "unknown" };
         let launch_agent_loaded = launchd_service_loaded();
+        let current_exe = std::env::current_exe().ok();
+        let owner_state = home.as_ref().map(|home| {
+            let plist_path = macos_service::launch_agent_path(home);
+            macos_service::inspect_launch_agent_owner(&plist_path, current_exe.as_deref())
+        });
         let launch_agent_path_exists = home
             .as_ref()
             .map(|home| launch_agent_path(home).exists())
             .unwrap_or(false);
         let launch_agent_path_drift = launch_agent_loaded && !launch_agent_path_exists;
+        let owner_drift = owner_state
+            .as_ref()
+            .map(|state| state.owner_drift)
+            .unwrap_or(false);
         let keychain_item_count = local_secret_presence_count();
         let version_mismatch = status.protocol_version != PROTOCOL_VERSION
             || status.daemon_version != env!("CARGO_PKG_VERSION");
@@ -670,6 +679,66 @@ impl LocalDaemon {
         installation.insert(
             "launch_agent_path_drift".to_string(),
             RedactedValue::Bool(launch_agent_path_drift),
+        );
+        installation.insert(
+            "daemon_owner".to_string(),
+            RedactedValue::String(
+                current_exe
+                    .as_deref()
+                    .map(ottto_core::install_owner_for_path)
+                    .map(macos_service::install_owner_label)
+                    .unwrap_or("unknown-owner")
+                    .to_string(),
+            ),
+        );
+        installation.insert(
+            "plist_owner".to_string(),
+            RedactedValue::String(
+                owner_state
+                    .as_ref()
+                    .map(|state| macos_service::install_owner_label(state.plist_owner))
+                    .unwrap_or("unknown-owner")
+                    .to_string(),
+            ),
+        );
+        installation.insert(
+            "loaded_owner".to_string(),
+            RedactedValue::String(
+                owner_state
+                    .as_ref()
+                    .map(|state| macos_service::install_owner_label(state.loaded_owner))
+                    .unwrap_or("unknown-owner")
+                    .to_string(),
+            ),
+        );
+        installation.insert("owner_drift".to_string(), RedactedValue::Bool(owner_drift));
+        installation.insert(
+            "repair_command".to_string(),
+            RedactedValue::String(
+                owner_state
+                    .as_ref()
+                    .and_then(|state| {
+                        let owner = if state.loaded_owner != ottto_protocol::InstallOwner::Unknown {
+                            state.loaded_owner
+                        } else {
+                            state.plist_owner
+                        };
+                        match owner {
+                            ottto_protocol::InstallOwner::Homebrew => {
+                                Some("brew services restart ottto")
+                            }
+                            ottto_protocol::InstallOwner::HostedInstaller => {
+                                Some("rerun the Ottto installer")
+                            }
+                            ottto_protocol::InstallOwner::AppBundle => {
+                                Some("quit and relaunch the Ottto app")
+                            }
+                            ottto_protocol::InstallOwner::Unknown => None,
+                        }
+                    })
+                    .unwrap_or("inspect LaunchAgent owner")
+                    .to_string(),
+            ),
         );
         installation.insert(
             "stale_registrations".to_string(),

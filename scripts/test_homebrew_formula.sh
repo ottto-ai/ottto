@@ -149,6 +149,7 @@ assert_contains "$formula" 'brew services start ottto'
 assert_contains "$formula" 'brew update && brew upgrade ottto'
 assert_contains "$formula" 'brew services restart ottto'
 assert_contains "$formula" 'brew services stop ottto'
+assert_contains "$formula" 'app connects to the Homebrew-owned service instead of replacing it'
 assert_not_contains "$formula" '/latest/ottto-macos-arm64.zip'
 
 if command -v ruby >/dev/null 2>&1; then

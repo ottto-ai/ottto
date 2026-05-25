@@ -24,6 +24,14 @@ release manifest:
 - Signed `Ottto.app`: provides the native app path while staying aligned with
   the same `ottto-service` runtime and release manifest.
 
+`net.ottto.service` is a single-owner user LaunchAgent. A normal install,
+launch, upgrade, or restart may repair only the LaunchAgent it already owns:
+Homebrew through `brew services`, the native app through its bundled helper,
+and the hosted installer through its installed helper. Replacing a different
+owner requires an explicit migration command; ordinary app launch must use a
+Homebrew-owned service without rewriting it, and ordinary Homebrew service
+start must not silently take over an app-bundle-owned job.
+
 Final public-v1 closeout verifies that the public repository resolves as
 `ottto-ai/ottto`, uses `main` as its default branch, and has that public `main`
 branch head bound to the launch runtime commit. It also verifies that the exact
@@ -385,7 +393,9 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   owns Homebrew launchd label `net.ottto.service`, starts with
   `brew services start ottto`, updates with
   `brew update && brew upgrade ottto`, and uninstalls with
-  `brew services stop ottto && brew uninstall ottto`.
+  `brew services stop ottto && brew uninstall ottto`. The Homebrew service
+  remains the LaunchAgent owner when `Ottto.app` is also present; the app talks
+  to the running service instead of replacing the Homebrew plist.
 - a stable hosted native installer wrapper generator that writes
   `install-macos.sh` only from a stable manifest whose native macOS app artifact
   is HTTPS, immutable-prefix pinned, SHA-256 pinned, signed, notarized,
@@ -414,13 +424,13 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - local and hosted preview installers that verify dev/preview artifacts,
   install the app and Rust helpers to user-scoped locations, clear quarantine
   for the explicit tester install path, and delegate LaunchAgent plist writing
-  to `ottto-service`. Bootstrap replaces an already-loaded
-  `net.ottto.service` job before loading the freshly written plist, so stale
-  SMAppService registrations do not keep launchd pinned to an older bundled
-  helper after an in-place dev app replacement. Hosted installer readiness
-  checks wait for the daemon without invoking CLI autostart, and the native app
-  skips bundled SMAppService registration while the installer-owned user
-  LaunchAgent exists.
+  to `ottto-service`. Bootstrap refreshes only same-owner LaunchAgents by
+  default and refuses cross-owner rewrites unless the operator supplies the
+  explicit migration flag, so stale app-bundle helpers can be repaired without
+  stealing Homebrew-owned or hosted-installer-owned jobs. Hosted installer
+  readiness checks wait for the daemon without invoking CLI autostart, and the
+  native app skips bundled SMAppService registration while the installer-owned
+  user LaunchAgent exists.
 - an installed dev/preview E2E smoke that validates the app bundle, LaunchAgent,
   CLI-to-daemon protocol, real setup claim handoff when a claim is supplied,
   actionable Codex verification JSON, and diagnostics redaction

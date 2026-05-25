@@ -7,6 +7,7 @@ use ottto_core::{
 };
 use ottto_protocol::{MachineIdentity, OperatingSystem};
 use ottto_service::{current_rfc3339_timestamp, macos_service, ControlToken, LocalDaemon};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -54,12 +55,22 @@ enum ServiceCommand {
     WriteLaunchAgent {
         #[arg(long)]
         executable: PathBuf,
+        #[arg(
+            long,
+            help = "Deliberately replace a LaunchAgent owned by another install method"
+        )]
+        migrate_owner: bool,
         #[arg(long)]
         json: bool,
     },
     Bootstrap {
         #[arg(long)]
         executable: PathBuf,
+        #[arg(
+            long,
+            help = "Deliberately replace a LaunchAgent owned by another install method"
+        )]
+        migrate_owner: bool,
         #[arg(long)]
         json: bool,
     },
@@ -174,7 +185,26 @@ fn main() -> Result<()> {
                 let _ = daemon;
             }
         }
-        Command::Service { command } => handle_service_command(command)?,
+        Command::Service { command } => {
+            let json = command.json_enabled();
+            if let Err(error) = handle_service_command(command) {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": false,
+                            "error": {
+                                "code": "launch_agent_owner_conflict",
+                                "message": error.to_string(),
+                                "retryable": false
+                            }
+                        }))?
+                    );
+                    std::process::exit(2);
+                }
+                return Err(error);
+            }
+        }
     }
 
     Ok(())
@@ -182,14 +212,23 @@ fn main() -> Result<()> {
 
 fn handle_service_command(command: ServiceCommand) -> Result<()> {
     let home = home_dir()?;
-    let (executable, write, execute, json) = match command {
-        ServiceCommand::InstallPlan { executable, json } => (executable, false, false, json),
-        ServiceCommand::WriteLaunchAgent { executable, json } => (executable, true, false, json),
-        ServiceCommand::Bootstrap { executable, json } => (executable, true, true, json),
+    let (executable, write, execute, json, migrate_owner) = match command {
+        ServiceCommand::InstallPlan { executable, json } => (executable, false, false, json, false),
+        ServiceCommand::WriteLaunchAgent {
+            executable,
+            migrate_owner,
+            json,
+        } => (executable, true, false, json, migrate_owner),
+        ServiceCommand::Bootstrap {
+            executable,
+            migrate_owner,
+            json,
+        } => (executable, true, true, json, migrate_owner),
     };
     let config = macos_service::LaunchAgentConfig::local_user_default(&home, executable);
     let plist_path = macos_service::launch_agent_path(&home);
     let plan = if write {
+        macos_service::ensure_launch_agent_write_allowed(&config, &plist_path, migrate_owner)?;
         macos_service::write_launch_agent(&config, &plist_path)?
     } else {
         macos_service::install_plan(&config, &plist_path)
@@ -211,6 +250,16 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+impl ServiceCommand {
+    fn json_enabled(&self) -> bool {
+        match self {
+            ServiceCommand::InstallPlan { json, .. }
+            | ServiceCommand::WriteLaunchAgent { json, .. }
+            | ServiceCommand::Bootstrap { json, .. } => *json,
+        }
+    }
 }
 
 fn start_builtin_relays(daemon: &LocalDaemon) {

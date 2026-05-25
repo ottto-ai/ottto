@@ -145,6 +145,7 @@ jq -e \
     and .environment.arch == "arm64"
     and ([.install_owners[].owner] | sort == ["app_bundle", "homebrew", "hosted_installer"])
     and (.install_owners[] | select(.owner == "homebrew") | .checks.formula_syntax == "not_run")
+    and (.install_owners[] | select(.owner == "homebrew") | .checks.app_launch_preserves_owner == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.runtime == "ottto-service")
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.service_label == "net.ottto.service")
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.version == "0.1.0")
@@ -154,14 +155,20 @@ jq -e \
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.release_manifest_sha256 == $manifest_sha)
     and (.install_owners[] | select(.owner == "homebrew") | .checks.setup_browser_claim == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.verify_codex_json == "not_run")
+    and (.install_owners[] | select(.owner == "homebrew") | .checks.doctor_owner_drift_json == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.fix_codex_json == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.diagnostics_collect_json == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.logout_json == "not_run")
+    and (.install_owners[] | select(.owner == "homebrew") | .checks.update_check_owner_json == "not_run")
+    and (.install_owners[] | select(.owner == "homebrew") | .checks.post_upgrade_app_relaunch_preserves_owner == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.reinstall == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.native_gatekeeper == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.upgrade == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.post_reinstall_status_json == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.artifact_checksum == "not_run")
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks.homebrew_second_install_safe_refusal == "not_run")
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks.doctor_owner_drift_json == "not_run")
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks.update_check_owner_json == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.apps_detect_json == "not_run")
   ' "$evidence" >/dev/null
 

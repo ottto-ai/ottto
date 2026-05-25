@@ -11,6 +11,16 @@ Ottto installs a user-scoped macOS local runtime:
 Do not install by copying binaries from a mutable directory. Use the install
 owner named by the release channel.
 
+## LaunchAgent Ownership
+
+`net.ottto.service` is a single-owner user LaunchAgent. Normal install, launch,
+upgrade, restart, and repair commands may refresh only the current owner. A
+Homebrew-owned LaunchAgent stays managed by `brew services`; a signed
+`Ottto.app` launch connects to that service instead of rewriting the plist. To
+switch owners, stop or uninstall the old owner first, or run an explicit
+operator migration command with the new owner selected. Do not install both the
+app bundle and Homebrew as independent service owners.
+
 ## Homebrew Install Owner
 
 When a stable release advertises Homebrew support, install through the published
@@ -27,12 +37,15 @@ Update and uninstall through Homebrew:
 ```bash
 brew update
 brew upgrade ottto
+brew services restart ottto
 brew services stop ottto
 brew uninstall ottto
 ```
 
 The formula must pin immutable artifact URLs and SHA-256 hashes from the stable
-release manifest. Do not self-overwrite a Homebrew-managed install.
+release manifest. Do not self-overwrite a Homebrew-managed install; use
+`brew services restart ottto` after upgrades so launchd points at the updated
+Homebrew opt path.
 
 ## Verified Native DMG Helper
 

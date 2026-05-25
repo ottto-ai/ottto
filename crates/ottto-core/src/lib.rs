@@ -25,11 +25,11 @@ pub use lifecycle::{
 };
 pub use local_client::{default_socket_path, request_unix_socket};
 pub use local_service::{
-    kickstart_macos_launch_agent, macos_launch_agent_target, user_launchctl_domain,
-    MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL, OTTTO_CLIENT_NAME,
-    OTTTO_CONTROL_TOKEN_ENV, OTTTO_LEGACY_SERVICE_BINARY_NAME, OTTTO_LEGACY_SOCKET_NAME,
-    OTTTO_SECRET_FALLBACK_DIR_ENV, OTTTO_SERVICE_BINARY_NAME, OTTTO_SERVICE_SOCKET_NAME,
-    OTTTO_SOCKET_ENV,
+    install_owner_for_path, kickstart_macos_launch_agent, macos_launch_agent_target,
+    user_launchctl_domain, MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL,
+    OTTTO_CLIENT_NAME, OTTTO_CONTROL_TOKEN_ENV, OTTTO_LEGACY_SERVICE_BINARY_NAME,
+    OTTTO_LEGACY_SOCKET_NAME, OTTTO_SECRET_FALLBACK_DIR_ENV, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SERVICE_SOCKET_NAME, OTTTO_SOCKET_ENV,
 };
 pub use redaction::{redact_inline, redact_key_value, RedactionPolicy};
 pub use status::{
