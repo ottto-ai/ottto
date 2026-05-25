@@ -116,7 +116,7 @@ LATEST_MANIFEST_URL="$RELEASE_CHANNEL_URL_ROOT/latest/release-manifest.json"
 if [[ -n "${OTTTO_SUPPORTED_INSTALL_OWNERS_JSON:-}" ]]; then
   SUPPORTED_INSTALL_OWNERS_JSON="$OTTTO_SUPPORTED_INSTALL_OWNERS_JSON"
 elif [[ "$CHANNEL" == "stable" ]]; then
-  SUPPORTED_INSTALL_OWNERS_JSON='["app_bundle"]'
+  SUPPORTED_INSTALL_OWNERS_JSON='["app_bundle", "homebrew"]'
 else
   SUPPORTED_INSTALL_OWNERS_JSON='["hosted_installer", "app_bundle", "homebrew"]'
 fi
