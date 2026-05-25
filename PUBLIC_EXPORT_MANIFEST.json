@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "40018cb4f8afc067146941847d1383531a19ec1b6288889668550a08c4b1a044",
+  "content_sha256": "401035d6c372633e038c499a8c2ad53da95cf734a2e38351bbdbb35f57fae5db",
   "files": [
     {
       "executable": false,
@@ -951,8 +951,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/homebrew_formula.sh",
-      "sha256": "b998d395f00370d049c7fe79587ab05892ad8ae33af11000129dd32af5832eac",
-      "size_bytes": 8519
+      "sha256": "57136fca5eab8d338f9e6825fdbacb5f59f8658b15c933b51f559a9dec1524b1",
+      "size_bytes": 8555
     },
     {
       "executable": true,
@@ -1133,8 +1133,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_homebrew_formula.sh",
-      "sha256": "ab4a715022410c16c760e363705382eeeac15f9a8e45950d346fd929b0f88d7e",
-      "size_bytes": 7110
+      "sha256": "96d450936c4c15a93006ca0dddc4bc783598acda9ec9a8d6ded29a14c7c5e2b1",
+      "size_bytes": 7167
     },
     {
       "executable": true,
