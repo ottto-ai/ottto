@@ -4749,21 +4749,27 @@ fn verify_source(
 
     let setup_run_token = match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
         Ok(token) => token,
-        Err(_) => {
-            let result = verification_result(
-                source,
-                SourceVerificationStatus::ReconnectRequired,
-                false,
-                0,
-                None,
-                None,
-                None,
-                "setup_run_token_missing",
-                "This Mac's connection to Ottto has lapsed. Open ottto.net/apps in your browser to reconnect, then try verifying again.",
-            );
-            daemon.record_verification_result(&result)?;
-            return Ok(result);
-        }
+        Err(_) => match refresh_setup_run_token_via_device_secret(
+            &connection.api_base_url,
+            &connection,
+        ) {
+            Ok(token) => token,
+            Err(_) => {
+                let result = verification_result(
+                    source,
+                    SourceVerificationStatus::ReconnectRequired,
+                    false,
+                    0,
+                    None,
+                    None,
+                    None,
+                    "setup_run_token_missing",
+                    "This Mac's local Ottto connection needs a fresh sign-in. Open Ottto in your browser, then try verifying again.",
+                );
+                daemon.record_verification_result(&result)?;
+                return Ok(result);
+            }
+        },
     };
 
     if source == SourceKind::Pi {
