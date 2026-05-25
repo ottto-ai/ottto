@@ -19,12 +19,16 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const CLAUDE_CODE_RELAY_PORT: u16 = 43119;
+pub const LOCAL_RELAY_DEFAULT_PORT: u16 = 43119;
+pub const CLAUDE_CODE_RELAY_PORT: u16 = LOCAL_RELAY_DEFAULT_PORT;
 pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
 pub const CODEX_RELAY_SOURCE: &str = "codex";
 pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
 
 const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+const LOCAL_RELAY_FALLBACK_BASE_PORT: u16 = 44120;
+const LOCAL_RELAY_FALLBACK_SPAN: u16 = 2000;
+const LOCAL_RELAY_FALLBACK_ATTEMPTS: u16 = 24;
 const MAX_OTLP_BODY_BYTES: usize = 25 * 1024 * 1024;
 const RELAY_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
 
@@ -58,32 +62,30 @@ static RELAY_TOKEN_CACHE: OnceLock<Mutex<BTreeMap<RelayTokenCacheKey, CachedRela
 static UPSTREAM_HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
-    spawn_source_relay(daemon, SnapshotSource::ClaudeCode, CLAUDE_CODE_RELAY_PORT)
+    spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
 }
 
 pub fn spawn_claude_code_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_local_otlp_relay(daemon)
 }
 
-fn spawn_source_relay(
-    daemon: LocalDaemon,
-    source: SnapshotSource,
-    port: u16,
-) -> Result<SocketAddr> {
-    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    let listener = match TcpListener::bind(bind_addr) {
-        Ok(listener) => listener,
+fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<SocketAddr> {
+    let (listener, _port) = match bind_local_relay_listener() {
+        Ok(bound) => bound,
         Err(error) => {
             let _ = daemon.set_relay_state_for_trusted_client(RelayState {
                 state: RelayRuntimeState::Failed,
-                endpoint: Some(format!("http://127.0.0.1:{port}")),
+                endpoint: Some(default_local_relay_base_url()),
                 last_connected_at: None,
                 last_error: Some(StableMessage {
                     code: "relay_bind_failed".to_string(),
-                    text: format!("Could not bind local OTLP relay on 127.0.0.1:{port}."),
+                    text: format!(
+                        "Could not bind local OTLP relay on 127.0.0.1:{} or a per-user fallback port.",
+                        LOCAL_RELAY_DEFAULT_PORT
+                    ),
                 }),
             });
-            return Err(error).context("bind local OTLP relay");
+            return Err(error);
         }
     };
     let local_addr = listener.local_addr()?;
@@ -115,6 +117,101 @@ fn spawn_source_relay(
     });
 
     Ok(local_addr)
+}
+
+fn bind_local_relay_listener() -> Result<(TcpListener, u16)> {
+    let mut last_error = None;
+    for port in candidate_relay_ports(current_uid()) {
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        match TcpListener::bind(bind_addr) {
+            Ok(listener) => {
+                if port != LOCAL_RELAY_DEFAULT_PORT {
+                    eprintln!(
+                        "local OTLP relay default port {LOCAL_RELAY_DEFAULT_PORT} is unavailable; using fallback port {port}"
+                    );
+                }
+                return Ok((listener, port));
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let error = last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("no local OTLP relay ports were available"));
+    Err(error).context("bind local OTLP relay")
+}
+
+pub fn default_local_relay_base_url() -> String {
+    local_relay_base_url_for_port(LOCAL_RELAY_DEFAULT_PORT)
+}
+
+pub fn local_relay_base_url_for_port(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+pub fn local_relay_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    let without_scheme = endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| endpoint.strip_prefix("http://localhost:"))?;
+    let port = without_scheme
+        .split('/')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())?;
+    Some(port)
+}
+
+pub fn local_relay_base_url_from_state(relay: &RelayState) -> String {
+    relay
+        .endpoint
+        .as_deref()
+        .and_then(local_relay_port_from_endpoint)
+        .map(local_relay_base_url_for_port)
+        .unwrap_or_else(default_local_relay_base_url)
+}
+
+pub fn local_relay_port_from_state(relay: &RelayState) -> u16 {
+    relay
+        .endpoint
+        .as_deref()
+        .and_then(local_relay_port_from_endpoint)
+        .unwrap_or(LOCAL_RELAY_DEFAULT_PORT)
+}
+
+fn candidate_relay_ports(uid: u32) -> Vec<u16> {
+    let mut ports = Vec::with_capacity(usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
+    push_unique_port(&mut ports, LOCAL_RELAY_DEFAULT_PORT);
+    let start = fallback_relay_port_for_uid(uid);
+    for offset in 0..LOCAL_RELAY_FALLBACK_ATTEMPTS {
+        let relative =
+            ((start - LOCAL_RELAY_FALLBACK_BASE_PORT) + offset) % LOCAL_RELAY_FALLBACK_SPAN;
+        push_unique_port(&mut ports, LOCAL_RELAY_FALLBACK_BASE_PORT + relative);
+    }
+    ports
+}
+
+fn push_unique_port(ports: &mut Vec<u16>, port: u16) {
+    if !ports.contains(&port) {
+        ports.push(port);
+    }
+}
+
+fn fallback_relay_port_for_uid(uid: u32) -> u16 {
+    LOCAL_RELAY_FALLBACK_BASE_PORT + (uid % u32::from(LOCAL_RELAY_FALLBACK_SPAN)) as u16
+}
+
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and does not mutate Rust-managed memory.
+        unsafe { libc::getuid() as u32 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDaemon) -> Result<()> {
@@ -636,6 +733,43 @@ mod tests {
             Some(SnapshotSource::ClaudeCode)
         );
         assert_eq!(source_from_relay_header("unknown"), None);
+    }
+
+    #[test]
+    fn relay_candidates_try_default_before_user_fallbacks() {
+        let ports = candidate_relay_ports(501);
+
+        assert_eq!(ports.first().copied(), Some(LOCAL_RELAY_DEFAULT_PORT));
+        assert_eq!(
+            ports.get(1).copied(),
+            Some(LOCAL_RELAY_FALLBACK_BASE_PORT + 501)
+        );
+        assert_eq!(ports.len(), usize::from(LOCAL_RELAY_FALLBACK_ATTEMPTS) + 1);
+    }
+
+    #[test]
+    fn relay_endpoint_helpers_accept_loopback_only() {
+        assert_eq!(
+            local_relay_port_from_endpoint("http://127.0.0.1:44121/v1/logs"),
+            Some(44121)
+        );
+        assert_eq!(
+            local_relay_port_from_endpoint("http://localhost:44122"),
+            Some(44122)
+        );
+        assert_eq!(local_relay_port_from_endpoint("https://ottto.net"), None);
+
+        let relay = RelayState {
+            state: RelayRuntimeState::Connected,
+            endpoint: Some("http://127.0.0.1:44121".to_string()),
+            last_connected_at: Some("2026-05-25T00:00:00Z".to_string()),
+            last_error: None,
+        };
+        assert_eq!(local_relay_port_from_state(&relay), 44121);
+        assert_eq!(
+            local_relay_base_url_from_state(&relay),
+            "http://127.0.0.1:44121"
+        );
     }
 
     #[test]

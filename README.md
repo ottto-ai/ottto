@@ -455,12 +455,15 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   print authentication failures on stdout still produce actionable safe setup
   errors.
 - built-in local OTLP relay support in `ottto-service` on `127.0.0.1:43119` for
-  Claude Code and Codex: approved setup-run `install_source` actions register a
+  Claude Code and Codex, with deterministic per-user fallback ports when
+  another macOS user account or stale Ottto service already owns the default
+  loopback listener: approved setup-run `install_source` actions register a
   telemetry device, store the relay secret locally, patch
   `~/.claude/settings.json` or `~/.codex/config.toml` with logs, metrics, and
-  traces endpoints, expose `/healthz` for local readiness, and expose a narrow
-  browser CORS `/control` endpoint for M3 `telemetry_control` enable/disable/status
-  requests from the Apps page. The control endpoint returns the private-network
+  traces endpoints for the active relay endpoint, expose `/healthz` for local
+  readiness, and expose a narrow browser CORS `/control` endpoint for M3
+  `telemetry_control` enable/disable/status requests from the Apps page. The
+  control endpoint returns the private-network
   CORS header required by Chromium for production `https://ottto.net` to reach
   the loopback daemon, while the frontend marks the request target as
   `loopback`. Claude Code setup also installs a local

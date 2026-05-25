@@ -59,6 +59,26 @@ ottto verify --app codex --json
 If repair JSON requires browser approval, do not edit config files directly.
 Present the browser/setup next action.
 
+## Local Relay Port Conflict
+
+The default local OTLP relay listens on `127.0.0.1:43119`. If another macOS
+user account or stale Ottto service already owns that port, `ottto-service`
+binds a deterministic per-user fallback port and reports the active endpoint in
+`ottto status --json`.
+
+Run the app repair flow after a fallback bind so Codex or Claude Code settings
+are rewritten to the active endpoint:
+
+```bash
+ottto fix --app codex --json
+ottto verify --app codex --json
+```
+
+If the stale service belongs to a test user or old login session, also remove
+that user's `net.ottto.service` LaunchAgent through the normal macOS account or
+install-owner path. Do not kill another user's process unless you own that test
+account and have confirmed it is not the active customer install.
+
 ## Account Disconnect Problems
 
 Use cloud-first logout:

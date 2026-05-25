@@ -963,11 +963,12 @@ fn apply_telemetry_config(
     daemon: &LocalDaemon,
     source: &SourceKind,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
-        SourceKind::Codex => patch_codex_config(),
+        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
-            patch_claude_code_env(&machine)
+            patch_claude_code_env_with_relay_base(&machine, &relay_base_url)
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "telemetry control does not patch Pi local config".to_string(),
@@ -2520,6 +2521,7 @@ fn process_setup_actions(
         let source = source_slug.as_deref().and_then(source_from_slug);
         let (status, message, result) = match action.action_type.as_str() {
             "install_source" => run_install_source_action(
+                daemon,
                 api_base_url,
                 connection,
                 setup_run_token,
@@ -2686,6 +2688,7 @@ fn complete_setup_action(
 }
 
 fn run_install_source_action(
+    daemon: &LocalDaemon,
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
@@ -2839,9 +2842,13 @@ fn run_install_source_action(
         ));
     }
 
+    let relay_base_url = local_relay_base_url_for_daemon(daemon);
+    let relay_port = local_relay_port_for_daemon(daemon);
     let patch = match source_kind {
-        SourceKind::Codex => patch_codex_config()?,
-        SourceKind::ClaudeCode => patch_claude_code_settings(machine)?,
+        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url)?,
+        SourceKind::ClaudeCode => {
+            patch_claude_code_settings_with_relay_base(machine, &relay_base_url)?
+        }
         SourceKind::Pi => unreachable!("Pi install actions do not patch OTLP config"),
     };
     record_install_session_event(
@@ -2871,7 +2878,7 @@ fn run_install_source_action(
         },
     )?;
 
-    let relay_running = loopback_listener_available(crate::otlp_relay::CLAUDE_CODE_RELAY_PORT);
+    let relay_running = loopback_listener_available(relay_port);
     if relay_running {
         record_install_session_event(
             api_base_url,
@@ -2886,7 +2893,7 @@ fn run_install_source_action(
                 ),
                 metadata: Some(json!({
                     "source": source,
-                    "port": crate::otlp_relay::CLAUDE_CODE_RELAY_PORT,
+                    "port": relay_port,
                 })),
                 device_id: Some(&device_id),
             },
@@ -2940,7 +2947,7 @@ fn run_install_source_action(
                         "local_changes": "installed",
                         "config_patched": true,
                         "relay_running": true,
-                        "relay_port": crate::otlp_relay::CLAUDE_CODE_RELAY_PORT,
+                        "relay_port": relay_port,
                         "relay_source": source,
                         "error_code": "verification_marker_failed",
                         "error_message": "Synthetic telemetry verification marker failed",
@@ -2970,7 +2977,7 @@ fn run_install_source_action(
             &device_id,
             source,
             relay_running,
-            crate::otlp_relay::CLAUDE_CODE_RELAY_PORT,
+            relay_port,
             &message,
         ),
     ))
@@ -3107,20 +3114,53 @@ struct ConfigPatchResult {
     backup_created: bool,
 }
 
-fn patch_codex_config() -> Result<ConfigPatchResult, LocalApiError> {
-    let backup_root = default_support_dir();
-    patch_codex_config_at(&home_path(".codex/config.toml"), &backup_root)
+fn local_relay_base_url_for_daemon(daemon: &LocalDaemon) -> String {
+    daemon
+        .status_for_trusted_client()
+        .map(|status| crate::otlp_relay::local_relay_base_url_from_state(&status.relay))
+        .unwrap_or_else(|_| crate::otlp_relay::default_local_relay_base_url())
 }
 
+fn local_relay_port_for_daemon(daemon: &LocalDaemon) -> u16 {
+    daemon
+        .status_for_trusted_client()
+        .map(|status| crate::otlp_relay::local_relay_port_from_state(&status.relay))
+        .unwrap_or(crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT)
+}
+
+fn patch_codex_config_with_relay_base(
+    relay_base_url: &str,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    let backup_root = default_support_dir();
+    patch_codex_config_at_with_relay_base(
+        &home_path(".codex/config.toml"),
+        &backup_root,
+        relay_base_url,
+    )
+}
+
+#[cfg(test)]
 fn patch_codex_config_at(
     path: &Path,
     backup_root: &Path,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    patch_codex_config_at_with_relay_base(
+        path,
+        backup_root,
+        &crate::otlp_relay::default_local_relay_base_url(),
+    )
+}
+
+fn patch_codex_config_at_with_relay_base(
+    path: &Path,
+    backup_root: &Path,
+    relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     if path.exists()
         && fs::read_to_string(path)
             .ok()
             .as_deref()
-            .is_some_and(codex_config_has_relay_otel)
+            .is_some_and(|body| codex_config_has_relay_otel_for_base(body, relay_base_url))
     {
         return Ok(ConfigPatchResult {
             created: false,
@@ -3128,7 +3168,7 @@ fn patch_codex_config_at(
         });
     }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
-    let body = render_codex_relay_toml_block();
+    let body = render_codex_relay_toml_block_for_base(relay_base_url);
     let write = codex_toml::upsert_fence(path, &body).map_err(agent_config_error)?;
     Ok(ConfigPatchResult {
         created: write.created,
@@ -3148,40 +3188,50 @@ fn remove_codex_config_at(path: &Path) -> Result<ConfigPatchResult, LocalApiErro
     })
 }
 
-fn render_codex_relay_toml_block() -> String {
+fn render_codex_relay_toml_block_for_base(relay_base_url: &str) -> String {
     let relay_header = crate::otlp_relay::LOCAL_RELAY_HEADER;
     let relay_source = crate::otlp_relay::CODEX_RELAY_SOURCE;
-    let relay_port = crate::otlp_relay::CLAUDE_CODE_RELAY_PORT;
+    let relay_base_url = relay_base_url.trim_end_matches('/');
     [
         "otel.environment = \"prod\"".to_string(),
         "otel.log_user_prompt = false".to_string(),
         format!(
-            "otel.exporter.\"otlp-http\" = {{ endpoint = \"http://127.0.0.1:{relay_port}/v1/logs\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
+            "otel.exporter.\"otlp-http\" = {{ endpoint = \"{relay_base_url}/v1/logs\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
         ),
         format!(
-            "otel.trace_exporter.\"otlp-http\" = {{ endpoint = \"http://127.0.0.1:{relay_port}/v1/traces\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
+            "otel.trace_exporter.\"otlp-http\" = {{ endpoint = \"{relay_base_url}/v1/traces\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
         ),
         format!(
-            "otel.metrics_exporter.\"otlp-http\" = {{ endpoint = \"http://127.0.0.1:{relay_port}/v1/metrics\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
+            "otel.metrics_exporter.\"otlp-http\" = {{ endpoint = \"{relay_base_url}/v1/metrics\", protocol = \"binary\", headers = {{ \"{relay_header}\" = \"{relay_source}\" }} }}"
         ),
     ]
     .join("\n")
 }
 
-fn patch_claude_code_settings(
+fn patch_claude_code_settings_with_relay_base(
     machine: &MachineIdentity,
+    relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let backup_root = default_support_dir();
-    patch_claude_code_settings_at(&home_path(".claude/settings.json"), machine, &backup_root)
+    patch_claude_code_settings_at_with_relay_base(
+        &home_path(".claude/settings.json"),
+        machine,
+        &backup_root,
+        relay_base_url,
+    )
 }
 
-fn patch_claude_code_env(machine: &MachineIdentity) -> Result<ConfigPatchResult, LocalApiError> {
+fn patch_claude_code_env_with_relay_base(
+    machine: &MachineIdentity,
+    relay_base_url: &str,
+) -> Result<ConfigPatchResult, LocalApiError> {
     let backup_root = default_support_dir();
     patch_claude_code_env_at(
         &home_path(".ottto/claude-telemetry.env"),
         &home_path(".zshrc"),
         machine,
         &backup_root,
+        relay_base_url,
     )
 }
 
@@ -3190,12 +3240,13 @@ fn patch_claude_code_env_at(
     shell_rc_path: &Path,
     machine: &MachineIdentity,
     backup_root: &Path,
+    relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let env_backup_created =
         backup_existing_config(SourceKind::ClaudeCode, env_path, backup_root)?.is_some();
     let shell_backup_created =
         backup_existing_config(SourceKind::ClaudeCode, shell_rc_path, backup_root)?.is_some();
-    let entries = claude_code_relay_env(machine);
+    let entries = claude_code_relay_env_with_base(machine, relay_base_url);
     let entry_refs = entries
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
@@ -3252,10 +3303,25 @@ fn agent_config_error(error: AgentConfigError) -> LocalApiError {
     }
 }
 
+#[cfg(test)]
 fn patch_claude_code_settings_at(
     path: &Path,
     machine: &MachineIdentity,
     backup_root: &Path,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    patch_claude_code_settings_at_with_relay_base(
+        path,
+        machine,
+        backup_root,
+        &crate::otlp_relay::default_local_relay_base_url(),
+    )
+}
+
+fn patch_claude_code_settings_at_with_relay_base(
+    path: &Path,
+    machine: &MachineIdentity,
+    backup_root: &Path,
+    relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let created = !path.exists();
     let backup_created =
@@ -3299,7 +3365,7 @@ fn patch_claude_code_settings_at(
     let env = env_value
         .as_object_mut()
         .ok_or(LocalApiError::StatePoisoned)?;
-    for (key, value) in claude_code_relay_env(machine) {
+    for (key, value) in claude_code_relay_env_with_base(machine, relay_base_url) {
         env.insert(key.to_string(), serde_json::Value::String(value));
     }
 
@@ -3447,11 +3513,11 @@ fn backup_existing_config(
     Ok(Some(ConfigBackupResult { backup_id }))
 }
 
-fn claude_code_relay_env(machine: &MachineIdentity) -> Vec<(&'static str, String)> {
-    let relay_base = format!(
-        "http://127.0.0.1:{}",
-        crate::otlp_relay::CLAUDE_CODE_RELAY_PORT
-    );
+fn claude_code_relay_env_with_base(
+    machine: &MachineIdentity,
+    relay_base_url: &str,
+) -> Vec<(&'static str, String)> {
+    let relay_base = relay_base_url.trim_end_matches('/');
     vec![
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_string()),
         ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1".to_string()),
@@ -4514,72 +4580,95 @@ fn read_optional_to_string(path: &PathBuf) -> Option<String> {
 }
 
 fn telemetry_config_installed(body: &str) -> bool {
-    codex_config_has_relay_otel(body)
-        && loopback_listener_available(crate::otlp_relay::CLAUDE_CODE_RELAY_PORT)
+    let relay_port = codex_config_relay_port(body);
+    relay_port.is_some()
+        && relay_port.is_some_and(loopback_listener_available)
         && snapshot_device_credentials_include_source(crate::otlp_relay::CODEX_RELAY_SOURCE)
 }
 
+#[cfg(test)]
 fn codex_config_has_relay_otel(body: &str) -> bool {
+    codex_config_relay_port(body).is_some()
+}
+
+fn codex_config_has_relay_otel_for_base(body: &str, relay_base_url: &str) -> bool {
+    codex_config_relay_port(body).is_some_and(|port| {
+        crate::otlp_relay::local_relay_base_url_for_port(port)
+            == relay_base_url.trim_end_matches('/')
+    })
+}
+
+fn codex_config_relay_port(body: &str) -> Option<u16> {
     let Ok(document) = body.parse::<DocumentMut>() else {
-        return false;
+        return None;
     };
-    let Some(otel) = document.get("otel").and_then(Item::as_table) else {
-        return false;
-    };
+    let otel = document.get("otel").and_then(Item::as_table)?;
     let prompt_logging_disabled = otel
         .get("log_user_prompt")
         .and_then(Item::as_value)
         .and_then(|value| value.as_bool())
         == Some(false);
-    prompt_logging_disabled
-        && codex_exporter_has_relay(otel, "exporter", "logs")
-        && codex_exporter_has_relay(otel, "trace_exporter", "traces")
-        && codex_exporter_has_relay(otel, "metrics_exporter", "metrics")
+    if !prompt_logging_disabled {
+        return None;
+    }
+    let logs = codex_exporter_relay_port(otel, "exporter", "logs")?;
+    let traces = codex_exporter_relay_port(otel, "trace_exporter", "traces")?;
+    let metrics = codex_exporter_relay_port(otel, "metrics_exporter", "metrics")?;
+    if logs == traces && traces == metrics {
+        Some(logs)
+    } else {
+        None
+    }
 }
 
+#[cfg(test)]
 fn codex_exporter_has_relay(otel: &Table, exporter_key: &str, signal: &str) -> bool {
-    let Some(otlp_http) = otel
+    let expected_port = crate::otlp_relay::LOCAL_RELAY_DEFAULT_PORT;
+    codex_exporter_relay_port(otel, exporter_key, signal) == Some(expected_port)
+}
+
+fn codex_exporter_relay_port(otel: &Table, exporter_key: &str, signal: &str) -> Option<u16> {
+    let otlp_http = otel
         .get(exporter_key)
         .and_then(Item::as_table_like)
         .and_then(|table| table.get("otlp-http"))
-        .and_then(Item::as_table_like)
-    else {
-        return false;
-    };
-    let expected_endpoint = format!(
-        "http://127.0.0.1:{}/v1/{signal}",
-        crate::otlp_relay::CLAUDE_CODE_RELAY_PORT
-    );
-    if otlp_http
+        .and_then(Item::as_table_like)?;
+    let endpoint = otlp_http
         .get("endpoint")
         .and_then(Item::as_value)
-        .and_then(|value| value.as_str())
-        != Some(expected_endpoint.as_str())
-    {
-        return false;
+        .and_then(|value| value.as_str())?;
+    let suffix = format!("/v1/{signal}");
+    if !endpoint.ends_with(&suffix) {
+        return None;
     }
+    let relay_base_url = endpoint.strip_suffix(&suffix)?;
+    let relay_port = crate::otlp_relay::local_relay_port_from_endpoint(relay_base_url)?;
     if otlp_http
         .get("protocol")
         .and_then(Item::as_value)
         .and_then(|value| value.as_str())
         != Some("binary")
     {
-        return false;
+        return None;
     }
-    let Some(headers) = otlp_http.get("headers").and_then(Item::as_table_like) else {
-        return false;
-    };
-    headers
+    let headers = otlp_http.get("headers").and_then(Item::as_table_like)?;
+    if headers
         .get(crate::otlp_relay::LOCAL_RELAY_HEADER)
         .and_then(Item::as_value)
         .and_then(|value| value.as_str())
         == Some(crate::otlp_relay::CODEX_RELAY_SOURCE)
+    {
+        Some(relay_port)
+    } else {
+        None
+    }
 }
 
 fn claude_code_telemetry_config_installed(body: &str) -> bool {
+    let relay_port = claude_code_settings_relay_port(body);
     claude_code_settings_has_relay_env(body)
         && claude_code_settings_has_statusline_helper(body)
-        && loopback_listener_available(crate::otlp_relay::CLAUDE_CODE_RELAY_PORT)
+        && relay_port.is_some_and(loopback_listener_available)
         && snapshot_device_credentials_include_source(crate::otlp_relay::CLAUDE_CODE_RELAY_SOURCE)
 }
 
@@ -4595,17 +4684,39 @@ fn snapshot_device_credentials_include_source(source: &str) -> bool {
 }
 
 fn claude_code_settings_has_relay_env(body: &str) -> bool {
-    let Ok(settings) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(env) = settings.get("env").and_then(|value| value.as_object()) else {
-        return false;
-    };
+    claude_code_settings_relay_port(body).is_some()
+}
 
-    let relay_base = format!(
-        "http://127.0.0.1:{}",
-        crate::otlp_relay::CLAUDE_CODE_RELAY_PORT
-    );
+#[cfg(test)]
+fn claude_code_settings_has_relay_env_for_base(body: &str, relay_base_url: &str) -> bool {
+    claude_code_settings_relay_port(body).is_some_and(|port| {
+        crate::otlp_relay::local_relay_base_url_for_port(port)
+            == relay_base_url.trim_end_matches('/')
+    })
+}
+
+fn claude_code_settings_relay_port(body: &str) -> Option<u16> {
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(body) else {
+        return None;
+    };
+    let env = settings.get("env").and_then(|value| value.as_object())?;
+
+    let metrics_endpoint = env
+        .get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+        .and_then(|value| value.as_str())?;
+    let logs_endpoint = env
+        .get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+        .and_then(|value| value.as_str())?;
+    let traces_endpoint = env
+        .get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+        .and_then(|value| value.as_str())?;
+    let metrics_port = relay_port_from_signal_endpoint(metrics_endpoint, "metrics")?;
+    let logs_port = relay_port_from_signal_endpoint(logs_endpoint, "logs")?;
+    let traces_port = relay_port_from_signal_endpoint(traces_endpoint, "traces")?;
+    if metrics_port != logs_port || logs_port != traces_port {
+        return None;
+    }
+
     let expected = [
         ("CLAUDE_CODE_ENABLE_TELEMETRY", "1".to_string()),
         ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1".to_string()),
@@ -4614,28 +4725,17 @@ fn claude_code_settings_has_relay_env(body: &str) -> bool {
         ("OTEL_TRACES_EXPORTER", "otlp".to_string()),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_string()),
         (
-            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-            format!("{relay_base}/v1/metrics"),
-        ),
-        (
-            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-            format!("{relay_base}/v1/logs"),
-        ),
-        (
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-            format!("{relay_base}/v1/traces"),
-        ),
-        (
             "OTEL_EXPORTER_OTLP_HEADERS",
             "X-Ottto-Local-Relay=claude_code".to_string(),
         ),
     ];
     for (key, expected_value) in expected {
         if env.get(key).and_then(|value| value.as_str()) != Some(expected_value.as_str()) {
-            return false;
+            return None;
         }
     }
-    env.get("CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS")
+    let metadata_valid = env
+        .get("CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS")
         .and_then(|value| value.as_str())
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|timeout| timeout >= 10000)
@@ -4646,7 +4746,20 @@ fn claude_code_settings_has_relay_env(body: &str) -> bool {
                 attributes.contains("service.name=claude-code")
                     && attributes.contains("ottto.source=claude_code")
                     && attributes.contains("ottto.machine_id=")
-            })
+            });
+    if metadata_valid {
+        Some(metrics_port)
+    } else {
+        None
+    }
+}
+
+fn relay_port_from_signal_endpoint(endpoint: &str, signal: &str) -> Option<u16> {
+    let suffix = format!("/v1/{signal}");
+    if !endpoint.ends_with(&suffix) {
+        return None;
+    }
+    crate::otlp_relay::local_relay_port_from_endpoint(endpoint.strip_suffix(&suffix)?)
 }
 
 fn claude_code_settings_has_statusline_helper(body: &str) -> bool {
@@ -7185,6 +7298,45 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    fn patch_codex_config_rewrites_managed_relay_to_active_fallback_endpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-codex-config-fallback-test-{}",
+            std::process::id()
+        ));
+        let path = root.join("config.toml");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(
+            &path,
+            format!(
+                "# ottto:start\n{}\n# ottto:end\nmodel = \"gpt-5.4\"\n",
+                render_codex_relay_toml_block_for_base(
+                    &crate::otlp_relay::default_local_relay_base_url()
+                )
+            ),
+        )
+        .expect("write config");
+
+        let backup_root = root.join("backups");
+        let fallback = "http://127.0.0.1:44621";
+        let result = patch_codex_config_at_with_relay_base(&path, &backup_root, fallback)
+            .expect("patch fallback config");
+        let body = fs::read_to_string(&path).expect("read config");
+
+        assert!(!result.created);
+        assert!(result.backup_created);
+        assert!(body.contains("http://127.0.0.1:44621/v1/logs"));
+        assert!(!body.contains("http://127.0.0.1:43119/v1/logs"));
+        assert!(codex_config_has_relay_otel(&body));
+        assert!(codex_config_has_relay_otel_for_base(&body, fallback));
+        assert!(!codex_config_has_relay_otel_for_base(
+            &body,
+            &crate::otlp_relay::default_local_relay_base_url()
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn patch_claude_code_env_writes_fenced_env_and_shell_source_line() {
         let root =
             std::env::temp_dir().join(format!("ottto-claude-env-test-{}", std::process::id()));
@@ -7196,9 +7348,14 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         fs::write(&shell_path, original_shell).expect("write shell rc");
 
         let backup_root = root.join("backups");
-        let result =
-            patch_claude_code_env_at(&env_path, &shell_path, &test_machine(), &backup_root)
-                .expect("patch env");
+        let result = patch_claude_code_env_at(
+            &env_path,
+            &shell_path,
+            &test_machine(),
+            &backup_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("patch env");
         let env_body = fs::read_to_string(&env_path).expect("read env file");
         let shell_body = fs::read_to_string(&shell_path).expect("read shell rc");
 
@@ -7317,6 +7474,47 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             value.get("theme").and_then(|value| value.as_str()),
             Some("dark")
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_claude_code_settings_can_target_active_fallback_endpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-settings-fallback-test-{}",
+            std::process::id()
+        ));
+        let path = root.join("settings.json");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&path, r#"{"env":{"EXISTING":"keep"}}"#).expect("write settings");
+
+        let backup_root = root.join("backups");
+        let fallback = "http://127.0.0.1:44621";
+        patch_claude_code_settings_at_with_relay_base(
+            &path,
+            &test_machine(),
+            &backup_root,
+            fallback,
+        )
+        .expect("patch settings");
+        let body = fs::read_to_string(&path).expect("read settings");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json settings");
+        let env = value
+            .get("env")
+            .and_then(|value| value.as_object())
+            .expect("env object");
+
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+                .and_then(|value| value.as_str()),
+            Some("http://127.0.0.1:44621/v1/logs")
+        );
+        assert!(claude_code_settings_has_relay_env(&body));
+        assert!(claude_code_settings_has_relay_env_for_base(&body, fallback));
+        assert!(!claude_code_settings_has_relay_env_for_base(
+            &body,
+            &crate::otlp_relay::default_local_relay_base_url()
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

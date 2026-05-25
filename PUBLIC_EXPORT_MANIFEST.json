@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "d86e2dfddedc9ccede7fbbd364a488307881b6cfd01205e9db76a35f802681ad",
+  "content_sha256": "463ecfaa4f1e05b3f2a97a9727b44720f895d3fcae5d1c9ca099ceb784292d7d",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "c66c5411fdea2d737a64a76da459d7483d4340002d0385bc87bb1cc47f30e642",
-      "size_bytes": 40388
+      "sha256": "dd5f5d58a0ed556f3bb7db86c136bd313753c4939e70cd98c8f693f2dfa09334",
+      "size_bytes": 40566
     },
     {
       "executable": false,
@@ -559,8 +559,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "97d62f6a598fd500adc75856ef909c9b28b469dc586be19bf0e9190ca8715193",
-      "size_bytes": 279423
+      "sha256": "6c65497252cf4cb18eba4c6c8003e727a8bc09c5cc73cbde33a02717aeb40b66",
+      "size_bytes": 286451
     },
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "4bea9e801318ba3a0fd283e14b1e3d23f8cc3f222e25a8430757be318573f03a",
-      "size_bytes": 22836
+      "sha256": "c3db763c6d1ef5fa5ad1e08c6fe59c061aeb11d630af84a19549a838ce9b4d0c",
+      "size_bytes": 27241
     },
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "119a89e739e4fefce883e291c99958eb9f288e44c6b64a850e4297ba6e2737f6",
-      "size_bytes": 2141
+      "sha256": "040fd54fa339e0d0792804e3d5e29f10f0de8dad8449779518beb17e7f71982a",
+      "size_bytes": 2924
     },
     {
       "executable": false,
@@ -1298,7 +1298,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-25T13:15:22+00:00",
+  "generated_at": "2026-05-25T14:54:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 186,
   "public_roots": [
@@ -1333,5 +1333,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "adbf9c1c1995c08ce92777431c348fd554a50428"
+  "source_commit": "0eafee5eb0f5b950900d2cfb2e9b4678d15cc673"
 }
