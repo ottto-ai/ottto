@@ -68,6 +68,37 @@ fails. Verify `release-manifest.json.sig` with
 `macos_manifest_signature.sh verify --manifest release-manifest.json` before
 trusting the manifest as the stable release record.
 
+## GitHub Release Verification Mirror
+
+The macOS stable release workflow can optionally publish a public GitHub Release
+as a **verification mirror only**. The mirror is opt-in per run via the
+`github_release_mirror` workflow input, runs for the `stable` channel only, and
+refuses to overwrite an existing `v<version>` release. The CDN at
+`install.ottto.net` remains the install and update source of truth; the GitHub
+Release never promotes a channel pointer and the workflow never writes to the
+CDN.
+
+A stable verification mirror is expected to carry exactly these assets:
+
+- `Ottto-macos-*.dmg`
+- `ottto-macos-*.zip`
+- `ottto-service-macos-*.zip`
+- `ottto-local-platform-sbom.cdx.json`
+- `release-manifest.json`
+- `release-manifest.json.sig`
+- `subject.checksums.txt`
+
+`release-manifest.json.sig` and `subject.checksums.txt` let anyone verify a
+downloaded build's manifest signature and per-artifact checksums independently of
+the CDN. Stable-candidate builds are not mirrored, and installer helpers
+(`install-macos.sh`, `homebrew/ottto.rb`) and QA evidence files are intentionally
+not attached.
+
+GitHub immutable releases (which protect tags/assets and add release
+attestations) are desirable for this mirror, but are not a hard verification gate
+unless the feature is enabled on the repository. Record the release immutability
+state as informational evidence rather than requiring it.
+
 ## Verify Stable Candidate RC
 
 Before a stable public release, the same commit must first pass internal
