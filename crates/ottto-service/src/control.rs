@@ -39,6 +39,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 #[cfg(unix)]
@@ -60,6 +61,8 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: u64 = 15;
 const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
+const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
+const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
 #[cfg(target_os = "macos")]
 const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
 
@@ -963,6 +966,13 @@ fn apply_telemetry_config(
     daemon: &LocalDaemon,
     source: &SourceKind,
 ) -> Result<ConfigPatchResult, LocalApiError> {
+    if source_patch_disabled(source) {
+        return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     match source {
         SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url),
@@ -2842,6 +2852,41 @@ fn run_install_source_action(
         ));
     }
 
+    if source_patch_disabled(&source_kind) {
+        record_install_session_event(
+            api_base_url,
+            &install_session.install_session_id,
+            &install_session.install_session_token,
+            InstallSessionEvent {
+                event_type: "config.patch.skipped",
+                status: "succeeded",
+                message: &format!(
+                    "{} telemetry config patching is disabled by environment",
+                    source_display_name(&source_kind)
+                ),
+                metadata: Some(json!({
+                    "source": source,
+                    "reason": "disabled_by_env",
+                })),
+                device_id: Some(&device_id),
+            },
+        )?;
+        let message = format!(
+            "{} telemetry config patching skipped by environment",
+            source_display_name(&source_kind)
+        );
+        return Ok((
+            "succeeded".to_string(),
+            message.clone(),
+            install_source_patch_disabled_result(
+                &install_session.install_session_id,
+                &device_id,
+                source,
+                &message,
+            ),
+        ));
+    }
+
     let relay_base_url = local_relay_base_url_for_daemon(daemon);
     let relay_port = local_relay_port_for_daemon(daemon);
     let patch = match source_kind {
@@ -2851,17 +2896,29 @@ fn run_install_source_action(
         }
         SourceKind::Pi => unreachable!("Pi install actions do not patch OTLP config"),
     };
+    let config_event_message = if patch.changed {
+        format!(
+            "Patched {} telemetry settings",
+            source_display_name(&source_kind)
+        )
+    } else {
+        format!(
+            "{} telemetry settings already up to date",
+            source_display_name(&source_kind)
+        )
+    };
     record_install_session_event(
         api_base_url,
         &install_session.install_session_id,
         &install_session.install_session_token,
         InstallSessionEvent {
-            event_type: "config.patched",
+            event_type: if patch.changed {
+                "config.patched"
+            } else {
+                "config.unchanged"
+            },
             status: "succeeded",
-            message: &format!(
-                "Patched {} telemetry settings",
-                source_display_name(&source_kind)
-            ),
+            message: &config_event_message,
             metadata: Some(json!({
                 "source": source,
                 "settings": match source_kind {
@@ -2869,6 +2926,7 @@ fn run_install_source_action(
                     SourceKind::ClaudeCode => "claude_settings",
                     SourceKind::Pi => "none",
                 },
+                "changed": patch.changed,
                 "created": patch.created,
                 "backup_created": patch.backup_created,
                 "backup_scope": "source_config",
@@ -2964,8 +3022,13 @@ fn run_install_source_action(
             source_display_name(&source_kind)
         )
     } else {
+        let config_state = if patch.changed {
+            "config was written"
+        } else {
+            "config is unchanged"
+        };
         format!(
-            "{} telemetry config was written, but the local OTLP relay is not listening",
+            "{} telemetry {config_state}, but the local OTLP relay is not listening",
             source_display_name(&source_kind)
         )
     };
@@ -2979,6 +3042,7 @@ fn run_install_source_action(
             relay_running,
             relay_port,
             &message,
+            patch.changed,
         ),
     ))
 }
@@ -2992,6 +3056,31 @@ fn source_requires_device_registration(source_kind: &SourceKind) -> bool {
 
 fn source_requires_config_patch(source_kind: &SourceKind) -> bool {
     matches!(source_kind, SourceKind::Codex | SourceKind::ClaudeCode)
+}
+
+fn source_patch_env_token(source_kind: &SourceKind) -> Option<&'static str> {
+    match source_kind {
+        SourceKind::Codex => Some("CODEX"),
+        SourceKind::ClaudeCode => Some("CLAUDE_CODE"),
+        SourceKind::Pi => None,
+    }
+}
+
+fn source_patch_disabled(source_kind: &SourceKind) -> bool {
+    let Some(token) = source_patch_env_token(source_kind) else {
+        return false;
+    };
+    let key = format!("OTTTO_PATCH_{token}_DISABLED");
+    std::env::var(&key)
+        .ok()
+        .is_some_and(|value| env_value_truthy(&value))
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn install_source_registration_result(
@@ -3018,13 +3107,14 @@ fn install_source_action_result(
     relay_running: bool,
     relay_port: u16,
     message: &str,
+    config_patched: bool,
 ) -> serde_json::Value {
     let mut result = json!({
         "install_session_id": install_session_id,
         "device_id": device_id,
         "source": source,
         "local_changes": "installed",
-        "config_patched": true,
+        "config_patched": config_patched,
         "relay_running": relay_running,
         "relay_port": relay_port,
         "relay_source": source,
@@ -3034,6 +3124,23 @@ fn install_source_action_result(
         result["error_message"] = json!(message);
     }
     result
+}
+
+fn install_source_patch_disabled_result(
+    install_session_id: &str,
+    device_id: &str,
+    source: &str,
+    message: &str,
+) -> serde_json::Value {
+    json!({
+        "install_session_id": install_session_id,
+        "device_id": device_id,
+        "source": source,
+        "local_changes": "patch_disabled",
+        "config_patched": false,
+        "relay_required": true,
+        "message": message,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -3110,6 +3217,7 @@ fn record_install_session_event(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigPatchResult {
+    changed: bool,
     created: bool,
     backup_created: bool,
 }
@@ -3163,14 +3271,23 @@ fn patch_codex_config_at_with_relay_base(
             .is_some_and(|body| codex_config_has_relay_otel_for_base(body, relay_base_url))
     {
         return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
+    let body = render_codex_relay_toml_block_for_base(relay_base_url);
+    if !codex_toml::upsert_would_change(path, &body).map_err(agent_config_error)? {
+        return Ok(ConfigPatchResult {
+            changed: false,
             created: false,
             backup_created: false,
         });
     }
     let backup_created = backup_existing_config(SourceKind::Codex, path, backup_root)?.is_some();
-    let body = render_codex_relay_toml_block_for_base(relay_base_url);
     let write = codex_toml::upsert_fence(path, &body).map_err(agent_config_error)?;
     Ok(ConfigPatchResult {
+        changed: write.changed,
         created: write.created,
         backup_created,
     })
@@ -3181,8 +3298,9 @@ fn remove_codex_config() -> Result<ConfigPatchResult, LocalApiError> {
 }
 
 fn remove_codex_config_at(path: &Path) -> Result<ConfigPatchResult, LocalApiError> {
-    let _write = codex_toml::remove_fence(path).map_err(agent_config_error)?;
+    let write = codex_toml::remove_fence(path).map_err(agent_config_error)?;
     Ok(ConfigPatchResult {
+        changed: write.changed,
         created: false,
         backup_created: false,
     })
@@ -3242,29 +3360,49 @@ fn patch_claude_code_env_at(
     backup_root: &Path,
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    let env_backup_created =
-        backup_existing_config(SourceKind::ClaudeCode, env_path, backup_root)?.is_some();
-    let shell_backup_created =
-        backup_existing_config(SourceKind::ClaudeCode, shell_rc_path, backup_root)?.is_some();
     let entries = claude_code_relay_env_with_base(machine, relay_base_url);
     let entry_refs = entries
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
         .collect::<Vec<_>>();
     let env_body = claude_env::render_export_block(&entry_refs);
+    let env_would_change =
+        claude_env::upsert_would_change(env_path, &env_body).map_err(agent_config_error)?;
+    let shell_body =
+        r#"[ -f "$HOME/.ottto/claude-telemetry.env" ] && . "$HOME/.ottto/claude-telemetry.env""#;
+    let shell_would_change =
+        claude_env::upsert_would_change(shell_rc_path, shell_body).map_err(agent_config_error)?;
+    if !env_would_change && !shell_would_change {
+        return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
+    let env_backup_created = if env_would_change {
+        backup_existing_config(SourceKind::ClaudeCode, env_path, backup_root)?.is_some()
+    } else {
+        false
+    };
+    let shell_backup_created = if shell_would_change {
+        backup_existing_config(SourceKind::ClaudeCode, shell_rc_path, backup_root)?.is_some()
+    } else {
+        false
+    };
     let env_write = claude_env::upsert_fence(env_path, &env_body).map_err(agent_config_error)?;
     #[cfg(unix)]
     {
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(env_path, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
+        if env_write.changed || env_write.created {
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(env_path, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
+        }
     }
 
-    let shell_body =
-        r#"[ -f "$HOME/.ottto/claude-telemetry.env" ] && . "$HOME/.ottto/claude-telemetry.env""#;
     let shell_write =
         claude_env::upsert_fence(shell_rc_path, shell_body).map_err(agent_config_error)?;
 
     Ok(ConfigPatchResult {
+        changed: env_write.changed || shell_write.changed,
         created: env_write.created || shell_write.created,
         backup_created: env_backup_created || shell_backup_created,
     })
@@ -3281,16 +3419,20 @@ fn remove_claude_code_env_at(
     env_path: &Path,
     shell_rc_path: &Path,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    let _env_write = claude_env::remove_fence(env_path).map_err(agent_config_error)?;
-    let _shell_write = claude_env::remove_fence(shell_rc_path).map_err(agent_config_error)?;
-    if env_path.exists()
+    let env_write = claude_env::remove_fence(env_path).map_err(agent_config_error)?;
+    let shell_write = claude_env::remove_fence(shell_rc_path).map_err(agent_config_error)?;
+    let removed_empty_env = if env_path.exists()
         && fs::read_to_string(env_path)
             .map(|body| body.trim().is_empty())
             .unwrap_or(false)
     {
         let _ = fs::remove_file(env_path);
-    }
+        true
+    } else {
+        false
+    };
     Ok(ConfigPatchResult {
+        changed: env_write.changed || shell_write.changed || removed_empty_env,
         created: false,
         backup_created: false,
     })
@@ -3324,24 +3466,25 @@ fn patch_claude_code_settings_at_with_relay_base(
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
     let created = !path.exists();
-    let backup_created =
-        backup_existing_config(SourceKind::ClaudeCode, path, backup_root)?.is_some();
-    let mut settings = if created {
+    let existing_settings = if created {
         json!({})
     } else {
         let body = fs::read_to_string(path).map_err(|_| LocalApiError::StatePoisoned)?;
         serde_json::from_str::<serde_json::Value>(&body)
             .map_err(|_| LocalApiError::StatePoisoned)?
     };
+    let mut settings = existing_settings.clone();
     if !settings.is_object() {
         settings = json!({});
     }
-    let delegated_statusline = existing_claude_statusline_command(&settings);
+    let delegated_statusline = match existing_claude_statusline_command(&settings) {
+        Some(command) => Some(command),
+        None => existing_claude_statusline_wrapper_delegated_command(backup_root)?,
+    };
     let object = settings
         .as_object_mut()
         .ok_or(LocalApiError::StatePoisoned)?;
-    let statusline_script =
-        write_claude_statusline_wrapper(backup_root, delegated_statusline.as_deref())?;
+    let statusline_script = claude_statusline_wrapper_path(backup_root);
     let statusline_value = object.entry("statusLine").or_insert_with(|| json!({}));
     if !statusline_value.is_object() {
         *statusline_value = json!({});
@@ -3369,6 +3512,21 @@ fn patch_claude_code_settings_at_with_relay_base(
         env.insert(key.to_string(), serde_json::Value::String(value));
     }
 
+    let settings_changed = settings != existing_settings;
+    let backup_created = if settings_changed {
+        backup_existing_config(SourceKind::ClaudeCode, path, backup_root)?.is_some()
+    } else {
+        false
+    };
+    let (_statusline_script, wrapper_changed) =
+        write_claude_statusline_wrapper(backup_root, delegated_statusline.as_deref())?;
+    if !settings_changed {
+        return Ok(ConfigPatchResult {
+            changed: wrapper_changed,
+            created: false,
+            backup_created: false,
+        });
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| LocalApiError::StatePoisoned)?;
     }
@@ -3377,6 +3535,7 @@ fn patch_claude_code_settings_at_with_relay_base(
     fs::write(&tmp_path, body).map_err(|_| LocalApiError::StatePoisoned)?;
     fs::rename(tmp_path, path).map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(ConfigPatchResult {
+        changed: true,
         created,
         backup_created,
     })
@@ -3406,14 +3565,46 @@ fn is_ottto_statusline_command(command: &str) -> bool {
     command.contains("claude-code-statusline")
 }
 
+fn claude_statusline_wrapper_path(support_dir: &Path) -> PathBuf {
+    support_dir.join("claude-code-statusline.sh")
+}
+
+fn existing_claude_statusline_wrapper_delegated_command(
+    support_dir: &Path,
+) -> Result<Option<String>, LocalApiError> {
+    let path = claude_statusline_wrapper_path(support_dir);
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LocalApiError::StatePoisoned),
+    };
+    Ok(body
+        .lines()
+        .find_map(|line| line.strip_prefix("ORIGINAL_STATUSLINE="))
+        .and_then(parse_shell_single_quoted_assignment)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+fn parse_shell_single_quoted_assignment(value: &str) -> Option<String> {
+    let inner = value.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.replace("'\"'\"'", "'"))
+}
+
 fn write_claude_statusline_wrapper(
     support_dir: &Path,
     delegated_command: Option<&str>,
-) -> Result<PathBuf, LocalApiError> {
+) -> Result<(PathBuf, bool), LocalApiError> {
     fs::create_dir_all(support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
-    let path = support_dir.join("claude-code-statusline.sh");
+    let path = claude_statusline_wrapper_path(support_dir);
     let cli_path = preferred_ottto_cli_path();
     let script = render_claude_statusline_wrapper(&cli_path, delegated_command);
+    match fs::read_to_string(&path) {
+        Ok(existing) if existing == script => return Ok((path, false)),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(LocalApiError::StatePoisoned),
+    }
     let tmp_path = path.with_extension(format!("sh.tmp.{}", std::process::id()));
     fs::write(&tmp_path, script).map_err(|_| LocalApiError::StatePoisoned)?;
     #[cfg(unix)]
@@ -3422,7 +3613,7 @@ fn write_claude_statusline_wrapper(
         fs::set_permissions(&tmp_path, permissions).map_err(|_| LocalApiError::StatePoisoned)?;
     }
     fs::rename(&tmp_path, &path).map_err(|_| LocalApiError::StatePoisoned)?;
-    Ok(path)
+    Ok((path, true))
 }
 
 fn preferred_ottto_cli_path() -> Option<PathBuf> {
@@ -3510,7 +3701,68 @@ fn backup_existing_config(
     fs::create_dir_all(&backup_dir).map_err(|_| LocalApiError::StatePoisoned)?;
     fs::copy(path, backup_dir.join(format!("{backup_id}.{extension}")))
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    prune_config_backups(&backup_dir, config_backup_retention_limit())?;
     Ok(Some(ConfigBackupResult { backup_id }))
+}
+
+fn config_backup_retention_limit() -> usize {
+    std::env::var(OTTTO_CONFIG_BACKUP_RETENTION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(MAX_CONFIG_BACKUPS_PER_SOURCE)
+}
+
+fn prune_config_backups(backup_dir: &Path, keep: usize) -> Result<(), LocalApiError> {
+    let mut entries = fs::read_dir(backup_dir)
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some(ConfigBackupEntry {
+                rank_millis: config_backup_rank_millis(&path, &metadata),
+                path,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .rank_millis
+            .cmp(&left.rank_millis)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    for entry in entries.into_iter().skip(keep) {
+        if let Err(error) = fs::remove_file(&entry.path) {
+            eprintln!(
+                "Failed to prune old config backup {}: {error}",
+                entry.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ConfigBackupEntry {
+    rank_millis: Option<u128>,
+    path: PathBuf,
+}
+
+fn config_backup_rank_millis(path: &Path, metadata: &fs::Metadata) -> Option<u128> {
+    let file_name = path.file_name()?.to_str()?;
+    if let Some((_prefix, suffix)) = file_name.split_once("_config_") {
+        let timestamp = suffix.split('.').next().unwrap_or("");
+        return timestamp.parse::<u128>().ok();
+    }
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
 }
 
 fn claude_code_relay_env_with_base(
@@ -5720,6 +5972,10 @@ mod tests {
             Self::set_os(key, value.as_os_str().to_os_string())
         }
 
+        fn set_str(key: &'static str, value: &str) -> Self {
+            Self::set_os(key, OsString::from(value))
+        }
+
         fn set_os(key: &'static str, value: OsString) -> Self {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
@@ -5751,6 +6007,22 @@ mod tests {
         let binary = bin_dir.join(name);
         fs::write(&binary, "#!/bin/sh\n").expect("fake binary");
         binary
+    }
+
+    fn count_backup_files(path: &Path) -> usize {
+        fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .metadata()
+                            .map(|metadata| metadata.is_file())
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     #[test]
@@ -7234,9 +7506,12 @@ X-API-Key = "otel_redacted"
             .and_then(Item::as_table)
             .expect("otel table");
 
+        assert!(result.changed);
         assert!(!result.created);
         assert!(result.backup_created);
-        assert!(backup_root.join("config-backups/codex").exists());
+        let backup_dir = backup_root.join("config-backups/codex");
+        assert!(backup_dir.exists());
+        assert_eq!(count_backup_files(&backup_dir), 1);
         assert_eq!(
             document
                 .get("model")
@@ -7254,6 +7529,12 @@ X-API-Key = "otel_redacted"
             "metrics_exporter",
             "metrics"
         ));
+        let second = patch_codex_config_at(&path, &backup_root).expect("patch config again");
+        assert!(!second.changed);
+        assert!(!second.created);
+        assert!(!second.backup_created);
+        assert_eq!(fs::read_to_string(&path).expect("read second config"), body);
+        assert_eq!(count_backup_files(&backup_dir), 1);
         remove_codex_config_at(&path).expect("remove managed block");
         assert_eq!(
             fs::read_to_string(&path).expect("read restored config"),
@@ -7290,6 +7571,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         let result = patch_codex_config_at(&path, &backup_root).expect("compatible relay config");
         let body = fs::read_to_string(&path).expect("read config");
 
+        assert!(!result.changed);
         assert!(!result.created);
         assert!(!result.backup_created);
         assert_eq!(body, original);
@@ -7359,6 +7641,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         let env_body = fs::read_to_string(&env_path).expect("read env file");
         let shell_body = fs::read_to_string(&shell_path).expect("read shell rc");
 
+        assert!(result.changed);
         assert!(result.created);
         assert!(result.backup_created);
         assert!(env_body.contains("# ottto:start"));
@@ -7377,6 +7660,29 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
                 & 0o777,
             0o600
         );
+        let backup_dir = backup_root.join("config-backups/claude_code");
+        assert_eq!(count_backup_files(&backup_dir), 1);
+
+        let second = patch_claude_code_env_at(
+            &env_path,
+            &shell_path,
+            &test_machine(),
+            &backup_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("patch env again");
+        assert!(!second.changed);
+        assert!(!second.created);
+        assert!(!second.backup_created);
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("read second env file"),
+            env_body
+        );
+        assert_eq!(
+            fs::read_to_string(&shell_path).expect("read second shell rc"),
+            shell_body
+        );
+        assert_eq!(count_backup_files(&backup_dir), 1);
 
         remove_claude_code_env_at(&env_path, &shell_path).expect("remove env");
         assert!(!env_path.exists());
@@ -7409,9 +7715,12 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             .and_then(|value| value.as_object())
             .expect("env object");
 
+        assert!(result.changed);
         assert!(!result.created);
         assert!(result.backup_created);
-        assert!(backup_root.join("config-backups/claude_code").exists());
+        let backup_dir = backup_root.join("config-backups/claude_code");
+        assert!(backup_dir.exists());
+        assert_eq!(count_backup_files(&backup_dir), 1);
         assert_eq!(
             env.get("EXISTING").and_then(|value| value.as_str()),
             Some("keep")
@@ -7474,6 +7783,156 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             value.get("theme").and_then(|value| value.as_str()),
             Some("dark")
         );
+
+        let second = patch_claude_code_settings_at(&path, &test_machine(), &backup_root)
+            .expect("patch settings again");
+        assert!(!second.changed);
+        assert!(!second.created);
+        assert!(!second.backup_created);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read second settings"),
+            body
+        );
+        assert_eq!(
+            fs::read_to_string(backup_root.join("claude-code-statusline.sh"))
+                .expect("read second statusLine wrapper"),
+            wrapper
+        );
+        assert_eq!(count_backup_files(&backup_dir), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_claude_code_settings_restores_missing_wrapper_without_settings_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-wrapper-restore-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let path = root.join("settings.json");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"jq -r '.model.display_name'"}}"#,
+        )
+        .expect("write settings");
+
+        patch_claude_code_settings_at(&path, &test_machine(), &backup_root)
+            .expect("patch settings");
+        let body = fs::read_to_string(&path).expect("read patched settings");
+        let backup_dir = backup_root.join("config-backups/claude_code");
+        assert_eq!(count_backup_files(&backup_dir), 1);
+        fs::remove_file(backup_root.join("claude-code-statusline.sh"))
+            .expect("remove statusLine wrapper");
+
+        let restored = patch_claude_code_settings_at(&path, &test_machine(), &backup_root)
+            .expect("restore wrapper");
+        let wrapper = fs::read_to_string(backup_root.join("claude-code-statusline.sh"))
+            .expect("read restored wrapper");
+
+        assert!(restored.changed);
+        assert!(!restored.created);
+        assert!(!restored.backup_created);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read settings again"),
+            body
+        );
+        assert_eq!(count_backup_files(&backup_dir), 1);
+        assert!(wrapper.contains("ORIGINAL_STATUSLINE=''"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backup_retention_keeps_newest_n_and_invalid_env_uses_default() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-backup-retention-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let backup_dir = root.join("config-backups/codex");
+        fs::create_dir_all(&backup_dir).expect("create backup dir");
+        for timestamp in 1..=5 {
+            fs::write(
+                backup_dir.join(format!("codex_config_{timestamp}.toml")),
+                format!("model = \"gpt-5.{timestamp}\"\n"),
+            )
+            .expect("write backup");
+        }
+        fs::write(backup_dir.join("codex_config_bad.toml"), "bad").expect("write bad backup");
+
+        let _retention_guard = EnvVarGuard::set_str(OTTTO_CONFIG_BACKUP_RETENTION_ENV, "3");
+        prune_config_backups(&backup_dir, config_backup_retention_limit()).expect("prune backups");
+        let files = fs::read_dir(&backup_dir)
+            .expect("read backups")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&"codex_config_3.toml".to_string()));
+        assert!(files.contains(&"codex_config_4.toml".to_string()));
+        assert!(files.contains(&"codex_config_5.toml".to_string()));
+
+        drop(_retention_guard);
+        let _invalid_guard = EnvVarGuard::set_str(OTTTO_CONFIG_BACKUP_RETENTION_ENV, "nope");
+        assert_eq!(
+            config_backup_retention_limit(),
+            MAX_CONFIG_BACKUPS_PER_SOURCE
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn source_patch_disabled_parses_per_source_truthy_values() {
+        assert_eq!(source_patch_env_token(&SourceKind::Codex), Some("CODEX"));
+        assert_eq!(
+            source_patch_env_token(&SourceKind::ClaudeCode),
+            Some("CLAUDE_CODE")
+        );
+        assert_eq!(source_patch_env_token(&SourceKind::Pi), None);
+        assert!(!source_patch_disabled(&SourceKind::Codex));
+
+        let _guard = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", " yes ");
+        assert!(source_patch_disabled(&SourceKind::Codex));
+        assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
+        assert!(!source_patch_disabled(&SourceKind::Pi));
+    }
+
+    #[test]
+    fn source_patch_disabled_ignores_falsey_values() {
+        let _guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "false");
+        assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
+    }
+
+    #[test]
+    fn remove_claude_code_env_ignores_patch_disabled_env() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-env-remove-disabled-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let env_path = root.join(".ottto/claude-telemetry.env");
+        let shell_path = root.join(".zshrc");
+        let backup_root = root.join("backups");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(&shell_path, "alias ll='ls -la'\n").expect("write shell rc");
+        patch_claude_code_env_at(
+            &env_path,
+            &shell_path,
+            &test_machine(),
+            &backup_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed env");
+
+        let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
+        let removed = remove_claude_code_env_at(&env_path, &shell_path).expect("remove env");
+
+        assert!(removed.changed);
+        assert!(!env_path.exists());
+        assert!(!fs::read_to_string(&shell_path)
+            .expect("read shell rc")
+            .contains("# ottto:start"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -7542,6 +8001,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             true,
             43119,
             "Codex telemetry setup installed",
+            true,
         );
         let object = result.as_object().expect("result object");
         for key in object.keys() {
@@ -7580,10 +8040,53 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             false,
             43119,
             "Codex relay unavailable",
+            true,
         );
         assert_eq!(
             failed.get("error_code").and_then(serde_json::Value::as_str),
             Some("relay_unavailable")
+        );
+    }
+
+    #[test]
+    fn install_source_patch_disabled_result_uses_setup_safe_metadata_keys() {
+        let result = install_source_patch_disabled_result(
+            "install_session_test",
+            "device_test",
+            "codex",
+            "Codex telemetry config patching skipped by environment",
+        );
+        let object = result.as_object().expect("result object");
+        for key in object.keys() {
+            let lower = key.to_ascii_lowercase();
+            for forbidden in [
+                "authorization",
+                "bearer",
+                "cookie",
+                "device_secret",
+                "header",
+                "key",
+                "password",
+                "secret",
+                "token",
+            ] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "install action result key should be backend-safe: {key}"
+                );
+            }
+        }
+        assert_eq!(
+            object
+                .get("local_changes")
+                .and_then(serde_json::Value::as_str),
+            Some("patch_disabled")
+        );
+        assert_eq!(
+            object
+                .get("config_patched")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
     }
 

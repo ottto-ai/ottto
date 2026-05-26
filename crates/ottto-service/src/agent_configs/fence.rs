@@ -67,6 +67,10 @@ pub fn upsert_fence(path: &Path, body: &str) -> AgentConfigResult<FenceWriteResu
     upsert_fence_with_validator(path, body, |_| Ok(()))
 }
 
+pub fn upsert_would_change(path: &Path, body: &str) -> AgentConfigResult<bool> {
+    upsert_would_change_with_validator(path, body, |_| Ok(()))
+}
+
 pub fn remove_fence(path: &Path) -> AgentConfigResult<FenceWriteResult> {
     remove_fence_with_validator(path, |_| Ok(()))
 }
@@ -76,27 +80,8 @@ pub(crate) fn upsert_fence_with_validator(
     body: &str,
     validator: impl Fn(&str) -> Result<(), String>,
 ) -> AgentConfigResult<FenceWriteResult> {
-    validate_body(body)?;
     let created = !path.exists();
-    let existing = read_existing(path)?;
-    let eol = detect_line_ending(&existing).unwrap_or("\n");
-    let block = render_block(body, eol);
-    let next = match find_fence(&existing, path)? {
-        Some(range) => {
-            let mut next =
-                String::with_capacity(existing.len() - (range.end - range.start) + block.len());
-            next.push_str(&existing[..range.start]);
-            next.push_str(&block);
-            next.push_str(&existing[range.end..]);
-            next
-        }
-        None => {
-            let mut next = String::with_capacity(existing.len() + block.len());
-            next.push_str(&block);
-            next.push_str(&existing);
-            next
-        }
-    };
+    let (existing, next) = planned_upsert(path, body)?;
     if next == existing {
         return Ok(FenceWriteResult {
             changed: false,
@@ -108,6 +93,24 @@ pub(crate) fn upsert_fence_with_validator(
         changed: true,
         created,
     })
+}
+
+pub(crate) fn upsert_would_change_with_validator(
+    path: &Path,
+    body: &str,
+    validator: impl Fn(&str) -> Result<(), String>,
+) -> AgentConfigResult<bool> {
+    let (existing, next) = planned_upsert(path, body)?;
+    if next == existing {
+        return Ok(false);
+    }
+    if let Err(message) = validator(&next) {
+        return Err(AgentConfigError::ValidationFailed {
+            path: path.to_path_buf(),
+            message,
+        });
+    }
+    Ok(true)
 }
 
 pub(crate) fn remove_fence_with_validator(
@@ -135,6 +138,30 @@ pub(crate) fn remove_fence_with_validator(
         changed: true,
         created: false,
     })
+}
+
+fn planned_upsert(path: &Path, body: &str) -> AgentConfigResult<(String, String)> {
+    validate_body(body)?;
+    let existing = read_existing(path)?;
+    let eol = detect_line_ending(&existing).unwrap_or("\n");
+    let block = render_block(body, eol);
+    let next = match find_fence(&existing, path)? {
+        Some(range) => {
+            let mut next =
+                String::with_capacity(existing.len() - (range.end - range.start) + block.len());
+            next.push_str(&existing[..range.start]);
+            next.push_str(&block);
+            next.push_str(&existing[range.end..]);
+            next
+        }
+        None => {
+            let mut next = String::with_capacity(existing.len() + block.len());
+            next.push_str(&block);
+            next.push_str(&existing);
+            next
+        }
+    };
+    Ok((existing, next))
 }
 
 fn read_existing(path: &Path) -> AgentConfigResult<String> {
@@ -493,6 +520,43 @@ mod tests {
 
         assert!(!result.changed);
         assert!(!result.created);
+    }
+
+    #[test]
+    fn upsert_would_change_reports_missing_changed_without_writing() {
+        let path = test_path("would-change-missing");
+
+        assert!(upsert_would_change(&path, "managed=true").expect("dry run"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn upsert_would_change_reports_matching_body_unchanged() {
+        let path = test_path("would-change-noop");
+        write(
+            &path,
+            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n",
+        );
+
+        assert!(!upsert_would_change(&path, "managed=true").expect("dry run"));
+        assert_eq!(
+            read(&path),
+            "# ottto:start\nmanaged=true\n# ottto:end\nuser=true\n"
+        );
+    }
+
+    #[test]
+    fn upsert_would_change_validates_changed_result() {
+        let path = test_path("would-change-validator");
+        write(&path, "user=true\n");
+
+        let error = upsert_would_change_with_validator(&path, "managed=true", |_| {
+            Err("not parseable".to_string())
+        })
+        .expect_err("validation failed");
+
+        assert!(matches!(error, AgentConfigError::ValidationFailed { .. }));
+        assert_eq!(read(&path), "user=true\n");
     }
 
     #[test]

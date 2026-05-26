@@ -1,10 +1,17 @@
 use std::path::Path;
 
-use super::fence::{remove_fence as remove_text_fence, upsert_fence as upsert_text_fence};
+use super::fence::{
+    remove_fence as remove_text_fence, upsert_fence as upsert_text_fence,
+    upsert_would_change as text_fence_would_change,
+};
 use super::fence::{AgentConfigResult, FenceWriteResult};
 
 pub fn upsert_fence(path: &Path, body: &str) -> AgentConfigResult<FenceWriteResult> {
     upsert_text_fence(path, body)
+}
+
+pub fn upsert_would_change(path: &Path, body: &str) -> AgentConfigResult<bool> {
+    text_fence_would_change(path, body)
 }
 
 pub fn remove_fence(path: &Path) -> AgentConfigResult<FenceWriteResult> {

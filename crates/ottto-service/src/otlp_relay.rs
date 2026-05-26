@@ -80,8 +80,7 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
                 last_error: Some(StableMessage {
                     code: "relay_bind_failed".to_string(),
                     text: format!(
-                        "Could not bind local OTLP relay on 127.0.0.1:{} or a per-user fallback port.",
-                        LOCAL_RELAY_DEFAULT_PORT
+                        "Could not bind local OTLP relay on 127.0.0.1:{LOCAL_RELAY_DEFAULT_PORT} or a per-user fallback port."
                     ),
                 }),
             });
