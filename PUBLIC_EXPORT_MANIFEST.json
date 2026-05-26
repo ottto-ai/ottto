@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "87f011a81aa648289eefedc1d5ccfe43c327d716a7218023dead671a65a2ecda",
+  "content_sha256": "fb626076a7dc00dda6444b815d7882207bf0f1824b9a5cebb244f4eaed280599",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/macos-stable-release.yml",
-      "sha256": "2b4b544eb40e1d4943b88d354067954531b0fbafd13ecc8bd6396dd50d775bf5",
-      "size_bytes": 10750
+      "sha256": "a5291d4fa09e23c5ce6cdab0a1b89f89fb8458485e01126270c0329b3c9f7a43",
+      "size_bytes": 13140
     },
     {
       "executable": false,
@@ -699,8 +699,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "bfeaea022efb9717e25ebf18e067985fbd6fecca3c796841733436f2b2bf7128",
-      "size_bytes": 5818
+      "sha256": "94be71f8d5980fb591eb5e6a78c1861a785baeb0afe7b6f7d9c5c737f624f470",
+      "size_bytes": 7207
     },
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "f7b8a656cb60053abc257f131dc8eb3b3db83d8ba7b1fef695381fc0b00d6589",
-      "size_bytes": 23162
+      "sha256": "f7c0ee79c41b1465eda306f3b2f80f6859194a37bce6c27b01bc881ab2f1fe0a",
+      "size_bytes": 23919
     },
     {
       "executable": false,
@@ -1231,8 +1231,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_release_workflow.sh",
-      "sha256": "86a8691e049398af36bcc083967abf6ba2337c8ce9a81b4e3e6cd1f8c0d087cf",
-      "size_bytes": 3359
+      "sha256": "8f3ebeabf9baab160171c2fb262bd47f3b72d89a775ea892d4edbe093123be16",
+      "size_bytes": 4018
     },
     {
       "executable": true,
