@@ -25,13 +25,21 @@ on:
         type: choice
         options:
           - none
+      github_release_mirror:
+        description: Mirror the stable build to a public GitHub Release for verification only. Never touches the CDN or channel promotion.
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: macos-stable-release-${{ github.ref }}-${{ inputs.channel }}-${{ inputs.version }}
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  # contents: write is required only so the optional, input-gated GitHub Release
+  # verification mirror can create a tag/release. It never publishes to the CDN or
+  # promotes a channel; the CDN remains the install/update source of truth.
+  contents: write
   id-token: write
   attestations: write
   artifact-metadata: write
@@ -278,3 +286,31 @@ jobs:
             dist/macos/subject.checksums.txt
             dist/macos/install-macos.sh
             dist/macos/homebrew/ottto.rb
+
+      - name: Mirror stable build to GitHub Release (verification only)
+        if: inputs.channel == 'stable' && inputs.github_release_mirror == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          tag="v${version}"
+          # Verification mirror only: the CDN at install.ottto.net stays the install and
+          # update source of truth. This step never promotes a channel pointer or writes
+          # to the CDN; it only publishes signed verification assets to a GitHub Release.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $tag already exists; refusing to overwrite a published release." >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Ottto ${version}" \
+            --notes "Public verification mirror for Ottto ${version}. Install and update source of truth is the CDN; these assets exist for signature and checksum verification only." \
+            dist/macos/Ottto-macos-*.dmg \
+            dist/macos/ottto-macos-*.zip \
+            dist/macos/ottto-service-macos-*.zip \
+            dist/macos/ottto-local-platform-sbom.cdx.json \
+            dist/macos/release-manifest.json \
+            dist/macos/release-manifest.json.sig \
+            dist/macos/subject.checksums.txt

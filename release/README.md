@@ -428,6 +428,16 @@ AWS/CDN prerequisites before publish:
 16. Update the stable `latest/` pointer only after download, checksum, stapler,
     Gatekeeper, install, service, update, uninstall, rollback, and closeout-gate
     evidence are attached to the release record.
+17. Optionally publish a public GitHub Release verification mirror by dispatching
+    the stable release workflow with `github_release_mirror: true` (stable channel
+    only). The mirror is verification-only: it never writes to the CDN and never
+    promotes a channel pointer, and it refuses to overwrite an existing
+    `v<version>` release. It attaches the app, CLI, and daemon archives, the
+    CycloneDX SBOM, `release-manifest.json`, `release-manifest.json.sig`, and
+    `subject.checksums.txt`, and intentionally omits `install-macos.sh`, the
+    Homebrew formula, and QA evidence files. Immutable GitHub releases are
+    desirable but not a hard gate; record the immutability state as informational
+    evidence. See `docs/release-verification.md`.
 
 ## Stable Closeout Evidence
 
