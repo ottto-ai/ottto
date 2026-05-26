@@ -1081,40 +1081,115 @@ fn source_health_from_verification(
         .iter()
         .find(|health| health.source == result.source)
         .and_then(|health| health.agent_status.clone());
-    let (source_state, grade, problems) = match result.status {
-        SourceVerificationStatus::Verified => (SourceState::Healthy, HealthGrade::Ok, Vec::new()),
-        SourceVerificationStatus::Warning => (
-            SourceState::Healthy,
+    let config_has_drift = !result.config.drift.is_empty();
+    let config_missing = !result.config.discovered
+        || result
+            .config
+            .drift
+            .iter()
+            .any(|drift| drift.key.ends_with("config_file"));
+    let patch_disabled = result.message.code == "patch_disabled";
+    let (source_state, grade, problems) = if config_has_drift {
+        (
+            SourceState::NeedsRepair,
             HealthGrade::Warning,
             vec![HealthProblem {
-                code: StableProblemCode::TelemetryNotVerified,
-                title: "Some route checks need review".to_string(),
+                code: if config_missing {
+                    StableProblemCode::ConfigMissing
+                } else {
+                    StableProblemCode::ConfigDrift
+                },
+                title: if config_missing {
+                    format!(
+                        "{} telemetry config is missing",
+                        source_display_name(&result.source)
+                    )
+                } else {
+                    format!(
+                        "{} telemetry config drifted",
+                        source_display_name(&result.source)
+                    )
+                },
                 detail: result.message.text.clone(),
                 retryable: true,
             }],
-        ),
-        SourceVerificationStatus::NoFreshTelemetry => (
-            SourceState::NeedsConfirmation,
-            HealthGrade::Warning,
-            vec![HealthProblem {
-                code: StableProblemCode::TelemetryNotVerified,
-                title: "No recent telemetry found".to_string(),
-                detail: result.message.text.clone(),
-                retryable: true,
-            }],
-        ),
-        SourceVerificationStatus::AccountNotConnected
-        | SourceVerificationStatus::ReconnectRequired
-        | SourceVerificationStatus::Failed => (
-            SourceState::Failed,
-            HealthGrade::Critical,
-            vec![HealthProblem {
-                code: StableProblemCode::TelemetryNotVerified,
-                title: "Verification could not complete".to_string(),
-                detail: result.message.text.clone(),
-                retryable: true,
-            }],
-        ),
+        )
+    } else if patch_disabled {
+        (SourceState::Healthy, HealthGrade::Ok, Vec::new())
+    } else {
+        match result.status {
+            SourceVerificationStatus::Verified => {
+                (SourceState::Healthy, HealthGrade::Ok, Vec::new())
+            }
+            SourceVerificationStatus::Warning => (
+                SourceState::Healthy,
+                HealthGrade::Warning,
+                vec![HealthProblem {
+                    code: StableProblemCode::TelemetryNotVerified,
+                    title: "Some route checks need review".to_string(),
+                    detail: result.message.text.clone(),
+                    retryable: true,
+                }],
+            ),
+            SourceVerificationStatus::NoFreshTelemetry => (
+                SourceState::NeedsConfirmation,
+                HealthGrade::Warning,
+                vec![HealthProblem {
+                    code: StableProblemCode::TelemetryNotVerified,
+                    title: "No recent telemetry found".to_string(),
+                    detail: result.message.text.clone(),
+                    retryable: true,
+                }],
+            ),
+            SourceVerificationStatus::AccountNotConnected
+            | SourceVerificationStatus::ReconnectRequired
+            | SourceVerificationStatus::Failed => (
+                SourceState::Failed,
+                HealthGrade::Critical,
+                vec![HealthProblem {
+                    code: StableProblemCode::TelemetryNotVerified,
+                    title: "Verification could not complete".to_string(),
+                    detail: result.message.text.clone(),
+                    retryable: true,
+                }],
+            ),
+        }
+    };
+    let recommended_actions = if config_has_drift {
+        let authority = repair_authority_for_state(state);
+        vec![RepairAction {
+            action: RepairActionKind::WriteConfig,
+            title: format!(
+                "Repair {} telemetry config",
+                source_display_name(&result.source)
+            ),
+            detail: result.message.text.clone(),
+            requires_approval: true,
+            destructive: false,
+            approval: setup_safe_repair_approval(&authority),
+            backup: Some(config_backup_metadata(
+                &result.source,
+                false,
+                None,
+                result.config.fingerprint.clone(),
+            )),
+        }]
+    } else if result.verified || patch_disabled {
+        Vec::new()
+    } else {
+        vec![RepairAction {
+            action: RepairActionKind::VerifyTelemetry,
+            title: format!("Retry {} verification", source_display_name(&result.source)),
+            detail: result.message.text.clone(),
+            requires_approval: false,
+            destructive: false,
+            approval: no_repair_approval(
+                true,
+                false,
+                "Retrying verification does not change local configuration.",
+            ),
+            backup: None,
+        }]
     };
 
     SourceHealth {
@@ -1127,12 +1202,7 @@ fn source_health_from_verification(
             observed_account_id: user_id,
             matched: Some(state.account.state == LocalAccountState::Connected),
         },
-        config: SourceConfigState {
-            discovered: result.verified,
-            path_hint: None,
-            fingerprint: None,
-            drift: Vec::new(),
-        },
+        config: result.config.clone(),
         collector: None,
         agent_status,
         plan_observations: Vec::new(),
@@ -1143,23 +1213,7 @@ fn source_health_from_verification(
             None
         },
         problems,
-        recommended_actions: if result.verified {
-            Vec::new()
-        } else {
-            vec![RepairAction {
-                action: RepairActionKind::VerifyTelemetry,
-                title: format!("Retry {} verification", source_display_name(&result.source)),
-                detail: result.message.text.clone(),
-                requires_approval: false,
-                destructive: false,
-                approval: no_repair_approval(
-                    true,
-                    false,
-                    "Retrying verification does not change local configuration.",
-                ),
-                backup: None,
-            }]
-        },
+        recommended_actions,
     }
 }
 
@@ -1933,6 +1987,12 @@ mod tests {
         let daemon = daemon();
         let result = SourceVerificationResult {
             source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
             status: SourceVerificationStatus::Verified,
             verified: true,
             records_seen: 2,
@@ -1967,6 +2027,12 @@ mod tests {
             .expect("source health should update");
         let result = SourceVerificationResult {
             source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
             status: SourceVerificationStatus::ReconnectRequired,
             verified: false,
             records_seen: 0,
@@ -1995,6 +2061,12 @@ mod tests {
         let daemon = daemon();
         let result = SourceVerificationResult {
             source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
             status: SourceVerificationStatus::AccountNotConnected,
             verified: false,
             records_seen: 0,

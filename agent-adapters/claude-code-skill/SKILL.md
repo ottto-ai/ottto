@@ -136,13 +136,16 @@ Prefer these commands for the Claude Code app:
 ```bash
 ottto apps status --app claude-code --json
 ottto verify --app claude-code --json
+ottto verify --repair --app claude-code --json
 ottto doctor --json
 ottto fix --app claude-code --json
 ```
 
-Run `doctor` before `fix` when diagnosing. Apply repair only through
-daemon-approved `ottto fix`; do not write telemetry environment variables,
-Claude settings, status-line config, or local auth files directly.
+Run `doctor` before `fix` when diagnosing. Plain verify is read-only and reports
+config drift; `verify --repair` may repair only daemon-owned WriteConfig drift.
+Apply repair only through daemon-approved commands; do not write telemetry
+environment variables, Claude settings, status-line config, or local auth files
+directly.
 
 Repair JSON includes plan `authority` and per-action `approval`. Treat terminal
 repair as allowed only when `authority.mode` is `server_backed_setup_action`,

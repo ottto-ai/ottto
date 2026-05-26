@@ -167,36 +167,32 @@
   "problems": [
     {
       "code": "config_drift",
-      "title": "Codex telemetry is pointed at a different Ottto account",
-      "detail": "The local Codex config does not match the account that owns this machine.",
+      "title": "Codex telemetry config drifted",
+      "detail": "Codex telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app codex` or `ottto fix --app codex`.",
       "retryable": true
     }
   ],
   "recommended_actions": [
     {
-      "action": "rotate_secret",
-      "title": "Rotate local telemetry key",
-      "detail": "Request a fresh source-scoped key and write it through ottto-service.",
+      "action": "write_config",
+      "title": "Repair Codex telemetry config",
+      "detail": "Codex telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app codex` or `ottto fix --app codex`.",
       "requires_approval": true,
       "destructive": false,
       "approval": {
-        "surface": "browser",
-        "setup_safe": false,
-        "server_backed": false,
-        "reason": "Credential repair requires browser approval."
-      }
-    },
-    {
-      "action": "verify_telemetry",
-      "title": "Verify fresh Codex telemetry",
-      "detail": "Run a smoke prompt and wait for the backend to observe the event.",
-      "requires_approval": false,
-      "destructive": false,
-      "approval": {
-        "surface": "none",
+        "surface": "terminal",
         "setup_safe": true,
-        "server_backed": false,
-        "reason": "Verification is read-only and does not mutate local state."
+        "server_backed": true,
+        "reason": "Setup-safe config repair is tied to the active setup run."
+      },
+      "backup": {
+        "scope": "source_config",
+        "required": true,
+        "restore_available": false,
+        "backup_id": null,
+        "target_fingerprint": "sha256:config-fingerprint",
+        "restore_operation": "uninstall_restore",
+        "detail": "Codex config changes must be reversible through ottto-service."
       }
     }
   ]

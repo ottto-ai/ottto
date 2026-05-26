@@ -41,6 +41,11 @@ local config or Keychain state before backend setup-key revocation completes.
 `ottto fix --json` returns repair authority metadata. Terminal repair is allowed
 only for setup-safe actions tied to an active setup-run binding. Credential,
 auth-adjacent, stale-account, or disconnected cases require browser approval.
+`ottto verify --repair --json` is narrower: it can repair only Codex or Claude
+Code WriteConfig drift after a read-only config check, then re-read config before
+telemetry smoke. `OTTTO_PATCH_CODEX_DISABLED` and
+`OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return
+`patch_disabled`.
 
 ## Diagnostics Redaction
 

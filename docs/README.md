@@ -42,6 +42,7 @@ ottto apps detect --json
 ottto apps status --app codex --json
 ottto setup --json
 ottto verify --app claude-code --json
+ottto verify --repair --app claude-code --json
 ottto fix --app claude-code --json
 ottto diagnostics collect --json
 ```

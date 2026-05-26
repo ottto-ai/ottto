@@ -71,10 +71,14 @@ ottto apps status --app codex --json
 ottto apps status --app claude-code --json
 ottto verify --app codex --json
 ottto verify --app claude-code --json
+ottto verify --repair --app codex --json
 ```
 
-Do not hand-edit local Codex, Claude Code, or Pi config as a setup shortcut.
-Config repair belongs to `ottto-service` and the typed repair flow.
+Plain verify is read-only and returns `config` state with a `sha256:`
+fingerprint plus drift details. `verify --repair` is limited to daemon-owned
+WriteConfig repair for Codex and Claude Code; Pi keeps its existing verification
+flow and has no config patching. Do not hand-edit local Codex, Claude Code, or
+Pi config as a setup shortcut.
 
 ## Stable Exit Codes
 

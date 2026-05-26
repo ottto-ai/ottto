@@ -82,6 +82,7 @@ ottto status --json
 ottto setup --json
 ottto apps detect --json
 ottto verify --app codex --json
+ottto verify --repair --app codex --json
 ottto doctor --json
 ottto fix --app codex --json
 ottto diagnostics collect --json
@@ -248,6 +249,7 @@ ottto logout --local-only --json
 ottto doctor --json
 ottto fix --app codex --json
 ottto verify --app codex --json
+ottto verify --repair --app codex --json
 ottto diagnostics collect --json
 ottto diagnostics collect --upload --approve-upload --accept-retention-disclosure --support-claim <claim> --json
 ottto update --json
@@ -296,6 +298,8 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - authenticated local daemon status access
 - daemon-owned relay and source state
 - daemon-owned repair locks
+- read-only Codex and Claude Code config drift verification with
+  `sha256:` fingerprints plus `verify --repair` WriteConfig repair
 - repair-plan proposal skeletons with required approval-boundary metadata:
   setup-safe config repairs may use terminal approval only when tied to an
   active setup-run binding, credential/auth-adjacent actions require browser

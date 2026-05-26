@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 185,
-  "content_sha256": "acc865f4f75b367228e3cb135cfcb2186d69f2538e4ae3f23d584490dc842232",
+  "content_sha256": "87f011a81aa648289eefedc1d5ccfe43c327d716a7218023dead671a65a2ecda",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "dd5f5d58a0ed556f3bb7db86c136bd313753c4939e70cd98c8f693f2dfa09334",
-      "size_bytes": 40566
+      "sha256": "bae8da005ce6284d89e008eca06273f5b6ffdb35e7d812a642d523b12ed91983",
+      "size_bytes": 40780
     },
     {
       "executable": false,
@@ -97,15 +97,15 @@
       "executable": false,
       "mode": "0644",
       "path": "agent-adapters/claude-code-skill/SKILL.md",
-      "sha256": "ab56ca46ee0c3095d93f2d57123364a477be588eca2b355e818072731d08e940",
-      "size_bytes": 5981
+      "sha256": "4ab6cc044fe3567434a00acea9481b0340790beb0d899abd6e30c71d94330d5c",
+      "size_bytes": 6143
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "agent-adapters/codex-skill/SKILL.md",
-      "sha256": "ce4ad4a1dd7b551730ac9d82d38bf88ac61218bb18cdba796ca56c2393f997b0",
-      "size_bytes": 6318
+      "sha256": "b57677d39d5962081f9ad75aa416f23a75a60d3c3be30d08d4e7babb631ee850",
+      "size_bytes": 6502
     },
     {
       "executable": false,
@@ -363,8 +363,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "8dbce42a1e3bdb53b99f408e20f284139d2932cee60d29678ec1abc97774b919",
-      "size_bytes": 67737
+      "sha256": "2eca07fcc45e5b002f29dc63d1bbf5e8270cb9ca9ae54d265c483b6a7dbdd044",
+      "size_bytes": 69097
     },
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "9ecedbb1c32e4fa0cd35b5c0da6d1b0b9006b00ed89e98644a7a5da6c40cc0e4",
-      "size_bytes": 67401
+      "sha256": "5a6397b662454e6afddadb69c4351b0d11681fd59be39e396b4c5082d4d73624",
+      "size_bytes": 69056
     },
     {
       "executable": false,
@@ -559,8 +559,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "33c66875b67f8574e0290e1eb468a86d0dc8f7c41160401bf957228b7e4b68a6",
-      "size_bytes": 304258
+      "sha256": "e35b1d5d748aebe0e428ac9518f5e827bf35b54ac74805ae093d1dab7b02c928",
+      "size_bytes": 342999
     },
     {
       "executable": false,
@@ -573,8 +573,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "ea9584c6f654ee4f81c9c527f9b406792a971a8fac9a5364a9d55f0996736740",
-      "size_bytes": 75339
+      "sha256": "8f2ebfc9c90c03f986b053b580698096ec6f549e5afe108886bf25b9a1d1f522",
+      "size_bytes": 78106
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/README.md",
-      "sha256": "a9c39cc8f1a14f7cb234c68dd1b2b33b227a68e09028e21d691364c3340d8e61",
-      "size_bytes": 1952
+      "sha256": "b767c347e0d089b0b7ab9587b995afd5883d2edd2141f4b6bf053a64f04ef98c",
+      "size_bytes": 1999
     },
     {
       "executable": false,
@@ -678,8 +678,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/examples.md",
-      "sha256": "e7faf487d8f1088546774815d6312b1cfb63fc04aa9fa2b2b861c0add30ff71f",
-      "size_bytes": 1461
+      "sha256": "e94b9b564d2b6ec2917c8cd12be5f02265ffa513c104f965d9add871a52f4bd3",
+      "size_bytes": 1686
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "2ea0176c25bf7ab2de2c918a94fd7a540fa0c80ed3ff025b775cf00bb26683f3",
-      "size_bytes": 2140
+      "sha256": "d7ad33c4038bd8af46bdd12b286a664ddcc6282956e483bc60808e59c735813e",
+      "size_bytes": 2435
     },
     {
       "executable": false,
@@ -706,22 +706,22 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/setup.md",
-      "sha256": "241c300cf1ee1ade83982cb64d87cb6aeede45a43a14a3df64f704cc66c42c18",
-      "size_bytes": 2044
+      "sha256": "dd42039c8c8782ad038d0087b074163a69feda54950efa514159cdbfe2461f9d",
+      "size_bytes": 2278
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "docs/support.md",
-      "sha256": "49d4e2ea77191ce2ddc38c3149caea41810c00356fa71af56ab8aff2f5a2a4db",
-      "size_bytes": 4215
+      "sha256": "85c8d6a92031f780367159d8179cd0f70610ac0fdf676c0bc74a5e0e0c54ba21",
+      "size_bytes": 4275
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "040fd54fa339e0d0792804e3d5e29f10f0de8dad8449779518beb17e7f71982a",
-      "size_bytes": 2924
+      "sha256": "8b22a033a2a8d02ab4badedd9e40c37f35c605a02bd691f9f4a13d0a90ab720b",
+      "size_bytes": 3290
     },
     {
       "executable": false,
@@ -755,8 +755,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
-      "sha256": "e5586ee71ee93be1ff1caadfdf50ef8df3dba45d5b5f7fe99372edb1fd422337",
-      "size_bytes": 13242
+      "sha256": "e6a0241000fabff78bf95efad7f9ee1a7e5c7ec40e7f36a1231036331fb4a6c2",
+      "size_bytes": 13331
     },
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/source-health/codex-needs-repair.json",
-      "sha256": "9b07bf4ebb1b0411f0d1873f444bbb674d72caa188153e3ed3c80185f37487e5",
-      "size_bytes": 5560
+      "sha256": "e242a85700e80ad1376fe8b0264bff2bf83c42f6bb555b8e418a42238f553343",
+      "size_bytes": 5570
     },
     {
       "executable": false,
@@ -1298,7 +1298,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-26T05:47:43+00:00",
+  "generated_at": "2026-05-26T08:09:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 186,
   "public_roots": [
@@ -1333,5 +1333,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bac5b58a9b3cbf22405211a0b1f3efaf8d19ee80"
+  "source_commit": "cdc5e0f8f11f37d2cc08b606931420e4397e9bdf"
 }

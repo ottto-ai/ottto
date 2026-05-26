@@ -21,13 +21,14 @@ use ottto_core::{
 };
 use ottto_protocol::{
     AgentInstallationDetection, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
-    AuthStartResponse, CliError, CliErrorCode, ControlResult, ControlResultStatus,
+    AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus,
     DiagnosticsBundle, DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval,
     DiagnosticsUploadAuthorization, DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner,
     LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
     LocalClientKind, LocalControlCommand, LocalControlRequest, LocalControlResponse,
-    MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel, SecretString,
-    ServiceOwnerState, SourceKind, SourceRouteVerificationResult, SourceVerificationResult,
+    MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel,
+    RepairActionKind, RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState,
+    SourceConfigState, SourceKind, SourceRouteVerificationResult, SourceVerificationResult,
     SourceVerificationStatus, StableMessage, TelemetryControlAction, UninstallExecutionResult,
     UpdateGate, UpdateState, UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE,
     LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
@@ -36,6 +37,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fs;
@@ -336,15 +338,9 @@ fn handle_command(
             require_authorized_local_client(daemon, &authorization)?;
             to_value(detect_agent_installation(&source))
         }
-        LocalControlCommand::Repair { source, dry_run } => match &authorization {
-            RequestAuthorization::Token(token) => {
-                to_value(daemon.propose_repair(token, source, dry_run)?)
-            }
-            RequestAuthorization::TrustedCompanionApp => {
-                to_value(daemon.propose_repair_for_trusted_client(source, dry_run)?)
-            }
-            RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
-        },
+        LocalControlCommand::Repair { source, dry_run } => {
+            to_value(repair_source(daemon, &authorization, source, dry_run)?)
+        }
         LocalControlCommand::DiagnosticsCollect {
             upload,
             upload_approval,
@@ -394,8 +390,8 @@ fn handle_command(
                 RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
             }
         }
-        LocalControlCommand::Verify { source } => {
-            to_value(verify_source(daemon, &authorization, source)?)
+        LocalControlCommand::Verify { source, repair } => {
+            to_value(verify_source(daemon, &authorization, source, repair)?)
         }
         LocalControlCommand::Setup {
             sources,
@@ -998,6 +994,133 @@ fn remove_telemetry_config(
         }
         SourceKind::Pi => Err(LocalApiError::InvalidRequest(
             "telemetry control does not patch Pi local config".to_string(),
+        )),
+    }
+}
+
+fn repair_source(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: SourceKind,
+    dry_run: bool,
+) -> Result<RepairPlan, LocalApiError> {
+    let mut plan = propose_repair_plan(daemon, authorization, source.clone(), dry_run)?;
+    if dry_run {
+        return Ok(plan);
+    }
+
+    plan.actions
+        .retain(|action| action.action == RepairActionKind::WriteConfig);
+
+    if !source_requires_config_patch(&source) {
+        plan.status = RepairPlanStatus::Blocked;
+        plan.authority.message = StableMessage {
+            code: "config_repair_not_supported".to_string(),
+            text: format!(
+                "{} does not support local config repair.",
+                source_display_name(&source)
+            ),
+        };
+        plan.actions.clear();
+        return Ok(plan);
+    }
+
+    if source_patch_disabled(&source) {
+        plan.status = RepairPlanStatus::Blocked;
+        plan.authority.message = patch_disabled_message(&source);
+        plan.actions.clear();
+        return Ok(plan);
+    }
+
+    let before = source_config_state_for_daemon(daemon, &source)?;
+    let patch = if before.drift.is_empty() {
+        ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        }
+    } else {
+        execute_write_config_repair(daemon, authorization, &source)?
+    };
+    let after = source_config_state_for_daemon(daemon, &source)?;
+
+    plan.status = if after.drift.is_empty() {
+        RepairPlanStatus::Succeeded
+    } else {
+        RepairPlanStatus::Failed
+    };
+    if let Some(action) = plan.actions.first_mut() {
+        action.detail = if after.drift.is_empty() {
+            if patch.changed {
+                format!(
+                    "{} telemetry config was repaired through ottto-service.",
+                    source_display_name(&source)
+                )
+            } else {
+                format!(
+                    "{} telemetry config already matched the active local relay.",
+                    source_display_name(&source)
+                )
+            }
+        } else {
+            format!(
+                "{} telemetry config still has drift after repair.",
+                source_display_name(&source)
+            )
+        };
+    }
+    Ok(plan)
+}
+
+fn propose_repair_plan(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: SourceKind,
+    dry_run: bool,
+) -> Result<RepairPlan, LocalApiError> {
+    match authorization {
+        RequestAuthorization::Token(token) => daemon.propose_repair(token, source, dry_run),
+        RequestAuthorization::TrustedCompanionApp => {
+            daemon.propose_repair_for_trusted_client(source, dry_run)
+        }
+        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+    }
+}
+
+fn execute_write_config_repair(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: &SourceKind,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    if source_patch_disabled(source) {
+        return Err(LocalApiError::InvalidRequest(format!(
+            "{} telemetry config patching is disabled by environment",
+            source_display_name(source)
+        )));
+    }
+    let _lease = match authorization {
+        RequestAuthorization::Token(token) => daemon.acquire_repair_lock(token, source.clone())?,
+        RequestAuthorization::TrustedCompanionApp => {
+            daemon.acquire_repair_lock_for_trusted_client(source.clone())?
+        }
+        RequestAuthorization::Untrusted => return Err(LocalApiError::LocalClientNotTrusted),
+    };
+    repair_source_config(daemon, source)
+}
+
+fn repair_source_config(
+    daemon: &LocalDaemon,
+    source: &SourceKind,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    let relay_base_url = local_relay_base_url_for_daemon(daemon);
+    match source {
+        SourceKind::Codex => patch_codex_config_with_relay_base(&relay_base_url),
+        SourceKind::ClaudeCode => {
+            let machine = daemon.status_for_trusted_client()?.machine;
+            patch_claude_code_settings_with_relay_base(&machine, &relay_base_url)
+        }
+        SourceKind::Pi => Err(LocalApiError::InvalidRequest(
+            "Pi does not support local config repair".to_string(),
         )),
     }
 }
@@ -3083,6 +3206,363 @@ fn env_value_truthy(value: &str) -> bool {
     )
 }
 
+fn source_config_state_for_daemon(
+    daemon: &LocalDaemon,
+    source: &SourceKind,
+) -> Result<SourceConfigState, LocalApiError> {
+    let relay_base_url = local_relay_base_url_for_daemon(daemon);
+    let patch_disabled = source_patch_disabled(source);
+    Ok(match source {
+        SourceKind::Codex => codex_config_state_at(
+            &home_path(".codex/config.toml"),
+            "~/.codex/config.toml",
+            &relay_base_url,
+            patch_disabled,
+        ),
+        SourceKind::ClaudeCode => {
+            let machine = daemon.status_for_trusted_client()?.machine;
+            claude_code_settings_config_state_at(
+                &home_path(".claude/settings.json"),
+                "~/.claude/settings.json",
+                &machine,
+                &relay_base_url,
+                patch_disabled,
+            )
+        }
+        SourceKind::Pi => empty_source_config(source),
+    })
+}
+
+fn empty_source_config(source: &SourceKind) -> SourceConfigState {
+    SourceConfigState {
+        discovered: false,
+        path_hint: match source {
+            SourceKind::Codex => Some("~/.codex/config.toml".to_string()),
+            SourceKind::ClaudeCode => Some("~/.claude/settings.json".to_string()),
+            SourceKind::Pi => None,
+        },
+        fingerprint: None,
+        drift: Vec::new(),
+    }
+}
+
+fn codex_config_state_at(
+    path: &Path,
+    path_hint: &str,
+    relay_base_url: &str,
+    patch_disabled: bool,
+) -> SourceConfigState {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return SourceConfigState {
+                discovered: false,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint: None,
+                drift: if patch_disabled {
+                    Vec::new()
+                } else {
+                    vec![config_drift("codex.config_file", "present", "missing")]
+                },
+            };
+        }
+        Err(_) => {
+            return SourceConfigState {
+                discovered: false,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint: None,
+                drift: if patch_disabled {
+                    Vec::new()
+                } else {
+                    vec![config_drift("codex.config_file", "readable", "unreadable")]
+                },
+            };
+        }
+    };
+    let fingerprint = Some(config_fingerprint(&bytes));
+    if patch_disabled {
+        return SourceConfigState {
+            discovered: true,
+            path_hint: Some(path_hint.to_string()),
+            fingerprint,
+            drift: Vec::new(),
+        };
+    }
+    let mut drift = Vec::new();
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            drift.push(config_drift("codex.config_toml", "valid", "invalid_utf8"));
+            return SourceConfigState {
+                discovered: true,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint,
+                drift,
+            };
+        }
+    };
+    let document = match body.parse::<DocumentMut>() {
+        Ok(document) => document,
+        Err(_) => {
+            drift.push(config_drift("codex.config_toml", "valid", "invalid"));
+            return SourceConfigState {
+                discovered: true,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint,
+                drift,
+            };
+        }
+    };
+    let Some(otel) = document.get("otel").and_then(Item::as_table) else {
+        drift.push(config_drift("otel", "present", "missing"));
+        return SourceConfigState {
+            discovered: true,
+            path_hint: Some(path_hint.to_string()),
+            fingerprint,
+            drift,
+        };
+    };
+    let prompt_logging_disabled = otel
+        .get("log_user_prompt")
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_bool());
+    if prompt_logging_disabled != Some(false) {
+        drift.push(config_drift(
+            "otel.log_user_prompt",
+            "false",
+            prompt_logging_disabled
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "missing".to_string()),
+        ));
+    }
+    codex_exporter_config_drift(
+        &mut drift,
+        otel,
+        "otel.exporter.otlp-http",
+        "exporter",
+        "logs",
+        relay_base_url,
+    );
+    codex_exporter_config_drift(
+        &mut drift,
+        otel,
+        "otel.trace_exporter.otlp-http",
+        "trace_exporter",
+        "traces",
+        relay_base_url,
+    );
+    codex_exporter_config_drift(
+        &mut drift,
+        otel,
+        "otel.metrics_exporter.otlp-http",
+        "metrics_exporter",
+        "metrics",
+        relay_base_url,
+    );
+    SourceConfigState {
+        discovered: true,
+        path_hint: Some(path_hint.to_string()),
+        fingerprint,
+        drift,
+    }
+}
+
+fn codex_exporter_config_drift(
+    drift: &mut Vec<ConfigDrift>,
+    otel: &Table,
+    drift_prefix: &str,
+    exporter_key: &str,
+    signal: &str,
+    relay_base_url: &str,
+) {
+    let otlp_http = otel
+        .get(exporter_key)
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("otlp-http"))
+        .and_then(Item::as_table_like);
+    let expected_endpoint = expected_relay_endpoint(relay_base_url, signal);
+    let observed_endpoint = otlp_http
+        .and_then(|table| table.get("endpoint"))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str());
+    if observed_endpoint != Some(expected_endpoint.as_str()) {
+        drift.push(config_drift(
+            format!("{drift_prefix}.endpoint"),
+            expected_endpoint,
+            observed_endpoint.unwrap_or("missing"),
+        ));
+    }
+    let observed_protocol = otlp_http
+        .and_then(|table| table.get("protocol"))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str());
+    if observed_protocol != Some("binary") {
+        drift.push(config_drift(
+            format!("{drift_prefix}.protocol"),
+            "binary",
+            observed_protocol.unwrap_or("missing"),
+        ));
+    }
+    let observed_header = otlp_http
+        .and_then(|table| table.get("headers"))
+        .and_then(Item::as_table_like)
+        .and_then(|headers| headers.get(crate::otlp_relay::LOCAL_RELAY_HEADER))
+        .and_then(Item::as_value)
+        .and_then(|value| value.as_str());
+    if observed_header != Some(crate::otlp_relay::CODEX_RELAY_SOURCE) {
+        drift.push(config_drift(
+            format!("{drift_prefix}.headers.X-Ottto-Local-Relay"),
+            crate::otlp_relay::CODEX_RELAY_SOURCE,
+            observed_header.unwrap_or("missing"),
+        ));
+    }
+}
+
+fn claude_code_settings_config_state_at(
+    path: &Path,
+    path_hint: &str,
+    machine: &MachineIdentity,
+    relay_base_url: &str,
+    patch_disabled: bool,
+) -> SourceConfigState {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return SourceConfigState {
+                discovered: false,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint: None,
+                drift: if patch_disabled {
+                    Vec::new()
+                } else {
+                    vec![config_drift(
+                        "claude_code.settings_file",
+                        "present",
+                        "missing",
+                    )]
+                },
+            };
+        }
+        Err(_) => {
+            return SourceConfigState {
+                discovered: false,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint: None,
+                drift: if patch_disabled {
+                    Vec::new()
+                } else {
+                    vec![config_drift(
+                        "claude_code.settings_file",
+                        "readable",
+                        "unreadable",
+                    )]
+                },
+            };
+        }
+    };
+    let fingerprint = Some(config_fingerprint(&bytes));
+    if patch_disabled {
+        return SourceConfigState {
+            discovered: true,
+            path_hint: Some(path_hint.to_string()),
+            fingerprint,
+            drift: Vec::new(),
+        };
+    }
+    let mut drift = Vec::new();
+    let settings = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            drift.push(config_drift(
+                "claude_code.settings_json",
+                "object",
+                "non_object",
+            ));
+            return SourceConfigState {
+                discovered: true,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint,
+                drift,
+            };
+        }
+        Err(_) => {
+            drift.push(config_drift(
+                "claude_code.settings_json",
+                "valid",
+                "invalid",
+            ));
+            return SourceConfigState {
+                discovered: true,
+                path_hint: Some(path_hint.to_string()),
+                fingerprint,
+                drift,
+            };
+        }
+    };
+    let env = settings.get("env").and_then(|value| value.as_object());
+    for (key, expected) in claude_code_relay_env_with_base(machine, relay_base_url) {
+        let observed = env
+            .and_then(|env| env.get(key))
+            .and_then(|value| value.as_str());
+        if observed != Some(expected.as_str()) {
+            drift.push(config_drift(
+                format!("env.{key}"),
+                expected,
+                observed.unwrap_or("missing"),
+            ));
+        }
+    }
+    let statusline_command = settings
+        .get("statusLine")
+        .and_then(|value| value.as_object())
+        .and_then(|statusline| statusline.get("command"))
+        .and_then(|value| value.as_str());
+    if !statusline_command.is_some_and(is_ottto_statusline_command) {
+        drift.push(config_drift(
+            "statusLine.command",
+            "ottto claude-code-statusline wrapper",
+            statusline_command.unwrap_or("missing"),
+        ));
+    }
+    SourceConfigState {
+        discovered: true,
+        path_hint: Some(path_hint.to_string()),
+        fingerprint,
+        drift,
+    }
+}
+
+fn expected_relay_endpoint(relay_base_url: &str, signal: &str) -> String {
+    format!("{}/v1/{signal}", relay_base_url.trim_end_matches('/'))
+}
+
+fn config_fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+fn config_drift(
+    key: impl Into<String>,
+    expected: impl Into<String>,
+    observed: impl Into<String>,
+) -> ConfigDrift {
+    ConfigDrift {
+        key: key.into(),
+        expected: RedactedValue::String(expected.into()),
+        observed: RedactedValue::String(observed.into()),
+    }
+}
+
+fn patch_disabled_message(source: &SourceKind) -> StableMessage {
+    StableMessage {
+        code: "patch_disabled".to_string(),
+        text: format!(
+            "{} telemetry config patching is disabled by environment; Ottto will not inspect or repair local config.",
+            source_display_name(source)
+        ),
+    }
+}
+
 fn install_source_registration_result(
     install_session_id: &str,
     device_id: &str,
@@ -3264,17 +3744,25 @@ fn patch_codex_config_at_with_relay_base(
     backup_root: &Path,
     relay_base_url: &str,
 ) -> Result<ConfigPatchResult, LocalApiError> {
-    if path.exists()
-        && fs::read_to_string(path)
-            .ok()
-            .as_deref()
-            .is_some_and(|body| codex_config_has_relay_otel_for_base(body, relay_base_url))
+    let existing_body = if path.exists() {
+        fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    if existing_body
+        .as_deref()
+        .is_some_and(|body| codex_config_has_relay_otel_for_base(body, relay_base_url))
     {
         return Ok(ConfigPatchResult {
             changed: false,
             created: false,
             backup_created: false,
         });
+    }
+    if let Some(result) =
+        patch_existing_codex_otel_table(path, backup_root, relay_base_url, existing_body.as_deref())
+    {
+        return result;
     }
     let body = render_codex_relay_toml_block_for_base(relay_base_url);
     if !codex_toml::upsert_would_change(path, &body).map_err(agent_config_error)? {
@@ -3291,6 +3779,58 @@ fn patch_codex_config_at_with_relay_base(
         created: write.created,
         backup_created,
     })
+}
+
+fn patch_existing_codex_otel_table(
+    path: &Path,
+    backup_root: &Path,
+    relay_base_url: &str,
+    existing_body: Option<&str>,
+) -> Option<Result<ConfigPatchResult, LocalApiError>> {
+    let existing_body = existing_body?;
+    let mut document = match existing_body.parse::<DocumentMut>() {
+        Ok(document) => document,
+        Err(_) => return None,
+    };
+    document.get("otel")?;
+    let replacement =
+        match render_codex_relay_toml_block_for_base(relay_base_url).parse::<DocumentMut>() {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                return Some(Err(LocalApiError::LocalOperationFailed(format!(
+                    "generated Codex telemetry config is invalid: {error}"
+                ))));
+            }
+        };
+    document["otel"] = replacement["otel"].clone();
+    let next_body = document.to_string();
+    if next_body == existing_body {
+        return Some(Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        }));
+    }
+    let backup_created = match backup_existing_config(SourceKind::Codex, path, backup_root) {
+        Ok(value) => value.is_some(),
+        Err(error) => return Some(Err(error)),
+    };
+    Some(
+        write_config_body(path, next_body.as_bytes()).map(|()| ConfigPatchResult {
+            changed: true,
+            created: false,
+            backup_created,
+        }),
+    )
+}
+
+fn write_config_body(path: &Path, body: &[u8]) -> Result<(), LocalApiError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| LocalApiError::StatePoisoned)?;
+    }
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    fs::write(&tmp_path, body).map_err(|_| LocalApiError::StatePoisoned)?;
+    fs::rename(tmp_path, path).map_err(|_| LocalApiError::StatePoisoned)
 }
 
 fn remove_codex_config() -> Result<ConfigPatchResult, LocalApiError> {
@@ -4625,8 +5165,19 @@ fn smoke_failure_verification_result(
     smoke: &SmokeResult,
     smoke_after: Option<String>,
 ) -> SourceVerificationResult {
-    verification_result(
+    let config = empty_source_config(&source);
+    smoke_failure_verification_result_with_config(source, config, smoke, smoke_after)
+}
+
+fn smoke_failure_verification_result_with_config(
+    source: SourceKind,
+    config: SourceConfigState,
+    smoke: &SmokeResult,
+    smoke_after: Option<String>,
+) -> SourceVerificationResult {
+    verification_result_with_config(
         source,
+        config,
         SourceVerificationStatus::Failed,
         false,
         0,
@@ -5161,11 +5712,44 @@ fn verify_source(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
     source: SourceKind,
+    repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    let mut config = source_config_state_for_daemon(daemon, &source)?;
+    if source_requires_config_patch(&source) && source_patch_disabled(&source) {
+        let message = patch_disabled_message(&source);
+        let result = verification_result_with_config(
+            source,
+            config,
+            SourceVerificationStatus::Warning,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "patch_disabled",
+            &message.text,
+        );
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
+
+    if source_requires_config_patch(&source) && !config.drift.is_empty() {
+        if repair {
+            execute_write_config_repair(daemon, authorization, &source)?;
+            config = source_config_state_for_daemon(daemon, &source)?;
+        }
+        if !config.drift.is_empty() {
+            let result = config_drift_verification_result(source, config, repair);
+            daemon.record_verification_result(&result)?;
+            return Ok(result);
+        }
+    }
+
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
-        let result = verification_result(
+        let result = verification_result_with_config(
             source,
+            config,
             SourceVerificationStatus::AccountNotConnected,
             false,
             0,
@@ -5180,8 +5764,9 @@ fn verify_source(
     }
 
     let Some(connection) = daemon.connection_for_authorized_client()? else {
-        let result = verification_result(
+        let result = verification_result_with_config(
             source,
+            config,
             SourceVerificationStatus::ReconnectRequired,
             false,
             0,
@@ -5201,8 +5786,9 @@ fn verify_source(
             match refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection) {
                 Ok(token) => token,
                 Err(_) => {
-                    let result = verification_result(
+                    let result = verification_result_with_config(
                     source,
+                    config,
                     SourceVerificationStatus::ReconnectRequired,
                     false,
                     0,
@@ -5236,16 +5822,27 @@ fn verify_source(
                             &fresh_token,
                         ) {
                             Ok(retry) => retry,
-                            Err(err) => {
-                                verification_result_for_backend_error(source.clone(), None, &err)
-                            }
+                            Err(err) => verification_result_for_backend_error_with_config(
+                                source.clone(),
+                                empty_source_config(&source),
+                                None,
+                                &err,
+                            ),
                         },
-                        Err(err) => {
-                            verification_result_for_backend_error(source.clone(), None, &err)
-                        }
+                        Err(err) => verification_result_for_backend_error_with_config(
+                            source.clone(),
+                            empty_source_config(&source),
+                            None,
+                            &err,
+                        ),
                     }
                 }
-                Err(other) => verification_result_for_backend_error(source.clone(), None, &other),
+                Err(other) => verification_result_for_backend_error_with_config(
+                    source.clone(),
+                    empty_source_config(&source),
+                    None,
+                    &other,
+                ),
             };
         daemon.record_verification_result(&result)?;
         return Ok(result);
@@ -5254,7 +5851,12 @@ fn verify_source(
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
     let result = if !smoke.succeeded {
-        smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after))
+        smoke_failure_verification_result_with_config(
+            source.clone(),
+            config,
+            &smoke,
+            Some(smoke_after),
+        )
     } else {
         match wait_for_verification_with_refresh(
             &connection.api_base_url,
@@ -5263,8 +5865,9 @@ fn verify_source(
             &source,
             &smoke_after,
         ) {
-            Ok(response) if response.verified => verification_result(
+            Ok(response) if response.verified => verification_result_with_config(
                 source.clone(),
+                config,
                 SourceVerificationStatus::Verified,
                 true,
                 response.records_seen,
@@ -5283,8 +5886,9 @@ fn verify_source(
                     }
                 ),
             ),
-            Ok(response) => verification_result(
+            Ok(response) => verification_result_with_config(
                 source.clone(),
+                config,
                 SourceVerificationStatus::NoFreshTelemetry,
                 false,
                 response.records_seen,
@@ -5294,7 +5898,12 @@ fn verify_source(
                 no_fresh_telemetry_code(&source, &smoke),
                 &no_fresh_telemetry_message(&source, &smoke),
             ),
-            Err(error) => verification_result_for_backend_error(source, Some(smoke_after), &error),
+            Err(error) => verification_result_for_backend_error_with_config(
+                source,
+                config,
+                Some(smoke_after),
+                &error,
+            ),
         }
     };
     daemon.record_verification_result(&result)?;
@@ -5586,6 +6195,7 @@ fn pi_route_aggregate_result(
         .max_by_key(|route| route.last_received_at.as_deref().unwrap_or(""));
     SourceVerificationResult {
         source: SourceKind::Pi,
+        config: empty_source_config(&SourceKind::Pi),
         status,
         verified: passed > 0,
         records_seen: route_results.iter().map(|route| route.records_seen).sum(),
@@ -5603,14 +6213,76 @@ fn pi_route_aggregate_result(
     }
 }
 
+fn config_drift_verification_result(
+    source: SourceKind,
+    config: SourceConfigState,
+    repair_requested: bool,
+) -> SourceVerificationResult {
+    let missing = !config.discovered
+        || config
+            .drift
+            .iter()
+            .any(|drift| drift.key.ends_with("config_file"));
+    let code = if repair_requested {
+        "config_drift_after_repair"
+    } else if missing {
+        "config_missing"
+    } else {
+        "config_drift"
+    };
+    let text = if repair_requested {
+        format!(
+            "{} telemetry config still does not match the active Ottto relay after repair.",
+            source_display_name(&source)
+        )
+    } else if missing {
+        format!(
+            "{} telemetry config is missing. Run `ottto verify --repair --app {}` or `ottto fix --app {}`.",
+            source_display_name(&source),
+            source_slug(&source),
+            source_slug(&source)
+        )
+    } else {
+        format!(
+            "{} telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app {}` or `ottto fix --app {}`.",
+            source_display_name(&source),
+            source_slug(&source),
+            source_slug(&source)
+        )
+    };
+    verification_result_with_config(
+        source,
+        config,
+        SourceVerificationStatus::Failed,
+        false,
+        0,
+        None,
+        None,
+        None,
+        code,
+        &text,
+    )
+}
+
 fn verification_result_for_backend_error(
     source: SourceKind,
     smoke_after: Option<String>,
     error: &LocalApiError,
 ) -> SourceVerificationResult {
+    let config = empty_source_config(&source);
+    verification_result_for_backend_error_with_config(source, config, smoke_after, error)
+}
+
+fn verification_result_for_backend_error_with_config(
+    source: SourceKind,
+    config: SourceConfigState,
+    smoke_after: Option<String>,
+    error: &LocalApiError,
+) -> SourceVerificationResult {
     if matches!(error, LocalApiError::SetupRunConnectionMissing) {
-        return verification_result(
+        return verification_result_with_config(
             source,
+            config,
             SourceVerificationStatus::ReconnectRequired,
             false,
             0,
@@ -5627,8 +6299,9 @@ fn verification_result_for_backend_error(
                 .body_excerpt
                 .as_deref()
                 .is_some_and(|body| body.to_ascii_lowercase().contains("expired"));
-            return verification_result(
+            return verification_result_with_config(
                 source,
+                config,
                 SourceVerificationStatus::ReconnectRequired,
                 false,
                 0,
@@ -5644,8 +6317,9 @@ fn verification_result_for_backend_error(
             );
         }
         if details.status == Some(404) {
-            return verification_result(
+            return verification_result_with_config(
                 source,
+                config,
                 SourceVerificationStatus::ReconnectRequired,
                 false,
                 0,
@@ -5657,8 +6331,9 @@ fn verification_result_for_backend_error(
             );
         }
         if details.kind == BackendErrorKind::Rejected {
-            return verification_result(
+            return verification_result_with_config(
                 source,
+                config,
                 SourceVerificationStatus::Failed,
                 false,
                 0,
@@ -5670,8 +6345,9 @@ fn verification_result_for_backend_error(
             );
         }
     }
-    verification_result(
+    verification_result_with_config(
         source,
+        config,
         SourceVerificationStatus::Failed,
         false,
         0,
@@ -5901,8 +6577,37 @@ fn verification_result(
     code: &str,
     text: &str,
 ) -> SourceVerificationResult {
+    let config = empty_source_config(&source);
+    verification_result_with_config(
+        source,
+        config,
+        status,
+        verified,
+        records_seen,
+        last_record_id,
+        last_received_at,
+        smoke_after,
+        code,
+        text,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verification_result_with_config(
+    source: SourceKind,
+    config: SourceConfigState,
+    status: SourceVerificationStatus,
+    verified: bool,
+    records_seen: u64,
+    last_record_id: Option<String>,
+    last_received_at: Option<String>,
+    smoke_after: Option<String>,
+    code: &str,
+    text: &str,
+) -> SourceVerificationResult {
     SourceVerificationResult {
         source,
+        config,
         status,
         verified,
         records_seen,
@@ -6001,6 +6706,27 @@ mod tests {
         ))
     }
 
+    fn control_test_root(name: &str) -> PathBuf {
+        let counter = TELEMETRY_KEY_STORE_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "ottto-control-{name}-{}-{}-{counter}",
+            std::process::id(),
+            current_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        create_control_test_dir(&root);
+        root
+    }
+
+    fn create_control_test_dir(path: &Path) {
+        fs::create_dir_all(path).expect("create control test dir");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("set control test dir permissions");
+        }
+    }
+
     fn fake_binary_path(root: &Path, name: &str) -> PathBuf {
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir).expect("fake bin dir");
@@ -6041,7 +6767,7 @@ mod tests {
             },
         );
 
-        assert!(response.ok);
+        assert!(response.ok, "{response:?}");
         assert_eq!(response.error, None);
         assert_eq!(
             response.payload.expect("payload").get("daemon"),
@@ -6555,7 +7281,7 @@ mod tests {
             },
         );
 
-        assert!(response.ok);
+        assert!(response.ok, "{response:?}");
         let payload = response.payload.expect("payload");
         assert_eq!(
             payload.get("cloud_credentials_untouched"),
@@ -7884,6 +8610,9 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
 
     #[test]
     fn source_patch_disabled_parses_per_source_truthy_values() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("patch env test lock");
         assert_eq!(source_patch_env_token(&SourceKind::Codex), Some("CODEX"));
         assert_eq!(
             source_patch_env_token(&SourceKind::ClaudeCode),
@@ -7900,12 +8629,395 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
 
     #[test]
     fn source_patch_disabled_ignores_falsey_values() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("patch env test lock");
         let _guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "false");
         assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
     }
 
     #[test]
+    fn codex_config_state_detects_clean_missing_wrong_and_invalid_without_writes() {
+        let root = control_test_root("codex-config-state");
+        fs::create_dir_all(&root).expect("create root");
+        let missing = root.join("missing.toml");
+        let default_base = crate::otlp_relay::default_local_relay_base_url();
+
+        let missing_state =
+            codex_config_state_at(&missing, "~/.codex/config.toml", &default_base, false);
+        assert!(!missing_state.discovered);
+        assert!(missing_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "codex.config_file"));
+
+        let invalid = root.join("invalid.toml");
+        fs::write(&invalid, "[otel\n").expect("write invalid config");
+        let invalid_body = fs::read_to_string(&invalid).expect("read invalid config");
+        let invalid_state =
+            codex_config_state_at(&invalid, "~/.codex/config.toml", &default_base, false);
+        assert!(invalid_state.discovered);
+        assert!(invalid_state
+            .fingerprint
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("sha256:"));
+        assert!(invalid_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "codex.config_toml"));
+        assert_eq!(
+            fs::read_to_string(&invalid).expect("read invalid again"),
+            invalid_body
+        );
+
+        let clean = root.join("clean.toml");
+        patch_codex_config_at_with_relay_base(&clean, &root.join("backups"), &default_base)
+            .expect("seed clean config");
+        let clean_body = fs::read_to_string(&clean).expect("read clean config");
+        let clean_state =
+            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
+        assert!(clean_state.discovered);
+        assert!(clean_state.drift.is_empty());
+        assert_eq!(
+            fs::read_to_string(&clean).expect("read clean again"),
+            clean_body
+        );
+
+        let fallback_base = "http://127.0.0.1:44621";
+        let wrong_relay_state =
+            codex_config_state_at(&clean, "~/.codex/config.toml", fallback_base, false);
+        assert!(wrong_relay_state
+            .drift
+            .iter()
+            .any(|drift| drift.key.ends_with(".endpoint")));
+
+        fs::write(
+            &clean,
+            clean_body.replace("protocol = \"binary\"", "protocol = \"grpc\""),
+        )
+        .expect("write wrong protocol");
+        let wrong_protocol_state =
+            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
+        assert!(wrong_protocol_state
+            .drift
+            .iter()
+            .any(|drift| drift.key.ends_with(".protocol")));
+
+        fs::write(
+            &clean,
+            clean_body.replace(
+                "\"X-Ottto-Local-Relay\" = \"codex\"",
+                "\"X-Ottto-Local-Relay\" = \"wrong\"",
+            ),
+        )
+        .expect("write wrong header");
+        let wrong_header_state =
+            codex_config_state_at(&clean, "~/.codex/config.toml", &default_base, false);
+        assert!(wrong_header_state
+            .drift
+            .iter()
+            .any(|drift| drift.key.ends_with(".headers.X-Ottto-Local-Relay")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_code_config_state_detects_settings_shape_without_env_fence_dependency() {
+        let root = control_test_root("claude-config-state");
+        fs::create_dir_all(&root).expect("create root");
+        let missing = root.join("settings-missing.json");
+        let default_base = crate::otlp_relay::default_local_relay_base_url();
+
+        let missing_state = claude_code_settings_config_state_at(
+            &missing,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            false,
+        );
+        assert!(!missing_state.discovered);
+        assert!(missing_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "claude_code.settings_file"));
+
+        let clean = root.join("settings.json");
+        patch_claude_code_settings_at_with_relay_base(
+            &clean,
+            &test_machine(),
+            &root.join("backups"),
+            &default_base,
+        )
+        .expect("seed clean settings");
+        let clean_body = fs::read_to_string(&clean).expect("read clean settings");
+        let clean_state = claude_code_settings_config_state_at(
+            &clean,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            false,
+        );
+        assert!(clean_state.discovered);
+        assert!(clean_state.drift.is_empty());
+        assert!(!root.join(".ottto/claude-telemetry.env").exists());
+        assert!(!root.join(".zshrc").exists());
+        assert_eq!(
+            fs::read_to_string(&clean).expect("read clean again"),
+            clean_body
+        );
+
+        let fallback_base = "http://127.0.0.1:44621";
+        let wrong_relay_state = claude_code_settings_config_state_at(
+            &clean,
+            "~/.claude/settings.json",
+            &test_machine(),
+            fallback_base,
+            false,
+        );
+        assert!(wrong_relay_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"));
+
+        let value: serde_json::Value = serde_json::from_str(&clean_body).expect("settings json");
+        let env = value.get("env").expect("env");
+        fs::write(&clean, serde_json::json!({ "env": env }).to_string())
+            .expect("write env-only settings");
+        let missing_statusline = claude_code_settings_config_state_at(
+            &clean,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            false,
+        );
+        assert!(missing_statusline
+            .drift
+            .iter()
+            .any(|drift| drift.key == "statusLine.command"));
+
+        fs::write(&clean, "{").expect("write invalid json");
+        let invalid_state = claude_code_settings_config_state_at(
+            &clean,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            false,
+        );
+        assert!(invalid_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "claude_code.settings_json"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_disabled_config_state_reports_no_drift_for_codex_and_claude() {
+        let root = control_test_root("patch-disabled-config-state");
+        fs::create_dir_all(&root).expect("create root");
+        let codex_path = root.join("config.toml");
+        let claude_path = root.join("settings.json");
+        fs::write(&codex_path, "[otel\n").expect("write invalid codex");
+        fs::write(&claude_path, "{").expect("write invalid claude");
+        let default_base = crate::otlp_relay::default_local_relay_base_url();
+
+        let codex = codex_config_state_at(&codex_path, "~/.codex/config.toml", &default_base, true);
+        let claude = claude_code_settings_config_state_at(
+            &claude_path,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            true,
+        );
+
+        assert!(codex.discovered);
+        assert!(codex.drift.is_empty());
+        assert!(claude.discovered);
+        assert!(claude.drift.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_repair_repairs_codex_config_before_account_check() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("home env test lock");
+        let root = control_test_root("verify-repair-codex");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let config_path = root.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[otel]
+log_user_prompt = true
+"#,
+        )
+        .expect("write drifted config");
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_verify_repair_codex".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: SourceKind::Codex,
+                    repair: true,
+                },
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let result: SourceVerificationResult =
+            serde_json::from_value(response.payload.expect("payload"))
+                .expect("verification result");
+        assert_eq!(result.message.code, "account_not_connected");
+        assert!(result.config.drift.is_empty());
+        let body = fs::read_to_string(&config_path).expect("read repaired config");
+        assert!(body.contains("http://127.0.0.1:43119/v1/logs"));
+        assert!(body.contains("protocol = \"binary\""));
+        assert!(body.contains("otel.log_user_prompt = false"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verify_patch_disabled_skips_repair_writes() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("patch env test lock");
+        let root = control_test_root("verify-patch-disabled");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
+        let config_path = root.join(".codex/config.toml");
+        let original = "[otel\n";
+        fs::write(&config_path, original).expect("write invalid config");
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_verify_patch_disabled".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: SourceKind::Codex,
+                    repair: true,
+                },
+            },
+        );
+
+        assert!(response.ok);
+        let result: SourceVerificationResult =
+            serde_json::from_value(response.payload.expect("payload"))
+                .expect("verification result");
+        assert_eq!(result.message.code, "patch_disabled");
+        assert!(result.config.drift.is_empty());
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            original
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fix_non_dry_run_executes_claude_write_config_repair() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("home env test lock");
+        let root = control_test_root("fix-claude-config");
+        create_control_test_dir(&root.join(".claude"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let settings_path = root.join(".claude/settings.json");
+        fs::write(&settings_path, r#"{"env":{"EXISTING":"keep"}}"#)
+            .expect("write drifted settings");
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_fix_claude".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Repair {
+                    source: SourceKind::ClaudeCode,
+                    dry_run: false,
+                },
+            },
+        );
+
+        assert!(response.ok);
+        let plan: RepairPlan =
+            serde_json::from_value(response.payload.expect("payload")).expect("repair plan");
+        assert_eq!(plan.status, RepairPlanStatus::Succeeded);
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].action, RepairActionKind::WriteConfig);
+        let state = claude_code_settings_config_state_at(
+            &settings_path,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &crate::otlp_relay::default_local_relay_base_url(),
+            false,
+        );
+        assert!(state.drift.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fix_patch_disabled_blocks_claude_repair_writes() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("patch env test lock");
+        let root = control_test_root("fix-disabled-claude");
+        create_control_test_dir(&root.join(".claude"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "1");
+        let settings_path = root.join(".claude/settings.json");
+        let original = r#"{"env":{"EXISTING":"keep"}}"#;
+        fs::write(&settings_path, original).expect("write settings");
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_fix_claude_disabled".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Repair {
+                    source: SourceKind::ClaudeCode,
+                    dry_run: false,
+                },
+            },
+        );
+
+        assert!(response.ok);
+        let plan: RepairPlan =
+            serde_json::from_value(response.payload.expect("payload")).expect("repair plan");
+        assert_eq!(plan.status, RepairPlanStatus::Blocked);
+        assert_eq!(plan.authority.message.code, "patch_disabled");
+        assert!(plan.actions.is_empty());
+        assert_eq!(
+            fs::read_to_string(&settings_path).expect("read settings"),
+            original
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn remove_claude_code_env_ignores_patch_disabled_env() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("patch env test lock");
         let root = std::env::temp_dir().join(format!(
             "ottto-claude-env-remove-disabled-test-{}-{}",
             std::process::id(),
@@ -8206,6 +9318,18 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
 
     #[test]
     fn verify_without_local_account_points_to_app_sign_in() {
+        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .expect("home env test lock");
+        let root = control_test_root("verify-no-account");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &root.join("support"),
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
         let daemon = daemon().with_connection(Some(LocalConnectionBinding {
             setup_run_id: "setup_stale".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -8217,6 +9341,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             &daemon,
             &RequestAuthorization::TrustedCompanionApp,
             SourceKind::Codex,
+            false,
         )
         .expect("verification should return actionable account state");
 
@@ -8224,6 +9349,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         assert!(!result.verified);
         assert_eq!(result.message.code, "account_not_connected");
         assert!(result.message.text.contains("Use Sign in in the Ottto app"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

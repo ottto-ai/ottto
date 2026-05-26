@@ -28,15 +28,18 @@ user. Do not treat the nonzero exit as a corrupt response.
 ```bash
 ottto apps status --app claude-code --json
 ottto verify --app claude-code --json
+ottto verify --repair --app claude-code --json
 ```
 
-If verification reports stale setup or browser approval needed, follow the JSON
-next action.
+Plain verify is read-only and reports `config.fingerprint` plus any config
+drift. Use `--repair` only when the JSON reports config drift; it repairs the
+daemon-owned WriteConfig action and re-checks config before telemetry smoke.
 
 ## Repair Codex
 
 ```bash
 ottto doctor --json
+ottto verify --repair --app codex --json
 ottto fix --app codex --json
 ottto verify --app codex --json
 ```

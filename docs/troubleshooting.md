@@ -44,6 +44,7 @@ For Claude Code:
 
 ```bash
 ottto doctor --json
+ottto verify --repair --app claude-code --json
 ottto fix --app claude-code --json
 ottto verify --app claude-code --json
 ```
@@ -52,12 +53,16 @@ For Codex:
 
 ```bash
 ottto doctor --json
+ottto verify --repair --app codex --json
 ottto fix --app codex --json
 ottto verify --app codex --json
 ```
 
-If repair JSON requires browser approval, do not edit config files directly.
-Present the browser/setup next action.
+Plain verify is read-only. `verify --repair` repairs only daemon-owned
+WriteConfig config drift, re-reads config, and runs telemetry smoke only after
+the config is clean. If repair JSON requires browser approval, or if verify
+returns `patch_disabled`, do not edit config files directly. Present the
+browser/setup next action or the patch-disabled fact.
 
 ## Local Relay Port Conflict
 
@@ -70,6 +75,7 @@ Run the app repair flow after a fallback bind so Codex or Claude Code settings
 are rewritten to the active endpoint:
 
 ```bash
+ottto verify --repair --app codex --json
 ottto fix --app codex --json
 ottto verify --app codex --json
 ```

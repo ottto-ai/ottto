@@ -760,6 +760,7 @@ pub struct LocalCollectorHealth {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceVerificationResult {
     pub source: SourceKind,
+    pub config: SourceConfigState,
     pub status: SourceVerificationStatus,
     pub verified: bool,
     pub records_seen: u64,
@@ -1375,6 +1376,8 @@ pub enum LocalControlCommand {
     },
     Verify {
         source: SourceKind,
+        #[serde(default)]
+        repair: bool,
     },
     RelayStart,
     RelayStop,
@@ -1713,6 +1716,50 @@ mod tests {
             local_only.command,
             LocalControlCommand::AuthReset { local_only: true }
         );
+    }
+
+    #[test]
+    fn verify_command_defaults_repair_to_false() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_verify_legacy",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "verify",
+            "source": "codex"
+        }))
+        .expect("legacy verify request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::Verify {
+                source: SourceKind::Codex,
+                repair: false,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_command_round_trips_repair_flags() {
+        for (repair, source) in [(false, SourceKind::Codex), (true, SourceKind::ClaudeCode)] {
+            let request = LocalControlRequest {
+                request_id: format!("req_verify_{repair}"),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: source.clone(),
+                    repair,
+                },
+            };
+            let value = serde_json::to_value(&request).expect("verify request serializes");
+            let parsed: LocalControlRequest =
+                serde_json::from_value(value).expect("verify request parses");
+            assert_eq!(
+                parsed.command,
+                LocalControlCommand::Verify { source, repair }
+            );
+        }
     }
 
     #[test]

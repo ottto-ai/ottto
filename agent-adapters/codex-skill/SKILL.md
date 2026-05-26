@@ -144,11 +144,13 @@ Verify an app through `ottto-service` and the setup-run/backend-token path:
 ottto verify --app codex --json
 ottto verify --app claude-code --json
 ottto verify --app pi --json
+ottto verify --repair --app codex --json
 ```
 
 If the app is missing, unsupported, stale, or waiting for browser approval,
-report the JSON status and next action. Do not hand-edit local app config as a
-shortcut.
+report the JSON status and next action. Plain verify is read-only and reports
+config drift. `verify --repair` is limited to daemon-owned WriteConfig repair
+for Codex and Claude Code; do not hand-edit local app config as a shortcut.
 
 ## Doctor And Fix
 

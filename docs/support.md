@@ -35,6 +35,7 @@ raw prompts, raw model output, or private repository links.
    ottto apps detect --json
    ottto apps status --app codex --json
    ottto verify --app codex --json
+   ottto verify --repair --app codex --json
    ```
 
 4. Use `doctor` before repair, and respect repair authority metadata:
@@ -44,9 +45,9 @@ raw prompts, raw model output, or private repository links.
    ottto fix --app codex --json
    ```
 
-   If JSON requires browser approval, do not edit local config directly. If a
-   setup-safe action allows terminal approval, confirm that it is tied to an
-   active setup-run binding before the user proceeds.
+   If JSON requires browser approval, do not edit local config directly.
+   `verify --repair` may repair only WriteConfig config drift and returns
+   `patch_disabled` without writing when patching is disabled by environment.
 
 ## Diagnostics
 

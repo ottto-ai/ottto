@@ -72,7 +72,7 @@ enum Command {
     #[command(about = "Apply daemon-approved repair for one app")]
     Fix(SourceArgs),
     #[command(about = "Verify one app and publish safe setup status")]
-    Verify(SourceArgs),
+    Verify(VerifyArgs),
     #[command(hide = true)]
     ClaudeCodeStatusline(JsonArgs),
     #[command(about = "Collect local-only or approved support diagnostics")]
@@ -183,6 +183,38 @@ struct SourceArgs {
 }
 
 impl SourceArgs {
+    fn selected_source(&self) -> SourceKind {
+        self.source
+            .or(self.app)
+            .expect("clap requires --source or --app")
+            .into()
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(
+        ArgGroup::new("source_selector")
+            .args(["source", "app"])
+            .required(true)
+            .multiple(false)
+    )
+)]
+struct VerifyArgs {
+    #[arg(long, value_enum, help = "Source to operate on")]
+    source: Option<SourceArg>,
+    #[arg(long, value_enum, help = "App to operate on")]
+    app: Option<SourceArg>,
+    #[arg(
+        long,
+        help = "Repair local telemetry config drift before running verification"
+    )]
+    repair: bool,
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+}
+
+impl VerifyArgs {
     fn selected_source(&self) -> SourceKind {
         self.source
             .or(self.app)
@@ -1026,6 +1058,7 @@ fn local_command(command: Command) -> LocalControlCommand {
         },
         Command::Verify(args) => LocalControlCommand::Verify {
             source: args.selected_source(),
+            repair: args.repair,
         },
         Command::Diagnostics {
             command: DiagnosticsCommand::Collect(args),
@@ -1065,7 +1098,8 @@ fn command_json(command: &Command) -> bool {
         Command::Doctor(args) | Command::Uninstall(args) | Command::Account(args) => args.json,
         Command::Setup(args) | Command::Login(args) => args.json,
         Command::Logout(args) => args.json,
-        Command::AgentStatus(args) | Command::Fix(args) | Command::Verify(args) => args.json,
+        Command::AgentStatus(args) | Command::Fix(args) => args.json,
+        Command::Verify(args) => args.json,
         Command::Diagnostics {
             command: DiagnosticsCommand::Collect(args),
         } => args.json,
@@ -1886,7 +1920,23 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Verify {
-                source: SourceKind::Codex
+                source: SourceKind::Codex,
+                repair: false
+            }
+        );
+    }
+
+    #[test]
+    fn verify_accepts_repair_flag() {
+        let cli = Cli::parse_from(["ottto", "verify", "--repair", "--app", "codex", "--json"]);
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::Verify {
+                source: SourceKind::Codex,
+                repair: true
             }
         );
     }

@@ -187,8 +187,9 @@ Options:
       --source <SOURCE>  Source to operate on [possible values: codex, claude-code, pi]
       --app <APP>        App to operate on [possible values: codex, claude-code, pi]
       --token <TOKEN>    Override the local-control token for CLI and agent requests
-      --json             Print one final JSON object and no human summary text
       --no-autostart     Do not kickstart the standard per-user ottto-service
+      --repair           Repair local telemetry config drift before running verification
+      --json             Print one final JSON object and no human summary text
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
 ### ottto diagnostics --help
