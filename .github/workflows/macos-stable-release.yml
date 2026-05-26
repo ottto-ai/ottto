@@ -261,6 +261,11 @@ jobs:
         with:
           name: ottto-macos-${{ inputs.channel }}-${{ inputs.version }}
           if-no-files-found: error
+          # These are manual-download build outputs only; CDN publication is separate
+          # and manual, so artifacts need only a short window to be fetched. Keep stable
+          # builds long enough for the operator to publish; expire throwaway candidates fast.
+          # Prevents the org's 0.5 GB free Actions/Packages storage from filling up.
+          retention-days: ${{ inputs.channel == 'stable' && 7 || 1 }}
           path: |
             dist/macos/Ottto-macos-*.dmg
             dist/macos/ottto-macos-*.zip
