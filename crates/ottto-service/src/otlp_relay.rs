@@ -744,8 +744,7 @@ mod tests {
     #[test]
     fn client_disconnect_during_write_recognises_routine_io_errors() {
         let broken_pipe: anyhow::Error =
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)")
-                .into();
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)").into();
         let connection_reset: anyhow::Error = std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "Connection reset by peer (os error 54)",
