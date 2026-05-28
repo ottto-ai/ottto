@@ -218,10 +218,70 @@ pub struct SourceHealth {
     pub agent_status: Option<AgentStatusSnapshot>,
     #[serde(default)]
     pub plan_observations: Vec<AgentStatusPlanObservation>,
+    /// Per-billing-destination usage detected from local session snapshots,
+    /// grouped by `(gateway_provider, plan_fingerprint, account_identifier_hash)`.
+    /// Populated by the daemon from the snapshot scan; the Companion renders
+    /// these in its "Detected Uses" panel. Empty when nothing has been
+    /// observed yet (the field is omitted from the wire in that case).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected_uses: Vec<DetectedUse>,
     pub last_seen_at: Option<Rfc3339Timestamp>,
     pub last_verified_at: Option<Rfc3339Timestamp>,
     pub problems: Vec<HealthProblem>,
     pub recommended_actions: Vec<RepairAction>,
+}
+
+/// One detected billing destination for a source, as observed from local
+/// session telemetry. The Companion keys rows on
+/// `[gateway_provider, plan_fingerprint ?? "", account_identifier_hash ?? ""]`
+/// (see `DetectedUse.id` in the Swift client), so that triple is the grouping
+/// key the daemon produces one entry per. Optionals use
+/// `skip_serializing_if = "Option::is_none"` to match the Swift lenient
+/// decoder, which tolerates absent keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedUse {
+    pub gateway_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub token_volume_recent: Vec<DetectedUseTokenSample>,
+    pub quota_window_state: DetectedUseQuotaWindowState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_used_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_resets_at: Option<Rfc3339Timestamp>,
+}
+
+/// One point in a `DetectedUse` token-volume sparkline: the bucket start time
+/// and the total tokens attributed to that destination within the bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedUseTokenSample {
+    pub at: Rfc3339Timestamp,
+    pub tokens: u64,
+}
+
+/// Live quota state for the destination that matches the source's current
+/// plan. Historical destinations stay `Unknown` (the daemon never smears the
+/// current plan's quota across destinations it does not belong to). Matches
+/// the Swift `DetectedUseQuotaWindowState` snake_case cases exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectedUseQuotaWindowState {
+    Ok,
+    NearLimit,
+    Exhausted,
+    RateLimited,
+    Stale,
+    Error,
+    Unsupported,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2071,5 +2131,104 @@ mod tests {
             .to_string()
             .contains("unsupported local control protocol_version 10"));
         assert!(error.to_string().contains("expected 11"));
+    }
+
+    #[test]
+    fn detected_use_serializes_to_swift_contract_keys() {
+        let detected = DetectedUse {
+            gateway_provider: "vertex".to_string(),
+            plan_fingerprint: Some("pro::20604".to_string()),
+            account_identifier_hash: Some("hash123".to_string()),
+            subscription_product: Some("pro".to_string()),
+            account_label: Some("Pro".to_string()),
+            last_seen_at: "2026-05-28T10:00:00Z".to_string(),
+            token_volume_recent: vec![DetectedUseTokenSample {
+                at: "2026-05-28T09:00:00Z".to_string(),
+                tokens: 4096,
+            }],
+            quota_window_state: DetectedUseQuotaWindowState::NearLimit,
+            quota_used_percent: Some(82),
+            quota_resets_at: Some("2026-06-01T00:00:00Z".to_string()),
+        };
+        let value = serde_json::to_value(&detected).expect("detected use serializes");
+        let object = value.as_object().expect("detected use is a JSON object");
+        // Every key the Swift `DetectedUse.CodingKeys` contract decodes, in
+        // snake_case. If any drifts the Companion panel silently empties.
+        let expected_keys = [
+            "gateway_provider",
+            "plan_fingerprint",
+            "account_identifier_hash",
+            "subscription_product",
+            "account_label",
+            "last_seen_at",
+            "token_volume_recent",
+            "quota_window_state",
+            "quota_used_percent",
+            "quota_resets_at",
+        ];
+        for key in expected_keys {
+            assert!(object.contains_key(key), "missing JSON key {key}");
+        }
+        assert_eq!(object.len(), expected_keys.len(), "unexpected extra keys");
+        assert_eq!(object["gateway_provider"], serde_json::json!("vertex"));
+        assert_eq!(
+            object["quota_window_state"],
+            serde_json::json!("near_limit")
+        );
+        assert_eq!(object["quota_used_percent"], serde_json::json!(82));
+        assert_eq!(
+            object["token_volume_recent"],
+            serde_json::json!([{"at": "2026-05-28T09:00:00Z", "tokens": 4096}])
+        );
+
+        let parsed: DetectedUse = serde_json::from_value(value).expect("round-trips");
+        assert_eq!(parsed, detected);
+    }
+
+    #[test]
+    fn detected_use_quota_window_state_uses_snake_case_slugs() {
+        for (variant, slug) in [
+            (DetectedUseQuotaWindowState::Ok, "ok"),
+            (DetectedUseQuotaWindowState::NearLimit, "near_limit"),
+            (DetectedUseQuotaWindowState::Exhausted, "exhausted"),
+            (DetectedUseQuotaWindowState::RateLimited, "rate_limited"),
+            (DetectedUseQuotaWindowState::Stale, "stale"),
+            (DetectedUseQuotaWindowState::Error, "error"),
+            (DetectedUseQuotaWindowState::Unsupported, "unsupported"),
+            (DetectedUseQuotaWindowState::Unknown, "unknown"),
+        ] {
+            let encoded = serde_json::to_string(&variant).expect("state serializes");
+            assert_eq!(encoded, format!("\"{slug}\""));
+            let decoded: DetectedUseQuotaWindowState =
+                serde_json::from_str(&encoded).expect("state deserializes");
+            assert_eq!(decoded, variant);
+        }
+    }
+
+    #[test]
+    fn detected_use_omits_none_optionals_and_empty_samples() {
+        let detected = DetectedUse {
+            gateway_provider: "anthropic".to_string(),
+            plan_fingerprint: None,
+            account_identifier_hash: None,
+            subscription_product: None,
+            account_label: None,
+            last_seen_at: "2026-05-28T10:00:00Z".to_string(),
+            token_volume_recent: Vec::new(),
+            quota_window_state: DetectedUseQuotaWindowState::Unknown,
+            quota_used_percent: None,
+            quota_resets_at: None,
+        };
+        let object = serde_json::to_value(&detected)
+            .expect("serializes")
+            .as_object()
+            .cloned()
+            .expect("object");
+        // Lenient-decoder contract: None optionals are omitted entirely; the
+        // required keys remain so the Swift decoder never falls back blindly.
+        assert!(!object.contains_key("plan_fingerprint"));
+        assert!(!object.contains_key("quota_used_percent"));
+        assert_eq!(object["token_volume_recent"], serde_json::json!([]));
+        assert_eq!(object["quota_window_state"], serde_json::json!("unknown"));
     }
 }

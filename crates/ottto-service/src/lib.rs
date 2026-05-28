@@ -4,6 +4,7 @@ pub mod agent_status;
 pub mod backfill;
 pub(crate) mod command_env;
 pub mod control;
+pub mod detected_uses;
 pub mod keychain;
 pub mod macos_service;
 pub mod otlp_relay;
@@ -16,18 +17,19 @@ pub mod unix_socket;
 pub mod xpc_mach;
 
 use ottto_core::{
-    default_connection_api_base_url, empty_status, launch_agent_path, launchd_target,
-    local_lifecycle_home_dir, FileConnectionStore, LocalConnectionBinding, RedactionPolicy,
-    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME,
-    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    default_connection_api_base_url, default_support_dir, empty_status, launch_agent_path,
+    launchd_target, local_lifecycle_home_dir, FileConnectionStore, LocalConnectionBinding,
+    RedactionPolicy, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 #[cfg(target_os = "macos")]
 use ottto_core::{ControlTokenStore, KeychainSecretStore};
 use ottto_protocol::{
-    AccountBindingState, AgentStatusSnapshot, AgentStatusState, AuthCompleteResponse,
-    AuthResetResponse, AuthStartResponse, CollectorDataSourceKind, CollectorDefaultState,
-    CollectorDescriptor, CollectorRiskClass, ConnectorMaturity, ConnectorReviewTier,
-    DaemonRuntimeState, DaemonStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    AccountBindingState, AgentQuotaWindow, AgentQuotaWindowFreshness, AgentQuotaWindowStatus,
+    AgentStatusSnapshot, AgentStatusState, AuthCompleteResponse, AuthResetResponse,
+    AuthStartResponse, CollectorDataSourceKind, CollectorDefaultState, CollectorDescriptor,
+    CollectorRiskClass, ConnectorMaturity, ConnectorReviewTier, DaemonRuntimeState, DaemonStatus,
+    DetectedUse, DetectedUseQuotaWindowState, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
     DiagnosticsSection, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
     DiagnosticsUploadStatus, EventStatus, HealthGrade, HealthProblem, LocalAccountBinding,
     LocalAccountState, LocalAccountUser, MachineIdentity, RedactedValue, RedactionCategory,
@@ -40,6 +42,7 @@ use ottto_protocol::{
     DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use thiserror::Error;
@@ -1193,6 +1196,7 @@ fn source_health_from_verification(
         }]
     };
 
+    let detected_uses = detected_uses_for_health(&result.source, agent_status.as_ref());
     SourceHealth {
         source: result.source.clone(),
         descriptor: source_descriptor(&result.source),
@@ -1207,6 +1211,7 @@ fn source_health_from_verification(
         collector: None,
         agent_status,
         plan_observations: Vec::new(),
+        detected_uses,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.verified {
             result.last_received_at.clone()
@@ -1302,6 +1307,7 @@ fn source_health_from_agent_status(
             }],
         ),
     };
+    let detected_uses = detected_uses_for_health(&snapshot.source, Some(&snapshot));
     SourceHealth {
         source: snapshot.source.clone(),
         descriptor: source_descriptor(&snapshot.source),
@@ -1321,6 +1327,7 @@ fn source_health_from_agent_status(
         collector: None,
         agent_status: Some(snapshot.clone()),
         plan_observations: snapshot.plan_observations.clone(),
+        detected_uses,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: if matches!(snapshot.status, AgentStatusState::Available) {
             Some(snapshot.captured_at)
@@ -1330,6 +1337,111 @@ fn source_health_from_agent_status(
         problems,
         recommended_actions: Vec::new(),
     }
+}
+
+/// Per-source detected-uses cache file:
+/// `<support_dir>/detected_uses/<source slug>.json`. Written by `snapshot_sync`
+/// after each scan, read here to attach to health.
+fn detected_uses_cache_path(support_dir: &Path, source: &SourceKind) -> PathBuf {
+    support_dir
+        .join("detected_uses")
+        .join(format!("{}.json", source_slug(source)))
+}
+
+/// Load the persisted detected uses for a source. A missing or unreadable cache
+/// yields an empty list (graceful empty — the panel shows nothing rather than
+/// erroring), as does a malformed file.
+fn load_detected_uses_for_source(source: &SourceKind) -> Vec<DetectedUse> {
+    let path = detected_uses_cache_path(&default_support_dir(), source);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Vec<DetectedUse>>(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Detected uses for a source's health, with live quota overlaid onto the
+/// destination matching the current account's plan when `agent_status` carries
+/// quota windows. Historical destinations keep `Unknown`/`None` quota.
+fn detected_uses_for_health(
+    source: &SourceKind,
+    agent_status: Option<&AgentStatusSnapshot>,
+) -> Vec<DetectedUse> {
+    let mut detected = load_detected_uses_for_source(source);
+    if let Some(snapshot) = agent_status {
+        merge_current_plan_quota(&mut detected, snapshot);
+    }
+    detected
+}
+
+/// Overlay the current plan's live quota onto the detected use whose
+/// `subscription_product` matches the account's plan. Other destinations are
+/// left at `Unknown`/`None`: smearing the current plan's quota across
+/// destinations it does not bill to would be misleading.
+fn merge_current_plan_quota(detected: &mut [DetectedUse], snapshot: &AgentStatusSnapshot) {
+    let Some(account) = snapshot.account.as_ref() else {
+        return;
+    };
+    let plan_keys: Vec<String> = [
+        account.plan_type.as_deref(),
+        account.subscription_product.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value.trim().to_ascii_lowercase())
+    .filter(|value| !value.is_empty())
+    .collect();
+    if plan_keys.is_empty() {
+        return;
+    }
+    let Some(window) = pick_quota_window(&snapshot.quota_windows) else {
+        return;
+    };
+    let (state, used_percent, resets_at) = quota_state_from_window(window);
+    for entry in detected.iter_mut() {
+        let matches_current = entry
+            .subscription_product
+            .as_deref()
+            .map(|product| plan_keys.contains(&product.trim().to_ascii_lowercase()))
+            .unwrap_or(false);
+        if matches_current {
+            entry.quota_window_state = state.clone();
+            entry.quota_used_percent = used_percent;
+            entry.quota_resets_at = resets_at.clone();
+        }
+    }
+}
+
+/// Pick the most constraining quota window: a rate-limited window first, then
+/// the highest used-percent. `None` when there are no windows.
+fn pick_quota_window(windows: &[AgentQuotaWindow]) -> Option<&AgentQuotaWindow> {
+    windows.iter().max_by_key(|window| {
+        let rate_limited = matches!(window.status, AgentQuotaWindowStatus::RateLimited);
+        (rate_limited, window.used_percent.unwrap_or(0))
+    })
+}
+
+/// Map a quota window to the Companion's detected-use quota state. A
+/// rate-limited or stale window maps directly; otherwise used-percent decides:
+/// `>= 100` exhausted, `>= 80` near limit, else ok. A window with no percent is
+/// `Unknown`.
+fn quota_state_from_window(
+    window: &AgentQuotaWindow,
+) -> (DetectedUseQuotaWindowState, Option<u8>, Option<String>) {
+    let stale = matches!(window.freshness, AgentQuotaWindowFreshness::Stale)
+        || matches!(window.status, AgentQuotaWindowStatus::Stale);
+    let state = if matches!(window.status, AgentQuotaWindowStatus::RateLimited) {
+        DetectedUseQuotaWindowState::RateLimited
+    } else if stale {
+        DetectedUseQuotaWindowState::Stale
+    } else {
+        match window.used_percent {
+            Some(percent) if percent >= 100 => DetectedUseQuotaWindowState::Exhausted,
+            Some(percent) if percent >= 80 => DetectedUseQuotaWindowState::NearLimit,
+            Some(_) => DetectedUseQuotaWindowState::Ok,
+            None => DetectedUseQuotaWindowState::Unknown,
+        }
+    };
+    (state, window.used_percent, window.resets_at.clone())
 }
 
 fn source_descriptor(source: &SourceKind) -> SourceDescriptor {
@@ -2154,6 +2266,134 @@ mod tests {
             .and_then(|candidate| candidate.items.get(key))
     }
 
+    #[test]
+    fn merge_current_plan_quota_only_touches_current_plan_destination() {
+        use ottto_protocol::{
+            AgentAccountStatus, AgentLoginState, AgentQuotaWindowScope,
+            AgentStatusCollectionMethod, AgentStatusConfidence, DetectedUseTokenSample,
+        };
+
+        // Two historical Codex destinations: the current Personal Pro plan and a
+        // Team plan billed elsewhere. Live agent status reports Pro near its
+        // limit. Only the Pro entry must receive quota; Team must stay
+        // Unknown/None (the current plan's quota is never smeared across
+        // destinations it does not bill to).
+        let mut detected = vec![
+            DetectedUse {
+                gateway_provider: "openai".to_string(),
+                plan_fingerprint: Some("pro::20598".to_string()),
+                account_identifier_hash: None,
+                subscription_product: Some("pro".to_string()),
+                account_label: Some("Pro".to_string()),
+                last_seen_at: "2026-05-28T10:00:00Z".to_string(),
+                token_volume_recent: vec![DetectedUseTokenSample {
+                    at: "2026-05-28T09:00:00Z".to_string(),
+                    tokens: 10,
+                }],
+                quota_window_state: DetectedUseQuotaWindowState::Unknown,
+                quota_used_percent: None,
+                quota_resets_at: None,
+            },
+            DetectedUse {
+                gateway_provider: "openai".to_string(),
+                plan_fingerprint: Some("team::20607".to_string()),
+                account_identifier_hash: None,
+                subscription_product: Some("team".to_string()),
+                account_label: Some("Team".to_string()),
+                last_seen_at: "2026-05-27T14:34:00Z".to_string(),
+                token_volume_recent: Vec::new(),
+                quota_window_state: DetectedUseQuotaWindowState::Unknown,
+                quota_used_percent: None,
+                quota_resets_at: None,
+            },
+        ];
+
+        let snapshot = AgentStatusSnapshot {
+            source: SourceKind::Codex,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::CliJson,
+            captured_at: "2026-05-28T10:00:00Z".to_string(),
+            expires_at: "2026-05-28T10:15:00Z".to_string(),
+            account: Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                provider: Some("openai".to_string()),
+                auth_method: Some("chatgpt".to_string()),
+                email: None,
+                account_id: None,
+                organization_id: None,
+                organization_label: None,
+                plan_type: Some("pro".to_string()),
+                subscription_product: Some("pro".to_string()),
+                billing_channel: None,
+                account_identifier_hash: None,
+                organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: None,
+                billing_identity_confidence: AgentStatusConfidence::High,
+                confidence: AgentStatusConfidence::High,
+            }),
+            model: None,
+            quota_windows: vec![
+                AgentQuotaWindow {
+                    name: "secondary".to_string(),
+                    scope: AgentQuotaWindowScope::Account,
+                    status: AgentQuotaWindowStatus::Ok,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: None,
+                    account_label: None,
+                    window_seconds: Some(604_800),
+                    started_at: None,
+                    resets_at: Some("2026-06-01T00:00:00Z".to_string()),
+                    quota: None,
+                    remaining: None,
+                    used_percent: Some(16),
+                    left_percent: Some(84),
+                },
+                AgentQuotaWindow {
+                    name: "primary".to_string(),
+                    scope: AgentQuotaWindowScope::Account,
+                    status: AgentQuotaWindowStatus::NearLimit,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: None,
+                    account_label: None,
+                    window_seconds: Some(18_000),
+                    started_at: None,
+                    resets_at: Some("2026-05-28T15:00:00Z".to_string()),
+                    quota: None,
+                    remaining: None,
+                    used_percent: Some(92),
+                    left_percent: Some(8),
+                },
+            ],
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        merge_current_plan_quota(&mut detected, &snapshot);
+
+        let pro = &detected[0];
+        assert_eq!(pro.subscription_product.as_deref(), Some("pro"));
+        // Most-constraining window (92%) wins → NearLimit, with its percent/reset.
+        assert_eq!(
+            pro.quota_window_state,
+            DetectedUseQuotaWindowState::NearLimit
+        );
+        assert_eq!(pro.quota_used_percent, Some(92));
+        assert_eq!(pro.quota_resets_at.as_deref(), Some("2026-05-28T15:00:00Z"));
+
+        let team = &detected[1];
+        assert_eq!(team.subscription_product.as_deref(), Some("team"));
+        assert_eq!(
+            team.quota_window_state,
+            DetectedUseQuotaWindowState::Unknown
+        );
+        assert_eq!(team.quota_used_percent, None);
+        assert_eq!(team.quota_resets_at, None);
+    }
+
     fn codex_health() -> SourceHealth {
         SourceHealth {
             source: SourceKind::Codex,
@@ -2174,6 +2414,7 @@ mod tests {
             collector: None,
             agent_status: None,
             plan_observations: Vec::new(),
+            detected_uses: Vec::new(),
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
             problems: Vec::new(),

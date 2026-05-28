@@ -3,18 +3,20 @@ use crate::backfill::{
     current_parser_version as backfill_current_parser_version, load_backfill_state,
     pending_backfill_sources, run_backfill, save_backfill_state,
 };
+use crate::detected_uses::{aggregate_detected_uses, merge_detected_uses};
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest, BatchRejected,
     SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
-    apply_upload_policy, scan_source_roots, ScanIndex, SnapshotBatchRequest, SnapshotSource,
-    SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    apply_upload_policy, scan_source_roots, ScanIndex, SnapshotBatchRequest, SnapshotItem,
+    SnapshotSource, SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
-use ottto_protocol::SourceKind;
+use ottto_protocol::{DetectedUse, SourceKind};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -306,6 +308,18 @@ fn sync_source(
 
     index.save(&index_path)?;
 
+    // Refresh the per-source detected-uses cache the daemon health assembly
+    // reads for the Companion's "Detected Uses" panel. The scan is incremental,
+    // so this cycle's snapshots are a delta; the cache merge preserves
+    // historical destinations. A failure here must never fail the sync, and the
+    // error is not logged verbatim because it can embed a local filesystem path.
+    if update_detected_uses_cache(support_dir, source, &scan_result.snapshots).is_err() {
+        eprintln!(
+            "local detected-uses cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
     if backfill_ran {
         backfill_state.completed_parser_versions.insert(
             source.api_slug().to_string(),
@@ -333,6 +347,45 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+/// Aggregate this cycle's snapshots into detected uses, merge them into the
+/// persisted per-source cache, and write it back atomically (temp + rename,
+/// like the backfill-state writer). The merge keeps historical destinations
+/// that this incremental cycle did not re-scan.
+fn update_detected_uses_cache(
+    support_dir: &Path,
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+) -> Result<()> {
+    let dir = support_dir.join("detected_uses");
+    let path = dir.join(format!("{}.json", source.api_slug()));
+    let merged = merge_detected_uses(
+        read_detected_uses_cache(&path),
+        aggregate_detected_uses(snapshots),
+    );
+
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create detected_uses dir {}", dir.display()))?;
+    let payload = serde_json::to_vec_pretty(&merged).context("serialize detected uses to JSON")?;
+    let temp_path = path.with_extension("json.tmp");
+    let mut temp = std::fs::File::create(&temp_path)
+        .with_context(|| format!("create detected_uses temp {}", temp_path.display()))?;
+    temp.write_all(&payload)
+        .with_context(|| format!("write detected_uses temp {}", temp_path.display()))?;
+    temp.sync_all().ok();
+    std::fs::rename(&temp_path, &path)
+        .with_context(|| format!("rename detected_uses cache into place {}", path.display()))?;
+    Ok(())
+}
+
+/// Read the persisted detected-uses cache, or an empty list when it is missing
+/// or unreadable (a fresh machine, or a malformed file we simply rebuild).
+fn read_detected_uses_cache(path: &Path) -> Vec<DetectedUse> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn upload_agent_status(
