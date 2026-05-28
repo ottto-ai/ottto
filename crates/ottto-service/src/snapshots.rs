@@ -13,11 +13,18 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
 pub const COLLECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v14";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v6";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v5";
-pub const BACKFILL_SOURCE_RETROACTIVE_V4: &str = "retroactive_v4";
+pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+// SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
+// cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
+// is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
+pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
+// Parser versions bumped together with the schema cutover so the on-disk scan
+// index treats every previously-scanned file as fresh and re-emits at the v6
+// shape; pending-backfill tracking re-runs the retroactive walk for the same
+// reason.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v15";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v7";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v6";
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 1_000;
 pub const BACKFILL_WINDOW_DAYS: u64 = 183;
 
@@ -73,25 +80,17 @@ pub struct SnapshotBatchRequest {
     pub snapshots: Vec<SnapshotItem>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PartitionKey {
-    pub gateway_provider: Option<String>,
-    pub plan_fingerprint: Option<String>,
-}
-
-impl PartitionKey {
-    pub fn is_default(&self) -> bool {
-        self.gateway_provider.is_none() && self.plan_fingerprint.is_none()
-    }
-
-    fn fingerprint_token(&self) -> String {
-        format!(
-            "{}|{}",
-            self.gateway_provider.as_deref().unwrap_or(""),
-            self.plan_fingerprint.as_deref().unwrap_or(""),
-        )
-    }
-}
+// Hoisted onto each SnapshotModelUsage row in v6: these participate in the
+// backend's billing_hash (one of the two row-key dimensions). Names match
+// `_usage_row_key` in backend/app/schemas/agent_session_snapshots.py.
+const ROW_BILLING_FIELDS: &[&str] = &[
+    "auth_mode",
+    "billing_channel",
+    "billing_provider",
+    "gateway_provider",
+    "model_provider",
+    "subscription_product",
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotItem {
@@ -108,7 +107,7 @@ pub struct SnapshotItem {
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
     pub model_usage: Vec<SnapshotModelUsage>,
-    pub activity_buckets: Vec<SnapshotActivityBucket>,
+    pub usage_buckets: Vec<SnapshotUsageBucket>,
     pub session_display_name: Option<String>,
     pub session_display_name_source: Option<String>,
     pub source_started_at: Option<String>,
@@ -122,23 +121,17 @@ pub struct SnapshotItem {
     pub workspace_label_source: Option<String>,
     pub source_file_fingerprint: Option<String>,
     pub provenance: SnapshotProvenance,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gateway_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan_fingerprint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backfill_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct SnapshotActivityBucket {
+pub struct SnapshotUsageBucket {
     pub bucket_start: String,
-    pub request_count: u64,
+    pub model_usage: Vec<SnapshotModelUsage>,
     pub first_activity_at: Option<String>,
     pub last_activity_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotModelUsage {
     pub model: String,
     pub input_tokens: u64,
@@ -152,6 +145,18 @@ pub struct SnapshotModelUsage {
     pub request_count: u64,
     pub selector_context: BTreeMap<String, String>,
     pub selector_sources: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,10 +168,6 @@ pub struct SnapshotProvenance {
     pub state_total_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_archived: Option<bool>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub partition_turn_counts: BTreeMap<String, u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parser_version: Option<String>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -245,8 +246,6 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     let fingerprint_payload = json!({
         "source": source.api_slug(),
         "source_session_id": &item.source_session_id,
-        "gateway_provider": &item.gateway_provider,
-        "plan_fingerprint": &item.plan_fingerprint,
         "input_tokens": item.input_tokens,
         "output_tokens": item.output_tokens,
         "cache_read_tokens": item.cache_read_tokens,
@@ -256,7 +255,7 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "unattributed_total_tokens": item.unattributed_total_tokens,
         "request_count": item.request_count,
         "model_usage": &item.model_usage,
-        "activity_buckets": &item.activity_buckets,
+        "usage_buckets": &item.usage_buckets,
         "title": &item.session_display_name,
         "title_source": &item.session_display_name_source,
         "workspace_display_label": &item.workspace_display_label,
@@ -355,29 +354,6 @@ impl SelectorCapture {
             self.sources.insert(field, source);
         }
     }
-
-    fn selector_hash(&self) -> String {
-        if self.context.is_empty() {
-            return "base".to_string();
-        }
-        let payload = serde_json::to_string(&self.context).unwrap_or_else(|_| "{}".to_string());
-        sha256_hex(&[payload.as_str()])[..16].to_string()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ModelSelectorUsage {
-    model: String,
-    selector_context: BTreeMap<String, String>,
-    selector_sources: BTreeMap<String, String>,
-    usage: UsageTotals,
-}
-
-#[derive(Debug, Clone)]
-struct ActivityBucketAccumulator {
-    request_count: u64,
-    first_activity_at: String,
-    last_activity_at: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -404,12 +380,55 @@ struct CodexStateThread {
     model: Option<String>,
 }
 
+// v6 row identity. Mirrors the backend's `_usage_row_key`
+// (model, selector_hash, billing_hash) tuple so daemon-side aggregation
+// dedupes the same rows the backend would have deduped on receipt. Without
+// this, two rows that differ only in plan_window_bucket would distinct on
+// the daemon, then collide on the backend (which strips plan_window_bucket
+// during normalization) and trip "duplicate model selector rows".
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey {
+    model: String,
+    selector_hash: String,
+    auth_mode: Option<String>,
+    billing_channel: Option<String>,
+    billing_provider: Option<String>,
+    gateway_provider: Option<String>,
+    model_provider: Option<String>,
+    subscription_product: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BucketRowAccumulator {
+    selector_context: BTreeMap<String, String>,
+    selector_sources: BTreeMap<String, String>,
+    usage: UsageTotals,
+}
+
 #[derive(Debug, Clone, Default)]
-struct PartitionState {
-    totals: UsageTotals,
-    model_usage: BTreeMap<(String, String), ModelSelectorUsage>,
-    activity_buckets: BTreeMap<String, ActivityBucketAccumulator>,
-    turn_count: u64,
+struct UsageBucketState {
+    rows: BTreeMap<RowKey, BucketRowAccumulator>,
+    first_activity_at: Option<String>,
+    last_activity_at: Option<String>,
+}
+
+impl UsageBucketState {
+    fn note_activity_at(&mut self, timestamp: &str) {
+        match self.first_activity_at.as_ref() {
+            Some(current) if timestamp < current.as_str() => {
+                self.first_activity_at = Some(timestamp.to_string())
+            }
+            None => self.first_activity_at = Some(timestamp.to_string()),
+            _ => {}
+        }
+        match self.last_activity_at.as_ref() {
+            Some(current) if timestamp > current.as_str() => {
+                self.last_activity_at = Some(timestamp.to_string())
+            }
+            None => self.last_activity_at = Some(timestamp.to_string()),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -425,9 +444,8 @@ struct SnapshotAccumulator {
     workspace_hash: Option<String>,
     latest_model: Option<String>,
     current_selector: SelectorCapture,
-    current_partition: PartitionKey,
     session_cumulative_usage: Option<UsageTotals>,
-    partitions: BTreeMap<PartitionKey, PartitionState>,
+    usage_buckets: BTreeMap<String, UsageBucketState>,
 }
 
 impl SnapshotAccumulator {
@@ -444,23 +462,18 @@ impl SnapshotAccumulator {
             workspace_hash: None,
             latest_model: None,
             current_selector: SelectorCapture::default(),
-            current_partition: PartitionKey::default(),
             session_cumulative_usage: None,
-            partitions: BTreeMap::new(),
+            usage_buckets: BTreeMap::new(),
         }
     }
 
     fn with_default_selector(source: SnapshotSource, selector: SelectorCapture) -> Self {
         let mut accumulator = Self::new(source);
-        // Default selector (e.g. Codex config defaults) feeds model_usage display
-        // context. Partition keys come from line selectors, so do not seed
-        // current_partition from defaults.
+        // Default selector (e.g. Codex config defaults) feeds the running
+        // display context for usage rows. Row keys are derived per-line
+        // from the merged selector at usage time.
         accumulator.current_selector = selector;
         accumulator
-    }
-
-    fn partition_mut(&mut self, key: &PartitionKey) -> &mut PartitionState {
-        self.partitions.entry(key.clone()).or_default()
     }
 
     fn note_time(&mut self, timestamp: Option<String>) {
@@ -483,41 +496,11 @@ impl SnapshotAccumulator {
         }
     }
 
-    fn note_activity(&mut self, timestamp: Option<String>, request_count: u64) {
-        if request_count == 0 {
-            return;
-        }
-        let Some(timestamp) = timestamp else {
-            return;
-        };
-        let Some((bucket_start, normalized_timestamp)) = activity_bucket_from_timestamp(&timestamp)
-        else {
-            return;
-        };
-        let partition_key = self.current_partition.clone();
-        let partition = self.partition_mut(&partition_key);
-        partition.turn_count = partition.turn_count.saturating_add(request_count);
-        match partition.activity_buckets.get_mut(&bucket_start) {
-            Some(bucket) => {
-                bucket.request_count += request_count;
-                if normalized_timestamp < bucket.first_activity_at {
-                    bucket.first_activity_at = normalized_timestamp.clone();
-                }
-                if normalized_timestamp > bucket.last_activity_at {
-                    bucket.last_activity_at = normalized_timestamp;
-                }
-            }
-            None => {
-                partition.activity_buckets.insert(
-                    bucket_start,
-                    ActivityBucketAccumulator {
-                        request_count,
-                        first_activity_at: normalized_timestamp.clone(),
-                        last_activity_at: normalized_timestamp,
-                    },
-                );
-            }
-        }
+    fn fallback_bucket_timestamp(&self, collected_at: Option<&str>) -> Option<String> {
+        self.last_activity_at
+            .clone()
+            .or_else(|| self.started_at.clone())
+            .or_else(|| collected_at.map(|value| value.to_string()))
     }
 
     fn set_title(&mut self, title: Option<String>, source: &str) {
@@ -581,9 +564,8 @@ impl SnapshotAccumulator {
         if selector.is_empty() {
             return;
         }
-        // current_selector is the running display-context for model_usage
-        // entries. Partition keys are derived per line in add_usage_* — never
-        // from this rolling merged view.
+        // Running display context for usage rows. Row keys are derived
+        // per-line from the merged selector inside add_usage_with_selector.
         self.current_selector.merge(selector);
     }
 
@@ -592,6 +574,7 @@ impl SnapshotAccumulator {
         model: Option<String>,
         usage: UsageTotals,
         selector: SelectorCapture,
+        timestamp: Option<&str>,
     ) {
         if usage.is_zero() {
             return;
@@ -600,42 +583,46 @@ impl SnapshotAccumulator {
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
         self.latest_model = Some(model.clone());
-        // Partition key comes from THIS LINE's selector only — never merged
-        // with prior turns'. A turn that omits gateway_provider lands in the
-        // default partition rather than inheriting the previous one.
-        let partition_key = partition_key_from_selector(&selector);
-        // Display context for model_usage is the merged view so config
-        // defaults (service_tier, mode) flow through.
+
+        // Resolve the hour to bucket into. Lines lacking a timestamp fall back
+        // to last-known activity; without that the usage is dropped to avoid
+        // synthesizing a misleading bucket.
+        let bucket_input = timestamp
+            .map(|value| value.to_string())
+            .or_else(|| self.fallback_bucket_timestamp(None));
+        let Some(bucket_input) = bucket_input else {
+            return;
+        };
+        let Some((bucket_start, normalized_timestamp)) =
+            activity_bucket_from_timestamp(&bucket_input)
+        else {
+            return;
+        };
+
         let mut merged = self.current_selector.clone();
         merged.merge(selector);
-        self.current_partition = partition_key.clone();
-        let partition = self.partition_mut(&partition_key);
-        partition.totals.add(&usage);
-        Self::add_model_usage_into(partition, model, merged, usage);
-    }
+        let (row_key, reduced_context, reduced_sources) = build_row_identity(&model, &merged);
 
-    fn add_model_usage_into(
-        partition: &mut PartitionState,
-        model: String,
-        selector: SelectorCapture,
-        usage: UsageTotals,
-    ) {
-        let selector_hash = selector.selector_hash();
-        let key = (model.clone(), selector_hash);
-        if let Some(entry) = partition.model_usage.get_mut(&key) {
-            entry.selector_sources.extend(selector.sources);
-            entry.usage.add(&usage);
-            return;
+        let bucket = self.usage_buckets.entry(bucket_start).or_default();
+        bucket.note_activity_at(&normalized_timestamp);
+        match bucket.rows.get_mut(&row_key) {
+            Some(row) => {
+                for (field, source) in reduced_sources {
+                    row.selector_sources.insert(field, source);
+                }
+                row.usage.add(&usage);
+            }
+            None => {
+                bucket.rows.insert(
+                    row_key,
+                    BucketRowAccumulator {
+                        selector_context: reduced_context,
+                        selector_sources: reduced_sources,
+                        usage,
+                    },
+                );
+            }
         }
-        partition.model_usage.insert(
-            key,
-            ModelSelectorUsage {
-                model,
-                selector_context: selector.context,
-                selector_sources: selector.sources,
-                usage,
-            },
-        );
     }
 
     fn set_cumulative_usage_with_selector(
@@ -643,41 +630,43 @@ impl SnapshotAccumulator {
         model: Option<String>,
         usage: UsageTotals,
         selector: SelectorCapture,
+        timestamp: Option<&str>,
+        // Override the delta's request_count when the upstream cumulative did
+        // not include an explicit request_count. The cumulative-derived delta
+        // would otherwise be 0 (since the cumulative request_count was
+        // synthetically defaulted to 1 by the parser), losing the per-event
+        // request count. v5 implemented this via a separate note_activity
+        // call; v6 folds it in here so the row totals reconcile.
+        implicit_request_count: Option<u64>,
     ) -> Option<UsageTotals> {
         if usage.is_zero() {
             return None;
         }
-        let model = model
+        let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        self.latest_model = Some(model.clone());
+        self.latest_model = Some(resolved_model.clone());
         // Codex (the only caller today) emits SESSION-wide cumulative totals.
-        // Track cumulative at the accumulator level so a mid-session partition
-        // change (e.g. plan_window_bucket rollover across the secondary reset)
-        // doesn't make the new partition swallow the entire prior cumulative
-        // as its first "delta".
-        let delta = match self.session_cumulative_usage.as_ref() {
+        // Detect rollover at the session level — a mid-session selector change
+        // (e.g. plan_window_bucket rollover) must not be treated as a restart.
+        let mut delta = match self.session_cumulative_usage.as_ref() {
             Some(previous) if usage.is_monotonic_after(previous) => usage.delta_from(previous),
             Some(_) => {
                 // Non-monotonic: treat as a session restart. Clear all
-                // partitions because the cumulative was invalidated.
-                self.partitions.clear();
+                // buckets because the cumulative was invalidated.
+                self.usage_buckets.clear();
                 usage.clone()
             }
             None => usage.clone(),
         };
         self.session_cumulative_usage = Some(usage.clone());
+        if let Some(count) = implicit_request_count {
+            delta.request_count = count;
+        }
         if delta.is_zero() {
             return None;
         }
-        // Partition for THIS delta comes from THIS LINE's selector only.
-        let partition_key = partition_key_from_selector(&selector);
-        let mut merged = self.current_selector.clone();
-        merged.merge(selector);
-        self.current_partition = partition_key.clone();
-        let partition = self.partition_mut(&partition_key);
-        partition.totals.add(&delta);
-        Self::add_model_usage_into(partition, model, merged, delta.clone());
+        self.add_usage_with_selector(Some(resolved_model), delta.clone(), selector, timestamp);
         Some(delta)
     }
 
@@ -713,131 +702,194 @@ impl SnapshotAccumulator {
             SnapshotSource::ClaudeCode => Some("uncached".to_string()),
             SnapshotSource::Pi => Some("uncached".to_string()),
         };
-        let parser_version = self.source.parser_version().to_string();
-        let partition_turn_counts: BTreeMap<String, u64> = self
-            .partitions
-            .iter()
-            .filter(|(_, state)| {
-                state.totals.total_tokens() > 0 || state.totals.reasoning_output_tokens > 0
-            })
-            .map(|(key, state)| (key.fingerprint_token(), state.turn_count))
-            .collect();
-        let mut items = Vec::new();
-        for (partition_key, partition) in self.partitions {
-            if partition.totals.total_tokens() == 0 && partition.totals.reasoning_output_tokens == 0
-            {
+        // Per-row session-wide aggregation (sum across all buckets keyed by
+        // RowKey). Drives the top-level model_usage list and the snapshot
+        // totals so the backend validator sees the two reconcile exactly.
+        let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
+        let mut usage_buckets: Vec<SnapshotUsageBucket> = Vec::new();
+        for (bucket_start, bucket) in self.usage_buckets {
+            if bucket.rows.is_empty() {
                 continue;
             }
-            let model_usage: Vec<SnapshotModelUsage> = partition
-                .model_usage
-                .into_values()
-                .map(|row| SnapshotModelUsage {
-                    model: row.model,
-                    input_tokens: row.usage.input_tokens,
-                    output_tokens: row.usage.output_tokens,
-                    cache_read_tokens: row.usage.cache_read_tokens,
-                    cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
-                    cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
-                    reasoning_output_tokens: row.usage.reasoning_output_tokens,
-                    unattributed_total_tokens: row.usage.unattributed_total_tokens,
-                    request_count: row.usage.request_count,
-                    selector_context: row.selector_context,
-                    selector_sources: row.selector_sources,
-                })
-                .collect();
-            let activity_buckets: Vec<SnapshotActivityBucket> = partition
-                .activity_buckets
-                .into_iter()
-                .map(|(bucket_start, bucket)| SnapshotActivityBucket {
-                    bucket_start,
-                    request_count: bucket.request_count,
-                    first_activity_at: Some(bucket.first_activity_at),
-                    last_activity_at: Some(bucket.last_activity_at),
-                })
-                .collect();
-            let activity_request_count: u64 = activity_buckets
-                .iter()
-                .map(|bucket| bucket.request_count)
-                .sum();
-            let request_count = if activity_request_count > 0 {
-                activity_request_count
-            } else {
-                partition.totals.request_count
-            };
-            let mut item = SnapshotItem {
-                source_session_id: source_session_id.clone(),
-                snapshot_fingerprint: String::new(),
-                status: "final".to_string(),
-                input_tokens: partition.totals.input_tokens,
-                output_tokens: partition.totals.output_tokens,
-                cache_read_tokens: partition.totals.cache_read_tokens,
-                cache_creation_5m_tokens: partition.totals.cache_creation_5m_tokens,
-                cache_creation_1h_tokens: partition.totals.cache_creation_1h_tokens,
-                reasoning_output_tokens: partition.totals.reasoning_output_tokens,
-                unattributed_total_tokens: partition.totals.unattributed_total_tokens,
-                request_count,
-                model_usage,
-                activity_buckets,
-                session_display_name: self.title.clone(),
-                session_display_name_source: self.title_source.clone(),
-                source_started_at: self.started_at.clone(),
-                source_ended_at: self.ended_at.clone(),
-                source_last_activity_at: self.last_activity_at.clone(),
-                collected_at: collected_at.to_string(),
-                workspace_hash: self.workspace_hash.clone(),
-                workspace_display_label: None,
-                workspace_label_source: None,
-                source_file_fingerprint: Some(source_file_fingerprint.clone()),
-                provenance: SnapshotProvenance {
-                    collector: collector.clone(),
-                    source_file_count: 1,
-                    input_token_scope: input_token_scope.clone(),
-                    state_total_tokens: None,
-                    state_archived: None,
-                    partition_turn_counts: partition_turn_counts.clone(),
-                    parser_version: Some(parser_version.clone()),
-                },
-                gateway_provider: partition_key.gateway_provider.clone(),
-                plan_fingerprint: partition_key.plan_fingerprint.clone(),
-                backfill_source: None,
-            };
-            item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
-            items.push(item);
+            let mut bucket_rows: Vec<SnapshotModelUsage> = Vec::new();
+            for (row_key, row) in bucket.rows {
+                bucket_rows.push(model_usage_from_row(&row_key, &row));
+                merge_session_row(&mut session_rows, row_key, row);
+            }
+            // Rows in BTreeMap are already RowKey-ordered; emit them so each
+            // bucket has at least one model_usage row (backend min_length=1).
+            usage_buckets.push(SnapshotUsageBucket {
+                bucket_start,
+                model_usage: bucket_rows,
+                first_activity_at: bucket.first_activity_at,
+                last_activity_at: bucket.last_activity_at,
+            });
         }
-        items
+        if session_rows.is_empty() {
+            return Vec::new();
+        }
+        let model_usage: Vec<SnapshotModelUsage> = session_rows
+            .iter()
+            .map(|(row_key, row)| model_usage_from_row(row_key, row))
+            .collect();
+        let mut totals = UsageTotals::default();
+        for row in session_rows.values() {
+            totals.add(&row.usage);
+        }
+        let mut item = SnapshotItem {
+            source_session_id: source_session_id.clone(),
+            snapshot_fingerprint: String::new(),
+            status: "final".to_string(),
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+            cache_read_tokens: totals.cache_read_tokens,
+            cache_creation_5m_tokens: totals.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
+            reasoning_output_tokens: totals.reasoning_output_tokens,
+            unattributed_total_tokens: totals.unattributed_total_tokens,
+            request_count: totals.request_count,
+            model_usage,
+            usage_buckets,
+            session_display_name: self.title.clone(),
+            session_display_name_source: self.title_source.clone(),
+            source_started_at: self.started_at.clone(),
+            source_ended_at: self.ended_at.clone(),
+            source_last_activity_at: self.last_activity_at.clone(),
+            collected_at: collected_at.to_string(),
+            workspace_hash: self.workspace_hash.clone(),
+            workspace_display_label: None,
+            workspace_label_source: None,
+            source_file_fingerprint: Some(source_file_fingerprint.clone()),
+            provenance: SnapshotProvenance {
+                collector: collector.clone(),
+                source_file_count: 1,
+                input_token_scope: input_token_scope.clone(),
+                state_total_tokens: None,
+                state_archived: None,
+            },
+        };
+        item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
+        vec![item]
     }
 }
 
-fn partition_key_from_selector(selector: &SelectorCapture) -> PartitionKey {
-    let gateway_provider = selector
-        .context
-        .get("gateway_provider")
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let subscription_product = selector
-        .context
-        .get("subscription_product")
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let plan_window_bucket = selector
-        .context
-        .get("plan_window_bucket")
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let plan_fingerprint = if subscription_product.is_some() || plan_window_bucket.is_some() {
-        Some(format!(
-            "{}::{}",
-            subscription_product.as_deref().unwrap_or(""),
-            plan_window_bucket.as_deref().unwrap_or(""),
-        ))
-    } else {
-        None
-    };
-    PartitionKey {
-        gateway_provider,
-        plan_fingerprint,
+fn merge_session_row(
+    session_rows: &mut BTreeMap<RowKey, BucketRowAccumulator>,
+    row_key: RowKey,
+    row: BucketRowAccumulator,
+) {
+    match session_rows.get_mut(&row_key) {
+        Some(existing) => {
+            for (field, source) in row.selector_sources {
+                existing.selector_sources.insert(field, source);
+            }
+            existing.usage.add(&row.usage);
+        }
+        None => {
+            session_rows.insert(row_key, row);
+        }
     }
 }
+
+fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> SnapshotModelUsage {
+    SnapshotModelUsage {
+        model: row_key.model.clone(),
+        input_tokens: row.usage.input_tokens,
+        output_tokens: row.usage.output_tokens,
+        cache_read_tokens: row.usage.cache_read_tokens,
+        cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
+        reasoning_output_tokens: row.usage.reasoning_output_tokens,
+        unattributed_total_tokens: row.usage.unattributed_total_tokens,
+        request_count: row.usage.request_count,
+        selector_context: row.selector_context.clone(),
+        selector_sources: row.selector_sources.clone(),
+        auth_mode: row_key.auth_mode.clone(),
+        billing_channel: row_key.billing_channel.clone(),
+        billing_provider: row_key.billing_provider.clone(),
+        gateway_provider: row_key.gateway_provider.clone(),
+        model_provider: row_key.model_provider.clone(),
+        subscription_product: row_key.subscription_product.clone(),
+    }
+}
+
+// Hoist the six billing fields out of selector_context into a RowKey, and
+// drop any non-allowlist keys (plan_window_bucket, agent_quota_*, etc.) that
+// the backend's normalize_selector_context would strip anyway. The remaining
+// reduced selector_context drives the row's selector_hash dimension.
+fn build_row_identity(
+    model: &str,
+    merged: &SelectorCapture,
+) -> (RowKey, BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut hoisted: BTreeMap<&'static str, Option<String>> = BTreeMap::new();
+    let mut reduced_context = BTreeMap::new();
+    let mut reduced_sources = BTreeMap::new();
+    for field in ROW_BILLING_FIELDS {
+        hoisted.insert(
+            *field,
+            merged
+                .context
+                .get(*field)
+                .filter(|value| !value.is_empty())
+                .cloned(),
+        );
+    }
+    for (key, value) in &merged.context {
+        if ROW_BILLING_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        if !SELECTOR_CONTEXT_ALLOWED.contains(&key.as_str()) {
+            continue;
+        }
+        reduced_context.insert(key.clone(), value.clone());
+    }
+    for (key, value) in &merged.sources {
+        if ROW_BILLING_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        if !SELECTOR_CONTEXT_ALLOWED.contains(&key.as_str()) {
+            continue;
+        }
+        reduced_sources.insert(key.clone(), value.clone());
+    }
+    let selector_hash = if reduced_context.is_empty() {
+        "base".to_string()
+    } else {
+        let payload = serde_json::to_string(&reduced_context).unwrap_or_else(|_| "{}".to_string());
+        sha256_hex(&[payload.as_str()])[..16].to_string()
+    };
+    let row_key = RowKey {
+        model: model.to_string(),
+        selector_hash,
+        auth_mode: hoisted.get("auth_mode").cloned().unwrap_or(None),
+        billing_channel: hoisted.get("billing_channel").cloned().unwrap_or(None),
+        billing_provider: hoisted.get("billing_provider").cloned().unwrap_or(None),
+        gateway_provider: hoisted.get("gateway_provider").cloned().unwrap_or(None),
+        model_provider: hoisted.get("model_provider").cloned().unwrap_or(None),
+        subscription_product: hoisted.get("subscription_product").cloned().unwrap_or(None),
+    };
+    (row_key, reduced_context, reduced_sources)
+}
+
+// Mirror of backend SELECTOR_FIELDS (selector_context.py). Daemon-side
+// reduction matches the backend's normalize_selector_context so two rows
+// that differ only in a key the backend would strip aren't emitted as
+// distinct rows here (which would trip "duplicate model selector rows" on
+// the backend bucket validator).
+const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
+    "service_tier",
+    "speed_mode",
+    "batch_mode",
+    "cache_ttl",
+    "region_mode",
+    "platform",
+    "context_bucket",
+    "mode",
+    "billing_channel",
+    "auth_mode",
+    "gateway_provider",
+    "subscription_product",
+];
 
 pub fn scan_source_roots(
     source: SnapshotSource,
@@ -968,7 +1020,7 @@ fn codex_state_only_snapshot(
         .title
         .clone()
         .and_then(|title| normalize_display_title(title, "session_index"));
-    let model_usage = vec![SnapshotModelUsage {
+    let row = SnapshotModelUsage {
         model,
         input_tokens: 0,
         output_tokens: 0,
@@ -980,7 +1032,35 @@ fn codex_state_only_snapshot(
         request_count: 0,
         selector_context: BTreeMap::new(),
         selector_sources: BTreeMap::new(),
-    }];
+        auth_mode: None,
+        billing_channel: None,
+        billing_provider: None,
+        gateway_provider: None,
+        model_provider: None,
+        subscription_product: None,
+    };
+    // v6 requires usage_buckets whenever the snapshot reports any usage.
+    // State-only snapshots have no per-line activity to bucket on, so we
+    // synthesize one bucket at the hour of the most recent state evidence
+    // (updated_at), falling back to created_at, then collected_at. If even
+    // that fails to parse, the snapshot is emitted without buckets — the
+    // backend will then reject it, but that's strictly better than crashing
+    // the daemon's snapshot scan.
+    let bucket_seed = thread
+        .updated_at
+        .clone()
+        .or_else(|| thread.created_at.clone())
+        .unwrap_or_else(|| collected_at.to_string());
+    let usage_buckets = match activity_bucket_from_timestamp(&bucket_seed) {
+        Some((bucket_start, normalized_timestamp)) => vec![SnapshotUsageBucket {
+            bucket_start,
+            model_usage: vec![row.clone()],
+            first_activity_at: Some(normalized_timestamp.clone()),
+            last_activity_at: Some(normalized_timestamp),
+        }],
+        None => Vec::new(),
+    };
+    let model_usage = vec![row];
     let has_display_name = display_name.is_some();
     let mut item = SnapshotItem {
         source_session_id: source_session_id.to_string(),
@@ -995,7 +1075,7 @@ fn codex_state_only_snapshot(
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
         model_usage,
-        activity_buckets: Vec::new(),
+        usage_buckets,
         session_display_name: display_name,
         session_display_name_source: has_display_name.then(|| "session_index".to_string()),
         source_started_at: thread.created_at.clone(),
@@ -1012,12 +1092,7 @@ fn codex_state_only_snapshot(
             input_token_scope: Some("total_only".to_string()),
             state_total_tokens: Some(thread.tokens_used),
             state_archived: Some(thread.archived),
-            partition_turn_counts: BTreeMap::new(),
-            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
         },
-        gateway_provider: None,
-        plan_fingerprint: None,
-        backfill_source: None,
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
@@ -1519,22 +1594,26 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
     if let Some(usage) = codex_total_usage(value) {
-        let has_explicit_request_count = codex_total_usage_has_request_count(value);
-        if let Some(delta) = accumulator.set_cumulative_usage_with_selector(
+        // Codex cumulative totals carry request_count as a session-wide count.
+        // When the field is missing the parser defaults it to 1 so deltas
+        // would yield 0 requests. Track the implicit case and override the
+        // delta's request_count to 1 so the bucket row reflects "one turn
+        // observed at this hour" — matching v5's note_activity behavior.
+        let implicit_request_count = if codex_total_usage_has_request_count(value) {
+            None
+        } else {
+            Some(1)
+        };
+        accumulator.set_cumulative_usage_with_selector(
             string_at(value, &["token_count", "info", "model"])
                 .or_else(|| string_at(value, &["payload", "info", "model"]))
                 .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
             selector,
-        ) {
-            let activity_request_count = if has_explicit_request_count {
-                delta.request_count
-            } else {
-                1
-            };
-            accumulator.note_activity(timestamp, activity_request_count);
-        }
+            timestamp.as_deref(),
+            implicit_request_count,
+        );
     }
 }
 
@@ -1684,15 +1763,14 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["workspace"])),
     );
     if let Some(usage) = claude_code_delta_usage(value) {
-        let request_count = usage.request_count;
         accumulator.add_usage_with_selector(
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
             claude_code_selector_from_line(value),
+            timestamp.as_deref(),
         );
-        accumulator.note_activity(timestamp, request_count);
     }
 }
 
@@ -1777,11 +1855,14 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             let model = string_at(value, &["message", "model"]);
             accumulator.set_model(model.clone());
             if let Some(usage) = pi_message_end_usage(value) {
-                let request_count = usage.request_count;
                 let mut selector = accumulator.current_selector.clone();
                 selector.merge(pi_selector_from_message_end(value));
-                accumulator.add_usage_with_selector(model, usage, selector);
-                accumulator.note_activity(timestamp.clone(), request_count);
+                accumulator.add_usage_with_selector(
+                    model,
+                    usage,
+                    selector,
+                    timestamp.as_deref(),
+                );
             }
             accumulator.note_time(timestamp);
         }
@@ -2849,15 +2930,13 @@ mod tests {
         assert_eq!(item.output_tokens, 25);
         assert_eq!(item.reasoning_output_tokens, 7);
         assert_eq!(item.request_count, 3);
-        assert_eq!(
-            item.activity_buckets,
-            vec![SnapshotActivityBucket {
-                bucket_start: "2026-05-06T10:00:00Z".to_string(),
-                request_count: 3,
-                first_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
-                last_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
-            }]
-        );
+        assert_eq!(item.usage_buckets.len(), 1);
+        let bucket = &item.usage_buckets[0];
+        assert_eq!(bucket.bucket_start, "2026-05-06T10:00:00Z");
+        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(bucket.model_usage.len(), 1);
+        assert_eq!(bucket.model_usage[0].request_count, 3);
         assert_eq!(item.model_usage[0].model, "gpt-5.5");
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
@@ -2892,23 +2971,15 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(item.request_count, 2);
-        assert_eq!(
-            item.activity_buckets,
-            vec![
-                SnapshotActivityBucket {
-                    bucket_start: "2026-05-06T10:00:00Z".to_string(),
-                    request_count: 1,
-                    first_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
-                    last_activity_at: Some("2026-05-06T10:03:00Z".to_string()),
-                },
-                SnapshotActivityBucket {
-                    bucket_start: "2026-05-06T11:00:00Z".to_string(),
-                    request_count: 1,
-                    first_activity_at: Some("2026-05-06T11:04:00Z".to_string()),
-                    last_activity_at: Some("2026-05-06T11:04:00Z".to_string()),
-                },
-            ]
-        );
+        assert_eq!(item.usage_buckets.len(), 2);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
+        assert_eq!(item.usage_buckets[0].first_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(item.usage_buckets[0].last_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(item.usage_buckets[0].model_usage[0].request_count, 1);
+        assert_eq!(item.usage_buckets[1].bucket_start, "2026-05-06T11:00:00Z");
+        assert_eq!(item.usage_buckets[1].first_activity_at.as_deref(), Some("2026-05-06T11:04:00Z"));
+        assert_eq!(item.usage_buckets[1].last_activity_at.as_deref(), Some("2026-05-06T11:04:00Z"));
+        assert_eq!(item.usage_buckets[1].model_usage[0].request_count, 1);
 
         let _ = fs::remove_file(path);
     }
@@ -3423,15 +3494,14 @@ mod tests {
         assert_eq!(item.input_tokens, 300);
         assert_eq!(item.output_tokens, 90);
         assert_eq!(item.request_count, 2);
-        assert_eq!(
-            item.activity_buckets,
-            vec![SnapshotActivityBucket {
-                bucket_start: "2026-05-19T10:00:00Z".to_string(),
-                request_count: 2,
-                first_activity_at: Some("2026-05-19T10:02:00Z".to_string()),
-                last_activity_at: Some("2026-05-19T10:03:00Z".to_string()),
-            }]
-        );
+        assert_eq!(item.usage_buckets.len(), 1);
+        let bucket = &item.usage_buckets[0];
+        assert_eq!(bucket.bucket_start, "2026-05-19T10:00:00Z");
+        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-19T10:02:00Z"));
+        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-19T10:03:00Z"));
+        // Two distinct service_tier rows aggregate within the same hour.
+        let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
+        assert_eq!(bucket_request_count, 2);
         assert_eq!(item.model_usage.len(), 2);
         let standard = item
             .model_usage
@@ -3698,15 +3768,13 @@ mod tests {
         assert_eq!(item.cache_creation_1h_tokens, 0);
         assert_eq!(item.output_tokens, 14);
         assert_eq!(item.request_count, 2);
-        assert_eq!(
-            item.activity_buckets,
-            vec![SnapshotActivityBucket {
-                bucket_start: "2026-05-06T10:00:00Z".to_string(),
-                request_count: 2,
-                first_activity_at: Some("2026-05-06T10:01:00Z".to_string()),
-                last_activity_at: Some("2026-05-06T10:02:00Z".to_string()),
-            }]
-        );
+        assert_eq!(item.usage_buckets.len(), 1);
+        let bucket = &item.usage_buckets[0];
+        assert_eq!(bucket.bucket_start, "2026-05-06T10:00:00Z");
+        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-06T10:01:00Z"));
+        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-06T10:02:00Z"));
+        let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
+        assert_eq!(bucket_request_count, 2);
         assert_eq!(item.model_usage[0].model, "claude-sonnet-4-6");
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
@@ -3717,7 +3785,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_activity_count_includes_zero_token_usage_events() {
+    fn claude_code_zero_token_usage_events_drop_from_buckets() {
         let path = temp_file("claude-zero-token-activity");
         fs::write(
             &path,
@@ -3738,22 +3806,23 @@ mod tests {
         .next()
         .expect("snapshot");
 
-        assert_eq!(item.request_count, 2);
+        // v6 couples usage and activity into the same bucket-row aggregation;
+        // a token-less event with no usage has nothing to attribute to the
+        // hour, so the second event drops out entirely. v5 would have
+        // counted it in activity_buckets but never in model_usage.
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
         assert_eq!(
-            item.activity_buckets,
-            vec![SnapshotActivityBucket {
-                bucket_start: "2026-05-06T10:00:00Z".to_string(),
-                request_count: 2,
-                first_activity_at: Some("2026-05-06T10:01:00Z".to_string()),
-                last_activity_at: Some("2026-05-06T10:02:00Z".to_string()),
-            }]
+            item.usage_buckets[0].first_activity_at.as_deref(),
+            Some("2026-05-06T10:01:00Z")
         );
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn claude_code_parser_builds_distinct_hourly_activity_buckets() {
+    fn claude_code_parser_builds_distinct_hourly_usage_buckets() {
         let path = temp_file("claude-activity-buckets");
         fs::write(
             &path,
@@ -3774,23 +3843,19 @@ mod tests {
         .next()
         .expect("snapshot");
 
+        assert_eq!(item.usage_buckets.len(), 2);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
         assert_eq!(
-            item.activity_buckets,
-            vec![
-                SnapshotActivityBucket {
-                    bucket_start: "2026-05-06T10:00:00Z".to_string(),
-                    request_count: 1,
-                    first_activity_at: Some("2026-05-06T10:59:59Z".to_string()),
-                    last_activity_at: Some("2026-05-06T10:59:59Z".to_string()),
-                },
-                SnapshotActivityBucket {
-                    bucket_start: "2026-05-06T11:00:00Z".to_string(),
-                    request_count: 1,
-                    first_activity_at: Some("2026-05-06T11:00:01Z".to_string()),
-                    last_activity_at: Some("2026-05-06T11:00:01Z".to_string()),
-                },
-            ]
+            item.usage_buckets[0].first_activity_at.as_deref(),
+            Some("2026-05-06T10:59:59Z")
         );
+        assert_eq!(item.usage_buckets[0].model_usage[0].request_count, 1);
+        assert_eq!(item.usage_buckets[1].bucket_start, "2026-05-06T11:00:00Z");
+        assert_eq!(
+            item.usage_buckets[1].first_activity_at.as_deref(),
+            Some("2026-05-06T11:00:01Z")
+        );
+        assert_eq!(item.usage_buckets[1].model_usage[0].request_count, 1);
 
         let _ = fs::remove_file(path);
     }
@@ -3974,8 +4039,13 @@ mod tests {
         assert_eq!(item.cache_creation_5m_tokens, 5);
         assert_eq!(item.cache_creation_1h_tokens, 0);
         assert_eq!(item.request_count, 2);
-        assert_eq!(item.activity_buckets.len(), 1);
-        assert_eq!(item.activity_buckets[0].request_count, 2);
+        assert_eq!(item.usage_buckets.len(), 1);
+        let bucket_request_count: u64 = item.usage_buckets[0]
+            .model_usage
+            .iter()
+            .map(|r| r.request_count)
+            .sum();
+        assert_eq!(bucket_request_count, 2);
         assert_eq!(item.model_usage.len(), 1);
         assert_eq!(item.model_usage[0].model, "gemini-2.5-pro");
         assert_eq!(item.model_usage[0].input_tokens, 150);
@@ -4091,21 +4161,14 @@ mod tests {
             "vertex-fingerprint".to_string(),
         )
         .expect("parse");
-        assert_eq!(items.len(), 1, "single partition for pure vertex session");
+        assert_eq!(items.len(), 1, "single row for pure vertex session");
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.gateway_provider.as_deref(), Some("vertex"));
-        assert!(item.plan_fingerprint.is_none());
+        // gateway_provider / model_provider now live on the model_usage row.
+        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("vertex"));
+        assert_eq!(item.model_usage[0].model_provider.as_deref(), Some("anthropic"));
+        assert!(item.model_usage[0].subscription_product.is_none());
         assert_eq!(item.input_tokens, 16);
         assert_eq!(item.output_tokens, 11);
-        let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("gateway_provider").map(String::as_str),
-            Some("vertex")
-        );
-        assert_eq!(
-            selector.get("model_provider").map(String::as_str),
-            Some("anthropic")
-        );
 
         let _ = fs::remove_file(path);
     }
@@ -4130,16 +4193,8 @@ mod tests {
         .expect("parse");
         assert_eq!(items.len(), 1);
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.gateway_provider.as_deref(), Some("bedrock"));
-        let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("gateway_provider").map(String::as_str),
-            Some("bedrock")
-        );
-        assert_eq!(
-            selector.get("model_provider").map(String::as_str),
-            Some("anthropic")
-        );
+        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("bedrock"));
+        assert_eq!(item.model_usage[0].model_provider.as_deref(), Some("anthropic"));
 
         let _ = fs::remove_file(path);
     }
@@ -4163,17 +4218,17 @@ mod tests {
         )
         .expect("parse");
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.gateway_provider.as_deref(), Some("anthropic"));
+        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("anthropic"));
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn claude_code_parser_splits_mixed_provider_session_into_distinct_snapshots() {
+    fn claude_code_parser_splits_mixed_provider_session_into_distinct_rows() {
         // A single Claude Code JSONL that interleaves Vertex (`msg_vrtx_*`) and
-        // first-party Anthropic (`msg_01*`) turns. The accumulator emits one
-        // snapshot per gateway_provider so each maps to its own billing
-        // identity downstream.
+        // first-party Anthropic (`msg_01*`) turns. v6 emits ONE Item per
+        // session with one model_usage row per gateway_provider so each maps
+        // to its own billing identity downstream.
         let path = temp_file("claude-mixed-provider");
         fs::write(
             &path,
@@ -4191,36 +4246,42 @@ mod tests {
             "mixed-fingerprint".to_string(),
         )
         .expect("parse");
-        assert_eq!(items.len(), 2, "one snapshot per gateway provider");
-        let mut gateways: Vec<Option<String>> =
-            items.iter().map(|s| s.gateway_provider.clone()).collect();
+        assert_eq!(items.len(), 1, "v6 emits one item per session");
+        let item = &items[0];
+        assert_eq!(item.model_usage.len(), 2);
+        let mut gateways: Vec<Option<String>> = item
+            .model_usage
+            .iter()
+            .map(|row| row.gateway_provider.clone())
+            .collect();
         gateways.sort();
         assert_eq!(
             gateways,
-            vec![Some("anthropic".to_string()), Some("vertex".to_string()),]
+            vec![Some("anthropic".to_string()), Some("vertex".to_string())]
         );
-        let vertex = items
+        let vertex = item
+            .model_usage
             .iter()
-            .find(|s| s.gateway_provider.as_deref() == Some("vertex"))
-            .expect("vertex partition");
-        let anthropic = items
+            .find(|row| row.gateway_provider.as_deref() == Some("vertex"))
+            .expect("vertex row");
+        let anthropic = item
+            .model_usage
             .iter()
-            .find(|s| s.gateway_provider.as_deref() == Some("anthropic"))
-            .expect("anthropic partition");
+            .find(|row| row.gateway_provider.as_deref() == Some("anthropic"))
+            .expect("anthropic row");
         assert_eq!(vertex.input_tokens, 10);
         assert_eq!(vertex.output_tokens, 5);
         assert_eq!(anthropic.input_tokens, 4);
         assert_eq!(anthropic.output_tokens, 3);
-        assert_ne!(vertex.snapshot_fingerprint, anthropic.snapshot_fingerprint);
-        // Both fingerprints land under the same source_session_id so the
-        // upstream UPSERT keeps them distinct by (session, gateway, plan).
-        assert_eq!(vertex.source_session_id, anthropic.source_session_id);
+        // Item totals reconcile with the row sum.
+        assert_eq!(item.input_tokens, 14);
+        assert_eq!(item.output_tokens, 8);
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn codex_parser_extracts_pro_plan_fingerprint_from_rate_limits() {
+    fn codex_parser_extracts_pro_subscription_product_from_rate_limits() {
         let path = temp_file("codex-pro-plan");
         // Pro plan fixture mirrors rons's empirical 2026-05-21 personal session.
         fs::write(
@@ -4236,46 +4297,24 @@ mod tests {
             parse_codex_jsonl_file(&path, "2026-05-21T10:05:00Z", "pro-fingerprint".to_string())
                 .expect("parse");
         let item = items.into_iter().next().expect("snapshot");
-        assert!(item.plan_fingerprint.is_some());
-        // bucket = 1780206326 / 86400 = 20604
-        assert_eq!(item.plan_fingerprint.as_deref(), Some("pro::20604"));
-        let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("subscription_product").map(String::as_str),
-            Some("pro")
-        );
-        assert_eq!(
-            selector.get("plan_window_bucket").map(String::as_str),
-            Some("20604")
-        );
-        assert_eq!(
-            selector.get("model_provider").map(String::as_str),
-            Some("openai")
-        );
-        assert_eq!(
-            selector
-                .get("agent_quota_primary_used_percent")
-                .map(String::as_str),
-            Some("35.5")
-        );
-        assert_eq!(
-            selector
-                .get("agent_quota_secondary_resets_at")
-                .map(String::as_str),
-            Some("1780206326")
-        );
-        assert_eq!(
-            selector
-                .get("agent_quota_credits_has_credits")
-                .map(String::as_str),
-            Some("true")
-        );
+        // v6: subscription_product / model_provider are hoisted onto the row.
+        // plan_window_bucket and agent_quota_* are stripped (not in backend's
+        // SELECTOR_FIELDS allowlist, so backend would drop them on receipt).
+        assert_eq!(item.model_usage.len(), 1);
+        let row = &item.model_usage[0];
+        assert_eq!(row.subscription_product.as_deref(), Some("pro"));
+        assert_eq!(row.model_provider.as_deref(), Some("openai"));
+        assert!(!row.selector_context.contains_key("subscription_product"));
+        assert!(!row.selector_context.contains_key("plan_window_bucket"));
+        assert!(!row
+            .selector_context
+            .contains_key("agent_quota_primary_used_percent"));
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn codex_parser_extracts_team_plan_fingerprint_distinct_from_pro() {
+    fn codex_parser_extracts_team_subscription_product_distinct_from_pro() {
         let path = temp_file("codex-team-plan");
         // Team plan fixture mirrors rons's empirical 2026-05-27 Singular session.
         fs::write(
@@ -4294,27 +4333,16 @@ mod tests {
         )
         .expect("parse");
         let item = items.into_iter().next().expect("snapshot");
-        // bucket = 1780484936 / 86400 = 20607
-        assert_eq!(item.plan_fingerprint.as_deref(), Some("team::20607"));
-        let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("subscription_product").map(String::as_str),
-            Some("team")
-        );
-        assert_eq!(
-            selector.get("plan_window_bucket").map(String::as_str),
-            Some("20607")
-        );
+        assert_eq!(item.model_usage[0].subscription_product.as_deref(), Some("team"));
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn codex_pro_and_team_fingerprints_route_to_distinct_snapshots() {
-        // Sanity check: pro and team plans produce distinct plan_fingerprints
-        // and would, if interleaved in the same session, produce distinct
-        // partitions. We parse two separate files and confirm their
-        // fingerprints don't collide.
+    fn codex_pro_and_team_subscription_products_produce_distinct_fingerprints() {
+        // Sanity check: pro and team plans produce distinct row-level
+        // subscription_product values and distinct snapshot fingerprints
+        // across two separate sessions.
         let pro_path = temp_file("codex-pro-vs-team-1");
         let team_path = temp_file("codex-pro-vs-team-2");
         fs::write(
@@ -4338,7 +4366,8 @@ mod tests {
             .into_iter()
             .next()
             .expect("team snapshot");
-        assert_ne!(pro_item.plan_fingerprint, team_item.plan_fingerprint);
+        assert_eq!(pro_item.model_usage[0].subscription_product.as_deref(), Some("pro"));
+        assert_eq!(team_item.model_usage[0].subscription_product.as_deref(), Some("team"));
         assert_ne!(
             pro_item.snapshot_fingerprint,
             team_item.snapshot_fingerprint
@@ -4349,9 +4378,9 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_emits_one_snapshot_per_gateway_in_multi_provider_session() {
+    fn pi_parser_emits_one_row_per_gateway_in_multi_provider_session() {
         // Pi can route per-turn to different providers within a single
-        // session. The accumulator must produce one snapshot per gateway.
+        // session. v6 emits ONE Item with one model_usage row per gateway.
         let path = temp_file("pi-multi-provider");
         fs::write(
             &path,
@@ -4370,10 +4399,14 @@ mod tests {
             "pi-multi-fingerprint".to_string(),
         )
         .expect("parse");
-        assert_eq!(items.len(), 3, "one snapshot per per-turn gateway provider");
-        let mut gateways: Vec<Option<String>> = items
+        assert_eq!(items.len(), 1, "v6 collapses to one item per session");
+        let item = &items[0];
+        assert_eq!(item.source_session_id, "pi-multi");
+        assert_eq!(item.model_usage.len(), 3);
+        let mut gateways: Vec<Option<String>> = item
+            .model_usage
             .iter()
-            .map(|item| item.gateway_provider.clone())
+            .map(|row| row.gateway_provider.clone())
             .collect();
         gateways.sort();
         assert_eq!(
@@ -4384,55 +4417,8 @@ mod tests {
                 Some("openai".to_string()),
             ]
         );
-        for item in &items {
-            assert!(item.plan_fingerprint.is_none());
-            assert_eq!(item.source_session_id, "pi-multi");
-        }
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn snapshot_provenance_records_partition_turn_counts() {
-        let path = temp_file("partition-turn-counts");
-        fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-05-27T14:00:00Z\",\"sessionId\":\"turn-counts\",\"summary\":\"mixed\"}\n",
-                "{\"timestamp\":\"2026-05-27T14:01:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_vrtx_a\",\"message\":{\"id\":\"msg_vrtx_a\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
-                "{\"timestamp\":\"2026-05-27T14:02:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_vrtx_b\",\"message\":{\"id\":\"msg_vrtx_b\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
-                "{\"timestamp\":\"2026-05-27T14:03:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_011\",\"message\":{\"id\":\"msg_01a\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n"
-            ),
-        )
-        .expect("write fixture");
-
-        let items = parse_claude_code_jsonl_file(
-            &path,
-            "2026-05-27T14:05:00Z",
-            "turn-counts-fp".to_string(),
-        )
-        .expect("parse");
-        assert_eq!(items.len(), 2);
-        let turn_counts = &items[0].provenance.partition_turn_counts;
-        // Both items share the same partition_turn_counts because it is a
-        // session-wide manifest. The two recorded entries should be vertex (2)
-        // and anthropic (1).
-        assert_eq!(turn_counts.len(), 2);
-        let vertex_count = turn_counts
-            .iter()
-            .find(|(key, _)| key.starts_with("vertex|"))
-            .map(|(_, value)| *value);
-        let anthropic_count = turn_counts
-            .iter()
-            .find(|(key, _)| key.starts_with("anthropic|"))
-            .map(|(_, value)| *value);
-        assert_eq!(vertex_count, Some(2));
-        assert_eq!(anthropic_count, Some(1));
-        for item in &items {
-            assert_eq!(
-                item.provenance.parser_version.as_deref(),
-                Some(CLAUDE_CODE_SNAPSHOT_PARSER_VERSION)
-            );
+        for row in &item.model_usage {
+            assert!(row.subscription_product.is_none());
         }
 
         let _ = fs::remove_file(path);
@@ -4468,40 +4454,13 @@ mod tests {
     }
 
     #[test]
-    fn partition_key_from_selector_uses_plan_type_and_window_bucket() {
-        let mut selector = SelectorCapture::default();
-        insert_selector_raw(
-            &mut selector,
-            "subscription_product",
-            "test.source",
-            &serde_json::Value::String("pro".to_string()),
-        );
-        insert_selector_raw(
-            &mut selector,
-            "plan_window_bucket",
-            "test.source",
-            &serde_json::Value::Number(20604.into()),
-        );
-        insert_selector_raw(
-            &mut selector,
-            "gateway_provider",
-            "test.source",
-            &serde_json::Value::String("openai".to_string()),
-        );
-        let key = partition_key_from_selector(&selector);
-        assert_eq!(key.gateway_provider.as_deref(), Some("openai"));
-        assert_eq!(key.plan_fingerprint.as_deref(), Some("pro::20604"));
-    }
-
-    #[test]
-    fn codex_cumulative_split_across_plan_window_rollover_attributes_delta_only() {
+    fn codex_cumulative_split_across_plan_window_rollover_buckets_correctly() {
         // Regression: a single Codex session that crosses a `secondary.resets_at`
-        // day-boundary must not let the new plan_window_bucket partition
-        // swallow the entire prior cumulative as its first "delta". The first
-        // event has cumulative 100/40; the second event (same plan, same
-        // session) has cumulative 130/55 but `secondary.resets_at` ticks over
-        // to the next 86_400-second bucket. Expected: pro::20603 has 100/40,
-        // pro::20604 has 30/15. Wrong (pre-fix): pro::20604 would have 130/55.
+        // day-boundary must not double-count the cumulative. Cumulative
+        // 100/40 → 130/55 is monotonic, so no session restart; the delta is
+        // 30/15. In v6 the two deltas land in two hour buckets (23:00 and
+        // 00:00) under the same RowKey (plan_window_bucket is stripped, so
+        // the row identity collapses). Top-level totals: 130/55.
         let path = temp_file("codex-rollover");
         fs::write(
             &path,
@@ -4519,35 +4478,41 @@ mod tests {
             "rollover-fingerprint".to_string(),
         )
         .expect("parse");
-        // bucket 20603 = floor(1780123199 / 86400), bucket 20604 = floor(1780209599 / 86400)
-        let first = items
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        // Top-level totals match the latest cumulative.
+        assert_eq!(item.input_tokens, 130);
+        assert_eq!(item.output_tokens, 55);
+        // Two hour buckets, each with the right per-hour delta.
+        assert_eq!(item.usage_buckets.len(), 2);
+        let pre = item
+            .usage_buckets
             .iter()
-            .find(|s| s.plan_fingerprint.as_deref() == Some("pro::20603"))
-            .expect("pre-rollover partition");
-        let second = items
+            .find(|b| b.bucket_start == "2026-05-31T23:00:00Z")
+            .expect("pre-rollover bucket");
+        let post = item
+            .usage_buckets
             .iter()
-            .find(|s| s.plan_fingerprint.as_deref() == Some("pro::20604"))
-            .expect("post-rollover partition");
+            .find(|b| b.bucket_start == "2026-06-01T00:00:00Z")
+            .expect("post-rollover bucket");
+        assert_eq!(pre.model_usage[0].input_tokens, 100);
+        assert_eq!(pre.model_usage[0].output_tokens, 40);
         assert_eq!(
-            first.input_tokens, 100,
-            "pre-rollover keeps first cumulative"
+            post.model_usage[0].input_tokens, 30,
+            "post-rollover gets only the delta"
         );
-        assert_eq!(first.output_tokens, 40);
-        assert_eq!(
-            second.input_tokens, 30,
-            "post-rollover gets only the delta, not the full cumulative"
-        );
-        assert_eq!(second.output_tokens, 15);
+        assert_eq!(post.model_usage[0].output_tokens, 15);
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn pi_partition_inherits_only_when_line_lacks_gateway_provider() {
+    fn pi_unlabeled_turn_lands_in_distinct_row_from_labeled_turn() {
         // Regression: a Pi turn that omits gatewayProvider must NOT inherit
-        // the gateway_provider key from a prior labeled turn into the
-        // partition key. The unlabeled turn lands in the default (None)
-        // partition rather than mis-attributing to anthropic.
+        // the gateway_provider key from a prior labeled turn into its row
+        // identity. The unlabeled turn becomes a row with gateway_provider=None
+        // rather than mis-attributing to anthropic. Pi message_end events
+        // don't update current_selector, so each line's gateway is line-local.
         let path = temp_file("pi-partition-isolation");
         fs::write(
             &path,
@@ -4562,35 +4527,24 @@ mod tests {
         let items =
             parse_pi_jsonl_file(&path, "2026-05-20T09:05:00Z", "iso-fingerprint".to_string())
                 .expect("parse");
-        let labeled = items
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.model_usage.len(), 2);
+        let labeled = item
+            .model_usage
             .iter()
-            .find(|s| s.gateway_provider.as_deref() == Some("anthropic"))
-            .expect("anthropic partition");
-        let unlabeled = items.iter().find(|s| s.gateway_provider.is_none());
+            .find(|row| row.gateway_provider.as_deref() == Some("anthropic"))
+            .expect("anthropic row");
+        let unlabeled = item
+            .model_usage
+            .iter()
+            .find(|row| row.gateway_provider.is_none())
+            .expect("unlabeled row");
         assert_eq!(labeled.input_tokens, 10);
         assert_eq!(labeled.output_tokens, 5);
-        assert!(
-            unlabeled.is_some(),
-            "unlabeled turn lands in default partition, not anthropic"
-        );
-        let unlabeled = unlabeled.unwrap();
         assert_eq!(unlabeled.input_tokens, 7);
         assert_eq!(unlabeled.output_tokens, 3);
 
         let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn partition_key_omits_plan_fingerprint_when_neither_subscription_nor_bucket_present() {
-        let mut selector = SelectorCapture::default();
-        insert_selector_raw(
-            &mut selector,
-            "gateway_provider",
-            "test.source",
-            &serde_json::Value::String("vertex".to_string()),
-        );
-        let key = partition_key_from_selector(&selector);
-        assert_eq!(key.gateway_provider.as_deref(), Some("vertex"));
-        assert!(key.plan_fingerprint.is_none());
     }
 }

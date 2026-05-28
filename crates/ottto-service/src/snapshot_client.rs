@@ -146,13 +146,26 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
     ) -> Result<SnapshotBatchResponse> {
-        ureq::post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
+        let response = ureq::post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-            .map_err(|error| anyhow!("upload snapshot batch failed: {error}"))?
-            .into_json()
-            .map_err(|error| anyhow!("parse snapshot batch response failed: {error}"))
+            .send_json(request);
+        match response {
+            Ok(ok) => ok
+                .into_json()
+                .map_err(|error| anyhow!("parse snapshot batch response failed: {error}")),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                // Temporary diagnostic: surface backend validation detail when
+                // a batch is rejected. Truncated so it doesn't dwarf the err log.
+                let snippet: String = body.chars().take(2000).collect();
+                eprintln!(
+                    "ottto-service-diagnostic: batch upload {code} body={snippet}"
+                );
+                Err(anyhow!("upload snapshot batch failed: HTTP {code}"))
+            }
+            Err(other) => Err(anyhow!("upload snapshot batch failed: {other}")),
+        }
     }
 
     pub fn report_status(

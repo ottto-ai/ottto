@@ -3,9 +3,9 @@
 //! When `CLAUDE_CODE_SNAPSHOT_PARSER_VERSION`, `CODEX_SNAPSHOT_PARSER_VERSION`,
 //! or `PI_SNAPSHOT_PARSER_VERSION` advances, the daemon owes a one-shot walk of
 //! every historical JSONL on disk so the upstream service can relabel existing
-//! sessions with the new attribution (gateway provider, plan fingerprint).
-//! Output snapshots are stamped with `backfill_source = "retroactive_v4"` and
-//! the upstream UPSERT is keyed by `snapshot_fingerprint`.
+//! sessions with the new attribution (gateway provider, plan fingerprint). The
+//! upstream UPSERT keys on `snapshot_fingerprint`, so re-runs on partial
+//! failure are idempotent.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshots::{
-    scan_source_roots, ScanIndex, SnapshotItem, SnapshotSource, BACKFILL_SOURCE_RETROACTIVE_V4,
+    scan_source_roots, ScanIndex, SnapshotItem, SnapshotSource,
     CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SNAPSHOT_PARSER_VERSION,
 };
 
@@ -110,11 +110,10 @@ pub fn pending_backfill_sources(state: &BackfillState) -> Vec<SnapshotSource> {
     .collect()
 }
 
-/// Walks historical JSONLs for every source that needs reconciliation. Each
-/// returned snapshot is stamped with the canonical retroactive backfill tag
-/// (`backfill_source="retroactive_v4"`) so the upstream service can UPSERT by
-/// `snapshot_fingerprint`. This function does not write anything — caller is
-/// responsible for routing snapshots through the existing sync channel.
+/// Walks historical JSONLs for every source that needs reconciliation. Backend
+/// UPSERTs by `snapshot_fingerprint` so re-runs on partial failure are
+/// idempotent. This function does not write anything — caller is responsible
+/// for routing snapshots through the existing sync channel.
 pub fn run_backfill(
     home_dir: &Path,
     pending: &[SnapshotSource],
@@ -143,10 +142,7 @@ pub fn run_backfill(
                 report.pi_snapshot_count = result.snapshots.len() as u64;
             }
         }
-        for mut item in result.snapshots {
-            item.backfill_source = Some(BACKFILL_SOURCE_RETROACTIVE_V4.to_string());
-            snapshots.push(item);
-        }
+        snapshots.extend(result.snapshots);
     }
     Ok((snapshots, report))
 }
@@ -163,11 +159,10 @@ pub struct LoggingBackfillSink;
 impl BackfillNotificationSink for LoggingBackfillSink {
     fn notify_completed(&self, report: &BackfillReport) {
         eprintln!(
-            "ottto-service: retroactive backfill complete — {} claude_code, {} codex, {} pi snapshots stamped {}",
+            "ottto-service: retroactive backfill complete — {} claude_code, {} codex, {} pi snapshots",
             report.claude_code_snapshot_count,
             report.codex_snapshot_count,
             report.pi_snapshot_count,
-            BACKFILL_SOURCE_RETROACTIVE_V4,
         );
     }
 }

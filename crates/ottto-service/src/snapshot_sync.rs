@@ -10,7 +10,7 @@ use crate::snapshot_client::{
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots, ScanIndex, SnapshotBatchRequest, SnapshotSource,
     SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
@@ -350,7 +350,7 @@ fn report_status(
             ),
         };
     let request = SnapshotStatusRequest {
-        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
         source: status.source.api_slug().to_string(),
         machine_id: status.machine_id.to_string(),
         enabled,
