@@ -82,7 +82,7 @@ pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()
     Ok(())
 }
 
-fn current_parser_version(source: SnapshotSource) -> &'static str {
+pub fn current_parser_version(source: SnapshotSource) -> &'static str {
     match source {
         SnapshotSource::Codex => CODEX_SNAPSHOT_PARSER_VERSION,
         SnapshotSource::ClaudeCode => CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,

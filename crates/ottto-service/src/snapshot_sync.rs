@@ -1,4 +1,8 @@
 use crate::agent_status::collect_agent_status;
+use crate::backfill::{
+    current_parser_version as backfill_current_parser_version, load_backfill_state,
+    pending_backfill_sources, run_backfill, save_backfill_state,
+};
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest, SnapshotApiClient,
     SnapshotStatusRequest,
@@ -192,6 +196,32 @@ fn sync_source(
         }
     };
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+
+    // Retroactive backfill: if this source's parser version bumped since the
+    // last successful backfill, walk every historical JSONL once and append
+    // those snapshots to the live-scan batch. The existing chunked upload
+    // path handles them via the same relay_token + retry semantics. The
+    // backend UPSERTs by snapshot_fingerprint so re-runs on partial failure
+    // are idempotent. State is persisted only after this iteration's upload
+    // succeeds (see `save_backfill_state` below).
+    let mut backfill_state = load_backfill_state(support_dir);
+    let backfill_ran = pending_backfill_sources(&backfill_state).contains(&source);
+    if backfill_ran {
+        match run_backfill(home, &[source], &scan_started_at) {
+            Ok((mut backfill_snapshots, _report)) => {
+                apply_upload_policy(source, &mut backfill_snapshots, upload_policy);
+                scan_result.snapshots.extend(backfill_snapshots);
+            }
+            Err(error) => {
+                eprintln!(
+                    "local snapshot backfill skipped for {}: {}",
+                    source.api_slug(),
+                    safe_error(&error)
+                );
+            }
+        }
+    }
+
     let mut accepted = 0;
 
     for chunk in scan_result.snapshots.chunks(SNAPSHOT_BATCH_LIMIT) {
@@ -244,6 +274,22 @@ fn sync_source(
     }
 
     index.save(&index_path)?;
+
+    if backfill_ran {
+        backfill_state.completed_parser_versions.insert(
+            source.api_slug().to_string(),
+            backfill_current_parser_version(source).to_string(),
+        );
+        backfill_state.last_completed_at = Some(scan_started_at.clone());
+        if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
+            eprintln!(
+                "local snapshot backfill state save failed for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+        }
+    }
+
     report_status(
         client,
         &relay_token,
