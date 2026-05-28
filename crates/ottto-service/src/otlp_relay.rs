@@ -103,7 +103,15 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
                     let client_daemon = daemon.clone();
                     thread::spawn(move || {
                         if let Err(error) = handle_client(stream, source, client_daemon) {
-                            eprintln!("local OTLP relay request failed: {error}");
+                            // BrokenPipe / ConnectionReset are routine when the
+                            // upstream agent (Codex / Claude Code) times out
+                            // before we finish writing the response — drop
+                            // those silently so we don't fill the daemon log
+                            // with one line per disconnected client. Everything
+                            // else still surfaces.
+                            if !client_disconnect_during_write(&error) {
+                                eprintln!("local OTLP relay request failed: {error}");
+                            }
                         }
                     });
                 }
@@ -696,6 +704,22 @@ fn current_rfc3339() -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// Walk the anyhow chain looking for an `io::Error` that's the routine
+/// "client went away mid-write" pattern. Used to decide whether to bother
+/// logging a relay failure — these happen any time an OTLP client times
+/// out and closes the socket before we finish writing the response.
+fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io_error| {
+            matches!(
+                io_error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,6 +739,34 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 16);
+    }
+
+    #[test]
+    fn client_disconnect_during_write_recognises_routine_io_errors() {
+        let broken_pipe: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Broken pipe (os error 32)").into();
+        let connection_reset: anyhow::Error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "Connection reset by peer (os error 54)",
+        )
+        .into();
+        // Wrap to mimic the way anyhow nests errors when callers add context.
+        let wrapped: anyhow::Error = anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ))
+        .context("write response");
+
+        assert!(client_disconnect_during_write(&broken_pipe));
+        assert!(client_disconnect_during_write(&connection_reset));
+        assert!(client_disconnect_during_write(&wrapped));
+
+        // Other I/O errors and non-I/O errors must still surface.
+        let timed_out: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into();
+        let plain = anyhow::anyhow!("relay device binding is missing");
+        assert!(!client_disconnect_during_write(&timed_out));
+        assert!(!client_disconnect_during_write(&plain));
     }
 
     #[test]
