@@ -14,9 +14,10 @@ use toml_edit::{DocumentMut, Item};
 
 pub const COLLECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 5;
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v13";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v5";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v4";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v14";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v6";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v5";
+pub const BACKFILL_SOURCE_RETROACTIVE_V4: &str = "retroactive_v4";
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 1_000;
 pub const BACKFILL_WINDOW_DAYS: u64 = 183;
 
@@ -72,6 +73,26 @@ pub struct SnapshotBatchRequest {
     pub snapshots: Vec<SnapshotItem>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PartitionKey {
+    pub gateway_provider: Option<String>,
+    pub plan_fingerprint: Option<String>,
+}
+
+impl PartitionKey {
+    pub fn is_default(&self) -> bool {
+        self.gateway_provider.is_none() && self.plan_fingerprint.is_none()
+    }
+
+    fn fingerprint_token(&self) -> String {
+        format!(
+            "{}|{}",
+            self.gateway_provider.as_deref().unwrap_or(""),
+            self.plan_fingerprint.as_deref().unwrap_or(""),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotItem {
     pub source_session_id: String,
@@ -101,6 +122,12 @@ pub struct SnapshotItem {
     pub workspace_label_source: Option<String>,
     pub source_file_fingerprint: Option<String>,
     pub provenance: SnapshotProvenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -136,6 +163,10 @@ pub struct SnapshotProvenance {
     pub state_total_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_archived: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub partition_turn_counts: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -214,6 +245,8 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     let fingerprint_payload = json!({
         "source": source.api_slug(),
         "source_session_id": &item.source_session_id,
+        "gateway_provider": &item.gateway_provider,
+        "plan_fingerprint": &item.plan_fingerprint,
         "input_tokens": item.input_tokens,
         "output_tokens": item.output_tokens,
         "cache_read_tokens": item.cache_read_tokens,
@@ -371,6 +404,14 @@ struct CodexStateThread {
     model: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PartitionState {
+    totals: UsageTotals,
+    model_usage: BTreeMap<(String, String), ModelSelectorUsage>,
+    activity_buckets: BTreeMap<String, ActivityBucketAccumulator>,
+    turn_count: u64,
+}
+
 #[derive(Debug, Clone)]
 struct SnapshotAccumulator {
     source: SnapshotSource,
@@ -384,10 +425,9 @@ struct SnapshotAccumulator {
     workspace_hash: Option<String>,
     latest_model: Option<String>,
     current_selector: SelectorCapture,
-    latest_cumulative_usage: Option<UsageTotals>,
-    totals: UsageTotals,
-    model_usage: BTreeMap<(String, String), ModelSelectorUsage>,
-    activity_buckets: BTreeMap<String, ActivityBucketAccumulator>,
+    current_partition: PartitionKey,
+    session_cumulative_usage: Option<UsageTotals>,
+    partitions: BTreeMap<PartitionKey, PartitionState>,
 }
 
 impl SnapshotAccumulator {
@@ -404,17 +444,23 @@ impl SnapshotAccumulator {
             workspace_hash: None,
             latest_model: None,
             current_selector: SelectorCapture::default(),
-            latest_cumulative_usage: None,
-            totals: UsageTotals::default(),
-            model_usage: BTreeMap::new(),
-            activity_buckets: BTreeMap::new(),
+            current_partition: PartitionKey::default(),
+            session_cumulative_usage: None,
+            partitions: BTreeMap::new(),
         }
     }
 
     fn with_default_selector(source: SnapshotSource, selector: SelectorCapture) -> Self {
         let mut accumulator = Self::new(source);
+        // Default selector (e.g. Codex config defaults) feeds model_usage display
+        // context. Partition keys come from line selectors, so do not seed
+        // current_partition from defaults.
         accumulator.current_selector = selector;
         accumulator
+    }
+
+    fn partition_mut(&mut self, key: &PartitionKey) -> &mut PartitionState {
+        self.partitions.entry(key.clone()).or_default()
     }
 
     fn note_time(&mut self, timestamp: Option<String>) {
@@ -448,7 +494,10 @@ impl SnapshotAccumulator {
         else {
             return;
         };
-        match self.activity_buckets.get_mut(&bucket_start) {
+        let partition_key = self.current_partition.clone();
+        let partition = self.partition_mut(&partition_key);
+        partition.turn_count = partition.turn_count.saturating_add(request_count);
+        match partition.activity_buckets.get_mut(&bucket_start) {
             Some(bucket) => {
                 bucket.request_count += request_count;
                 if normalized_timestamp < bucket.first_activity_at {
@@ -459,7 +508,7 @@ impl SnapshotAccumulator {
                 }
             }
             None => {
-                self.activity_buckets.insert(
+                partition.activity_buckets.insert(
                     bucket_start,
                     ActivityBucketAccumulator {
                         request_count,
@@ -469,13 +518,6 @@ impl SnapshotAccumulator {
                 );
             }
         }
-    }
-
-    fn activity_bucket_request_count(&self) -> u64 {
-        self.activity_buckets
-            .values()
-            .map(|bucket| bucket.request_count)
-            .sum()
     }
 
     fn set_title(&mut self, title: Option<String>, source: &str) {
@@ -536,9 +578,13 @@ impl SnapshotAccumulator {
     }
 
     fn set_selector(&mut self, selector: SelectorCapture) {
-        if !selector.is_empty() {
-            self.current_selector = selector;
+        if selector.is_empty() {
+            return;
         }
+        // current_selector is the running display-context for model_usage
+        // entries. Partition keys are derived per line in add_usage_* — never
+        // from this rolling merged view.
+        self.current_selector.merge(selector);
     }
 
     fn add_usage_with_selector(
@@ -554,24 +600,34 @@ impl SnapshotAccumulator {
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
         self.latest_model = Some(model.clone());
-        self.totals.add(&usage);
-        let selector = if selector.is_empty() {
-            self.current_selector.clone()
-        } else {
-            selector
-        };
-        self.add_model_usage(model, selector, usage);
+        // Partition key comes from THIS LINE's selector only — never merged
+        // with prior turns'. A turn that omits gateway_provider lands in the
+        // default partition rather than inheriting the previous one.
+        let partition_key = partition_key_from_selector(&selector);
+        // Display context for model_usage is the merged view so config
+        // defaults (service_tier, mode) flow through.
+        let mut merged = self.current_selector.clone();
+        merged.merge(selector);
+        self.current_partition = partition_key.clone();
+        let partition = self.partition_mut(&partition_key);
+        partition.totals.add(&usage);
+        Self::add_model_usage_into(partition, model, merged, usage);
     }
 
-    fn add_model_usage(&mut self, model: String, selector: SelectorCapture, usage: UsageTotals) {
+    fn add_model_usage_into(
+        partition: &mut PartitionState,
+        model: String,
+        selector: SelectorCapture,
+        usage: UsageTotals,
+    ) {
         let selector_hash = selector.selector_hash();
         let key = (model.clone(), selector_hash);
-        if let Some(entry) = self.model_usage.get_mut(&key) {
+        if let Some(entry) = partition.model_usage.get_mut(&key) {
             entry.selector_sources.extend(selector.sources);
             entry.usage.add(&usage);
             return;
         }
-        self.model_usage.insert(
+        partition.model_usage.insert(
             key,
             ModelSelectorUsage {
                 model,
@@ -595,42 +651,45 @@ impl SnapshotAccumulator {
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
         self.latest_model = Some(model.clone());
-        let delta = match self.latest_cumulative_usage.as_ref() {
+        // Codex (the only caller today) emits SESSION-wide cumulative totals.
+        // Track cumulative at the accumulator level so a mid-session partition
+        // change (e.g. plan_window_bucket rollover across the secondary reset)
+        // doesn't make the new partition swallow the entire prior cumulative
+        // as its first "delta".
+        let delta = match self.session_cumulative_usage.as_ref() {
             Some(previous) if usage.is_monotonic_after(previous) => usage.delta_from(previous),
             Some(_) => {
-                self.model_usage.clear();
+                // Non-monotonic: treat as a session restart. Clear all
+                // partitions because the cumulative was invalidated.
+                self.partitions.clear();
                 usage.clone()
             }
             None => usage.clone(),
         };
-        self.latest_cumulative_usage = Some(usage.clone());
-        self.totals = usage;
+        self.session_cumulative_usage = Some(usage.clone());
         if delta.is_zero() {
             return None;
         }
-        let selector = if selector.is_empty() {
-            self.current_selector.clone()
-        } else {
-            selector
-        };
-        self.add_model_usage(model, selector, delta.clone());
+        // Partition for THIS delta comes from THIS LINE's selector only.
+        let partition_key = partition_key_from_selector(&selector);
+        let mut merged = self.current_selector.clone();
+        merged.merge(selector);
+        self.current_partition = partition_key.clone();
+        let partition = self.partition_mut(&partition_key);
+        partition.totals.add(&delta);
+        Self::add_model_usage_into(partition, model, merged, delta.clone());
         Some(delta)
     }
 
-    fn into_item(
+    fn into_items(
         self,
         path: &Path,
         collected_at: &str,
         source_file_fingerprint: String,
-    ) -> Option<SnapshotItem> {
-        let activity_request_count = self.activity_bucket_request_count();
-        let request_count = if activity_request_count > 0 {
-            activity_request_count
-        } else {
-            self.totals.request_count
-        };
-        let source_session_id = self
+    ) -> Vec<SnapshotItem> {
+        let Some(source_session_id) = self
             .source_session_id
+            .clone()
             .or_else(|| {
                 (self.source == SnapshotSource::Codex)
                     .then(|| codex_session_id_from_path(path))
@@ -640,79 +699,143 @@ impl SnapshotAccumulator {
                 path.file_stem()
                     .and_then(|value| value.to_str())
                     .map(|value| value.to_string())
-            })?;
-        if self.totals.total_tokens() == 0 && self.totals.reasoning_output_tokens == 0 {
-            return None;
-        }
-        let model_usage: Vec<SnapshotModelUsage> = self
-            .model_usage
-            .into_values()
-            .map(|row| SnapshotModelUsage {
-                model: row.model,
-                input_tokens: row.usage.input_tokens,
-                output_tokens: row.usage.output_tokens,
-                cache_read_tokens: row.usage.cache_read_tokens,
-                cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
-                cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
-                reasoning_output_tokens: row.usage.reasoning_output_tokens,
-                unattributed_total_tokens: row.usage.unattributed_total_tokens,
-                request_count: row.usage.request_count,
-                selector_context: row.selector_context,
-                selector_sources: row.selector_sources,
             })
-            .collect();
-        let activity_buckets: Vec<SnapshotActivityBucket> = self
-            .activity_buckets
-            .into_iter()
-            .map(|(bucket_start, bucket)| SnapshotActivityBucket {
-                bucket_start,
-                request_count: bucket.request_count,
-                first_activity_at: Some(bucket.first_activity_at),
-                last_activity_at: Some(bucket.last_activity_at),
-            })
-            .collect();
-        let mut item = SnapshotItem {
-            source_session_id,
-            snapshot_fingerprint: String::new(),
-            status: "final".to_string(),
-            input_tokens: self.totals.input_tokens,
-            output_tokens: self.totals.output_tokens,
-            cache_read_tokens: self.totals.cache_read_tokens,
-            cache_creation_5m_tokens: self.totals.cache_creation_5m_tokens,
-            cache_creation_1h_tokens: self.totals.cache_creation_1h_tokens,
-            reasoning_output_tokens: self.totals.reasoning_output_tokens,
-            unattributed_total_tokens: self.totals.unattributed_total_tokens,
-            request_count,
-            model_usage,
-            activity_buckets,
-            session_display_name: self.title,
-            session_display_name_source: self.title_source,
-            source_started_at: self.started_at,
-            source_ended_at: self.ended_at,
-            source_last_activity_at: self.last_activity_at,
-            collected_at: collected_at.to_string(),
-            workspace_hash: self.workspace_hash,
-            workspace_display_label: None,
-            workspace_label_source: None,
-            source_file_fingerprint: Some(source_file_fingerprint),
-            provenance: SnapshotProvenance {
-                collector: match self.source {
-                    SnapshotSource::Codex => "codex_jsonl".to_string(),
-                    SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
-                    SnapshotSource::Pi => "pi_jsonl".to_string(),
-                },
-                source_file_count: 1,
-                input_token_scope: match self.source {
-                    SnapshotSource::Codex => Some("inclusive_cached".to_string()),
-                    SnapshotSource::ClaudeCode => Some("uncached".to_string()),
-                    SnapshotSource::Pi => Some("uncached".to_string()),
-                },
-                state_total_tokens: None,
-                state_archived: None,
-            },
+        else {
+            return Vec::new();
         };
-        item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
-        Some(item)
+        let collector = match self.source {
+            SnapshotSource::Codex => "codex_jsonl".to_string(),
+            SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
+            SnapshotSource::Pi => "pi_jsonl".to_string(),
+        };
+        let input_token_scope = match self.source {
+            SnapshotSource::Codex => Some("inclusive_cached".to_string()),
+            SnapshotSource::ClaudeCode => Some("uncached".to_string()),
+            SnapshotSource::Pi => Some("uncached".to_string()),
+        };
+        let parser_version = self.source.parser_version().to_string();
+        let partition_turn_counts: BTreeMap<String, u64> = self
+            .partitions
+            .iter()
+            .filter(|(_, state)| {
+                state.totals.total_tokens() > 0 || state.totals.reasoning_output_tokens > 0
+            })
+            .map(|(key, state)| (key.fingerprint_token(), state.turn_count))
+            .collect();
+        let mut items = Vec::new();
+        for (partition_key, partition) in self.partitions {
+            if partition.totals.total_tokens() == 0 && partition.totals.reasoning_output_tokens == 0
+            {
+                continue;
+            }
+            let model_usage: Vec<SnapshotModelUsage> = partition
+                .model_usage
+                .into_values()
+                .map(|row| SnapshotModelUsage {
+                    model: row.model,
+                    input_tokens: row.usage.input_tokens,
+                    output_tokens: row.usage.output_tokens,
+                    cache_read_tokens: row.usage.cache_read_tokens,
+                    cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
+                    reasoning_output_tokens: row.usage.reasoning_output_tokens,
+                    unattributed_total_tokens: row.usage.unattributed_total_tokens,
+                    request_count: row.usage.request_count,
+                    selector_context: row.selector_context,
+                    selector_sources: row.selector_sources,
+                })
+                .collect();
+            let activity_buckets: Vec<SnapshotActivityBucket> = partition
+                .activity_buckets
+                .into_iter()
+                .map(|(bucket_start, bucket)| SnapshotActivityBucket {
+                    bucket_start,
+                    request_count: bucket.request_count,
+                    first_activity_at: Some(bucket.first_activity_at),
+                    last_activity_at: Some(bucket.last_activity_at),
+                })
+                .collect();
+            let activity_request_count: u64 = activity_buckets
+                .iter()
+                .map(|bucket| bucket.request_count)
+                .sum();
+            let request_count = if activity_request_count > 0 {
+                activity_request_count
+            } else {
+                partition.totals.request_count
+            };
+            let mut item = SnapshotItem {
+                source_session_id: source_session_id.clone(),
+                snapshot_fingerprint: String::new(),
+                status: "final".to_string(),
+                input_tokens: partition.totals.input_tokens,
+                output_tokens: partition.totals.output_tokens,
+                cache_read_tokens: partition.totals.cache_read_tokens,
+                cache_creation_5m_tokens: partition.totals.cache_creation_5m_tokens,
+                cache_creation_1h_tokens: partition.totals.cache_creation_1h_tokens,
+                reasoning_output_tokens: partition.totals.reasoning_output_tokens,
+                unattributed_total_tokens: partition.totals.unattributed_total_tokens,
+                request_count,
+                model_usage,
+                activity_buckets,
+                session_display_name: self.title.clone(),
+                session_display_name_source: self.title_source.clone(),
+                source_started_at: self.started_at.clone(),
+                source_ended_at: self.ended_at.clone(),
+                source_last_activity_at: self.last_activity_at.clone(),
+                collected_at: collected_at.to_string(),
+                workspace_hash: self.workspace_hash.clone(),
+                workspace_display_label: None,
+                workspace_label_source: None,
+                source_file_fingerprint: Some(source_file_fingerprint.clone()),
+                provenance: SnapshotProvenance {
+                    collector: collector.clone(),
+                    source_file_count: 1,
+                    input_token_scope: input_token_scope.clone(),
+                    state_total_tokens: None,
+                    state_archived: None,
+                    partition_turn_counts: partition_turn_counts.clone(),
+                    parser_version: Some(parser_version.clone()),
+                },
+                gateway_provider: partition_key.gateway_provider.clone(),
+                plan_fingerprint: partition_key.plan_fingerprint.clone(),
+                backfill_source: None,
+            };
+            item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
+            items.push(item);
+        }
+        items
+    }
+}
+
+fn partition_key_from_selector(selector: &SelectorCapture) -> PartitionKey {
+    let gateway_provider = selector
+        .context
+        .get("gateway_provider")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let subscription_product = selector
+        .context
+        .get("subscription_product")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let plan_window_bucket = selector
+        .context
+        .get("plan_window_bucket")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let plan_fingerprint = if subscription_product.is_some() || plan_window_bucket.is_some() {
+        Some(format!(
+            "{}::{}",
+            subscription_product.as_deref().unwrap_or(""),
+            plan_window_bucket.as_deref().unwrap_or(""),
+        ))
+    } else {
+        None
+    };
+    PartitionKey {
+        gateway_provider,
+        plan_fingerprint,
     }
 }
 
@@ -772,17 +895,15 @@ pub fn scan_source_roots(
             )?,
         };
         if source == SnapshotSource::Codex {
-            if let Some(snapshot) = parsed.as_mut() {
+            for snapshot in parsed.iter_mut() {
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
             }
         }
         let last_snapshot_fingerprint = parsed
-            .as_ref()
+            .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
         index.record(candidate, last_snapshot_fingerprint);
-        if let Some(snapshot) = parsed {
-            snapshots.push(snapshot);
-        }
+        snapshots.extend(parsed);
     }
     if source == SnapshotSource::Codex {
         append_codex_state_only_snapshots(&mut snapshots, &codex_title_metadata, collected_at);
@@ -891,7 +1012,12 @@ fn codex_state_only_snapshot(
             input_token_scope: Some("total_only".to_string()),
             state_total_tokens: Some(thread.tokens_used),
             state_archived: Some(thread.archived),
+            partition_turn_counts: BTreeMap::new(),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
         },
+        gateway_provider: None,
+        plan_fingerprint: None,
+        backfill_source: None,
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
@@ -901,7 +1027,7 @@ pub fn parse_codex_jsonl_file(
     path: &Path,
     collected_at: &str,
     source_file_fingerprint: String,
-) -> Result<Option<SnapshotItem>> {
+) -> Result<Vec<SnapshotItem>> {
     parse_codex_jsonl_file_with_title_metadata(
         path,
         collected_at,
@@ -915,7 +1041,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
     collected_at: &str,
     source_file_fingerprint: String,
     title_metadata: &CodexTitleMetadata,
-) -> Result<Option<SnapshotItem>> {
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -930,7 +1056,7 @@ pub fn parse_claude_code_jsonl_file(
     path: &Path,
     collected_at: &str,
     source_file_fingerprint: String,
-) -> Result<Option<SnapshotItem>> {
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -945,7 +1071,7 @@ pub fn parse_pi_jsonl_file(
     path: &Path,
     collected_at: &str,
     source_file_fingerprint: String,
-) -> Result<Option<SnapshotItem>> {
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -963,7 +1089,7 @@ fn parse_jsonl_file(
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
-) -> Result<Option<SnapshotItem>> {
+) -> Result<Vec<SnapshotItem>> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut accumulator = if let Some(metadata) = codex_title_metadata {
@@ -990,7 +1116,7 @@ fn parse_jsonl_file(
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
     }
-    Ok(accumulator.into_item(path, collected_at, source_file_fingerprint))
+    Ok(accumulator.into_items(path, collected_at, source_file_fingerprint))
 }
 
 fn raw_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -1151,6 +1277,29 @@ fn selector_from_object(value: &Value, source_prefix: &str) -> SelectorCapture {
                 "openai.fast_mode",
             ],
         ),
+        (
+            "gateway_provider",
+            &["gateway_provider", "gatewayProvider", "api"],
+        ),
+        (
+            "model_provider",
+            &["model_provider", "modelProvider", "provider"],
+        ),
+        ("auth_mode", &["auth_mode", "authMode"]),
+        ("billing_channel", &["billing_channel", "billingChannel"]),
+        (
+            "subscription_product",
+            &[
+                "subscription_product",
+                "subscriptionProduct",
+                "plan_type",
+                "planType",
+            ],
+        ),
+        (
+            "plan_window_bucket",
+            &["plan_window_bucket", "planWindowBucket"],
+        ),
     ];
     for (field, field_aliases) in aliases {
         for alias in *field_aliases {
@@ -1196,10 +1345,27 @@ fn codex_selector_from_line(value: &Value) -> SelectorCapture {
         &["turn_context", "payload"],
         &["payload", "info"],
         &["token_count", "info"],
+        &["payload", "rate_limits"],
+        &["token_count", "info", "rate_limits"],
     ];
     for path in object_paths {
         merge_selector_object_at(&mut selector, value, path);
     }
+    if let Some(bucket) = codex_plan_window_bucket(value) {
+        insert_selector_raw(
+            &mut selector,
+            "plan_window_bucket",
+            "derived_from_rate_limits_secondary_resets_at",
+            &Value::Number(bucket.into()),
+        );
+    }
+    codex_extract_quota_window_selectors(value, &mut selector);
+    insert_selector_raw(
+        &mut selector,
+        "model_provider",
+        "derived_from_codex_source",
+        &Value::String("openai".to_string()),
+    );
     let service_tier_paths: &[&[&str]] = &[
         &["token_count", "info", "service_tier"],
         &["payload", "info", "service_tier"],
@@ -1268,7 +1434,36 @@ fn claude_code_selector_from_line(value: &Value) -> SelectorCapture {
         }
     }
     selector.merge(selector_from_object(value, ""));
+    if let Some(gateway) = detect_claude_gateway_provider(value) {
+        let raw = Value::String(gateway);
+        insert_selector_raw(
+            &mut selector,
+            "gateway_provider",
+            "derived_from_message_id_prefix",
+            &raw,
+        );
+        insert_selector_raw(
+            &mut selector,
+            "model_provider",
+            "derived_from_claude_code_source",
+            &Value::String("anthropic".to_string()),
+        );
+    }
     selector
+}
+
+fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
+    let id = string_at(value, &["message", "id"]).or_else(|| string_at(value, &["requestId"]))?;
+    if id.contains("_vrtx_") {
+        return Some("vertex".into());
+    }
+    if id.contains("_bdrk_") {
+        return Some("bedrock".into());
+    }
+    if id.starts_with("msg_") || id.starts_with("req_") {
+        return Some("anthropic".into());
+    }
+    None
 }
 
 fn pi_selector_from_custom(value: &Value) -> Option<SelectorCapture> {
@@ -1339,6 +1534,68 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                 1
             };
             accumulator.note_activity(timestamp, activity_request_count);
+        }
+    }
+}
+
+fn codex_plan_window_bucket(value: &Value) -> Option<u64> {
+    let rate_limit_paths: &[&[&str]] = &[
+        &["payload", "rate_limits"],
+        &["token_count", "info", "rate_limits"],
+    ];
+    for path in rate_limit_paths {
+        if let Some(rate_limits) = raw_value_at(value, path) {
+            if let Some(resets_at) = u64_at(rate_limits, &["secondary", "resets_at"]) {
+                return Some(resets_at / 86_400);
+            }
+        }
+    }
+    None
+}
+
+fn codex_extract_quota_window_selectors(value: &Value, selector: &mut SelectorCapture) {
+    let rate_limits = raw_value_at(value, &["payload", "rate_limits"])
+        .or_else(|| raw_value_at(value, &["token_count", "info", "rate_limits"]));
+    let Some(rate_limits) = rate_limits else {
+        return;
+    };
+    for window_name in &["primary", "secondary"] {
+        let Some(window) = raw_value_at(rate_limits, &[*window_name]) else {
+            continue;
+        };
+        for (field_suffix, source_key, raw) in [
+            (
+                "used_percent",
+                "used_percent",
+                window.get("used_percent").cloned(),
+            ),
+            (
+                "window_minutes",
+                "window_minutes",
+                window.get("window_minutes").cloned(),
+            ),
+            ("resets_at", "resets_at", window.get("resets_at").cloned()),
+        ] {
+            let Some(raw) = raw else {
+                continue;
+            };
+            let field = format!("agent_quota_{window_name}_{field_suffix}");
+            let source = format!("payload.rate_limits.{window_name}.{source_key}");
+            insert_selector_raw(selector, field.as_str(), source.as_str(), &raw);
+        }
+    }
+    if let Some(credits) = raw_value_at(rate_limits, &["credits"]) {
+        for (field_suffix, source_key) in [
+            ("has_credits", "has_credits"),
+            ("unlimited", "unlimited"),
+            ("balance", "balance"),
+        ] {
+            let Some(raw) = credits.get(source_key) else {
+                continue;
+            };
+            let field = format!("agent_quota_credits_{field_suffix}");
+            let source = format!("payload.rate_limits.credits.{source_key}");
+            insert_selector_raw(selector, field.as_str(), source.as_str(), raw);
         }
     }
 }
@@ -2575,6 +2832,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(
@@ -2628,6 +2887,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.request_count, 2);
@@ -2681,6 +2942,8 @@ mod tests {
             &metadata,
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(
@@ -2931,6 +3194,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
         assert_eq!(
             item.session_display_name.as_deref(),
@@ -2958,6 +3223,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
         assert_eq!(noisy_item.session_display_name, None);
         assert_eq!(noisy_item.session_display_name_source, None);
@@ -2985,6 +3252,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
         item.workspace_display_label = Some("Checkout service".to_string());
         item.workspace_label_source = Some("user_approved".to_string());
@@ -3048,6 +3317,8 @@ mod tests {
             &first,
         )
         .expect("parse first")
+        .into_iter()
+        .next()
         .expect("first snapshot");
         let second_item = parse_codex_jsonl_file_with_title_metadata(
             &path,
@@ -3056,6 +3327,8 @@ mod tests {
             &second,
         )
         .expect("parse second")
+        .into_iter()
+        .next()
         .expect("second snapshot");
         assert_ne!(
             first_item.snapshot_fingerprint,
@@ -3111,6 +3384,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.session_display_name, None);
@@ -3141,6 +3416,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.input_tokens, 300);
@@ -3197,6 +3474,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
@@ -3248,6 +3527,8 @@ mod tests {
             &metadata,
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
@@ -3296,6 +3577,8 @@ mod tests {
             &metadata,
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
@@ -3351,6 +3634,8 @@ mod tests {
             &metadata,
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
@@ -3396,6 +3681,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.source_session_id, "claude-session-1");
@@ -3447,6 +3734,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.request_count, 2);
@@ -3481,6 +3770,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(
@@ -3522,6 +3813,8 @@ mod tests {
             "file-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.model_usage.len(), 2);
@@ -3578,6 +3871,8 @@ mod tests {
             "ephemeral-fingerprint".to_string(),
         )
         .expect("parse")
+        .into_iter()
+        .next()
         .expect("snapshot");
 
         assert_eq!(item.cache_creation_5m_tokens, 3500);
@@ -3612,6 +3907,8 @@ mod tests {
 
         let item = parse_pi_jsonl_file(&path, "2026-05-19T11:05:00Z", "fp".to_string())
             .expect("parse")
+            .into_iter()
+            .next()
             .expect("snapshot");
 
         assert_eq!(item.model_usage.len(), 2);
@@ -3662,6 +3959,8 @@ mod tests {
 
         let item = parse_pi_jsonl_file(&path, "2026-05-14T22:05:00Z", "fp".to_string())
             .expect("parse")
+            .into_iter()
+            .next()
             .expect("snapshot");
 
         assert_eq!(
@@ -3713,6 +4012,8 @@ mod tests {
 
         let item = parse_pi_jsonl_file(&path, "2026-05-14T22:11:00Z", "fp".to_string())
             .expect("parse")
+            .into_iter()
+            .next()
             .expect("snapshot");
 
         assert_eq!(item.input_tokens, 200);
@@ -3741,7 +4042,7 @@ mod tests {
         let item =
             parse_pi_jsonl_file(&path, "2026-05-14T22:21:00Z", "fp".to_string()).expect("parse");
 
-        assert!(item.is_none());
+        assert!(item.is_empty());
 
         let _ = fs::remove_file(path);
     }
@@ -3769,5 +4070,527 @@ mod tests {
         let forbidden_reader_call = [".", "read", "_to", "_string("].concat();
         assert!(!source.contains(&forbidden_std_call));
         assert!(!source.contains(&forbidden_reader_call));
+    }
+
+    #[test]
+    fn claude_code_parser_marks_vertex_routing_from_message_id_prefix() {
+        let path = temp_file("claude-vertex-routing");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T11:00:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"summary\":\"Vertex routed session\"}\n",
+                "{\"timestamp\":\"2026-05-27T11:01:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"requestId\":\"req_vrtx_011CbTQja3ndEG6i5VSxvTMy\",\"message\":{\"id\":\"msg_vrtx_01E8CZoVChX5VsRneeXge7Xn\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}}\n",
+                "{\"timestamp\":\"2026-05-27T11:02:00Z\",\"sessionId\":\"2cc9312d-6254-421d-a3f4-af09f0ea6843\",\"requestId\":\"req_vrtx_011CbTQjb5ndEG6i5VSxvTMz\",\"message\":{\"id\":\"msg_vrtx_01E8CZoVChX5VsRneeXge7Xo\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-27T11:05:00Z",
+            "vertex-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1, "single partition for pure vertex session");
+        let item = items.into_iter().next().expect("snapshot");
+        assert_eq!(item.gateway_provider.as_deref(), Some("vertex"));
+        assert!(item.plan_fingerprint.is_none());
+        assert_eq!(item.input_tokens, 16);
+        assert_eq!(item.output_tokens, 11);
+        let selector = &item.model_usage[0].selector_context;
+        assert_eq!(
+            selector.get("gateway_provider").map(String::as_str),
+            Some("vertex")
+        );
+        assert_eq!(
+            selector.get("model_provider").map(String::as_str),
+            Some("anthropic")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_marks_bedrock_routing_from_message_id_prefix() {
+        let path = temp_file("claude-bedrock-routing");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T12:00:00Z\",\"sessionId\":\"bedrock-session-1\",\"summary\":\"Bedrock routed session\"}\n",
+                "{\"timestamp\":\"2026-05-27T12:01:00Z\",\"sessionId\":\"bedrock-session-1\",\"requestId\":\"req_bdrk_011CbV4TXyzr5mSprKh46T21\",\"message\":{\"id\":\"msg_bdrk_01NL9dabWXgaJeBdwZRrWEYc\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":20,\"output_tokens\":11}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-27T12:05:00Z",
+            "bedrock-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1);
+        let item = items.into_iter().next().expect("snapshot");
+        assert_eq!(item.gateway_provider.as_deref(), Some("bedrock"));
+        let selector = &item.model_usage[0].selector_context;
+        assert_eq!(
+            selector.get("gateway_provider").map(String::as_str),
+            Some("bedrock")
+        );
+        assert_eq!(
+            selector.get("model_provider").map(String::as_str),
+            Some("anthropic")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_marks_anthropic_routing_when_id_has_no_provider_infix() {
+        let path = temp_file("claude-anthropic-routing");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T13:00:00Z\",\"sessionId\":\"1b2a248b-a5b7-41c5-bcd2-7b162a257149\",\"summary\":\"First-party routed session\"}\n",
+                "{\"timestamp\":\"2026-05-27T13:01:00Z\",\"sessionId\":\"1b2a248b-a5b7-41c5-bcd2-7b162a257149\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRpZ\",\"message\":{\"id\":\"msg_01VYXWshPjnW6L97x52sQbCT\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":9,\"output_tokens\":6}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-27T13:05:00Z",
+            "first-party-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let item = items.into_iter().next().expect("snapshot");
+        assert_eq!(item.gateway_provider.as_deref(), Some("anthropic"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_splits_mixed_provider_session_into_distinct_snapshots() {
+        // A single Claude Code JSONL that interleaves Vertex (`msg_vrtx_*`) and
+        // first-party Anthropic (`msg_01*`) turns. The accumulator emits one
+        // snapshot per gateway_provider so each maps to its own billing
+        // identity downstream.
+        let path = temp_file("claude-mixed-provider");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T14:00:00Z\",\"sessionId\":\"mixed-session\",\"summary\":\"cvon/cvoff demo\"}\n",
+                "{\"timestamp\":\"2026-05-27T14:01:00Z\",\"sessionId\":\"mixed-session\",\"requestId\":\"req_vrtx_011CbTQja3ndEG6i5VSxvTMy\",\"message\":{\"id\":\"msg_vrtx_01E8CZoVChX5VsRneeXge7Xn\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-05-27T14:05:00Z\",\"sessionId\":\"mixed-session\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRpZ\",\"message\":{\"id\":\"msg_01VYXWshPjnW6L97x52sQbCT\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":4,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-27T14:10:00Z",
+            "mixed-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 2, "one snapshot per gateway provider");
+        let mut gateways: Vec<Option<String>> =
+            items.iter().map(|s| s.gateway_provider.clone()).collect();
+        gateways.sort();
+        assert_eq!(
+            gateways,
+            vec![Some("anthropic".to_string()), Some("vertex".to_string()),]
+        );
+        let vertex = items
+            .iter()
+            .find(|s| s.gateway_provider.as_deref() == Some("vertex"))
+            .expect("vertex partition");
+        let anthropic = items
+            .iter()
+            .find(|s| s.gateway_provider.as_deref() == Some("anthropic"))
+            .expect("anthropic partition");
+        assert_eq!(vertex.input_tokens, 10);
+        assert_eq!(vertex.output_tokens, 5);
+        assert_eq!(anthropic.input_tokens, 4);
+        assert_eq!(anthropic.output_tokens, 3);
+        assert_ne!(vertex.snapshot_fingerprint, anthropic.snapshot_fingerprint);
+        // Both fingerprints land under the same source_session_id so the
+        // upstream UPSERT keeps them distinct by (session, gateway, plan).
+        assert_eq!(vertex.source_session_id, anthropic.source_session_id);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_extracts_pro_plan_fingerprint_from_rate_limits() {
+        let path = temp_file("codex-pro-plan");
+        // Pro plan fixture mirrors rons's empirical 2026-05-21 personal session.
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-pro-personal\",\"model_provider\":\"openai\"}}\n",
+                "{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":30,\"output_tokens\":12,\"cached_input_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"pro\",\"primary\":{\"used_percent\":35.5,\"window_minutes\":300,\"resets_at\":1779691736},\"secondary\":{\"used_percent\":12.3,\"window_minutes\":10080,\"resets_at\":1780206326},\"credits\":{\"has_credits\":true,\"unlimited\":false,\"balance\":null}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items =
+            parse_codex_jsonl_file(&path, "2026-05-21T10:05:00Z", "pro-fingerprint".to_string())
+                .expect("parse");
+        let item = items.into_iter().next().expect("snapshot");
+        assert!(item.plan_fingerprint.is_some());
+        // bucket = 1780206326 / 86400 = 20604
+        assert_eq!(item.plan_fingerprint.as_deref(), Some("pro::20604"));
+        let selector = &item.model_usage[0].selector_context;
+        assert_eq!(
+            selector.get("subscription_product").map(String::as_str),
+            Some("pro")
+        );
+        assert_eq!(
+            selector.get("plan_window_bucket").map(String::as_str),
+            Some("20604")
+        );
+        assert_eq!(
+            selector.get("model_provider").map(String::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            selector
+                .get("agent_quota_primary_used_percent")
+                .map(String::as_str),
+            Some("35.5")
+        );
+        assert_eq!(
+            selector
+                .get("agent_quota_secondary_resets_at")
+                .map(String::as_str),
+            Some("1780206326")
+        );
+        assert_eq!(
+            selector
+                .get("agent_quota_credits_has_credits")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_extracts_team_plan_fingerprint_distinct_from_pro() {
+        let path = temp_file("codex-team-plan");
+        // Team plan fixture mirrors rons's empirical 2026-05-27 Singular session.
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T14:34:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-team-singular\",\"model_provider\":\"openai\"}}\n",
+                "{\"timestamp\":\"2026-05-27T14:35:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":18,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"team\",\"primary\":{\"used_percent\":2.0,\"window_minutes\":300,\"resets_at\":1779898136},\"secondary\":{\"used_percent\":16.0,\"window_minutes\":10080,\"resets_at\":1780484936}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_codex_jsonl_file(
+            &path,
+            "2026-05-27T14:40:00Z",
+            "team-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let item = items.into_iter().next().expect("snapshot");
+        // bucket = 1780484936 / 86400 = 20607
+        assert_eq!(item.plan_fingerprint.as_deref(), Some("team::20607"));
+        let selector = &item.model_usage[0].selector_context;
+        assert_eq!(
+            selector.get("subscription_product").map(String::as_str),
+            Some("team")
+        );
+        assert_eq!(
+            selector.get("plan_window_bucket").map(String::as_str),
+            Some("20607")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_pro_and_team_fingerprints_route_to_distinct_snapshots() {
+        // Sanity check: pro and team plans produce distinct plan_fingerprints
+        // and would, if interleaved in the same session, produce distinct
+        // partitions. We parse two separate files and confirm their
+        // fingerprints don't collide.
+        let pro_path = temp_file("codex-pro-vs-team-1");
+        let team_path = temp_file("codex-pro-vs-team-2");
+        fs::write(
+            &pro_path,
+            "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-pro-vs-team-1\"}}\n{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"pro\",\"secondary\":{\"resets_at\":1780206326}}}}\n",
+        )
+        .expect("write pro");
+        fs::write(
+            &team_path,
+            "{\"timestamp\":\"2026-05-27T14:34:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-codex-pro-vs-team-2\"}}\n{\"timestamp\":\"2026-05-27T14:35:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1,\"output_tokens\":1,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"team\",\"secondary\":{\"resets_at\":1780484936}}}}\n",
+        )
+        .expect("write team");
+
+        let pro_item = parse_codex_jsonl_file(&pro_path, "2026-05-21T10:05:00Z", "p".to_string())
+            .expect("parse pro")
+            .into_iter()
+            .next()
+            .expect("pro snapshot");
+        let team_item = parse_codex_jsonl_file(&team_path, "2026-05-27T14:40:00Z", "t".to_string())
+            .expect("parse team")
+            .into_iter()
+            .next()
+            .expect("team snapshot");
+        assert_ne!(pro_item.plan_fingerprint, team_item.plan_fingerprint);
+        assert_ne!(
+            pro_item.snapshot_fingerprint,
+            team_item.snapshot_fingerprint
+        );
+
+        let _ = fs::remove_file(pro_path);
+        let _ = fs::remove_file(team_path);
+    }
+
+    #[test]
+    fn pi_parser_emits_one_snapshot_per_gateway_in_multi_provider_session() {
+        // Pi can route per-turn to different providers within a single
+        // session. The accumulator must produce one snapshot per gateway.
+        let path = temp_file("pi-multi-provider");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"timestamp\":\"2026-05-20T09:00:00Z\",\"sessionId\":\"pi-multi\",\"cwd\":\"/work\"}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747731600000,\"gatewayProvider\":\"anthropic\",\"modelProvider\":\"anthropic\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747731660000,\"gatewayProvider\":\"openai\",\"modelProvider\":\"openai\",\"message\":{\"model\":\"gpt-5.5\",\"usage\":{\"input\":8,\"output\":6}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747731720000,\"gatewayProvider\":\"google\",\"modelProvider\":\"google\",\"message\":{\"model\":\"gemini-2.5\",\"usage\":{\"input\":3,\"output\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_pi_jsonl_file(
+            &path,
+            "2026-05-20T09:05:00Z",
+            "pi-multi-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 3, "one snapshot per per-turn gateway provider");
+        let mut gateways: Vec<Option<String>> = items
+            .iter()
+            .map(|item| item.gateway_provider.clone())
+            .collect();
+        gateways.sort();
+        assert_eq!(
+            gateways,
+            vec![
+                Some("anthropic".to_string()),
+                Some("google".to_string()),
+                Some("openai".to_string()),
+            ]
+        );
+        for item in &items {
+            assert!(item.plan_fingerprint.is_none());
+            assert_eq!(item.source_session_id, "pi-multi");
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_provenance_records_partition_turn_counts() {
+        let path = temp_file("partition-turn-counts");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-27T14:00:00Z\",\"sessionId\":\"turn-counts\",\"summary\":\"mixed\"}\n",
+                "{\"timestamp\":\"2026-05-27T14:01:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_vrtx_a\",\"message\":{\"id\":\"msg_vrtx_a\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-05-27T14:02:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_vrtx_b\",\"message\":{\"id\":\"msg_vrtx_b\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-05-27T14:03:00Z\",\"sessionId\":\"turn-counts\",\"requestId\":\"req_011\",\"message\":{\"id\":\"msg_01a\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-27T14:05:00Z",
+            "turn-counts-fp".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 2);
+        let turn_counts = &items[0].provenance.partition_turn_counts;
+        // Both items share the same partition_turn_counts because it is a
+        // session-wide manifest. The two recorded entries should be vertex (2)
+        // and anthropic (1).
+        assert_eq!(turn_counts.len(), 2);
+        let vertex_count = turn_counts
+            .iter()
+            .find(|(key, _)| key.starts_with("vertex|"))
+            .map(|(_, value)| *value);
+        let anthropic_count = turn_counts
+            .iter()
+            .find(|(key, _)| key.starts_with("anthropic|"))
+            .map(|(_, value)| *value);
+        assert_eq!(vertex_count, Some(2));
+        assert_eq!(anthropic_count, Some(1));
+        for item in &items {
+            assert_eq!(
+                item.provenance.parser_version.as_deref(),
+                Some(CLAUDE_CODE_SNAPSHOT_PARSER_VERSION)
+            );
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn detect_claude_gateway_provider_recognizes_known_prefixes() {
+        assert_eq!(
+            detect_claude_gateway_provider(&serde_json::json!({
+                "message": { "id": "msg_vrtx_01E8CZoVChX5VsRneeXge7Xn" }
+            })),
+            Some("vertex".to_string())
+        );
+        assert_eq!(
+            detect_claude_gateway_provider(&serde_json::json!({
+                "requestId": "req_bdrk_011CbV4T"
+            })),
+            Some("bedrock".to_string())
+        );
+        assert_eq!(
+            detect_claude_gateway_provider(&serde_json::json!({
+                "message": { "id": "msg_01VYXWshPjnW6L97x52sQbCT" }
+            })),
+            Some("anthropic".to_string())
+        );
+        assert_eq!(
+            detect_claude_gateway_provider(&serde_json::json!({
+                "message": { "id": "" }
+            })),
+            None
+        );
+        assert_eq!(detect_claude_gateway_provider(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn partition_key_from_selector_uses_plan_type_and_window_bucket() {
+        let mut selector = SelectorCapture::default();
+        insert_selector_raw(
+            &mut selector,
+            "subscription_product",
+            "test.source",
+            &serde_json::Value::String("pro".to_string()),
+        );
+        insert_selector_raw(
+            &mut selector,
+            "plan_window_bucket",
+            "test.source",
+            &serde_json::Value::Number(20604.into()),
+        );
+        insert_selector_raw(
+            &mut selector,
+            "gateway_provider",
+            "test.source",
+            &serde_json::Value::String("openai".to_string()),
+        );
+        let key = partition_key_from_selector(&selector);
+        assert_eq!(key.gateway_provider.as_deref(), Some("openai"));
+        assert_eq!(key.plan_fingerprint.as_deref(), Some("pro::20604"));
+    }
+
+    #[test]
+    fn codex_cumulative_split_across_plan_window_rollover_attributes_delta_only() {
+        // Regression: a single Codex session that crosses a `secondary.resets_at`
+        // day-boundary must not let the new plan_window_bucket partition
+        // swallow the entire prior cumulative as its first "delta". The first
+        // event has cumulative 100/40; the second event (same plan, same
+        // session) has cumulative 130/55 but `secondary.resets_at` ticks over
+        // to the next 86_400-second bucket. Expected: pro::20603 has 100/40,
+        // pro::20604 has 30/15. Wrong (pre-fix): pro::20604 would have 130/55.
+        let path = temp_file("codex-rollover");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T23:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-rollover-session\"}}\n",
+                "{\"timestamp\":\"2026-05-31T23:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":40,\"request_count\":1},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"pro\",\"secondary\":{\"resets_at\":1780123199}}}}\n",
+                "{\"timestamp\":\"2026-06-01T00:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":130,\"output_tokens\":55,\"request_count\":2},\"model\":\"gpt-5.5\"},\"rate_limits\":{\"plan_type\":\"pro\",\"secondary\":{\"resets_at\":1780209599}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_codex_jsonl_file(
+            &path,
+            "2026-06-01T00:35:00Z",
+            "rollover-fingerprint".to_string(),
+        )
+        .expect("parse");
+        // bucket 20603 = floor(1780123199 / 86400), bucket 20604 = floor(1780209599 / 86400)
+        let first = items
+            .iter()
+            .find(|s| s.plan_fingerprint.as_deref() == Some("pro::20603"))
+            .expect("pre-rollover partition");
+        let second = items
+            .iter()
+            .find(|s| s.plan_fingerprint.as_deref() == Some("pro::20604"))
+            .expect("post-rollover partition");
+        assert_eq!(
+            first.input_tokens, 100,
+            "pre-rollover keeps first cumulative"
+        );
+        assert_eq!(first.output_tokens, 40);
+        assert_eq!(
+            second.input_tokens, 30,
+            "post-rollover gets only the delta, not the full cumulative"
+        );
+        assert_eq!(second.output_tokens, 15);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_partition_inherits_only_when_line_lacks_gateway_provider() {
+        // Regression: a Pi turn that omits gatewayProvider must NOT inherit
+        // the gateway_provider key from a prior labeled turn into the
+        // partition key. The unlabeled turn lands in the default (None)
+        // partition rather than mis-attributing to anthropic.
+        let path = temp_file("pi-partition-isolation");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"timestamp\":\"2026-05-20T09:00:00Z\",\"sessionId\":\"pi-iso\",\"cwd\":\"/work\"}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747731600000,\"gatewayProvider\":\"anthropic\",\"modelProvider\":\"anthropic\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input\":10,\"output\":5}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747731660000,\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input\":7,\"output\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items =
+            parse_pi_jsonl_file(&path, "2026-05-20T09:05:00Z", "iso-fingerprint".to_string())
+                .expect("parse");
+        let labeled = items
+            .iter()
+            .find(|s| s.gateway_provider.as_deref() == Some("anthropic"))
+            .expect("anthropic partition");
+        let unlabeled = items.iter().find(|s| s.gateway_provider.is_none());
+        assert_eq!(labeled.input_tokens, 10);
+        assert_eq!(labeled.output_tokens, 5);
+        assert!(
+            unlabeled.is_some(),
+            "unlabeled turn lands in default partition, not anthropic"
+        );
+        let unlabeled = unlabeled.unwrap();
+        assert_eq!(unlabeled.input_tokens, 7);
+        assert_eq!(unlabeled.output_tokens, 3);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn partition_key_omits_plan_fingerprint_when_neither_subscription_nor_bucket_present() {
+        let mut selector = SelectorCapture::default();
+        insert_selector_raw(
+            &mut selector,
+            "gateway_provider",
+            "test.source",
+            &serde_json::Value::String("vertex".to_string()),
+        );
+        let key = partition_key_from_selector(&selector);
+        assert_eq!(key.gateway_provider.as_deref(), Some("vertex"));
+        assert!(key.plan_fingerprint.is_none());
     }
 }

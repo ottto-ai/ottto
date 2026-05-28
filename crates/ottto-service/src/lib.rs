@@ -1,6 +1,7 @@
 pub mod adaptive_collector;
 pub mod agent_configs;
 pub mod agent_status;
+pub mod backfill;
 pub(crate) mod command_env;
 pub mod control;
 pub mod keychain;
