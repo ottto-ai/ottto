@@ -4,8 +4,8 @@ use crate::backfill::{
     pending_backfill_sources, run_backfill, save_backfill_state,
 };
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest, SnapshotApiClient,
-    SnapshotStatusRequest,
+    load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest, BatchRejected,
+    SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots, ScanIndex, SnapshotBatchRequest, SnapshotSource,
@@ -235,6 +235,40 @@ fn sync_source(
         let response = match client.upload_batch(&relay_token, &request) {
             Ok(response) => response,
             Err(error) => {
+                // Distinguish a backend payload rejection (4xx, almost always a
+                // daemon<->backend schema mismatch — persistent, not transient)
+                // from a transport fault. The schema case gets a LOUD, specific
+                // log + a distinct collector-status code so the next contract
+                // drift is visible immediately instead of running silent (the
+                // v5->v6 break only surfaced as a vague "upload failed" line).
+                let (state, context) =
+                    if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+                        eprintln!(
+                            "ottto-service: snapshot batch REJECTED by backend (HTTP {}) for {} — \
+                             daemon SNAPSHOT_SCHEMA_VERSION={} does not match what the backend \
+                             accepts; usage/cost sync is NOT reaching the backend until the daemon \
+                             or backend is updated. This is a schema/contract mismatch, not a \
+                             network error.",
+                            rejected.status,
+                            source.api_slug(),
+                            SNAPSHOT_SCHEMA_VERSION,
+                        );
+                        (
+                            CollectorState::Error {
+                                code: "schema_rejected",
+                                message: "backend rejected snapshot batch (schema/contract mismatch)",
+                            },
+                            "backend rejected snapshot batch (schema mismatch)",
+                        )
+                    } else {
+                        (
+                            CollectorState::Error {
+                                code: "network_error",
+                                message: "local snapshot upload failed",
+                            },
+                            "upload local snapshots",
+                        )
+                    };
                 let _ = report_status(
                     client,
                     &relay_token,
@@ -243,13 +277,10 @@ fn sync_source(
                         machine_id,
                         scan_started_at: &scan_started_at,
                         counts: SyncCounts::from_scan_result(&scan_result, accepted),
-                        state: CollectorState::Error {
-                            code: "network_error",
-                            message: "local snapshot upload failed",
-                        },
+                        state,
                     },
                 );
-                return Err(error.context("upload local snapshots"));
+                return Err(error.context(context));
             }
         };
         if response.disabled {

@@ -10,6 +10,30 @@ use serde_json::json;
 
 const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
 
+/// The backend rejected a snapshot batch with an HTTP 4xx. This is almost
+/// always a daemon<->backend schema/contract mismatch (the daemon emitting a
+/// shape the backend's strict validator refuses), not a transient transport
+/// fault. Surfaced as a typed error so `snapshot_sync` can emit a loud,
+/// specific diagnostic and report a `schema_rejected` collector status instead
+/// of burying it as a generic `network_error` — the failure mode that let the
+/// v5->v6 break run silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for BatchRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected snapshot batch: HTTP {} (likely daemon/backend schema mismatch)",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for BatchRejected {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivityHintResponse {
     pub source: String,
@@ -146,13 +170,24 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
     ) -> Result<SnapshotBatchResponse> {
-        ureq::post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
+        match ureq::post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
-            .map_err(|error| anyhow!("upload snapshot batch failed: {error}"))?
-            .into_json()
-            .map_err(|error| anyhow!("parse snapshot batch response failed: {error}"))
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse snapshot batch response failed: {error}")),
+            // 4xx = the backend refused the payload (schema/contract mismatch),
+            // not a transient fault. Tag it typed so the caller can be loud and
+            // specific. We deliberately do NOT echo the response body: it can
+            // carry backend-internal detail, and the status code plus the daemon
+            // schema version is enough to diagnose and act on.
+            Err(ureq::Error::Status(code, _response)) if (400..500).contains(&code) => {
+                Err(anyhow::Error::new(BatchRejected { status: code }))
+            }
+            Err(error) => Err(anyhow!("upload snapshot batch failed: {error}")),
+        }
     }
 
     pub fn report_status(
@@ -202,6 +237,24 @@ pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)
 mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
+
+    #[test]
+    fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
+        // The upload_batch 4xx path wraps BatchRejected in anyhow::Error; the
+        // snapshot_sync caller relies on downcast_ref to choose the loud
+        // schema-mismatch diagnostic over the generic network-error path.
+        let err = anyhow::Error::new(BatchRejected { status: 422 });
+        let rejected = err
+            .downcast_ref::<BatchRejected>()
+            .expect("BatchRejected must downcast from anyhow::Error");
+        assert_eq!(rejected.status, 422);
+        assert!(err.to_string().contains("422"));
+        assert!(err.to_string().contains("schema mismatch"));
+
+        // A plain transport error must NOT masquerade as a schema rejection.
+        let other = anyhow!("upload snapshot batch failed: connection refused");
+        assert!(other.downcast_ref::<BatchRejected>().is_none());
+    }
 
     #[test]
     fn api_urls_are_joined_without_double_slashes() {
