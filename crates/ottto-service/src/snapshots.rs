@@ -4596,4 +4596,208 @@ mod tests {
 
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn v6_snapshot_batch_matches_backend_contract() {
+        // Golden daemon<->backend contract guard. Companion to the backend's
+        // backend/tests/unit/test_daemon_snapshot_contract.py (master 6fa4deeff),
+        // which validates the canonical daemon payload (generated from THIS
+        // serializer) against AgentSessionSnapshotBatchRequest, declared
+        // `extra="forbid"`. The v5->v6 break shipped silent because no
+        // cross-language test existed: the daemon emitted item-level
+        // gateway_provider / plan_fingerprint / backfill_source while the backend
+        // forbade them, so every batch 422'd. Keep the two tests in lockstep:
+        // when the snapshot schema changes, update the field sets below AND the
+        // backend fixture/model together.
+
+        // Allowed AgentSessionSnapshotItem fields (extra="forbid"), copied from
+        // app/schemas/agent_session_snapshots.py. `cost` is allowed but the
+        // daemon does not emit it — we assert subset, not equality.
+        const ALLOWED_ITEM_FIELDS: &[&str] = &[
+            "source_session_id",
+            "snapshot_fingerprint",
+            "status",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "model_usage",
+            "usage_buckets",
+            "cost",
+            "session_display_name",
+            "session_display_name_source",
+            "source_started_at",
+            "source_ended_at",
+            "source_last_activity_at",
+            "collected_at",
+            "workspace_hash",
+            "workspace_display_label",
+            "workspace_label_source",
+            "source_file_fingerprint",
+            "provenance",
+        ];
+        // Allowed AgentSessionSnapshotModelUsage fields (extra="forbid").
+        const ALLOWED_ROW_FIELDS: &[&str] = &[
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "reasoning_output_tokens",
+            "unattributed_total_tokens",
+            "request_count",
+            "selector_context",
+            "selector_sources",
+            "billing_provider",
+            "model_provider",
+            "billing_channel",
+            "auth_mode",
+            "gateway_provider",
+            "subscription_product",
+            "account_identifier_hash",
+            "cost_usd",
+        ];
+        // The exact v5 item-level attribution keys the backend now forbids — the
+        // shape that produced the 422. A daemon regression that re-adds any of
+        // these to the item is caught here, not in prod.
+        const FORBIDDEN_ITEM_FIELDS: &[&str] =
+            &["gateway_provider", "plan_fingerprint", "backfill_source"];
+
+        // One Vertex Claude row (mirrors the backend's snapshot_batch_v6.json),
+        // carried both as the item-level aggregate and inside the hour bucket.
+        let vertex_row = SnapshotModelUsage {
+            model: "claude-opus-4-7".to_string(),
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_read_tokens: 10,
+            cache_creation_5m_tokens: 5,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            selector_context: BTreeMap::from([(
+                "service_tier".to_string(),
+                "standard".to_string(),
+            )]),
+            selector_sources: BTreeMap::from([(
+                "service_tier".to_string(),
+                "message.usage.service_tier".to_string(),
+            )]),
+            auth_mode: Some("service_account_oauth".to_string()),
+            billing_channel: Some("cloud".to_string()),
+            billing_provider: Some("google_cloud".to_string()),
+            gateway_provider: Some("vertex".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            subscription_product: None,
+        };
+        let item = SnapshotItem {
+            source_session_id: "claude-vertex-session-1".to_string(),
+            snapshot_fingerprint: "a".repeat(32),
+            status: "final".to_string(),
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_read_tokens: 10,
+            cache_creation_5m_tokens: 5,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            model_usage: vec![vertex_row.clone()],
+            usage_buckets: vec![SnapshotUsageBucket {
+                bucket_start: "2026-05-28T17:00:00Z".to_string(),
+                model_usage: vec![vertex_row],
+                first_activity_at: Some("2026-05-28T17:05:00Z".to_string()),
+                last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
+            }],
+            session_display_name: None,
+            session_display_name_source: None,
+            source_started_at: Some("2026-05-28T17:00:00Z".to_string()),
+            source_ended_at: Some("2026-05-28T17:45:00Z".to_string()),
+            source_last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
+            collected_at: "2026-05-28T17:46:00Z".to_string(),
+            workspace_hash: Some("b".repeat(32)),
+            workspace_display_label: None,
+            workspace_label_source: None,
+            source_file_fingerprint: Some("c".repeat(32)),
+            provenance: SnapshotProvenance {
+                collector: "claude_code_jsonl".to_string(),
+                source_file_count: 1,
+                input_token_scope: Some("uncached".to_string()),
+                state_total_tokens: None,
+                state_archived: None,
+            },
+        };
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: SnapshotSource::ClaudeCode.api_slug().to_string(),
+            machine_id: "machine-contract-0001".to_string(),
+            collector_version: Some("local-enriched/1".to_string()),
+            snapshots: vec![item],
+        };
+        let value = serde_json::to_value(&request).expect("serialize v6 batch");
+
+        // (1) schema version is 6 — both the constant and the wire value.
+        assert_eq!(SNAPSHOT_SCHEMA_VERSION, 6);
+        assert_eq!(value["schema_version"], json!(6));
+
+        let allowed_item: BTreeSet<&str> = ALLOWED_ITEM_FIELDS.iter().copied().collect();
+        let allowed_row: BTreeSet<&str> = ALLOWED_ROW_FIELDS.iter().copied().collect();
+
+        let item_value = &value["snapshots"][0];
+        let snapshot = item_value
+            .as_object()
+            .expect("snapshot item serializes to an object");
+
+        // (2) every snapshot-item key is within the backend's allowed item set.
+        for key in snapshot.keys() {
+            assert!(
+                allowed_item.contains(key.as_str()),
+                "snapshot item key `{key}` is not in the backend AgentSessionSnapshotItem field set"
+            );
+        }
+
+        // (3) no v5 item-level attribution keys (the precise 422 cause).
+        for forbidden in FORBIDDEN_ITEM_FIELDS {
+            assert!(
+                !snapshot.contains_key(*forbidden),
+                "snapshot item must NOT carry v5 item-level `{forbidden}` (the v6 422 cause)"
+            );
+        }
+
+        // (4) every model_usage row key — item-level AND per-bucket — is within
+        // the backend's allowed row set, and attribution rides on the row.
+        let mut rows: Vec<&Value> = item_value["model_usage"]
+            .as_array()
+            .expect("item model_usage is an array")
+            .iter()
+            .collect();
+        for bucket in item_value["usage_buckets"]
+            .as_array()
+            .expect("usage_buckets is an array")
+        {
+            rows.extend(
+                bucket["model_usage"]
+                    .as_array()
+                    .expect("bucket model_usage is an array"),
+            );
+        }
+        assert!(!rows.is_empty(), "expected at least one model_usage row");
+        for row in rows {
+            let row = row.as_object().expect("model_usage row is an object");
+            for key in row.keys() {
+                assert!(
+                    allowed_row.contains(key.as_str()),
+                    "model_usage row key `{key}` is not in the backend \
+                     AgentSessionSnapshotModelUsage field set"
+                );
+            }
+            // v6 moved attribution onto the row; assert it is actually there.
+            assert_eq!(row.get("gateway_provider"), Some(&json!("vertex")));
+        }
+    }
 }
