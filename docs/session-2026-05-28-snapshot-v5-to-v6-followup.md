@@ -2,23 +2,43 @@
 
 ## Status
 
-Open. The daemon is pinned at `SNAPSHOT_SCHEMA_VERSION = 5`
-(`crates/ottto-service/src/snapshots.rs:16`) while the private backend's
-`AgentSessionSnapshotBatchRequest`
-(`backend/app/schemas/agent_session_snapshots.py:380-390`) requires
-`schema_version: Literal[6]` with `model_config = ConfigDict(extra="forbid")`.
-Daemon batch uploads to `POST /api/v1/agent-session-snapshots/batches`
-return 422 every tick, surfacing in the daemon log as:
+**Resolved** in `693e2654` (daemon v6 batch schema) on `main`. The
+`cargo fmt` fix for that commit landed in `rons/v6-fmt-and-doc`. The
+daemon now emits `SNAPSHOT_SCHEMA_VERSION = 6` with per-hour
+`usage_buckets` and per-`model_usage` attribution row keys matching the
+backend's `AgentSessionSnapshotBatchRequest`
+(`backend/app/schemas/agent_session_snapshots.py`).
+
+Verified in production against the live backend: a hot-swapped v6 daemon
+completed the full retroactive backfill for all three sources and the
+backend accepted every batch — `snapshot_backfill_state.json` recorded
+`codex_jsonl:v15`, `claude_code_jsonl:v7`, `pi_jsonl:v6` (only written
+after an accepted upload), and all three scan-index files saved (only
+written after a clean upload loop). The 422 is fixed.
+
+One operational caveat remains: the **live daemon** still runs the old
+`/Applications/Ottto.app/Contents/Helpers/ottto-service` (v5) binary, so
+the 422 log spam continues on this machine until a clean reinstall of an
+official Ottto.app carrying the merged v6 daemon. Non-blocking — this is
+session-level usage/cost data, not the agent-status surface (schema
+v2, separate table) that drives the ottto.net/apps "DETECTED" counter.
+
+The analysis below is retained as the historical record of why the fix
+was scoped as a separate change.
+
+---
+
+### Original problem (historical)
+
+The daemon was pinned at `SNAPSHOT_SCHEMA_VERSION = 5` while the backend
+required `schema_version: Literal[6]` with
+`model_config = ConfigDict(extra="forbid")`, so daemon batch uploads to
+`POST /api/v1/agent-session-snapshots/batches` returned 422 every tick:
 
 ```
 local snapshot sync skipped for codex: local snapshot upload failed
 local snapshot sync skipped for claude_code: local snapshot upload failed
 ```
-
-Non-blocking — the agent-status snapshots endpoint (different surface,
-different table) is on schema_version=2 and works end-to-end, which is
-what populates the ottto.net/apps "DETECTED" counter. This is the
-session-level usage/cost data that's stuck, not onboarding state.
 
 ## What changed on the backend (causing the drift)
 
@@ -35,7 +55,7 @@ SnapshotItem-level `gateway_provider` / `plan_fingerprint` /
 `backfill_source` fields the daemon sends are now `extra="forbid"`
 rejections.
 
-## Why we didn't just patch this autonomously
+## Why it was scoped as a separate change (historical)
 
 A simple "drop the rejected fields + bump schema_version" patch fails
 the backend validator at line 327-328:
@@ -71,16 +91,32 @@ The proper fix is a focused daemon refactor:
    at `snapshots.rs:730-806` plus the cached scan-index emitters at
    `snapshots.rs:2853, 2896` etc.
 
-That's a real day-of-work change in the daemon's partition state. Out
-of scope for the autonomous "fix the broken-pipe and 422" session that
-spawned this note.
+That was a real day-of-work change in the daemon's partition state,
+scoped separately from the "fix the broken-pipe and 422" session that
+spawned this note. **It has since landed** — see Status above.
+
+## How it was resolved
+
+The daemon's `SnapshotPartition` (separate per-row `model_usage` + per-hour
+`activity_buckets` maps) was replaced by a single per-hour-per-row
+aggregator: `BTreeMap<bucket_start, BTreeMap<RowKey, BucketRowAccumulator>>`,
+where `RowKey = (model, reduced selector_hash, auth_mode, billing_channel,
+billing_provider, gateway_provider, model_provider, subscription_product)` —
+mirroring the backend's `_usage_row_key`. `into_items` sums per-row across
+hours for the top-level `model_usage`/totals and emits the per-hour
+breakdown as `usage_buckets`, so the backend's bucket-vs-top reconciliation
+passes. The six billing fields are hoisted out of `selector_context` onto
+each row, and the selector is reduced to the backend's 12-key allowlist so
+stripped keys (`plan_window_bucket`, `agent_quota_*`) don't create phantom
+rows. Codex state-only snapshots synthesize a single bucket at
+floor(`updated_at` → hour). The status endpoint stays at schema v5
+(`SNAPSHOT_STATUS_SCHEMA_VERSION`); only the batch endpoint moved to v6.
 
 ## Recommendations
 
-- Open a separate, focused PR for the daemon v6 sync.
-- While that lands, the 422 is harmless to onboarding — keep an eye on
-  the daemon log line count if it ever becomes noisy. Currently it
-  fires at the snapshot-sync cadence which is sparse.
+- Daemon v6 is on `main`. Package it into the next official Ottto.app
+  release alongside the OTLP-relay broken-pipe fix (PR #7) so the live
+  daemon stops emitting v5 and the 422 log spam clears on reinstall.
 - Backend already has a strict `extra="forbid"` v6 contract, matching
   the repo's "clean cutover" policy, so no backward-compatibility shim
   is needed (or wanted) on the backend side.

@@ -1857,12 +1857,7 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(usage) = pi_message_end_usage(value) {
                 let mut selector = accumulator.current_selector.clone();
                 selector.merge(pi_selector_from_message_end(value));
-                accumulator.add_usage_with_selector(
-                    model,
-                    usage,
-                    selector,
-                    timestamp.as_deref(),
-                );
+                accumulator.add_usage_with_selector(model, usage, selector, timestamp.as_deref());
             }
             accumulator.note_time(timestamp);
         }
@@ -2933,8 +2928,14 @@ mod tests {
         assert_eq!(item.usage_buckets.len(), 1);
         let bucket = &item.usage_buckets[0];
         assert_eq!(bucket.bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
-        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(
+            bucket.first_activity_at.as_deref(),
+            Some("2026-05-06T10:03:00Z")
+        );
+        assert_eq!(
+            bucket.last_activity_at.as_deref(),
+            Some("2026-05-06T10:03:00Z")
+        );
         assert_eq!(bucket.model_usage.len(), 1);
         assert_eq!(bucket.model_usage[0].request_count, 3);
         assert_eq!(item.model_usage[0].model, "gpt-5.5");
@@ -2973,12 +2974,24 @@ mod tests {
         assert_eq!(item.request_count, 2);
         assert_eq!(item.usage_buckets.len(), 2);
         assert_eq!(item.usage_buckets[0].bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(item.usage_buckets[0].first_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
-        assert_eq!(item.usage_buckets[0].last_activity_at.as_deref(), Some("2026-05-06T10:03:00Z"));
+        assert_eq!(
+            item.usage_buckets[0].first_activity_at.as_deref(),
+            Some("2026-05-06T10:03:00Z")
+        );
+        assert_eq!(
+            item.usage_buckets[0].last_activity_at.as_deref(),
+            Some("2026-05-06T10:03:00Z")
+        );
         assert_eq!(item.usage_buckets[0].model_usage[0].request_count, 1);
         assert_eq!(item.usage_buckets[1].bucket_start, "2026-05-06T11:00:00Z");
-        assert_eq!(item.usage_buckets[1].first_activity_at.as_deref(), Some("2026-05-06T11:04:00Z"));
-        assert_eq!(item.usage_buckets[1].last_activity_at.as_deref(), Some("2026-05-06T11:04:00Z"));
+        assert_eq!(
+            item.usage_buckets[1].first_activity_at.as_deref(),
+            Some("2026-05-06T11:04:00Z")
+        );
+        assert_eq!(
+            item.usage_buckets[1].last_activity_at.as_deref(),
+            Some("2026-05-06T11:04:00Z")
+        );
         assert_eq!(item.usage_buckets[1].model_usage[0].request_count, 1);
 
         let _ = fs::remove_file(path);
@@ -3497,8 +3510,14 @@ mod tests {
         assert_eq!(item.usage_buckets.len(), 1);
         let bucket = &item.usage_buckets[0];
         assert_eq!(bucket.bucket_start, "2026-05-19T10:00:00Z");
-        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-19T10:02:00Z"));
-        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-19T10:03:00Z"));
+        assert_eq!(
+            bucket.first_activity_at.as_deref(),
+            Some("2026-05-19T10:02:00Z")
+        );
+        assert_eq!(
+            bucket.last_activity_at.as_deref(),
+            Some("2026-05-19T10:03:00Z")
+        );
         // Two distinct service_tier rows aggregate within the same hour.
         let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
         assert_eq!(bucket_request_count, 2);
@@ -3771,8 +3790,14 @@ mod tests {
         assert_eq!(item.usage_buckets.len(), 1);
         let bucket = &item.usage_buckets[0];
         assert_eq!(bucket.bucket_start, "2026-05-06T10:00:00Z");
-        assert_eq!(bucket.first_activity_at.as_deref(), Some("2026-05-06T10:01:00Z"));
-        assert_eq!(bucket.last_activity_at.as_deref(), Some("2026-05-06T10:02:00Z"));
+        assert_eq!(
+            bucket.first_activity_at.as_deref(),
+            Some("2026-05-06T10:01:00Z")
+        );
+        assert_eq!(
+            bucket.last_activity_at.as_deref(),
+            Some("2026-05-06T10:02:00Z")
+        );
         let bucket_request_count: u64 = bucket.model_usage.iter().map(|r| r.request_count).sum();
         assert_eq!(bucket_request_count, 2);
         assert_eq!(item.model_usage[0].model, "claude-sonnet-4-6");
@@ -4164,8 +4189,14 @@ mod tests {
         assert_eq!(items.len(), 1, "single row for pure vertex session");
         let item = items.into_iter().next().expect("snapshot");
         // gateway_provider / model_provider now live on the model_usage row.
-        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("vertex"));
-        assert_eq!(item.model_usage[0].model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            item.model_usage[0].gateway_provider.as_deref(),
+            Some("vertex")
+        );
+        assert_eq!(
+            item.model_usage[0].model_provider.as_deref(),
+            Some("anthropic")
+        );
         assert!(item.model_usage[0].subscription_product.is_none());
         assert_eq!(item.input_tokens, 16);
         assert_eq!(item.output_tokens, 11);
@@ -4193,8 +4224,14 @@ mod tests {
         .expect("parse");
         assert_eq!(items.len(), 1);
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("bedrock"));
-        assert_eq!(item.model_usage[0].model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            item.model_usage[0].gateway_provider.as_deref(),
+            Some("bedrock")
+        );
+        assert_eq!(
+            item.model_usage[0].model_provider.as_deref(),
+            Some("anthropic")
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -4218,7 +4255,10 @@ mod tests {
         )
         .expect("parse");
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.model_usage[0].gateway_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            item.model_usage[0].gateway_provider.as_deref(),
+            Some("anthropic")
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -4333,7 +4373,10 @@ mod tests {
         )
         .expect("parse");
         let item = items.into_iter().next().expect("snapshot");
-        assert_eq!(item.model_usage[0].subscription_product.as_deref(), Some("team"));
+        assert_eq!(
+            item.model_usage[0].subscription_product.as_deref(),
+            Some("team")
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -4366,8 +4409,14 @@ mod tests {
             .into_iter()
             .next()
             .expect("team snapshot");
-        assert_eq!(pro_item.model_usage[0].subscription_product.as_deref(), Some("pro"));
-        assert_eq!(team_item.model_usage[0].subscription_product.as_deref(), Some("team"));
+        assert_eq!(
+            pro_item.model_usage[0].subscription_product.as_deref(),
+            Some("pro")
+        );
+        assert_eq!(
+            team_item.model_usage[0].subscription_product.as_deref(),
+            Some("team")
+        );
         assert_ne!(
             pro_item.snapshot_fingerprint,
             team_item.snapshot_fingerprint
