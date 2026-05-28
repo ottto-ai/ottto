@@ -6658,14 +6658,40 @@ mod tests {
     use crate::{ControlToken, LocalDaemon};
     use ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV;
     use ottto_protocol::{LocalClientKind, MachineIdentity, OperatingSystem, SecretString};
+    use serial_test::serial;
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // The per-file Mutex below serializes tests within control.rs that mutate
+    // shared process env vars (HOME, OTTTO_*). The #[serial] markers on each
+    // such test extend that boundary across the entire ottto-service test
+    // binary so that other modules whose tests merely *read* HOME (snapshot_sync,
+    // agent_status, agent_configs::detection, etc.) cannot observe HOME
+    // mid-swap. Two named tests — verify_repair_repairs_codex_config_before_account_check
+    // and verify_without_local_account_points_to_app_sign_in — failed at full
+    // --test-threads, pass at 4; #[serial] on all env-mutating tests is the
+    // robust fix, since the per-file Mutex only protects against intra-file
+    // contention.
     static TELEMETRY_CONTROL_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TELEMETRY_KEY_STORE_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Acquire the backend/env test lock, tolerating a poisoned mutex.
+    ///
+    /// The guarded value is `()` and every caller restores the process env it
+    /// mutated via `EnvVarGuard` on scope exit, so a panic inside one critical
+    /// section leaves no shared state for the next test to observe. Recovering
+    /// the guard with `into_inner()` keeps a single legitimate test failure from
+    /// cascading into a wall of spurious `PoisonError` panics in every later
+    /// test that takes this lock — which is exactly what masked the real
+    /// failure when these tests raced at full `--test-threads`.
+    fn lock_backend_test_env() -> std::sync::MutexGuard<'static, ()> {
+        TELEMETRY_CONTROL_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -6828,6 +6854,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn logout_without_cloud_connection_points_to_local_only_escape_hatch() {
         let support_root = telemetry_key_store_root("logout-missing-connection");
         let _support_guard =
@@ -6851,6 +6878,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn logout_backend_unavailable_preserves_local_state() {
         let secret_root = telemetry_key_store_root("logout-unavailable");
         fs::create_dir_all(&secret_root).expect("secret root");
@@ -7525,10 +7553,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_accepts_fresh_enable_request_without_leaking_key() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("enable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("enable-install");
@@ -7652,10 +7679,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_disable_removes_stored_key() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("disable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-install");
@@ -7712,10 +7738,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_disable_preserves_key_when_fence_needs_review() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("disable-manual-fence");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-manual-fence-install");
@@ -7770,10 +7795,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_status_returns_indexed_key_id() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("status-key");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let store = TelemetryKeyStore::file_only(&store_root);
@@ -7815,10 +7839,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn uninstall_sweep_removes_indexed_telemetry_keys() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("uninstall");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let store = TelemetryKeyStore::file_only(&store_root);
@@ -7854,10 +7877,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_enable_needs_attention_when_agent_missing() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let store_root = telemetry_key_store_root("missing-agent");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let missing = AgentInstallationDetection {
@@ -7954,10 +7976,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn telemetry_control_rejects_backend_rejected_token() {
-        let _guard = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("telemetry control backend test lock");
+        let _guard = lock_backend_test_env();
         let api_base_url = control_token_validation_server(401);
         let response = handle_request(
             &daemon(),
@@ -8570,6 +8591,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    #[serial]
     fn backup_retention_keeps_newest_n_and_invalid_env_uses_default() {
         let root = std::env::temp_dir().join(format!(
             "ottto-backup-retention-test-{}-{}",
@@ -8609,10 +8631,9 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    #[serial]
     fn source_patch_disabled_parses_per_source_truthy_values() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("patch env test lock");
+        let _lock = lock_backend_test_env();
         assert_eq!(source_patch_env_token(&SourceKind::Codex), Some("CODEX"));
         assert_eq!(
             source_patch_env_token(&SourceKind::ClaudeCode),
@@ -8628,10 +8649,9 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    #[serial]
     fn source_patch_disabled_ignores_falsey_values() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("patch env test lock");
+        let _lock = lock_backend_test_env();
         let _guard = EnvVarGuard::set_str("OTTTO_PATCH_CLAUDE_CODE_DISABLED", "false");
         assert!(!source_patch_disabled(&SourceKind::ClaudeCode));
     }
@@ -8839,10 +8859,9 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    #[serial]
     fn verify_repair_repairs_codex_config_before_account_check() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("home env test lock");
+        let _lock = lock_backend_test_env();
         let root = control_test_root("verify-repair-codex");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
@@ -8886,10 +8905,9 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
     fn verify_patch_disabled_skips_repair_writes() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("patch env test lock");
+        let _lock = lock_backend_test_env();
         let root = control_test_root("verify-patch-disabled");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
@@ -8927,10 +8945,9 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
     fn fix_non_dry_run_executes_claude_write_config_repair() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("home env test lock");
+        let _lock = lock_backend_test_env();
         let root = control_test_root("fix-claude-config");
         create_control_test_dir(&root.join(".claude"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
@@ -8973,10 +8990,9 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
     fn fix_patch_disabled_blocks_claude_repair_writes() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("patch env test lock");
+        let _lock = lock_backend_test_env();
         let root = control_test_root("fix-disabled-claude");
         create_control_test_dir(&root.join(".claude"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
@@ -9014,10 +9030,9 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
     fn remove_claude_code_env_ignores_patch_disabled_env() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("patch env test lock");
+        let _lock = lock_backend_test_env();
         let root = std::env::temp_dir().join(format!(
             "ottto-claude-env-remove-disabled-test-{}-{}",
             std::process::id(),
@@ -9317,10 +9332,9 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
     fn verify_without_local_account_points_to_app_sign_in() {
-        let _lock = TELEMETRY_CONTROL_BACKEND_TEST_LOCK
-            .lock()
-            .expect("home env test lock");
+        let _lock = lock_backend_test_env();
         let root = control_test_root("verify-no-account");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);

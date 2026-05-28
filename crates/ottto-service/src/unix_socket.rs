@@ -164,11 +164,13 @@ mod tests {
         LocalClientKind, LocalControlCommand, LocalControlRequest, MachineIdentity,
         OperatingSystem, LOCAL_CONTROL_PROTOCOL_VERSION,
     };
+    use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
+    #[serial]
     fn unix_socket_serves_authenticated_status() {
         let path = std::env::temp_dir().join(format!(
             "ottto-service-test-{}-{}.sock",
@@ -205,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn unix_socket_permissions_are_user_only() {
         let path = std::env::temp_dir().join(format!(
             "ottto-service-test-{}-{}.sock",
@@ -243,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn unix_socket_does_not_require_client_write_shutdown() {
         let path = std::env::temp_dir().join(format!(
             "ottto-service-test-{}-{}.sock",
@@ -280,6 +284,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn unix_socket_rejects_stale_protocol_request_with_local_control_error() {
         let path = std::env::temp_dir().join(format!(
             "ottto-service-test-{}-{}.sock",

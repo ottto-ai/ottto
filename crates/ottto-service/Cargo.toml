@@ -32,5 +32,8 @@ time.workspace = true
 toml_edit.workspace = true
 ureq.workspace = true
 
+[dev-dependencies]
+serial_test.workspace = true
+
 [build-dependencies]
 cc.workspace = true
