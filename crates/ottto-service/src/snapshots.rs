@@ -22,11 +22,20 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // index treats every previously-scanned file as fresh and re-emits at the v6
 // shape; pending-backfill tracking re-runs the retroactive walk for the same
 // reason.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v15";
+// v16: the Codex state-only fallback now treats a session whose rollout was
+// parsed in ANY prior scan run (tracked in the persisted scan index) as
+// covered, instead of only sessions parsed in the current run. The version
+// bump re-walks every rollout once so the backend supersedes the stale
+// unattributed "Other" totals that the previous (run-scoped) check produced
+// on every incremental scan.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v16";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v7";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v6";
-pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 1_000;
-pub const BACKFILL_WINDOW_DAYS: u64 = 183;
+// Generous ceilings: scanning is incremental (per-file fingerprint) and
+// streaming, so a larger history is a one-time backfill cost with bounded
+// memory. The finite caps still guard a pathological ~/.codex.
+pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
+pub const BACKFILL_WINDOW_DAYS: u64 = 730;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -898,6 +907,26 @@ pub fn scan_source_roots(
     collected_at: &str,
     requested_backfill_window_days: u64,
 ) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+    )
+}
+
+// Inner form with an injectable file cap so the cap-policy test can exercise
+// truncation without materializing `MAX_BACKFILL_FILES_PER_SOURCE` files.
+fn scan_source_roots_with_limit(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+) -> Result<SourceScanResult> {
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
     let codex_title_metadata = if source == SnapshotSource::Codex {
         CodexTitleMetadata::load_from_roots(roots)
@@ -915,10 +944,9 @@ pub fn scan_source_roots(
         )?;
     }
     let discovered_file_count = files.len();
-    let skipped_file_count_due_to_limit =
-        discovered_file_count.saturating_sub(MAX_BACKFILL_FILES_PER_SOURCE);
+    let skipped_file_count_due_to_limit = discovered_file_count.saturating_sub(file_limit);
     files.sort_by_key(|file| Reverse(file.modified_unix_seconds));
-    files.truncate(MAX_BACKFILL_FILES_PER_SOURCE);
+    files.truncate(file_limit);
 
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
@@ -958,12 +986,17 @@ pub fn scan_source_roots(
         snapshots.extend(parsed);
     }
     if source == SnapshotSource::Codex {
-        append_codex_state_only_snapshots(&mut snapshots, &codex_title_metadata, collected_at);
+        append_codex_state_only_snapshots(
+            &mut snapshots,
+            &codex_title_metadata,
+            collected_at,
+            index,
+        );
     }
     Ok(SourceScanResult {
         source,
         backfill_window_days,
-        backfill_file_limit: MAX_BACKFILL_FILES_PER_SOURCE,
+        backfill_file_limit: file_limit,
         discovered_file_count,
         skipped_file_count_due_to_limit,
         scan_cap_hit: skipped_file_count_due_to_limit > 0,
@@ -989,13 +1022,37 @@ fn append_codex_state_only_snapshots(
     snapshots: &mut Vec<SnapshotItem>,
     metadata: &CodexTitleMetadata,
     collected_at: &str,
+    index: &ScanIndex,
 ) {
     let covered_session_ids: BTreeSet<String> = snapshots
         .iter()
         .map(|snapshot| snapshot.source_session_id.clone())
         .collect();
+    // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
+    // The incremental scan skips unchanged rollout files, so they are absent
+    // from this run's `snapshots`, but their split snapshot already reached the
+    // backend — re-emitting a state-only total would overwrite it with an
+    // unattributed "Other" (the bug this fix targets). We recover those session
+    // ids from the persisted scan index. Two correctness points:
+    //   * Only entries that actually produced a snapshot count
+    //     (`last_snapshot_fingerprint` is set). `index.record` runs for every
+    //     scanned file, including a rollout that parsed to zero usage rows; such
+    //     a session has no split snapshot, so it MUST still fall through to a
+    //     state-only total or its tokens would be dropped entirely.
+    //   * Session ids are derived from the rollout filename, so coverage does
+    //     not depend on the state DB `rollout_path` matching the scan path
+    //     byte-for-byte (home symlinks, relative paths, case differences).
+    let covered_in_prior_runs: BTreeSet<String> = index
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.last_snapshot_fingerprint.is_some())
+        .filter_map(|(path, _)| codex_session_id_from_path(Path::new(path)))
+        .collect();
     for (source_session_id, thread) in &metadata.state_threads {
-        if thread.tokens_used == 0 || covered_session_ids.contains(source_session_id) {
+        if thread.tokens_used == 0
+            || covered_session_ids.contains(source_session_id)
+            || covered_in_prior_runs.contains(source_session_id)
+        {
             continue;
         }
         snapshots.push(codex_state_only_snapshot(
@@ -2756,11 +2813,11 @@ mod tests {
     }
 
     #[test]
-    fn backfill_window_defaults_to_six_months_and_starts_from_now_when_zero() {
+    fn backfill_window_defaults_to_two_years_and_starts_from_now_when_zero() {
         let now = 1_800_000_000;
         let day_seconds = 24 * 60 * 60;
 
-        assert_eq!(BACKFILL_WINDOW_DAYS, 183);
+        assert_eq!(BACKFILL_WINDOW_DAYS, 730);
         assert!(is_recent_enough_at(
             now - BACKFILL_WINDOW_DAYS * day_seconds,
             now,
@@ -2778,7 +2835,10 @@ mod tests {
     #[test]
     fn scan_policy_caps_recent_files_and_reports_partial_state() {
         let root = temp_dir("scan-policy-cap");
-        for index in 0..=MAX_BACKFILL_FILES_PER_SOURCE {
+        // Inject a tiny cap so we exercise truncation without writing
+        // MAX_BACKFILL_FILES_PER_SOURCE (10k) fixture files.
+        let file_limit = 3;
+        for index in 0..=file_limit {
             let path = root.join(format!("session-{index:04}.jsonl"));
             fs::write(
                 path,
@@ -2791,24 +2851,22 @@ mod tests {
         }
 
         let mut index = ScanIndex::default();
-        let scan = scan_source_roots(
+        let scan = scan_source_roots_with_limit(
             SnapshotSource::Codex,
             std::slice::from_ref(&root),
             &mut index,
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
+            file_limit,
         )
         .expect("scan");
 
         assert_eq!(scan.backfill_window_days, BACKFILL_WINDOW_DAYS);
-        assert_eq!(scan.backfill_file_limit, MAX_BACKFILL_FILES_PER_SOURCE);
-        assert_eq!(
-            scan.discovered_file_count,
-            MAX_BACKFILL_FILES_PER_SOURCE + 1
-        );
+        assert_eq!(scan.backfill_file_limit, file_limit);
+        assert_eq!(scan.discovered_file_count, file_limit + 1);
         assert_eq!(scan.skipped_file_count_due_to_limit, 1);
         assert!(scan.scan_cap_hit);
-        assert_eq!(scan.scanned_file_count, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert_eq!(scan.scanned_file_count, file_limit);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3255,6 +3313,188 @@ mod tests {
             state_only.session_display_name.as_deref(),
             Some("Archived State Only")
         );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    // Standard Codex `threads` schema (no rollout_path column — coverage is
+    // derived from the rollout filename, not this column).
+    const CODEX_THREADS_DDL: &str = concat!(
+        "CREATE TABLE threads (",
+        "id TEXT PRIMARY KEY, title TEXT NOT NULL, tokens_used INTEGER NOT NULL, ",
+        "archived INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, ",
+        "created_at_ms INTEGER, updated_at_ms INTEGER, model TEXT)",
+    );
+    const CODEX_THREADS_INSERT: &str = concat!(
+        "INSERT INTO threads (id, title, tokens_used, archived, created_at, updated_at, ",
+        "created_at_ms, updated_at_ms, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    );
+
+    #[test]
+    fn codex_state_only_skips_sessions_already_parsed_in_a_prior_run() {
+        // Regression: the incremental scan skips a rollout file it parsed in an
+        // earlier run, so the session is absent from the current run's parsed
+        // set. The state-only fallback must NOT then re-emit an unattributed
+        // "Other" total for it (its split snapshot already reached the backend);
+        // coverage is judged against the persisted scan index (session ids of
+        // files that produced a snapshot), not just this run.
+        let codex_dir = temp_dir("codex-state-incremental");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-14T10-00-00-019e253c-9999-7000-9000-cccccccccccc.jsonl",
+            ),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-9999-7000-9000-cccccccccccc\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50,\"output_tokens\":9},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    "019e253c-9999-7000-9000-cccccccccccc",
+                    "Parsed Then Skipped",
+                    59_i64,
+                    0_i64,
+                    1_777_777_000_i64,
+                    1_777_777_100_i64,
+                    1_777_777_000_000_i64,
+                    1_777_777_100_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+
+        let roots = [sessions_dir];
+        let mut index = ScanIndex::default();
+
+        // First run: the rollout is parsed → split snapshot, no state-only total.
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].input_tokens, 50);
+        assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
+
+        // Second run (same index): the unchanged rollout is skipped, so it is not
+        // in this run's parsed set. With the fix, no state-only "Other" is emitted
+        // because the session is covered by a prior run in the scan index.
+        let second = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T11:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan");
+        assert!(
+            second
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.unattributed_total_tokens == 0),
+            "incremental re-scan must not re-emit an unattributed Other for an already-parsed session",
+        );
+        assert!(second.snapshots.iter().all(|snapshot| snapshot
+            .provenance
+            .input_token_scope
+            .as_deref()
+            != Some("total_only")));
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn codex_state_only_preserved_when_rollout_parses_to_no_usage() {
+        // Regression guard: a rollout that exists but yields zero usage rows
+        // (e.g. only session_meta, or a legacy/unknown token payload) is still
+        // recorded in the scan index, but it produced NO split snapshot. Such a
+        // thread must keep surfacing its tokens as a state-only "Other" — both
+        // on the first scan and on incremental re-scans — never be dropped just
+        // because the file was scanned.
+        let codex_dir = temp_dir("codex-state-empty-rollout");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        // session_meta only — no token_count event, so parsing yields no rows.
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-14T10-00-00-019e253c-aaaa-7000-9000-eeeeeeeeeeee.jsonl",
+            ),
+            "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-aaaa-7000-9000-eeeeeeeeeeee\"}}\n",
+        )
+        .expect("write fixture");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    "019e253c-aaaa-7000-9000-eeeeeeeeeeee",
+                    "Unparseable Rollout",
+                    4_321_i64,
+                    0_i64,
+                    1_777_777_000_i64,
+                    1_777_777_100_i64,
+                    1_777_777_000_000_i64,
+                    1_777_777_100_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+
+        let roots = [sessions_dir];
+        let mut index = ScanIndex::default();
+
+        let assert_state_only = |label: &str, scan: &SourceScanResult| {
+            let state_only = scan
+                .snapshots
+                .iter()
+                .find(|s| s.source_session_id == "019e253c-aaaa-7000-9000-eeeeeeeeeeee")
+                .unwrap_or_else(|| panic!("{label}: expected a state-only snapshot"));
+            assert_eq!(state_only.unattributed_total_tokens, 4_321, "{label}");
+            assert_eq!(
+                state_only.provenance.input_token_scope.as_deref(),
+                Some("total_only"),
+                "{label}",
+            );
+        };
+
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_state_only("first scan", &first);
+
+        // Incremental re-scan: file skipped, but it never produced a snapshot, so
+        // the tokens must still surface as a state-only Other (not be dropped).
+        let second = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T11:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan");
+        assert_state_only("incremental re-scan", &second);
 
         let _ = fs::remove_dir_all(codex_dir);
     }
