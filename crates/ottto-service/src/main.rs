@@ -88,7 +88,8 @@ fn main() -> Result<()> {
                 current_rfc3339_timestamp(),
             )
             .with_account(FileAccountStore::default().load()?)
-            .with_connection(FileConnectionStore::default().load()?);
+            .with_connection(FileConnectionStore::default().load()?)
+            .with_source_state_dir(ottto_core::default_sources_dir());
             let status = daemon.status(&token)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -109,7 +110,8 @@ fn main() -> Result<()> {
                     current_rfc3339_timestamp(),
                 )
                 .with_account(FileAccountStore::default().load()?)
-                .with_connection(FileConnectionStore::default().load()?);
+                .with_connection(FileConnectionStore::default().load()?)
+                .with_source_state_dir(ottto_core::default_sources_dir());
                 if !once {
                     start_builtin_relays(&daemon);
                 }
@@ -136,7 +138,8 @@ fn main() -> Result<()> {
                 current_rfc3339_timestamp(),
             )
             .with_account(FileAccountStore::default().load()?)
-            .with_connection(FileConnectionStore::default().load()?);
+            .with_connection(FileConnectionStore::default().load()?)
+            .with_source_state_dir(ottto_core::default_sources_dir());
             start_builtin_relays(&daemon);
             #[cfg(all(target_os = "macos", unix))]
             {
@@ -267,7 +270,7 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(addr) => eprintln!("serving local OTLP relay at http://{addr}"),
         Err(error) => eprintln!("local OTLP relay unavailable: {error}"),
     }
-    match ottto_service::snapshot_sync::spawn_local_snapshot_sync() {
+    match ottto_service::snapshot_sync::spawn_local_snapshot_sync(daemon.clone()) {
         Ok(()) => eprintln!("serving local snapshot sync"),
         Err(error) => eprintln!("local snapshot sync unavailable: {error}"),
     }

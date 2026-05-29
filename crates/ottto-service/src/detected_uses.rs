@@ -96,7 +96,7 @@ pub fn merge_detected_uses(
     fresh: Vec<DetectedUse>,
 ) -> Vec<DetectedUse> {
     let mut by_key: BTreeMap<GroupKey, DetectedUse> = BTreeMap::new();
-    for entry in existing.into_iter().chain(fresh.into_iter()) {
+    for entry in existing.into_iter().chain(fresh) {
         let key = detected_use_key(&entry);
         match by_key.remove(&key) {
             Some(previous) => {

@@ -13,6 +13,7 @@ use crate::snapshots::{
     SnapshotSource, SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION,
     MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
+use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
 use ottto_protocol::{DetectedUse, SourceKind};
@@ -78,13 +79,13 @@ struct CollectorStatus<'a> {
     state: CollectorState<'a>,
 }
 
-pub fn spawn_local_snapshot_sync() -> Result<()> {
+pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
     std::thread::Builder::new()
         .name("ottto-snapshot-sync".to_string())
         .spawn(move || loop {
-            if let Err(error) = sync_once(&home, &support_dir) {
+            if let Err(error) = sync_once(&home, &support_dir, &daemon) {
                 eprintln!("local snapshot sync skipped: {}", safe_error(&error));
             }
             std::thread::sleep(SNAPSHOT_SYNC_INTERVAL);
@@ -93,7 +94,7 @@ pub fn spawn_local_snapshot_sync() -> Result<()> {
     Ok(())
 }
 
-fn sync_once(home: &Path, support_dir: &Path) -> Result<()> {
+fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -111,6 +112,7 @@ fn sync_once(home: &Path, support_dir: &Path) -> Result<()> {
             &machine_id,
             home,
             support_dir,
+            daemon,
         ) {
             eprintln!(
                 "local snapshot sync skipped for {}: {}",
@@ -129,6 +131,10 @@ fn sync_once(home: &Path, support_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// One extra parameter (the daemon handle, for caching the reconciliation
+// policy) pushes this one over clippy's 7-arg threshold; the alternative is a
+// throwaway context struct for an internal helper, which is not worth it.
+#[allow(clippy::too_many_arguments)]
 fn sync_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -137,10 +143,18 @@ fn sync_source(
     machine_id: &str,
     home: &Path,
     support_dir: &Path,
+    daemon: &LocalDaemon,
 ) -> Result<()> {
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let activity_hint = client.get_activity_hint(&relay_token)?;
+    // Cache the workspace reconciliation policy so the daemon can surface it on
+    // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
+    // only error path and is not worth aborting the sync over.
+    let _ = daemon.record_reconciliation_enabled(
+        source_kind(source),
+        activity_hint.local_usage_reconciliation_enabled,
+    );
     if !activity_hint.local_usage_reconciliation_enabled {
         report_status(
             client,

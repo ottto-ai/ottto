@@ -9,9 +9,10 @@ pub mod token_store;
 
 pub use account_store::{
     default_account_path, default_connection_api_base_url, default_connection_path,
-    default_device_path, default_machine_path, default_support_dir, is_persistent_installation_id,
-    is_persistent_machine_id, FileAccountStore, FileConnectionStore, FileDeviceStore,
-    FileMachineStore, LocalConnectionBinding, LocalDeviceBinding, LocalMachineBinding,
+    default_device_path, default_machine_path, default_sources_dir, default_support_dir,
+    is_persistent_installation_id, is_persistent_machine_id, source_state_file_name,
+    FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore, FileSourceStateStore,
+    LocalConnectionBinding, LocalDeviceBinding, LocalMachineBinding, LocalSourceState,
 };
 pub use claude_statusline::{
     claude_statusline_cache_path, ingest_claude_statusline_payload,

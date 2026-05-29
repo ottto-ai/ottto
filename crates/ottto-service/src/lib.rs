@@ -18,9 +18,10 @@ pub mod xpc_mach;
 
 use ottto_core::{
     default_connection_api_base_url, default_support_dir, empty_status, launch_agent_path,
-    launchd_target, local_lifecycle_home_dir, FileConnectionStore, LocalConnectionBinding,
-    RedactionPolicy, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    launchd_target, local_lifecycle_home_dir, source_state_file_name, FileConnectionStore,
+    FileSourceStateStore, LocalConnectionBinding, LocalSourceState, RedactionPolicy,
+    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 #[cfg(target_os = "macos")]
 use ottto_core::{ControlTokenStore, KeychainSecretStore};
@@ -134,12 +135,77 @@ struct DaemonState {
     machine: MachineIdentity,
     relay: RelayState,
     sources: Vec<SourceHealth>,
+    /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
+    /// from `<source_state_dir>/<slug>-state.json` and stamped on first
+    /// observation; drives `SourceHealth.connected_at`. Persisted (unlike
+    /// `sources`) so it survives daemon restarts.
+    source_first_seen: BTreeMap<String, String>,
+    /// Most recent `local_usage_reconciliation_enabled` per source slug,
+    /// recorded by the snapshot-sync loop; drives
+    /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
+    /// and restart), which the Companion tolerates as "managed by workspace".
+    source_reconciliation: BTreeMap<String, bool>,
+    /// Directory for the persisted per-source state files. `None` keeps
+    /// first-seen purely in-memory (tests); production sets it via
+    /// `with_source_state_dir(default_sources_dir())`.
+    source_state_dir: Option<PathBuf>,
     account: LocalAccountBinding,
     connection: Option<LocalConnectionBinding>,
     pending_auth: Option<PendingAuthClaim>,
     repair_locked: bool,
     running: bool,
     now: String,
+}
+
+impl DaemonState {
+    fn first_seen(&self, source: &SourceKind) -> Option<String> {
+        self.source_first_seen.get(source_slug(source)).cloned()
+    }
+
+    fn reconciliation_enabled(&self, source: &SourceKind) -> Option<bool> {
+        self.source_reconciliation.get(source_slug(source)).copied()
+    }
+
+    /// Record the first time `source` is observed. A no-op once known, so the
+    /// persisted original timestamp wins after a restart rather than being
+    /// overwritten by a later re-observation. Persists to disk when a
+    /// source-state dir is configured.
+    fn stamp_first_seen(&mut self, source: &SourceKind, observed_at: Option<&str>) {
+        let Some(observed_at) = observed_at else {
+            return; // No honest timestamp to stamp yet.
+        };
+        let slug = source_slug(source);
+        if self.source_first_seen.contains_key(slug) {
+            return;
+        }
+        self.source_first_seen
+            .insert(slug.to_string(), observed_at.to_string());
+        if let Some(dir) = self.source_state_dir.as_ref() {
+            let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+            if let Err(error) = store.save(&LocalSourceState {
+                first_seen_at: Some(observed_at.to_string()),
+            }) {
+                eprintln!("failed to persist first-seen for {slug}: {error}");
+            }
+        }
+    }
+
+    /// Clear the in-memory first-seen + reconciliation maps and delete the
+    /// persisted per-source state files. Called at the account reset sites so a
+    /// fresh account starts with a fresh first-seen history.
+    fn clear_source_state(&mut self) {
+        if let Some(dir) = self.source_state_dir.as_ref() {
+            for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+                let slug = source_slug(&source);
+                let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+                if let Err(error) = store.reset() {
+                    eprintln!("failed to clear first-seen for {slug}: {error}");
+                }
+            }
+        }
+        self.source_first_seen.clear();
+        self.source_reconciliation.clear();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +233,9 @@ impl LocalDaemon {
                     last_error: None,
                 },
                 sources: Vec::new(),
+                source_first_seen: BTreeMap::new(),
+                source_reconciliation: BTreeMap::new(),
+                source_state_dir: None,
                 account: LocalAccountBinding::not_connected(),
                 connection: None,
                 pending_auth: None,
@@ -190,6 +259,35 @@ impl LocalDaemon {
             state.connection = connection;
         }
         self
+    }
+
+    /// Enable persistence of per-source first-seen timestamps under `dir`
+    /// (`<dir>/<slug>-state.json`) and boot-load any existing files into the
+    /// in-memory map. Production passes `default_sources_dir()`; constructors
+    /// that omit this keep first-seen purely in-memory.
+    pub fn with_source_state_dir(self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        if let Ok(mut state) = self.inner.lock() {
+            state.source_first_seen = load_source_first_seen(&dir);
+            state.source_state_dir = Some(dir);
+        }
+        self
+    }
+
+    /// Record the most recent reconciliation policy for a source, learned by
+    /// the snapshot-sync loop's activity hint. This is an internal,
+    /// trusted-process call (no control token), mirroring how the local OTLP
+    /// relay updates daemon state. Best-effort: a poisoned lock is ignored.
+    pub fn record_reconciliation_enabled(
+        &self,
+        source: SourceKind,
+        enabled: bool,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        state
+            .source_reconciliation
+            .insert(source_slug(&source).to_string(), enabled);
+        Ok(())
     }
 
     pub fn status(&self, token: &str) -> Result<DaemonStatus, LocalApiError> {
@@ -219,6 +317,7 @@ impl LocalDaemon {
         let previous_account = state.account.clone();
         state.pending_auth = Some(claim.clone());
         state.sources.clear();
+        state.clear_source_state();
         state.account = LocalAccountBinding {
             state: LocalAccountState::ClaimPending,
             user: previous_account.user,
@@ -313,6 +412,7 @@ impl LocalDaemon {
         state.connection = None;
         state.pending_auth = None;
         state.sources.clear();
+        state.clear_source_state();
         Ok(AuthResetResponse {
             account: state.account.clone(),
             removed_account,
@@ -385,6 +485,7 @@ impl LocalDaemon {
             return Ok(());
         }
         let mut state = self.state()?;
+        state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
         let health = source_health_from_verification(&state, result);
         if let Some(existing) = state
             .sources
@@ -1010,6 +1111,39 @@ fn source_slug(source: &SourceKind) -> &'static str {
     }
 }
 
+/// Boot-load persisted first-seen timestamps for all sources from `dir`, keyed
+/// by source slug. Missing or unreadable files are skipped (graceful empty),
+/// matching the lenient posture of the detected-uses cache.
+fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+        let slug = source_slug(&source);
+        let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+        if let Ok(Some(LocalSourceState {
+            first_seen_at: Some(first_seen),
+            ..
+        })) = store.load()
+        {
+            map.insert(slug.to_string(), first_seen);
+        }
+    }
+    map
+}
+
+/// Whether a local telemetry key is configured for `source`. Telemetry is a
+/// Codex / Claude Code concept, so Pi returns `None`. A keystore read error is
+/// treated as "not configured" rather than surfaced.
+fn telemetry_configured_for_source(source: &SourceKind) -> Option<bool> {
+    match source {
+        SourceKind::Codex | SourceKind::ClaudeCode => Some(
+            keychain::TelemetryKeyStore::production()
+                .latest_key_id(source)
+                .is_ok_and(|key| key.is_some()),
+        ),
+        SourceKind::Pi => None,
+    }
+}
+
 const CONNECTOR_REGISTRY_JSON: &str = include_str!(env!("OTTTO_CONNECTOR_REGISTRY_PATH"));
 
 #[derive(Debug, serde::Deserialize)]
@@ -1220,10 +1354,20 @@ fn source_health_from_verification(
         },
         problems,
         recommended_actions,
+        connected_at: state.first_seen(&result.source),
+        telemetry_configured: telemetry_configured_for_source(&result.source),
+        reconciliation_enabled: state.reconciliation_enabled(&result.source),
     }
 }
 
 fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSnapshot) {
+    state.stamp_first_seen(&snapshot.source, Some(&snapshot.captured_at));
+    // Recompute the mutable companion fields up front: the in-place branch
+    // below updates an existing row without rebuilding it, so telemetry/
+    // reconciliation would otherwise go stale (e.g. after telemetry is
+    // configured). connected_at is left untouched — it is a stable first-seen.
+    let telemetry_configured = telemetry_configured_for_source(&snapshot.source);
+    let reconciliation_enabled = state.reconciliation_enabled(&snapshot.source);
     if let Some(existing) = state
         .sources
         .iter_mut()
@@ -1231,6 +1375,8 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
     {
         existing.agent_status = Some(snapshot.clone());
         existing.last_seen_at = Some(snapshot.captured_at.clone());
+        existing.telemetry_configured = telemetry_configured;
+        existing.reconciliation_enabled = reconciliation_enabled;
         if matches!(snapshot.status, AgentStatusState::Available) {
             existing.last_verified_at = Some(snapshot.captured_at.clone());
         }
@@ -1336,6 +1482,9 @@ fn source_health_from_agent_status(
         },
         problems,
         recommended_actions: Vec::new(),
+        connected_at: state.first_seen(&snapshot.source),
+        telemetry_configured: telemetry_configured_for_source(&snapshot.source),
+        reconciliation_enabled: state.reconciliation_enabled(&snapshot.source),
     }
 }
 
@@ -1648,6 +1797,7 @@ mod tests {
         AccountBindingState, HealthGrade, LocalAccountOrganization, OperatingSystem,
         SourceConfigState, SourceState,
     };
+    use serial_test::serial;
 
     const TOKEN: &str = "local_control_token";
 
@@ -2394,6 +2544,159 @@ mod tests {
         assert_eq!(team.quota_resets_at, None);
     }
 
+    #[test]
+    fn source_first_seen_persists_across_restart_and_clears_on_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-persist",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state_file = dir.join(source_state_file_name("codex"));
+
+        // First daemon observes Codex: it stamps and persists the first-seen
+        // timestamp, and surfaces the cached reconciliation policy.
+        let initial = daemon().with_source_state_dir(dir.clone());
+        initial
+            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .expect("record reconciliation");
+        initial
+            .record_verification_result(&verified_codex("2026-05-05T10:15:00Z"))
+            .expect("record verification");
+        let status = initial.status(TOKEN).expect("status");
+        assert_eq!(
+            status.sources[0].connected_at.as_deref(),
+            Some("2026-05-05T10:15:00Z")
+        );
+        assert_eq!(status.sources[0].reconciliation_enabled, Some(true));
+        assert!(state_file.exists(), "first-seen file should be persisted");
+
+        // A fresh daemon (simulated restart) boot-loads the persisted first-seen
+        // and a later observation with a different timestamp must not overwrite
+        // it. Reconciliation is in-memory only, so it resets to None.
+        let restarted = daemon().with_source_state_dir(dir.clone());
+        restarted
+            .record_verification_result(&verified_codex("2026-05-06T08:00:00Z"))
+            .expect("record verification after restart");
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(
+            status.sources[0].connected_at.as_deref(),
+            Some("2026-05-05T10:15:00Z"),
+            "persisted first-seen should win over a later observation"
+        );
+        assert_eq!(status.sources[0].reconciliation_enabled, None);
+
+        // Account reset deletes the persisted per-source state file.
+        restarted
+            .reset_account_for_trusted_client()
+            .expect("reset account");
+        assert!(
+            !state_file.exists(),
+            "reset should delete the per-source state file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_seen_is_in_memory_only_without_a_state_dir() {
+        // Without a configured state dir the daemon still reports connected_at
+        // for the current session but writes nothing to disk.
+        let daemon = daemon();
+        daemon
+            .record_verification_result(&verified_codex("2026-05-05T10:15:00Z"))
+            .expect("record verification");
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(
+            status.sources[0].connected_at.as_deref(),
+            Some("2026-05-05T10:15:00Z")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn telemetry_configured_reflects_keystore_and_skips_pi() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "ottto-telemetry-configured-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _guard = TestEnvVar::set(keychain::TELEMETRY_KEY_FILE_STORE_ENV, &store_dir);
+
+        // Empty keystore: Codex / Claude are telemetry sources but unconfigured;
+        // Pi has no local telemetry concept at all.
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::Codex),
+            Some(false)
+        );
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::ClaudeCode),
+            Some(false)
+        );
+        assert_eq!(telemetry_configured_for_source(&SourceKind::Pi), None);
+
+        // After a Codex key is stored, only Codex reports configured.
+        keychain::TelemetryKeyStore::production()
+            .save(&SourceKind::Codex, "key_test", "secret")
+            .expect("save telemetry key");
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::Codex),
+            Some(true)
+        );
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::ClaudeCode),
+            Some(false)
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    fn verified_codex(last_received_at: &str) -> SourceVerificationResult {
+        SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Verified,
+            verified: true,
+            records_seen: 1,
+            last_record_id: Some("record_1".to_string()),
+            last_received_at: Some(last_received_at.to_string()),
+            smoke_after: None,
+            message: StableMessage {
+                code: "verified".to_string(),
+                text: "Saw recent Codex telemetry.".to_string(),
+            },
+            route_results: Vec::new(),
+        }
+    }
+
+    /// Minimal scoped env-var guard for the `#[serial]` telemetry test; restores
+    /// the previous value (or removes the var) on drop.
+    struct TestEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl TestEnvVar {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn codex_health() -> SourceHealth {
         SourceHealth {
             source: SourceKind::Codex,
@@ -2419,6 +2722,9 @@ mod tests {
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
             problems: Vec::new(),
             recommended_actions: Vec::new(),
+            connected_at: Some("2026-05-05T09:00:00Z".to_string()),
+            telemetry_configured: Some(true),
+            reconciliation_enabled: Some(true),
         }
     }
 
