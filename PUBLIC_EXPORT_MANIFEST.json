@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "6595c876a03b673497e3731a97cf0a9489ea939f28ede029adbceb04a9452802",
+  "content_sha256": "759665e9dc86fb7160540663226023899d3d3916b69950b73cb37f8536153abf",
   "files": [
     {
       "executable": false,
@@ -433,8 +433,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lifecycle.rs",
-      "sha256": "815bdf7f6a7bba8d4c2e7afaa5ac10a58b6fa0be70fa86800a2a0facc5629ad0",
-      "size_bytes": 18951
+      "sha256": "74a1c8ea6b80d9d4065a21417fa0eb4850e5b81cea626417cfe07346ceda3bda",
+      "size_bytes": 18649
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "caa4f9b93360b9bc4e7088c814c6b79c59505ecb7d76efa7f3582bcbe4d06850",
-      "size_bytes": 185776
+      "sha256": "ba5f2540391fe9c14fb807ea67fdc92b2df0d1b5adeb9d432a7041012a03f319",
+      "size_bytes": 196206
     },
     {
       "executable": false,
@@ -1028,8 +1028,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "0d49a1de296df666a93988dafd34c8d8c18e495aa0ede941cfc624b616c4c0f5",
-      "size_bytes": 28624
+      "sha256": "166491fc0b415ecbdd4a4e3e4d6f2f962a48643b978ffaa888a00c40690b6976",
+      "size_bytes": 28606
     },
     {
       "executable": true,
