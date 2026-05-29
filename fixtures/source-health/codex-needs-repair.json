@@ -195,5 +195,8 @@
         "detail": "Codex config changes must be reversible through ottto-service."
       }
     }
-  ]
+  ],
+  "connected_at": "2026-05-05T08:30:00Z",
+  "telemetry_configured": true,
+  "reconciliation_enabled": true
 }

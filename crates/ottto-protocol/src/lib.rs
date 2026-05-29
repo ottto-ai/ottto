@@ -229,6 +229,23 @@ pub struct SourceHealth {
     pub last_verified_at: Option<Rfc3339Timestamp>,
     pub problems: Vec<HealthProblem>,
     pub recommended_actions: Vec<RepairAction>,
+    /// When this source was first observed on this machine (persisted daemon
+    /// first-seen, not the in-memory session start). The Companion App v2 shows
+    /// it on the source row. Absent on daemons that predate the field, so the
+    /// Swift decoder treats it as optional and falls back to an honest blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_at: Option<Rfc3339Timestamp>,
+    /// Whether a local telemetry key is configured for this source (Codex /
+    /// Claude Code only). `None` for sources without local telemetry (e.g. Pi)
+    /// and for daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_configured: Option<bool>,
+    /// Whether local usage reconciliation is enabled for this source, per the
+    /// most recent workspace activity hint the daemon fetched. `None` when the
+    /// daemon has not yet learned the policy (the Companion renders an honest
+    /// "managed by workspace" state) and for daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation_enabled: Option<bool>,
 }
 
 /// One detected billing destination for a source, as observed from local

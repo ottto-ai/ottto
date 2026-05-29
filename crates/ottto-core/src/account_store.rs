@@ -41,6 +41,19 @@ pub fn default_machine_path() -> PathBuf {
     default_support_dir().join(MACHINE_FILE_NAME)
 }
 
+/// Directory holding the per-source daemon state files
+/// (`<support>/sources/<slug>-state.json`).
+pub fn default_sources_dir() -> PathBuf {
+    default_support_dir().join("sources")
+}
+
+/// File name for a source's persisted daemon-side state, e.g.
+/// `codex-state.json`. The caller supplies the source slug so the naming
+/// convention lives in one place regardless of the parent directory.
+pub fn source_state_file_name(source_slug: &str) -> String {
+    format!("{source_slug}-state.json")
+}
+
 pub fn default_connection_api_base_url() -> String {
     std::env::var("OTTTO_API_BASE_URL")
         .ok()
@@ -73,6 +86,16 @@ pub struct LocalMachineBinding {
     /// legacy `machine.json` files; the daemon backfills it on next boot.
     #[serde(default)]
     pub hardware_uuid: Option<String>,
+}
+
+/// Persisted daemon-side state for a single source. Today it only carries the
+/// real first-seen timestamp (so `SourceHealth.connected_at` survives daemon
+/// restarts and account resets clear it); kept as its own struct so future
+/// per-source daemon state can be added without a new file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LocalSourceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +195,54 @@ impl FileConnectionStore {
 impl Default for FileConnectionStore {
     fn default() -> Self {
         Self::new(default_connection_path())
+    }
+}
+
+/// Reads and writes one source's `<support>/sources/<slug>-state.json` file,
+/// mirroring `FileConnectionStore`. There is no `Default` because the path is
+/// per-source; build it from `default_sources_dir()` +
+/// `source_state_file_name(slug)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSourceStateStore {
+    path: PathBuf,
+}
+
+impl FileSourceStateStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Option<LocalSourceState>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let body = fs::read_to_string(&self.path)
+            .with_context(|| format!("read source state {}", self.path.display()))?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("parse source state {}", self.path.display()))
+    }
+
+    pub fn save(&self, state: &LocalSourceState) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create source state dir {}", parent.display()))?;
+        }
+        let body = serde_json::to_vec_pretty(state)?;
+        write_user_only(&self.path, &body)
+    }
+
+    pub fn reset(&self) -> Result<Option<LocalSourceState>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let existing = self.load()?;
+        fs::remove_file(&self.path)
+            .with_context(|| format!("remove source state {}", self.path.display()))?;
+        Ok(existing)
     }
 }
 
@@ -391,6 +462,32 @@ mod tests {
         }
 
         assert_eq!(store.reset().expect("reset connection"), Some(connection));
+        assert_eq!(store.load().expect("load reset"), None);
+    }
+
+    #[test]
+    fn source_state_store_round_trips_and_resets() {
+        let path = temp_path("source-state").with_file_name(source_state_file_name("codex"));
+        let store = FileSourceStateStore::new(&path);
+        let state = LocalSourceState {
+            first_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
+        };
+
+        assert_eq!(store.load().expect("load missing"), None);
+        store.save(&state).expect("save source state");
+        assert_eq!(
+            store.load().expect("load source state"),
+            Some(state.clone())
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        assert_eq!(store.reset().expect("reset source state"), Some(state));
         assert_eq!(store.load().expect("load reset"), None);
     }
 
