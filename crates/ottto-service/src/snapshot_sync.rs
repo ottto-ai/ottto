@@ -9,8 +9,8 @@ use crate::snapshot_client::{
     SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
-    apply_upload_policy, scan_source_roots, ScanIndex, SnapshotBatchRequest, SnapshotItem,
-    SnapshotSource, SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION,
+    apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
+    SnapshotItem, SnapshotSource, SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION,
     MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
@@ -186,12 +186,13 @@ fn sync_source(
     };
     let index_path = snapshot_index_path(support_dir, source, upload_policy);
     let mut index = ScanIndex::load(&index_path)?;
-    let mut scan_result = match scan_source_roots(
+    let mut scan_result = match scan_source_roots_with_artifacts(
         source,
         &roots,
         &mut index,
         &scan_started_at,
         activity_hint.backfill_window_days,
+        upload_policy.session_artifacts_enabled,
     ) {
         Ok(scan_result) => scan_result,
         Err(error) => {
@@ -224,7 +225,12 @@ fn sync_source(
     let mut backfill_state = load_backfill_state(support_dir);
     let backfill_ran = pending_backfill_sources(&backfill_state).contains(&source);
     if backfill_ran {
-        match run_backfill(home, &[source], &scan_started_at) {
+        match run_backfill(
+            home,
+            &[source],
+            &scan_started_at,
+            upload_policy.session_artifacts_enabled,
+        ) {
             Ok((mut backfill_snapshots, _report)) => {
                 apply_upload_policy(source, &mut backfill_snapshots, upload_policy);
                 scan_result.snapshots.extend(backfill_snapshots);

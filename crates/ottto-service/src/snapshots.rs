@@ -484,6 +484,13 @@ struct SnapshotAccumulator {
     session_cumulative_usage: Option<UsageTotals>,
     usage_buckets: BTreeMap<String, UsageBucketState>,
     artifacts: Vec<SessionArtifact>,
+    /// Whether VCS artifact scraping runs for this session. Defaults to ``true``
+    /// (see ``new``); the production scan path sets it from the org upload
+    /// policy so the expensive scrape is skipped entirely when the
+    /// ``local_usage_session_artifacts_enabled`` setting is off — the common
+    /// case. ``apply_upload_policy`` still strips artifacts before upload as
+    /// defense-in-depth, so a stray scrape can never leak.
+    artifacts_enabled: bool,
 }
 
 impl SnapshotAccumulator {
@@ -503,6 +510,9 @@ impl SnapshotAccumulator {
             session_cumulative_usage: None,
             usage_buckets: BTreeMap::new(),
             artifacts: Vec::new(),
+            // Default on so direct parse-function callers (mostly tests) keep
+            // extracting; the production scan path overrides this from policy.
+            artifacts_enabled: true,
         }
     }
 
@@ -956,6 +966,31 @@ pub fn scan_source_roots(
     collected_at: &str,
     requested_backfill_window_days: u64,
 ) -> Result<SourceScanResult> {
+    // Convenience entry used by tests and non-policy-aware callers: artifacts
+    // are scraped unconditionally. Production sync uses
+    // `scan_source_roots_with_artifacts` to honor the org upload policy.
+    scan_source_roots_with_artifacts(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        true,
+    )
+}
+
+/// Production scan entry: `artifacts_enabled` is the org's session-artifacts
+/// upload policy. When false, the per-line VCS artifact scrape is skipped for
+/// Claude Code transcripts (the expensive path) rather than scraped and then
+/// discarded by `apply_upload_policy`.
+pub fn scan_source_roots_with_artifacts(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    artifacts_enabled: bool,
+) -> Result<SourceScanResult> {
     scan_source_roots_with_limit(
         source,
         roots,
@@ -963,6 +998,7 @@ pub fn scan_source_roots(
         collected_at,
         requested_backfill_window_days,
         MAX_BACKFILL_FILES_PER_SOURCE,
+        artifacts_enabled,
     )
 }
 
@@ -975,6 +1011,7 @@ fn scan_source_roots_with_limit(
     collected_at: &str,
     requested_backfill_window_days: u64,
     file_limit: usize,
+    artifacts_enabled: bool,
 ) -> Result<SourceScanResult> {
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
     let codex_title_metadata = if source == SnapshotSource::Codex {
@@ -1012,10 +1049,11 @@ fn scan_source_roots_with_limit(
                 source_file_fingerprint.clone(),
                 &codex_title_metadata,
             )?,
-            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file(
+            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_artifacts(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
+                artifacts_enabled,
             )?,
             SnapshotSource::Pi => parse_pi_jsonl_file(
                 &candidate.path,
@@ -1231,6 +1269,8 @@ fn parse_codex_jsonl_file_with_title_metadata(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(title_metadata),
+        // Codex lines never feed the artifact scraper; the value is moot.
+        true,
     )
 }
 
@@ -1239,6 +1279,18 @@ pub fn parse_claude_code_jsonl_file(
     collected_at: &str,
     source_file_fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_artifacts(path, collected_at, source_file_fingerprint, true)
+}
+
+/// As ``parse_claude_code_jsonl_file`` but with the artifact-scrape policy
+/// threaded in. The production scan path passes ``false`` when the org has
+/// session artifacts disabled so the per-line VCS scrape is skipped entirely.
+fn parse_claude_code_jsonl_file_with_artifacts(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    artifacts_enabled: bool,
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -1246,6 +1298,7 @@ pub fn parse_claude_code_jsonl_file(
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         None,
+        artifacts_enabled,
     )
 }
 
@@ -1261,6 +1314,8 @@ pub fn parse_pi_jsonl_file(
         SnapshotSource::Pi,
         apply_pi_line,
         None,
+        // Pi lines never feed the artifact scraper; the value is moot.
+        true,
     )
 }
 
@@ -1271,6 +1326,7 @@ fn parse_jsonl_file(
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
+    artifacts_enabled: bool,
 ) -> Result<Vec<SnapshotItem>> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -1279,6 +1335,7 @@ fn parse_jsonl_file(
     } else {
         SnapshotAccumulator::new(source)
     };
+    accumulator.artifacts_enabled = artifacts_enabled;
     for line in reader.lines() {
         let line = line.with_context(|| format!("read JSONL line {}", path.display()))?;
         if line.trim().is_empty() {
@@ -1879,9 +1936,15 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             timestamp.as_deref(),
         );
     }
-    let artifacts = extract_session_artifacts(&claude_code_scannable_text(value));
-    if !artifacts.is_empty() {
-        accumulator.add_artifacts(artifacts);
+    // Artifact scraping clones and tokenizes every tool-result blob on the
+    // line, so skip it wholesale when the org has the feature off (the default
+    // and majority case) rather than scraping then discarding in
+    // ``apply_upload_policy``.
+    if accumulator.artifacts_enabled {
+        let artifacts = extract_session_artifacts(&claude_code_scannable_text(value));
+        if !artifacts.is_empty() {
+            accumulator.add_artifacts(artifacts);
+        }
     }
 }
 
@@ -3102,6 +3165,7 @@ mod tests {
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
             file_limit,
+            true,
         )
         .expect("scan");
 
@@ -3911,6 +3975,61 @@ mod tests {
         }
         // All-numeric bracketed log lines are not commits (require an a-f digit).
         assert!(extract_session_artifacts("[INFO 1234567] starting").is_empty());
+    }
+
+    #[test]
+    fn claude_code_artifact_scrape_skipped_when_disabled_and_runs_when_enabled() {
+        // Transcript whose tool_result carries a clean PR URL — exactly what the
+        // per-line scraper collects when the feature is on.
+        let fixture = concat!(
+            "{\"timestamp\":\"2026-05-29T00:00:00Z\",\"sessionId\":\"artifact-scan-session\",\"summary\":\"Artifact scan session\"}\n",
+            "{\"timestamp\":\"2026-05-29T00:01:00Z\",\"sessionId\":\"artifact-scan-session\",\"message\":{\"id\":\"msg_01artifact\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "{\"timestamp\":\"2026-05-29T00:02:00Z\",\"sessionId\":\"artifact-scan-session\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"Opened https://github.com/ottto-ai/repo/pull/42\"}]}]}}\n",
+        );
+
+        // Enabled (public parse default, and the scan path when the org setting
+        // is on): the PR URL is scraped into session_artifacts.
+        let enabled_path = temp_file("claude-artifacts-enabled");
+        fs::write(&enabled_path, fixture).expect("write fixture");
+        let enabled = parse_claude_code_jsonl_file(
+            &enabled_path,
+            "2026-05-29T00:05:00Z",
+            "artifacts-enabled-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            enabled.session_artifacts,
+            vec![SessionArtifact {
+                kind: "pull_request".to_string(),
+                value: "https://github.com/ottto-ai/repo/pull/42".to_string(),
+            }],
+            "scrape must run when artifacts are enabled"
+        );
+        let _ = fs::remove_file(&enabled_path);
+
+        // Disabled (production scan path when the org setting is off): the scrape
+        // is skipped wholesale, so no artifacts are produced — the discard in
+        // apply_upload_policy never even runs.
+        let disabled_path = temp_file("claude-artifacts-disabled");
+        fs::write(&disabled_path, fixture).expect("write fixture");
+        let disabled = parse_claude_code_jsonl_file_with_artifacts(
+            &disabled_path,
+            "2026-05-29T00:05:00Z",
+            "artifacts-disabled-fingerprint".to_string(),
+            false,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert!(
+            disabled.session_artifacts.is_empty(),
+            "scrape must be skipped when artifacts are disabled"
+        );
+        let _ = fs::remove_file(&disabled_path);
     }
 
     #[test]

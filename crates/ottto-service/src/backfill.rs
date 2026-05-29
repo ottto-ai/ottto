@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::snapshots::{
-    scan_source_roots, ScanIndex, SnapshotItem, SnapshotSource,
+    scan_source_roots_with_artifacts, ScanIndex, SnapshotItem, SnapshotSource,
     CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SNAPSHOT_PARSER_VERSION,
 };
 
@@ -113,11 +113,14 @@ pub fn pending_backfill_sources(state: &BackfillState) -> Vec<SnapshotSource> {
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
 /// UPSERTs by `snapshot_fingerprint` so re-runs on partial failure are
 /// idempotent. This function does not write anything — caller is responsible
-/// for routing snapshots through the existing sync channel.
+/// for routing snapshots through the existing sync channel. `artifacts_enabled`
+/// is the org session-artifacts upload policy; when false the per-line VCS
+/// scrape is skipped (artifacts are stripped before upload regardless).
 pub fn run_backfill(
     home_dir: &Path,
     pending: &[SnapshotSource],
     collected_at: &str,
+    artifacts_enabled: bool,
 ) -> Result<(Vec<SnapshotItem>, BackfillReport)> {
     let mut snapshots = Vec::new();
     let mut report = BackfillReport {
@@ -127,7 +130,14 @@ pub fn run_backfill(
     for source in pending {
         let roots = source.default_roots(home_dir);
         let mut index = ScanIndex::default();
-        let result = scan_source_roots(*source, &roots, &mut index, collected_at, u64::MAX)?;
+        let result = scan_source_roots_with_artifacts(
+            *source,
+            &roots,
+            &mut index,
+            collected_at,
+            u64::MAX,
+            artifacts_enabled,
+        )?;
         match source {
             SnapshotSource::ClaudeCode => {
                 report.claude_code_session_count = result.scanned_session_count as u64;
@@ -178,13 +188,15 @@ pub type SnapshotDeliverer = Arc<dyn Fn(Vec<SnapshotItem>) -> Result<()> + Send 
 /// result so callers (e.g. tests) can await it. Production callers detach.
 /// State is only persisted (and the sink notified) when `deliver` returns
 /// `Ok`; a failing deliver leaves the parser-version bookkeeping untouched
-/// so the next daemon start retries the backfill.
+/// so the next daemon start retries the backfill. `artifacts_enabled` is the
+/// org session-artifacts upload policy, threaded down to `run_backfill`.
 pub fn spawn_backfill_thread(
     home_dir: PathBuf,
     state_dir: PathBuf,
     collected_at: String,
     sink: Arc<dyn BackfillNotificationSink>,
     deliver: SnapshotDeliverer,
+    artifacts_enabled: bool,
 ) -> std::thread::JoinHandle<Result<BackfillReport>> {
     std::thread::spawn(move || {
         let mut state = load_backfill_state(&state_dir);
@@ -192,7 +204,8 @@ pub fn spawn_backfill_thread(
         if pending.is_empty() {
             return Ok(state.last_report.clone().unwrap_or_default());
         }
-        let (snapshots, report) = run_backfill(&home_dir, &pending, &collected_at)?;
+        let (snapshots, report) =
+            run_backfill(&home_dir, &pending, &collected_at, artifacts_enabled)?;
         deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
         for source in &pending {
             state.completed_parser_versions.insert(
@@ -314,7 +327,7 @@ mod tests {
             SnapshotSource::Pi,
         ];
         let (snapshots, report) =
-            run_backfill(&home, &pending, "2026-05-28T10:00:00Z").expect("backfill ok");
+            run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true).expect("backfill ok");
         assert_eq!(snapshots.len(), 0);
         assert_eq!(report.total_snapshots(), 0);
         fs::remove_dir_all(&home).ok();
