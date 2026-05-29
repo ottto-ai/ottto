@@ -47,6 +47,8 @@ pub struct ActivityHintResponse {
     pub session_titles_enabled: bool,
     #[serde(default = "default_true")]
     pub workspace_labels_enabled: bool,
+    #[serde(default)]
+    pub session_artifacts_enabled: bool,
     pub recommended_scan_after: String,
 }
 

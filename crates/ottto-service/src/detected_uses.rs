@@ -351,6 +351,7 @@ mod tests {
             workspace_display_label: None,
             workspace_label_source: None,
             source_file_fingerprint: None,
+            session_artifacts: Vec::new(),
             provenance: SnapshotProvenance {
                 collector: "test".to_string(),
                 source_file_count: 1,

@@ -182,6 +182,7 @@ fn sync_source(
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: activity_hint.session_titles_enabled,
         workspace_labels_enabled: activity_hint.workspace_labels_enabled,
+        session_artifacts_enabled: activity_hint.session_artifacts_enabled,
     };
     let index_path = snapshot_index_path(support_dir, source, upload_policy);
     let mut index = ScanIndex::load(&index_path)?;
@@ -532,6 +533,15 @@ fn snapshot_index_path(
     if !upload_policy.workspace_labels_enabled {
         suffixes.push("no-labels");
     }
+    // Artifacts are opt-in (default off), so the suffix marks the ENABLED state.
+    // Enabling switches to the fresh `-artifacts` index, forcing a full re-scan
+    // so existing/closed sessions retroactively gain artifacts. (Disabling
+    // reverts to the base index; unchanged transcripts are not re-scanned, so
+    // artifacts already uploaded persist on the backend until the file changes
+    // — consistent with the titles/labels suffix behavior.)
+    if upload_policy.session_artifacts_enabled {
+        suffixes.push("artifacts");
+    }
     let policy_suffix = if suffixes.is_empty() {
         String::new()
     } else {
@@ -651,6 +661,7 @@ mod tests {
                 SnapshotUploadPolicy {
                     session_titles_enabled: false,
                     workspace_labels_enabled: true,
+                    session_artifacts_enabled: false,
                 },
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles.json")
@@ -662,9 +673,36 @@ mod tests {
                 SnapshotUploadPolicy {
                     session_titles_enabled: false,
                     workspace_labels_enabled: false,
+                    session_artifacts_enabled: false,
                 },
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles-no-labels.json")
+        );
+        // Opt-in artifacts get a distinct path so toggling the flag re-scans
+        // unchanged transcripts.
+        assert_eq!(
+            snapshot_index_path(
+                root,
+                SnapshotSource::ClaudeCode,
+                SnapshotUploadPolicy {
+                    session_titles_enabled: true,
+                    workspace_labels_enabled: true,
+                    session_artifacts_enabled: true,
+                },
+            ),
+            PathBuf::from("/support/snapshots/claude_code-scan-index-artifacts.json")
+        );
+        assert_eq!(
+            snapshot_index_path(
+                root,
+                SnapshotSource::Codex,
+                SnapshotUploadPolicy {
+                    session_titles_enabled: false,
+                    workspace_labels_enabled: true,
+                    session_artifacts_enabled: true,
+                },
+            ),
+            PathBuf::from("/support/snapshots/codex-scan-index-no-titles-artifacts.json")
         );
     }
 

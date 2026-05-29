@@ -129,6 +129,8 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_label_source: Option<String>,
     pub source_file_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub session_artifacts: Vec<SessionArtifact>,
     pub provenance: SnapshotProvenance,
 }
 
@@ -179,6 +181,23 @@ pub struct SnapshotProvenance {
     pub state_archived: Option<bool>,
 }
 
+/// A VCS artifact (PR / issue / commit) referenced in a session, scraped locally
+/// from transcript tool output. Scope is any PR/issue/MR URL or `git commit`
+/// summary that appears in tool output (not only artifacts the session authored
+/// — e.g. a `gh pr view` of someone else's PR also counts). Opt-in (stripped
+/// before upload unless the backend activity hint enabled it); values are
+/// canonical and content-free by construction (clean authority, no credentials/
+/// query/percent-encoding, path truncated at the numeric id) so the backend
+/// accepts them unchanged.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SessionArtifact {
+    pub kind: String,
+    pub value: String,
+}
+
+/// Maximum VCS artifacts retained per session (runaway-transcript guard).
+const MAX_SESSION_ARTIFACTS: usize = 50;
+
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -213,6 +232,7 @@ pub struct SourceScanResult {
 pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
+    pub session_artifacts_enabled: bool,
 }
 
 impl Default for SnapshotUploadPolicy {
@@ -220,6 +240,9 @@ impl Default for SnapshotUploadPolicy {
         Self {
             session_titles_enabled: true,
             workspace_labels_enabled: true,
+            // Opt-in: artifacts are stripped before upload unless the backend
+            // activity hint explicitly enables them for the org.
+            session_artifacts_enabled: false,
         }
     }
 }
@@ -243,6 +266,10 @@ pub fn apply_upload_policy(
         {
             item.workspace_display_label = None;
             item.workspace_label_source = None;
+            fingerprint_needs_refresh = true;
+        }
+        if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
+            item.session_artifacts.clear();
             fingerprint_needs_refresh = true;
         }
         if fingerprint_needs_refresh {
@@ -269,6 +296,7 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "title_source": &item.session_display_name_source,
         "workspace_display_label": &item.workspace_display_label,
         "workspace_label_source": &item.workspace_label_source,
+        "session_artifacts": &item.session_artifacts,
     });
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
@@ -455,6 +483,7 @@ struct SnapshotAccumulator {
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     usage_buckets: BTreeMap<String, UsageBucketState>,
+    artifacts: Vec<SessionArtifact>,
 }
 
 impl SnapshotAccumulator {
@@ -473,6 +502,21 @@ impl SnapshotAccumulator {
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             usage_buckets: BTreeMap::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Merge newly scraped artifacts, deduping and capping at
+    /// ``MAX_SESSION_ARTIFACTS``. Encounter order is preserved; ``into_items``
+    /// sorts for a deterministic fingerprint.
+    fn add_artifacts(&mut self, artifacts: Vec<SessionArtifact>) {
+        for artifact in artifacts {
+            if self.artifacts.len() >= MAX_SESSION_ARTIFACTS {
+                break;
+            }
+            if !self.artifacts.iter().any(|existing| existing == &artifact) {
+                self.artifacts.push(artifact);
+            }
         }
     }
 
@@ -769,6 +813,11 @@ impl SnapshotAccumulator {
             workspace_display_label: None,
             workspace_label_source: None,
             source_file_fingerprint: Some(source_file_fingerprint.clone()),
+            session_artifacts: {
+                let mut artifacts = self.artifacts.clone();
+                artifacts.sort();
+                artifacts
+            },
             provenance: SnapshotProvenance {
                 collector: collector.clone(),
                 source_file_count: 1,
@@ -1143,6 +1192,7 @@ fn codex_state_only_snapshot(
         workspace_display_label: None,
         workspace_label_source: None,
         source_file_fingerprint: None,
+        session_artifacts: Vec::new(),
         provenance: SnapshotProvenance {
             collector: "codex_state_sqlite".to_string(),
             source_file_count: 1,
@@ -1829,6 +1879,200 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             timestamp.as_deref(),
         );
     }
+    let artifacts = extract_session_artifacts(&claude_code_scannable_text(value));
+    if !artifacts.is_empty() {
+        accumulator.add_artifacts(artifacts);
+    }
+}
+
+/// Gather tool-output text from one Claude Code transcript line (tool_result
+/// content + ``toolUseResult`` stdout/stderr) for artifact scraping. Prompt text
+/// and assistant prose are deliberately excluded.
+fn claude_code_scannable_text(value: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tool_use_result) = value.get("toolUseResult") {
+        collect_tool_text(tool_use_result, &mut parts);
+    }
+    if let Some(content) = value.pointer("/message/content").and_then(Value::as_array) {
+        for block in content {
+            if string_eq_at(block, &["type"], "tool_result") {
+                if let Some(inner) = block.get("content") {
+                    collect_tool_text(inner, &mut parts);
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn collect_tool_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => parts.push(text.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_text(item, parts);
+            }
+        }
+        Value::Object(map) => {
+            for key in ["stdout", "stderr", "text", "content", "output"] {
+                if let Some(child) = map.get(key) {
+                    collect_tool_text(child, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Scrape canonical, content-free VCS artifacts (PR / issue / commit) from free
+/// text. Only clean values survive: clean authority, no credentials, query, or
+/// percent-encoding, and the path truncated at the numeric id — so the backend
+/// accepts them unchanged and a malformed match can never reject the batch.
+fn extract_session_artifacts(text: &str) -> Vec<SessionArtifact> {
+    let mut out: Vec<SessionArtifact> = Vec::new();
+    for token in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '\\' | '|'
+            )
+    }) {
+        if let Some(artifact) = parse_artifact_url(token) {
+            push_unique_artifact(&mut out, artifact);
+        }
+    }
+    for line in text.lines() {
+        if let Some(sha) = parse_commit_sha_line(line) {
+            push_unique_artifact(
+                &mut out,
+                SessionArtifact {
+                    kind: "commit".to_string(),
+                    value: sha,
+                },
+            );
+        }
+    }
+    out
+}
+
+fn push_unique_artifact(out: &mut Vec<SessionArtifact>, artifact: SessionArtifact) {
+    if out.len() >= MAX_SESSION_ARTIFACTS {
+        return;
+    }
+    if !out.iter().any(|existing| existing == &artifact) {
+        out.push(artifact);
+    }
+}
+
+/// Parse one token as a PR/issue/MR URL, returning its canonical form
+/// (`scheme://authority/<repo path>/<marker>/<id>`) or None.
+fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
+    let token = token.trim_end_matches(|c: char| matches!(c, '.' | ';' | ':' | '!' | '?'));
+    let (scheme, rest) = if let Some(rest) = token.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = token.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let slash = rest.find('/')?;
+    let authority = &rest[..slash];
+    if !is_clean_authority(authority) {
+        return None;
+    }
+    // Drop any query string / fragment before segmenting the path.
+    let path = &rest[slash..];
+    let path = path
+        .split(|c: char| c == '?' || c == '#')
+        .next()
+        .unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (kind, id_index) = find_artifact_marker(&segments)?;
+    if !segments[..=id_index]
+        .iter()
+        .all(|segment| is_clean_path_segment(segment))
+    {
+        return None;
+    }
+    let canonical_path = segments[..=id_index].join("/");
+    Some(SessionArtifact {
+        kind: kind.to_string(),
+        value: format!("{scheme}://{authority}/{canonical_path}"),
+    })
+}
+
+/// Locate the first PR/issue/MR marker in path segments, returning its kind and
+/// the index of the numeric-id segment.
+fn find_artifact_marker(segments: &[&str]) -> Option<(&'static str, usize)> {
+    for i in 0..segments.len() {
+        if segments[i] == "-"
+            && i + 2 < segments.len()
+            && segments[i + 1] == "merge_requests"
+            && is_numeric(segments[i + 2])
+        {
+            return Some(("pull_request", i + 2));
+        }
+        if (segments[i] == "pull" || segments[i] == "pull-requests")
+            && i + 1 < segments.len()
+            && is_numeric(segments[i + 1])
+        {
+            return Some(("pull_request", i + 1));
+        }
+        if segments[i] == "issues" && i + 1 < segments.len() && is_numeric(segments[i + 1]) {
+            return Some(("issue", i + 1));
+        }
+    }
+    None
+}
+
+/// Extract a lowercase-hex commit SHA from a `git commit` summary line of the
+/// form `[branch sha] message` (or `[branch (root-commit) sha] message`).
+fn parse_commit_sha_line(line: &str) -> Option<String> {
+    let inner = line.trim_start().strip_prefix('[')?;
+    let close = inner.find(']')?;
+    let token = inner[..close].split_whitespace().last()?;
+    // Require lowercase hex AND at least one a-f letter. Real git short SHAs are
+    // virtually always mixed hex; demanding a letter rejects all-numeric log
+    // lines like `[INFO 1234567] starting` that would otherwise look like a SHA.
+    let is_hex = token.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+    let has_hex_letter = token.chars().any(|c| matches!(c, 'a'..='f'));
+    if (7..=40).contains(&token.len()) && is_hex && has_hex_letter {
+        Some(token.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_clean_authority(authority: &str) -> bool {
+    if authority.is_empty() {
+        return false;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    {
+        return false;
+    }
+    match port {
+        Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+        None => true,
+    }
+}
+
+fn is_clean_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn is_numeric(segment: &str) -> bool {
+    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
 }
 
 fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
@@ -3590,6 +3834,7 @@ mod tests {
             SnapshotUploadPolicy {
                 session_titles_enabled: false,
                 workspace_labels_enabled: false,
+                session_artifacts_enabled: false,
             },
         );
 
@@ -3604,6 +3849,140 @@ mod tests {
         assert!(!serialized.contains("Checkout service"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn extract_session_artifacts_collects_clean_pr_issue_commit() {
+        let text = concat!(
+            "Created PR: https://github.com/ottto-ai/repo/pull/42\n",
+            "MR https://gitlab.com/group/sub/proj/-/merge_requests/7 ",
+            "and https://bitbucket.org/team/repo/pull-requests/3\n",
+            "Issue: https://github.com/ottto-ai/repo/issues/9.\n",
+            "[main a1b2c3d] commit message\n",
+        );
+        let pairs: BTreeSet<(String, String)> = extract_session_artifacts(text)
+            .into_iter()
+            .map(|artifact| (artifact.kind, artifact.value))
+            .collect();
+        assert!(pairs.contains(&(
+            "pull_request".to_string(),
+            "https://github.com/ottto-ai/repo/pull/42".to_string()
+        )));
+        assert!(pairs.contains(&(
+            "pull_request".to_string(),
+            "https://gitlab.com/group/sub/proj/-/merge_requests/7".to_string()
+        )));
+        assert!(pairs.contains(&(
+            "pull_request".to_string(),
+            "https://bitbucket.org/team/repo/pull-requests/3".to_string()
+        )));
+        assert!(pairs.contains(&(
+            "issue".to_string(),
+            "https://github.com/ottto-ai/repo/issues/9".to_string()
+        )));
+        assert!(pairs.contains(&("commit".to_string(), "a1b2c3d".to_string())));
+    }
+
+    #[test]
+    fn extract_session_artifacts_canonicalizes_and_rejects_unclean() {
+        // Trailing path suffix and query string are dropped to the id.
+        let canon = extract_session_artifacts(
+            "https://github.com/o/r/pull/42/files https://github.com/o/r/pull/7?w=1",
+        );
+        let values: BTreeSet<String> = canon.into_iter().map(|a| a.value).collect();
+        assert!(values.contains("https://github.com/o/r/pull/42"));
+        assert!(values.contains("https://github.com/o/r/pull/7"));
+        assert!(values
+            .iter()
+            .all(|value| !value.contains('?') && !value.contains("/files")));
+
+        // Embedded credentials, percent-encoded local paths, and non-http
+        // schemes never produce an artifact (so the batch can never be rejected).
+        for unclean in [
+            "https://user:pass@github.com/o/r/pull/1",
+            "https://github.com/o/%2Fusers%2Fron/pull/1",
+            "ftp://github.com/o/r/pull/1",
+            "https://github.com/o/r/tree/main",
+        ] {
+            assert!(
+                extract_session_artifacts(unclean).is_empty(),
+                "expected no artifact for {unclean}"
+            );
+        }
+        // All-numeric bracketed log lines are not commits (require an a-f digit).
+        assert!(extract_session_artifacts("[INFO 1234567] starting").is_empty());
+    }
+
+    #[test]
+    fn apply_upload_policy_strips_artifacts_when_disabled() {
+        let item = sample_session_artifact_item();
+        let original_fingerprint = item.snapshot_fingerprint.clone();
+        let mut disabled = vec![item.clone()];
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut disabled,
+            SnapshotUploadPolicy {
+                session_titles_enabled: true,
+                workspace_labels_enabled: true,
+                session_artifacts_enabled: false,
+            },
+        );
+        assert!(disabled[0].session_artifacts.is_empty());
+        assert_ne!(disabled[0].snapshot_fingerprint, original_fingerprint);
+
+        let mut enabled = vec![item.clone()];
+        apply_upload_policy(
+            SnapshotSource::ClaudeCode,
+            &mut enabled,
+            SnapshotUploadPolicy {
+                session_titles_enabled: true,
+                workspace_labels_enabled: true,
+                session_artifacts_enabled: true,
+            },
+        );
+        assert_eq!(enabled[0].session_artifacts.len(), 1);
+        assert_eq!(enabled[0].snapshot_fingerprint, original_fingerprint);
+    }
+
+    fn sample_session_artifact_item() -> SnapshotItem {
+        let mut item = SnapshotItem {
+            source_session_id: "artifact-session".to_string(),
+            snapshot_fingerprint: String::new(),
+            status: "final".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            model_usage: Vec::new(),
+            usage_buckets: Vec::new(),
+            session_display_name: None,
+            session_display_name_source: None,
+            source_started_at: None,
+            source_ended_at: None,
+            source_last_activity_at: None,
+            collected_at: "2026-05-29T00:00:00Z".to_string(),
+            workspace_hash: None,
+            workspace_display_label: None,
+            workspace_label_source: None,
+            source_file_fingerprint: None,
+            session_artifacts: vec![SessionArtifact {
+                kind: "pull_request".to_string(),
+                value: "https://github.com/o/r/pull/1".to_string(),
+            }],
+            provenance: SnapshotProvenance {
+                collector: "claude_code_jsonl".to_string(),
+                source_file_count: 1,
+                input_token_scope: Some("uncached".to_string()),
+                state_total_tokens: None,
+                state_archived: None,
+            },
+        };
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+        item
     }
 
     #[test]
@@ -4878,6 +5257,7 @@ mod tests {
             "workspace_display_label",
             "workspace_label_source",
             "source_file_fingerprint",
+            "session_artifacts",
             "provenance",
         ];
         // Allowed AgentSessionSnapshotModelUsage fields (extra="forbid").
@@ -4964,6 +5344,7 @@ mod tests {
             workspace_display_label: None,
             workspace_label_source: None,
             source_file_fingerprint: Some("c".repeat(32)),
+            session_artifacts: Vec::new(),
             provenance: SnapshotProvenance {
                 collector: "claude_code_jsonl".to_string(),
                 source_file_count: 1,
