@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "759665e9dc86fb7160540663226023899d3d3916b69950b73cb37f8536153abf",
+  "content_sha256": "f6fcceabddbe5b01860317f924b89eb4473e59534b7105f715a6d8651c3a2132",
   "files": [
     {
       "executable": false,
@@ -573,8 +573,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "bb9c1d892d5ab10599a4558d75640ea5137657fd09920b8cfe7f09a986276833",
-      "size_bytes": 24661
+      "sha256": "27d7b56d21481b081d5316c2ef7dffa36f3976d3931ba2de35d11af8fa27ce05",
+      "size_bytes": 24704
     },
     {
       "executable": false,
@@ -615,15 +615,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "7cf4663b4fbcc8decec7c7d8863db006fd430eff86237697abff44207411f5a5",
-      "size_bytes": 11089
+      "sha256": "1f16687eae1d7c25de33503ebc364b7e727365f152abdd1a4fb1e41a0d2fdbd6",
+      "size_bytes": 11152
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "42f05a57844095b817d2420c4b72961404ddc8a464dd104f087f8884f7112806",
-      "size_bytes": 26102
+      "sha256": "4a179d1b68a1823ceca4941c5879f632b56566599492b8a07bd7395c69bcf5a8",
+      "size_bytes": 27838
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "ba5f2540391fe9c14fb807ea67fdc92b2df0d1b5adeb9d432a7041012a03f319",
-      "size_bytes": 196206
+      "sha256": "ce689fecb1f117a7772db433031976b0b67e01f006e89a4868a0c03719d79e67",
+      "size_bytes": 210955
     },
     {
       "executable": false,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-05-29T10:08:24+00:00",
+  "generated_at": "2026-05-29T18:52:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "18955b23a943ba5a1355fb680da0594469513fac"
+  "source_commit": "82f4b783ba798c64da5f8ec5140d11873b1c30af"
 }
