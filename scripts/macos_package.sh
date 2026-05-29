@@ -126,7 +126,7 @@ if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and len
 fi
 if [[ ! -d "$MAC_APP_ROOT" ]]; then
   echo "macOS app root does not exist: $MAC_APP_ROOT" >&2
-  echo "Set OTTTO_MACOS_APP_ROOT to the OtttoCompanion Swift package root." >&2
+  echo "Set OTTTO_MACOS_APP_ROOT to the Ottto Swift package root." >&2
   exit 2
 fi
 if [[ ! -f "$MAC_APP_ROOT/Package.swift" ]]; then
@@ -153,7 +153,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 fi
 
 SWIFT_BUILD_DIR="$MAC_APP_ROOT/.build/release"
-APP_EXECUTABLE="$SWIFT_BUILD_DIR/OtttoCompanion"
+APP_EXECUTABLE="$SWIFT_BUILD_DIR/Ottto"
 CLI_BINARY="$ROOT/target/release/ottto"
 DAEMON_BINARY="$ROOT/target/release/ottto-service"
 
