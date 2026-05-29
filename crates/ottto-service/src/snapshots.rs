@@ -2030,7 +2030,7 @@ fn push_unique_artifact(out: &mut Vec<SessionArtifact>, artifact: SessionArtifac
 /// Parse one token as a PR/issue/MR URL, returning its canonical form
 /// (`scheme://authority/<repo path>/<marker>/<id>`) or None.
 fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
-    let token = token.trim_end_matches(|c: char| matches!(c, '.' | ';' | ':' | '!' | '?'));
+    let token = token.trim_end_matches(['.', ';', ':', '!', '?']);
     let (scheme, rest) = if let Some(rest) = token.strip_prefix("https://") {
         ("https", rest)
     } else if let Some(rest) = token.strip_prefix("http://") {
@@ -2045,10 +2045,7 @@ fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
     }
     // Drop any query string / fragment before segmenting the path.
     let path = &rest[slash..];
-    let path = path
-        .split(|c: char| c == '?' || c == '#')
-        .next()
-        .unwrap_or(path);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let (kind, id_index) = find_artifact_marker(&segments)?;
     if !segments[..=id_index]
