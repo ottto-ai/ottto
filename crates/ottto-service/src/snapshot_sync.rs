@@ -131,6 +131,10 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
     Ok(())
 }
 
+// One extra parameter (the daemon handle, for caching the reconciliation
+// policy) pushes this one over clippy's 7-arg threshold; the alternative is a
+// throwaway context struct for an internal helper, which is not worth it.
+#[allow(clippy::too_many_arguments)]
 fn sync_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
