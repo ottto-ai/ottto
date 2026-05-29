@@ -98,13 +98,6 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             destructive: false,
         },
         UninstallAction {
-            action: "stop_process".to_string(),
-            target: "OtttoCompanion".to_string(),
-            kind: "process".to_string(),
-            requires_confirmation: true,
-            destructive: false,
-        },
-        UninstallAction {
             action: "unload_launch_agent".to_string(),
             target: launchd_target(),
             kind: "launch_agent".to_string(),
@@ -212,7 +205,6 @@ pub fn execute_local_uninstall(
 
     if options.stop_companion_process {
         stop_process("Ottto", &mut report);
-        stop_process("OtttoCompanion", &mut report);
     } else {
         report.warn("Companion process stop was deferred because uninstall was invoked through ottto-service");
     }
