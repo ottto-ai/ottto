@@ -12,9 +12,10 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +32,54 @@ const LOCAL_RELAY_FALLBACK_SPAN: u16 = 2000;
 const LOCAL_RELAY_FALLBACK_ATTEMPTS: u16 = 24;
 const MAX_OTLP_BODY_BYTES: usize = 25 * 1024 * 1024;
 const RELAY_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
+/// Per-connection read/write timeout. A local client that never finishes
+/// sending its request line + headers (classic slowloris) — or that stops
+/// reading our response — trips this and is dropped instead of pinning a
+/// worker thread forever.
+const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum bytes accepted for a single request line or header line. Caps the
+/// per-line heap allocation a client can force with one unterminated line.
+const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+/// Maximum cumulative bytes accepted across all header lines (request line
+/// excluded). Caps total head allocation independent of per-line size.
+const MAX_HEADER_TOTAL_BYTES: usize = 64 * 1024;
+/// Maximum number of header lines accepted before the terminating blank line.
+const MAX_HEADER_COUNT: usize = 100;
+/// Maximum number of relay connections handled at once. Bounds the blast
+/// radius of a local flood: connections over the cap are rejected with 503
+/// without spawning an unbounded worker.
+const MAX_CONCURRENT_RELAY_CONNECTIONS: usize = 128;
+
+/// Live count of in-flight relay connections, released via [`ConnectionGuard`].
+static ACTIVE_RELAY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that reserves one in-flight connection slot on construction and
+/// releases it on drop, so the count is always restored on handler exit even
+/// across early returns, errors, or panics.
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    /// Reserves a connection slot. Returns `None` (and reserves nothing) when
+    /// the cap is already reached, so the caller can reject without spawning.
+    fn acquire() -> Option<Self> {
+        // Reserve optimistically, then roll back if we exceeded the cap. This
+        // keeps acquisition lock-free; the brief over-count is bounded by the
+        // number of concurrent acquirers and never leaks a slot.
+        if ACTIVE_RELAY_CONNECTIONS.fetch_add(1, Ordering::SeqCst)
+            >= MAX_CONCURRENT_RELAY_CONNECTIONS
+        {
+            ACTIVE_RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(ConnectionGuard)
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        ACTIVE_RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Debug)]
 struct HttpRequest {
@@ -99,16 +148,36 @@ fn spawn_source_relay(daemon: LocalDaemon, source: SnapshotSource) -> Result<Soc
     thread::spawn(move || {
         for incoming in listener.incoming() {
             match incoming {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Bound per-connection I/O time before doing anything else
+                    // so a slow or stalled client trips the timeout instead of
+                    // blocking a worker thread forever.
+                    apply_relay_io_timeouts(&stream);
+
+                    // Cap simultaneously-handled connections. Over the cap we
+                    // reject with 503 on the accept thread without spawning an
+                    // unbounded worker, so a local flood can't exhaust threads
+                    // or memory. The guard releases the slot on handler exit.
+                    let Some(guard) = ConnectionGuard::acquire() else {
+                        let _ = write_json_response(
+                            &mut stream,
+                            503,
+                            json!({"error":"relay_busy","message":"Too many concurrent local relay connections"}),
+                        );
+                        continue;
+                    };
+
                     let client_daemon = daemon.clone();
                     thread::spawn(move || {
+                        let _guard = guard;
                         if let Err(error) = handle_client(stream, source, client_daemon) {
                             // BrokenPipe / ConnectionReset are routine when the
                             // upstream agent (Codex / Claude Code) times out
                             // before we finish writing the response — drop
                             // those silently so we don't fill the daemon log
-                            // with one line per disconnected client. Everything
-                            // else still surfaces.
+                            // with one line per disconnected client. Slow-client
+                            // I/O timeouts are likewise routine. Everything else
+                            // still surfaces.
                             if !client_disconnect_during_write(&error) {
                                 eprintln!("local OTLP relay request failed: {error}");
                             }
@@ -149,6 +218,14 @@ fn bind_local_relay_listener() -> Result<(TcpListener, u16)> {
         .map(anyhow::Error::from)
         .unwrap_or_else(|| anyhow!("no local OTLP relay ports were available"));
     Err(error).context("bind local OTLP relay")
+}
+
+/// Apply the read and write timeout to an accepted relay stream. A best-effort
+/// operation: if the platform rejects the timeout we proceed without it rather
+/// than dropping an otherwise-valid connection.
+fn apply_relay_io_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(RELAY_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RELAY_IO_TIMEOUT));
 }
 
 pub fn default_local_relay_base_url() -> String {
@@ -587,24 +664,52 @@ fn state_fingerprint(source: SnapshotSource, api_base_url: &str, device_id: &str
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut reader = BufReader::new(stream);
+    read_http_request_from(&mut reader)
+}
+
+/// Parse an HTTP request from any buffered reader. Split out from
+/// [`read_http_request`] so the bounded request-line/header parsing can be
+/// unit-tested without a socket. The request line and every header line are
+/// read with [`read_line_limited`] (per-line cap), the header section is
+/// bounded by cumulative byte and count caps, and the body keeps the existing
+/// [`MAX_OTLP_BODY_BYTES`] cap.
+fn read_http_request_from<R: BufRead>(reader: &mut R) -> Result<HttpRequest> {
     let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
+    let read = read_line_limited(reader, &mut request_line, MAX_HEADER_LINE_BYTES)
         .context("read request line")?;
+    if read == 0 {
+        return Err(anyhow!("empty request"));
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().ok_or_else(|| anyhow!("missing method"))?;
     let path = parts.next().ok_or_else(|| anyhow!("missing path"))?;
     if !path.starts_with('/') {
         return Err(anyhow!("invalid path"));
     }
+    let method = method.to_ascii_uppercase();
+    let path = path.to_string();
 
     let mut headers = BTreeMap::new();
+    let mut header_bytes_total: usize = 0;
+    let mut header_count: usize = 0;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).context("read header")?;
+        let read =
+            read_line_limited(reader, &mut line, MAX_HEADER_LINE_BYTES).context("read header")?;
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
+            // A zero-length read means EOF before the terminating blank line;
+            // an empty trimmed line is the blank line itself. Either way the
+            // header section ends here.
             break;
+        }
+        header_count += 1;
+        if header_count > MAX_HEADER_COUNT {
+            return Err(anyhow!("too many request headers"));
+        }
+        header_bytes_total = header_bytes_total.saturating_add(read);
+        if header_bytes_total > MAX_HEADER_TOTAL_BYTES {
+            return Err(anyhow!("request headers too large"));
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
@@ -626,11 +731,45 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     }
 
     Ok(HttpRequest {
-        method: method.to_ascii_uppercase(),
-        path: path.to_string(),
+        method,
+        path,
         headers,
         body,
     })
+}
+
+/// Read a single line (up to and including the terminating `\n`) into `buf`,
+/// but fail once more than `max` bytes have been consumed without reaching the
+/// newline. This bounds the per-line heap allocation an unbounded
+/// `BufRead::read_line` would otherwise allow, closing the "stream one giant
+/// header line" memory-exhaustion path. Returns the number of bytes appended;
+/// `0` means EOF was reached with no bytes read.
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max: usize,
+) -> io::Result<usize> {
+    let start_len = buf.len();
+    // Cap the reader at `max` bytes for this line. A well-formed line of at
+    // most `max` bytes (including its trailing `\n`) is read in full; a longer
+    // line is truncated before its newline, so the missing terminator below
+    // signals "over-long" without ever allocating past the cap.
+    let mut limited = reader.take(max as u64);
+    let read = limited.read_line(buf)?;
+    if read == 0 {
+        return Ok(0);
+    }
+    let line = &buf[start_len..];
+    if !line.ends_with('\n') {
+        // We pulled at least one byte but never reached a newline within the
+        // cap. Either the line is over-long or the stream ended mid-line;
+        // either way the request head is malformed/oversized — reject it.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line exceeds maximum length",
+        ));
+    }
+    Ok(read)
 }
 
 fn write_json_response(stream: &mut TcpStream, status: u16, body: serde_json::Value) -> Result<()> {
@@ -704,10 +843,13 @@ fn current_rfc3339() -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
-/// Walk the anyhow chain looking for an `io::Error` that's the routine
-/// "client went away mid-write" pattern. Used to decide whether to bother
-/// logging a relay failure — these happen any time an OTLP client times
-/// out and closes the socket before we finish writing the response.
+/// Walk the anyhow chain looking for an `io::Error` that's a routine
+/// "client went away or stalled" pattern. Used to decide whether to bother
+/// logging a relay failure — these happen any time an OTLP client closes the
+/// socket before we finish writing the response, or trickles/stalls its
+/// request until the per-connection [`RELAY_IO_TIMEOUT`] fires. A socket
+/// read/write timeout surfaces as `WouldBlock` on Unix and `TimedOut` on
+/// Windows, so both are treated as routine.
 fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -715,7 +857,10 @@ fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
         .any(|io_error| {
             matches!(
                 io_error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
             )
         })
 }
@@ -761,11 +906,21 @@ mod tests {
         assert!(client_disconnect_during_write(&connection_reset));
         assert!(client_disconnect_during_write(&wrapped));
 
-        // Other I/O errors and non-I/O errors must still surface.
+        // Slow-client socket timeouts are routine too: a read/write timeout
+        // surfaces as TimedOut (Windows) or WouldBlock (Unix), and both mean
+        // the per-connection RELAY_IO_TIMEOUT fired rather than a real fault.
         let timed_out: anyhow::Error =
             std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into();
+        let would_block: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block").into();
+        assert!(client_disconnect_during_write(&timed_out));
+        assert!(client_disconnect_during_write(&would_block));
+
+        // Non-I/O errors and unrelated I/O errors must still surface.
+        let not_found: anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "not found").into();
         let plain = anyhow::anyhow!("relay device binding is missing");
-        assert!(!client_disconnect_during_write(&timed_out));
+        assert!(!client_disconnect_during_write(&not_found));
         assert!(!client_disconnect_during_write(&plain));
     }
 
@@ -887,5 +1042,184 @@ mod tests {
         let token = format!("header.{payload}.signature");
 
         assert_eq!(relay_token_refresh_after(&token, now), now);
+    }
+
+    #[test]
+    fn read_http_request_parses_well_formed_post() {
+        let body = b"hello-otlp";
+        let raw = format!(
+            "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut bytes = raw.into_bytes();
+        bytes.extend_from_slice(body);
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        let request = read_http_request_from(&mut reader).expect("request parses");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/logs");
+        assert_eq!(
+            request.headers.get("content-type").map(String::as_str),
+            Some("application/x-protobuf")
+        );
+        assert_eq!(request.body, body);
+    }
+
+    #[test]
+    fn read_http_request_parses_bodyless_get() {
+        let raw = "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let request = read_http_request_from(&mut reader).expect("request parses");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/healthz");
+        assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn read_http_request_rejects_over_long_header_line() {
+        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\nX-Big: ");
+        raw.push_str(&"a".repeat(MAX_HEADER_LINE_BYTES + 64));
+        raw.push_str("\r\n\r\n");
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let error = read_http_request_from(&mut reader).expect_err("over-long line rejected");
+        assert!(
+            error.to_string().contains("read header")
+                || error.to_string().contains("exceeds maximum length"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn read_http_request_rejects_cumulative_header_bytes() {
+        // Each header line stays under the per-line cap, but together they
+        // exceed the cumulative byte cap.
+        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+        let value = "b".repeat(MAX_HEADER_LINE_BYTES / 2);
+        let lines_needed = (MAX_HEADER_TOTAL_BYTES / value.len()) + 2;
+        for index in 0..lines_needed {
+            raw.push_str(&format!("X-Pad-{index}: {value}\r\n"));
+        }
+        raw.push_str("\r\n");
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let error =
+            read_http_request_from(&mut reader).expect_err("cumulative header bytes rejected");
+        assert!(
+            error.to_string().contains("headers too large"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn read_http_request_rejects_excess_header_count() {
+        let mut raw = String::from("POST /v1/logs HTTP/1.1\r\n");
+        for index in 0..(MAX_HEADER_COUNT + 5) {
+            raw.push_str(&format!("X-H-{index}: v\r\n"));
+        }
+        raw.push_str("\r\n");
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let error = read_http_request_from(&mut reader).expect_err("excess header count rejected");
+        assert!(
+            error.to_string().contains("too many request headers"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn read_http_request_rejects_oversized_body_via_content_length() {
+        let raw = format!(
+            "POST /v1/logs HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_OTLP_BODY_BYTES + 1
+        );
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let error = read_http_request_from(&mut reader).expect_err("oversized body rejected");
+        assert!(
+            error.to_string().contains("request body too large"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn read_line_limited_accepts_line_at_cap_and_rejects_beyond() {
+        // A line whose bytes (including the newline) total exactly the cap is
+        // accepted.
+        let at_cap = format!("{}\n", "x".repeat(15));
+        assert_eq!(at_cap.len(), 16);
+        let mut reader = BufReader::new(at_cap.as_bytes());
+        let mut buf = String::new();
+        let read = read_line_limited(&mut reader, &mut buf, 16).expect("at-cap line accepted");
+        assert_eq!(read, 16);
+        assert_eq!(buf, at_cap);
+
+        // One byte over the cap is rejected before the newline is reached.
+        let over_cap = format!("{}\n", "x".repeat(16));
+        let mut reader = BufReader::new(over_cap.as_bytes());
+        let mut buf = String::new();
+        let error =
+            read_line_limited(&mut reader, &mut buf, 16).expect_err("over-cap line rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_line_limited_reports_eof_as_zero() {
+        let mut reader = BufReader::new(&b""[..]);
+        let mut buf = String::new();
+        let read = read_line_limited(&mut reader, &mut buf, 16).expect("eof is not an error");
+        assert_eq!(read, 0);
+        assert!(buf.is_empty());
+    }
+
+    // The two ConnectionGuard tests both mutate the shared
+    // ACTIVE_RELAY_CONNECTIONS static, so serialize them against each other to
+    // keep their counter assertions deterministic under the parallel test
+    // runner.
+    static CONNECTION_GUARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn connection_guard_increments_and_releases_on_drop() {
+        let _serial = CONNECTION_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let baseline = ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst);
+        {
+            let _guard = ConnectionGuard::acquire().expect("slot available");
+            assert_eq!(
+                ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
+                baseline + 1
+            );
+        }
+        assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
+    }
+
+    #[test]
+    fn connection_guard_rejects_over_the_cap_without_leaking_slots() {
+        let _serial = CONNECTION_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let baseline = ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst);
+        // Saturate the remaining slots up to the cap.
+        let mut guards = Vec::new();
+        while ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst) < MAX_CONCURRENT_RELAY_CONNECTIONS {
+            guards.push(ConnectionGuard::acquire().expect("slot available below cap"));
+        }
+        assert_eq!(
+            ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RELAY_CONNECTIONS
+        );
+
+        // At the cap, acquisition is refused and the rejected attempt must not
+        // leave the counter inflated.
+        assert!(ConnectionGuard::acquire().is_none());
+        assert_eq!(
+            ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RELAY_CONNECTIONS
+        );
+
+        drop(guards);
+        assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
     }
 }
