@@ -36,6 +36,18 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v6";
 // memory. The finite caps still guard a pathological ~/.codex.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
+// Defensive size ceilings for the streaming JSONL read path. The scan caps the
+// file COUNT and an mtime window, but the per-file/-line byte lengths were
+// previously unbounded: a transcript whose monitored tool output embeds a huge
+// blob (one multi-hundred-MB/GB physical line) would be materialized whole in
+// RAM by the line reader (and cloned again by the artifact scraper), OOM-killing
+// the per-user daemon. Real sessions are well under 100 MB and individual lines
+// far smaller, so these ceilings are generous-but-finite and never trip on
+// normal transcripts; an oversized file is skipped wholesale and an oversized
+// line is dropped, both gracefully (matching the tolerant skip handling used
+// throughout the scan) so one pathological input cannot abort the scan.
+pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1336,16 +1348,10 @@ fn parse_jsonl_file(
         SnapshotAccumulator::new(source)
     };
     accumulator.artifacts_enabled = artifacts_enabled;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("read JSONL line {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        apply_line(&value, &mut accumulator);
-    }
+    read_bounded_jsonl_lines(reader, MAX_JSONL_LINE_BYTES, |value| {
+        apply_line(value, &mut accumulator);
+    })
+    .with_context(|| format!("read JSONL {}", path.display()))?;
     if source == SnapshotSource::Codex {
         if let Some(metadata) = codex_title_metadata {
             accumulator.apply_codex_title_metadata(path, metadata);
@@ -1356,6 +1362,100 @@ fn parse_jsonl_file(
         accumulator.apply_first_prompt_fallback();
     }
     Ok(accumulator.into_items(path, collected_at, source_file_fingerprint))
+}
+
+/// Stream a JSONL reader line-by-line with a hard per-line byte ceiling,
+/// invoking `on_value` for each line that parses to a JSON value.
+///
+/// Unlike `BufRead::lines` (and unlike a bare `read_until`, which would still
+/// grow its buffer to the full length of an oversized physical line before
+/// returning), this never materializes more than `max_line_bytes` of any single
+/// line. Bytes are pulled through the reader's own buffer via `fill_buf`/
+/// `consume` into a REUSED `buf`; the moment a line would exceed the cap the
+/// in-progress bytes are dropped and the remainder of the physical line is
+/// read-and-discarded (never buffered) up to the newline or EOF, then the line
+/// is skipped. The tolerant per-line semantics of the old loop are preserved
+/// exactly for normal lines: an empty/whitespace line is skipped, a line that is
+/// not valid UTF-8 is skipped, and a line that does not parse as JSON is skipped
+/// — only genuine I/O errors surface as `Err`.
+fn read_bounded_jsonl_lines(
+    mut reader: impl BufRead,
+    max_line_bytes: usize,
+    mut on_value: impl FnMut(&Value),
+) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // Accumulate one line, bounded to `max_line_bytes`. `line_complete`
+        // tracks whether we reached a newline (vs. EOF) so we can stop the
+        // outer loop on a trailing partial line.
+        let mut line_complete = false;
+        let mut overflowed = false;
+        let reached_eof = loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break true;
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(offset) => {
+                    if !overflowed {
+                        let take = (max_line_bytes - buf.len()).min(offset);
+                        if take < offset {
+                            // Line (up to the newline) exceeds the cap: keep
+                            // only what fits, mark it overflowed so it is later
+                            // skipped, and never buffer the rest.
+                            overflowed = true;
+                        }
+                        buf.extend_from_slice(&available[..take]);
+                    }
+                    reader.consume(offset + 1);
+                    line_complete = true;
+                    break false;
+                }
+                None => {
+                    let len = available.len();
+                    if !overflowed {
+                        let take = (max_line_bytes - buf.len()).min(len);
+                        if take < len {
+                            overflowed = true;
+                        }
+                        buf.extend_from_slice(&available[..take]);
+                    }
+                    reader.consume(len);
+                }
+            }
+        };
+        if !line_complete && buf.is_empty() && !overflowed {
+            // Clean EOF with no pending bytes.
+            break;
+        }
+        if overflowed {
+            // Drop the oversized line; its retained-capacity buffer is reset to
+            // the cap so one huge line does not pin a large allocation.
+            buf.clear();
+            buf.shrink_to(max_line_bytes);
+            if reached_eof {
+                break;
+            }
+            continue;
+        }
+        // Trim a trailing CR so a CRLF transcript parses identically to LF.
+        let mut bytes = buf.as_slice();
+        if bytes.last() == Some(&b'\r') {
+            bytes = &bytes[..bytes.len() - 1];
+        }
+        if let Ok(line) = std::str::from_utf8(bytes) {
+            if !line.trim().is_empty() {
+                if let Ok(value) = serde_json::from_str::<Value>(line) {
+                    on_value(&value);
+                }
+            }
+        }
+        if reached_eof {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn raw_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -2716,6 +2816,13 @@ fn collect_recent_jsonl_files(
         if !is_recent_enough(modified_unix_seconds, backfill_window_days) {
             continue;
         }
+        // Skip pathologically large transcripts before they ever reach the
+        // parser. metadata.len() is already read for fingerprinting, so this is
+        // free; an oversized file is dropped from the candidate set rather than
+        // opened, keeping the scan's memory bounded without aborting it.
+        if metadata.len() > MAX_JSONL_FILE_BYTES {
+            continue;
+        }
         files.push(CandidateFile {
             source_file_fingerprint: source_file_fingerprint_with_context(
                 &path,
@@ -3172,6 +3279,112 @@ mod tests {
         assert_eq!(scan.skipped_file_count_due_to_limit, 1);
         assert!(scan.scan_cap_hit);
         assert_eq!(scan.scanned_file_count, file_limit);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_reader_skips_oversized_line_and_keeps_neighbors() {
+        // One pathological line that exceeds the (tiny test) cap sits between two
+        // valid lines. The oversized line must be dropped while both neighbors
+        // still parse and accumulate in order.
+        let cap = 32;
+        let huge = "x".repeat(cap * 4);
+        let input = format!("{{\"n\":1}}\n{{\"big\":\"{huge}\"}}\n{{\"n\":2}}\n",);
+        assert!(input.len() > cap * 4, "oversized line must exceed the cap");
+
+        let mut seen = Vec::new();
+        read_bounded_jsonl_lines(input.as_bytes(), cap, |value| {
+            seen.push(value.clone());
+        })
+        .expect("bounded read");
+
+        assert_eq!(seen.len(), 2, "only the two valid lines survive");
+        assert_eq!(seen[0], json!({ "n": 1 }));
+        assert_eq!(seen[1], json!({ "n": 2 }));
+        // The dropped line never reaches the callback as a (truncated) value.
+        assert!(seen.iter().all(|value| value.get("big").is_none()));
+    }
+
+    #[test]
+    fn bounded_reader_parses_normal_transcript_unchanged() {
+        // A normal multi-line transcript (no line near the cap) parses exactly
+        // as the old `lines()` loop would, including a final line without a
+        // trailing newline.
+        let input = "{\"type\":\"a\",\"v\":1}\n{\"type\":\"b\",\"v\":2}\n{\"type\":\"c\",\"v\":3}";
+        let mut seen = Vec::new();
+        read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
+            seen.push(value.clone());
+        })
+        .expect("bounded read");
+
+        assert_eq!(
+            seen,
+            vec![
+                json!({ "type": "a", "v": 1 }),
+                json!({ "type": "b", "v": 2 }),
+                json!({ "type": "c", "v": 3 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_reader_preserves_empty_and_malformed_line_semantics() {
+        // Blank/whitespace lines and unparseable lines are skipped exactly as
+        // before; a trailing newline does not emit a spurious empty value.
+        let input = "\n   \n{\"ok\":true}\nnot json at all\n\n{\"ok\":false}\n";
+        let mut seen = Vec::new();
+        read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
+            seen.push(value.clone());
+        })
+        .expect("bounded read");
+
+        assert_eq!(seen, vec![json!({ "ok": true }), json!({ "ok": false })],);
+    }
+
+    #[test]
+    fn scan_policy_skips_oversized_transcript_files() {
+        let root = temp_dir("scan-policy-oversized");
+        // A normal session and an oversized one (forced just over the file cap)
+        // live in the same root. The oversized file must be skipped wholesale
+        // without aborting the scan or contributing a snapshot.
+        fs::write(
+            root.join("session-normal.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-ffffffffffff\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write normal fixture");
+
+        // Sparse file: logical length over the cap, negligible bytes on disk.
+        let oversized_path = root.join("session-oversized.jsonl");
+        let oversized = File::create(&oversized_path).expect("create oversized");
+        oversized
+            .set_len(MAX_JSONL_FILE_BYTES + 1)
+            .expect("grow oversized");
+        drop(oversized);
+        assert!(
+            fs::metadata(&oversized_path).expect("stat oversized").len() > MAX_JSONL_FILE_BYTES
+        );
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("scan must not abort on an oversized file");
+
+        // The oversized file is never a candidate, so only the normal session is
+        // discovered and scanned; the scan completes without panic.
+        assert_eq!(scan.discovered_file_count, 1);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(!scan.snapshots.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
