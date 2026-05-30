@@ -128,9 +128,10 @@ impl ControlTokenStore for FileControlTokenStore {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| TokenStoreError::Store(error.to_string()))?;
+            set_user_only_directory_permissions(parent)?;
         }
-        fs::write(&self.path, token).map_err(|error| TokenStoreError::Store(error.to_string()))?;
-        set_user_only_permissions(&self.path)
+        write_secret_file_0600(&self.path, token.as_bytes())
+            .map_err(|error| TokenStoreError::Store(error.to_string()))
     }
 
     fn delete(&self) -> Result<(), TokenStoreError> {
@@ -387,17 +388,88 @@ pub fn generate_control_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// Writes `bytes` to `path` so the secret is never exposed through a
+/// world-readable or symlink-followable window.
+///
+/// A fresh temp file is created in the same directory with `create_new` +
+/// mode `0o600`: `create_new` fails if anything (including a pre-planted
+/// symlink) already exists at the temp path, so a squatter cannot redirect the
+/// write to another target. The temp file is then `rename`d over `path`, which
+/// is atomic and preserves the `0o600` mode while overwriting any existing
+/// secret. On any failure after creation the temp file is removed.
+///
+/// Shared with `account_store.rs` (same crate); each caller maps the
+/// `io::Error` to its own error type.
 #[cfg(unix)]
-fn set_user_only_permissions(path: &Path) -> Result<(), TokenStoreError> {
-    use std::os::unix::fs::PermissionsExt;
+pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| TokenStoreError::Store(error.to_string()))
+    let mut attempt = 0_u32;
+    let (mut file, tmp_path) = loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(
+            ".{}.tmp.{}.{nanos}.{attempt}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("secret"),
+            std::process::id(),
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+        {
+            Ok(file) => break (file, tmp_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_user_only_permissions(_path: &Path) -> Result<(), TokenStoreError> {
+pub(crate) fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
+}
+
+/// Restricts a created secret directory to owner-only (`0o700`) so the secrecy
+/// of the files inside does not silently depend on an ancestor (`~/Library`)
+/// the daemon never controls. Shared with `account_store.rs`.
+#[cfg(unix)]
+pub(crate) fn restrict_secret_dir_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn restrict_secret_dir_to_owner(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+fn set_user_only_directory_permissions(path: &Path) -> Result<(), TokenStoreError> {
+    restrict_secret_dir_to_owner(path).map_err(|error| TokenStoreError::Store(error.to_string()))
 }
 
 fn load_file_secret(account: &str) -> Result<String, TokenStoreError> {
@@ -419,9 +491,10 @@ fn save_file_secret(account: &str, token: &str) -> Result<(), TokenStoreError> {
     let path = file_secret_path(account);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| TokenStoreError::Store(error.to_string()))?;
+        set_user_only_directory_permissions(parent)?;
     }
-    fs::write(&path, token).map_err(|error| TokenStoreError::Store(error.to_string()))?;
-    set_user_only_permissions(&path)
+    write_secret_file_0600(&path, token.as_bytes())
+        .map_err(|error| TokenStoreError::Store(error.to_string()))
 }
 
 fn delete_file_secret(account: &str) -> Result<(), TokenStoreError> {
@@ -542,6 +615,91 @@ mod tests {
         } else {
             std::env::remove_var(OTTTO_SECRET_FALLBACK_DIR_ENV);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_existing_secret_file_keeps_user_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "ottto-control-token-overwrite-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let store = FileControlTokenStore::new(&path);
+
+        store.save("first_value").expect("save first");
+        store.save("second_value").expect("overwrite");
+        assert_eq!(store.load().expect("load"), "second_value");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_secret_does_not_follow_symlink_at_final_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-control-token-symlink-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create dir");
+
+        let target = dir.join("attacker-target");
+        fs::write(&target, "untouched").expect("seed target");
+        let link = dir.join("control-token");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
+
+        let store = FileControlTokenStore::new(&link);
+        store
+            .save("real_secret")
+            .expect("save through symlink path");
+
+        // The symlink's original target must NOT have received the secret; the
+        // rename replaced the symlink itself with a fresh regular file.
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "untouched"
+        );
+        assert!(!fs::symlink_metadata(&link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(&link).expect("read link path"),
+            "real_secret"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_owner_only_secret_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Exercise directory hardening via the explicit-path store so the test
+        // never mutates the process-global `OTTTO_SECRET_FALLBACK_DIR_ENV` and
+        // cannot race the env-driven fallback test running in parallel.
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-control-token-dirmode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = FileControlTokenStore::new(dir.join(CONTROL_TOKEN_FILE_NAME));
+
+        store.save("off-box-secret").expect("save secret");
+        let mode = fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "macos")]

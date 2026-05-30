@@ -124,8 +124,7 @@ impl FileAccountStore {
 
     pub fn save(&self, account: &LocalAccountBinding) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create account dir {}", parent.display()))?;
+            create_secret_dir(parent)?;
         }
         let body = serde_json::to_vec_pretty(account)?;
         write_user_only(&self.path, &body)
@@ -174,8 +173,7 @@ impl FileConnectionStore {
 
     pub fn save(&self, connection: &LocalConnectionBinding) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create connection dir {}", parent.display()))?;
+            create_secret_dir(parent)?;
         }
         let body = serde_json::to_vec_pretty(connection)?;
         write_user_only(&self.path, &body)
@@ -228,8 +226,7 @@ impl FileSourceStateStore {
 
     pub fn save(&self, state: &LocalSourceState) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create source state dir {}", parent.display()))?;
+            create_secret_dir(parent)?;
         }
         let body = serde_json::to_vec_pretty(state)?;
         write_user_only(&self.path, &body)
@@ -272,8 +269,7 @@ impl FileDeviceStore {
 
     pub fn save(&self, device: &LocalDeviceBinding) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create device dir {}", parent.display()))?;
+            create_secret_dir(parent)?;
         }
         let body = serde_json::to_vec_pretty(device)?;
         write_user_only(&self.path, &body)
@@ -322,8 +318,7 @@ impl FileMachineStore {
 
     pub fn save(&self, machine: &LocalMachineBinding) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create machine dir {}", parent.display()))?;
+            create_secret_dir(parent)?;
         }
         let body = serde_json::to_vec_pretty(machine)?;
         write_user_only(&self.path, &body)
@@ -378,22 +373,21 @@ pub fn is_persistent_installation_id(value: &str) -> bool {
         && trimmed != "install_test"
 }
 
+/// Creates the secret-bearing directory and restricts it to owner-only
+/// (`0o700`) so secrecy does not silently depend on an ancestor (`~/Library`)
+/// the daemon never controls.
+fn create_secret_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("create secret dir {}", dir.display()))?;
+    crate::token_store::restrict_secret_dir_to_owner(dir)
+        .with_context(|| format!("chmod secret dir {}", dir.display()))
+}
+
+/// Writes a secret-bearing binding without ever exposing a world-readable or
+/// symlink-followable window. Delegates to the shared `0o600`-from-creation
+/// atomic writer in `token_store.rs`.
 fn write_user_only(path: &Path, body: &[u8]) -> Result<()> {
-    fs::write(path, body).with_context(|| format!("write account binding {}", path.display()))?;
-    set_user_only_permissions(path)
-}
-
-#[cfg(unix)]
-fn set_user_only_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod account binding {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_user_only_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::token_store::write_secret_file_0600(path, body)
+        .with_context(|| format!("write account binding {}", path.display()))
 }
 
 #[cfg(test)]
@@ -542,6 +536,52 @@ mod tests {
 
         assert_eq!(machine.machine_id, "otm_1234567890abcdef");
         assert_eq!(store.load().expect("load").expect("machine"), machine);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_save_creates_owner_only_support_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("dirmode");
+        let parent = path.parent().expect("parent").to_path_buf();
+        let store = FileAccountStore::new(&path);
+
+        store.save(&connected_account()).expect("save account");
+
+        let mode = fs::metadata(&parent)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_save_overwrites_symlink_without_following_to_target() {
+        let path = temp_path("symlink");
+        let dir = path.parent().expect("parent").to_path_buf();
+        fs::create_dir_all(&dir).expect("create dir");
+
+        let target = dir.join("attacker-target");
+        fs::write(&target, "untouched").expect("seed target");
+        std::os::unix::fs::symlink(&target, &path).expect("plant symlink");
+
+        let store = FileAccountStore::new(&path);
+        store.save(&connected_account()).expect("save account");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "untouched"
+        );
+        assert!(!fs::symlink_metadata(&path)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(store.load().expect("load account"), connected_account());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn connected_account() -> LocalAccountBinding {
