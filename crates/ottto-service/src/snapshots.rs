@@ -28,9 +28,29 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // bump re-walks every rollout once so the backend supersedes the stale
 // unattributed "Other" totals that the previous (run-scoped) check produced
 // on every incremental scan.
+// claude_code v8: every Claude Code usage row now carries a derived
+// `context_bucket` (long/short) selector so turns that ran on the "(1M
+// context)" window are attributed separately (see
+// CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS). The per-row selector shape
+// changed, so the bump re-walks every Claude session once to re-emit at v8.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v16";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v7";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v8";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v6";
+
+/// Effective per-turn input context (uncached input + cache reads + cache
+/// writes) above which a Claude turn could only have run with the "(1M
+/// context)" window enabled — the regular Claude context cap is 200K tokens.
+/// Turns strictly over this boundary tag `context_bucket=long`; everything at
+/// or below tags `short`. 1M usage bills at standard per-token rates but drives
+/// cost via token VOLUME, so the product analyzes it separately.
+///
+/// MUST stay in lockstep with the backend pricing catalog's
+/// `context_bucket_threshold_tokens` for the 1M-capable Claude models and the
+/// cost projector's `_derive_context_bucket`, which honors this daemon-supplied
+/// bucket ahead of its own (request_count==1-gated) derivation. See
+/// coding-agents-observability backend/app/services/telemetry_cost_projector.py
+/// and backend/app/domain/pricing/selector_context.py.
+pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 // Generous ceilings: scanning is incremental (per-file fingerprint) and
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
@@ -337,6 +357,19 @@ impl UsageTotals {
             + self.cache_creation_5m_tokens
             + self.cache_creation_1h_tokens
             + self.unattributed_total_tokens
+    }
+
+    /// Effective input context for one turn: the prompt size the model actually
+    /// saw — uncached input + cache reads + cache writes (5m + 1h TTL). Output
+    /// and reasoning tokens are excluded. Mirrors the backend cost projector's
+    /// `context_length` (input + cache_read + cache_creation). Drives the
+    /// `context_bucket` selector: a value above the 200K regular-context cap
+    /// could only have come from the 1M-context window.
+    fn effective_input_context(&self) -> u64 {
+        self.input_tokens
+            + self.cache_read_tokens
+            + self.cache_creation_5m_tokens
+            + self.cache_creation_1h_tokens
     }
 
     fn add(&mut self, other: &UsageTotals) {
@@ -2027,12 +2060,44 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["workspace"])),
     );
     if let Some(usage) = claude_code_delta_usage(value) {
+        let mut selector = claude_code_selector_from_line(value);
+        // Tag the 1M-context attribution bucket from this turn's effective input
+        // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
+        // for BOTH the regular and the "(1M context)" picker variants and never
+        // persists the `anthropic-beta: context-1m` opt-in (a request header) to
+        // the transcript, so per-turn input volume is the only signal: a turn
+        // whose effective input context exceeds the regular 200K cap could only
+        // have run with the 1M window enabled. A 1M-enabled turn under the
+        // threshold is indistinguishable from a regular turn and correctly tags
+        // `short`. The bucket rides in selector_context, so the existing
+        // RowKey/selector_hash split already emits a session's long and short
+        // turns as separate model_usage rows; the backend honors this
+        // daemon-supplied bucket ahead of its own (request_count==1-gated)
+        // derivation, so aggregated hourly rows still tag `long` accurately. An
+        // explicit transcript-supplied bucket (none emitted today) is left as-is.
+        let has_explicit_bucket = selector
+            .context
+            .get("context_bucket")
+            .is_some_and(|value| !value.is_empty());
+        if !has_explicit_bucket {
+            let context_bucket =
+                if usage.effective_input_context() > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
+                    "long"
+                } else {
+                    "short"
+                };
+            selector.insert(
+                "context_bucket",
+                context_bucket.to_string(),
+                "derived_from_effective_input_volume",
+            );
+        }
         accumulator.add_usage_with_selector(
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
-            claude_code_selector_from_line(value),
+            selector,
             timestamp.as_deref(),
         );
     }
@@ -5269,6 +5334,106 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_parser_splits_long_and_short_context_into_distinct_rows() {
+        // One first-party Anthropic session (same model, same gateway, same
+        // hour) whose turns differ ONLY in prompt size. The daemon derives a
+        // per-turn `context_bucket` from effective input volume (input +
+        // cache_read + cache_creation): the >200K turn could only have run on
+        // the "(1M context)" window so it tags `long`; the boundary turn tags
+        // `short`. Because context_bucket rides in selector_context (and thus
+        // the RowKey/selector_hash), the otherwise-identical turns split into
+        // separate model_usage rows the backend attributes independently.
+        let path = temp_file("claude-context-bucket");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-29T09:00:00Z\",\"sessionId\":\"ctx-bucket-session\",\"summary\":\"1M context demo\"}\n",
+                // short/boundary: effective == 200_000 exactly. The threshold is
+                // strict `>`, so 200K is NOT long.
+                "{\"timestamp\":\"2026-05-29T09:01:00Z\",\"sessionId\":\"ctx-bucket-session\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRpZ\",\"message\":{\"id\":\"msg_01VYXWshPjnW6L97x52sQbCT\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":200000,\"output_tokens\":10}}}\n",
+                // long: uncached input is only 20K, but cache_read (250K) +
+                // cache_creation (5K) push effective input to 275K > 200K. Proves
+                // cached tokens count toward the effective context window.
+                "{\"timestamp\":\"2026-05-29T09:05:00Z\",\"sessionId\":\"ctx-bucket-session\",\"requestId\":\"req_011CbU3R6JKp2myJL8gtuRpA\",\"message\":{\"id\":\"msg_01VYXWshPjnW6L97x52sQbCU\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20000,\"cache_read_input_tokens\":250000,\"cache_creation_input_tokens\":5000,\"output_tokens\":20}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-29T09:10:00Z",
+            "context-bucket-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1, "one item per session");
+        let item = &items[0];
+        assert_eq!(
+            item.model_usage.len(),
+            2,
+            "long and short turns split into distinct rows"
+        );
+
+        let short = item
+            .model_usage
+            .iter()
+            .find(|row| {
+                row.selector_context
+                    .get("context_bucket")
+                    .map(String::as_str)
+                    == Some("short")
+            })
+            .expect("short-context row");
+        let long = item
+            .model_usage
+            .iter()
+            .find(|row| {
+                row.selector_context
+                    .get("context_bucket")
+                    .map(String::as_str)
+                    == Some("long")
+            })
+            .expect("long-context row");
+
+        // Boundary: effective == 200_000 stays short (strict `>`).
+        assert_eq!(short.input_tokens, 200_000);
+        assert_eq!(short.output_tokens, 10);
+        assert_eq!(short.cache_read_tokens, 0);
+        assert_eq!(short.cache_creation_5m_tokens, 0);
+        // Long: cached tokens are what cross the threshold (input alone is 20K).
+        assert_eq!(long.input_tokens, 20_000);
+        assert_eq!(long.cache_read_tokens, 250_000);
+        assert_eq!(long.cache_creation_5m_tokens, 5_000);
+        assert_eq!(long.output_tokens, 20);
+
+        // Both rows record the derivation source and share model + gateway, so
+        // the ONLY dimension that split them is the context_bucket.
+        for row in [short, long] {
+            assert_eq!(
+                row.selector_sources
+                    .get("context_bucket")
+                    .map(String::as_str),
+                Some("derived_from_effective_input_volume")
+            );
+            assert_eq!(row.model, "claude-opus-4-8");
+            assert_eq!(row.gateway_provider.as_deref(), Some("anthropic"));
+            assert_eq!(row.model_provider.as_deref(), Some("anthropic"));
+        }
+
+        // Item totals reconcile with the row sum across both buckets.
+        assert_eq!(item.input_tokens, 220_000);
+        assert_eq!(item.output_tokens, 30);
+        assert_eq!(item.cache_read_tokens, 250_000);
+        assert_eq!(item.cache_creation_5m_tokens, 5_000);
+
+        // The single 09:00 hour bucket carries the same split, so the backend
+        // sees long/short separated per hour, not merged into one row.
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].model_usage.len(), 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_parser_extracts_pro_subscription_product_from_rate_limits() {
         let path = temp_file("codex-pro-plan");
         // Pro plan fixture mirrors rons's empirical 2026-05-21 personal session.
@@ -5629,14 +5794,26 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
-            selector_context: BTreeMap::from([(
-                "service_tier".to_string(),
-                "standard".to_string(),
-            )]),
-            selector_sources: BTreeMap::from([(
-                "service_tier".to_string(),
-                "message.usage.service_tier".to_string(),
-            )]),
+            selector_context: BTreeMap::from([
+                ("service_tier".to_string(), "standard".to_string()),
+                // v8: the 1M-context attribution bucket rides INSIDE
+                // selector_context (a free-form JsonObject on the row), so it
+                // adds no new top-level row key and stays within the backend's
+                // extra="forbid" AgentSessionSnapshotModelUsage field set. The
+                // backend's normalize_selector_context recognizes it
+                // (SELECTOR_FIELDS / source key `context_bucket`).
+                ("context_bucket".to_string(), "long".to_string()),
+            ]),
+            selector_sources: BTreeMap::from([
+                (
+                    "service_tier".to_string(),
+                    "message.usage.service_tier".to_string(),
+                ),
+                (
+                    "context_bucket".to_string(),
+                    "derived_from_effective_input_volume".to_string(),
+                ),
+            ]),
             auth_mode: Some("service_account_oauth".to_string()),
             billing_channel: Some("cloud".to_string()),
             billing_provider: Some("google_cloud".to_string()),
@@ -5749,5 +5926,21 @@ mod tests {
             // v6 moved attribution onto the row; assert it is actually there.
             assert_eq!(row.get("gateway_provider"), Some(&json!("vertex")));
         }
+
+        // (5) v8: context_bucket rides inside selector_context (a free-form
+        // dict), not as a top-level row key. Assert it survives serialization
+        // there and does NOT leak out as a new row field the backend forbids.
+        let first_row = item_value["model_usage"][0]
+            .as_object()
+            .expect("first model_usage row is an object");
+        assert!(
+            !first_row.contains_key("context_bucket"),
+            "context_bucket must live inside selector_context, not as a top-level row key"
+        );
+        assert_eq!(
+            item_value["model_usage"][0]["selector_context"]["context_bucket"],
+            json!("long"),
+            "context_bucket must be carried inside the row's selector_context"
+        );
     }
 }
