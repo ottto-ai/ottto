@@ -675,12 +675,15 @@ fn emit_browser_claim_started(
             if claim.browser_opened {
                 println!("Opened Ottto in your browser.");
             } else if let Some(error) = &claim.browser_open_error {
-                println!("Could not open the browser automatically: {error}");
+                println!(
+                    "Could not open the browser automatically: {}",
+                    sanitize_for_terminal(error)
+                );
             } else {
                 println!("Browser auto-open skipped.");
             }
-            println!("Open: {}", claim.claim_url);
-            println!("Code: {}", claim.claim_code);
+            println!("Open: {}", sanitize_for_terminal(&claim.claim_url));
+            println!("Code: {}", sanitize_for_terminal(&claim.claim_code));
             if wait_enabled {
                 println!("Waiting for browser approval.");
             }
@@ -828,7 +831,45 @@ fn setup_timeout_payload(
     payload
 }
 
+/// Returns true only for URLs we trust to hand to the OS browser opener.
+///
+/// Backend-controlled `claim_url` values are deserialized verbatim from a remote
+/// HTTP response, so we accept only `https://<host>` or loopback
+/// `http://localhost` / `http://127.0.0.1`. Everything else is rejected and
+/// never passed to `open`: custom schemes (`customapp://`, `file://`, `data:`,
+/// `javascript:`), an empty string, a value starting with `-` that `open` would
+/// treat as a flag, and — critically — host look-alikes that a bare prefix
+/// check would wave through (`http://localhost.evil.com`, `http://127.0.0.1.evil`,
+/// `http://localhost-evil.com`, `http://localhost@evil.com`). The host is parsed
+/// at the real authority boundary so the loopback allowance cannot be spoofed.
+fn is_safe_external_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    // Authority = everything before the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // A `@` in the authority is userinfo, which can disguise the real host
+    // (`http://localhost@evil.com` actually targets evil.com); reject outright.
+    if authority.contains('@') {
+        return false;
+    }
+    // Host is the authority minus an optional `:port`.
+    let host = authority.split(':').next().unwrap_or(authority);
+    match scheme {
+        "https" => !host.is_empty(),
+        "http" => host == "localhost" || host == "127.0.0.1",
+        _ => false,
+    }
+}
+
 fn open_browser(url: &str) -> Result<(), String> {
+    if !is_safe_external_url(url) {
+        return Err(format!(
+            "refused to open untrusted claim URL ({}); open it manually if you trust it",
+            sanitize_for_terminal(url)
+        ));
+    }
+
     #[cfg(target_os = "macos")]
     {
         let status = std::process::Command::new("open")
@@ -844,7 +885,6 @@ fn open_browser(url: &str) -> Result<(), String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = url;
         Err("browser auto-open is only supported on macOS".to_string())
     }
 }
@@ -971,7 +1011,7 @@ fn print_response(
 fn print_error(error: CliError, output_mode: OutputMode, request_id: Option<&str>) -> i32 {
     let exit_code = error.code.exit_code();
     match output_mode {
-        OutputMode::Human => eprintln!("{}", error.message),
+        OutputMode::Human => eprintln!("{}", sanitize_for_terminal(&error.message)),
         OutputMode::Json => println!("{}", pretty_json(&CliErrorResponse { error })),
         OutputMode::Ndjson => println!(
             "{}",
@@ -1123,6 +1163,24 @@ fn compact_json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("json should serialize")
 }
 
+/// Neutralizes terminal control sequences in daemon/backend-derived strings
+/// before they are printed in human output mode.
+///
+/// Strips C0 control characters (0x00-0x1F) except `\t` and `\n`, the DEL char
+/// (0x7F), and C1 control characters (0x80-0x9F). This defeats ANSI/CSI/OSC
+/// escape injection (e.g. clearing the screen, setting the window title, or
+/// spoofing a success line) while preserving normal printable text, tabs, and
+/// newlines so legitimate multi-line messages still render. JSON/NDJSON paths
+/// are already safe via serde escaping and must not be routed through this.
+fn sanitize_for_terminal(s: &str) -> String {
+    // `char::is_control` is true for the C0 range (0x00-0x1F), DEL (0x7F), and
+    // the C1 range (0x80-0x9F) — exactly the bytes we want to drop, including
+    // ESC (0x1B). Tab and newline are control chars too, so allow them back in.
+    s.chars()
+        .filter(|&c| c == '\t' || c == '\n' || !c.is_control())
+        .collect()
+}
+
 fn progress_event(request_id: &str, command: &str) -> serde_json::Value {
     serde_json::json!({
         "event": "progress",
@@ -1225,35 +1283,44 @@ fn setup_payload_exit_code(payload: &serde_json::Value) -> i32 {
     }
 }
 
+/// Builds the human-mode summary line. Every daemon/backend-derived field
+/// (message text, daemon, source, account state, status/state) is routed
+/// through `sanitize_for_terminal` so a malicious backend cannot inject
+/// terminal escape sequences into the TTY.
 fn human_summary(payload: &serde_json::Value) -> String {
     if let Some(message) = payload
         .get("message")
         .and_then(|value| value.get("text"))
         .and_then(|value| value.as_str())
     {
-        return message.to_string();
+        return sanitize_for_terminal(message);
     }
     if let Some(daemon) = payload.get("daemon").and_then(|value| value.as_str()) {
-        return format!("Ottto local daemon: {daemon}");
+        return format!("Ottto local daemon: {}", sanitize_for_terminal(daemon));
     }
     if let Some(source) = payload.get("source").and_then(|value| value.as_str()) {
-        return format!("Ottto {source}: {}", payload_summary(payload));
+        return format!(
+            "Ottto {}: {}",
+            sanitize_for_terminal(source),
+            payload_summary(payload)
+        );
     }
     if let Some(account) = payload.get("account").and_then(|value| value.as_object()) {
         if let Some(state) = account.get("state").and_then(|value| value.as_str()) {
-            return format!("Ottto account: {state}");
+            return format!("Ottto account: {}", sanitize_for_terminal(state));
         }
     }
     payload_summary(payload)
 }
 
 fn payload_summary(payload: &serde_json::Value) -> String {
-    payload
-        .get("status")
-        .or_else(|| payload.get("state"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("ok")
-        .to_string()
+    sanitize_for_terminal(
+        payload
+            .get("status")
+            .or_else(|| payload.get("state"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("ok"),
+    )
 }
 
 fn daemon_unavailable_error(
@@ -2072,5 +2139,79 @@ mod tests {
             invocation.request.command,
             LocalControlCommand::UninstallExecute { confirm: true }
         );
+    }
+
+    #[test]
+    fn is_safe_external_url_accepts_trusted_targets() {
+        assert!(is_safe_external_url("https://ottto.net/x"));
+        assert!(is_safe_external_url("http://localhost:8765/x"));
+        assert!(is_safe_external_url("http://127.0.0.1:5/x"));
+    }
+
+    #[test]
+    fn is_safe_external_url_rejects_untrusted_targets() {
+        assert!(!is_safe_external_url("customscheme://x"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("-e"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url(""));
+        assert!(!is_safe_external_url("ftp://x"));
+        assert!(!is_safe_external_url("http://evil.com"));
+    }
+
+    #[test]
+    fn is_safe_external_url_rejects_loopback_host_lookalikes() {
+        // A bare `starts_with("http://localhost")` check would wave these
+        // plain-HTTP attacker hosts through; the authority-boundary parse must
+        // reject every one of them.
+        assert!(!is_safe_external_url("http://localhost.evil.com/x"));
+        assert!(!is_safe_external_url("http://127.0.0.1.evil.com/x"));
+        assert!(!is_safe_external_url("http://localhost-evil.com/x"));
+        assert!(!is_safe_external_url("http://localhost@evil.com/x"));
+        assert!(!is_safe_external_url("http://127.0.0.1@evil.com"));
+        assert!(!is_safe_external_url("http://localhost:8765@evil.com/x"));
+        // Genuine loopback forms still pass.
+        assert!(is_safe_external_url("http://localhost"));
+        assert!(is_safe_external_url("http://127.0.0.1/claim"));
+    }
+
+    #[test]
+    fn open_browser_refuses_untrusted_claim_url() {
+        let error = open_browser("customscheme://x").expect_err("untrusted url is rejected");
+        assert!(error.contains("untrusted"));
+        // The raw (sanitized) URL is surfaced so the user can decide manually.
+        assert!(error.contains("customscheme://x"));
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_control_sequences() {
+        assert_eq!(sanitize_for_terminal("\x1b[2J"), "[2J");
+        assert_eq!(sanitize_for_terminal("\x1b]0;title\x07"), "]0;title");
+        assert_eq!(sanitize_for_terminal("\x1b"), "");
+        assert_eq!(sanitize_for_terminal("\x07"), "");
+        assert_eq!(sanitize_for_terminal("\x7f"), "");
+        // C1 control byte (next-line) is also stripped.
+        assert_eq!(sanitize_for_terminal("a\u{85}b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_preserves_printable_text() {
+        assert_eq!(
+            sanitize_for_terminal("hello\tworld\nok"),
+            "hello\tworld\nok"
+        );
+        assert_eq!(sanitize_for_terminal("café — naïve ✓"), "café — naïve ✓");
+    }
+
+    #[test]
+    fn sanitize_for_terminal_neutralizes_crafted_claim_code() {
+        let claim = BrowserClaimState {
+            claim_code: "claim_REAL\x1b[2K\rclaim_FAKE".to_string(),
+            ..fake_browser_claim()
+        };
+        let sanitized = sanitize_for_terminal(&claim.claim_code);
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\r'));
+        assert_eq!(sanitized, "claim_REAL[2Kclaim_FAKE");
     }
 }

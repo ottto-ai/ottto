@@ -13,7 +13,7 @@ use std::os::raw::{c_char, c_int, c_void};
 extern "C" {
     fn ottto_xpc_serve(
         mach_service: *const c_char,
-        handler: extern "C" fn(*const c_char, libc::pid_t, *mut c_void) -> *mut c_char,
+        handler: extern "C" fn(*const c_char, libc::pid_t, libc::uid_t, *mut c_void) -> *mut c_char,
         context: *mut c_void,
     ) -> c_int;
 }
@@ -45,6 +45,7 @@ pub fn serve_xpc_mach_service(_mach_service: &str, _daemon: LocalDaemon) -> Resu
 extern "C" fn handle_xpc_request(
     request_json: *const c_char,
     peer_pid: libc::pid_t,
+    peer_euid: libc::uid_t,
     context: *mut c_void,
 ) -> *mut c_char {
     if request_json.is_null() || context.is_null() {
@@ -55,11 +56,15 @@ extern "C" fn handle_xpc_request(
     let request = unsafe { CStr::from_ptr(request_json) }
         .to_string_lossy()
         .into_owned();
-    let peer = if peer_pid > 0 {
-        Some(LocalClientPeer::from_pid(peer_pid as u32))
+    let pid = if peer_pid > 0 {
+        Some(peer_pid as u32)
     } else {
         None
     };
+    // The shim already rejected peers whose euid != the daemon euid at the
+    // connection level; capturing the euid here lets the control layer re-assert
+    // the match as defense in depth. On macOS `libc::uid_t` is `u32`.
+    let peer = Some(LocalClientPeer::from_pid_and_euid(pid, Some(peer_euid)));
     let response = handle_request_json_with_peer(daemon, &request, peer);
     c_string_or_null(&response)
 }

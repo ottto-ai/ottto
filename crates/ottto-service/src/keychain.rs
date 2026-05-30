@@ -210,11 +210,7 @@ impl TelemetryKeyStore {
     fn save_index_file(&self, reference: &TelemetryKeyRef) -> Result<(), TelemetryKeychainError> {
         let path = self.file_path(reference);
         self.ensure_file_parent(&path)?;
-        fs::write(&path, b"").map_err(|source| TelemetryKeychainError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        set_user_only_permissions(&path)
+        write_secret_file_0600(&path, b"")
     }
 
     fn save_file_secret(
@@ -224,11 +220,7 @@ impl TelemetryKeyStore {
     ) -> Result<(), TelemetryKeychainError> {
         let path = self.file_path(reference);
         self.ensure_file_parent(&path)?;
-        fs::write(&path, secret).map_err(|source| TelemetryKeychainError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        set_user_only_permissions(&path)
+        write_secret_file_0600(&path, secret.as_bytes())
     }
 
     fn load_file_secret(
@@ -301,6 +293,13 @@ impl TelemetryKeyStore {
                 else {
                     continue;
                 };
+                // Skip dotfiles: the atomic secret writer creates a transient
+                // `.<name>.tmp.<pid>.<nanos>.<attempt>` file that is renamed into
+                // place, but a hard crash in that window could orphan one. Never
+                // surface such an orphan (or any dotfile) as a telemetry key.
+                if file_name.starts_with('.') {
+                    continue;
+                }
                 refs.push(TelemetryKeyRef {
                     source: source.clone(),
                     key_id: unsanitize_file_component(&file_name),
@@ -496,21 +495,77 @@ fn delete_keychain_secret(
     Ok(false)
 }
 
-fn set_user_only_permissions(path: &Path) -> Result<(), TelemetryKeychainError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, permissions).map_err(|source| TelemetryKeychainError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+/// Writes `bytes` to `path` so the secret is never exposed through a
+/// world-readable or symlink-followable window.
+///
+/// A fresh temp file is created in the same directory with `create_new` +
+/// mode `0o600`: `create_new` fails if anything (including a pre-planted
+/// symlink) already exists at the temp path, so a squatter cannot redirect the
+/// write to another target. The temp file is then `rename`d over `path`, which
+/// is atomic and preserves the `0o600` mode while overwriting any existing
+/// secret. On any failure after creation the temp file is removed.
+///
+/// This mirrors `ottto_core::token_store::write_secret_file_0600`; a small
+/// duplication is accepted to avoid a cross-crate export change.
+#[cfg(unix)]
+fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<(), TelemetryKeychainError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let io_error = |source: io::Error| TelemetryKeychainError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    let mut attempt = 0_u32;
+    let (mut file, tmp_path) = loop {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(
+            ".{}.tmp.{}.{nanos}.{attempt}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("secret"),
+            std::process::id(),
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+        {
+            Ok(file) => break (file, tmp_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+    };
+
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io_error(error));
     }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
+    drop(file);
+
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(io_error(error));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_secret_file_0600(path: &Path, bytes: &[u8]) -> Result<(), TelemetryKeychainError> {
+    fs::write(path, bytes).map_err(|source| TelemetryKeychainError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn set_user_only_directory_permissions(path: &Path) -> Result<(), TelemetryKeychainError> {
@@ -634,6 +689,85 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].path().to_string_lossy().contains("../"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_secret_file_is_user_only_and_survives_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("filemode");
+        let store = TelemetryKeyStore::file_only(&root);
+        store
+            .save(&SourceKind::Codex, "key_mode", "first_secret")
+            .expect("save first");
+
+        let path = root.join(CODEX_TELEMETRY_KEY_SERVICE).join("key_mode");
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        store
+            .save(&SourceKind::Codex, "key_mode", "second_secret")
+            .expect("overwrite");
+        assert_eq!(
+            store.load(&SourceKind::Codex, "key_mode").expect("load"),
+            "second_secret"
+        );
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_root_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("dirmode");
+        let store = TelemetryKeyStore::file_only(&root);
+        store
+            .save(&SourceKind::ClaudeCode, "key_dir", "secret")
+            .expect("save");
+
+        let mode = fs::metadata(&root)
+            .expect("root metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_symlink_planted_at_secret_path() {
+        let root = test_root("symlink");
+        let store = TelemetryKeyStore::file_only(&root);
+        // Seed the service directory so we can plant a symlink at the final path.
+        store
+            .save(&SourceKind::Codex, "seed", "seed_secret")
+            .expect("seed");
+
+        let service_dir = root.join(CODEX_TELEMETRY_KEY_SERVICE);
+        let target = root.join("attacker-target");
+        fs::write(&target, "untouched").expect("seed target");
+        let link = service_dir.join("key_link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink");
+
+        store
+            .save(&SourceKind::Codex, "key_link", "real_secret")
+            .expect("save through symlink path");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read target"),
+            "untouched"
+        );
+        assert!(!fs::symlink_metadata(&link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            store.load(&SourceKind::Codex, "key_link").expect("load"),
+            "real_secret"
+        );
     }
 
     #[test]
