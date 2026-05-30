@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -94,7 +94,34 @@ impl Drop for RestrictiveSocketUmask {
 }
 
 fn local_client_peer(stream: &UnixStream) -> Option<LocalClientPeer> {
-    peer_pid(stream).map(LocalClientPeer::from_pid)
+    let pid = peer_pid(stream);
+    let euid = peer_euid(stream);
+    if pid.is_none() && euid.is_none() {
+        return None;
+    }
+    Some(LocalClientPeer::from_pid_and_euid(pid, euid))
+}
+
+#[cfg(unix)]
+fn peer_euid(stream: &UnixStream) -> Option<u32> {
+    // getpeereid is a supported, non-spoofable way to read the connecting
+    // peer's effective uid (and gid). It is captured here at accept time and
+    // threaded into LocalClientPeer so the control layer can enforce that the
+    // peer runs as the daemon's own uid before granting token-less trust.
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    // `libc::uid_t` is `u32` on every supported unix target.
+    if rc == 0 {
+        Some(uid)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn peer_euid(_stream: &UnixStream) -> Option<u32> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -168,6 +195,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn peer_euid_reports_connecting_process_euid() {
+        // A connected socket pair lives in this process, so the captured peer
+        // euid must equal our own effective uid.
+        let (a, _b) = UnixStream::pair().expect("socket pair");
+        let euid = peer_euid(&a).expect("peer euid available on connected socket");
+        assert_eq!(euid, unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn local_client_peer_captures_euid() {
+        let (a, _b) = UnixStream::pair().expect("socket pair");
+        let peer = local_client_peer(&a).expect("peer attributes");
+        assert_eq!(peer.euid, Some(unsafe { libc::geteuid() }));
+    }
 
     #[test]
     #[serial]

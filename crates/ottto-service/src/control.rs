@@ -71,14 +71,26 @@ const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
 #[derive(Debug, Clone, Default)]
 pub struct LocalClientPeer {
     pub pid: Option<u32>,
+    /// Effective uid of the connecting peer, when the transport can supply it
+    /// (`getpeereid` for the unix socket, `xpc_connection_get_euid` for XPC).
+    /// Used as a connection-level gate: a peer running as a different uid than
+    /// the daemon is never trusted, which keeps the Mach service at least as
+    /// restrictive as the 0600 unix socket and closes the cross-uid attack
+    /// surface around the (recyclable) PID-based companion check.
+    pub euid: Option<u32>,
     #[cfg(test)]
     trusted_for_tests: bool,
 }
 
 impl LocalClientPeer {
-    pub fn from_pid(pid: u32) -> Self {
+    // NOTE: there is intentionally no `from_pid(pid)` constructor. A peer must
+    // always carry its effective uid so the euid gate can run; a euid-less peer
+    // would be fail-closed for companion trust anyway. Both transports build
+    // peers via `from_pid_and_euid` (unix_socket: getpeereid, xpc: shim euid).
+    pub fn from_pid_and_euid(pid: Option<u32>, euid: Option<u32>) -> Self {
         Self {
-            pid: Some(pid),
+            pid,
+            euid,
             #[cfg(test)]
             trusted_for_tests: false,
         }
@@ -88,9 +100,34 @@ impl LocalClientPeer {
     fn trusted_for_tests() -> Self {
         Self {
             pid: None,
+            euid: None,
             trusted_for_tests: true,
         }
     }
+
+    /// True when the peer's effective uid is known and equals the daemon's
+    /// effective uid. Returns `false` if the transport could not supply the
+    /// peer euid (fail-closed): a peer we cannot attribute to our own uid must
+    /// not be trusted for the token-less companion authorization.
+    fn euid_matches_daemon(&self) -> bool {
+        match self.euid {
+            Some(peer_euid) => peer_euid == daemon_effective_uid(),
+            None => false,
+        }
+    }
+}
+
+/// The effective uid of the running daemon process.
+#[cfg(unix)]
+fn daemon_effective_uid() -> u32 {
+    // SAFETY: geteuid() is always-successful and has no preconditions.
+    // `libc::uid_t` is `u32` on every supported unix target.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn daemon_effective_uid() -> u32 {
+    u32::MAX
 }
 
 pub fn handle_request(daemon: &LocalDaemon, request: LocalControlRequest) -> LocalControlResponse {
@@ -194,6 +231,16 @@ fn companion_peer_is_trusted(peer: Option<&LocalClientPeer>) -> bool {
         return true;
     }
 
+    // Connection-level peer gate (defense against PID-reuse TOCTOU and the
+    // missing XPC credential check): the token-less companion authorization is
+    // only ever granted to a peer that runs as the daemon's own effective uid.
+    // This is evaluated with supported, non-spoofable kernel-provided
+    // credentials (`getpeereid` / `xpc_connection_get_euid`) before the
+    // recyclable-PID-based code-signing check runs.
+    if !peer.euid_matches_daemon() {
+        return false;
+    }
+
     let Some(pid) = peer.pid else {
         return false;
     };
@@ -207,6 +254,42 @@ fn trusted_companion_pid(pid: u32) -> bool {
         Flags, GuestAttributes, SecCode, SecRequirement,
     };
 
+    // SECURITY / KNOWN-LIMITATION (PID-reuse TOCTOU):
+    //
+    // `kSecGuestAttributePid` is the Apple-documented-insecure way to identify a
+    // guest: a PID is recyclable, so between the kernel handing us the peer PID
+    // and this `copy_guest_with_attribues` call the original process could exit
+    // and its PID be reused by an attacker's process. The robust fix is to
+    // identify the guest by its `audit_token_t` instead of its PID.
+    //
+    // The dependency surface to do that is already available:
+    //   * `security_framework::os::macos::code_signing::GuestAttributes` exposes
+    //     `set_audit_token(token: CFDataRef)` (security-framework 3.7), which
+    //     maps to `kSecGuestAttributeAudit` — the non-recyclable identifier.
+    //   * The peer audit token is obtainable per transport:
+    //       - unix socket: `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` (documented
+    //         in <sys/un.h>) yields the 32-byte `audit_token_t`.
+    //       - XPC: `xpc_connection_get_audit_token(peer, &token)` — present in
+    //         libxpc but NOT declared in the public SDK headers.
+    //
+    // It is NOT wired up here yet for two reasons that, given this finding's
+    // low/medium severity and the impossibility of validating against the real
+    // signed Companion in this environment, make shipping it now riskier than
+    // the bug:
+    //   1. `set_audit_token` takes a `core_foundation::data::CFDataRef`, which
+    //      would require adding `core-foundation` as a *direct* dependency of
+    //      ottto-service (it is currently only transitive) and constructing the
+    //      CFData/audit-token FFI correctly.
+    //   2. The XPC capture relies on a private (undeclared) libxpc symbol.
+    // A wrong move here would break legitimate Companion auth, a worse
+    // regression than this hard-to-exploit, same-uid bug.
+    //
+    // The shipped mitigation is the connection-level euid gate in
+    // `companion_peer_is_trusted`, which requires the peer to run as the
+    // daemon's own uid before this PID check is even reached — closing the
+    // cross-uid attack surface. FOLLOW-UP: implement the audit-token upgrade
+    // above and validate it on-device against the signed Companion before
+    // release.
     let mut attrs = GuestAttributes::new();
     attrs.set_pid(pid as libc::pid_t);
     let Ok(code) = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE) else {
@@ -806,6 +889,13 @@ fn telemetry_control_with_detector(
     action: TelemetryControlAction,
     source: SourceKind,
     control_token: String,
+    // SECURITY: the request-supplied `api_base_url` cannot freely choose where the
+    // control token is validated. Token validation is the only gate protecting
+    // this telemetry-config mutation against an untrusted local peer, so
+    // `control_token_validation_base_url` only honors this value when it is a
+    // trusted production backend (never a request-supplied loopback URL), closing
+    // the bypass where a co-resident attacker points validation at their own
+    // server. See that resolver for the full rationale.
     api_base_url: Option<String>,
     key_id: Option<String>,
     organization_id: Option<String>,
@@ -820,7 +910,7 @@ fn telemetry_control_with_detector(
         ));
     }
 
-    let api_base_url = validated_api_base_url(api_base_url.as_deref())?;
+    let token_validation_base_url = control_token_validation_base_url(api_base_url.as_deref())?;
     validate_control_token_fresh(&control_token, &action, &source)?;
 
     match &action {
@@ -841,8 +931,12 @@ fn telemetry_control_with_detector(
         TelemetryControlAction::Status => {}
     }
 
-    let claims =
-        validate_control_token_with_backend(&api_base_url, &control_token, &action, &source)?;
+    let claims = validate_control_token_with_backend(
+        &token_validation_base_url,
+        &control_token,
+        &action,
+        &source,
+    )?;
     if let (Some(expected), Some(observed)) = (
         claims.organization_id.as_deref(),
         organization_id
@@ -5607,6 +5701,72 @@ fn validated_api_base_url(raw: Option<&str>) -> Result<String, LocalApiError> {
     Ok(value.to_string())
 }
 
+/// Resolve the backend base URL used to validate an apps control token.
+///
+/// SECURITY: control-token validation is the *only* gate that authorizes an
+/// `Untrusted` local peer to mutate telemetry config (write/delete the user's
+/// ingest key). That validation must therefore target a backend the untrusted
+/// caller cannot choose. Unlike [`validated_api_base_url`], this resolver
+/// deliberately IGNORES any request-supplied `api_base_url`: a co-resident
+/// local attacker could otherwise point validation at their own
+/// `http://localhost:<port>` server that returns HTTP 200 and forge approval of
+/// an unsigned token (the local freshness check never verifies the JWT
+/// signature — see [`decode_control_token_payload`], which has no pinned public
+/// key, so the trusted backend is the cryptographic gate).
+///
+/// The `http://localhost` / `http://127.0.0.1` allowance exists only for
+/// developer and test use, so it is honored ONLY when it arrives through the
+/// developer-controlled `OTTTO_API_BASE_URL` environment variable — never from
+/// the request body. A request-supplied *production* base (`ottto.net/backend`
+/// or `api.ottto.net`) IS honored, because it points at the real ottto backend
+/// which rejects a forged/unsigned token; this keeps legitimate production
+/// flows (which may target either host) working unchanged. Any other request
+/// value (notably a loopback URL) is ignored and validation falls back to the
+/// production default. Note the precedence is env > request(production) >
+/// default: a daemon configured with a trusted `OTTTO_API_BASE_URL` validates
+/// against that, and an *untrusted* env override fails closed (NetworkUnavailable)
+/// rather than silently falling back to a request-supplied host.
+fn control_token_validation_base_url(requested: Option<&str>) -> Result<String, LocalApiError> {
+    // 1. The developer-controlled env override wins outright (it may legitimately
+    //    point at a local backend for dev/test).
+    if let Some(env_value) = std::env::var("OTTTO_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+    {
+        if !is_trusted_api_base_url(&env_value) {
+            return Err(LocalApiError::NetworkUnavailable);
+        }
+        return Ok(env_value);
+    }
+    // 2. With no env override, honor a request-supplied PRODUCTION backend (safe:
+    //    the real backend rejects forged tokens), but IGNORE any non-production
+    //    request value — that loopback redirect is the bypass we are closing.
+    if let Some(production) = requested
+        .map(|value| value.trim().trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+        .filter(|value| is_production_api_base_url(value))
+    {
+        return Ok(production.to_string());
+    }
+    // 3. Production default.
+    Ok(DEFAULT_API_BASE_URL.to_string())
+}
+
+/// A production ottto backend URL (`ottto.net/backend` or `api.ottto.net`,
+/// optionally with a sub-path). Unlike [`is_trusted_api_base_url`] this excludes
+/// the loopback dev allowance, so it is safe to honor even from an untrusted
+/// request body when deciding where to validate a control token.
+fn is_production_api_base_url(value: &str) -> bool {
+    if value.contains('@') || value.contains('?') || value.contains('#') {
+        return false;
+    }
+    value == DEFAULT_API_BASE_URL
+        || value == DIRECT_API_BASE_URL
+        || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
+        || value.starts_with(&format!("{DIRECT_API_BASE_URL}/"))
+}
+
 fn is_trusted_api_base_url(value: &str) -> bool {
     if value.contains('@') || value.contains('?') || value.contains('#') {
         return false;
@@ -6712,6 +6872,13 @@ mod tests {
             std::env::set_var(key, value);
             Self { key, previous }
         }
+
+        /// Temporarily unset an env var, restoring it (or its absence) on drop.
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -6996,6 +7163,132 @@ mod tests {
         assert_eq!(
             validated_api_base_url(Some(DIRECT_API_BASE_URL)).expect("valid"),
             DIRECT_API_BASE_URL.to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_defaults_to_production_without_env() {
+        let _guard = lock_backend_test_env();
+        let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+        assert_eq!(
+            control_token_validation_base_url(None).expect("default base"),
+            DEFAULT_API_BASE_URL.to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_honors_request_production_without_env() {
+        let _guard = lock_backend_test_env();
+        let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+        // A request-supplied production backend is honored (the real backend
+        // rejects forged tokens), preserving legitimate prod behavior for both
+        // ottto.net/backend and api.ottto.net callers.
+        assert_eq!(
+            control_token_validation_base_url(Some(DIRECT_API_BASE_URL)).expect("direct base"),
+            DIRECT_API_BASE_URL.to_string()
+        );
+        assert_eq!(
+            control_token_validation_base_url(Some("https://api.ottto.net/v1")).expect("subpath"),
+            "https://api.ottto.net/v1".to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_ignores_request_loopback_without_env() {
+        let _guard = lock_backend_test_env();
+        let _env_guard = EnvVarGuard::remove("OTTTO_API_BASE_URL");
+        // The attack: a request-supplied loopback validation URL must NOT be
+        // honored; validation falls back to the trusted production default.
+        assert_eq!(
+            control_token_validation_base_url(Some("http://127.0.0.1:1")).expect("fallback"),
+            DEFAULT_API_BASE_URL.to_string()
+        );
+        assert_eq!(
+            control_token_validation_base_url(Some("http://localhost:8787")).expect("fallback"),
+            DEFAULT_API_BASE_URL.to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_env_overrides_request() {
+        let _guard = lock_backend_test_env();
+        // Developer env override wins even when the request carries a production
+        // base, so dev/test pointed at a local backend keeps working.
+        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8787");
+        assert_eq!(
+            control_token_validation_base_url(Some(DEFAULT_API_BASE_URL)).expect("env wins"),
+            "http://localhost:8787".to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_honors_developer_env_localhost() {
+        let _guard = lock_backend_test_env();
+        // The localhost allowance is only reachable through the developer-
+        // controlled env var, never the request body.
+        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://localhost:8787/");
+        assert_eq!(
+            control_token_validation_base_url(None).expect("env base"),
+            "http://localhost:8787".to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn control_token_validation_base_rejects_untrusted_env_origin() {
+        let _guard = lock_backend_test_env();
+        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "https://attacker.example");
+        assert!(control_token_validation_base_url(None).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn telemetry_control_ignores_request_supplied_localhost_base() {
+        // SECURITY regression guard for the control-token authorization bypass:
+        // a request whose `api_base_url` points at an attacker loopback server
+        // must NOT cause the control token to be validated against that server.
+        //
+        // The trusted env-resolved backend is wired to a mock that REJECTS the
+        // token (HTTP 401), while the request `api_base_url` points at an
+        // attacker mock that would APPROVE it (HTTP 200). If the request field
+        // were still honored the forged token would be approved; the fix routes
+        // validation to the env backend, so the request is correctly rejected.
+        let _guard = lock_backend_test_env();
+        let trusted_rejecting_backend = control_token_validation_server(401);
+        let _env_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &trusted_rejecting_backend);
+        let attacker_approving_backend = control_token_validation_server(200);
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_telemetry_attacker_base".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
+                command: LocalControlCommand::TelemetryControl {
+                    action: TelemetryControlAction::Status,
+                    source: SourceKind::Codex,
+                    control_token: test_control_token("status", "codex", 300),
+                    api_base_url: Some(attacker_approving_backend),
+                    key_id: None,
+                    organization_id: None,
+                    otlp_endpoint: None,
+                    ingest_key: None,
+                },
+            },
+        );
+
+        // Validation hit the trusted (rejecting) backend, not the attacker's
+        // approving one, so the forged token is denied.
+        assert!(!response.ok, "{response:?}");
+        assert_eq!(
+            response.error.expect("error").code,
+            CliErrorCode::LocalClientNotTrusted
         );
     }
 
@@ -7296,6 +7589,44 @@ mod tests {
     }
 
     #[test]
+    fn peer_euid_matches_daemon_for_self_uid() {
+        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), Some(daemon_effective_uid()));
+        assert!(peer.euid_matches_daemon());
+    }
+
+    #[test]
+    fn peer_euid_mismatch_is_not_daemon() {
+        // A different uid (daemon uid +1) must not match.
+        let other = daemon_effective_uid().wrapping_add(1);
+        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), Some(other));
+        assert!(!peer.euid_matches_daemon());
+    }
+
+    #[test]
+    fn peer_without_euid_fails_closed() {
+        // When the transport could not supply the peer euid we must fail closed.
+        let peer = LocalClientPeer::from_pid_and_euid(Some(1234), None);
+        assert!(!peer.euid_matches_daemon());
+    }
+
+    #[test]
+    fn companion_peer_with_mismatched_euid_is_not_trusted() {
+        // The euid gate runs before the PID-based code-signing check, so a peer
+        // running as a different uid is rejected regardless of its PID.
+        let other = daemon_effective_uid().wrapping_add(1);
+        let peer = LocalClientPeer::from_pid_and_euid(Some(std::process::id()), Some(other));
+        assert!(!companion_peer_is_trusted(Some(&peer)));
+    }
+
+    #[test]
+    fn companion_peer_without_euid_is_not_trusted() {
+        // A peer missing euid attribution (e.g. an older transport path) cannot
+        // be granted token-less companion trust.
+        let peer = LocalClientPeer::from_pid_and_euid(Some(std::process::id()), None);
+        assert!(!companion_peer_is_trusted(Some(&peer)));
+    }
+
+    #[test]
     fn uninstall_plan_is_typed_and_cloud_safe() {
         let response = handle_request(
             &daemon(),
@@ -7569,7 +7900,13 @@ mod tests {
                 .as_os_str()
                 .to_os_string(),
         );
+        // The mock backend serves both the control-token validation (resolved
+        // via the trusted OTTTO_API_BASE_URL env) and the OTLP verification
+        // marker (via otlp_endpoint). The request `api_base_url` carries a dead
+        // loopback URL: if it were still honored for token validation the
+        // request would fail, proving the resolver ignores it.
         let api_base_url = control_token_validation_server_with_marker(200);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -7582,7 +7919,7 @@ mod tests {
                     action: TelemetryControlAction::EnableTelemetry,
                     source: SourceKind::Codex,
                     control_token: test_control_token("enable_telemetry", "codex", 300),
-                    api_base_url: Some(api_base_url.clone()),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: Some("key_123".to_string()),
                     organization_id: Some("org_123".to_string()),
                     otlp_endpoint: Some(api_base_url),
@@ -7697,7 +8034,13 @@ mod tests {
             )
             .expect("seed key");
 
+        // SECURITY: the control token must be validated against the trusted
+        // env-resolved backend, not the request-supplied `api_base_url`. The
+        // working mock backend is wired through OTTTO_API_BASE_URL, while the
+        // request carries a dead loopback URL that would fail validation if it
+        // were (insecurely) honored.
         let api_base_url = control_token_validation_server(200);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -7710,7 +8053,7 @@ mod tests {
                     action: TelemetryControlAction::DisableTelemetry,
                     source: SourceKind::Codex,
                     control_token: test_control_token("disable_telemetry", "codex", 300),
-                    api_base_url: Some(api_base_url),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: Some("key_disable".to_string()),
                     organization_id: None,
                     otlp_endpoint: None,
@@ -7759,6 +8102,7 @@ mod tests {
             .expect("seed key");
 
         let api_base_url = control_token_validation_server(200);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -7771,7 +8115,7 @@ mod tests {
                     action: TelemetryControlAction::DisableTelemetry,
                     source: SourceKind::Codex,
                     control_token: test_control_token("disable_telemetry", "codex", 300),
-                    api_base_url: Some(api_base_url),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: Some("key_manual_fence".to_string()),
                     organization_id: None,
                     otlp_endpoint: None,
@@ -7806,6 +8150,7 @@ mod tests {
             .expect("seed key");
 
         let api_base_url = control_token_validation_server(200);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -7818,7 +8163,7 @@ mod tests {
                     action: TelemetryControlAction::Status,
                     source: SourceKind::Codex,
                     control_token: test_control_token("status", "codex", 300),
-                    api_base_url: Some(api_base_url),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: None,
                     organization_id: None,
                     otlp_endpoint: None,
@@ -7891,12 +8236,15 @@ mod tests {
             install_docs_url: Some("https://example.invalid/codex".to_string()),
         };
 
+        let _api_base_guard =
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &control_token_validation_server(200));
         let response = telemetry_control_with_detector(
             &daemon(),
             TelemetryControlAction::EnableTelemetry,
             SourceKind::Codex,
             test_control_token("enable_telemetry", "codex", 300),
-            Some(control_token_validation_server(200)),
+            // Ignored for token validation (resolved via OTTTO_API_BASE_URL).
+            Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
             Some("key_missing".to_string()),
             Some("org_123".to_string()),
             Some("https://api.ottto.net".to_string()),
@@ -7980,6 +8328,7 @@ mod tests {
     fn telemetry_control_rejects_backend_rejected_token() {
         let _guard = lock_backend_test_env();
         let api_base_url = control_token_validation_server(401);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
             LocalControlRequest {
@@ -7992,7 +8341,7 @@ mod tests {
                     action: TelemetryControlAction::Status,
                     source: SourceKind::Codex,
                     control_token: test_control_token("status", "codex", 300),
-                    api_base_url: Some(api_base_url),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                     key_id: None,
                     organization_id: None,
                     otlp_endpoint: None,
@@ -9494,6 +9843,13 @@ log_user_prompt = true
         drop(listener);
         format!("http://{address}")
     }
+
+    /// A trusted-format loopback URL on a port nothing listens on. Telemetry
+    /// control tests pass this as the *request* `api_base_url` to prove the
+    /// control-token resolver ignores it: if validation were (insecurely)
+    /// routed here it would fail with connection-refused, but the resolver
+    /// instead uses the mock backend wired through OTTTO_API_BASE_URL.
+    const ATTACKER_LOOPBACK_API_BASE_URL: &str = "http://127.0.0.1:1";
 
     fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
