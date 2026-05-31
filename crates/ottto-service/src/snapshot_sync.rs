@@ -155,6 +155,14 @@ fn sync_source(
         source_kind(source),
         activity_hint.local_usage_reconciliation_enabled,
     );
+    if let Err(error) = upload_agent_status(client, &relay_token, source, machine_id) {
+        eprintln!(
+            "local agent status upload skipped for {}: {}",
+            source.api_slug(),
+            safe_error(&error)
+        );
+    }
+
     if !activity_hint.local_usage_reconciliation_enabled {
         report_status(
             client,
@@ -168,14 +176,6 @@ fn sync_source(
             },
         )?;
         return Ok(());
-    }
-
-    if let Err(error) = upload_agent_status(client, &relay_token, source, machine_id) {
-        eprintln!(
-            "local agent status upload skipped for {}: {}",
-            source.api_slug(),
-            safe_error(&error)
-        );
     }
 
     let roots = source.default_roots(home);
