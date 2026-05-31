@@ -24,6 +24,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -380,6 +381,8 @@ fn claude_statusline_quota_windows_from_cache(
     now: u64,
 ) -> Vec<AgentQuotaWindow> {
     let mut windows = Vec::new();
+    let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+    let cache_is_stale = cache_age > CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS;
     for window in cache.windows {
         if window.resets_at_epoch_seconds <= now {
             continue;
@@ -395,8 +398,16 @@ fn claude_statusline_quota_windows_from_cache(
         windows.push(AgentQuotaWindow {
             name: name.to_string(),
             scope: AgentQuotaWindowScope::Account,
-            status: percent_quota_status(window.used_percent),
-            freshness: AgentQuotaWindowFreshness::Fresh,
+            status: if cache_is_stale {
+                AgentQuotaWindowStatus::Stale
+            } else {
+                percent_quota_status(window.used_percent)
+            },
+            freshness: if cache_is_stale {
+                AgentQuotaWindowFreshness::Stale
+            } else {
+                AgentQuotaWindowFreshness::Fresh
+            },
             model: None,
             account_label: None,
             window_seconds,
@@ -2797,6 +2808,31 @@ mod tests {
         assert_eq!(windows[0].name, "weekly");
         assert_eq!(windows[0].status, AgentQuotaWindowStatus::Exhausted);
         assert_eq!(windows[0].left_percent, Some(0));
+    }
+
+    #[test]
+    fn claude_statusline_cache_marks_old_windows_stale() {
+        let cache = ClaudeStatusLineRateLimitCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: 100,
+            windows: vec![ClaudeStatusLineRateLimitWindow {
+                name: "five_hour".to_string(),
+                used_percent: 24,
+                resets_at_epoch_seconds: 2_000,
+            }],
+        };
+
+        let windows = claude_statusline_quota_windows_from_cache(
+            cache,
+            100 + CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS + 1,
+        );
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].name, "session");
+        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Stale);
+        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(windows[0].used_percent, Some(24));
+        assert_eq!(windows[0].left_percent, Some(76));
     }
 
     #[test]
