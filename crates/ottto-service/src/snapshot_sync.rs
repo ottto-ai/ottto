@@ -16,7 +16,7 @@ use crate::snapshots::{
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
-use ottto_protocol::{DetectedUse, SourceKind};
+use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -129,6 +129,57 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
         ));
     }
     Ok(())
+}
+
+pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Result<usize> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let client = SnapshotApiClient::new(snapshot_api_base_url());
+
+    let mut uploaded = 0;
+    let mut failed_sources = Vec::new();
+    for source in enabled_snapshot_sources(&device) {
+        let source_kind = source_kind(source);
+        let source_snapshots = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.source == source_kind)
+            .cloned()
+            .map(AgentStatusSnapshot::redacted_for_backend)
+            .collect::<Vec<_>>();
+        if source_snapshots.is_empty() {
+            continue;
+        }
+        let relay_token = match client.issue_relay_token(&device, &device_secret, source) {
+            Ok(token) => token,
+            Err(_) => {
+                failed_sources.push(source.api_slug());
+                continue;
+            }
+        };
+        let request = AgentStatusSnapshotUploadRequest {
+            machine_id: machine_id.clone(),
+            snapshots: source_snapshots,
+        };
+        match client.upload_agent_status(&relay_token, &request) {
+            Ok(response) => {
+                uploaded += response.accepted as usize;
+            }
+            Err(_) => {
+                failed_sources.push(source.api_slug());
+            }
+        }
+    }
+
+    if !failed_sources.is_empty() {
+        return Err(anyhow!(
+            "agent status upload failed for {} source(s)",
+            failed_sources.len()
+        ));
+    }
+
+    Ok(uploaded)
 }
 
 // One extra parameter (the daemon handle, for caching the reconciliation
@@ -583,7 +634,7 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
         .and_then(|value| value.format(&Rfc3339).ok())
 }
 
-fn safe_error(error: &anyhow::Error) -> &'static str {
+pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
     let text = error.to_string();
     if text.contains("relay device") {
         "relay device credentials are unavailable"
@@ -593,7 +644,9 @@ fn safe_error(error: &anyhow::Error) -> &'static str {
         "relay token request failed"
     } else if text.contains("get activity hint failed") {
         "activity hint request failed"
-    } else if text.contains("upload agent status failed") {
+    } else if text.contains("upload agent status failed")
+        || text.contains("agent status upload failed")
+    {
         "agent status upload failed"
     } else if text.contains("scan local snapshots") {
         "local snapshot scan failed"
@@ -611,6 +664,14 @@ fn safe_error(error: &anyhow::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ottto_core::{
+        FileDeviceStore, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SECRET_FALLBACK_DIR_ENV,
+    };
+    use ottto_protocol::{AgentStatusCollectionMethod, AgentStatusState};
+    use serial_test::serial;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn enabled_snapshot_sources_follow_device_grants() {
@@ -749,5 +810,264 @@ mod tests {
             safe_error(&anyhow!("issue relay token failed: rejected")),
             "relay token request failed"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn manual_agent_status_upload_posts_granted_refreshed_snapshots() {
+        let root = test_dir("manual-agent-status-upload");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = agent_status_upload_server(captured.clone());
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save device");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+
+        let uploaded = upload_agent_status_snapshots(&[
+            test_agent_status(SourceKind::Codex),
+            test_agent_status(SourceKind::ClaudeCode),
+        ])
+        .expect("upload agent status");
+
+        assert_eq!(uploaded, 1);
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[0].contains("\"source\":\"codex\""));
+        assert!(requests[0].contains("X-Ottto-Device-Secret: device-secret"));
+        assert!(requests[1].contains("POST /api/v1/agent-status/snapshots"));
+        assert!(requests[1].contains("Authorization:"));
+        assert!(requests[1].contains("relay-token-codex"));
+        assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+        assert!(requests[1].contains("\"source\":\"codex\""));
+        assert!(!requests[1].contains("claude_code"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn manual_agent_status_upload_attempts_remaining_sources_after_failure() {
+        let root = test_dir("manual-agent-status-partial-failure");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = agent_status_partial_failure_server(captured.clone());
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                sources: vec!["codex".to_string(), "claude_code".to_string()],
+            })
+            .expect("save device");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+
+        let error = upload_agent_status_snapshots(&[
+            test_agent_status(SourceKind::Codex),
+            test_agent_status(SourceKind::ClaudeCode),
+        ])
+        .expect_err("partial upload should report aggregate failure");
+
+        assert_eq!(safe_error(&error), "agent status upload failed");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].contains("\"source\":\"codex\""));
+        assert!(requests[1].contains("\"source\":\"claude_code\""));
+        assert!(requests[2].contains("POST /api/v1/agent-status/snapshots"));
+        assert!(requests[2].contains("\"source\":\"claude_code\""));
+        assert!(!requests[2].contains("\"source\":\"codex\""));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            Self::set_os(key, value.as_os_str().to_os_string())
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            Self::set_os(key, std::ffi::OsString::from(value))
+        }
+
+        fn set_os(key: &'static str, value: std::ffi::OsString) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ottto-{name}-{}-{}",
+            std::process::id(),
+            current_rfc3339().replace([':', '-'], "")
+        ))
+    }
+
+    fn test_agent_status(source: SourceKind) -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            source,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::ManualFallback,
+            captured_at: "2026-06-01T10:00:00Z".to_string(),
+            expires_at: "2026-06-01T10:15:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn agent_status_upload_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind agent status backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept agent status request");
+                let request = read_complete_http_request(&mut stream);
+                captured
+                    .lock()
+                    .expect("capture agent status request")
+                    .push(request);
+                let body = if index == 0 {
+                    r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
+                } else {
+                    r#"{"accepted":1,"machine_id":"otm_test","sources":["codex"]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write agent status response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn agent_status_partial_failure_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind agent status backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept agent status request");
+                let request = read_complete_http_request(&mut stream);
+                captured
+                    .lock()
+                    .expect("capture agent status request")
+                    .push(request);
+                let (status, body) = match index {
+                    0 => ("500 Internal Server Error", r#"{"error":"temporary"}"#),
+                    1 => (
+                        "200 OK",
+                        r#"{"token":"relay-token-claude","expires_at":"2026-06-01T10:15:00Z"}"#,
+                    ),
+                    _ => (
+                        "200 OK",
+                        r#"{"accepted":1,"machine_id":"otm_test","sources":["claude_code"]}"#,
+                    ),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write agent status response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                    if http_request_complete(&request) {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn http_request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let body_start = header_end + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+        content_length
+            .map(|length| request.len() >= body_start + length)
+            .unwrap_or(true)
     }
 }

@@ -1350,7 +1350,7 @@ fn refresh_agent_status_for(
     let captured_at = current_rfc3339();
     let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
         .unwrap_or_else(|| captured_at.clone());
-    match authorization {
+    let snapshots = match authorization {
         RequestAuthorization::Token(token) => {
             daemon.refresh_agent_status(token, source, captured_at, expires_at)
         }
@@ -1358,7 +1358,14 @@ fn refresh_agent_status_for(
             daemon.refresh_agent_status_for_trusted_client(source, captured_at, expires_at)
         }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+    }?;
+    if let Err(error) = crate::snapshot_sync::upload_agent_status_snapshots(&snapshots) {
+        eprintln!(
+            "manual agent status upload skipped: {}",
+            crate::snapshot_sync::safe_error(&error)
+        );
     }
+    Ok(snapshots)
 }
 
 fn auth_start(

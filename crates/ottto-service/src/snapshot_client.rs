@@ -7,8 +7,12 @@ use ottto_core::{
 use ottto_protocol::AgentStatusSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::Duration;
 
 const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The backend rejected a snapshot batch with an HTTP 4xx. This is almost
 /// always a daemon<->backend schema/contract mismatch (the daemon emitting a
@@ -121,6 +125,7 @@ struct RelayTokenResponse {
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     api_base_url: String,
+    agent: ureq::Agent,
 }
 
 impl SnapshotApiClient {
@@ -128,12 +133,14 @@ impl SnapshotApiClient {
         Self {
             api_base_url: std::env::var("OTTTO_API_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
+            agent: timeout_agent(),
         }
     }
 
     pub fn new(api_base_url: impl Into<String>) -> Self {
         Self {
             api_base_url: api_base_url.into(),
+            agent: timeout_agent(),
         }
     }
 
@@ -147,7 +154,9 @@ impl SnapshotApiClient {
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id
         ));
-        let response: RelayTokenResponse = ureq::post(&url)
+        let response: RelayTokenResponse = self
+            .agent
+            .post(&url)
             .set("Accept", "application/json")
             .set("X-Ottto-Device-Secret", device_secret)
             .send_json(json!({ "source": source.api_slug() }))
@@ -158,7 +167,8 @@ impl SnapshotApiClient {
     }
 
     pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
-        ureq::get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+        self.agent
+            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .call()
@@ -172,7 +182,9 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
     ) -> Result<SnapshotBatchResponse> {
-        match ureq::post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
@@ -197,7 +209,8 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotStatusRequest,
     ) -> Result<SnapshotStatusResponse> {
-        ureq::post(&self.api_url("/api/v1/agent-session-snapshots/status"))
+        self.agent
+            .post(&self.api_url("/api/v1/agent-session-snapshots/status"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
@@ -211,7 +224,8 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &AgentStatusSnapshotUploadRequest,
     ) -> Result<AgentStatusSnapshotUploadResponse> {
-        ureq::post(&self.api_url("/api/v1/agent-status/snapshots"))
+        self.agent
+            .post(&self.api_url("/api/v1/agent-status/snapshots"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
@@ -223,6 +237,14 @@ impl SnapshotApiClient {
     fn api_url(&self, path: &str) -> String {
         format!("{}{}", self.api_base_url.trim_end_matches('/'), path)
     }
+}
+
+fn timeout_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
+        .timeout_read(SNAPSHOT_HTTP_READ_TIMEOUT)
+        .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+        .build()
 }
 
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
