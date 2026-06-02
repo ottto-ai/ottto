@@ -5,6 +5,8 @@ MANIFEST=""
 SUBJECT_CHECKSUMS=""
 REPOSITORY="${OTTTO_RELEASE_REPOSITORY:-ottto-ai/ottto}"
 SIGNER_WORKFLOW="${OTTTO_RELEASE_SIGNER_WORKFLOW:-.github/workflows/macos-stable-release.yml}"
+SOURCE_REF="${OTTTO_RELEASE_SOURCE_REF:-refs/heads/main}"
+SOURCE_DIGEST="${OTTTO_RELEASE_SOURCE_DIGEST:-}"
 SLSA_ATTESTATION_URL=""
 SBOM_ATTESTATION_URL=""
 
@@ -20,6 +22,8 @@ both SLSA provenance and CycloneDX SBOM attestations.
 Options:
   --repo <owner/repo>              Expected GitHub repository. Default: ottto-ai/ottto
   --signer-workflow <path>         Expected signer workflow path.
+  --source-ref <ref>               Expected source git ref. Default: refs/heads/main
+  --source-digest <sha>            Expected source commit digest. Default: manifest commit
   --slsa-attestation-url <url>     Optional URL recorded on supply_chain.slsa_build.
   --sbom-attestation-url <url>     Optional URL recorded on supply_chain.sbom.
   -h, --help                      Show help.
@@ -42,6 +46,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --signer-workflow)
       SIGNER_WORKFLOW="${2:?--signer-workflow requires a value}"
+      shift 2
+      ;;
+    --source-ref)
+      SOURCE_REF="${2:?--source-ref requires a value}"
+      shift 2
+      ;;
+    --source-digest)
+      SOURCE_DIGEST="${2:?--source-digest requires a value}"
       shift 2
       ;;
     --slsa-attestation-url)
@@ -95,6 +107,17 @@ if [[ ! "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
 fi
 if [[ "$SIGNER_WORKFLOW" != .github/workflows/*.yml && "$SIGNER_WORKFLOW" != .github/workflows/*.yaml ]]; then
   echo "Signer workflow must be a GitHub workflow path: $SIGNER_WORKFLOW" >&2
+  exit 2
+fi
+if [[ "$SOURCE_REF" != refs/* ]]; then
+  echo "Source ref must be a fully-qualified git ref: $SOURCE_REF" >&2
+  exit 2
+fi
+if [[ -z "$SOURCE_DIGEST" ]]; then
+  SOURCE_DIGEST="$(jq -r '.commit // empty' "$MANIFEST")"
+fi
+if [[ ! "$SOURCE_DIGEST" =~ ^[0-9A-Fa-f]{7,64}$ ]]; then
+  echo "Source digest must be a git commit hash: $SOURCE_DIGEST" >&2
   exit 2
 fi
 
@@ -169,16 +192,46 @@ if [[ "$sbom_predicate_type" != "https://cyclonedx.org/bom" ]]; then
   exit 1
 fi
 
+slsa_predicate_type="https://slsa.dev/provenance/v1"
+signer_workflow_identity="$REPOSITORY/$SIGNER_WORKFLOW"
+
+verify_attestation() {
+  local path="$1"
+  local predicate_type="$2"
+  local output
+  output="$(mktemp)"
+  if ! gh attestation verify "$path" \
+    --repo "$REPOSITORY" \
+    --predicate-type "$predicate_type" \
+    --signer-workflow "$signer_workflow_identity" \
+    --source-ref "$SOURCE_REF" \
+    --source-digest "$SOURCE_DIGEST" \
+    --format json > "$output"; then
+    rm -f "$output"
+    return 1
+  fi
+  if ! jq -e --arg predicate_type "$predicate_type" '
+    type == "array"
+    and length > 0
+    and all(.[]; .verificationResult.statement.predicateType == $predicate_type)
+  ' "$output" >/dev/null; then
+    echo "Verified attestation JSON did not contain the expected predicate type: $predicate_type" >&2
+    rm -f "$output"
+    return 1
+  fi
+  rm -f "$output"
+}
+
 while IFS= read -r subject; do
   path="$(jq -r '.path' <<<"$subject")"
-  gh attestation verify "$path" --repo "$REPOSITORY" >/dev/null
-  gh attestation verify "$path" --repo "$REPOSITORY" --predicate-type "$sbom_predicate_type" >/dev/null
+  verify_attestation "$path" "$slsa_predicate_type"
+  verify_attestation "$path" "$sbom_predicate_type"
 done < <(jq -c '.[]' <<<"$subjects_json")
 
 subjects_names_json="$(jq -c '[.[].name] | sort' <<<"$subjects_json")"
 first_subject_path="$(jq -r '.[0].path' <<<"$subjects_json")"
-slsa_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY"
-sbom_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY --predicate-type $sbom_predicate_type"
+slsa_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY --predicate-type $slsa_predicate_type --signer-workflow $signer_workflow_identity --source-ref $SOURCE_REF --source-digest $SOURCE_DIGEST --format json"
+sbom_verification_command="gh attestation verify $first_subject_path --repo $REPOSITORY --predicate-type $sbom_predicate_type --signer-workflow $signer_workflow_identity --source-ref $SOURCE_REF --source-digest $SOURCE_DIGEST --format json"
 
 tmp_manifest="$(mktemp "$manifest_dir/release-manifest.attestation-bind.XXXXXX")"
 trap 'rm -f "$tmp_manifest"' EXIT
@@ -186,6 +239,9 @@ trap 'rm -f "$tmp_manifest"' EXIT
 jq \
   --arg repository "$REPOSITORY" \
   --arg signer_workflow "$SIGNER_WORKFLOW" \
+  --arg slsa_predicate_type "$slsa_predicate_type" \
+  --arg source_ref "$SOURCE_REF" \
+  --arg source_digest "$SOURCE_DIGEST" \
   --arg slsa_verification_command "$slsa_verification_command" \
   --arg sbom_verification_command "$sbom_verification_command" \
   --arg slsa_attestation_url "$SLSA_ATTESTATION_URL" \
@@ -197,10 +253,12 @@ jq \
     + {
         spec_version: "1.2",
         level: "build_l2",
-        predicate_type: "https://slsa.dev/provenance/v1",
+        predicate_type: $slsa_predicate_type,
         repository: $repository,
         signer_workflow: $signer_workflow,
         subjects: $subjects,
+        source_ref: $source_ref,
+        source_digest: $source_digest,
         attested: true,
         verified: true,
         verification_command: $slsa_verification_command

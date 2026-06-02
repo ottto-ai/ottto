@@ -292,10 +292,17 @@ verify each native artifact with GitHub CLI:
 
 ```bash
 gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
-  -R ottto-ai/ottto
+  -R ottto-ai/ottto \
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
+  --source-ref refs/heads/main \
+  --source-digest <release-commit>
 gh attestation verify dist/macos/Ottto-macos-arm64.dmg \
   -R ottto-ai/ottto \
-  --predicate-type https://cyclonedx.org/bom
+  --predicate-type https://cyclonedx.org/bom \
+  --signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml \
+  --source-ref refs/heads/main \
+  --source-digest <release-commit>
 ```
 
 Then bind the exact manifest with the same subject checksum file:
@@ -320,7 +327,8 @@ After attestation binding, sign and verify the final manifest bytes:
   --manifest dist/macos/release-manifest.json \
   --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"
 ./scripts/macos_manifest_signature.sh verify \
-  --manifest dist/macos/release-manifest.json
+  --manifest dist/macos/release-manifest.json \
+  --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"
 ```
 
 To check whether the current Mac has the non-secret Apple toolchain before any

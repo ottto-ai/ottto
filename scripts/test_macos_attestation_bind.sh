@@ -29,6 +29,52 @@ if [[ "$1" != "attestation" || "$2" != "verify" ]]; then
   echo "unexpected gh invocation: $*" >&2
   exit 2
 fi
+predicate_type=""
+signer_workflow=""
+source_ref=""
+source_digest=""
+format=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --predicate-type)
+      predicate_type="${2:?}"
+      shift 2
+      ;;
+    --signer-workflow)
+      signer_workflow="${2:?}"
+      shift 2
+      ;;
+    --source-ref)
+      source_ref="${2:?}"
+      shift 2
+      ;;
+    --source-digest)
+      source_digest="${2:?}"
+      shift 2
+      ;;
+    --format)
+      format="${2:?}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [[ -z "$predicate_type" || -z "$signer_workflow" || -z "$source_ref" || -z "$source_digest" || "$format" != "json" ]]; then
+  echo "missing attestation origin binding flags: $*" >&2
+  exit 2
+fi
+if [[ "$signer_workflow" != "ottto-ai/ottto/.github/workflows/macos-stable-release.yml" ]]; then
+  echo "unexpected signer workflow: $signer_workflow" >&2
+  exit 2
+fi
+if [[ "$source_ref" != "refs/heads/main" || "$source_digest" != "abcdef123456" ]]; then
+  echo "unexpected source binding: $source_ref $source_digest" >&2
+  exit 2
+fi
+printf '[{"verificationResult":{"statement":{"predicateType":"%s"}}}]
+' "$predicate_type"
 exit 0
 MOCK
 chmod +x "$mock_bin/gh"
@@ -39,10 +85,13 @@ artifact="$TMP_DIR/Ottto-macos-arm64.dmg"
 cli="$TMP_DIR/ottto-macos-arm64.zip"
 daemon="$TMP_DIR/ottto-service-macos-arm64.zip"
 sbom="$TMP_DIR/ottto-local-platform-sbom.cdx.json"
+installer="$TMP_DIR/install-macos.sh"
 manifest="$TMP_DIR/release-manifest.json"
 printf 'app artifact\n' > "$artifact"
 printf 'cli artifact\n' > "$cli"
 printf 'daemon artifact\n' > "$daemon"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$installer"
+chmod +x "$installer"
 jq -n '{bomFormat: "CycloneDX", specVersion: "1.7", version: 1}' > "$sbom"
 sbom_sha="$(shasum -a 256 "$sbom" | awk '{print $1}')"
 
@@ -108,7 +157,8 @@ jq -n \
     ottto-macos-arm64.zip \
     ottto-service-macos-arm64.zip \
     ottto-local-platform-sbom.cdx.json \
-    release-manifest.json > subject.checksums.txt
+    release-manifest.json \
+    install-macos.sh > subject.checksums.txt
 )
 
 before_without_supply="$TMP_DIR/before-without-supply.json"
@@ -133,19 +183,33 @@ jq -e '
   and .supply_chain.slsa_build.verified == true
   and .supply_chain.slsa_build.repository == "ottto-ai/ottto"
   and .supply_chain.slsa_build.signer_workflow == ".github/workflows/macos-stable-release.yml"
+  and .supply_chain.slsa_build.source_ref == "refs/heads/main"
+  and .supply_chain.slsa_build.source_digest == "abcdef123456"
   and (.supply_chain.slsa_build.subjects | index("release-manifest.json") != null)
   and .supply_chain.sbom.attested == true
   and .supply_chain.sbom.verified == true
 ' "$manifest" >/dev/null
 
-expected_invocations=$((5 * 2))
+expected_invocations=$((6 * 2))
 actual_invocations="$(wc -l < "$GH_MOCK_LOG" | tr -d ' ')"
 if [[ "$actual_invocations" != "$expected_invocations" ]]; then
   echo "Expected $expected_invocations gh attestation verify calls, got $actual_invocations" >&2
   exit 1
 fi
+if ! grep -Fq -- "--predicate-type https://slsa.dev/provenance/v1" "$GH_MOCK_LOG"; then
+  echo "Expected SLSA attestation verification predicate type" >&2
+  exit 1
+fi
 if ! grep -Fq -- "--predicate-type https://cyclonedx.org/bom" "$GH_MOCK_LOG"; then
   echo "Expected SBOM attestation verification predicate type" >&2
+  exit 1
+fi
+if ! grep -Fq -- "--signer-workflow ottto-ai/ottto/.github/workflows/macos-stable-release.yml" "$GH_MOCK_LOG"; then
+  echo "Expected signer workflow attestation verification binding" >&2
+  exit 1
+fi
+if ! grep -Fq -- "--source-ref refs/heads/main" "$GH_MOCK_LOG" || ! grep -Fq -- "--source-digest abcdef123456" "$GH_MOCK_LOG"; then
+  echo "Expected source ref and digest attestation verification binding" >&2
   exit 1
 fi
 

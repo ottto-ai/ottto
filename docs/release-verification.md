@@ -52,9 +52,16 @@ When GitHub artifact attestations are used, verify the attestation against the
 expected repository and subject digest from the release manifest:
 
 ```bash
-gh attestation verify <artifact> --repo <owner>/<repo>
 gh attestation verify <artifact> --repo <owner>/<repo> \
-  --predicate-type https://cyclonedx.org/bom
+  --predicate-type https://slsa.dev/provenance/v1 \
+  --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
+  --source-ref refs/heads/main \
+  --source-digest <release-commit>
+gh attestation verify <artifact> --repo <owner>/<repo> \
+  --predicate-type https://cyclonedx.org/bom \
+  --signer-workflow <owner>/<repo>/.github/workflows/macos-stable-release.yml \
+  --source-ref refs/heads/main \
+  --source-digest <release-commit>
 ```
 
 The attestation subject must match the artifact digest. The SLSA provenance must
@@ -65,8 +72,9 @@ Stable manifests should be bound with `macos_attestation_bind.sh` using the
 published `subject.checksums.txt`; the helper updates only the SLSA and SBOM
 manifest fields and refuses `verified=true` if GitHub attestation verification
 fails. Verify `release-manifest.json.sig` with
-`macos_manifest_signature.sh verify --manifest release-manifest.json` before
-trusting the manifest as the stable release record.
+`macos_manifest_signature.sh verify --manifest release-manifest.json --identity "$OTTTO_MACOS_CODESIGN_IDENTITY"`
+before trusting the manifest as the stable release record so the CMS payload is
+bound to the expected Ottto Developer ID identity.
 
 ## GitHub Release Verification Mirror
 
