@@ -2565,6 +2565,15 @@ fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<String, LocalApiError> {
+    // SECURITY: this path POSTs the long-lived relay device_secret to the
+    // backend. `connection.api_base_url` is deserialized from on-disk
+    // connection.json (see `LocalConnectionBinding`) and is not trusted — a
+    // co-resident attacker who tampers that file could otherwise exfiltrate the
+    // secret to their own host. Gate the base through the same trusted-base
+    // validator every other secret-bearing egress in this file uses, BEFORE
+    // touching the device secret. Fail closed: both callers map an `Err` to a
+    // reconnect/backend error, so an untrusted base never releases the secret.
+    let api_base_url = validated_api_base_url(Some(api_base_url))?;
     let device = FileDeviceStore::default()
         .load()
         .map_err(|_| LocalApiError::StatePoisoned)?
@@ -2574,7 +2583,7 @@ fn refresh_setup_run_token_via_device_secret(
         .map_err(|_| LocalApiError::SetupRunConnectionMissing)?;
 
     let url = api_url_with_base(
-        api_base_url,
+        &api_base_url,
         &format!(
             "/api/v1/setup-runs/{}/local-client/refresh",
             connection.setup_run_id
@@ -7171,6 +7180,24 @@ mod tests {
             validated_api_base_url(Some(DIRECT_API_BASE_URL)).expect("valid"),
             DIRECT_API_BASE_URL.to_string()
         );
+    }
+
+    #[test]
+    fn refresh_setup_run_token_refuses_untrusted_api_base() {
+        // SECURITY (Codex High: "Verify refresh can leak device secret to
+        // untrusted API base"): the device-secret refresh must fail closed when
+        // connection.api_base_url is untrusted, BEFORE the relay device_secret is
+        // loaded or POSTed anywhere. Validation runs first, so an attacker base
+        // never reaches the secret-bearing request.
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_untrusted".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            api_base_url: "https://attacker.example".to_string(),
+        };
+        let result =
+            refresh_setup_run_token_via_device_secret("https://attacker.example", &connection);
+        assert!(matches!(result, Err(LocalApiError::NetworkUnavailable)));
     }
 
     #[test]
