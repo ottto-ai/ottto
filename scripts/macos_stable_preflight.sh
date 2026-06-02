@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GATE="$ROOT/scripts/macos_release_gate.sh"
+HELPER_GENERATOR="$ROOT/scripts/hosted_native_installer.sh"
 
 MANIFEST=""
 SIGN_IDENTITY="${OTTTO_MACOS_CODESIGN_IDENTITY:-}"
@@ -78,6 +79,8 @@ require_command() {
 require_command jq
 require_command shasum
 require_command python3
+require_command bash
+require_command cmp
 
 if [[ "$DRY_RUN" != "true" ]]; then
   require_command codesign
@@ -206,6 +209,33 @@ resolve_manifest_file() {
   fi
   return 1
 }
+
+if [[ -n "$verified_installer_path" ]]; then
+  if ! verified_installer_resolved_path="$(resolve_manifest_file "$verified_installer_path")"; then
+    fail "Stable manifest verified native installer helper is missing: $verified_installer_path"
+  else
+    if [[ ! -f "$verified_installer_resolved_path" ]]; then
+      fail "Stable manifest verified native installer helper is not a regular file: $verified_installer_path"
+    fi
+    if [[ ! -x "$verified_installer_resolved_path" ]]; then
+      fail "Stable manifest verified native installer helper must be executable: $verified_installer_path"
+    fi
+    if ! bash -n "$verified_installer_resolved_path"; then
+      fail "Stable manifest verified native installer helper has invalid shell syntax: $verified_installer_path"
+    fi
+    expected_installer="$(mktemp)"
+    trap 'rm -f "$expected_installer"' EXIT
+    if "$HELPER_GENERATOR" --manifest "$MANIFEST" --output "$expected_installer" >/dev/null; then
+      if ! cmp -s "$expected_installer" "$verified_installer_resolved_path"; then
+        fail "Stable manifest verified native installer helper does not match the generated helper: $verified_installer_path"
+      fi
+    else
+      fail "Stable manifest verified native installer helper could not be regenerated for verification"
+    fi
+    rm -f "$expected_installer"
+    trap - EXIT
+  fi
+fi
 
 if ! python3 - "$MANIFEST" <<'PY'
 from __future__ import annotations
@@ -462,6 +492,9 @@ done < <(
   {
     jq -r '.artifacts[] | .path | split("/")[-1]' "$MANIFEST"
     printf '%s\n' "release-manifest.json" "$(basename "$sbom_path")"
+    if [[ -n "$verified_installer_path" ]]; then
+      printf '%s\n' "$(basename "$verified_installer_path")"
+    fi
   } | sort -u
 )
 for subject in "${required_subjects[@]}"; do

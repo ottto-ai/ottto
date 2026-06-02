@@ -189,17 +189,33 @@ jobs:
             dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
           mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
 
+      - name: Generate stable install artifacts
+        if: inputs.channel == 'stable'
+        run: |
+          set -euo pipefail
+          scripts/homebrew_formula.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/homebrew/ottto.rb
+          scripts/hosted_native_installer.sh \
+            --manifest dist/macos/release-manifest.json \
+            --output dist/macos/install-macos.sh
+
       - name: Generate attestation subject checksums
         run: |
           set -euo pipefail
           (
             cd dist/macos
-            shasum -a 256 \
-              Ottto-macos-*.dmg \
-              ottto-macos-*.zip \
-              ottto-service-macos-*.zip \
-              ottto-local-platform-sbom.cdx.json \
-              release-manifest.json > subject.checksums.txt
+            subjects=(
+              Ottto-macos-*.dmg
+              ottto-macos-*.zip
+              ottto-service-macos-*.zip
+              ottto-local-platform-sbom.cdx.json
+              release-manifest.json
+            )
+            if [[ "${{ inputs.channel }}" == "stable" ]]; then
+              subjects+=(install-macos.sh)
+            fi
+            shasum -a 256 "${subjects[@]}" > subject.checksums.txt
           )
 
       - name: Create provenance attestation
@@ -227,12 +243,17 @@ jobs:
           set -euo pipefail
           (
             cd dist/macos
-            shasum -a 256 \
-              Ottto-macos-*.dmg \
-              ottto-macos-*.zip \
-              ottto-service-macos-*.zip \
-              ottto-local-platform-sbom.cdx.json \
-              release-manifest.json > subject.checksums.txt
+            subjects=(
+              Ottto-macos-*.dmg
+              ottto-macos-*.zip
+              ottto-service-macos-*.zip
+              ottto-local-platform-sbom.cdx.json
+              release-manifest.json
+            )
+            if [[ "${{ inputs.channel }}" == "stable" ]]; then
+              subjects+=(install-macos.sh)
+            fi
+            shasum -a 256 "${subjects[@]}" > subject.checksums.txt
           )
 
       - name: Create final provenance attestation
@@ -255,17 +276,6 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow .github/workflows/macos-stable-release.yml
           scripts/macos_release_gate.sh --manifest dist/macos/release-manifest.json
-
-      - name: Generate stable install artifacts
-        if: inputs.channel == 'stable'
-        run: |
-          set -euo pipefail
-          scripts/homebrew_formula.sh \
-            --manifest dist/macos/release-manifest.json \
-            --output dist/macos/homebrew/ottto.rb
-          scripts/hosted_native_installer.sh \
-            --manifest dist/macos/release-manifest.json \
-            --output dist/macos/install-macos.sh
 
       - name: Sign and verify release manifest
         run: |

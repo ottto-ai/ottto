@@ -12,11 +12,12 @@ usage() {
 Usage: macos_manifest_signature.sh <sign|verify> --manifest <release-manifest.json> [options]
 
 Signs release-manifest.json with a Developer ID-backed CMS signature and
-verifies that release-manifest.json.sig decodes to exactly the manifest bytes.
+verifies that release-manifest.json.sig decodes to exactly the manifest bytes
+and is signed by the expected Developer ID identity.
 
 Options:
   --signature <path>  Signature path. Default: <manifest>.sig
-  --identity <name>   Developer ID Application identity for sign mode.
+  --identity <name>   Expected Developer ID Application identity for signing and verification.
   --keychain <path>   Optional keychain passed to security cms.
   -h, --help          Show help.
 USAGE
@@ -84,19 +85,25 @@ require_command cmp
 require_command security
 
 security_common_args=(cms)
+security_find_args=(find-certificate)
 if [[ -n "$KEYCHAIN" ]]; then
   security_common_args+=(-k "$KEYCHAIN")
+  security_find_args+=(-k "$KEYCHAIN")
 fi
 
-if [[ "$MODE" == "sign" ]]; then
+validate_developer_id_identity() {
   if [[ -z "$IDENTITY" ]]; then
-    echo "Developer ID Application identity is required for signing" >&2
+    echo "Developer ID Application identity is required for $MODE" >&2
     exit 2
   fi
   if [[ "$IDENTITY" != Developer\ ID\ Application:* ]]; then
     echo "Manifest CMS signing identity must be a Developer ID Application identity" >&2
     exit 2
   fi
+}
+
+if [[ "$MODE" == "sign" ]]; then
+  validate_developer_id_identity
   security "${security_common_args[@]}" -S -u 6 -H SHA256 -G -N "$IDENTITY" -i "$MANIFEST" -o "$SIGNATURE"
   echo "Wrote CMS signature: $SIGNATURE"
   exit 0
@@ -107,12 +114,27 @@ if [[ ! -f "$SIGNATURE" ]]; then
   exit 1
 fi
 
+validate_developer_id_identity
+
+signer_details="$(mktemp)"
 decoded="$(mktemp)"
-trap 'rm -f "$decoded"' EXIT
-security "${security_common_args[@]}" -D -u 6 -i "$SIGNATURE" -o "$decoded"
+trap 'rm -f "$signer_details" "$decoded"' EXIT
+
+if ! security "${security_find_args[@]}" -c "$IDENTITY" -p >/dev/null; then
+  echo "Expected Developer ID identity was not found in the keychain: $IDENTITY" >&2
+  exit 1
+fi
+if ! security "${security_common_args[@]}" -D -u 6 -v -i "$SIGNATURE" -o "$decoded" >"$signer_details" 2>&1; then
+  cat "$signer_details" >&2
+  exit 1
+fi
+if ! grep -Fq "$IDENTITY" "$signer_details"; then
+  echo "CMS signature was not signed by expected identity: $IDENTITY" >&2
+  exit 1
+fi
 if ! cmp -s "$MANIFEST" "$decoded"; then
   echo "CMS signature payload does not match manifest bytes" >&2
   exit 1
 fi
 
-echo "Verified CMS signature payload for $MANIFEST"
+echo "Verified CMS signature payload and signer for $MANIFEST"

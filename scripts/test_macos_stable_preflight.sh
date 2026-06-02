@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFLIGHT="$ROOT/scripts/macos_stable_preflight.sh"
+HELPER_GENERATOR="$ROOT/scripts/hosted_native_installer.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -143,6 +144,7 @@ write_manifest() {
           signer_workflow: ".github/workflows/macos-stable-release.yml",
           subjects: [
             "ottto",
+            "install-macos.sh",
             "release-manifest.json",
             "ottto-local-platform-sbom.cdx.json"
           ],
@@ -180,9 +182,9 @@ write_manifest() {
           url: $app_url,
           verification_path: $artifact,
           sha256: $sha,
-          signed: false,
-          notarized: false,
-          gatekeeper_assessed: false
+          signed: true,
+          notarized: true,
+          gatekeeper_assessed: true
         },
         {
           name: "ottto",
@@ -193,9 +195,9 @@ write_manifest() {
           url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-macos-arm64.zip",
           verification_path: $artifact,
           sha256: $sha,
-          signed: false,
-          notarized: false,
-          gatekeeper_assessed: false
+          signed: true,
+          notarized: true,
+          gatekeeper_assessed: true
         },
         {
           name: "ottto-service",
@@ -206,9 +208,9 @@ write_manifest() {
           url: "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/ottto-service-macos-arm64.zip",
           verification_path: $artifact,
           sha256: $sha,
-          signed: false,
-          notarized: false,
-          gatekeeper_assessed: false
+          signed: true,
+          notarized: true,
+          gatekeeper_assessed: true
         }
       ]
     }' > "$manifest"
@@ -220,7 +222,18 @@ write_manifest \
   "$sha" \
   "https://install.ottto.net/ottto-local-platform/releases/stable/0.1.0/Ottto-macos-arm64.dmg" \
   "$stable_manifest"
+"$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" >/dev/null
 "$PREFLIGHT" --manifest "$stable_manifest" --dry-run >/dev/null
+
+tampered_helper_manifest="$TMP_DIR/tampered-helper-manifest.json"
+cp "$stable_manifest" "$tampered_helper_manifest"
+printf '#!/usr/bin/env bash\necho pwned\n' > "$TMP_DIR/install-macos.sh"
+chmod +x "$TMP_DIR/install-macos.sh"
+if "$PREFLIGHT" --manifest "$tampered_helper_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected tampered stable installer helper to fail stable preflight" >&2
+  exit 1
+fi
+"$HELPER_GENERATOR" --manifest "$stable_manifest" --output "$TMP_DIR/install-macos.sh" >/dev/null
 
 dev_manifest="$TMP_DIR/dev-manifest.json"
 write_manifest \
