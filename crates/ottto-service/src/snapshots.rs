@@ -35,7 +35,7 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // changed, so the bump re-walks every Claude session once to re-emit at v8.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v16";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v8";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v6";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -1114,7 +1114,9 @@ fn scan_source_roots_with_limit(
         let last_snapshot_fingerprint = parsed
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
-        index.record(candidate, last_snapshot_fingerprint);
+        if source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some() {
+            index.record(candidate, last_snapshot_fingerprint);
+        }
         snapshots.extend(parsed);
     }
     if source == SnapshotSource::Codex {
@@ -4080,6 +4082,135 @@ mod tests {
         assert_state_only("incremental re-scan", &second);
 
         let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn pi_scan_retries_zero_parsed_file_until_usage_arrives() {
+        let root = temp_dir("pi-retry-zero-parsed");
+        let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-05-14T10:00:00Z\"}\n"
+            ),
+        )
+        .expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 0);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-05-14T10:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1779234000000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let second = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan");
+        assert_eq!(second.snapshots.len(), 1);
+        assert_eq!(
+            second.snapshots[0].source_session_id,
+            "019e2700-1111-7000-9000-111111111111"
+        );
+
+        let third = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("third scan");
+        assert_eq!(third.snapshots.len(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_scan_reprocesses_v6_zero_parse_index_entries() {
+        let root = temp_dir("pi-v6-index");
+        let path = root.join("session-019e2700-2222-7000-9000-222222222222.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-2222-7000-9000-222222222222\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-05-14T10:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1779235000000,\"usage\":{\"input\":22,\"output\":11,\"cacheRead\":1,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let metadata = fs::metadata(&path).expect("read metadata");
+        let size_bytes = metadata.len();
+        let modified_unix_seconds = metadata
+            .modified()
+            .expect("modification time")
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let v6_key =
+            source_file_fingerprint(&path, size_bytes, modified_unix_seconds, "pi_jsonl:v6");
+        let legacy_entry = ScanIndexEntry {
+            size_bytes,
+            modified_unix_seconds,
+            source_file_fingerprint: v6_key.clone(),
+            last_snapshot_fingerprint: None,
+        };
+
+        let mut index = ScanIndex {
+            files: std::collections::BTreeMap::from([(
+                path.to_string_lossy().to_string(),
+                legacy_entry,
+            )]),
+        };
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(
+            scan.snapshots[0].source_session_id,
+            "019e2700-2222-7000-9000-222222222222"
+        );
+
+        let entry = index
+            .files
+            .get(&path.to_string_lossy().to_string())
+            .expect("index entry");
+        assert!(entry.last_snapshot_fingerprint.is_some());
+        assert_ne!(entry.source_file_fingerprint, v6_key);
+        assert_eq!(
+            entry.source_file_fingerprint,
+            source_file_fingerprint(
+                &path,
+                size_bytes,
+                modified_unix_seconds,
+                PI_SNAPSHOT_PARSER_VERSION
+            )
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
