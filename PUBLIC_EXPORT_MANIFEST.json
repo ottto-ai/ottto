@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "afc9a19bb5cd9ab8924838bce928f8755a5d77cd3c6a0f2c17df185e81de4fb5",
+  "content_sha256": "d4f7efd1f9fa022d623c35edd689e61046c31437e4efffc5cd0976381ac964f6",
   "files": [
     {
       "executable": false,
@@ -986,8 +986,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_attestation_bind.sh",
-      "sha256": "02604f8d8b792aeb69616c385e87c9c035017d66276a842da468058f934a218d",
-      "size_bytes": 9640
+      "sha256": "de47df1db1ed6ea740542a307aaf68c320f20e949f48f6685496287177b183aa",
+      "size_bytes": 10252
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-02T18:47:40+00:00",
+  "generated_at": "2026-06-02T22:07:53+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0932a02fbf7aace7c7c8d4e5a39ddff5b108e166"
+  "source_commit": "3bd734695ec48ae29e5b0edada00d21c90ae8a73"
 }
