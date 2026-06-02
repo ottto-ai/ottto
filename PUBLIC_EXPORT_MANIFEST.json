@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "90c3b9f3c3c38e4d1dc934d9e791a98200825fc3c276ede2f62acde594c79d21",
+  "content_sha256": "c24424dd9522e45fb84037fc4e5767a1f99327efc2a10a2c5fd1539a18a15324",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/macos-stable-release.yml",
-      "sha256": "b25e1c879d003bb90dd89c0a29dd2ad387c08b58386d94c9247bedc38fe18249",
-      "size_bytes": 14211
+      "sha256": "99752b76063b8530e0271917ec824935fe4df7340c66b1e5a5102993580d9e3b",
+      "size_bytes": 14541
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "94be71f8d5980fb591eb5e6a78c1861a785baeb0afe7b6f7d9c5c737f624f470",
-      "size_bytes": 7207
+      "sha256": "a1967772f379d09701aa59f86fea9c1b47b83f58bb33a8e4da08ac40349528c0",
+      "size_bytes": 7675
     },
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "f7c0ee79c41b1465eda306f3b2f80f6859194a37bce6c27b01bc881ab2f1fe0a",
-      "size_bytes": 23919
+      "sha256": "30c1ef6c50f95ae100754f96ef7267cccba1edd5000bd1909e2fffa9ea29814c",
+      "size_bytes": 24319
     },
     {
       "executable": false,
@@ -986,8 +986,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_attestation_bind.sh",
-      "sha256": "1a864d54293675e6b46cc6e0688801551753359ab72ad02eab4b782d42a345ac",
-      "size_bytes": 7523
+      "sha256": "02604f8d8b792aeb69616c385e87c9c035017d66276a842da468058f934a218d",
+      "size_bytes": 9640
     },
     {
       "executable": true,
@@ -1014,8 +1014,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_manifest_signature.sh",
-      "sha256": "18b8ac42a95534759e29e2da154294fb2134993c48c7ad6cdbd0d47fa68d721f",
-      "size_bytes": 2680
+      "sha256": "ee37a385a5a11d5bd1406e4eb52e4c160bc826200f6e3695550a8aa84e5c95c5",
+      "size_bytes": 3378
     },
     {
       "executable": true,
@@ -1070,8 +1070,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_preflight.sh",
-      "sha256": "0eb4c63d0ce62b38503d9f7471d29647075610a2655702c9842c07b85b2444c6",
-      "size_bytes": 23267
+      "sha256": "e6f82aa87163b6d900450ed4a863f7ef629dbb846e7480c2ffe97d2ead9e4c26",
+      "size_bytes": 24835
     },
     {
       "executable": true,
@@ -1168,8 +1168,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_attestation_bind.sh",
-      "sha256": "06c7862a22819a4918c3ba1d43b3a95a794557d809ae057871350fb8c09e3e78",
-      "size_bytes": 5717
+      "sha256": "d22b06c355fafcec7a963bcb044c04cadbaf6209ff4f314a4dfab868d37e040b",
+      "size_bytes": 7697
     },
     {
       "executable": true,
@@ -1182,8 +1182,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_manifest_signature.sh",
-      "sha256": "af112314e22a868aed1e8f4998a6aa3d1c8032d2a173b7adb2222080dd91ab00",
-      "size_bytes": 2041
+      "sha256": "49fde237b9b10013e9bce61c1065cd0699b592b1ab413e55f4d76e966b7eac28",
+      "size_bytes": 3279
     },
     {
       "executable": true,
@@ -1238,8 +1238,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_preflight.sh",
-      "sha256": "ba604c2c2086835a6293b60bcb1bddc1d4a00f0b979ee3db649cde30cba7cde8",
-      "size_bytes": 12274
+      "sha256": "26f05d4d905f3c7944d81dd043b7d256f883fd24c6bffa024a8d482b89de9c8d",
+      "size_bytes": 12959
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-01T10:53:20+00:00",
+  "generated_at": "2026-06-02T09:53:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f050ed05f0a884428a3ceead55e94691a24add87"
+  "source_commit": "6c1fa326456ff09fc5ac8866d2e01d6938d99299"
 }
