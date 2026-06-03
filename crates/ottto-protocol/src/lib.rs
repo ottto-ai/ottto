@@ -418,6 +418,42 @@ pub enum SourceOperationState {
     Disabled,
 }
 
+/// Display-safe default settings captured for an agent runtime.
+///
+/// These are config/CLI defaults, not proof that a completed session ran with
+/// the same values. The backend keeps them separate from per-session selector
+/// evidence (`AgentRuntimeDefaultsSnapshot`), and surfaces them on the apps
+/// page, session-start defaults, and Advisor facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentRuntimeDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selector_context: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selector_sources: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusSnapshot {
     pub source: SourceKind,
@@ -441,6 +477,8 @@ pub struct AgentStatusSnapshot {
     pub plan_observations: Vec<AgentStatusPlanObservation>,
     #[serde(default)]
     pub diagnostics: Vec<AgentStatusDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_defaults: Option<AgentRuntimeDefaults>,
 }
 
 impl AgentStatusSnapshot {
@@ -501,6 +539,25 @@ impl AgentStatusSnapshot {
             .drain(..)
             .map(redact_diagnostic_for_backend)
             .collect();
+
+        if let Some(defaults) = self.runtime_defaults.as_mut() {
+            defaults.model = safe_optional_text(defaults.model.take());
+            defaults.service_tier = safe_optional_text(defaults.service_tier.take());
+            defaults.speed_mode = safe_optional_text(defaults.speed_mode.take());
+            defaults.reasoning_effort = safe_optional_text(defaults.reasoning_effort.take());
+            defaults.approval_policy = safe_optional_text(defaults.approval_policy.take());
+            defaults.sandbox_mode = safe_optional_text(defaults.sandbox_mode.take());
+            defaults.machine_id = safe_optional_text(defaults.machine_id.take());
+            defaults.provenance = safe_optional_text(defaults.provenance.take());
+            defaults.selector_context = std::mem::take(&mut defaults.selector_context)
+                .into_iter()
+                .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                .collect();
+            defaults.selector_sources = std::mem::take(&mut defaults.selector_sources)
+                .into_iter()
+                .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
+                .collect();
+        }
         self
     }
 }
@@ -1973,6 +2030,22 @@ mod tests {
                 severity: AgentDiagnosticSeverity::Warning,
                 message: "failed reading /Users/ron/.codex/config".to_string(),
             }],
+            runtime_defaults: Some(AgentRuntimeDefaults {
+                provenance: Some("config_file".to_string()),
+                model: Some("gpt-5.4".to_string()),
+                service_tier: Some("default".to_string()),
+                fast_mode_enabled: Some(false),
+                selector_context: BTreeMap::from([
+                    ("service_tier".to_string(), "default".to_string()),
+                    // Path-like value must be stripped by redaction.
+                    ("leaked".to_string(), "/Users/ron/.codex/config".to_string()),
+                ]),
+                selector_sources: BTreeMap::from([(
+                    "service_tier".to_string(),
+                    "codex.config.service_tier".to_string(),
+                )]),
+                ..Default::default()
+            }),
         }
         .redacted_for_backend();
 
@@ -2012,6 +2085,25 @@ mod tests {
         assert_eq!(snapshot.credit_balances[0].account_label, None);
         assert_eq!(snapshot.credit_balances[0].remaining, Some(0));
         assert_eq!(snapshot.diagnostics[0].message, "diagnostic redacted");
+        let runtime_defaults = snapshot.runtime_defaults.expect("runtime_defaults");
+        assert_eq!(runtime_defaults.service_tier.as_deref(), Some("default"));
+        assert_eq!(runtime_defaults.fast_mode_enabled, Some(false));
+        assert_eq!(
+            runtime_defaults
+                .selector_context
+                .get("service_tier")
+                .map(String::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            runtime_defaults
+                .selector_sources
+                .get("service_tier")
+                .map(String::as_str),
+            Some("codex.config.service_tier")
+        );
+        // Path-like config value is stripped by backend redaction.
+        assert!(!runtime_defaults.selector_context.contains_key("leaked"));
     }
 
     #[test]
