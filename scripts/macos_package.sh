@@ -211,10 +211,11 @@ fi
 cp "$CLI_BINARY" "$OUTPUT_DIR/ottto"
 cp "$DAEMON_BINARY" "$OUTPUT_DIR/ottto-service"
 
-# Sparkle feed keys are added only once the EdDSA public key is configured
-# (OTTTO_SPARKLE_PUBLIC_ED_KEY). Until then the framework is embedded but the
-# app's updater stays inert and falls back to the manual download path — so the
-# seamless updater goes live exactly when the signed-release key is wired in.
+# Sparkle feed keys ship whenever the EdDSA public key is configured. The public
+# key is baked as a default below (it is public; the matching private key lives
+# only in the signing Mac's login Keychain), so signed releases emit the updater
+# feed keys automatically. Override OTTTO_SPARKLE_PUBLIC_ED_KEY to rotate it.
+: "${OTTTO_SPARKLE_PUBLIC_ED_KEY:=7+mQTEYSADfrrzjx3bpVlVUlZNo/UHDEPSSFV85jtYE=}"
 SPARKLE_INFO_PLIST_KEYS=""
 if [[ -n "${OTTTO_SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
   SPARKLE_FEED_URL="${OTTTO_SPARKLE_FEED_URL:-$RELEASE_CHANNEL_URL_ROOT/latest/appcast.xml}"
