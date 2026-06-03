@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "d4f7efd1f9fa022d623c35edd689e61046c31437e4efffc5cd0976381ac964f6",
+  "content_sha256": "f270c9ab25a6c46e6c1eeabf29686ac101c90f20486a2f4e13b2464ff285ec51",
   "files": [
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_manifest_signature.sh",
-      "sha256": "ee37a385a5a11d5bd1406e4eb52e4c160bc826200f6e3695550a8aa84e5c95c5",
-      "size_bytes": 3378
+      "sha256": "ac45b4739a921eac43144761e41f0a7cd0c2d1a15f670655a388853b09ad7268",
+      "size_bytes": 4307
     },
     {
       "executable": true,
@@ -1182,8 +1182,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_manifest_signature.sh",
-      "sha256": "49fde237b9b10013e9bce61c1065cd0699b592b1ab413e55f4d76e966b7eac28",
-      "size_bytes": 3279
+      "sha256": "968326538c417ce26c6348e11c0384fe074d195aabdd3aadd67cd480ad07af40",
+      "size_bytes": 5023
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-02T22:07:53+00:00",
+  "generated_at": "2026-06-03T06:50:23+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3bd734695ec48ae29e5b0edada00d21c90ae8a73"
+  "source_commit": "f90f1890f8fe4c4a0a7df8d32ae2a5e5438ba67e"
 }
