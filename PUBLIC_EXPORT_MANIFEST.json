@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "f270c9ab25a6c46e6c1eeabf29686ac101c90f20486a2f4e13b2464ff285ec51",
+  "content_sha256": "a78eadc3db2703ed4a8f2e84b0a87d5b9f9c898fcbebca71714a5f5d4e7db167",
   "files": [
     {
       "executable": false,
@@ -1028,8 +1028,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "166491fc0b415ecbdd4a4e3e4d6f2f962a48643b978ffaa888a00c40690b6976",
-      "size_bytes": 28606
+      "sha256": "7bbb89c8e922254fa97252d997bd9d034b5102d644a85c79c0067c2b1a82a1ca",
+      "size_bytes": 31628
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-03T06:50:23+00:00",
+  "generated_at": "2026-06-03T10:45:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f90f1890f8fe4c4a0a7df8d32ae2a5e5438ba67e"
+  "source_commit": "0c749c907b2de21b53bd4a5127ea37323cfcceb3"
 }

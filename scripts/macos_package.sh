@@ -98,6 +98,8 @@ require_command ditto
 require_command hdiutil
 require_command plutil
 require_command codesign
+require_command install_name_tool
+require_command otool
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "aarch64" ]]; then
@@ -164,6 +166,17 @@ for binary in "$APP_EXECUTABLE" "$CLI_BINARY" "$DAEMON_BINARY"; do
   fi
 done
 
+# Sparkle.framework powers the seamless in-app updater. SwiftPM copies it next
+# to the built executable; fall back to the extracted XCFramework slice.
+SPARKLE_FRAMEWORK="$SWIFT_BUILD_DIR/Sparkle.framework"
+if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
+  SPARKLE_FRAMEWORK="$(find "$MAC_APP_ROOT/.build" -type d -path '*macos-arm64*/Sparkle.framework' -print -quit 2>/dev/null || true)"
+fi
+if [[ ! -d "$SPARKLE_FRAMEWORK" ]]; then
+  echo "Sparkle.framework not found under $MAC_APP_ROOT/.build (did 'swift build' resolve Sparkle?)" >&2
+  exit 1
+fi
+
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
@@ -172,10 +185,14 @@ APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_HELPERS="$APP_CONTENTS/Helpers"
 APP_RESOURCES="$APP_CONTENTS/Resources"
+APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
 APP_LAUNCH_AGENTS="$APP_CONTENTS/Library/LaunchAgents"
 
-mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES" "$APP_LAUNCH_AGENTS"
+mkdir -p "$APP_MACOS" "$APP_HELPERS" "$APP_RESOURCES" "$APP_FRAMEWORKS" "$APP_LAUNCH_AGENTS"
 cp "$APP_EXECUTABLE" "$APP_MACOS/Ottto"
+# Embed Sparkle.framework (ditto preserves the Versions/Current symlinks). The
+# app links Sparkle, so the bundle will not launch without this.
+ditto "$SPARKLE_FRAMEWORK" "$APP_FRAMEWORKS/Sparkle.framework"
 cp "$CLI_BINARY" "$APP_HELPERS/ottto"
 cp "$DAEMON_BINARY" "$APP_HELPERS/ottto-service"
 cp "$MAC_APP_ROOT/Sources/OtttoCompanion/Resources/OtttoCompanionIcon.icns" "$APP_RESOURCES/OtttoCompanionIcon.icns"
@@ -193,6 +210,24 @@ else
 fi
 cp "$CLI_BINARY" "$OUTPUT_DIR/ottto"
 cp "$DAEMON_BINARY" "$OUTPUT_DIR/ottto-service"
+
+# Sparkle feed keys are added only once the EdDSA public key is configured
+# (OTTTO_SPARKLE_PUBLIC_ED_KEY). Until then the framework is embedded but the
+# app's updater stays inert and falls back to the manual download path — so the
+# seamless updater goes live exactly when the signed-release key is wired in.
+SPARKLE_INFO_PLIST_KEYS=""
+if [[ -n "${OTTTO_SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+  SPARKLE_FEED_URL="${OTTTO_SPARKLE_FEED_URL:-$RELEASE_CHANNEL_URL_ROOT/latest/appcast.xml}"
+  SPARKLE_INFO_PLIST_KEYS=$(cat <<SPARKLEKEYS
+  <key>SUFeedURL</key>
+  <string>${SPARKLE_FEED_URL}</string>
+  <key>SUPublicEDKey</key>
+  <string>${OTTTO_SPARKLE_PUBLIC_ED_KEY}</string>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+SPARKLEKEYS
+)
+fi
 
 cat > "$APP_CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -238,6 +273,7 @@ cat > "$APP_CONTENTS/Info.plist" <<PLIST
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+${SPARKLE_INFO_PLIST_KEYS}
 </dict>
 </plist>
 PLIST
@@ -293,11 +329,42 @@ else
   }
 fi
 
+# Sign Sparkle's nested code inside-out (XPC services, Autoupdate, Updater.app),
+# then the framework. Never use --deep (it corrupts the XPC service signatures).
+sign_sparkle() {
+  local fw="$1"
+  local v="$fw/Versions/B"
+  if [[ -n "$SIGN_IDENTITY" ]]; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$v/XPCServices/Installer.xpc"
+    codesign --force --options runtime --timestamp --preserve-metadata=entitlements --sign "$SIGN_IDENTITY" "$v/XPCServices/Downloader.xpc"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$v/Autoupdate"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$v/Updater.app"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$fw"
+  else
+    local target
+    for target in \
+      "$v/XPCServices/Installer.xpc" \
+      "$v/XPCServices/Downloader.xpc" \
+      "$v/Autoupdate" \
+      "$v/Updater.app" \
+      "$fw"; do
+      codesign --force --sign - "$target"
+    done
+  fi
+}
+
+# Add the runpath so the embedded Sparkle.framework resolves at launch. Must run
+# before the main executable is signed (a later install_name_tool voids it).
+if ! otool -l "$APP_MACOS/Ottto" | grep -q "@executable_path/../Frameworks"; then
+  install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_MACOS/Ottto"
+fi
+
 sign_code "$APP_HELPERS/ottto"
 sign_code "$APP_HELPERS/ottto-service"
 sign_code "$APP_MACOS/Ottto"
 sign_code "$OUTPUT_DIR/ottto"
 sign_code "$OUTPUT_DIR/ottto-service"
+sign_sparkle "$APP_FRAMEWORKS/Sparkle.framework"
 sign_code "$APP_BUNDLE"
 
 LAUNCH_SMOKE_EVIDENCE="$OUTPUT_DIR/packaged-app-launch-smoke.json"
