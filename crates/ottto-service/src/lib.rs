@@ -2520,6 +2520,7 @@ mod tests {
             capabilities: Vec::new(),
             plan_observations: Vec::new(),
             diagnostics: Vec::new(),
+            runtime_defaults: None,
         };
 
         merge_current_plan_quota(&mut detected, &snapshot);
