@@ -4740,10 +4740,13 @@ fn run_pi_verify_source_action(
         .filter(|route| route.verified)
         .count();
     let routes_failed = routes_total.saturating_sub(routes_verified);
-    let action_status = if result.verified {
-        "succeeded"
-    } else {
-        "failed"
+    // A Warning (partial-verified, or all routes awaiting a provider re-sign-in)
+    // is a non-fatal completion: the run should advance and the source settle to
+    // "warning"/needs-attention, not a hard "failed" that blocks. Only a real
+    // smoke Failed maps the action to "failed".
+    let action_status = match result.status {
+        SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
+        _ => "failed",
     };
     Ok((
         action_status.to_string(),
@@ -6291,6 +6294,23 @@ fn run_one_pi_route_verification(
     setup_run_token: &str,
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
+    // A subscription-OAuth route (openai-codex / anthropic / github-copilot)
+    // authenticates via a single-use *rotating* refresh token that Ottto must not
+    // consume. Running a live `pi` smoke would burn that token (the provider then
+    // returns 401 refresh_token_reused — which also breaks the agent's own CLI),
+    // and Ottto cannot re-mint it. So verify these routes PASSIVELY from telemetry
+    // the local_sessions collector already uploaded, and surface an actionable
+    // re-auth Warning (not a hard smoke Failed) when none is fresh. Non-OAuth
+    // routes (api_key / gateway / service_account) still run a live smoke.
+    if route_is_subscription_oauth(route) {
+        return verify_pi_subscription_oauth_route_passively(
+            api_base_url,
+            connection,
+            setup_run_token,
+            route,
+        );
+    }
+
     let before_session_files = pi_session_files();
     let smoke_after = current_rfc3339();
     let smoke = run_pi_route_smoke_prompt(route, Some(before_session_files.len()));
@@ -6320,6 +6340,172 @@ fn run_one_pi_route_verification(
     ) {
         Ok(verification) => pi_route_result_from_verification(route, &smoke, verification),
         Err(error) => pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error),
+    }
+}
+
+/// error_code (and aggregate code) for a Pi route that has no fresh telemetry and
+/// authenticates via a rotating provider OAuth token Ottto can't re-mint: the
+/// recovery is a provider re-sign-in (`ottto fix --app pi` yields the steps).
+const PI_OAUTH_REAUTH_CODE: &str = "pi_oauth_reauth_required";
+
+/// How far back to look for already-uploaded telemetry when verifying a
+/// subscription-OAuth Pi route passively (we don't run a live smoke, so we treat
+/// recent observed usage as the verification signal).
+const PI_PASSIVE_LOOKBACK_HOURS: u32 = 6;
+
+/// True for a Pi route whose provider OAuth token rotates on use (subscription
+/// auth_mode=oauth: openai-codex / anthropic / github-copilot). These must not be
+/// live-smoked.
+fn route_is_subscription_oauth(route: &PiModelRoute) -> bool {
+    route.classification.auth_mode.as_deref() == Some("oauth")
+        && route.classification.billing_channel.as_deref() == Some("subscription")
+}
+
+/// `now - hours` as an RFC3339 UTC timestamp (mirrors `current_rfc3339`'s
+/// `/bin/date` approach). Falls back to "now" on failure, which simply tightens
+/// the passive lookback (safe — it requires fresher telemetry).
+fn rfc3339_hours_ago(hours: u32) -> String {
+    Command::new("/bin/date")
+        .args(["-u", &format!("-v-{hours}H"), "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(current_rfc3339)
+}
+
+/// Verify a subscription-OAuth Pi route without a live smoke: query the backend
+/// for recently-observed telemetry for this route (model/provider filtered) over
+/// a passive lookback window. Fresh telemetry -> Verified; none -> an actionable
+/// re-auth Warning (never a hard smoke failure); backend error -> error result.
+fn verify_pi_subscription_oauth_route_passively(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    route: &PiModelRoute,
+) -> SourceRouteVerificationResult {
+    let lookback = rfc3339_hours_ago(PI_PASSIVE_LOOKBACK_HOURS);
+    let local_session_observed = Some(!pi_session_files().is_empty());
+    let filters = if pi_route_is_unscoped(route) {
+        None
+    } else {
+        Some(SetupRunVerificationFilters {
+            model: Some(route.model.clone()),
+            model_provider: route.classification.model_provider.clone(),
+            billing_provider: route.classification.billing_provider.clone(),
+        })
+    };
+    // A single query is enough: no smoke runs, so polling for 60s can't make new
+    // records appear — they either already exist in the lookback window or not.
+    match get_setup_run_verification_with_base(
+        api_base_url,
+        connection,
+        setup_run_token,
+        &SourceKind::Pi,
+        &lookback,
+        filters.as_ref(),
+    ) {
+        Ok(verification) if verification.verified => pi_route_passive_result(
+            route,
+            SourceVerificationStatus::Verified,
+            true,
+            verification.records_seen,
+            verification.last_record_id,
+            verification.last_received_at,
+            Some(lookback),
+            None,
+            format!(
+                "Saw {} recent Pi telemetry record(s) for {} (verified from observed usage; no live smoke for this rotating-OAuth route).",
+                verification.records_seen,
+                pi_route_label(route)
+            ),
+            local_session_observed,
+        ),
+        Ok(_) => pi_route_passive_result(
+            route,
+            SourceVerificationStatus::Warning,
+            false,
+            0,
+            None,
+            None,
+            Some(lookback),
+            Some(PI_OAUTH_REAUTH_CODE.to_string()),
+            format!(
+                "Pi route {} needs a provider re-sign-in: no recent telemetry, and Ottto can't live-probe a rotating-OAuth route. Run `ottto fix --app pi` for recovery steps.",
+                pi_route_label(route)
+            ),
+            local_session_observed,
+        ),
+        Err(error) => pi_route_result_from_backend_error(
+            route,
+            &pi_passive_placeholder_smoke(local_session_observed),
+            Some(lookback),
+            &error,
+        ),
+    }
+}
+
+/// A non-run `SmokeResult` placeholder for the passive verify path (no live `pi`
+/// smoke was executed) so we can reuse the existing backend-error result builder.
+fn pi_passive_placeholder_smoke(local_session_observed: Option<bool>) -> SmokeResult {
+    SmokeResult {
+        command_found: true,
+        succeeded: false,
+        exit_status: None,
+        duration_ms: 0,
+        message: "Verified passively from observed telemetry; no live smoke was run for this rotating-OAuth route.".to_string(),
+        diagnostic: None,
+        error_code: Some(PI_OAUTH_REAUTH_CODE.to_string()),
+        local_session_observed,
+    }
+}
+
+/// Build a route result for the passive (no-live-smoke) verification path.
+#[allow(clippy::too_many_arguments)]
+fn pi_route_passive_result(
+    route: &PiModelRoute,
+    status: SourceVerificationStatus,
+    verified: bool,
+    records_seen: u64,
+    last_record_id: Option<String>,
+    last_received_at: Option<String>,
+    smoke_after: Option<String>,
+    error_code: Option<String>,
+    text: String,
+    local_session_observed: Option<bool>,
+) -> SourceRouteVerificationResult {
+    let identity = pi_route_billing_identity_hints(route);
+    let code = error_code.clone().unwrap_or_else(|| "verified".to_string());
+    SourceRouteVerificationResult {
+        provider: pi_route_provider(route),
+        model: pi_route_model(route),
+        model_provider: route.classification.model_provider.clone(),
+        billing_provider: route.classification.billing_provider.clone(),
+        billing_channel: route.classification.billing_channel.clone(),
+        auth_mode: route.classification.auth_mode.clone(),
+        gateway_provider: route.classification.gateway_provider.clone(),
+        subscription_product: route.classification.subscription_product.clone(),
+        source_category: route.classification.source_category.clone(),
+        account_identifier_hash: identity.account_identifier_hash,
+        organization_identifier_hash: identity.organization_identifier_hash,
+        credential_fingerprint_hash: identity.credential_fingerprint_hash,
+        billing_identity_evidence: identity.billing_identity_evidence,
+        billing_identity_confidence: identity.billing_identity_confidence,
+        status,
+        verified,
+        records_seen,
+        last_record_id,
+        last_received_at,
+        smoke_after,
+        command_found: true,
+        command_succeeded: false,
+        exit_status: None,
+        duration_ms: 0,
+        diagnostic: None,
+        error_code,
+        local_session_observed,
+        message: StableMessage { code, text },
     }
 }
 
@@ -6512,19 +6698,41 @@ fn pi_route_aggregate_result(
 ) -> SourceVerificationResult {
     let total = route_results.len();
     let passed = route_results.iter().filter(|route| route.verified).count();
+    // A route awaiting a provider re-sign-in is a soft, actionable Warning — not a
+    // hard smoke failure — even though it isn't verified: Ottto deliberately did
+    // not (and can't safely) live-probe a rotating-OAuth route, so "no fresh
+    // telemetry yet" must not aggregate to Failed.
+    let reauth_pending = route_results
+        .iter()
+        .filter(|route| {
+            !route.verified && route.error_code.as_deref() == Some(PI_OAUTH_REAUTH_CODE)
+        })
+        .count();
+    let hard_failed = total.saturating_sub(passed).saturating_sub(reauth_pending);
     let status = if total > 0 && passed == total {
         SourceVerificationStatus::Verified
-    } else if passed > 0 {
+    } else if total > 0 && hard_failed == 0 {
+        // Everything is verified and/or awaiting re-auth.
+        SourceVerificationStatus::Warning
+    } else if passed > 0 || reauth_pending > 0 {
         SourceVerificationStatus::Warning
     } else {
         SourceVerificationStatus::Failed
     };
-    let (code, text) = match status {
-        SourceVerificationStatus::Verified => ("verified", format!("Verified {total} Pi model routes.")),
+    let all_reauth_pending = passed == 0 && hard_failed == 0 && reauth_pending > 0;
+    let (code, text): (&str, String) = match status {
+        SourceVerificationStatus::Verified => {
+            ("verified", format!("Verified {total} Pi model routes."))
+        }
+        SourceVerificationStatus::Warning if all_reauth_pending => (
+            PI_OAUTH_REAUTH_CODE,
+            "Re-sign in to the Pi provider, then re-run Verify — Ottto can't re-mint a rotating provider OAuth token."
+                .to_string(),
+        ),
         SourceVerificationStatus::Warning => (
             "pi_route_warnings",
             format!(
-                "Verified {passed} of {total} Pi model routes; review warnings for the failed routes."
+                "Verified {passed} of {total} Pi model routes; review the remaining routes (re-sign in if a provider asks)."
             ),
         ),
         _ => (
@@ -6995,7 +7203,87 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_status::PiRouteClassification;
     use ottto_protocol::{RepairAuthority, RepairAuthorityMode};
+
+    fn subscription_oauth_route() -> PiModelRoute {
+        PiModelRoute {
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.5".to_string(),
+            thinking_level: None,
+            classification: PiRouteClassification {
+                model_provider: Some("openai".to_string()),
+                billing_provider: Some("openai".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                auth_mode: Some("oauth".to_string()),
+                gateway_provider: None,
+                subscription_product: Some("chatgpt".to_string()),
+                source_category: Some("chatgpt_openai_subscription".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn subscription_oauth_routes_are_detected_and_others_are_not() {
+        assert!(route_is_subscription_oauth(&subscription_oauth_route()));
+
+        let mut api_key = subscription_oauth_route();
+        api_key.classification.auth_mode = Some("api_key".to_string());
+        api_key.classification.billing_channel = Some("usage".to_string());
+        assert!(!route_is_subscription_oauth(&api_key));
+
+        let mut gateway = subscription_oauth_route();
+        gateway.classification.auth_mode = Some("oauth".to_string());
+        gateway.classification.billing_channel = Some("usage".to_string());
+        assert!(!route_is_subscription_oauth(&gateway));
+    }
+
+    #[test]
+    fn pi_reauth_pending_route_aggregates_to_warning_not_failed() {
+        let route = subscription_oauth_route();
+        let reauth = pi_route_passive_result(
+            &route,
+            SourceVerificationStatus::Warning,
+            false,
+            0,
+            None,
+            None,
+            Some("2026-06-04T00:00:00Z".to_string()),
+            Some(PI_OAUTH_REAUTH_CODE.to_string()),
+            "needs provider re-auth".to_string(),
+            Some(true),
+        );
+
+        let aggregate = pi_route_aggregate_result(vec![reauth]);
+
+        // The old behavior aggregated a single non-verified route to Failed /
+        // pi_route_smoke_failed; an awaiting-re-auth route must be a soft Warning.
+        assert_eq!(aggregate.status, SourceVerificationStatus::Warning);
+        assert_eq!(aggregate.message.code, PI_OAUTH_REAUTH_CODE);
+        assert!(!aggregate.verified);
+    }
+
+    #[test]
+    fn pi_verified_passive_route_aggregates_to_verified() {
+        let route = subscription_oauth_route();
+        let verified = pi_route_passive_result(
+            &route,
+            SourceVerificationStatus::Verified,
+            true,
+            3,
+            None,
+            None,
+            Some("2026-06-04T00:00:00Z".to_string()),
+            None,
+            "saw recent telemetry".to_string(),
+            Some(true),
+        );
+
+        let aggregate = pi_route_aggregate_result(vec![verified]);
+
+        assert_eq!(aggregate.status, SourceVerificationStatus::Verified);
+        assert!(aggregate.verified);
+    }
 
     #[test]
     fn pi_reauth_repair_plan_is_actionable_not_blocked() {

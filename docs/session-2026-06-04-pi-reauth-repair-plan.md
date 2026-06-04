@@ -35,12 +35,23 @@ had no recovery path.
 `cargo build/fmt/clippy` clean; `cargo test -p ottto-service --lib` 318 passing (+1
 new: `pi_reauth_repair_plan_is_actionable_not_blocked`).
 
-## Follow-up (separate — the verify half)
+## The verify half (now also done — stop burning the rotating token)
 
-Stop the Pi verify from **burning the rotating token** in the first place: never live-
-smoke a subscription-OAuth route (`openai-codex`/`anthropic`/`github-copilot`) — verify
-it passively from telemetry the local_sessions collector already uploaded, and surface
-a `pi_oauth_reauth_required` **Warning** (not a hard smoke `Failed`) when none is fresh,
-with the aggregate + standalone-action status updated to treat reauth-pending as
-Warning. This change (`run_one_pi_route_verification` + `pi_route_aggregate_result` +
-`run_pi_verify_source_action`) is planned but not in this commit.
+`run_one_pi_route_verification` now, for a **subscription-OAuth route**
+(`route_is_subscription_oauth`: `auth_mode == oauth` && `billing_channel ==
+subscription` → openai-codex / anthropic / github-copilot), skips the live `pi` smoke
+entirely (it would burn the single-use rotating refresh token — the very
+`refresh_token_reused` failure that also breaks the agent's own CLI) and verifies the
+route **passively**: a single backend query for already-uploaded telemetry for that
+route over a 6h lookback (`verify_pi_subscription_oauth_route_passively` →
+`get_setup_run_verification_with_base`). Fresh telemetry → `Verified`; none →
+`pi_oauth_reauth_required` **Warning** with the recovery pointer (not a hard
+`smoke_command_failed`). Non-OAuth routes (api_key / gateway / service_account) still
+run a live smoke.
+
+`pi_route_aggregate_result` treats reauth-pending routes as a non-`Failed` bucket
+(all verified-or-reauth-pending → `Warning`), and `run_pi_verify_source_action` maps a
+`Warning` to a non-fatal `succeeded` action (so the run advances and the source
+settles to `warning`/needs-attention, not a hard `failed`). Tests added for the
+classifier + the reauth-pending → Warning aggregate + the passive-verified → Verified
+aggregate. `cargo test -p ottto-service --lib` 321 passing; clippy clean.
