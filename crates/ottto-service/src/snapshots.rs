@@ -4203,9 +4203,7 @@ mod tests {
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
             &path,
-            concat!(
-                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-05-14T10:00:00Z\"}\n"
-            ),
+            "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-05-14T10:00:00Z\"}\n",
         )
         .expect("write empty usage fixture");
 
