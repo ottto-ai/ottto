@@ -26,12 +26,12 @@ use ottto_protocol::{
     DiagnosticsUploadAuthorization, DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner,
     LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
     LocalClientKind, LocalControlCommand, LocalControlRequest, LocalControlResponse,
-    MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel,
-    RepairActionKind, RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState,
-    SourceConfigState, SourceKind, SourceRouteVerificationResult, SourceVerificationResult,
-    SourceVerificationStatus, StableMessage, TelemetryControlAction, UninstallExecutionResult,
-    UpdateGate, UpdateState, UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE,
-    LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel, RepairAction,
+    RepairActionApproval, RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus,
+    SecretString, ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
+    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
+    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
+    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -1100,11 +1100,21 @@ fn repair_source(
     source: SourceKind,
     dry_run: bool,
 ) -> Result<RepairPlan, LocalApiError> {
-    let mut plan = propose_repair_plan(daemon, authorization, source.clone(), dry_run)?;
+    let plan = propose_repair_plan(daemon, authorization, source.clone(), dry_run)?;
     if dry_run {
         return Ok(plan);
     }
 
+    // Pi has no local telemetry config to patch; its failure mode is an
+    // expired/consumed provider OAuth credential that only a provider re-sign-in
+    // can fix (Ottto can't re-mint the rotating token). Offer that actionable
+    // recovery instead of a dead "blocked, no actions" response. Build the plan
+    // before the WriteConfig-only retain below would strip everything.
+    if matches!(source, SourceKind::Pi) {
+        return Ok(build_pi_reauth_repair_plan(plan));
+    }
+
+    let mut plan = plan;
     plan.actions
         .retain(|action| action.action == RepairActionKind::WriteConfig);
 
@@ -1166,6 +1176,48 @@ fn repair_source(
         };
     }
     Ok(plan)
+}
+
+/// Build an actionable Pi recovery plan: a manual provider re-sign-in (which the
+/// daemon cannot perform — it can't re-mint a provider's rotating OAuth token)
+/// plus a follow-up re-verify, instead of the dead `config_repair_not_supported`
+/// "blocked, no actions" response. Reuses the authority already computed by
+/// `propose_repair_plan` so terminal/browser approval semantics are preserved.
+fn build_pi_reauth_repair_plan(mut plan: RepairPlan) -> RepairPlan {
+    plan.status = RepairPlanStatus::Proposed;
+    plan.authority.message = StableMessage {
+        code: "pi_provider_reauth_required".to_string(),
+        text: "Pi reported an expired provider sign-in. Re-sign in to the failing provider in Pi, then re-run Verify.".to_string(),
+    };
+    let approval = RepairActionApproval {
+        surface: RepairApprovalSurface::None,
+        setup_safe: true,
+        server_backed: false,
+        reason:
+            "Re-authenticating a provider in Pi is a manual local action; Ottto only guides it."
+                .to_string(),
+    };
+    plan.actions = vec![
+        RepairAction {
+            action: RepairActionKind::ReauthProvider,
+            title: "Re-sign in to the Pi provider".to_string(),
+            detail: "Run `pi` and re-authenticate the failing provider (e.g. openai-codex), then retry Verify. Ottto can't re-mint the provider's rotating OAuth token for you.".to_string(),
+            requires_approval: false,
+            destructive: false,
+            approval: approval.clone(),
+            backup: None,
+        },
+        RepairAction {
+            action: RepairActionKind::VerifyTelemetry,
+            title: "Re-run Pi verification".to_string(),
+            detail: "After re-signing in, run Verify again to confirm Pi telemetry is flowing.".to_string(),
+            requires_approval: false,
+            destructive: false,
+            approval,
+            backup: None,
+        },
+    ];
+    plan
 }
 
 fn propose_repair_plan(
@@ -6943,6 +6995,52 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ottto_protocol::{RepairAuthority, RepairAuthorityMode};
+
+    #[test]
+    fn pi_reauth_repair_plan_is_actionable_not_blocked() {
+        let plan = RepairPlan {
+            plan_id: "plan".to_string(),
+            machine_id: "otm_test".to_string(),
+            source: SourceKind::Pi,
+            dry_run: false,
+            status: RepairPlanStatus::Blocked,
+            authority: RepairAuthority {
+                mode: RepairAuthorityMode::ServerBackedSetupAction,
+                server_backed: true,
+                terminal_approval_allowed: true,
+                browser_approval_required: false,
+                setup_run_id: None,
+                message: StableMessage {
+                    code: "placeholder".to_string(),
+                    text: "placeholder".to_string(),
+                },
+            },
+            actions: Vec::new(),
+            created_at: "2026-06-04T00:00:00Z".to_string(),
+        };
+
+        let result = build_pi_reauth_repair_plan(plan);
+
+        // The old behavior was Blocked / config_repair_not_supported / no actions.
+        assert_eq!(result.status, RepairPlanStatus::Proposed);
+        assert_eq!(result.authority.message.code, "pi_provider_reauth_required");
+        assert!(
+            result
+                .actions
+                .iter()
+                .any(|action| action.action == RepairActionKind::ReauthProvider),
+            "expected an actionable provider re-auth step"
+        );
+        assert!(
+            result
+                .actions
+                .iter()
+                .any(|action| action.action == RepairActionKind::VerifyTelemetry),
+            "expected a follow-up re-verify step"
+        );
+    }
+
     use crate::keychain::{
         TelemetryKeyStore, TelemetryKeychainError, TELEMETRY_KEY_FILE_STORE_ENV,
     };

@@ -1156,6 +1156,11 @@ pub enum RepairActionKind {
     RevokeSecret,
     RemoveLocalState,
     RestoreBackup,
+    /// Guide the user to re-authenticate a failing provider that the daemon
+    /// cannot repair on its own (e.g. a Pi route whose provider OAuth token has
+    /// expired or been consumed). Advisory: the daemon does not perform the
+    /// re-auth itself.
+    ReauthProvider,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
