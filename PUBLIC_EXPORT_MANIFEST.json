@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "7acd5cba1d527bb2522285a3a8815bb1be17064ba255c5ffc4c9de73bf847a2e",
+  "content_sha256": "745a5452332ad54fc96ebdb386f0c603f1356c29ca3dcf3481f62b49744bf4e7",
   "files": [
     {
       "path": ".github/dependabot.yml",
@@ -571,8 +571,8 @@
     },
     {
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "27d7b56d21481b081d5316c2ef7dffa36f3976d3931ba2de35d11af8fa27ce05",
-      "size_bytes": 24704,
+      "sha256": "097e0ac45ce83ee8a8eaf56e90d1560e671925d63f3e0a08ad1e45365ffccad4",
+      "size_bytes": 24730,
       "mode": "0644",
       "executable": false
     },
@@ -634,8 +634,8 @@
     },
     {
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a8a1bc353090688bcc158cee5a6b39cde3a09e938e15b124f550005533df86b1",
-      "size_bytes": 248214,
+      "sha256": "a581fb7566027b8ba09dec782351a41d6685d26ff71c07706652681b18285311",
+      "size_bytes": 255759,
       "mode": "0644",
       "executable": false
     },
