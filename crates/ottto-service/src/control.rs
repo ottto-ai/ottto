@@ -1945,7 +1945,10 @@ fn apply_machine_icon(status_value: &mut serde_json::Value, icon: Option<(String
     if icon_url.is_empty() {
         return;
     }
-    let Some(machine) = status_value.get_mut("machine").and_then(|m| m.as_object_mut()) else {
+    let Some(machine) = status_value
+        .get_mut("machine")
+        .and_then(|m| m.as_object_mut())
+    else {
         return;
     };
     let matches =
@@ -1970,12 +1973,16 @@ mod machine_icon_tests {
 
     #[test]
     fn injects_icon_when_machine_matches() {
-        let mut status = serde_json::json!({ "machine": { "machine_id": "otm_x", "hostname": "h" } });
+        let mut status =
+            serde_json::json!({ "machine": { "machine_id": "otm_x", "hostname": "h" } });
         apply_machine_icon(
             &mut status,
             Some(("otm_x".to_string(), "https://icon.png".to_string())),
         );
-        assert_eq!(status["machine"]["icon_url"], serde_json::json!("https://icon.png"));
+        assert_eq!(
+            status["machine"]["icon_url"],
+            serde_json::json!("https://icon.png")
+        );
     }
 
     #[test]
