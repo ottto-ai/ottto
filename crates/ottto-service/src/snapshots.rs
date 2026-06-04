@@ -133,6 +133,43 @@ const ROW_BILLING_FIELDS: &[&str] = &[
     "subscription_product",
 ];
 
+/// Raw, *unclassified* session-origin signals read from the Codex `session_meta`
+/// and the Claude Code JSONL header. Forwarded so the BACKEND derives the
+/// initiator itself (single source of truth) -- mirrors the backend
+/// `AgentSessionSnapshotOrigin`. Every field optional; a source fills what it exposes.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct SnapshotOrigin {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>, // Codex: user/subagent/automation (authoritative)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>, // Codex: cli/vscode/exec/mcp (string form)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_subagent: Option<bool>, // true when Codex `source` was the subagent object
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub originator: Option<String>, // Codex: surface label (weak signal)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>, // Claude: claude-desktop/cli/sdk-cli
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_sidechain: Option<bool>, // Claude: subagent (Task tool)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>, // Claude: "bg"
+}
+
+impl SnapshotOrigin {
+    fn is_empty(&self) -> bool {
+        self.thread_source.is_none()
+            && self.source.is_none()
+            && self.source_subagent.is_none()
+            && self.originator.is_none()
+            && self.agent_role.is_none()
+            && self.entrypoint.is_none()
+            && self.is_sidechain.is_none()
+            && self.session_kind.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotItem {
     pub source_session_id: String,
@@ -164,6 +201,9 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub session_artifacts: Vec<SessionArtifact>,
     pub provenance: SnapshotProvenance,
+    /// Raw session-origin signals; the backend re-derives the initiator from these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<SnapshotOrigin>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -329,6 +369,11 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "workspace_display_label": &item.workspace_display_label,
         "workspace_label_source": &item.workspace_label_source,
         "session_artifacts": &item.session_artifacts,
+        // Including origin makes a one-time re-upload happen when the collector
+        // starts forwarding it, so the backend can re-derive the initiator for
+        // already-uploaded sessions (otherwise the fingerprint is unchanged and
+        // the snapshot is never re-sent).
+        "origin": &item.origin,
     });
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
@@ -528,6 +573,7 @@ struct SnapshotAccumulator {
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     usage_buckets: BTreeMap<String, UsageBucketState>,
+    origin: SnapshotOrigin,
     artifacts: Vec<SessionArtifact>,
     /// Whether VCS artifact scraping runs for this session. Defaults to ``true``
     /// (see ``new``); the production scan path sets it from the org upload
@@ -554,6 +600,7 @@ impl SnapshotAccumulator {
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             usage_buckets: BTreeMap::new(),
+            origin: SnapshotOrigin::default(),
             artifacts: Vec::new(),
             // Default on so direct parse-function callers (mostly tests) keep
             // extracting; the production scan path overrides this from policy.
@@ -880,6 +927,7 @@ impl SnapshotAccumulator {
                 state_total_tokens: None,
                 state_archived: None,
             },
+            origin: (!self.origin.is_empty()).then(|| self.origin.clone()),
         };
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
         vec![item]
@@ -1285,6 +1333,8 @@ fn codex_state_only_snapshot(
             state_total_tokens: Some(thread.tokens_used),
             state_archived: Some(thread.archived),
         },
+        // Codex state-index summaries carry no session_meta -> no raw origin.
+        origin: None,
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
@@ -1874,6 +1924,36 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             .or_else(|| string_at(value, &["session_id"]))
             .or_else(|| string_at(value, &["sessionId"]));
     }
+    // Raw session-origin (siblings of `id` in session_meta.payload). The
+    // session_meta line carries these; other lines yield None, so first-seen
+    // (guarded by is_none) keeps the authoritative session_meta values.
+    if accumulator.origin.thread_source.is_none() {
+        accumulator.origin.thread_source =
+            string_at(value, &["session_meta", "payload", "thread_source"])
+                .or_else(|| string_at(value, &["payload", "thread_source"]));
+    }
+    if accumulator.origin.source.is_none() && accumulator.origin.source_subagent.is_none() {
+        if let Some(src) = raw_value_at(value, &["session_meta", "payload", "source"])
+            .or_else(|| raw_value_at(value, &["payload", "source"]))
+        {
+            if let Some(text) = src.as_str() {
+                accumulator.origin.source = Some(text.to_string());
+            } else if src.is_object() {
+                // Codex subagent form: source = { "subagent": { "thread_spawn": .. } }.
+                accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
+            }
+        }
+    }
+    if accumulator.origin.originator.is_none() {
+        accumulator.origin.originator =
+            string_at(value, &["session_meta", "payload", "originator"])
+                .or_else(|| string_at(value, &["payload", "originator"]));
+    }
+    if accumulator.origin.agent_role.is_none() {
+        accumulator.origin.agent_role =
+            string_at(value, &["session_meta", "payload", "agent_role"])
+                .or_else(|| string_at(value, &["payload", "agent_role"]));
+    }
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["time"]))
         .or_else(|| string_at(value, &["created_at"]));
@@ -2040,6 +2120,19 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.source_session_id = string_at(value, &["sessionId"])
             .or_else(|| string_at(value, &["session_id"]))
             .or_else(|| string_at(value, &["conversation_id"]));
+    }
+    // Raw session-origin from the Claude JSONL header/lines. entrypoint +
+    // sessionKind are first-seen; isSidechain is per-line so any true marks the
+    // whole session a subagent (Task tool sidechain).
+    if accumulator.origin.entrypoint.is_none() {
+        accumulator.origin.entrypoint = string_at(value, &["entrypoint"]);
+    }
+    if accumulator.origin.session_kind.is_none() {
+        accumulator.origin.session_kind = string_at(value, &["sessionKind"]);
+    }
+    if let Some(sidechain) = value.get("isSidechain").and_then(Value::as_bool) {
+        accumulator.origin.is_sidechain =
+            Some(accumulator.origin.is_sidechain.unwrap_or(false) || sidechain);
     }
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
@@ -3705,6 +3798,35 @@ mod tests {
     }
 
     #[test]
+    fn codex_parser_forwards_raw_session_origin() {
+        // session_meta.payload carries thread_source/source/originator/agent_role
+        // (siblings of id). The backend re-derives the initiator from these.
+        let path = temp_file("codex");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-origin-codex\",\"source\":\"vscode\",\"originator\":\"Codex Desktop\",\"thread_source\":\"user\",\"agent_role\":\"explorer\"}}\n",
+                "{\"timestamp\":\"2026-05-06T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let origin = item.origin.expect("origin forwarded");
+        assert_eq!(origin.thread_source.as_deref(), Some("user"));
+        assert_eq!(origin.source.as_deref(), Some("vscode"));
+        assert_eq!(origin.originator.as_deref(), Some("Codex Desktop"));
+        assert_eq!(origin.agent_role.as_deref(), Some("explorer"));
+        assert_eq!(origin.source_subagent, None);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_parser_uses_observed_usage_events_when_request_count_is_missing() {
         let path = temp_file("codex-observed-activity");
         fs::write(
@@ -4616,6 +4738,7 @@ mod tests {
                 state_total_tokens: None,
                 state_archived: None,
             },
+            origin: None,
         };
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
         item
@@ -5087,6 +5210,32 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_parser_forwards_raw_session_origin() {
+        // Claude JSONL lines carry entrypoint/sessionKind/isSidechain; any
+        // sidechain line marks the whole session a subagent.
+        let path = temp_file("claude");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-origin-1\",\"entrypoint\":\"cli\",\"isSidechain\":false,\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-origin-1\",\"isSidechain\":true,\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let origin = item.origin.expect("origin forwarded");
+        assert_eq!(origin.entrypoint.as_deref(), Some("cli"));
+        assert_eq!(origin.is_sidechain, Some(true));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -6078,6 +6227,7 @@ mod tests {
             "source_file_fingerprint",
             "session_artifacts",
             "provenance",
+            "origin",
         ];
         // Allowed AgentSessionSnapshotModelUsage fields (extra="forbid").
         const ALLOWED_ROW_FIELDS: &[&str] = &[
@@ -6183,6 +6333,7 @@ mod tests {
                 state_total_tokens: None,
                 state_archived: None,
             },
+            origin: None,
         };
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
