@@ -6096,6 +6096,35 @@ fn verify_source(
         return Ok(result);
     }
 
+    // Codex/Claude verification proves telemetry by polling the backend for
+    // records that the LOCAL OTLP relay forwards, and that forward requires the
+    // relay device binding + relay-device-secret. On a freshly-claimed Mac those
+    // are provisioned by the setup-run install action — not by claim completion,
+    // and not by `ottto fix` (which only patches the agent's OTLP config) — so
+    // within that window the relay drops every exported record (502) and the
+    // backend poll returns 0. Running a smoke anyway and reporting
+    // `no_fresh_telemetry` mis-attributes "telemetry transport is still being
+    // set up" to "the agent produced no telemetry", which is what made a fresh
+    // install fail to verify Codex even though the smoke ran and `fix` reported
+    // success. Detect the missing provisioning up front and return an accurate,
+    // actionable status instead of running a doomed smoke.
+    if !relay_device_is_provisioned() {
+        let result = verification_result_with_config(
+            source.clone(),
+            config,
+            SourceVerificationStatus::ReconnectRequired,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "relay_device_not_provisioned",
+            "This Mac just connected and is still finishing telemetry setup. Open the Ottto app to finish setup (or wait a moment), then try verifying again.",
+        );
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
+
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
     let result = if !smoke.succeeded {
@@ -6156,6 +6185,20 @@ fn verify_source(
     };
     daemon.record_verification_result(&result)?;
     Ok(result)
+}
+
+/// True when the local OTLP relay can actually forward telemetry to the backend
+/// — i.e. both the relay device binding (`FileDeviceStore`) and the
+/// relay-device-secret exist. Mirrors
+/// `snapshot_client::load_snapshot_device_credentials`. On a freshly-claimed Mac
+/// these are provisioned asynchronously by the setup-run install action, so a
+/// Codex/Claude verify uses this to avoid running a doomed smoke and reporting
+/// `no_fresh_telemetry` while telemetry transport is still being set up.
+fn relay_device_is_provisioned() -> bool {
+    matches!(FileDeviceStore::default().load(), Ok(Some(_)))
+        && KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .is_ok()
 }
 
 fn run_pi_route_verification(
