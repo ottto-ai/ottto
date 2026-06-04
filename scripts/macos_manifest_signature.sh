@@ -83,6 +83,7 @@ require_command() {
 
 require_command cmp
 require_command security
+require_command openssl
 
 security_common_args=(cms)
 security_find_args=(find-certificate)
@@ -117,18 +118,31 @@ fi
 validate_developer_id_identity
 
 signer_details="$(mktemp)"
+signer_cert="$(mktemp)"
 decoded="$(mktemp)"
-trap 'rm -f "$signer_details" "$decoded"' EXIT
+trap 'rm -f "$signer_details" "$signer_cert" "$decoded"' EXIT
 
 if ! security "${security_find_args[@]}" -c "$IDENTITY" -p >/dev/null; then
   echo "Expected Developer ID identity was not found in the keychain: $IDENTITY" >&2
   exit 1
 fi
-if ! security "${security_common_args[@]}" -D -u 6 -v -i "$SIGNATURE" -o "$decoded" >"$signer_details" 2>&1; then
+# Decode and cryptographically verify the CMS signature against a trusted object-signing
+# chain (certusage 6), capturing the manifest payload for the byte-equality check below.
+if ! security "${security_common_args[@]}" -D -u 6 -i "$SIGNATURE" -o "$decoded" 2>"$signer_details"; then
   cat "$signer_details" >&2
   exit 1
 fi
-if ! grep -Fq "$IDENTITY" "$signer_details"; then
+# Origin-bind the signature to the expected Developer ID. `security cms -D -v` does not
+# emit the signer certificate, so extract the certificate that actually produced the
+# signature with openssl: -signer reports the real signer (not every embedded cert), so a
+# decoy certificate carrying a matching subject cannot satisfy this check. Then confirm
+# the signer's subject is the expected identity.
+if ! openssl cms -verify -inform DER -in "$SIGNATURE" -noverify -signer "$signer_cert" -out /dev/null 2>"$signer_details"; then
+  cat "$signer_details" >&2
+  echo "Failed to extract a CMS signer certificate from signature: $SIGNATURE" >&2
+  exit 1
+fi
+if ! openssl x509 -in "$signer_cert" -noout -subject 2>/dev/null | grep -Fq "$IDENTITY"; then
   echo "CMS signature was not signed by expected identity: $IDENTITY" >&2
   exit 1
 fi

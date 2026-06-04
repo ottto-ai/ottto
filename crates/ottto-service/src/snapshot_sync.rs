@@ -5,8 +5,8 @@ use crate::backfill::{
 };
 use crate::detected_uses::{aggregate_detected_uses, merge_detected_uses};
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest, BatchRejected,
-    SnapshotApiClient, SnapshotStatusRequest,
+    load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
+    AgentStatusSnapshotUploadResponse, BatchRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
@@ -165,6 +165,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         match client.upload_agent_status(&relay_token, &request) {
             Ok(response) => {
                 uploaded += response.accepted as usize;
+                persist_machine_icon(&response);
             }
             Err(_) => {
                 failed_sources.push(source.api_slug());
@@ -180,6 +181,20 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
     }
 
     Ok(uploaded)
+}
+
+/// Best-effort: cache the AI-generated machine icon URL the backend echoes on the
+/// agent-status sync response, so the status command can surface it on
+/// `status.machine.icon_url`. Never fails sync on a write error.
+fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
+    let payload = serde_json::json!({
+        "machine_id": response.machine_id,
+        "icon_url": response.machine_icon_url,
+        "icon_version": response.machine_icon_version,
+    });
+    if let Ok(serialized) = serde_json::to_string(&payload) {
+        let _ = std::fs::write(default_support_dir().join("machine_icon.json"), serialized);
+    }
 }
 
 // One extra parameter (the daemon handle, for caching the reconciliation
@@ -475,7 +490,8 @@ fn upload_agent_status(
         machine_id: machine_id.to_string(),
         snapshots: vec![snapshot],
     };
-    client.upload_agent_status(relay_token, &request)?;
+    let response = client.upload_agent_status(relay_token, &request)?;
+    persist_machine_icon(&response);
     Ok(())
 }
 
@@ -960,6 +976,7 @@ mod tests {
             capabilities: Vec::new(),
             plan_observations: Vec::new(),
             diagnostics: Vec::new(),
+            runtime_defaults: None,
         }
     }
 

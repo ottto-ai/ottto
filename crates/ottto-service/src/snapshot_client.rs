@@ -115,6 +115,13 @@ pub struct AgentStatusSnapshotUploadResponse {
     pub accepted: u64,
     pub machine_id: String,
     pub sources: Vec<String>,
+    /// AI-generated machine icon the web shows, echoed back by the backend so the
+    /// daemon can surface it on `status.machine.icon_url`. Absent on older
+    /// backends (serde default → None).
+    #[serde(default)]
+    pub machine_icon_url: Option<String>,
+    #[serde(default)]
+    pub machine_icon_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

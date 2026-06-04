@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "afc9a19bb5cd9ab8924838bce928f8755a5d77cd3c6a0f2c17df185e81de4fb5",
+  "content_sha256": "f3492edd59fc9026ed6da2984b71349f0be4681778d67a7ade367656e9213b8b",
   "files": [
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "c643fbf2c5022da55e5ffa1d372076049546a19da86359ccb995647b74d127b1",
-      "size_bytes": 77376
+      "sha256": "329ffa118919387f019191f5393d13badc68579e67783d8ca2c5dfce9bfe13c9",
+      "size_bytes": 82150
     },
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "553e7790b1ca17d9ba150720fa7a9adb031308bbfcbaa1bcdee1fecd444607fc",
-      "size_bytes": 111780
+      "sha256": "3cf8d5ba0afdf1f07b529ab6aaafc2c9f5db1ab90fca5a36a94b106aae523429",
+      "size_bytes": 112928
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "0e5a0532d10d5ce5b988d84c49da850307275fbb0a334c34b26e4a9befe092b8",
-      "size_bytes": 363506
+      "sha256": "9765a798e3c4ac8b23512a07e023cdc4ef686ce5d1da0ea4523588a0a1f15c58",
+      "size_bytes": 366161
     },
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "b8d25cbe1607e31f5a3a632c8c0927ad985994e55cd1406dc2e04799b5710425",
-      "size_bytes": 101773
+      "sha256": "5fd2ce8fdf3dc07f65495360f9b728451e1f31279c8dcb7186fd17be67aa8f99",
+      "size_bytes": 101809
     },
     {
       "executable": false,
@@ -615,15 +615,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "aed49ef33b8ae8b5cb4cd823ab1cb5b0c2c4711301dbc57e8afe5cb958d470d7",
-      "size_bytes": 11846
+      "sha256": "45cd10e6454a3192b332b485f02aeec06133ff76b50bc50282ced0282900843c",
+      "size_bytes": 12177
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "e9de4b5ec02d8f3e38c19b91795447689aab7a25176d6638d46985850eb7b389",
-      "size_bytes": 40918
+      "sha256": "ae82e38f936a45103f250b06684302a0da6cc772280d78a4fa0e04f4ca549b23",
+      "size_bytes": 41738
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "34ebb2a8206a3933eb20a819ca68bccdb4d6fe1638db13e0a53149c3363791f3",
-      "size_bytes": 235938
+      "sha256": "3ea61cc5bba1c098a250969bc5bc3766e7cf559d3e35525d769417e1a1da9347",
+      "size_bytes": 243482
     },
     {
       "executable": false,
@@ -986,8 +986,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_attestation_bind.sh",
-      "sha256": "02604f8d8b792aeb69616c385e87c9c035017d66276a842da468058f934a218d",
-      "size_bytes": 9640
+      "sha256": "de47df1db1ed6ea740542a307aaf68c320f20e949f48f6685496287177b183aa",
+      "size_bytes": 10252
     },
     {
       "executable": true,
@@ -1014,8 +1014,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_manifest_signature.sh",
-      "sha256": "ee37a385a5a11d5bd1406e4eb52e4c160bc826200f6e3695550a8aa84e5c95c5",
-      "size_bytes": 3378
+      "sha256": "ac45b4739a921eac43144761e41f0a7cd0c2d1a15f670655a388853b09ad7268",
+      "size_bytes": 4307
     },
     {
       "executable": true,
@@ -1028,8 +1028,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "166491fc0b415ecbdd4a4e3e4d6f2f962a48643b978ffaa888a00c40690b6976",
-      "size_bytes": 28606
+      "sha256": "9c7dafae6d911882df976624e404dea9d55f85c381119b1b9ccebaede7888b3c",
+      "size_bytes": 31716
     },
     {
       "executable": true,
@@ -1182,8 +1182,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_manifest_signature.sh",
-      "sha256": "49fde237b9b10013e9bce61c1065cd0699b592b1ab413e55f4d76e966b7eac28",
-      "size_bytes": 3279
+      "sha256": "968326538c417ce26c6348e11c0384fe074d195aabdd3aadd67cd480ad07af40",
+      "size_bytes": 5023
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-02T18:47:40+00:00",
+  "generated_at": "2026-06-04T07:19:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0932a02fbf7aace7c7c8d4e5a39ddff5b108e166"
+  "source_commit": "bfeaef9d08791398075cc502008e92141654973a"
 }

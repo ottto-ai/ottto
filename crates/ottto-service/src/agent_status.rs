@@ -7,8 +7,9 @@ use ottto_protocol::{
     AgentContextState, AgentContextStatus, AgentCreditBalance, AgentCreditBalanceStatus,
     AgentCreditBalanceUnit, AgentDiagnosticSeverity, AgentLoginState, AgentModelStatus,
     AgentQuotaWindow, AgentQuotaWindowFreshness, AgentQuotaWindowScope, AgentQuotaWindowStatus,
-    AgentStatusCollectionMethod, AgentStatusConfidence, AgentStatusDiagnostic,
-    AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, SourceKind,
+    AgentRuntimeDefaults, AgentStatusCollectionMethod, AgentStatusConfidence,
+    AgentStatusDiagnostic, AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState,
+    SourceKind,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -264,7 +265,31 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         snapshot.status = AgentStatusState::Available;
     }
     append_current_plan_observation(&mut snapshot);
+    snapshot.runtime_defaults = build_codex_runtime_defaults(&snapshot.captured_at);
     snapshot
+}
+
+/// Assemble display-safe Codex runtime defaults from `~/.codex/config.toml` for
+/// the agent-status upload. The backend overwrites `machine_id` from the stored
+/// snapshot, so it is left unset here.
+fn build_codex_runtime_defaults(captured_at: &str) -> Option<AgentRuntimeDefaults> {
+    let defaults = crate::snapshots::load_codex_config_defaults(&codex_config_path())?;
+    let fast_mode_enabled = defaults.display_fast_mode();
+    Some(AgentRuntimeDefaults {
+        captured_at: Some(captured_at.to_string()),
+        provenance: Some("config_file".to_string()),
+        machine_id: None,
+        model: defaults.model,
+        service_tier: defaults.service_tier,
+        speed_mode: None,
+        fast_mode_enabled,
+        priority_enabled: None,
+        reasoning_effort: defaults.reasoning_effort,
+        approval_policy: defaults.approval_policy,
+        sandbox_mode: None,
+        selector_context: defaults.selector_context,
+        selector_sources: defaults.selector_sources,
+    })
 }
 
 fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
@@ -691,6 +716,7 @@ fn base_snapshot(
         capabilities: Vec::new(),
         plan_observations: Vec::new(),
         diagnostics: Vec::new(),
+        runtime_defaults: None,
     }
 }
 

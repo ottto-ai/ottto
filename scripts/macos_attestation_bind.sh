@@ -116,6 +116,16 @@ fi
 if [[ -z "$SOURCE_DIGEST" ]]; then
   SOURCE_DIGEST="$(jq -r '.commit // empty' "$MANIFEST")"
 fi
+# `gh attestation verify --source-digest` matches against the full 40-char source
+# commit digest, but release manifests record an abbreviated commit. Expand it to
+# the full SHA when the source repository is available; leave it unchanged if it is
+# already full or cannot be resolved (e.g. unit tests using synthetic commits).
+if [[ "$SOURCE_DIGEST" =~ ^[0-9A-Fa-f]{7,39}$ ]] && command -v git >/dev/null 2>&1; then
+  full_source_digest="$(git rev-parse --verify --quiet "${SOURCE_DIGEST}^{commit}" 2>/dev/null || true)"
+  if [[ -n "$full_source_digest" ]]; then
+    SOURCE_DIGEST="$full_source_digest"
+  fi
+fi
 if [[ ! "$SOURCE_DIGEST" =~ ^[0-9A-Fa-f]{7,64}$ ]]; then
   echo "Source digest must be a git commit hash: $SOURCE_DIGEST" >&2
   exit 2
