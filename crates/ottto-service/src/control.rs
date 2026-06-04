@@ -403,7 +403,9 @@ fn handle_command(
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
-            to_value(status)
+            let mut value = to_value(status)?;
+            inject_machine_icon(&mut value);
+            Ok(value)
         }
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
         LocalControlCommand::AgentStatusRefresh { source } => {
@@ -1926,6 +1928,76 @@ fn detect_install_owner() -> InstallOwner {
         .as_deref()
         .map(install_owner_for_path)
         .unwrap_or(InstallOwner::Unknown)
+}
+
+/// Best-effort: surface the AI-generated machine icon (persisted by the snapshot
+/// sync from the backend response) on `status.machine.icon_url`, so the Companion
+/// footer matches the web /apps machine identity. Any failure leaves it unset and
+/// the app falls back to its procedural glyph.
+fn inject_machine_icon(status_value: &mut serde_json::Value) {
+    apply_machine_icon(status_value, load_persisted_machine_icon());
+}
+
+fn apply_machine_icon(status_value: &mut serde_json::Value, icon: Option<(String, String)>) {
+    let Some((icon_machine_id, icon_url)) = icon else {
+        return;
+    };
+    if icon_url.is_empty() {
+        return;
+    }
+    let Some(machine) = status_value
+        .get_mut("machine")
+        .and_then(|m| m.as_object_mut())
+    else {
+        return;
+    };
+    let matches =
+        machine.get("machine_id").and_then(|v| v.as_str()) == Some(icon_machine_id.as_str());
+    if matches {
+        machine.insert("icon_url".to_string(), serde_json::Value::String(icon_url));
+    }
+}
+
+fn load_persisted_machine_icon() -> Option<(String, String)> {
+    let path = ottto_core::default_support_dir().join("machine_icon.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let machine_id = value.get("machine_id")?.as_str()?.to_string();
+    let icon_url = value.get("icon_url")?.as_str()?.to_string();
+    Some((machine_id, icon_url))
+}
+
+#[cfg(test)]
+mod machine_icon_tests {
+    use super::apply_machine_icon;
+
+    #[test]
+    fn injects_icon_when_machine_matches() {
+        let mut status =
+            serde_json::json!({ "machine": { "machine_id": "otm_x", "hostname": "h" } });
+        apply_machine_icon(
+            &mut status,
+            Some(("otm_x".to_string(), "https://icon.png".to_string())),
+        );
+        assert_eq!(
+            status["machine"]["icon_url"],
+            serde_json::json!("https://icon.png")
+        );
+    }
+
+    #[test]
+    fn skips_on_mismatch_empty_or_none() {
+        let mut status = serde_json::json!({ "machine": { "machine_id": "otm_x" } });
+        apply_machine_icon(
+            &mut status,
+            Some(("otm_other".to_string(), "https://icon.png".to_string())),
+        );
+        assert!(status["machine"].get("icon_url").is_none());
+        apply_machine_icon(&mut status, Some(("otm_x".to_string(), String::new())));
+        assert!(status["machine"].get("icon_url").is_none());
+        apply_machine_icon(&mut status, None);
+        assert!(status["machine"].get("icon_url").is_none());
+    }
 }
 
 fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
