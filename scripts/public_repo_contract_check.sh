@@ -81,7 +81,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PUBLIC_PROTOCOL_VERSION = 12
+PUBLIC_PROTOCOL_VERSION = 13
 PUBLIC_ROOT = Path(sys.argv[1]).resolve()
 PRIVATE_REPO_ROOT = Path(sys.argv[2]).resolve() if sys.argv[2] else None
 PRIVATE_RUNTIME_PIN_ARG = sys.argv[3]

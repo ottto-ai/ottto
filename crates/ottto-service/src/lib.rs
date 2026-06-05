@@ -353,6 +353,20 @@ impl LocalDaemon {
         Ok(claim.clone())
     }
 
+    pub fn pending_auth_claim_for_resume(
+        &self,
+        claim_code: &str,
+    ) -> Result<PendingAuthClaim, LocalApiError> {
+        let state = self.state()?;
+        let Some(claim) = &state.pending_auth else {
+            return Err(LocalApiError::NoPendingAuthClaim);
+        };
+        if claim.claim_code != claim_code {
+            return Err(LocalApiError::AuthClaimMismatch);
+        }
+        Ok(claim.clone())
+    }
+
     pub fn complete_auth_with_account(
         &self,
         claim_code: &str,
@@ -386,6 +400,7 @@ impl LocalDaemon {
             setup_run_id: setup_run_id.clone(),
             setup_run_token_expires_at: setup_run_token_expires_at.clone(),
             machine_id: machine_id.clone(),
+            claim_code: Some(claim_code.to_string()),
             api_base_url: default_connection_api_base_url(),
         });
         state.account = account.clone();
@@ -395,6 +410,28 @@ impl LocalDaemon {
             setup_run_token_expires_at,
             machine_id,
         })
+    }
+
+    pub fn completed_auth_claim_for_resume(
+        &self,
+        claim_code: &str,
+    ) -> Result<Option<AuthCompleteResponse>, LocalApiError> {
+        let state = self.state()?;
+        let Some(connection) = &state.connection else {
+            return Ok(None);
+        };
+        if connection.claim_code.as_deref() != Some(claim_code) {
+            return Ok(None);
+        }
+        if state.account.state != LocalAccountState::Connected {
+            return Ok(None);
+        }
+        Ok(Some(AuthCompleteResponse {
+            account: state.account.clone(),
+            setup_run_id: connection.setup_run_id.clone(),
+            setup_run_token_expires_at: connection.setup_run_token_expires_at.clone(),
+            machine_id: connection.machine_id.clone(),
+        }))
     }
 
     pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
@@ -2127,6 +2164,54 @@ mod tests {
     }
 
     #[test]
+    fn pending_auth_claim_for_resume_uses_daemon_stored_nonce() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+
+        let resumed = daemon
+            .pending_auth_claim_for_resume("claim_one")
+            .expect("resume pending auth");
+        assert_eq!(resumed.claim_code, "claim_one");
+        assert_eq!(resumed.nonce, "nonce_one");
+        assert!(matches!(
+            daemon.pending_auth_claim_for_resume("claim_two"),
+            Err(LocalApiError::AuthClaimMismatch)
+        ));
+    }
+
+    #[test]
+    fn completed_auth_claim_for_resume_requires_matching_claim_code() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete auth");
+
+        let resumed = daemon
+            .completed_auth_claim_for_resume("claim_one")
+            .expect("resume completed auth")
+            .expect("matching claim should be resumable");
+        assert_eq!(resumed.setup_run_id, "setup_1");
+        assert_eq!(
+            daemon
+                .completed_auth_claim_for_resume("claim_two")
+                .expect("mismatch lookup"),
+            None
+        );
+    }
+
+    #[test]
     fn connected_account_can_refresh_same_user() {
         let daemon = daemon();
         daemon
@@ -2195,6 +2280,7 @@ mod tests {
             setup_run_id: "setup_persisted".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
             machine_id: Some("machine_test".to_string()),
+            claim_code: None,
             api_base_url: "https://api.ottto.net".to_string(),
         };
 
@@ -2765,6 +2851,7 @@ mod tests {
             setup_run_id: setup_run_id.to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
             machine_id: Some("machine_test".to_string()),
+            claim_code: None,
             api_base_url: "https://api.ottto.net".to_string(),
         }
     }

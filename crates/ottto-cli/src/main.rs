@@ -524,6 +524,7 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
     let timeout = Duration::from_secs(args.timeout);
     let mut browser_claim: Option<BrowserClaimState> = None;
     let mut browser_claim_completed = false;
+    let mut claim_code_auth_completed = false;
     let mut last_setup_payload: Option<serde_json::Value> = None;
 
     loop {
@@ -558,7 +559,8 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
             }
         }
 
-        let setup_request = request_like(&invocation, setup_command(&args));
+        let setup_request =
+            request_like(&invocation, setup_command(&args, claim_code_auth_completed));
         print_progress(&setup_request, invocation.output_mode);
         match request_with_autostart(&invocation, &setup_request) {
             Ok(response) if response.ok => {
@@ -607,6 +609,31 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
                             );
                         }
                     }
+                } else if args.claim_code.is_some()
+                    && !claim_code_auth_completed
+                    && setup_claim_already_claimed_error(&error)
+                {
+                    let claim_code = args.claim_code.as_deref().expect("claim code is present");
+                    match complete_pending_browser_claim(&invocation, claim_code) {
+                        SetupAuthCompletion::Completed => {
+                            claim_code_auth_completed = true;
+                            if invocation.output_mode == OutputMode::Human {
+                                println!("Browser approval received. Continuing setup.");
+                            }
+                            continue;
+                        }
+                        SetupAuthCompletion::Pending => {
+                            sleep_for_setup_poll();
+                            continue;
+                        }
+                        SetupAuthCompletion::Failed(error) => {
+                            return print_error(
+                                error,
+                                invocation.output_mode,
+                                Some(response.request_id.as_str()),
+                            );
+                        }
+                    }
                 } else {
                     return print_error(
                         error,
@@ -637,10 +664,14 @@ fn request_like(invocation: &Invocation, command: LocalControlCommand) -> LocalC
     }
 }
 
-fn setup_command(args: &SetupArgs) -> LocalControlCommand {
+fn setup_command(args: &SetupArgs, claim_code_auth_completed: bool) -> LocalControlCommand {
     LocalControlCommand::Setup {
         sources: Vec::new(),
-        claim_code: args.claim_code.clone(),
+        claim_code: if claim_code_auth_completed {
+            None
+        } else {
+            args.claim_code.clone()
+        },
         setup_run_id: args.setup_run_id.clone(),
         api_base_url: args.api_base_url.clone(),
     }
@@ -717,6 +748,33 @@ fn complete_browser_claim(
     }
 }
 
+fn complete_pending_browser_claim(
+    invocation: &Invocation,
+    claim_code: &str,
+) -> SetupAuthCompletion {
+    let request = request_like(
+        invocation,
+        LocalControlCommand::AuthCompletePending {
+            claim_code: claim_code.to_string(),
+        },
+    );
+    print_progress(&request, invocation.output_mode);
+    match request_with_autostart(invocation, &request) {
+        Ok(response) if response.ok => SetupAuthCompletion::Completed,
+        Ok(response) => {
+            let error = response
+                .error
+                .unwrap_or_else(|| internal_error("missing daemon error"));
+            if pending_browser_claim_error(&error) {
+                SetupAuthCompletion::Pending
+            } else {
+                SetupAuthCompletion::Failed(error)
+            }
+        }
+        Err(error) => SetupAuthCompletion::Failed(error),
+    }
+}
+
 fn pending_browser_claim_error(error: &CliError) -> bool {
     error.details.values().any(|value| match value {
         RedactedValue::String(detail) => {
@@ -733,6 +791,15 @@ fn duplicate_browser_claim_completion_error(error: &CliError) -> bool {
         .message
         .to_ascii_lowercase()
         .contains("no pending ottto sign-in claim")
+}
+
+fn setup_claim_already_claimed_error(error: &CliError) -> bool {
+    error.details.values().any(|value| match value {
+        RedactedValue::String(detail) => detail
+            .to_ascii_lowercase()
+            .contains("setup code is claimed"),
+        _ => false,
+    })
 }
 
 fn browser_claim_from_payload(payload: &serde_json::Value) -> Result<BrowserClaimState, CliError> {
@@ -1331,6 +1398,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
+        LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
         LocalControlCommand::AuthReset { .. } => "auth_reset",
         LocalControlCommand::Account => "account",
         LocalControlCommand::Detect { .. } => "detect",
@@ -1828,6 +1896,17 @@ mod tests {
             details: BTreeMap::new(),
         };
         assert!(duplicate_browser_claim_completion_error(&duplicate));
+
+        let already_claimed = CliError {
+            code: CliErrorCode::BackendRejected,
+            message: "Ottto rejected the local setup request.".to_string(),
+            retryable: false,
+            details: BTreeMap::from([(
+                "body_excerpt".to_string(),
+                RedactedValue::String(r#"{"detail":"Setup code is claimed."}"#.to_string()),
+            )]),
+        };
+        assert!(setup_claim_already_claimed_error(&already_claimed));
     }
 
     #[test]
@@ -1902,6 +1981,38 @@ mod tests {
             LocalControlCommand::Setup {
                 sources: Vec::new(),
                 claim_code: Some("claim_123".to_string()),
+                setup_run_id: None,
+                api_base_url: None
+            }
+        );
+    }
+
+    #[test]
+    fn setup_omits_claim_code_after_claim_auth_completes() {
+        let args = SetupArgs {
+            claim_code: Some("claim_123".to_string()),
+            no_browser: false,
+            no_wait: false,
+            timeout: DEFAULT_SETUP_TIMEOUT_SECONDS,
+            setup_run_id: None,
+            api_base_url: None,
+            json: true,
+        };
+
+        assert_eq!(
+            setup_command(&args, false),
+            LocalControlCommand::Setup {
+                sources: Vec::new(),
+                claim_code: Some("claim_123".to_string()),
+                setup_run_id: None,
+                api_base_url: None
+            }
+        );
+        assert_eq!(
+            setup_command(&args, true),
+            LocalControlCommand::Setup {
+                sources: Vec::new(),
+                claim_code: None,
                 setup_run_id: None,
                 api_base_url: None
             }

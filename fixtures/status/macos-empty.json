@@ -1,5 +1,5 @@
 {
-  "protocol_version": 12,
+  "protocol_version": 13,
   "daemon_version": "0.1.0",
   "machine": {
     "machine_id": "machine_01HXLOCALMAC",

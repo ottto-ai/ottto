@@ -148,7 +148,7 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-b
   echo "Expected contract check to fail when control protocol drifts" >&2
   exit 1
 fi
-grep -q "control status request protocol_version must be 12" /tmp/public-contract-broken-protocol.out
+grep -q "control status request protocol_version must be 13" /tmp/public-contract-broken-protocol.out
 
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"

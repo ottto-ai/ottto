@@ -22,7 +22,7 @@ write_manifest() {
       commit: "244f7ea90a7a",
       generated_at: "2026-05-21T18:00:00Z",
       min_supported_version: "0.1.0",
-      min_protocol_version: 12,
+      min_protocol_version: 13,
       supported_install_owners: ["homebrew", "hosted_installer", "app_bundle"],
       rollback: {
         strategy: "channel_latest_pointer",
@@ -153,7 +153,7 @@ write_evidence() {
             version: "0.1.0",
             release_channel: "stable",
             install_owner: "homebrew",
-            protocol_version: 12,
+            protocol_version: 13,
             release_manifest_sha256: $manifest_sha
           },
           checks: {
@@ -188,7 +188,7 @@ write_evidence() {
             version: "0.1.0",
             release_channel: "stable",
             install_owner: "hosted_installer",
-            protocol_version: 12,
+            protocol_version: 13,
             release_manifest_sha256: $manifest_sha
           },
           checks: {
@@ -222,7 +222,7 @@ write_evidence() {
             version: "0.1.0",
             release_channel: "stable",
             install_owner: "app_bundle",
-            protocol_version: 12,
+            protocol_version: 13,
             release_manifest_sha256: $manifest_sha
           },
           checks: {

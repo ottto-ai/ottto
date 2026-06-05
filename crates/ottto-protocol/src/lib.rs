@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
@@ -1502,6 +1502,9 @@ pub enum LocalControlCommand {
         claim_code: String,
         nonce: String,
     },
+    AuthCompletePending {
+        claim_code: String,
+    },
     AuthReset {
         #[serde(default)]
         local_only: bool,
@@ -1894,6 +1897,25 @@ mod tests {
                     max_tokens: Some(4000),
                     all_machines: false,
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn auth_complete_pending_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_complete_pending",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "auth_complete_pending",
+            "claim_code": "claim_123"
+        }))
+        .expect("auth complete pending request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AuthCompletePending {
+                claim_code: "claim_123".to_string()
             }
         );
     }
