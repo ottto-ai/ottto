@@ -67,6 +67,8 @@ pub struct LocalConnectionBinding {
     pub setup_run_id: String,
     pub setup_run_token_expires_at: String,
     pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_code: Option<String>,
     #[serde(default = "default_connection_api_base_url")]
     pub api_base_url: String,
 }
@@ -438,6 +440,7 @@ mod tests {
             setup_run_id: "setup_run_test".to_string(),
             setup_run_token_expires_at: "2026-05-05T11:00:00Z".to_string(),
             machine_id: Some("otm_test".to_string()),
+            claim_code: Some("claim_test".to_string()),
             api_base_url: "http://localhost:4318".to_string(),
         };
 

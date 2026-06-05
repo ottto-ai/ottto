@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "2a9c1a132afc851dc34c57f0e9274911df4bcfe5d57d258536fd63f1095791b2",
+  "content_sha256": "9c7bdc0997ce791a3c4158d4e1dccc1153ec44c5c559508d2ba1f88c08c17f1c",
   "files": [
     {
       "executable": false,
@@ -363,8 +363,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "e2e7d1dfe04510f110a1f1d68b77cab2f5dd908837ce2f13ef65512ed7e97719",
-      "size_bytes": 82839
+      "sha256": "72c02d311a92cdaa8188f7c8ab95368fe8a4baa4ea73ffd8765c99a9a307f83f",
+      "size_bytes": 86977
     },
     {
       "executable": false,
@@ -412,8 +412,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/account_store.rs",
-      "sha256": "f86420bbcdf124dca08e4386e2b0e946774a4b54058960b62cff1f54ee54a582",
-      "size_bytes": 19992
+      "sha256": "c2eb63508025d2cae14977d6c54bc0a03d0cede7b388f0caa3193a34e58b48f9",
+      "size_bytes": 20147
     },
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "0cbf0dbc4b8adce0fbf0035c4c7bef1fb1573cd0ef46ba11b3a0694fb4a1f4e2",
-      "size_bytes": 85287
+      "sha256": "1b0019f33f3ede5428d2e3100793ab61d18b5c45a2dfc5f5daec48023c5cd51a",
+      "size_bytes": 85975
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "1bc43a662a8c7971286ae5cd00148b2dd77908fce261beb25f58c6660f81748a",
-      "size_bytes": 390630
+      "sha256": "4cda130491b8f43f0acb8823e286696d8cd156383f4d0c2bf8d5a41c46643200",
+      "size_bytes": 391967
     },
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "5fd2ce8fdf3dc07f65495360f9b728451e1f31279c8dcb7186fd17be67aa8f99",
-      "size_bytes": 101809
+      "sha256": "f8b13f3b26095f948d0ac0a0a593aa90ff59a9700703ceaf73b7cc4d361b81e9",
+      "size_bytes": 104802
     },
     {
       "executable": false,
@@ -755,21 +755,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/daemon-unavailable-watch-output.ndjson",
-      "sha256": "ab9fdb84adb75500e882ada1661a1ec6448296d6f4c25dc1f39acd5be8ed2b2b",
+      "sha256": "7ea955b887e08f348591db6855ffdde348566e9325db84c8656c357652e4a848",
       "size_bytes": 408
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/diagnostics-collect-request.json",
-      "sha256": "361acdc1337171bcc45210f4c5b063f157f485930487f05475591860feeef3d5",
+      "sha256": "7b2ad5c783f36d2d74d547c217e03ad13e88eadb2814fcdfc9fae2e7ddb0309c",
       "size_bytes": 188
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/diagnostics-upload-request.json",
-      "sha256": "abcc19c21f04c9a79d7b6441a6820057d44c858257dd713b5447b3e6749d6f05",
+      "sha256": "381fe77f31050b0ae82397ea027cdfb97f3ae9bd5a5657763a2475728d1b463d",
       "size_bytes": 358
     },
     {
@@ -790,7 +790,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/setup-claim-request.json",
-      "sha256": "ed124f567e48dccff2153d203bf78bf41d5b780ebfbf62486a6f16bf59dabd14",
+      "sha256": "b7d72b247d074926f4edf14063bc69a075a9d765f5455b6183b5931dd746d80f",
       "size_bytes": 241
     },
     {
@@ -811,35 +811,35 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/status-json-output.json",
-      "sha256": "21e5d8d63b1e8d545bdd9f5f61fb7cf539cbf90eac5c0979251ea03163a68be8",
+      "sha256": "63d56357eb586188e306830d80e3abcc64837156e5446a31e342e0915da8fff1",
       "size_bytes": 52
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/status-watch-output.ndjson",
-      "sha256": "ed8326d17f42b99806fc0110e7cad0bd945e0d8ca0cc31160d3c1392709a59e8",
+      "sha256": "db84ae43210305bcfc16238433c264ffa8bc640b3b0fec9ae8bba47df2323929",
       "size_bytes": 243
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/control/status-request.json",
-      "sha256": "924476995bf8e450e7873c5839b12d5f169a7e615691a6614da692ca2d9f5d2d",
+      "sha256": "11d7c9466584779f954128e94ea30b5a5c7cb8b2d47b788907d40ee6a99d4dc4",
       "size_bytes": 111
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/control/status-response.json",
-      "sha256": "671ee54c59ac99449810f24834a198012a21c5df0dff7291258a37f9925cbe20",
+      "sha256": "2df3141a443b258761b16bf6f47d0e6f25999ea91ff02642c93345ce8380437e",
       "size_bytes": 140
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/diagnostics/redacted-bundle.json",
-      "sha256": "a01dafc5c7d8466e5d78fd1b9350384ca9be1f0529ea036a63cf785cd2e79692",
+      "sha256": "00c3e930470008f3f45b902975b42c88390ad02347f4c77c8f0676ef0ecaa24e",
       "size_bytes": 3082
     },
     {
@@ -860,7 +860,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/status/macos-empty.json",
-      "sha256": "8a2188acc9d15535c6346f4f4ea62924f21089d94f3bc7e28c16f46559a2d072",
+      "sha256": "811351781b7c40dc13875d3a375bc0e23eff16e8c94f3ced7abf2e28eb69a906",
       "size_bytes": 953
     },
     {
@@ -1035,14 +1035,14 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_public_rc_evidence_template.sh",
-      "sha256": "7adccc85f62ea0880fca30e28ebdffc8e946af92105f816c7c9d05b3f96cf404",
+      "sha256": "72bfcfd1eafb948b3bbf9cfa4447db18c9a148ef146f80bb001a404a090f1bd9",
       "size_bytes": 6617
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_public_rc_gate.sh",
-      "sha256": "081d1501e1a5cd9ba98f2792a11cd13b9604ace8b3ff4b03b92376c39052c43c",
+      "sha256": "06c20fe68406f6972c3067e621b87947572689d5c94413e36cc1e98d32531958",
       "size_bytes": 10774
     },
     {
@@ -1063,21 +1063,21 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_closeout_gate.sh",
-      "sha256": "525124a1713e392bbc54424634581355646a782136de1094d0291209589cdb2c",
+      "sha256": "4d511a5ddd1442433ba4d4a52a49c6c8e2c9691594c807369fae05f261397f7d",
       "size_bytes": 10449
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_preflight.sh",
-      "sha256": "8c466cdd2a030e121f865011b403752bcb973d464b688d6fab454cb92c9b2dba",
+      "sha256": "90ae6e9651b9bebc774c420f62b54616dd284c4d72d6fe19f025d76dda8657f2",
       "size_bytes": 24835
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_qa_evidence_template.sh",
-      "sha256": "8e515c5cb129869b1f19c26a75f5faf9a3ddceca0ccfad1548c62be94878fe5f",
+      "sha256": "bba45e4a080fe7ed90dd9305571bb4b5ff3b0cba08c85ec2bf3a69f9189ccd0b",
       "size_bytes": 9377
     },
     {
@@ -1091,7 +1091,7 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "89de6a8acd89d402cdeac4b4eb8466ac28e7b47847ca10e177942001e96a9d28",
+      "sha256": "3e0140040a5f569d12f29e217400cc43ab1519bb04843f59dd7804f179cb15d1",
       "size_bytes": 29388
     },
     {
@@ -1154,21 +1154,21 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_homebrew_formula.sh",
-      "sha256": "15130bb3f7a9eda98b92328c51463cfd19a5184ccb303b7133b9d606a87d41b9",
+      "sha256": "7cfe0c2a17a872dccbcb63a42d8fe46e3cc077c27047d4c9fdb82b1e113dc18c",
       "size_bytes": 7263
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_hosted_native_installer.sh",
-      "sha256": "ad89e32ad0ee9d7fbef59b7481906b2b136343fc137a4cb9c986bdf7867d8986",
+      "sha256": "e34f7203b74d5a89978e97877b489bd213a2d7788129a6c8c81cc0f620af67f1",
       "size_bytes": 9270
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_attestation_bind.sh",
-      "sha256": "1a6eb298019564a8d7fdf5f53bd62071e0695e6db2ed5e3b46f3fc89f6e7838e",
+      "sha256": "bbb0a7f1213c58dd83c2e8c79cafac0cbb3fbfce8c389c4bff1748c25a31f412",
       "size_bytes": 7697
     },
     {
@@ -1203,14 +1203,14 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_public_rc_gate.sh",
-      "sha256": "2dd88de9d8ec6a3bc6e92c78a8a5698b03a4336638c6885718e3e3f3c0ee21af",
+      "sha256": "bf3d95b0f7d6ff62120d8ebd670d821352ee765d5df4a62db030de0f55927fff",
       "size_bytes": 15931
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_release_gate.sh",
-      "sha256": "ce3fde8c04230eb6fb926f16cd25440a19fe1de10b05f201dbb5797b5a05e4a8",
+      "sha256": "cf5fb5c9269c9f615028ca28c82f2aed4d64275a34cc5fa9f400132e8c292c92",
       "size_bytes": 15712
     },
     {
@@ -1231,21 +1231,21 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_closeout_gate.sh",
-      "sha256": "8f51ee48d79a65c8b4f619f5fc08bf9dbe140cd41f318fd307de21f264ff5407",
+      "sha256": "1a506e3d56ee32a0557469a26c01e96908df69a48bcda0fc01a3009f05ef4e11",
       "size_bytes": 14445
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_preflight.sh",
-      "sha256": "5216a3000cd436ecd95615c4d9578e275c5c92b1e904572cdd728ec507e743c1",
+      "sha256": "8edc8d42451f0805e2def763553b81ccb64ad47893b93b5dc9f4fa19cdfe73c5",
       "size_bytes": 12959
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_qa_evidence_template.sh",
-      "sha256": "a796b16ab07a04474aee9e392ea8ee2d1e036bb1e1006b0affc719e62deb3a82",
+      "sha256": "46ad9ed7ce6c79811932b8ac74886c135a1406e5874bcf025ba6ca44e061a90b",
       "size_bytes": 10389
     },
     {
@@ -1266,7 +1266,7 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "8af4cb933fa11b714bb702f57d0eb6868bd01b56388102cfdaca613da843c781",
+      "sha256": "8b66f5b9bf74ee07144c495206939e187f61656baf98866e10568fdd9bbe6c8e",
       "size_bytes": 11011
     },
     {
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-04T07:19:49+00:00",
+  "generated_at": "2026-06-05T12:59:52+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bfeaef9d08791398075cc502008e92141654973a"
+  "source_commit": "7c0c41c376c6b201f6787679fe05783c7317da8c"
 }

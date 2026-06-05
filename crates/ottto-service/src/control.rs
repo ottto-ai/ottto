@@ -417,6 +417,9 @@ fn handle_command(
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
         }
+        LocalControlCommand::AuthCompletePending { claim_code } => {
+            to_value(auth_complete_pending(daemon, &authorization, &claim_code)?)
+        }
         LocalControlCommand::AuthReset { local_only } => {
             to_value(auth_reset(daemon, &authorization, local_only)?)
         }
@@ -1468,7 +1471,30 @@ fn auth_complete(
 ) -> Result<AuthCompleteResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
     let pending = daemon.pending_auth_claim(claim_code, nonce)?;
-    let completed = complete_setup_claim(&pending, &status.machine)?;
+    complete_pending_auth_claim(daemon, &status.machine, pending)
+}
+
+fn auth_complete_pending(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    claim_code: &str,
+) -> Result<AuthCompleteResponse, LocalApiError> {
+    let status = status_for(daemon, authorization)?;
+    match daemon.pending_auth_claim_for_resume(claim_code) {
+        Ok(pending) => complete_pending_auth_claim(daemon, &status.machine, pending),
+        Err(LocalApiError::NoPendingAuthClaim) => daemon
+            .completed_auth_claim_for_resume(claim_code)?
+            .ok_or(LocalApiError::NoPendingAuthClaim),
+        Err(error) => Err(error),
+    }
+}
+
+fn complete_pending_auth_claim(
+    daemon: &LocalDaemon,
+    machine: &MachineIdentity,
+    pending: PendingAuthClaim,
+) -> Result<AuthCompleteResponse, LocalApiError> {
+    let completed = complete_setup_claim(&pending, machine)?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -1491,8 +1517,8 @@ fn auth_complete(
         }),
     };
     let response = daemon.complete_auth_with_account(
-        claim_code,
-        nonce,
+        &pending.claim_code,
+        &pending.nonce,
         account.clone(),
         completed.setup_run_id.clone(),
         completed.setup_run_token_expires_at.clone(),
@@ -1506,6 +1532,7 @@ fn auth_complete(
             setup_run_id: completed.setup_run_id,
             setup_run_token_expires_at: completed.setup_run_token_expires_at,
             machine_id: completed.machine_id,
+            claim_code: Some(pending.claim_code),
             api_base_url: validated_api_base_url(None)?,
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -2387,6 +2414,7 @@ fn setup_run(
             setup_run_id: attached.setup_run_id.clone(),
             setup_run_token_expires_at: attached.expires_at.clone(),
             machine_id: attached.run.machine_id.clone(),
+            claim_code: Some(code.to_string()),
             api_base_url: api_base_url.clone(),
         };
         KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
@@ -7635,6 +7663,9 @@ mod tests {
                 claim_code: "claim_test".to_string(),
                 nonce: "nonce_test".to_string(),
             },
+            LocalControlCommand::AuthCompletePending {
+                claim_code: "claim_test".to_string(),
+            },
         ] {
             let response = handle_request(
                 &daemon(),
@@ -7695,6 +7726,7 @@ mod tests {
                 setup_run_id: "setup_unavailable".to_string(),
                 setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
                 machine_id: Some("machine_test".to_string()),
+                claim_code: None,
                 api_base_url,
             }));
 
@@ -7808,6 +7840,7 @@ mod tests {
             setup_run_id: "setup_context".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
             machine_id: Some("machine_test".to_string()),
+            claim_code: None,
             api_base_url: DIRECT_API_BASE_URL.to_string(),
         };
         let url = agent_context_url(
@@ -7844,6 +7877,7 @@ mod tests {
             setup_run_id: "setup_untrusted".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
             machine_id: Some("machine_test".to_string()),
+            claim_code: None,
             api_base_url: "https://attacker.example".to_string(),
         };
         let result =
@@ -10382,6 +10416,7 @@ log_user_prompt = true
             setup_run_id: "setup_stale".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
             machine_id: Some("machine_test".to_string()),
+            claim_code: None,
             api_base_url: "https://api.ottto.net".to_string(),
         }));
 

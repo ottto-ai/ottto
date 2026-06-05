@@ -38,7 +38,7 @@ write_manifest() {
       commit: "abcdef123456",
       generated_at: "2026-05-21T00:00:00Z",
       min_supported_version: "0.1.0",
-      min_protocol_version: 12,
+      min_protocol_version: 13,
       supported_install_owners: ["app_bundle"],
       install_methods: {
         verified_native_installer: {
