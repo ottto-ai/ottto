@@ -20,6 +20,26 @@ use thiserror::Error;
 const LAUNCHCTL: &str = "/bin/launchctl";
 const PKILL: &str = "/usr/bin/pkill";
 
+/// macOS Keychain generic-password *services* that hold per-source telemetry
+/// exporter keys. These are keyed by the backend-issued `key_id` (the item
+/// *account*), so a machine accumulates one item per claim until pruned, and a
+/// complete uninstall must purge every item under each service — not a fixed
+/// account.
+///
+/// The canonical definitions for the live store live in `ottto_service::keychain`
+/// (which also sweeps these on the daemon uninstall path). This crate keeps its
+/// own copy because the CLI `ottto uninstall` path (`execute_local_uninstall`)
+/// links `ottto-core` but not `ottto-service`, so it cannot reach that sweep.
+/// Keep the two lists in sync; the names are stable.
+const CODEX_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-codex";
+const CLAUDE_CODE_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-claude_code";
+const LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE: &str = "ottto.telemetry.device-secret";
+const TELEMETRY_KEYCHAIN_SERVICES: &[&str] = &[
+    CODEX_TELEMETRY_KEY_SERVICE,
+    CLAUDE_CODE_TELEMETRY_KEY_SERVICE,
+    LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE,
+];
+
 #[derive(Debug, Error)]
 pub enum LifecycleError {
     #[error("HOME is required for Ottto local lifecycle operations")]
@@ -147,6 +167,18 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             destructive: true,
         },
     ];
+
+    actions.extend(
+        TELEMETRY_KEYCHAIN_SERVICES
+            .iter()
+            .map(|service| UninstallAction {
+                action: "remove_telemetry_keys".to_string(),
+                target: (*service).to_string(),
+                kind: "local_keychain_service".to_string(),
+                requires_confirmation: true,
+                destructive: true,
+            }),
+    );
 
     actions.extend(
         [
@@ -406,6 +438,20 @@ fn remove_keychain_tokens(report: &mut CleanupReport) {
             ));
         }
     }
+    for service in TELEMETRY_KEYCHAIN_SERVICES {
+        match purge_keychain_service(service) {
+            Ok(0) => {}
+            Ok(removed) => report.removed_paths.push(format!(
+                "keychain://{service} ({removed} telemetry key item(s))"
+            )),
+            Err(error) => {
+                failures += 1;
+                report.fail(format!(
+                    "purge telemetry keychain service {service}: {error}"
+                ));
+            }
+        }
+    }
     report.credential_status = if failures == 0 {
         "removed_or_absent".to_string()
     } else {
@@ -438,6 +484,48 @@ fn delete_legacy_keychain_item(account: &'static str) -> Result<(), String> {
     } else {
         message
     })
+}
+
+/// Deletes every generic-password item under `service`, regardless of account.
+///
+/// `security delete-generic-password -s <service>` removes one matching item per
+/// invocation (there is no batch flag), so we loop until it reports the item is
+/// missing. Telemetry exporter keys are accounted by the backend `key_id`; the
+/// daemon-path sweep in `ottto_service::keychain` clears them, but the CLI
+/// uninstall path runs here and cannot reach that crate — so this index-free
+/// purge is what makes `ottto uninstall` actually clear them.
+#[cfg(target_os = "macos")]
+fn purge_keychain_service(service: &str) -> Result<usize, String> {
+    let mut removed = 0usize;
+    loop {
+        let output = Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-s", service])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            removed += 1;
+            // Defensive cap: a single service should never hold this many items.
+            // Bail rather than spin forever if `security` ever reports success
+            // without actually removing an item.
+            if removed >= 1024 {
+                return Err(format!(
+                    "stopped after removing {removed} items from {service} (possible runaway)"
+                ));
+            }
+            continue;
+        }
+        if keychain_delete_reports_missing(output.status.code(), &output.stderr) {
+            return Ok(removed);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if message.is_empty() {
+            format!("security exited with status {}", output.status)
+        } else {
+            message
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -540,6 +628,20 @@ mod tests {
                 "net.ottto.locald/control-token",
                 "net.ottto.locald/setup-run-token",
                 "net.ottto.locald/relay-device-secret",
+            ]
+        );
+        let telemetry_services = plan
+            .actions
+            .iter()
+            .filter(|action| action.kind == "local_keychain_service")
+            .map(|action| (action.action.as_str(), action.target.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            telemetry_services,
+            vec![
+                ("remove_telemetry_keys", "ottto-telemetry-key-codex"),
+                ("remove_telemetry_keys", "ottto-telemetry-key-claude_code"),
+                ("remove_telemetry_keys", "ottto.telemetry.device-secret"),
             ]
         );
         assert!(plan
