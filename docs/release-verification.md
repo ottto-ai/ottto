@@ -125,7 +125,7 @@ matches the stable manifest commit. The stable-candidate manifest must mark
 every macOS artifact as signed, notarized, and Gatekeeper-assessed, and the
 evidence must include passed `artifact_signatures`, `notarization`, and
 `gatekeeper_assessment` checks. It must also bind the exercised local runtime to
-`ottto-service`, `net.ottto.service`, protocol v11, the stable-candidate
+`ottto-service`, `net.ottto.service`, protocol v13, the stable-candidate
 version/channel, and the candidate release-manifest SHA-256. The evidence must
 not include private repo paths, local user paths, raw claim/setup tokens,
 account or machine identifiers, passwords, API keys, or bearer credentials.
@@ -157,7 +157,7 @@ macos_stable_qa_evidence_template.sh \
 
 The template binds the exact manifest SHA-256, adds each required owner, and
 records the expected local-runtime binding for `ottto-service`,
-`net.ottto.service`, protocol v11, stable version/channel, install owner, and
+`net.ottto.service`, protocol v13, stable version/channel, install owner, and
 release-manifest SHA-256. It leaves every owner check as `not_run`. Fill those
 values with real clean-machine pass/fail facts; do not paste raw terminal
 output or local identifiers into the evidence file. Then run:
@@ -173,7 +173,12 @@ DMG/PKG and then binds to the `app_bundle` owner after installation. Homebrew
 must remain absent from `supported_install_owners` until its clean-machine
 lifecycle evidence passes. Owner checks include: install, service/app readiness,
 browser setup claim, app detection, Codex verify, doctor, fix, diagnostics,
-logout, update check, upgrade, uninstall, reinstall, and post-reinstall status.
+logout, update check, upgrade, uninstall, reinstall, post-reinstall status, and
+re-onboard after a local Keychain wipe. The re-onboard check must start from a
+previously claimed Mac, remove local runtime state and all local telemetry
+device-secret Keychain rows, use dashboard Start fresh to remove the stale
+machine, reinstall, complete browser claim, and prove relay-device
+provisioning, snapshot creation, and connected account state recover.
 Homebrew evidence also has to prove that launching `Ottto.app` before and after
 upgrade preserves the Homebrew-owned LaunchAgent, that doctor reports no owner
 drift, and that update JSON reports the Homebrew install owner. App-bundle

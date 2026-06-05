@@ -117,6 +117,7 @@ CHECKS_BY_OWNER = {
         "uninstall",
         "reinstall",
         "post_reinstall_status_json",
+        "reonboard_after_keychain_wipe",
     ],
     "hosted_installer": [
         "wrapper_download",
@@ -138,6 +139,7 @@ CHECKS_BY_OWNER = {
         "uninstall",
         "reinstall",
         "post_reinstall_status_json",
+        "reonboard_after_keychain_wipe",
     ],
     "app_bundle": [
         "artifact_checksum",
@@ -161,6 +163,7 @@ CHECKS_BY_OWNER = {
         "uninstall",
         "reinstall",
         "post_reinstall_status_json",
+        "reonboard_after_keychain_wipe",
     ],
 }
 

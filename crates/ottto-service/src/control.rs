@@ -1312,6 +1312,12 @@ fn sweep_telemetry_keys_for_uninstall(result: &mut UninstallExecutionResult) {
                     .iter()
                     .map(|reference| format!("keychain://{}", reference.target())),
             );
+            result.removed_paths.extend(
+                sweep
+                    .removed_unindexed_services
+                    .iter()
+                    .map(|target| format!("keychain://{target}")),
+            );
             result.warnings.extend(sweep.warnings);
         }
         Err(error) => {

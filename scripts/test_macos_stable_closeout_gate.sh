@@ -176,7 +176,8 @@ write_evidence() {
             post_upgrade_app_relaunch_preserves_owner: "passed",
             uninstall: "passed",
             reinstall: "passed",
-            post_reinstall_status_json: "passed"
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
           }
         },
         {
@@ -210,7 +211,8 @@ write_evidence() {
             upgrade: "passed",
             uninstall: "passed",
             reinstall: "passed",
-            post_reinstall_status_json: "passed"
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
           }
         },
         {
@@ -246,7 +248,8 @@ write_evidence() {
             upgrade: "passed",
             uninstall: "passed",
             reinstall: "passed",
-            post_reinstall_status_json: "passed"
+            post_reinstall_status_json: "passed",
+            reonboard_after_keychain_wipe: "passed"
           }
         }
       ]

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 188,
-  "content_sha256": "ce7d78bd105a82def0f259dd75702e9c2fded9365df3615677e065bccc58019a",
+  "content_sha256": "5ddc3b51c3140a2bb5e668ed320f09819336013949af36465025231ae3cf0392",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "37e0817b0ae2fd4ac7fbe5333f17d1c86c4bea8ff8863fa39524dc7eb44bca70",
-      "size_bytes": 41221
+      "sha256": "bb6bae15e7ff8b1443438e2ed2760ee6f295b7174adb75a68890dce017e5c707",
+      "size_bytes": 41261
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "4cda130491b8f43f0acb8823e286696d8cd156383f4d0c2bf8d5a41c46643200",
-      "size_bytes": 391967
+      "sha256": "4a4360b616e686d3ba3bba09e51ad84d4d781a7a69484180e8cc5efc808b9155",
+      "size_bytes": 392188
     },
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/keychain.rs",
-      "sha256": "cba9714e5f4952125e8dcad0e85431192a6e9370156eae6f7ca5741722cf1232",
-      "size_bytes": 26626
+      "sha256": "b143b53cb3cad054f865e30dd6be962fd414732504a00a4df49a28192637209b",
+      "size_bytes": 30367
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "a1967772f379d09701aa59f86fea9c1b47b83f58bb33a8e4da08ac40349528c0",
-      "size_bytes": 7675
+      "sha256": "e7e8e92263bace9dc5871b01213069177417160e902fbec3ee45160a39df1e2c",
+      "size_bytes": 8041
     },
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "30c1ef6c50f95ae100754f96ef7267cccba1edd5000bd1909e2fffa9ea29814c",
-      "size_bytes": 24319
+      "sha256": "e1cae7f1a9083e28f76a092e9730bc3dbb7e34d68233b1168ab58853bab51e6e",
+      "size_bytes": 24389
     },
     {
       "executable": false,
@@ -1063,8 +1063,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_closeout_gate.sh",
-      "sha256": "4d511a5ddd1442433ba4d4a52a49c6c8e2c9691594c807369fae05f261397f7d",
-      "size_bytes": 10449
+      "sha256": "330b45174a7ba586ea47943dd94649da25736c9a34bb5630fff7c034692f7ea7",
+      "size_bytes": 10569
     },
     {
       "executable": true,
@@ -1077,8 +1077,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_qa_evidence_template.sh",
-      "sha256": "bba45e4a080fe7ed90dd9305571bb4b5ff3b0cba08c85ec2bf3a69f9189ccd0b",
-      "size_bytes": 9377
+      "sha256": "3b9bb260879b364d63d1ba1bfebf1c94d41ebf02b7b6016bd2d9b205b84d3e75",
+      "size_bytes": 9500
     },
     {
       "executable": true,
@@ -1231,8 +1231,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_closeout_gate.sh",
-      "sha256": "1a506e3d56ee32a0557469a26c01e96908df69a48bcda0fc01a3009f05ef4e11",
-      "size_bytes": 14445
+      "sha256": "075abe348f13c04a6b6a4ec5835fff88fce06ffa2a146047d0d3872b3eaa2175",
+      "size_bytes": 14604
     },
     {
       "executable": true,
@@ -1245,8 +1245,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_qa_evidence_template.sh",
-      "sha256": "46ad9ed7ce6c79811932b8ac74886c135a1406e5874bcf025ba6ca44e061a90b",
-      "size_bytes": 10389
+      "sha256": "e7b4dc1237951906e765f5b11807008cf319536d73f6fa958d331d4c17f5b1f3",
+      "size_bytes": 10735
     },
     {
       "executable": true,
@@ -1319,7 +1319,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-05T13:20:56+00:00",
+  "generated_at": "2026-06-05T19:49:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 189,
   "public_roots": [
@@ -1354,5 +1354,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2a96d9230845472f8388985ecbd073f563cacd69"
+  "source_commit": "3926630a014f6fbe7903d83c14ccc0e8e3a404f3"
 }
