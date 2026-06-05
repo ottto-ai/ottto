@@ -58,7 +58,7 @@ jq -n \
       service_label: "net.ottto.service",
       version: "0.1.0-stable-candidate.1",
       release_channel: "stable-candidate",
-      protocol_version: 11,
+      protocol_version: 12,
       release_manifest_sha256: $candidate_sha
     },
     checks: {
@@ -108,7 +108,7 @@ write_manifest() {
       commit: "abcdef123456",
       generated_at: "2026-05-10T00:00:00Z",
       min_supported_version: "0.1.0",
-      min_protocol_version: 11,
+      min_protocol_version: 12,
       supported_install_owners: ["app_bundle"],
       install_methods: {
         verified_native_installer: {
@@ -299,7 +299,7 @@ if "$PREFLIGHT" --manifest "$failed_candidate_rc_manifest" --dry-run >/dev/null 
 fi
 
 bad_candidate_rc_runtime="$TMP_DIR/stable-candidate-rc-bad-runtime-qa.json"
-jq '.local_platform.protocol_version = 10' "$candidate_rc_evidence" > "$bad_candidate_rc_runtime"
+jq '.local_platform.protocol_version = 11' "$candidate_rc_evidence" > "$bad_candidate_rc_runtime"
 bad_candidate_rc_runtime_manifest="$TMP_DIR/stable-candidate-rc-bad-runtime-manifest.json"
 jq --arg evidence "$bad_candidate_rc_runtime" \
   '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
@@ -310,7 +310,7 @@ if "$PREFLIGHT" --manifest "$bad_candidate_rc_runtime_manifest" --dry-run >/dev/
 fi
 
 bad_protocol_manifest="$TMP_DIR/bad-protocol-stable-manifest.json"
-jq '.min_protocol_version = 10' "$stable_manifest" > "$bad_protocol_manifest"
+jq '.min_protocol_version = 11' "$stable_manifest" > "$bad_protocol_manifest"
 if "$PREFLIGHT" --manifest "$bad_protocol_manifest" --dry-run >/dev/null 2>&1; then
   echo "Expected stale stable protocol version to fail stable preflight" >&2
   exit 1

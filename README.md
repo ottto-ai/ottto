@@ -79,6 +79,7 @@ The first public smoke commands are:
 
 ```bash
 ottto status --json
+ottto context --json
 ottto setup --json
 ottto apps detect --json
 ottto verify --app codex --json
@@ -234,6 +235,9 @@ Current locked commands:
 ottto status --json
 ottto status --json --watch
 ottto status --refresh-agent-status --json
+ottto context --json
+ottto context --json --range today --source codex
+ottto context --json --all-machines --max-tokens 4000
 ottto apps --json
 ottto apps detect --json
 ottto apps status --app codex --json
@@ -267,9 +271,10 @@ up to `--timeout` seconds for browser approval and setup progress before
 returning exit code `61`. Agents and headless flows can pass `--no-browser` to
 skip auto-open and `--no-wait` to return the fallback claim payload immediately
 with exit code `60`. `--watch` without `--json` exits as `invalid_request`.
-Human mode prints short summaries only and is not a parsing contract. All
-commands call `ottto-service` through the local-control protocol except local
-uninstall cleanup and the hidden Claude Code status-line helper.
+Human mode prints short summaries only and is not a parsing contract. `context`
+is an agent-only JSON command; omitting `--json` exits as `invalid_request`.
+All commands call `ottto-service` through the local-control protocol except
+local uninstall cleanup and the hidden Claude Code status-line helper.
 
 Stable CLI exit codes are:
 
@@ -285,10 +290,12 @@ Stable CLI exit codes are:
 | `61` | Setup timed out |
 | `70` | Internal error |
 
-Public command nouns use `apps` and `--app`. The lower-level
-`agent-status --source <source>` and `--source` selectors remain available for
-existing automation while protocol payloads continue to use `source` and
-`SourceKind`.
+Public command nouns use `apps` and `--app` for local app lifecycle work. The
+lower-level `agent-status --source <source>` selector remains available for
+existing automation while protocol payloads continue to use `SourceKind`.
+`context --source <source>` intentionally accepts backend source slugs, not only
+local app values, because cloud context can include API and cloud-provider
+sources in addition to Codex, Claude Code, and Pi.
 
 ## Current Phase
 
@@ -538,8 +545,8 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   upload, collector status, and backend activity-hints, with missing relay
   device credentials logged as a safe local skip instead of leaking paths or
   secrets
-- local protocol version 11 and local snapshot schema version 5 as clean
-  cutovers. Local control requests must include `protocol_version: 11`, and
+- local protocol version 12 and local snapshot schema version 5 as clean
+  cutovers. Local control requests must include `protocol_version: 12`, and
   backend local snapshot batch/status endpoints reject stale internal schema
   versions instead of compatibility-mapping them. Protocol v11 adds
   owner-aware update gates, manifest minimum-version/protocol metadata, and

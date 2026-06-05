@@ -38,6 +38,7 @@ Customer-facing commands use app language:
 
 ```bash
 ottto apps --json
+ottto context --json
 ottto apps detect --json
 ottto apps status --app codex --json
 ottto setup --json

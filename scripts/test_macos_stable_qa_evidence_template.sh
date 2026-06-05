@@ -18,7 +18,7 @@ write_manifest() {
     commit: "244f7ea90a7a",
     generated_at: "2026-05-21T18:00:00Z",
     min_supported_version: "0.1.0",
-    min_protocol_version: 11,
+    min_protocol_version: 12,
     supported_install_owners: ["homebrew", "hosted_installer", "app_bundle"],
     rollback: {
       strategy: "channel_latest_pointer",
@@ -151,7 +151,7 @@ jq -e \
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.version == "0.1.0")
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.release_channel == "stable")
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.install_owner == "homebrew")
-    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.protocol_version == 11)
+    and (.install_owners[] | select(.owner == "homebrew") | .local_platform.protocol_version == 12)
     and (.install_owners[] | select(.owner == "homebrew") | .local_platform.release_manifest_sha256 == $manifest_sha)
     and (.install_owners[] | select(.owner == "homebrew") | .checks.setup_browser_claim == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.verify_codex_json == "not_run")
@@ -210,11 +210,11 @@ fi
 grep -q "expected stable manifest" /tmp/stable-qa-template-dev.out
 
 stale_protocol_manifest="$tmp_dir/stale-protocol-manifest.json"
-jq '.min_protocol_version = 10' "$manifest" > "$stale_protocol_manifest"
+jq '.min_protocol_version = 11' "$manifest" > "$stale_protocol_manifest"
 if "$TEMPLATE" --manifest "$stale_protocol_manifest" --output - >/tmp/stable-qa-template-stale-protocol.out 2>&1; then
   echo "Expected template generation to reject stale protocol manifests" >&2
   exit 1
 fi
-grep -q "min_protocol_version must be 11" /tmp/stable-qa-template-stale-protocol.out
+grep -q "min_protocol_version must be 12" /tmp/stable-qa-template-stale-protocol.out
 
 echo "macos_stable_qa_evidence_template tests passed"

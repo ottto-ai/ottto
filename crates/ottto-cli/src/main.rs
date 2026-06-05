@@ -6,8 +6,8 @@ use ottto_core::{
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
-    CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval, LocalControlCommand,
-    LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
+    AgentContextQuery, CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval,
+    LocalControlCommand, LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
     LOCAL_CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
@@ -59,6 +59,8 @@ enum Command {
     Apps(AppsArgs),
     #[command(about = "Refresh one source status using the lower-level source noun")]
     AgentStatus(SourceArgs),
+    #[command(about = "Print cloud context for AI agents")]
+    Context(ContextArgs),
     #[command(about = "Connect this Mac through a browser claim")]
     Setup(SetupArgs),
     #[command(about = "Sign in and connect this Mac through a browser claim")]
@@ -109,6 +111,75 @@ struct AppsArgs {
     json: bool,
     #[command(subcommand)]
     command: Option<AppsCommand>,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(
+        ArgGroup::new("source_selector")
+            .args(["source", "app"])
+            .multiple(false)
+    )
+)]
+struct ContextArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(long, value_name = "DAYS", help = "Number of days to include")]
+    days: Option<u16>,
+    #[arg(long, value_name = "RANGE", help = "Calendar range preset")]
+    range: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window start date"
+    )]
+    start_date: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window end date"
+    )]
+    end_date: Option<String>,
+    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    timezone: Option<String>,
+    #[arg(long, value_name = "SOURCE", help = "Source slug to filter context to")]
+    source: Option<String>,
+    #[arg(long, value_enum, help = "App/source alias to filter context to")]
+    app: Option<SourceArg>,
+    #[arg(
+        long,
+        value_name = "MACHINE_ID",
+        help = "Override the local machine filter"
+    )]
+    machine_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROFILE_ID",
+        help = "Filter by source plan profile id"
+    )]
+    source_plan_profile_id: Option<String>,
+    #[arg(long, value_name = "TOKENS", help = "Approximate output token budget")]
+    max_tokens: Option<u32>,
+    #[arg(long, help = "Request account-wide context instead of this Mac")]
+    all_machines: bool,
+}
+
+impl ContextArgs {
+    fn query(&self) -> AgentContextQuery {
+        AgentContextQuery {
+            days: self.days,
+            range: non_empty_option(self.range.as_deref()),
+            start_date: non_empty_option(self.start_date.as_deref()),
+            end_date: non_empty_option(self.end_date.as_deref()),
+            timezone: non_empty_option(self.timezone.as_deref()),
+            source: non_empty_option(self.source.as_deref())
+                .or_else(|| self.app.map(|source| source.slug().to_string())),
+            machine_id: non_empty_option(self.machine_id.as_deref()),
+            source_plan_profile_id: non_empty_option(self.source_plan_profile_id.as_deref()),
+            max_tokens: self.max_tokens,
+            all_machines: self.all_machines,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -231,6 +302,16 @@ enum SourceArg {
     Pi,
 }
 
+impl SourceArg {
+    fn slug(self) -> &'static str {
+        match self {
+            SourceArg::Codex => "codex",
+            SourceArg::ClaudeCode => "claude_code",
+            SourceArg::Pi => "pi",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum DiagnosticsCommand {
     #[command(about = "Collect a redacted diagnostics bundle")]
@@ -285,6 +366,10 @@ struct Invocation {
 
 fn main() {
     let cli = Cli::parse();
+    if let Err(error) = validate_cli(&cli) {
+        let code = print_error(error, OutputMode::Human, None);
+        std::process::exit(code);
+    }
     let setup_args = match &cli.command {
         Command::Setup(args) | Command::Login(args) => Some(args.clone()),
         _ => None,
@@ -311,6 +396,18 @@ fn main() {
         run(invocation)
     };
     std::process::exit(code);
+}
+
+fn validate_cli(cli: &Cli) -> Result<(), CliError> {
+    if matches!(&cli.command, Command::Context(args) if !args.json) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto context is agent JSON only; pass --json".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    Ok(())
 }
 
 fn run_claude_code_statusline(json: bool) -> i32 {
@@ -1078,6 +1175,9 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::AgentStatus(args) => LocalControlCommand::AgentStatusRefresh {
             source: Some(args.selected_source()),
         },
+        Command::Context(args) => LocalControlCommand::AgentContext {
+            query: args.query(),
+        },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
@@ -1138,6 +1238,7 @@ fn command_json(command: &Command) -> bool {
         Command::Doctor(args) | Command::Uninstall(args) | Command::Account(args) => args.json,
         Command::Setup(args) | Command::Login(args) => args.json,
         Command::Logout(args) => args.json,
+        Command::Context(args) => args.json,
         Command::AgentStatus(args) | Command::Fix(args) => args.json,
         Command::Verify(args) => args.json,
         Command::Diagnostics {
@@ -1149,6 +1250,13 @@ fn command_json(command: &Command) -> bool {
         },
         Command::ClaudeCodeStatusline(args) => args.json,
     }
+}
+
+fn non_empty_option(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn request_id() -> String {
@@ -1220,6 +1328,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::Status { .. } => "status",
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthReset { .. } => "auth_reset",
@@ -1308,6 +1417,14 @@ fn human_summary(payload: &serde_json::Value) -> String {
     if let Some(account) = payload.get("account").and_then(|value| value.as_object()) {
         if let Some(state) = account.get("state").and_then(|value| value.as_str()) {
             return format!("Ottto account: {}", sanitize_for_terminal(state));
+        }
+    }
+    if let Some(schema_version) = payload
+        .get("schema_version")
+        .and_then(|value| value.as_str())
+    {
+        if schema_version == "agent_context.v1" {
+            return "Ottto context: ok".to_string();
         }
     }
     payload_summary(payload)
@@ -1448,7 +1565,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 18] = [
+        let commands: [(&str, &[&str]); 19] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
@@ -1464,6 +1581,7 @@ mod tests {
                 "ottto agent-status --help",
                 &["ottto", "agent-status", "--help"],
             ),
+            ("ottto context --help", &["ottto", "context", "--help"]),
             ("ottto setup --help", &["ottto", "setup", "--help"]),
             ("ottto login --help", &["ottto", "login", "--help"]),
             ("ottto account --help", &["ottto", "account", "--help"]),
@@ -1509,6 +1627,17 @@ mod tests {
         let error = output_mode(command_json(&cli.command), cli.watch).expect_err("watch invalid");
         assert_eq!(error.code, CliErrorCode::InvalidRequest);
         assert_eq!(error.message, "--watch requires --json");
+    }
+
+    #[test]
+    fn context_requires_json_mode() {
+        let cli = Cli::parse_from(["ottto", "context"]);
+        let error = validate_cli(&cli).expect_err("context requires json");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "ottto context is agent JSON only; pass --json"
+        );
     }
 
     #[test]
@@ -1966,6 +2095,91 @@ mod tests {
             invocation.request.command,
             LocalControlCommand::AgentStatusRefresh {
                 source: Some(SourceKind::Codex)
+            }
+        );
+    }
+
+    #[test]
+    fn context_builds_agent_context_request() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "context",
+            "--json",
+            "--days",
+            "14",
+            "--range",
+            "last_7_days",
+            "--start-date",
+            "2026-06-01",
+            "--end-date",
+            "2026-06-05",
+            "--timezone",
+            "America/Los_Angeles",
+            "--app",
+            "claude-code",
+            "--machine-id",
+            "otm_test",
+            "--source-plan-profile-id",
+            "018fe251-b6f3-7cc8-9f82-01a76449d111",
+            "--max-tokens",
+            "4000",
+        ]);
+        validate_cli(&cli).expect("context json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: Some("claude_code".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    max_tokens: Some(4000),
+                    all_machines: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn context_watch_builds_ndjson_invocation() {
+        let cli = Cli::parse_from(["ottto", "context", "--json", "--watch", "--all-machines"]);
+        validate_cli(&cli).expect("context watch valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Ndjson);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery {
+                    all_machines: true,
+                    ..AgentContextQuery::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn context_accepts_backend_source_slugs() {
+        let cli = Cli::parse_from(["ottto", "context", "--json", "--source", "bedrock"]);
+        validate_cli(&cli).expect("context json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery {
+                    source: Some("bedrock".to_string()),
+                    ..AgentContextQuery::default()
+                }
             }
         );
     }

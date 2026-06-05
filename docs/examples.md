@@ -14,6 +14,19 @@ ottto apps --json
 Report daemon reachability, account state, app readiness, exit code, and next
 action.
 
+## Agent Context
+
+```bash
+ottto context --json
+ottto context --json --range today --source codex
+ottto context --json --all-machines --max-tokens 4000
+```
+
+Use `context` only as a machine-readable agent surface. It returns cloud context
+from Ottto through the local daemon and requires this Mac to be connected.
+`--app codex|claude-code|pi` is available as a local app alias, while `--source`
+accepts backend source slugs for local, API, and cloud-provider data.
+
 ## Headless Setup
 
 ```bash

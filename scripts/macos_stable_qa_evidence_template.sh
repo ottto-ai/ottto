@@ -208,8 +208,8 @@ if product != "ottto-local-platform":
     die(f"expected product=ottto-local-platform, got {product}")
 if channel != "stable":
     die(f"expected stable manifest, got channel={channel}")
-if min_protocol_version != 11:
-    die("manifest.min_protocol_version must be 11")
+if min_protocol_version != 12:
+    die("manifest.min_protocol_version must be 12")
 
 quality_gates = require_object(manifest.get("quality_gates"), "manifest.quality_gates")
 gate = require_object(

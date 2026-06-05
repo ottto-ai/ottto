@@ -7,6 +7,7 @@ Commands:
   status        Show daemon, account, relay, update, and app health
   apps          List apps or refresh app setup status
   agent-status  Refresh one source status using the lower-level source noun
+  context       Print cloud context for AI agents
   setup         Connect this Mac through a browser claim
   login         Sign in and connect this Mac through a browser claim
   account       Show the Ottto account connected to this Mac
@@ -94,6 +95,46 @@ Options:
       --no-autostart     Do not kickstart the standard per-user ottto-service
       --watch            Emit NDJSON progress events and a final event; requires --json
   -h, --help             Print help
+### ottto context --help
+Print cloud context for AI agents
+
+Usage: ottto context [OPTIONS]
+
+Options:
+      --json
+          Print one final JSON object and no human summary text
+      --socket <SOCKET>
+          Override the ottto-service Unix socket path
+      --days <DAYS>
+          Number of days to include
+      --token <TOKEN>
+          Override the local-control token for CLI and agent requests
+      --no-autostart
+          Do not kickstart the standard per-user ottto-service
+      --range <RANGE>
+          Calendar range preset
+      --start-date <YYYY-MM-DD>
+          Inclusive custom window start date
+      --watch
+          Emit NDJSON progress events and a final event; requires --json
+      --end-date <YYYY-MM-DD>
+          Inclusive custom window end date
+      --timezone <TZ>
+          IANA timezone for calendar windows
+      --source <SOURCE>
+          Source slug to filter context to
+      --app <APP>
+          App/source alias to filter context to [possible values: codex, claude-code, pi]
+      --machine-id <MACHINE_ID>
+          Override the local machine filter
+      --source-plan-profile-id <PROFILE_ID>
+          Filter by source plan profile id
+      --max-tokens <TOKENS>
+          Approximate output token budget
+      --all-machines
+          Request account-wide context instead of this Mac
+  -h, --help
+          Print help
 ### ottto setup --help
 Connect this Mac through a browser claim
 
