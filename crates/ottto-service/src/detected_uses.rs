@@ -359,6 +359,7 @@ mod tests {
                 state_total_tokens: None,
                 state_archived: None,
             },
+            origin: None,
         }
     }
 
