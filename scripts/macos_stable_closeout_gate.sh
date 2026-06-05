@@ -69,7 +69,8 @@ required_checks_for_owner() {
         post_upgrade_app_relaunch_preserves_owner \
         uninstall \
         reinstall \
-        post_reinstall_status_json
+        post_reinstall_status_json \
+        reonboard_after_keychain_wipe
       ;;
     hosted_installer)
       printf '%s\n' \
@@ -91,7 +92,8 @@ required_checks_for_owner() {
         upgrade \
         uninstall \
         reinstall \
-        post_reinstall_status_json
+        post_reinstall_status_json \
+        reonboard_after_keychain_wipe
       ;;
     app_bundle)
       printf '%s\n' \
@@ -115,7 +117,8 @@ required_checks_for_owner() {
         upgrade \
         uninstall \
         reinstall \
-        post_reinstall_status_json
+        post_reinstall_status_json \
+        reonboard_after_keychain_wipe
       ;;
     *)
       return 1

@@ -162,14 +162,17 @@ jq -e \
     and (.install_owners[] | select(.owner == "homebrew") | .checks.update_check_owner_json == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.post_upgrade_app_relaunch_preserves_owner == "not_run")
     and (.install_owners[] | select(.owner == "homebrew") | .checks.reinstall == "not_run")
+    and (.install_owners[] | select(.owner == "homebrew") | .checks.reonboard_after_keychain_wipe == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.native_gatekeeper == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.upgrade == "not_run")
     and (.install_owners[] | select(.owner == "hosted_installer") | .checks.post_reinstall_status_json == "not_run")
+    and (.install_owners[] | select(.owner == "hosted_installer") | .checks.reonboard_after_keychain_wipe == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.artifact_checksum == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.homebrew_second_install_safe_refusal == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.doctor_owner_drift_json == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.update_check_owner_json == "not_run")
     and (.install_owners[] | select(.owner == "app_bundle") | .checks.apps_detect_json == "not_run")
+    and (.install_owners[] | select(.owner == "app_bundle") | .checks.reonboard_after_keychain_wipe == "not_run")
   ' "$evidence" >/dev/null
 
 if "$CLOSEOUT_GATE" --manifest "$manifest" >/tmp/stable-qa-template-closeout.out 2>&1; then

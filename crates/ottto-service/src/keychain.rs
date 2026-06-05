@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 pub const TELEMETRY_KEY_SERVICE_PREFIX: &str = "ottto-telemetry-key-";
 pub const CODEX_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-codex";
 pub const CLAUDE_CODE_TELEMETRY_KEY_SERVICE: &str = "ottto-telemetry-key-claude_code";
+pub const LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE: &str = "ottto.telemetry.device-secret";
 pub const TELEMETRY_KEY_FILE_STORE_ENV: &str = "OTTTO_TELEMETRY_KEY_STORE_DIR";
+const KEYCHAIN_SERVICE_SWEEP_LIMIT: usize = 256;
 
 fn is_directory_not_empty(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENOTEMPTY)
@@ -86,6 +88,7 @@ pub struct TelemetryKeyStore {
 pub struct TelemetryKeySweepResult {
     pub removed: Vec<TelemetryKeyRef>,
     pub missing: Vec<TelemetryKeyRef>,
+    pub removed_unindexed_services: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -120,9 +123,12 @@ impl TelemetryKeyStore {
                 let _ = delete_keychain_secret(&reference.source, &reference.key_id);
                 return Err(error);
             }
+            self.prune_other_keys_for_source(&reference);
             return Ok(());
         }
-        self.save_file_secret(&reference, secret)
+        self.save_file_secret(&reference, secret)?;
+        self.prune_other_keys_for_source(&reference);
+        Ok(())
     }
 
     pub fn load(
@@ -169,6 +175,7 @@ impl TelemetryKeyStore {
         let mut result = TelemetryKeySweepResult {
             removed: Vec::new(),
             missing: Vec::new(),
+            removed_unindexed_services: Vec::new(),
             warnings: Vec::new(),
         };
         for reference in self.indexed_refs()? {
@@ -178,6 +185,19 @@ impl TelemetryKeyStore {
                 Err(error) => result
                     .warnings
                     .push(format!("failed to remove telemetry key: {error}")),
+            }
+        }
+        if self.keychain_enabled {
+            for service in telemetry_keychain_sweep_services() {
+                match delete_all_keychain_secrets_for_service(service) {
+                    Ok(0) => {}
+                    Ok(removed) => result
+                        .removed_unindexed_services
+                        .push(format!("{service}/* ({removed})")),
+                    Err(error) => result.warnings.push(format!(
+                        "failed to remove unindexed telemetry keychain items for {service}: {error}"
+                    )),
+                }
             }
         }
         for service in [
@@ -205,6 +225,17 @@ impl TelemetryKeyStore {
             )),
         }
         Ok(result)
+    }
+
+    fn prune_other_keys_for_source(&self, current: &TelemetryKeyRef) {
+        let Ok(references) = self.indexed_refs() else {
+            return;
+        };
+        for reference in references {
+            if reference.source == current.source && reference.key_id != current.key_id {
+                let _ = self.delete(&reference.source, &reference.key_id);
+            }
+        }
     }
 
     fn save_index_file(&self, reference: &TelemetryKeyRef) -> Result<(), TelemetryKeychainError> {
@@ -338,6 +369,14 @@ pub fn telemetry_key_service(source: &SourceKind) -> Result<&'static str, Teleme
         SourceKind::ClaudeCode => Ok(CLAUDE_CODE_TELEMETRY_KEY_SERVICE),
         SourceKind::Pi => Err(TelemetryKeychainError::UnsupportedSource(source.clone())),
     }
+}
+
+fn telemetry_keychain_sweep_services() -> [&'static str; 3] {
+    [
+        CODEX_TELEMETRY_KEY_SERVICE,
+        CLAUDE_CODE_TELEMETRY_KEY_SERVICE,
+        LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE,
+    ]
 }
 
 pub fn key_ref(
@@ -487,6 +526,42 @@ fn security_cli_delete_reports_missing(exit_code: Option<i32>, stderr: &[u8]) ->
     stderr.contains("could not be found") || stderr.contains("item not found")
 }
 
+#[cfg(target_os = "macos")]
+fn delete_all_keychain_secrets_for_service(service: &str) -> Result<usize, String> {
+    let mut removed = 0usize;
+    loop {
+        let output = std::process::Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-s", service])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            removed += 1;
+            if removed >= KEYCHAIN_SERVICE_SWEEP_LIMIT {
+                return Err(format!(
+                    "stopped after {removed} deletes; service still has matching items"
+                ));
+            }
+            continue;
+        }
+        if security_cli_delete_reports_missing(output.status.code(), &output.stderr) {
+            return Ok(removed);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if message.is_empty() {
+            format!("security exited with status {}", output.status)
+        } else {
+            message
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_all_keychain_secrets_for_service(_service: &str) -> Result<usize, String> {
+    Ok(0)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn delete_keychain_secret(
     _source: &SourceKind,
@@ -612,6 +687,18 @@ mod tests {
     }
 
     #[test]
+    fn keychain_uninstall_sweep_includes_legacy_device_secret_service() {
+        assert_eq!(
+            telemetry_keychain_sweep_services(),
+            [
+                CODEX_TELEMETRY_KEY_SERVICE,
+                CLAUDE_CODE_TELEMETRY_KEY_SERVICE,
+                LEGACY_TELEMETRY_DEVICE_SECRET_SERVICE,
+            ]
+        );
+    }
+
+    #[test]
     fn pi_is_not_a_keychain_telemetry_source() {
         assert!(matches!(
             telemetry_key_service(&SourceKind::Pi),
@@ -670,6 +757,22 @@ mod tests {
         assert_eq!(
             store.latest_key_id(&SourceKind::Codex).unwrap(),
             Some("key_002".to_string())
+        );
+        assert!(matches!(
+            store.load(&SourceKind::Codex, "key_001"),
+            Err(TelemetryKeychainError::Missing)
+        ));
+        assert_eq!(
+            store
+                .load(&SourceKind::Codex, "key_002")
+                .expect("load current"),
+            "otel_secret_2"
+        );
+        assert_eq!(
+            store
+                .load(&SourceKind::ClaudeCode, "key_999")
+                .expect("load other source"),
+            "otel_secret_3"
         );
     }
 
