@@ -611,8 +611,9 @@ def check_private_consumers() -> int:
     if frontend_control is not None:
         text = frontend_control.read_text(encoding="utf-8")
         expect(
-            "LOCAL_CONTROL_PROTOCOL_VERSION = 12" in text,
-            "private frontend local-control client must send protocol version 12",
+            "LOCAL_CONTROL_PROTOCOL_VERSION = 13" in text
+            or re.search(r"LOCAL_CONTROL_PROTOCOL_VERSIONS\s*=\s*\[\s*13\b", text) is not None,
+            "private frontend local-control client must send protocol version 13",
         )
         expect(
             'command: "telemetry_control"' in text,
