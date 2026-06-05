@@ -20,18 +20,19 @@ use ottto_core::{
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
-    AgentInstallationDetection, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
-    AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus,
-    DiagnosticsBundle, DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval,
-    DiagnosticsUploadAuthorization, DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner,
-    LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
-    LocalClientKind, LocalControlCommand, LocalControlRequest, LocalControlResponse,
-    MachineIdentity, RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel, RepairAction,
-    RepairActionApproval, RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus,
-    SecretString, ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
-    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
-    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    AgentContextQuery, AgentInstallationDetection, AgentStatusSnapshot, AuthCompleteResponse,
+    AuthResetResponse, AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult,
+    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
+    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
+    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
+    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
+    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
+    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
+    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
+    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -411,6 +412,7 @@ fn handle_command(
         LocalControlCommand::AgentStatusRefresh { source } => {
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
+        LocalControlCommand::AgentContext { query } => agent_context(daemon, &authorization, query),
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
@@ -569,6 +571,25 @@ fn account_for(
         RequestAuthorization::TrustedCompanionApp => daemon.account_for_trusted_client(),
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
+}
+
+fn agent_context(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    query: AgentContextQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let status = status_for(daemon, authorization)?;
+    if status.account.state != LocalAccountState::Connected {
+        return Err(LocalApiError::InvalidRequest(
+            "ottto context requires this Mac to be connected to Ottto".to_string(),
+        ));
+    }
+    let connection = daemon
+        .connection_for_authorized_client()?
+        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+    let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
+    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
+    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn require_authorized_local_client(
@@ -2727,6 +2748,40 @@ fn refresh_setup_run_token_via_device_secret(
         .save(&refreshed)
         .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(response.setup_run_token)
+}
+
+fn setup_run_token_for_connection(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+) -> Result<String, LocalApiError> {
+    match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
+        Ok(token) => Ok(token),
+        Err(_) => refresh_setup_run_token_via_device_secret(api_base_url, connection),
+    }
+}
+
+fn get_agent_context_with_refresh(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentContextQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    match get_agent_context_with_base(api_base_url, connection, setup_run_token, query) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
+                let refreshed_token =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                return get_agent_context_with_base(
+                    api_base_url,
+                    connection,
+                    &refreshed_token,
+                    query,
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 fn disconnect_setup_run_with_refresh(
@@ -6979,6 +7034,70 @@ fn get_setup_run_verification_with_base(
     backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
+fn get_agent_context_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentContextQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let url = agent_context_url(api_base_url, connection, query);
+    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+}
+
+fn agent_context_url(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    query: &AgentContextQuery,
+) -> String {
+    let url = api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/agent-context",
+            connection.setup_run_id
+        ),
+    );
+    let mut params = Vec::new();
+    if let Some(days) = query.days {
+        params.push(("days", days.to_string()));
+    }
+    push_non_empty_query(&mut params, "range", query.range.as_deref());
+    push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
+    push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
+    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
+    push_non_empty_query(&mut params, "source", query.source.as_deref());
+    push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
+    push_non_empty_query(
+        &mut params,
+        "source_plan_profile_id",
+        query.source_plan_profile_id.as_deref(),
+    );
+    if let Some(max_tokens) = query.max_tokens {
+        params.push(("max_tokens", max_tokens.to_string()));
+    }
+    if query.all_machines {
+        params.push(("all_machines", "true".to_string()));
+    }
+    if params.is_empty() {
+        return url;
+    }
+    let query_string = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", form_url_encode(key), form_url_encode(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{url}?{query_string}")
+}
+
+fn push_non_empty_query(
+    params: &mut Vec<(&'static str, String)>,
+    key: &'static str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        params.push((key, value.to_string()));
+    }
+}
+
 fn backend_post_json<T: DeserializeOwned>(
     url: &str,
     body: &impl Serialize,
@@ -7680,6 +7799,37 @@ mod tests {
         assert_eq!(
             validated_api_base_url(Some(DIRECT_API_BASE_URL)).expect("valid"),
             DIRECT_API_BASE_URL.to_string()
+        );
+    }
+
+    #[test]
+    fn agent_context_url_encodes_local_client_query() {
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_context".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+        let url = agent_context_url(
+            DIRECT_API_BASE_URL,
+            &connection,
+            &AgentContextQuery {
+                days: Some(14),
+                range: Some("last 7 days".to_string()),
+                start_date: Some("2026-06-01".to_string()),
+                end_date: Some("2026-06-05".to_string()),
+                timezone: Some("America/Los_Angeles".to_string()),
+                source: Some("claude_code".to_string()),
+                machine_id: Some("otm_test".to_string()),
+                source_plan_profile_id: Some("profile_123".to_string()),
+                max_tokens: Some(4000),
+                all_machines: true,
+            },
+        );
+
+        assert_eq!(
+            url,
+            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000&all_machines=true"
         );
     }
 

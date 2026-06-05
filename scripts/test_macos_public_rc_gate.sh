@@ -118,7 +118,7 @@ write_candidate_manifest() {
       commit: "abcdef123456",
       generated_at: "2026-05-21T00:00:00Z",
       min_supported_version: "0.1.0",
-      min_protocol_version: 11,
+      min_protocol_version: 12,
       supported_install_owners: ["hosted_installer", "app_bundle", "homebrew"],
       rollback: {
         strategy: "channel_latest_pointer",
@@ -240,7 +240,7 @@ write_stable_binding_manifest() {
       version: "0.1.0",
       channel: "stable",
       commit: $commit,
-      min_protocol_version: 11,
+      min_protocol_version: 12,
       quality_gates: {
         stable_candidate_rc: {
           status: "passed",
@@ -265,19 +265,19 @@ jq -e \
    and .local_platform.service_label == "net.ottto.service"
    and .local_platform.version == "0.1.0-stable-candidate.1"
    and .local_platform.release_channel == "stable-candidate"
-   and .local_platform.protocol_version == 11
+   and .local_platform.protocol_version == 12
    and .local_platform.release_manifest_sha256 == $candidate_sha' \
   "$template_evidence" >/dev/null
 expect_failure "unfilled template evidence" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$template_evidence"
 
 stale_protocol_manifest="$TMP_DIR/stale-protocol-stable-candidate-release-manifest.json"
-jq '.min_protocol_version = 10' "$candidate_manifest" > "$stale_protocol_manifest"
+jq '.min_protocol_version = 11' "$candidate_manifest" > "$stale_protocol_manifest"
 if "$TEMPLATE" --candidate-manifest "$stale_protocol_manifest" --output - >/tmp/macos-public-rc-template.out 2>&1; then
   echo "Expected stable-candidate RC template generation to reject stale protocol manifests" >&2
   exit 1
 fi
-grep -q "min_protocol_version must be 11" /tmp/macos-public-rc-template.out
+grep -q "min_protocol_version must be 12" /tmp/macos-public-rc-template.out
 
 passed_evidence="$TMP_DIR/stable-candidate-rc-qa.json"
 jq \
@@ -292,7 +292,7 @@ jq \
 
 expect_failure "stale protocol stable-candidate manifest rejected" \
   "$GATE" --candidate-manifest "$stale_protocol_manifest" --evidence "$passed_evidence"
-grep -q "stable-candidate manifest min_protocol_version must be 11" /tmp/macos-public-rc-gate.out
+grep -q "stable-candidate manifest min_protocol_version must be 12" /tmp/macos-public-rc-gate.out
 
 stable_binding="$TMP_DIR/stable-manifest.json"
 write_stable_binding_manifest \
@@ -306,13 +306,13 @@ write_stable_binding_manifest \
   --stable-manifest "$stable_binding" >/dev/null
 
 bad_stable_protocol="$TMP_DIR/bad-stable-protocol-manifest.json"
-jq '.min_protocol_version = 10' "$stable_binding" > "$bad_stable_protocol"
+jq '.min_protocol_version = 11' "$stable_binding" > "$bad_stable_protocol"
 expect_failure "stable binding stale protocol rejected" \
   "$GATE" \
   --candidate-manifest "$candidate_manifest" \
   --evidence "$passed_evidence" \
   --stable-manifest "$bad_stable_protocol"
-grep -q "stable manifest min_protocol_version must be 11" /tmp/macos-public-rc-gate.out
+grep -q "stable manifest min_protocol_version must be 12" /tmp/macos-public-rc-gate.out
 
 dev_manifest="$TMP_DIR/dev-release-manifest.json"
 write_candidate_manifest "dev" "$dev_manifest"
@@ -338,11 +338,11 @@ expect_failure "bad local-platform runtime" \
 grep -q "local_platform.runtime must be ottto-service" /tmp/macos-public-rc-gate.out
 
 bad_protocol_evidence="$TMP_DIR/bad-protocol-stable-candidate-rc-qa.json"
-jq '.local_platform.protocol_version = 10' \
+jq '.local_platform.protocol_version = 11' \
   "$passed_evidence" > "$bad_protocol_evidence"
 expect_failure "bad local-platform protocol" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$bad_protocol_evidence"
-grep -q "local_platform.protocol_version must be 11" /tmp/macos-public-rc-gate.out
+grep -q "local_platform.protocol_version must be 12" /tmp/macos-public-rc-gate.out
 
 bad_runtime_sha_evidence="$TMP_DIR/bad-runtime-sha-stable-candidate-rc-qa.json"
 jq '.local_platform.release_manifest_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \

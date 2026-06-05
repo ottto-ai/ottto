@@ -21,6 +21,11 @@ Every adapter must:
   monitors, or local source files
 - summarize redacted status facts instead of pasting raw diagnostics payloads
 
+Agents that need product context should call `ottto context --json` instead of
+parsing local session files or the human web UI. The command is intentionally
+JSON-only and returns backend-computed account, machine, subscription, usage,
+cost, and recommendation context through the connected local daemon.
+
 ## MCP Decision
 
 The MCP adapter is intentionally deferred for public v1. An MCP server can be

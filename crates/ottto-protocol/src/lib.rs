@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
@@ -1025,7 +1025,7 @@ pub struct SetupEvent {
     pub event_id: String,
     pub step: SetupStep,
     pub status: EventStatus,
-    pub source: Option<SourceKind>,
+    pub source: Option<String>,
     pub message: StableMessage,
     pub occurred_at: Rfc3339Timestamp,
     pub metadata: BTreeMap<String, RedactedValue>,
@@ -1458,6 +1458,30 @@ pub enum LocalClientKind {
     WebUi,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub all_machines: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalControlCommand {
@@ -1468,6 +1492,10 @@ pub enum LocalControlCommand {
     AuthStatus,
     AgentStatusRefresh {
         source: Option<SourceKind>,
+    },
+    AgentContext {
+        #[serde(default)]
+        query: AgentContextQuery,
     },
     AuthStart,
     AuthComplete {
@@ -1823,6 +1851,49 @@ mod tests {
                 source: SourceKind::Codex,
                 action_type: "install_source".to_string(),
                 api_base_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_context_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_context",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_context",
+            "query": {
+                "days": 14,
+                "range": "last_7_days",
+                "timezone": "America/New_York",
+                "source": "codex",
+                "machine_id": "otm_test",
+                "source_plan_profile_id": "018fe251-b6f3-7cc8-9f82-01a76449d111",
+                "max_tokens": 4000,
+                "all_machines": false
+            }
+        }))
+        .expect("agent context request");
+
+        assert_eq!(request.request_id, "req_agent_context");
+        assert_eq!(request.client_kind, Some(LocalClientKind::Cli));
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: None,
+                    end_date: None,
+                    timezone: Some("America/New_York".to_string()),
+                    source: Some("codex".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    max_tokens: Some(4000),
+                    all_machines: false,
+                }
             }
         );
     }
@@ -2209,9 +2280,9 @@ mod tests {
 
     #[test]
     fn diagnostics_collect_without_upload_fields_defaults_to_local_only() {
-        let request = serde_json::from_str::<LocalControlRequest>(
-            r#"{"request_id":"req_test","protocol_version":11,"command":"diagnostics_collect"}"#,
-        )
+        let request = serde_json::from_str::<LocalControlRequest>(&format!(
+            r#"{{"request_id":"req_test","protocol_version":{PROTOCOL_VERSION},"command":"diagnostics_collect"}}"#
+        ))
         .expect("current local-only diagnostics request should deserialize");
 
         assert_eq!(
@@ -2244,7 +2315,9 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported local control protocol_version 10"));
-        assert!(error.to_string().contains("expected 11"));
+        assert!(error
+            .to_string()
+            .contains(&format!("expected {PROTOCOL_VERSION}")));
     }
 
     #[test]
