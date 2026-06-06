@@ -510,6 +510,22 @@ impl LocalDaemon {
         Ok(())
     }
 
+    pub fn clear_setup_run_for_authorized_client_if_matches(
+        &self,
+        setup_run_id: &str,
+        api_base_url: &str,
+    ) -> Result<bool, LocalApiError> {
+        let mut state = self.state()?;
+        let Some(connection) = state.connection.as_ref() else {
+            return Ok(false);
+        };
+        if connection.setup_run_id != setup_run_id || connection.api_base_url != api_base_url {
+            return Ok(false);
+        }
+        state.connection = None;
+        Ok(true)
+    }
+
     pub fn record_verification_result(
         &self,
         result: &SourceVerificationResult,

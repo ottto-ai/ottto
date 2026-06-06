@@ -49,6 +49,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table};
@@ -68,6 +69,14 @@ const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
 #[cfg(target_os = "macos")]
 const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
+
+static SETUP_RUN_BINDING_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_setup_run_binding() -> MutexGuard<'static, ()> {
+    SETUP_RUN_BINDING_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LocalClientPeer {
@@ -1501,6 +1510,7 @@ fn complete_pending_auth_claim(
     pending: PendingAuthClaim,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
     let completed = complete_setup_claim(&pending, machine)?;
+    let _binding_lock = lock_setup_run_binding();
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -1571,6 +1581,7 @@ fn auth_reset(
     FileAccountStore::default()
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    let _binding_lock = lock_setup_run_binding();
     FileConnectionStore::default()
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -2423,6 +2434,7 @@ fn setup_run(
             claim_code: Some(code.to_string()),
             api_base_url: api_base_url.clone(),
         };
+        let _binding_lock = lock_setup_run_binding();
         KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
             .save(&attached.setup_run_token)
             .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -2443,7 +2455,15 @@ fn setup_run(
     let setup_run_token = setup_run_token.ok_or(LocalApiError::SetupRunConnectionMissing)?;
 
     let scan = build_local_scan(&status.machine, sources);
-    let mut detail = publish_scan_result(&api_base_url, &connection, &setup_run_token, &scan)?;
+    let mut detail = match publish_scan_result(&api_base_url, &connection, &setup_run_token, &scan)
+    {
+        Ok(detail) => detail,
+        Err(error) if is_terminal_setup_run_scan_error(&error) => {
+            clear_setup_run_connection_if_current(daemon, &connection, &setup_run_token)?;
+            return Err(LocalApiError::SetupRunConnectionMissing);
+        }
+        Err(error) => return Err(error),
+    };
     let action_results = process_setup_actions(
         daemon,
         &api_base_url,
@@ -2487,6 +2507,69 @@ fn setup_run(
         "next_action": detail.next_action,
         "actions": action_results,
     }))
+}
+
+fn clear_setup_run_connection_if_current(
+    daemon: &LocalDaemon,
+    failed_connection: &LocalConnectionBinding,
+    failed_setup_run_token: &str,
+) -> Result<(), LocalApiError> {
+    let _binding_lock = lock_setup_run_binding();
+    let store = FileConnectionStore::default();
+    let persisted = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    if persisted
+        .as_ref()
+        .is_some_and(|binding| setup_run_binding_matches(binding, failed_connection))
+    {
+        store.reset().map_err(|_| LocalApiError::StatePoisoned)?;
+        let current_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load();
+        if current_token
+            .as_deref()
+            .is_ok_and(|token| token == failed_setup_run_token)
+        {
+            let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
+        }
+    }
+    daemon.clear_setup_run_for_authorized_client_if_matches(
+        &failed_connection.setup_run_id,
+        &failed_connection.api_base_url,
+    )?;
+    Ok(())
+}
+
+fn setup_run_binding_matches(
+    current: &LocalConnectionBinding,
+    expected: &LocalConnectionBinding,
+) -> bool {
+    current.setup_run_id == expected.setup_run_id && current.api_base_url == expected.api_base_url
+}
+
+fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(details) = error else {
+        return false;
+    };
+    if !details.endpoint.contains("/api/v1/setup-runs/")
+        || !details.endpoint.contains("/local-client/scan-result")
+    {
+        return false;
+    }
+    if matches!(details.status, Some(404) | Some(410)) {
+        return true;
+    }
+    if !matches!(details.status, Some(401) | Some(403)) {
+        return false;
+    }
+    let body = details
+        .body_excerpt
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    body.contains("setup run cancelled")
+        || body.contains("setup_run_cancelled")
+        || body.contains("setup run expired")
+        || body.contains("setup_run_expired")
+        || body.contains("setup run missing")
+        || body.contains("setup run not found")
 }
 
 fn setup_answer(
@@ -2793,6 +2876,7 @@ fn refresh_setup_run_token_via_device_secret(
         "device_secret": device_secret,
     });
     let response: SetupRunRefreshResponse = backend_post_json(&url, &body, &[])?;
+    let _binding_lock = lock_setup_run_binding();
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&response.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -10502,6 +10586,131 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn setup_clears_cancelled_binding_before_requiring_fresh_claim() {
+        let _lock = lock_backend_test_env();
+        let support_root = control_test_root("setup-cancelled-binding");
+        let secret_root = telemetry_key_store_root("setup-cancelled-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        fs::write(
+            secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
+            "otsr_stale",
+        )
+        .expect("setup-run token");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_cancelled".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: setup_run_cancelled_scan_server(),
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let response = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_setup_cancelled".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Setup {
+                    sources: vec![SourceKind::Codex],
+                    claim_code: None,
+                    setup_run_id: None,
+                    api_base_url: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::NeedsUserAction);
+        assert!(error.message.contains("Setup needs browser approval"));
+        assert_eq!(
+            daemon
+                .connection_for_authorized_client()
+                .expect("load connection"),
+            None
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load persisted connection"),
+            None
+        );
+        assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(!secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).exists());
+    }
+
+    #[test]
+    #[serial]
+    fn setup_cancelled_cleanup_preserves_newer_binding_and_token() {
+        let _lock = lock_backend_test_env();
+        let support_root = control_test_root("setup-cancelled-race");
+        let secret_root = telemetry_key_store_root("setup-cancelled-race-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let stale = LocalConnectionBinding {
+            setup_run_id: "setup_cancelled".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: "https://api.ottto.net".to_string(),
+        };
+        let fresh = LocalConnectionBinding {
+            setup_run_id: "setup_fresh".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:35:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some("claim_fresh".to_string()),
+            api_base_url: "https://api.ottto.net".to_string(),
+        };
+        FileConnectionStore::default()
+            .save(&fresh)
+            .expect("persist fresh binding");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_fresh")
+            .expect("persist fresh token");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(fresh.clone()));
+
+        clear_setup_run_connection_if_current(&daemon, &stale, "otsr_stale")
+            .expect("conditional clear");
+
+        assert_eq!(
+            daemon
+                .connection_for_authorized_client()
+                .expect("load daemon connection"),
+            Some(fresh.clone())
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load persisted connection"),
+            Some(fresh)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load setup token"),
+            "otsr_fresh"
+        );
+    }
+
+    #[test]
     fn setup_timeout_maps_to_timed_out_exit_code() {
         let error = cli_error(LocalApiError::TimedOut(
             "setup wait reached timeout".to_string(),
@@ -10511,6 +10720,25 @@ log_user_prompt = true
         assert_eq!(error.code.exit_code(), 61);
         assert!(error.retryable);
         assert!(error.message.contains("Timed out waiting for setup"));
+    }
+
+    fn setup_run_cancelled_scan_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept setup scan");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.contains("/api/v1/setup-runs/setup_cancelled/local-client/scan-result"));
+            let body = r#"{"error":"HTTPException","detail":"Setup run cancelled","request_id":"req_test"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write setup cancellation");
+        });
+        format!("http://{address}")
     }
 
     fn control_token_validation_server(status: u16) -> String {
