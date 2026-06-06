@@ -2568,6 +2568,8 @@ fn is_terminal_setup_run_scan_error(error: &LocalApiError) -> bool {
         || body.contains("setup_run_cancelled")
         || body.contains("setup run expired")
         || body.contains("setup_run_expired")
+        || body.contains("setup run companion token expired")
+        || body.contains("setup_run_companion_token_expired")
         || body.contains("setup run missing")
         || body.contains("setup run not found")
 }
@@ -10655,6 +10657,77 @@ log_user_prompt = true
 
     #[test]
     #[serial]
+    fn setup_clears_companion_token_expired_binding_before_requiring_fresh_claim() {
+        let _lock = lock_backend_test_env();
+        let support_root = control_test_root("setup-token-expired-binding");
+        let secret_root = telemetry_key_store_root("setup-token-expired-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        fs::write(
+            secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
+            "otsr_stale",
+        )
+        .expect("setup-run token");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_token_expired".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: setup_run_terminal_scan_server(
+                "setup_token_expired",
+                "Setup run companion token expired",
+            ),
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let response = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_setup_token_expired".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Setup {
+                    sources: vec![SourceKind::Codex],
+                    claim_code: None,
+                    setup_run_id: None,
+                    api_base_url: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::NeedsUserAction);
+        assert!(error.message.contains("Setup needs browser approval"));
+        assert_eq!(
+            daemon
+                .connection_for_authorized_client()
+                .expect("load connection"),
+            None
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load persisted connection"),
+            None
+        );
+        assert!(KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .load()
+            .is_err());
+        assert!(!secret_root.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).exists());
+    }
+
+    #[test]
+    #[serial]
     fn setup_cancelled_cleanup_preserves_newer_binding_and_token() {
         let _lock = lock_backend_test_env();
         let support_root = control_test_root("setup-cancelled-race");
@@ -10723,13 +10796,21 @@ log_user_prompt = true
     }
 
     fn setup_run_cancelled_scan_server() -> String {
+        setup_run_terminal_scan_server("setup_cancelled", "Setup run cancelled")
+    }
+
+    fn setup_run_terminal_scan_server(setup_run_id: &'static str, detail: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept setup scan");
             let request = read_complete_http_request(&mut stream);
-            assert!(request.contains("/api/v1/setup-runs/setup_cancelled/local-client/scan-result"));
-            let body = r#"{"error":"HTTPException","detail":"Setup run cancelled","request_id":"req_test"}"#;
+            assert!(request.contains(&format!(
+                "/api/v1/setup-runs/{setup_run_id}/local-client/scan-result"
+            )));
+            let body = format!(
+                r#"{{"error":"HTTPException","detail":"{detail}","request_id":"req_test"}}"#
+            );
             let response = format!(
                 "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
