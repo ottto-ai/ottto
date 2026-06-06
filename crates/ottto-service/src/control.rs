@@ -2456,6 +2456,7 @@ fn setup_run(
             detail = refreshed.clone();
         }
     }
+    request_snapshot_sync_after_setup_actions(daemon, &action_results);
 
     let source_count = detail
         .sources
@@ -2571,6 +2572,7 @@ fn setup_action(
         &setup_run_token,
         &status.machine,
     )?;
+    request_snapshot_sync_after_setup_actions(daemon, &action_results);
     let detail = action_results
         .last()
         .and_then(|result| result.detail.clone())
@@ -2653,6 +2655,24 @@ struct SetupActionResult {
     source: Option<String>,
     status: String,
     detail: Option<SetupRunDetailApiResponse>,
+}
+
+fn request_snapshot_sync_after_setup_actions(
+    daemon: &LocalDaemon,
+    action_results: &[SetupActionResult],
+) {
+    let registered_device = action_results.iter().any(|result| {
+        result.action_type == "install_source"
+            && result.status == "succeeded"
+            && result
+                .source
+                .as_deref()
+                .and_then(source_from_slug)
+                .is_some_and(|source| source_requires_device_registration(&source))
+    });
+    if registered_device {
+        request_snapshot_sync_after_device_registration(daemon);
+    }
 }
 
 fn setup_result_from_detail(
@@ -3491,6 +3511,15 @@ fn run_install_source_action(
             patch.changed,
         ),
     ))
+}
+
+fn request_snapshot_sync_after_device_registration(daemon: &LocalDaemon) {
+    if let Err(error) = crate::snapshot_sync::spawn_one_shot_local_snapshot_sync(daemon.clone()) {
+        eprintln!(
+            "local snapshot sync after setup unavailable: {}",
+            crate::snapshot_sync::safe_error(&error)
+        );
+    }
 }
 
 fn source_requires_device_registration(source_kind: &SourceKind) -> bool {
