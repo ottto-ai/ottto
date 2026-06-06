@@ -20,6 +20,7 @@ use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
@@ -27,6 +28,7 @@ const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 const SNAPSHOT_BATCH_LIMIT: usize = 100;
+static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
@@ -92,6 +94,52 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
         })
         .context("spawn local snapshot sync")?;
     Ok(())
+}
+
+pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
+    let home = home_dir()?;
+    let support_dir = default_support_dir();
+    if !claim_one_shot_sync_slot() {
+        return Ok(());
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("ottto-snapshot-sync-now".to_string())
+        .spawn(move || {
+            if let Err(error) = sync_once(&home, &support_dir, &daemon) {
+                eprintln!(
+                    "local snapshot sync after setup skipped: {}",
+                    safe_error(&error)
+                );
+            }
+            set_one_shot_sync_in_flight(false);
+        });
+    if let Err(error) = spawn_result {
+        set_one_shot_sync_in_flight(false);
+        return Err(error).context("spawn immediate local snapshot sync");
+    }
+    Ok(())
+}
+
+fn claim_one_shot_sync_slot() -> bool {
+    let lock = ONE_SHOT_SYNC_IN_FLIGHT.get_or_init(|| Mutex::new(false));
+    match lock.lock() {
+        Ok(mut in_flight) => {
+            if *in_flight {
+                false
+            } else {
+                *in_flight = true;
+                true
+            }
+        }
+        Err(_) => true,
+    }
+}
+
+fn set_one_shot_sync_in_flight(value: bool) {
+    let lock = ONE_SHOT_SYNC_IN_FLIGHT.get_or_init(|| Mutex::new(false));
+    if let Ok(mut in_flight) = lock.lock() {
+        *in_flight = value;
+    }
 }
 
 fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
@@ -715,6 +763,18 @@ mod tests {
             enabled_snapshot_sources(&device),
             vec![SnapshotSource::ClaudeCode]
         );
+    }
+
+    #[test]
+    fn one_shot_sync_slot_is_single_flight() {
+        set_one_shot_sync_in_flight(false);
+
+        assert!(claim_one_shot_sync_slot());
+        assert!(!claim_one_shot_sync_slot());
+
+        set_one_shot_sync_in_flight(false);
+        assert!(claim_one_shot_sync_slot());
+        set_one_shot_sync_in_flight(false);
     }
 
     #[test]
