@@ -3255,6 +3255,10 @@ fn run_install_source_action(
     KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
         .save(&registered.device_secret)
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    // The local device binding + secret are now durable. Wake the snapshot
+    // collector before any backend completion/event call that can transiently
+    // fail after registration has already succeeded.
+    request_snapshot_sync_after_device_registration(daemon);
     record_install_session_event(
         api_base_url,
         &install_session.install_session_id,
