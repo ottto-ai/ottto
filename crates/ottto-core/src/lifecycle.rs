@@ -315,6 +315,14 @@ fn uninstall_cleanup_targets(home: &Path) -> Vec<CleanupTarget> {
             kind: CleanupTargetKind::Directory,
         },
         CleanupTarget {
+            path: PathBuf::from("/Applications").join("Ottto.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
+            path: PathBuf::from("/Applications").join("Ottto Companion.app"),
+            kind: CleanupTargetKind::Directory,
+        },
+        CleanupTarget {
             path: home
                 .join("Library")
                 .join("Application Support")
@@ -579,6 +587,8 @@ mod tests {
                 "/Users/test/Library/LaunchAgents/net.ottto.locald.plist",
                 "/Users/test/Applications/Ottto.app",
                 "/Users/test/Applications/Ottto Companion.app",
+                "/Applications/Ottto.app",
+                "/Applications/Ottto Companion.app",
                 "/Users/test/Library/Application Support/Ottto",
                 "/Users/test/Library/Logs/Ottto",
                 "/Users/test/.ottto",
