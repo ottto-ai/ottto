@@ -81,7 +81,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PUBLIC_PROTOCOL_VERSION = 13
+PUBLIC_PROTOCOL_VERSION = 14
 PUBLIC_ROOT = Path(sys.argv[1]).resolve()
 PRIVATE_REPO_ROOT = Path(sys.argv[2]).resolve() if sys.argv[2] else None
 PRIVATE_RUNTIME_PIN_ARG = sys.argv[3]
@@ -611,9 +611,9 @@ def check_private_consumers() -> int:
     if frontend_control is not None:
         text = frontend_control.read_text(encoding="utf-8")
         expect(
-            "LOCAL_CONTROL_PROTOCOL_VERSION = 13" in text
-            or re.search(r"LOCAL_CONTROL_PROTOCOL_VERSIONS\s*=\s*\[\s*13\b", text) is not None,
-            "private frontend local-control client must send protocol version 13",
+            "LOCAL_CONTROL_PROTOCOL_VERSION = 14" in text
+            or re.search(r"LOCAL_CONTROL_PROTOCOL_VERSIONS\s*=\s*\[\s*14\b", text) is not None,
+            "private frontend local-control client must send protocol version 14",
         )
         expect(
             'command: "telemetry_control"' in text,

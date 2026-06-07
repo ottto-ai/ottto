@@ -125,7 +125,7 @@ matches the stable manifest commit. The stable-candidate manifest must mark
 every macOS artifact as signed, notarized, and Gatekeeper-assessed, and the
 evidence must include passed `artifact_signatures`, `notarization`, and
 `gatekeeper_assessment` checks. It must also bind the exercised local runtime to
-`ottto-service`, `net.ottto.service`, protocol v13, the stable-candidate
+`ottto-service`, `net.ottto.service`, protocol v14, the stable-candidate
 version/channel, and the candidate release-manifest SHA-256. The evidence must
 not include private repo paths, local user paths, raw claim/setup tokens,
 account or machine identifiers, passwords, API keys, or bearer credentials.
@@ -157,7 +157,7 @@ macos_stable_qa_evidence_template.sh \
 
 The template binds the exact manifest SHA-256, adds each required owner, and
 records the expected local-runtime binding for `ottto-service`,
-`net.ottto.service`, protocol v13, stable version/channel, install owner, and
+`net.ottto.service`, protocol v14, stable version/channel, install owner, and
 release-manifest SHA-256. It leaves every owner check as `not_run`. Fill those
 values with real clean-machine pass/fail facts; do not paste raw terminal
 output or local identifiers into the evidence file. Then run:

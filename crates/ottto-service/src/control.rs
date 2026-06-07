@@ -20,19 +20,19 @@ use ottto_core::{
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentInstallationDetection, AgentStatusSnapshot, AuthCompleteResponse,
-    AuthResetResponse, AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult,
-    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
-    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
-    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
-    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
-    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
-    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
-    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
-    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
-    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentSessionsQuery,
+    AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse, AuthStartResponse, CliError,
+    CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
+    DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
+    DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
+    LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
+    LocalControlCommand, LocalControlRequest, LocalControlResponse, MachineIdentity, RedactedValue,
+    RelayRuntimeState, RelayState, ReleaseChannel, RepairAction, RepairActionApproval,
+    RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus, SecretString,
+    ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
+    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
+    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
+    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -423,6 +423,10 @@ fn handle_command(
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
         LocalControlCommand::AgentContext { query } => agent_context(daemon, &authorization, query),
+        LocalControlCommand::AgentCosts { query } => agent_costs(daemon, &authorization, query),
+        LocalControlCommand::AgentSessions { query } => {
+            agent_sessions(daemon, &authorization, query)
+        }
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
@@ -591,18 +595,48 @@ fn agent_context(
     authorization: &RequestAuthorization,
     query: AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto context")?;
+    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+fn agent_costs(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    query: AgentCostsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto costs")?;
+    get_agent_costs_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+fn agent_sessions(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    query: AgentSessionsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
+    get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+fn setup_run_agent_read_context(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    command: &str,
+) -> Result<(String, LocalConnectionBinding, String), LocalApiError> {
     let status = status_for(daemon, authorization)?;
     if status.account.state != LocalAccountState::Connected {
-        return Err(LocalApiError::InvalidRequest(
-            "ottto context requires this Mac to be connected to Ottto".to_string(),
-        ));
+        return Err(LocalApiError::InvalidRequest(format!(
+            "{command} requires this Mac to be connected to Ottto"
+        )));
     }
     let connection = daemon
         .connection_for_authorized_client()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
     let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
-    get_agent_context_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+    Ok((api_base_url, connection, setup_run_token))
 }
 
 fn require_authorized_local_client(
@@ -2917,6 +2951,54 @@ fn get_agent_context_with_refresh(
                 let refreshed_token =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_context_with_base(
+                    api_base_url,
+                    connection,
+                    &refreshed_token,
+                    query,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn get_agent_costs_with_refresh(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentCostsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    match get_agent_costs_with_base(api_base_url, connection, setup_run_token, query) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
+                let refreshed_token =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                return get_agent_costs_with_base(
+                    api_base_url,
+                    connection,
+                    &refreshed_token,
+                    query,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn get_agent_sessions_with_refresh(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentSessionsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    match get_agent_sessions_with_base(api_base_url, connection, setup_run_token, query) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
+                let refreshed_token =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                return get_agent_sessions_with_base(
                     api_base_url,
                     connection,
                     &refreshed_token,
@@ -7334,6 +7416,26 @@ fn get_agent_context_with_base(
     backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
+fn get_agent_costs_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentCostsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let url = agent_costs_url(api_base_url, connection, query);
+    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+}
+
+fn get_agent_sessions_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentSessionsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let url = agent_sessions_url(api_base_url, connection, query);
+    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+}
+
 fn agent_context_url(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
@@ -7367,6 +7469,103 @@ fn agent_context_url(
     if query.all_machines {
         params.push(("all_machines", "true".to_string()));
     }
+    if params.is_empty() {
+        return url;
+    }
+    let query_string = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", form_url_encode(key), form_url_encode(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{url}?{query_string}")
+}
+
+fn agent_costs_url(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    query: &AgentCostsQuery,
+) -> String {
+    let url = api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/costs",
+            connection.setup_run_id
+        ),
+    );
+    let mut params = Vec::new();
+    if let Some(days) = query.days {
+        params.push(("days", days.to_string()));
+    }
+    push_non_empty_query(&mut params, "range", query.range.as_deref());
+    push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
+    push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
+    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
+    push_non_empty_query(&mut params, "source", query.source.as_deref());
+    push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
+    push_non_empty_query(
+        &mut params,
+        "source_plan_profile_id",
+        query.source_plan_profile_id.as_deref(),
+    );
+    push_non_empty_query(&mut params, "bucket", query.bucket.as_deref());
+    push_non_empty_query(&mut params, "mode", query.mode.as_deref());
+    if query.all_machines {
+        params.push(("all_machines", "true".to_string()));
+    }
+    url_with_query_params(url, params)
+}
+
+fn agent_sessions_url(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    query: &AgentSessionsQuery,
+) -> String {
+    let url = api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/sessions",
+            connection.setup_run_id
+        ),
+    );
+    let mut params = Vec::new();
+    if let Some(limit) = query.limit {
+        params.push(("limit", limit.to_string()));
+    }
+    push_non_empty_query(&mut params, "cursor", query.cursor.as_deref());
+    push_non_empty_query(&mut params, "range", query.range.as_deref());
+    push_non_empty_query(&mut params, "start_date", query.start_date.as_deref());
+    push_non_empty_query(&mut params, "end_date", query.end_date.as_deref());
+    push_non_empty_query(&mut params, "timezone", query.timezone.as_deref());
+    push_non_empty_query(&mut params, "source", query.source.as_deref());
+    push_non_empty_query(&mut params, "model", query.model.as_deref());
+    push_non_empty_query(
+        &mut params,
+        "billing_provider",
+        query.billing_provider.as_deref(),
+    );
+    push_non_empty_query(
+        &mut params,
+        "billing_channel",
+        query.billing_channel.as_deref(),
+    );
+    push_non_empty_query(&mut params, "machine_id", query.machine_id.as_deref());
+    push_non_empty_query(
+        &mut params,
+        "source_plan_profile_id",
+        query.source_plan_profile_id.as_deref(),
+    );
+    push_non_empty_query(&mut params, "min_cost", query.min_cost.as_deref());
+    push_non_empty_query(&mut params, "max_cost", query.max_cost.as_deref());
+    push_non_empty_query(&mut params, "sort_by", query.sort_by.as_deref());
+    push_non_empty_query(&mut params, "sort_dir", query.sort_dir.as_deref());
+    push_non_empty_query(&mut params, "search", query.search.as_deref());
+    if query.all_machines {
+        params.push(("all_machines", "true".to_string()));
+    }
+    url_with_query_params(url, params)
+}
+
+fn url_with_query_params(url: String, params: Vec<(&'static str, String)>) -> String {
     if params.is_empty() {
         return url;
     }
@@ -8126,13 +8325,86 @@ mod tests {
                 machine_id: Some("otm_test".to_string()),
                 source_plan_profile_id: Some("profile_123".to_string()),
                 max_tokens: Some(4000),
-                all_machines: true,
+                all_machines: false,
             },
         );
 
         assert_eq!(
             url,
-            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000&all_machines=true"
+            "https://api.ottto.net/api/v1/setup-runs/setup_context/local-client/agent-context?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=claude_code&machine_id=otm_test&source_plan_profile_id=profile_123&max_tokens=4000"
+        );
+    }
+
+    #[test]
+    fn agent_costs_url_encodes_local_client_query() {
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_costs".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+        let url = agent_costs_url(
+            DIRECT_API_BASE_URL,
+            &connection,
+            &AgentCostsQuery {
+                days: Some(14),
+                range: Some("last 7 days".to_string()),
+                start_date: Some("2026-06-01".to_string()),
+                end_date: Some("2026-06-05".to_string()),
+                timezone: Some("America/Los_Angeles".to_string()),
+                source: Some("vertex".to_string()),
+                machine_id: Some("otm_test".to_string()),
+                source_plan_profile_id: Some("profile_123".to_string()),
+                bucket: Some("day".to_string()),
+                mode: Some("full".to_string()),
+                all_machines: false,
+            },
+        );
+
+        assert_eq!(
+            url,
+            "https://api.ottto.net/api/v1/setup-runs/setup_costs/local-client/costs?days=14&range=last+7+days&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=vertex&machine_id=otm_test&source_plan_profile_id=profile_123&bucket=day&mode=full"
+        );
+    }
+
+    #[test]
+    fn agent_sessions_url_encodes_local_client_query() {
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_sessions".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+        let url = agent_sessions_url(
+            DIRECT_API_BASE_URL,
+            &connection,
+            &AgentSessionsQuery {
+                limit: Some(25),
+                cursor: Some("next 123".to_string()),
+                range: Some("today".to_string()),
+                start_date: Some("2026-06-01".to_string()),
+                end_date: Some("2026-06-05".to_string()),
+                timezone: Some("America/Los_Angeles".to_string()),
+                source: Some("codex".to_string()),
+                model: Some("gpt-5.3 codex".to_string()),
+                billing_provider: Some("openai".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                machine_id: Some("otm_test".to_string()),
+                source_plan_profile_id: Some("profile_123".to_string()),
+                min_cost: Some("1.25".to_string()),
+                max_cost: Some("7.5".to_string()),
+                sort_by: Some("cost".to_string()),
+                sort_dir: Some("desc".to_string()),
+                search: Some("roadmap review".to_string()),
+                all_machines: false,
+            },
+        );
+
+        assert_eq!(
+            url,
+            "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
         );
     }
 

@@ -20,11 +20,16 @@ action.
 ottto context --json
 ottto context --json --range today --source codex
 ottto context --json --all-machines --max-tokens 4000
+ottto costs --json --range today --source codex
+ottto costs --json --all-machines --bucket day
+ottto sessions --json --limit 20 --source codex
+ottto sessions --json --all-machines --sort-by cost --sort-dir desc
 ```
 
-Use `context` only as a machine-readable agent surface. It returns cloud context
-from Ottto through the local daemon and requires this Mac to be connected.
-`--app codex|claude-code|pi` is available as a local app alias, while `--source`
+Use `context`, `costs`, and `sessions` only as machine-readable agent surfaces.
+They return backend-computed context, cost breakdowns, and session lists through
+the local daemon and require this Mac to be connected. `--app
+codex|claude-code|pi` is available as a local app alias, while `--source`
 accepts backend source slugs for local, API, and cloud-provider data.
 
 ## Headless Setup
