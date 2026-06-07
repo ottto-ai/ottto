@@ -315,6 +315,10 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
         return handle_control_request(&mut stream, &daemon, request);
     }
 
+    if request.path == "/whoami" {
+        return handle_whoami_request(&mut stream, &daemon, request);
+    }
+
     if request.method == "GET" && request.path == "/healthz" {
         return write_json_response(&mut stream, 200, relay_health_payload(source));
     }
@@ -411,11 +415,74 @@ fn handle_control_request(
     write_json_response_with_headers(stream, 200, serde_json::to_value(response)?, &cors_headers)
 }
 
+/// CORS-gated loopback identity probe. Lets an ottto.net page running on THIS
+/// machine learn which workspace machine it is on (stable, per-browser), instead
+/// of inferring it from workspace-wide "most recent companion" heuristics.
+/// Returns identity only (machine_id + display_name); never `hardware_uuid`.
+fn handle_whoami_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if let Some(origin) = origin {
+        if !is_allowed_control_origin(origin) {
+            return write_json_response(
+                stream,
+                403,
+                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto identity"}),
+            );
+        }
+    }
+    let cors_headers = cors_headers(origin, "GET, OPTIONS");
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "GET" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local identity endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    match daemon.machine_for_trusted_client() {
+        Ok(machine) => write_json_response_with_headers(
+            stream,
+            200,
+            json!({
+                "machine_id": machine.machine_id,
+                "machine_name": machine.display_name,
+            }),
+            &cors_headers,
+        ),
+        Err(_) => write_json_response_with_headers(
+            stream,
+            503,
+            json!({"error":"unavailable","message":"Machine identity is not available"}),
+            &cors_headers,
+        ),
+    }
+}
+
 fn control_cors_headers(origin: Option<&str>) -> Vec<(String, String)> {
+    cors_headers(origin, "POST, OPTIONS")
+}
+
+fn cors_headers(origin: Option<&str>, allow_methods: &str) -> Vec<(String, String)> {
     let mut headers = vec![
         (
             "Access-Control-Allow-Methods".to_string(),
-            "POST, OPTIONS".to_string(),
+            allow_methods.to_string(),
         ),
         (
             "Access-Control-Allow-Headers".to_string(),

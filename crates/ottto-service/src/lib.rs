@@ -304,6 +304,13 @@ impl LocalDaemon {
         Ok(state.account.clone())
     }
 
+    /// This machine's identity, for the local loopback `/whoami` probe. Exposes
+    /// only non-sensitive identity (callers must not leak `hardware_uuid`).
+    pub fn machine_for_trusted_client(&self) -> Result<MachineIdentity, LocalApiError> {
+        let state = self.state()?;
+        Ok(state.machine.clone())
+    }
+
     fn status_for_authorized_client(&self) -> Result<DaemonStatus, LocalApiError> {
         let state = self.state()?;
         Ok(status_from_state(&state))
