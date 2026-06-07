@@ -12,6 +12,7 @@ use std::time::Duration;
 const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The backend rejected a snapshot batch with an HTTP 4xx. This is almost
@@ -133,6 +134,7 @@ struct RelayTokenResponse {
 pub struct SnapshotApiClient {
     api_base_url: String,
     agent: ureq::Agent,
+    batch_agent: ureq::Agent,
 }
 
 impl SnapshotApiClient {
@@ -140,14 +142,16 @@ impl SnapshotApiClient {
         Self {
             api_base_url: std::env::var("OTTTO_API_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
-            agent: timeout_agent(),
+            agent: timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
+            batch_agent: timeout_agent(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT),
         }
     }
 
     pub fn new(api_base_url: impl Into<String>) -> Self {
         Self {
             api_base_url: api_base_url.into(),
-            agent: timeout_agent(),
+            agent: timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
+            batch_agent: timeout_agent(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT),
         }
     }
 
@@ -190,7 +194,7 @@ impl SnapshotApiClient {
         request: &SnapshotBatchRequest,
     ) -> Result<SnapshotBatchResponse> {
         match self
-            .agent
+            .batch_agent
             .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
@@ -246,10 +250,10 @@ impl SnapshotApiClient {
     }
 }
 
-fn timeout_agent() -> ureq::Agent {
+fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
-        .timeout_read(SNAPSHOT_HTTP_READ_TIMEOUT)
+        .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
         .build()
 }
@@ -298,6 +302,15 @@ mod tests {
             client.api_url("/api/v1/agent-status/snapshots"),
             "https://ottto.test/backend/api/v1/agent-status/snapshots"
         );
+    }
+
+    #[test]
+    fn snapshot_batch_timeout_covers_initial_backfill_reconciliation() {
+        // Initial backfills can synchronously reconcile many historical
+        // sessions. Keep the longer read window scoped to batch uploads so
+        // health/status calls still fail quickly when production is unhealthy.
+        assert!(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT >= Duration::from_secs(120));
+        assert!(SNAPSHOT_HTTP_READ_TIMEOUT <= Duration::from_secs(15));
     }
 
     #[test]
