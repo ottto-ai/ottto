@@ -265,6 +265,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         snapshot.status = AgentStatusState::Available;
     }
     append_current_plan_observation(&mut snapshot);
+    append_codex_workspace_observations(&mut snapshot);
     snapshot.runtime_defaults = build_codex_runtime_defaults(&snapshot.captured_at);
     snapshot
 }
@@ -650,6 +651,35 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
     }
 }
 
+fn append_codex_workspace_observations(snapshot: &mut AgentStatusSnapshot) {
+    let Some(credentials) = read_codex_auth_credentials() else {
+        return;
+    };
+    let Some(token) = credentials.id_token.as_deref() else {
+        return;
+    };
+    let Some(observations) = codex_workspace_observations_from_id_token(
+        token,
+        &snapshot.captured_at,
+        snapshot
+            .model
+            .as_ref()
+            .and_then(|model| model.provider.clone())
+            .as_deref(),
+    ) else {
+        return;
+    };
+    if observations.is_empty() {
+        return;
+    }
+    snapshot.plan_observations.extend(observations);
+    snapshot.diagnostics.push(AgentStatusDiagnostic {
+        code: "codex_workspace_memberships_detected".to_string(),
+        severity: AgentDiagnosticSeverity::Info,
+        message: "Codex ID token includes additional OpenAI workspaces; plan is shown only when the token explicitly claims it.".to_string(),
+    });
+}
+
 fn collection_method_key(method: &AgentStatusCollectionMethod) -> &'static str {
     match method {
         AgentStatusCollectionMethod::AppServer => "app_server",
@@ -836,6 +866,10 @@ fn read_codex_auth_credentials() -> Option<CodexAuthCredentials> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
     let account_id = first_json_string(&json, &["account_id", "chatgpt_account_id"])
+        .or_else(|| {
+            json.get("tokens")
+                .and_then(|tokens| first_json_string(tokens, &["account_id", "chatgpt_account_id"]))
+        })
         .or_else(|| id_token.as_deref().and_then(codex_account_id_from_id_token));
     if access_token.is_none() && id_token.is_none() {
         return None;
@@ -1036,27 +1070,149 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     }]
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CodexOrganization {
     id: Option<String>,
     label: Option<String>,
+    is_default: bool,
+    plan_type: Option<String>,
 }
 
 fn default_codex_organization(value: &Value) -> Option<CodexOrganization> {
-    let organizations = value.get("organizations")?.as_array()?;
-    let selected = organizations
+    let organizations = codex_organizations(value);
+    organizations
         .iter()
-        .find(|organization| {
-            organization
-                .get("is_default")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+        .find(|organization| organization.is_default)
+        .cloned()
+        .or_else(|| organizations.into_iter().next())
+}
+
+fn codex_workspace_observations_from_id_token(
+    token: &str,
+    observed_at: &str,
+    model_provider: Option<&str>,
+) -> Option<Vec<AgentStatusPlanObservation>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let auth_claim = claims.get("https://api.openai.com/auth")?;
+    let email = first_json_string(&claims, &["email"]);
+    let account_id = first_json_string(
+        auth_claim,
+        &["chatgpt_account_id", "chatgpt_user_id", "user_id"],
+    )
+    .or_else(|| first_json_string(&claims, &["sub"]));
+    let account_identifier_hash = account_id
+        .as_deref()
+        .and_then(|value| billing_identity_hash("openai", "account", value));
+    Some(
+        codex_organizations(auth_claim)
+            .into_iter()
+            .filter(|organization| !organization.is_default)
+            .filter(|organization| organization.id.is_some() || organization.label.is_some())
+            .map(|organization| {
+                let subscription_product = organization
+                    .plan_type
+                    .clone()
+                    .map(chatgpt_subscription_product);
+                let billing_channel = if subscription_product.is_some() {
+                    "subscription"
+                } else {
+                    "workspace_membership"
+                };
+                let subscription_identity_hash = if subscription_product.is_some() {
+                    account_identifier_hash.clone()
+                } else {
+                    None
+                };
+                let account_id = if subscription_product.is_some() {
+                    account_id.clone()
+                } else {
+                    None
+                };
+                let organization_id = if subscription_product.is_some() {
+                    organization.id
+                } else {
+                    None
+                };
+                AgentStatusPlanObservation {
+                    observed_at: Some(observed_at.to_string()),
+                    evidence_method: Some("id_token_organization".to_string()),
+                    source_session_id: None,
+                    provider: Some("openai".to_string()),
+                    billing_provider: Some("openai".to_string()),
+                    model_provider: model_provider.map(ToString::to_string),
+                    billing_channel: Some(billing_channel.to_string()),
+                    auth_mode: Some("oauth".to_string()),
+                    gateway_provider: None,
+                    subscription_product,
+                    plan_type: organization.plan_type,
+                    account_label: email.clone(),
+                    account_id,
+                    organization_label: organization.label,
+                    organization_id,
+                    // Do not emit organization hashes for plan-unknown
+                    // memberships. The local app can show the workspace label,
+                    // while backend redaction stores the observation without
+                    // materializing a misleading subscription profile.
+                    account_identifier_hash: subscription_identity_hash.clone(),
+                    organization_identifier_hash: None,
+                    credential_fingerprint_hash: None,
+                    billing_identity_evidence: subscription_identity_hash
+                        .as_ref()
+                        .map(|_| "provider_account_id".to_string()),
+                    billing_identity_confidence: if subscription_identity_hash.is_some() {
+                        AgentStatusConfidence::High
+                    } else {
+                        AgentStatusConfidence::Unknown
+                    },
+                    confidence: if billing_channel == "subscription" {
+                        AgentStatusConfidence::High
+                    } else {
+                        AgentStatusConfidence::Medium
+                    },
+                    is_current: Some(false),
+                }
+            })
+            .collect(),
+    )
+}
+
+fn codex_organizations(value: &Value) -> Vec<CodexOrganization> {
+    let Some(organizations) = value.get("organizations").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    organizations
+        .iter()
+        .filter_map(|organization| {
+            let id = first_json_string(organization, &["id"]);
+            let label = first_json_string(organization, &["title", "name", "label"]);
+            if id.is_none() && label.is_none() {
+                return None;
+            }
+            Some(CodexOrganization {
+                id,
+                label,
+                is_default: organization
+                    .get("is_default")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                plan_type: first_json_string(
+                    organization,
+                    &[
+                        "chatgpt_plan_type",
+                        "plan_type",
+                        "planType",
+                        "subscription_plan",
+                        "subscriptionPlan",
+                        "tier",
+                    ],
+                )
+                .map(normalize_plan_type)
+                .filter(|value| !value.is_empty()),
+            })
         })
-        .or_else(|| organizations.first())?;
-    Some(CodexOrganization {
-        id: first_json_string(selected, &["id"]),
-        label: first_json_string(selected, &["title", "name", "label"]),
-    })
+        .collect()
 }
 
 fn merge_codex_accounts(
@@ -2686,6 +2842,104 @@ mod tests {
             Some("chatgpt_team")
         );
         assert_eq!(account.confidence, AgentStatusConfidence::High);
+    }
+
+    #[test]
+    fn codex_id_token_workspace_observations_keep_unknown_plans_as_memberships() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{
+                "email": "codex@example.com",
+                "sub": "account_sub",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account_123",
+                    "chatgpt_plan_type": "Pro",
+                    "organizations": [
+                        {"id": "org_current", "title": "Current Org", "is_default": true},
+                        {"id": "org_related", "title": "Related Org", "is_default": false}
+                    ]
+                }
+            }"#,
+        );
+        let token = format!("{header}.{payload}.signature");
+
+        let observations = codex_workspace_observations_from_id_token(
+            &token,
+            "2026-06-07T10:00:00Z",
+            Some("openai"),
+        )
+        .expect("observations");
+
+        assert_eq!(observations.len(), 1);
+        let related = &observations[0];
+        assert_eq!(
+            related.evidence_method.as_deref(),
+            Some("id_token_organization")
+        );
+        assert_eq!(
+            related.billing_channel.as_deref(),
+            Some("workspace_membership")
+        );
+        assert_eq!(related.subscription_product, None);
+        assert_eq!(related.plan_type, None);
+        assert_eq!(related.account_label.as_deref(), Some("codex@example.com"));
+        assert_eq!(related.organization_label.as_deref(), Some("Related Org"));
+        assert_eq!(related.account_id, None);
+        assert_eq!(related.organization_id, None);
+        assert_eq!(related.is_current, Some(false));
+        assert_eq!(related.account_identifier_hash, None);
+        assert_eq!(related.organization_identifier_hash, None);
+        assert_eq!(
+            related.billing_identity_confidence,
+            AgentStatusConfidence::Unknown
+        );
+        assert_eq!(related.confidence, AgentStatusConfidence::Medium);
+    }
+
+    #[test]
+    fn codex_id_token_workspace_observations_promote_explicit_org_plans() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{
+                "email": "codex@example.com",
+                "sub": "account_sub",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account_123",
+                    "organizations": [
+                        {"id": "org_current", "title": "Current Org", "is_default": true},
+                        {"id": "org_team", "title": "Team Org", "subscription_plan": "Team"}
+                    ]
+                }
+            }"#,
+        );
+        let token = format!("{header}.{payload}.signature");
+
+        let observations = codex_workspace_observations_from_id_token(
+            &token,
+            "2026-06-07T10:00:00Z",
+            Some("openai"),
+        )
+        .expect("observations");
+
+        assert_eq!(observations.len(), 1);
+        let team = &observations[0];
+        assert_eq!(team.billing_channel.as_deref(), Some("subscription"));
+        assert_eq!(team.plan_type.as_deref(), Some("team"));
+        assert_eq!(team.subscription_product.as_deref(), Some("chatgpt_team"));
+        assert_eq!(team.organization_label.as_deref(), Some("Team Org"));
+        assert_eq!(team.account_id.as_deref(), Some("account_123"));
+        assert_eq!(team.organization_id.as_deref(), Some("org_team"));
+        assert_eq!(team.is_current, Some(false));
+        assert!(team.account_identifier_hash.is_some());
+        assert_eq!(
+            team.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+        assert_eq!(
+            team.billing_identity_confidence,
+            AgentStatusConfidence::High
+        );
+        assert_eq!(team.confidence, AgentStatusConfidence::High);
     }
 
     #[test]
