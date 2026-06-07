@@ -3314,6 +3314,10 @@ fn heartbeat_setup_run(
         "metadata": {
             "client_name": OTTTO_CLIENT_NAME,
             "protocol_version": PROTOCOL_VERSION,
+            // Report the live running version so the Apps surface can read it
+            // from the heartbeat (the source of truth) instead of inferring it
+            // from setup-scan / telemetry-device snapshots.
+            "local_platform_version": compiled_release_version(),
         },
     });
     let _: serde_json::Value =
