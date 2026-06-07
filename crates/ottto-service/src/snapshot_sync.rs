@@ -6,7 +6,8 @@ use crate::backfill::{
 use crate::detected_uses::{aggregate_detected_uses, merge_detected_uses};
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
-    AgentStatusSnapshotUploadResponse, BatchRejected, SnapshotApiClient, SnapshotStatusRequest,
+    AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
+    SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
@@ -372,14 +373,27 @@ fn sync_source(
         let response = match client.upload_batch(&relay_token, &request) {
             Ok(response) => response,
             Err(error) => {
-                // Distinguish a backend payload rejection (4xx, almost always a
-                // daemon<->backend schema mismatch — persistent, not transient)
-                // from a transport fault. The schema case gets a LOUD, specific
-                // log + a distinct collector-status code so the next contract
-                // drift is visible immediately instead of running silent (the
-                // v5->v6 break only surfaced as a vague "upload failed" line).
-                let (state, context) = if let Some(rejected) = error.downcast_ref::<BatchRejected>()
+                // Distinguish authorization failures from backend payload
+                // rejections. Only validation-like rejections are schema drift;
+                // 401/403 means the relay binding or token needs attention.
+                let (state, context) = if let Some(rejected) =
+                    error.downcast_ref::<BatchAuthorizationRejected>()
                 {
+                    eprintln!(
+                        "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
+                         for {}; refresh the relay device binding or reconnect this Mac before \
+                         retrying local usage sync.",
+                        rejected.status,
+                        source.api_slug(),
+                    );
+                    (
+                        CollectorState::Error {
+                            code: "auth_error",
+                            message: "backend rejected snapshot batch authorization",
+                        },
+                        "backend rejected snapshot batch authorization",
+                    )
+                } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
                     eprintln!(
                         "ottto-service: snapshot batch REJECTED by backend (HTTP {}) for {} — \
                              daemon SNAPSHOT_SCHEMA_VERSION={} does not match what the backend \
