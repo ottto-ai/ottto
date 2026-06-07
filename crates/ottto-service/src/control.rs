@@ -58,6 +58,7 @@ const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -2292,7 +2293,10 @@ fn cli_error(error: LocalApiError) -> CliError {
         LocalApiError::ManualFenceReviewRequired => CliErrorCode::ManualFenceReviewRequired,
         LocalApiError::LocalOperationFailed(_) => CliErrorCode::Internal,
         LocalApiError::NetworkUnavailable => CliErrorCode::NetworkUnavailable,
-        LocalApiError::TimedOut(_) => CliErrorCode::TimedOut,
+        LocalApiError::TimedOut(reason) => {
+            details.insert("detail".to_string(), RedactedValue::String(reason.clone()));
+            CliErrorCode::TimedOut
+        }
         LocalApiError::Backend(backend) => {
             details.insert(
                 "endpoint".to_string(),
@@ -7184,7 +7188,11 @@ fn get_setup_run_verification_with_base(
         .collect::<Vec<_>>()
         .join("&");
     let url = format!("{url}?{query}");
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_json_with_timeout(
+        &url,
+        &[("X-Ottto-Setup-Run-Token", setup_run_token)],
+        SETUP_VERIFICATION_HTTP_TIMEOUT,
+    )
 }
 
 fn get_agent_context_with_base(
@@ -7274,9 +7282,17 @@ fn backend_get_json<T: DeserializeOwned>(
     url: &str,
     headers: &[(&str, &str)],
 ) -> Result<T, LocalApiError> {
+    backend_get_json_with_timeout(url, headers, BACKEND_REQUEST_TIMEOUT)
+}
+
+fn backend_get_json_with_timeout<T: DeserializeOwned>(
+    url: &str,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<T, LocalApiError> {
     let mut request = ureq::get(url)
         .set("Accept", "application/json")
-        .timeout(BACKEND_REQUEST_TIMEOUT);
+        .timeout(timeout);
     for (key, value) in headers {
         request = request.set(key, value);
     }
@@ -10793,6 +10809,29 @@ log_user_prompt = true
         assert_eq!(error.code.exit_code(), 61);
         assert!(error.retryable);
         assert!(error.message.contains("Timed out waiting for setup"));
+    }
+
+    #[test]
+    fn setup_timeout_preserves_safe_detail() {
+        let error = cli_error(LocalApiError::TimedOut(
+            "backend request timed out for /api/v1/setup-runs/[id]/local-client/verification"
+                .to_string(),
+        ));
+
+        assert_eq!(error.code, CliErrorCode::TimedOut);
+        assert_eq!(
+            error.details.get("detail"),
+            Some(&RedactedValue::String(
+                "backend request timed out for /api/v1/setup-runs/[id]/local-client/verification"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn setup_verification_http_timeout_covers_full_poll_window() {
+        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > VERIFICATION_WAIT_TIMEOUT);
+        assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
     }
 
     fn setup_run_cancelled_scan_server() -> String {
