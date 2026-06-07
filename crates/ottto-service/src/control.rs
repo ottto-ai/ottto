@@ -3071,7 +3071,9 @@ fn process_setup_actions(
         let Some(action) = next.action else {
             break;
         };
-        record_setup_action_event(
+        let source_slug = action.source.clone();
+        let source = source_slug.as_deref().and_then(source_from_slug);
+        if let Err(error) = record_setup_action_event(
             api_base_url,
             connection,
             setup_run_token,
@@ -3082,10 +3084,28 @@ fn process_setup_actions(
                 message: "Local daemon started setup action",
                 metadata: None,
             },
-        )?;
-        let source_slug = action.source.clone();
-        let source = source_slug.as_deref().and_then(source_from_slug);
-        let (status, message, result) = match action.action_type.as_str() {
+        ) {
+            let (status, message, result) =
+                setup_action_execution_error_result(&action, source.as_ref(), &error);
+            let detail = complete_setup_action(
+                api_base_url,
+                connection,
+                setup_run_token,
+                &action,
+                &status,
+                &message,
+                result,
+            )?;
+            results.push(SetupActionResult {
+                action_id: action.id,
+                action_type: action.action_type,
+                source: source_slug,
+                status,
+                detail: Some(detail),
+            });
+            continue;
+        }
+        let action_outcome = match action.action_type.as_str() {
             "install_source" => run_install_source_action(
                 daemon,
                 api_base_url,
@@ -3093,9 +3113,9 @@ fn process_setup_actions(
                 setup_run_token,
                 &action,
                 machine,
-            )?,
+            ),
             "verify_source" => {
-                if let Some(source) = source {
+                if let Some(source) = source.clone() {
                     run_verify_source_action(
                         daemon,
                         api_base_url,
@@ -3103,9 +3123,9 @@ fn process_setup_actions(
                         setup_run_token,
                         &action,
                         source,
-                    )?
+                    )
                 } else {
-                    (
+                    Ok((
                         "failed".to_string(),
                         "Setup action source was missing".to_string(),
                         json!({
@@ -3113,17 +3133,21 @@ fn process_setup_actions(
                             "error_code": "source_missing",
                             "error_message": "Setup action source was missing",
                         }),
-                    )
+                    ))
                 }
             }
-            _ => (
+            _ => Ok((
                 "failed".to_string(),
                 format!("Unsupported setup action {}", action.action_type),
                 json!({
                     "error_code": "unsupported_action",
                     "error_message": format!("Unsupported setup action {}", action.action_type),
                 }),
-            ),
+            )),
+        };
+        let (status, message, result) = match action_outcome {
+            Ok(outcome) => outcome,
+            Err(error) => setup_action_execution_error_result(&action, source.as_ref(), &error),
         };
         let detail = complete_setup_action(
             api_base_url,
@@ -3143,6 +3167,107 @@ fn process_setup_actions(
         });
     }
     Ok(results)
+}
+
+fn setup_action_execution_error_result(
+    action: &SetupRunActionApiResponse,
+    source: Option<&SourceKind>,
+    error: &LocalApiError,
+) -> (String, String, serde_json::Value) {
+    let (error_code, error_message) = setup_action_execution_error_detail(error);
+    (
+        "failed".to_string(),
+        error_message.clone(),
+        json!({
+            "action_type": action.action_type.as_str(),
+            "source": action.source.as_deref().or_else(|| source.map(source_slug)),
+            "verified": false,
+            "error_code": error_code,
+            "error_message": error_message,
+        }),
+    )
+}
+
+fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, String) {
+    match error {
+        LocalApiError::SetupRunConnectionMissing => (
+            "setup_run_connection_missing",
+            "This Mac needs to reconnect to Ottto. Open ottto.net/apps in your browser, then retry setup.".to_string(),
+        ),
+        LocalApiError::SetupRunConnectionMismatch => (
+            "setup_run_connection_mismatch",
+            "This setup action belongs to a different Ottto setup run. Start a fresh setup from ottto.net/apps.".to_string(),
+        ),
+        LocalApiError::TimedOut(_) => (
+            "setup_action_timed_out",
+            "Setup action timed out while waiting for Ottto. Check your network and retry setup.".to_string(),
+        ),
+        LocalApiError::NetworkUnavailable => (
+            "network_unavailable",
+            "Network is unavailable while running setup. Check your connection and retry setup.".to_string(),
+        ),
+        LocalApiError::Backend(details) => {
+            if details.status == Some(401) || details.status == Some(403) {
+                return (
+                    "setup_action_rejected",
+                    "Ottto rejected this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+                );
+            }
+            if details.status == Some(404) {
+                return (
+                    "setup_run_missing",
+                    "Ottto could not find this setup run. Start a fresh setup from ottto.net/apps.".to_string(),
+                );
+            }
+            match details.kind {
+                BackendErrorKind::Unreachable => (
+                    "backend_unreachable",
+                    "Could not reach Ottto while running setup. Check your network and retry setup.".to_string(),
+                ),
+                BackendErrorKind::Unavailable => (
+                    "backend_unavailable",
+                    "Ottto was unavailable while running setup. Retry setup in a moment.".to_string(),
+                ),
+                BackendErrorKind::Rejected => (
+                    "backend_rejected",
+                    "Ottto rejected this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+                ),
+                BackendErrorKind::ResponseUnexpected => (
+                    "backend_response_unexpected",
+                    "Ottto returned an unexpected setup response. Retry setup in a moment.".to_string(),
+                ),
+            }
+        }
+        LocalApiError::LocalOperationFailed(_) => (
+            "local_operation_failed",
+            "A local setup step failed. Open Diagnostics or retry setup.".to_string(),
+        ),
+        LocalApiError::StatePoisoned => (
+            "local_state_unavailable",
+            "Local Ottto setup state is unavailable. Restart Ottto and retry setup.".to_string(),
+        ),
+        LocalApiError::RepairLocked => (
+            "repair_locked",
+            "Another Ottto repair is already running. Wait for it to finish, then retry setup.".to_string(),
+        ),
+        LocalApiError::ManualFenceReviewRequired => (
+            "manual_fence_review_required",
+            "Setup needs manual config review before it can continue.".to_string(),
+        ),
+        LocalApiError::InvalidRequest(_) => (
+            "invalid_setup_action",
+            "Ottto could not run this setup action. Start a fresh setup from ottto.net/apps.".to_string(),
+        ),
+        LocalApiError::Unauthorized
+        | LocalApiError::LocalClientNotTrusted
+        | LocalApiError::AccountResetRequired
+        | LocalApiError::EmptyControlToken
+        | LocalApiError::NoPendingAuthClaim
+        | LocalApiError::AuthClaimMismatch => (
+            "setup_action_failed",
+            "Ottto could not finish this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -10812,6 +10937,76 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn setup_verify_action_backend_error_completes_failed_action() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("setup-action-error-complete");
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        let completed_body = Arc::new(Mutex::new(None));
+        let api_base_url = setup_verify_action_backend_error_server(completed_body.clone());
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_error_complete".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection.clone()));
+
+        let results = process_setup_actions(
+            &daemon,
+            &api_base_url,
+            &connection,
+            "otsr_test",
+            &test_machine(),
+        )
+        .expect("setup action should complete as failed instead of wedging");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action_type, "verify_source");
+        assert_eq!(results[0].source.as_deref(), Some("codex"));
+        assert_eq!(results[0].status, "failed");
+        let body_guard = completed_body.lock().expect("completed body lock");
+        let body = body_guard.as_ref().expect("complete body observed");
+        assert_eq!(
+            body.get("status").and_then(serde_json::Value::as_str),
+            Some("failed")
+        );
+        let result = body.get("result").expect("completion result");
+        assert_eq!(
+            result.get("error_code").and_then(serde_json::Value::as_str),
+            Some("backend_unavailable")
+        );
+        let message = result
+            .get("error_message")
+            .and_then(serde_json::Value::as_str)
+            .expect("safe error message");
+        assert!(message.contains("Ottto was unavailable"));
+        assert!(!message.contains("/api/v1"));
+        assert!(!message.contains("setup_error_complete"));
+        assert_eq!(
+            result.get("verified").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn setup_timeout_preserves_safe_detail() {
         let error = cli_error(LocalApiError::TimedOut(
             "backend request timed out for /api/v1/setup-runs/[id]/local-client/verification"
@@ -10832,6 +11027,61 @@ log_user_prompt = true
     fn setup_verification_http_timeout_covers_full_poll_window() {
         assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > VERIFICATION_WAIT_TIMEOUT);
         assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
+    }
+
+    fn setup_verify_action_backend_error_server(
+        completed_body: Arc<Mutex<Option<serde_json::Value>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup action backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let mut next_action_calls = 0_u8;
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().expect("accept setup action request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/heartbeat") {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request.contains("/local-client/next-action") {
+                    let body = if next_action_calls == 0 {
+                        r#"{"action":{"id":"action_verify_codex","action_type":"verify_source","source":"codex"}}"#
+                    } else {
+                        r#"{"action":null}"#
+                    };
+                    next_action_calls += 1;
+                    write_json_response(&mut stream, 200, "OK", body);
+                    if next_action_calls > 1 {
+                        break;
+                    }
+                } else if request.contains("/actions/action_verify_codex/events") {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request.contains("/local-client/verification") {
+                    write_json_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        r#"{"detail":"warehouse timeout request_id=req_hidden"}"#,
+                    );
+                } else if request.contains("/actions/action_verify_codex/complete") {
+                    let body: serde_json::Value =
+                        serde_json::from_str(http_request_body(&request)).expect("complete json");
+                    *completed_body.lock().expect("completed body lock") = Some(body);
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"run":{"id":"setup_error_complete","status":"waiting_for_user","machine_id":"machine_test"},"sources":[{"source":"codex","detected":true,"readiness_percent":70,"state":"failed","missing_fields":[]}],"next_action":null,"next_question":null}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        r#"{"detail":"unexpected setup action request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
     }
 
     fn setup_run_cancelled_scan_server() -> String {
@@ -11003,6 +11253,28 @@ log_user_prompt = true
             })
             .unwrap_or(0);
         request.len() >= body_start + content_length
+    }
+
+    fn http_request_body(request: &str) -> &str {
+        request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("")
+    }
+
+    fn write_json_response(
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        reason: &str,
+        body: &str,
+    ) {
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
     }
 
     fn test_control_token(action: &str, source: &str, expires_in_seconds: i64) -> String {
