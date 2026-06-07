@@ -15,13 +15,10 @@ const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The backend rejected a snapshot batch with an HTTP 4xx. This is almost
-/// always a daemon<->backend schema/contract mismatch (the daemon emitting a
-/// shape the backend's strict validator refuses), not a transient transport
-/// fault. Surfaced as a typed error so `snapshot_sync` can emit a loud,
-/// specific diagnostic and report a `schema_rejected` collector status instead
-/// of burying it as a generic `network_error` — the failure mode that let the
-/// v5->v6 break run silently.
+/// The backend rejected a snapshot batch because the payload did not satisfy the
+/// strict daemon/backend contract. Surfaced as a typed error so `snapshot_sync`
+/// can emit a loud, specific diagnostic and report `schema_rejected` instead of
+/// burying real contract drift as a generic upload failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchRejected {
     pub status: u16,
@@ -38,6 +35,25 @@ impl std::fmt::Display for BatchRejected {
 }
 
 impl std::error::Error for BatchRejected {}
+
+/// The backend refused a snapshot batch before payload validation because the
+/// relay authorization was missing, stale, or not permitted for this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for BatchAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected snapshot batch authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for BatchAuthorizationRejected {}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivityHintResponse {
@@ -203,12 +219,19 @@ impl SnapshotApiClient {
             Ok(response) => response
                 .into_json()
                 .map_err(|error| anyhow!("parse snapshot batch response failed: {error}")),
-            // 4xx = the backend refused the payload (schema/contract mismatch),
-            // not a transient fault. Tag it typed so the caller can be loud and
-            // specific. We deliberately do NOT echo the response body: it can
-            // carry backend-internal detail, and the status code plus the daemon
+            // 401/403 means relay authorization failed, not schema drift.
+            // Keep it typed and body-free so the caller can surface an auth
+            // diagnostic without leaking backend details or token-adjacent text.
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(BatchAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            // Validation-like statuses mean the backend refused the payload
+            // contract. We deliberately do NOT echo the response body: it can
+            // carry backend-internal detail, and the status code plus daemon
             // schema version is enough to diagnose and act on.
-            Err(ureq::Error::Status(code, _response)) if (400..500).contains(&code) => {
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
                 Err(anyhow::Error::new(BatchRejected { status: code }))
             }
             Err(error) => Err(anyhow!("upload snapshot batch failed: {error}")),
@@ -275,8 +298,8 @@ mod tests {
 
     #[test]
     fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
-        // The upload_batch 4xx path wraps BatchRejected in anyhow::Error; the
-        // snapshot_sync caller relies on downcast_ref to choose the loud
+        // The upload_batch validation path wraps BatchRejected in anyhow::Error;
+        // the snapshot_sync caller relies on downcast_ref to choose the loud
         // schema-mismatch diagnostic over the generic network-error path.
         let err = anyhow::Error::new(BatchRejected { status: 422 });
         let rejected = err
@@ -289,6 +312,18 @@ mod tests {
         // A plain transport error must NOT masquerade as a schema rejection.
         let other = anyhow!("upload snapshot batch failed: connection refused");
         assert!(other.downcast_ref::<BatchRejected>().is_none());
+    }
+
+    #[test]
+    fn batch_authorization_rejected_downcasts_separately_from_schema_rejection() {
+        let err = anyhow::Error::new(BatchAuthorizationRejected { status: 401 });
+        let rejected = err
+            .downcast_ref::<BatchAuthorizationRejected>()
+            .expect("BatchAuthorizationRejected must downcast from anyhow::Error");
+        assert_eq!(rejected.status, 401);
+        assert!(err.to_string().contains("401"));
+        assert!(err.to_string().contains("authorization"));
+        assert!(err.downcast_ref::<BatchRejected>().is_none());
     }
 
     #[test]
