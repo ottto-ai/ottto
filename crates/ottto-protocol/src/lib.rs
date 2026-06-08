@@ -851,6 +851,62 @@ pub struct AgentStatusDiagnostic {
     pub code: String,
     pub severity: AgentDiagnosticSeverity,
     pub message: String,
+    /// Account/subscription this diagnostic is about. `None` means the
+    /// diagnostic is provider-wide (applies to the whole source / all accounts).
+    /// Populated only for account-attributed diagnostics. Stripped from the
+    /// backend-upload copy (see `redact_diagnostic_for_backend`), so the backend
+    /// wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_label: Option<String>,
+    /// Scope hint for the local Companion. Absent on older daemons; a missing
+    /// value is treated as provider-wide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AgentDiagnosticScope>,
+}
+
+impl AgentStatusDiagnostic {
+    /// Provider-wide diagnostic. `scope`/`account_label` are left absent: an
+    /// absent scope already means provider-wide, so the wire format is identical
+    /// to before these fields existed.
+    pub fn source(
+        code: impl Into<String>,
+        severity: AgentDiagnosticSeverity,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity,
+            message: message.into(),
+            account_label: None,
+            scope: None,
+        }
+    }
+
+    /// Diagnostic attributed to a specific account/subscription. Reserved for
+    /// future per-account diagnostics — today every daemon diagnostic is
+    /// provider-wide (see `source`).
+    pub fn for_account(
+        code: impl Into<String>,
+        severity: AgentDiagnosticSeverity,
+        message: impl Into<String>,
+        account_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            severity,
+            message: message.into(),
+            account_label: Some(account_label.into()),
+            scope: Some(AgentDiagnosticScope::Account),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDiagnosticScope {
+    Source,
+    Account,
+    Organization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1899,6 +1955,11 @@ fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> Agent
     if !is_safe_backend_text(&diagnostic.message) {
         diagnostic.message = "diagnostic redacted".to_string();
     }
+    // `account_label`/`scope` are Companion-local hints (and the label may carry
+    // account/org text); strip them so the backend-upload wire format is
+    // unchanged from before these fields existed.
+    diagnostic.account_label = None;
+    diagnostic.scope = None;
     diagnostic
 }
 
@@ -2374,11 +2435,11 @@ mod tests {
                 confidence: AgentStatusConfidence::High,
                 is_current: Some(true),
             }],
-            diagnostics: vec![AgentStatusDiagnostic {
-                code: "stderr".to_string(),
-                severity: AgentDiagnosticSeverity::Warning,
-                message: "failed reading /Users/ron/.codex/config".to_string(),
-            }],
+            diagnostics: vec![AgentStatusDiagnostic::source(
+                "stderr",
+                AgentDiagnosticSeverity::Warning,
+                "failed reading /Users/ron/.codex/config",
+            )],
             runtime_defaults: Some(AgentRuntimeDefaults {
                 provenance: Some("config_file".to_string()),
                 model: Some("gpt-5.4".to_string()),
