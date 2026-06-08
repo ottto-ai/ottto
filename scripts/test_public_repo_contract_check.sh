@@ -106,7 +106,7 @@ def load_manifest(manifest):
     return manifest
 PY
   cat > "$private_root/frontend/src/lib/apps/local-telemetry-control.ts" <<'TS'
-const LOCAL_CONTROL_PROTOCOL_VERSIONS = [14, 13, 12] as const;
+const LOCAL_CONTROL_PROTOCOL_VERSIONS = [15, 14, 13, 12] as const;
 type LocalControlRequest = {
   command: "telemetry_control";
   targetAddressSpace?: "loopback";
@@ -148,7 +148,7 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-b
   echo "Expected contract check to fail when control protocol drifts" >&2
   exit 1
 fi
-grep -q "control status request protocol_version must be 14" /tmp/public-contract-broken-protocol.out
+grep -q "control status request protocol_version must be 15" /tmp/public-contract-broken-protocol.out
 
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
@@ -284,6 +284,6 @@ if "$CONTRACT_SCRIPT" \
   exit 1
 fi
 grep -q "private backend registry loader must read root connectors/registry.generated.json" /tmp/public-contract-broken-private.out
-grep -q "private frontend local-control client must send protocol version 14" /tmp/public-contract-broken-private.out
+grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
 
 echo "public_repo_contract_check tests passed"

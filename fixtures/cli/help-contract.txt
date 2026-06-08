@@ -4,23 +4,25 @@ Ottto local platform CLI for developers, support, CI, and AI agents
 Usage: ottto [OPTIONS] <COMMAND>
 
 Commands:
-  status        Show daemon, account, relay, update, and app health
-  apps          List apps or refresh app setup status
-  agent-status  Refresh one source status using the lower-level source noun
-  context       Print cloud context for AI agents
-  costs         Print cloud cost breakdown for AI agents
-  sessions      Print cloud sessions for AI agents
-  setup         Connect this Mac through a browser claim
-  login         Sign in and connect this Mac through a browser claim
-  account       Show the Ottto account connected to this Mac
-  logout        Disconnect this Mac from Ottto
-  doctor        Run daemon health checks and print current status
-  fix           Apply daemon-approved repair for one app
-  verify        Verify one app and publish safe setup status
-  diagnostics   Collect local-only or approved support diagnostics
-  update        Check owner-aware update state and instructions
-  uninstall     Remove Ottto local runtime state for this user
-  help          Print this message or the help of the given subcommand(s)
+  status           Show daemon, account, relay, update, and app health
+  apps             List apps or refresh app setup status
+  agent-status     Refresh one source status using the lower-level source noun
+  context          Print cloud context for AI agents
+  costs            Print cloud cost breakdown for AI agents
+  sessions         Print cloud sessions for AI agents
+  recommendations  Print Advisor recommendations for AI agents
+  provider-impact  Print staff-only provider-impact events for AI agents
+  setup            Connect this Mac through a browser claim
+  login            Sign in and connect this Mac through a browser claim
+  account          Show the Ottto account connected to this Mac
+  logout           Disconnect this Mac from Ottto
+  doctor           Run daemon health checks and print current status
+  fix              Apply daemon-approved repair for one app
+  verify           Verify one app and publish safe setup status
+  diagnostics      Collect local-only or approved support diagnostics
+  update           Check owner-aware update state and instructions
+  uninstall        Remove Ottto local runtime state for this user
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
       --socket <SOCKET>  Override the ottto-service Unix socket path
@@ -235,6 +237,40 @@ Options:
           Request account-wide sessions instead of this Mac
   -h, --help
           Print help
+### ottto recommendations --help
+Print Advisor recommendations for AI agents
+
+Usage: ottto recommendations [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto provider-impact --help
+Print staff-only provider-impact events for AI agents
+
+Usage: ottto provider-impact [OPTIONS]
+
+Options:
+      --json                        Print one final JSON object and no human summary text
+      --socket <SOCKET>             Override the ottto-service Unix socket path
+      --date-from <YYYY-MM-DD>      Inclusive event date start
+      --token <TOKEN>               Override the local-control token for CLI and agent requests
+      --date-to <YYYY-MM-DD>        Inclusive event date end
+      --no-autostart                Do not kickstart the standard per-user ottto-service
+      --provider <PROVIDER>         Provider filter
+      --watch                       Emit NDJSON progress events and a final event; requires --json
+      --app <APP>                   Provider app or surface filter
+      --kind <KIND>                 Provider-impact kind filter
+      --confidence <CONFIDENCE>     Confidence filter
+      --impact-priority <PRIORITY>  Impact priority filter
+      --status <STATUS>             Review status filter
+      --q <TEXT>                    Search text
+      --limit <LIMIT>               Maximum number of events to return
+  -h, --help                        Print help
 ### ottto setup --help
 Connect this Mac through a browser claim
 

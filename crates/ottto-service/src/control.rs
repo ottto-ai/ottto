@@ -20,19 +20,20 @@ use ottto_core::{
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentSessionsQuery,
-    AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse, AuthStartResponse, CliError,
-    CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
-    DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
-    DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
-    LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
-    LocalControlCommand, LocalControlRequest, LocalControlResponse, MachineIdentity, RedactedValue,
-    RelayRuntimeState, RelayState, ReleaseChannel, RepairAction, RepairActionApproval,
-    RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus, SecretString,
-    ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
-    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
-    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentProviderImpactQuery,
+    AgentRecommendationsQuery, AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse,
+    AuthResetResponse, AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult,
+    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
+    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
+    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
+    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
+    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
+    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
+    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
+    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -427,6 +428,12 @@ fn handle_command(
         LocalControlCommand::AgentSessions { query } => {
             agent_sessions(daemon, &authorization, query)
         }
+        LocalControlCommand::AgentRecommendations { query } => {
+            agent_recommendations(daemon, &authorization, query)
+        }
+        LocalControlCommand::AgentProviderImpact { query } => {
+            agent_provider_impact(daemon, &authorization, query)
+        }
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
@@ -618,6 +625,26 @@ fn agent_sessions(
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto sessions")?;
     get_agent_sessions_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+fn agent_recommendations(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    query: AgentRecommendationsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto recommendations")?;
+    get_agent_recommendations_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+fn agent_provider_impact(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    query: AgentProviderImpactQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
+    get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
 }
 
 fn setup_run_agent_read_context(
@@ -2999,6 +3026,54 @@ fn get_agent_sessions_with_refresh(
                 let refreshed_token =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_sessions_with_base(
+                    api_base_url,
+                    connection,
+                    &refreshed_token,
+                    query,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn get_agent_recommendations_with_refresh(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentRecommendationsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    match get_agent_recommendations_with_base(api_base_url, connection, setup_run_token, query) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
+                let refreshed_token =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                return get_agent_recommendations_with_base(
+                    api_base_url,
+                    connection,
+                    &refreshed_token,
+                    query,
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn get_agent_provider_impact_with_refresh(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentProviderImpactQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    match get_agent_provider_impact_with_base(api_base_url, connection, setup_run_token, query) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
+                let refreshed_token =
+                    refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+                return get_agent_provider_impact_with_base(
                     api_base_url,
                     connection,
                     &refreshed_token,
@@ -7436,6 +7511,26 @@ fn get_agent_sessions_with_base(
     backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
+fn get_agent_recommendations_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentRecommendationsQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let url = agent_recommendations_url(api_base_url, connection, query);
+    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+}
+
+fn get_agent_provider_impact_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    query: &AgentProviderImpactQuery,
+) -> Result<serde_json::Value, LocalApiError> {
+    let url = agent_provider_impact_url(api_base_url, connection, query);
+    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+}
+
 fn agent_context_url(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
@@ -7561,6 +7656,52 @@ fn agent_sessions_url(
     push_non_empty_query(&mut params, "search", query.search.as_deref());
     if query.all_machines {
         params.push(("all_machines", "true".to_string()));
+    }
+    url_with_query_params(url, params)
+}
+
+fn agent_recommendations_url(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    _query: &AgentRecommendationsQuery,
+) -> String {
+    api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/recommendations",
+            connection.setup_run_id
+        ),
+    )
+}
+
+fn agent_provider_impact_url(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    query: &AgentProviderImpactQuery,
+) -> String {
+    let url = api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/provider-impact",
+            connection.setup_run_id
+        ),
+    );
+    let mut params = Vec::new();
+    push_non_empty_query(&mut params, "date_from", query.date_from.as_deref());
+    push_non_empty_query(&mut params, "date_to", query.date_to.as_deref());
+    push_non_empty_query(&mut params, "provider", query.provider.as_deref());
+    push_non_empty_query(&mut params, "app", query.app.as_deref());
+    push_non_empty_query(&mut params, "kind", query.kind.as_deref());
+    push_non_empty_query(&mut params, "confidence", query.confidence.as_deref());
+    push_non_empty_query(
+        &mut params,
+        "impact_priority",
+        query.impact_priority.as_deref(),
+    );
+    push_non_empty_query(&mut params, "status", query.status.as_deref());
+    push_non_empty_query(&mut params, "q", query.q.as_deref());
+    if let Some(limit) = query.limit {
+        params.push(("limit", limit.to_string()));
     }
     url_with_query_params(url, params)
 }
@@ -8405,6 +8546,59 @@ mod tests {
         assert_eq!(
             url,
             "https://api.ottto.net/api/v1/setup-runs/setup_sessions/local-client/sessions?limit=25&cursor=next+123&range=today&start_date=2026-06-01&end_date=2026-06-05&timezone=America%2FLos_Angeles&source=codex&model=gpt-5.3+codex&billing_provider=openai&billing_channel=subscription&machine_id=otm_test&source_plan_profile_id=profile_123&min_cost=1.25&max_cost=7.5&sort_by=cost&sort_dir=desc&search=roadmap+review"
+        );
+    }
+
+    #[test]
+    fn agent_recommendations_url_targets_local_client_endpoint() {
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_recommendations".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+        let url = agent_recommendations_url(
+            DIRECT_API_BASE_URL,
+            &connection,
+            &AgentRecommendationsQuery::default(),
+        );
+
+        assert_eq!(
+            url,
+            "https://api.ottto.net/api/v1/setup-runs/setup_recommendations/local-client/recommendations"
+        );
+    }
+
+    #[test]
+    fn agent_provider_impact_url_encodes_local_client_query() {
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_provider_impact".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+        let url = agent_provider_impact_url(
+            DIRECT_API_BASE_URL,
+            &connection,
+            &AgentProviderImpactQuery {
+                date_from: Some("2026-06-01".to_string()),
+                date_to: Some("2026-06-08".to_string()),
+                provider: Some("openai".to_string()),
+                app: Some("codex".to_string()),
+                kind: Some("quota".to_string()),
+                confidence: Some("high".to_string()),
+                impact_priority: Some("critical".to_string()),
+                status: Some("verified".to_string()),
+                q: Some("subscription change".to_string()),
+                limit: Some(25),
+            },
+        );
+
+        assert_eq!(
+            url,
+            "https://api.ottto.net/api/v1/setup-runs/setup_provider_impact/local-client/provider-impact?date_from=2026-06-01&date_to=2026-06-08&provider=openai&app=codex&kind=quota&confidence=high&impact_priority=critical&status=verified&q=subscription+change&limit=25"
         );
     }
 

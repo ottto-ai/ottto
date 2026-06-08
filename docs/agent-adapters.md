@@ -22,10 +22,12 @@ Every adapter must:
 - summarize redacted status facts instead of pasting raw diagnostics payloads
 
 Agents that need product context should call `ottto context --json`, `ottto
-costs --json`, or `ottto sessions --json` instead of parsing local session
-files or the human web UI. These commands are intentionally JSON-only and return
+costs --json`, `ottto sessions --json`, `ottto recommendations --json`, or
+`ottto provider-impact --json` instead of parsing local session files or the
+human web UI. These commands are intentionally JSON-only and return
 backend-computed account, machine, subscription, usage, cost, recommendation,
-and session facts through the connected local daemon.
+session, and staff-only provider-impact facts through the connected local
+daemon.
 
 ## MCP Decision
 

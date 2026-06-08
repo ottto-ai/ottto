@@ -6,9 +6,10 @@ use ottto_core::{
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentCostsQuery, AgentSessionsQuery, CliError, CliErrorCode,
-    CliErrorResponse, DiagnosticsUploadApproval, LocalControlCommand, LocalControlRequest,
-    LocalControlResponse, RedactedValue, SourceKind, LOCAL_CONTROL_PROTOCOL_VERSION,
+    AgentContextQuery, AgentCostsQuery, AgentProviderImpactQuery, AgentRecommendationsQuery,
+    AgentSessionsQuery, CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval,
+    LocalControlCommand, LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
+    LOCAL_CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -65,6 +66,10 @@ enum Command {
     Costs(CostsArgs),
     #[command(about = "Print cloud sessions for AI agents")]
     Sessions(SessionsArgs),
+    #[command(about = "Print Advisor recommendations for AI agents")]
+    Recommendations(RecommendationsArgs),
+    #[command(about = "Print staff-only provider-impact events for AI agents")]
+    ProviderImpact(ProviderImpactArgs),
     #[command(about = "Connect this Mac through a browser claim")]
     Setup(SetupArgs),
     #[command(about = "Sign in and connect this Mac through a browser claim")]
@@ -365,6 +370,65 @@ impl SessionsArgs {
     }
 }
 
+#[derive(Debug, Args)]
+struct RecommendationsArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+}
+
+impl RecommendationsArgs {
+    fn query(&self) -> AgentRecommendationsQuery {
+        AgentRecommendationsQuery {}
+    }
+}
+
+#[derive(Debug, Args)]
+struct ProviderImpactArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(long, value_name = "YYYY-MM-DD", help = "Inclusive event date start")]
+    date_from: Option<String>,
+    #[arg(long, value_name = "YYYY-MM-DD", help = "Inclusive event date end")]
+    date_to: Option<String>,
+    #[arg(long, value_name = "PROVIDER", help = "Provider filter")]
+    provider: Option<String>,
+    #[arg(long, value_name = "APP", help = "Provider app or surface filter")]
+    app: Option<String>,
+    #[arg(long, value_name = "KIND", help = "Provider-impact kind filter")]
+    kind: Option<String>,
+    #[arg(long, value_name = "CONFIDENCE", help = "Confidence filter")]
+    confidence: Option<String>,
+    #[arg(long, value_name = "PRIORITY", help = "Impact priority filter")]
+    impact_priority: Option<String>,
+    #[arg(long, value_name = "STATUS", help = "Review status filter")]
+    status: Option<String>,
+    #[arg(long, value_name = "TEXT", help = "Search text")]
+    q: Option<String>,
+    #[arg(
+        long,
+        value_name = "LIMIT",
+        help = "Maximum number of events to return"
+    )]
+    limit: Option<u16>,
+}
+
+impl ProviderImpactArgs {
+    fn query(&self) -> AgentProviderImpactQuery {
+        AgentProviderImpactQuery {
+            date_from: non_empty_option(self.date_from.as_deref()),
+            date_to: non_empty_option(self.date_to.as_deref()),
+            provider: non_empty_option(self.provider.as_deref()),
+            app: non_empty_option(self.app.as_deref()),
+            kind: non_empty_option(self.kind.as_deref()),
+            confidence: non_empty_option(self.confidence.as_deref()),
+            impact_priority: non_empty_option(self.impact_priority.as_deref()),
+            status: non_empty_option(self.status.as_deref()),
+            q: non_empty_option(self.q.as_deref()),
+            limit: self.limit,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum AppsCommand {
     #[command(about = "Refresh all supported app statuses")]
@@ -602,6 +666,22 @@ fn validate_cli(cli: &Cli) -> Result<(), CliError> {
         return Err(CliError {
             code: CliErrorCode::InvalidRequest,
             message: "ottto sessions is agent JSON only; pass --json".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    if matches!(&cli.command, Command::Recommendations(args) if !args.json) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto recommendations is agent JSON only; pass --json".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    if matches!(&cli.command, Command::ProviderImpact(args) if !args.json) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto provider-impact is agent JSON only; pass --json".to_string(),
             retryable: false,
             details: BTreeMap::new(),
         });
@@ -1450,6 +1530,12 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Sessions(args) => LocalControlCommand::AgentSessions {
             query: args.query(),
         },
+        Command::Recommendations(args) => LocalControlCommand::AgentRecommendations {
+            query: args.query(),
+        },
+        Command::ProviderImpact(args) => LocalControlCommand::AgentProviderImpact {
+            query: args.query(),
+        },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
@@ -1513,6 +1599,8 @@ fn command_json(command: &Command) -> bool {
         Command::Context(args) => args.json,
         Command::Costs(args) => args.json,
         Command::Sessions(args) => args.json,
+        Command::Recommendations(args) => args.json,
+        Command::ProviderImpact(args) => args.json,
         Command::AgentStatus(args) | Command::Fix(args) => args.json,
         Command::Verify(args) => args.json,
         Command::Diagnostics {
@@ -1609,6 +1697,8 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AgentCosts { .. } => "agent_costs",
         LocalControlCommand::AgentSessions { .. } => "agent_sessions",
+        LocalControlCommand::AgentRecommendations { .. } => "agent_recommendations",
+        LocalControlCommand::AgentProviderImpact { .. } => "agent_provider_impact",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
@@ -1846,7 +1936,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 21] = [
+        let commands: [(&str, &[&str]); 23] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
@@ -1865,6 +1955,14 @@ mod tests {
             ("ottto context --help", &["ottto", "context", "--help"]),
             ("ottto costs --help", &["ottto", "costs", "--help"]),
             ("ottto sessions --help", &["ottto", "sessions", "--help"]),
+            (
+                "ottto recommendations --help",
+                &["ottto", "recommendations", "--help"],
+            ),
+            (
+                "ottto provider-impact --help",
+                &["ottto", "provider-impact", "--help"],
+            ),
             ("ottto setup --help", &["ottto", "setup", "--help"]),
             ("ottto login --help", &["ottto", "login", "--help"]),
             ("ottto account --help", &["ottto", "account", "--help"]),
@@ -2652,6 +2750,86 @@ mod tests {
                     all_machines: true,
                 }
             }
+        );
+    }
+
+    #[test]
+    fn recommendations_builds_agent_recommendations_request() {
+        let cli = Cli::parse_from(["ottto", "recommendations", "--json"]);
+        validate_cli(&cli).expect("recommendations json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentRecommendations {
+                query: AgentRecommendationsQuery::default()
+            }
+        );
+    }
+
+    #[test]
+    fn provider_impact_builds_agent_provider_impact_request() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "provider-impact",
+            "--json",
+            "--date-from",
+            "2026-06-01",
+            "--date-to",
+            "2026-06-08",
+            "--provider",
+            "openai",
+            "--app",
+            "codex",
+            "--kind",
+            "quota",
+            "--confidence",
+            "high",
+            "--impact-priority",
+            "critical",
+            "--status",
+            "verified",
+            "--q",
+            "subscription",
+            "--limit",
+            "25",
+        ]);
+        validate_cli(&cli).expect("provider-impact json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentProviderImpact {
+                query: AgentProviderImpactQuery {
+                    date_from: Some("2026-06-01".to_string()),
+                    date_to: Some("2026-06-08".to_string()),
+                    provider: Some("openai".to_string()),
+                    app: Some("codex".to_string()),
+                    kind: Some("quota".to_string()),
+                    confidence: Some("high".to_string()),
+                    impact_priority: Some("critical".to_string()),
+                    status: Some("verified".to_string()),
+                    q: Some("subscription".to_string()),
+                    limit: Some(25),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn recommendations_and_provider_impact_require_json() {
+        let recommendations = Cli::parse_from(["ottto", "recommendations"]);
+        assert_eq!(
+            validate_cli(&recommendations).unwrap_err().message,
+            "ottto recommendations is agent JSON only; pass --json"
+        );
+
+        let provider_impact = Cli::parse_from(["ottto", "provider-impact"]);
+        assert_eq!(
+            validate_cli(&provider_impact).unwrap_err().message,
+            "ottto provider-impact is agent JSON only; pass --json"
         );
     }
 

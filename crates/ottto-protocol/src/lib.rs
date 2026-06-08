@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
@@ -1548,6 +1548,33 @@ pub struct AgentSessionsQuery {
     pub all_machines: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRecommendationsQuery {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProviderImpactQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact_priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalControlCommand {
@@ -1570,6 +1597,14 @@ pub enum LocalControlCommand {
     AgentSessions {
         #[serde(default)]
         query: AgentSessionsQuery,
+    },
+    AgentRecommendations {
+        #[serde(default)]
+        query: AgentRecommendationsQuery,
+    },
+    AgentProviderImpact {
+        #[serde(default)]
+        query: AgentProviderImpactQuery,
     },
     AuthStart,
     AuthComplete {
@@ -2053,6 +2088,65 @@ mod tests {
                     search: Some("expensive".to_string()),
                     all_machines: false,
                     ..AgentSessionsQuery::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_recommendations_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_recommendations",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_recommendations"
+        }))
+        .expect("agent recommendations request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentRecommendations {
+                query: AgentRecommendationsQuery::default()
+            }
+        );
+    }
+
+    #[test]
+    fn agent_provider_impact_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_provider_impact",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_provider_impact",
+            "query": {
+                "date_from": "2026-06-01",
+                "date_to": "2026-06-08",
+                "provider": "openai",
+                "app": "codex",
+                "kind": "quota",
+                "confidence": "high",
+                "impact_priority": "critical",
+                "status": "verified",
+                "q": "subscription",
+                "limit": 25
+            }
+        }))
+        .expect("agent provider impact request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentProviderImpact {
+                query: AgentProviderImpactQuery {
+                    date_from: Some("2026-06-01".to_string()),
+                    date_to: Some("2026-06-08".to_string()),
+                    provider: Some("openai".to_string()),
+                    app: Some("codex".to_string()),
+                    kind: Some("quota".to_string()),
+                    confidence: Some("high".to_string()),
+                    impact_priority: Some("critical".to_string()),
+                    status: Some("verified".to_string()),
+                    q: Some("subscription".to_string()),
+                    limit: Some(25),
                 }
             }
         );

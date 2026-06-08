@@ -58,7 +58,7 @@ jq -n \
       service_label: "net.ottto.service",
       version: "0.1.0-stable-candidate.1",
       release_channel: "stable-candidate",
-      protocol_version: 14,
+      protocol_version: 15,
       release_manifest_sha256: $candidate_sha
     },
     checks: {
@@ -108,7 +108,7 @@ write_manifest() {
       commit: "abcdef123456",
       generated_at: "2026-05-10T00:00:00Z",
       min_supported_version: "0.1.0",
-      min_protocol_version: 14,
+      min_protocol_version: 15,
       supported_install_owners: ["app_bundle"],
       install_methods: {
         verified_native_installer: {
