@@ -184,6 +184,15 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
+    // Session-level Codex latency (avg across the session's `task_complete`
+    // turns). Codex emits duration/ttft only in the rollout `task_complete`
+    // event (never over OTLP), so the daemon aggregates them here. Absent for
+    // Claude Code / Pi (which surface per-turn latency via OTLP) and for Codex
+    // sessions with no completed turns. Backend schema must accept these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_time_to_first_token_ms: Option<u64>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     pub session_display_name: Option<String>,
@@ -582,6 +591,13 @@ struct SnapshotAccumulator {
     /// case. ``apply_upload_policy`` still strips artifacts before upload as
     /// defense-in-depth, so a stray scrape can never leak.
     artifacts_enabled: bool,
+    // Codex per-session latency accumulators, summed from rollout
+    // `task_complete` events (`duration_ms` + `time_to_first_token_ms`) and
+    // averaged in `into_items`. Zero counts mean no latency was observed.
+    latency_duration_ms_sum: u64,
+    latency_duration_ms_count: u64,
+    latency_ttft_ms_sum: u64,
+    latency_ttft_ms_count: u64,
 }
 
 impl SnapshotAccumulator {
@@ -605,6 +621,10 @@ impl SnapshotAccumulator {
             // Default on so direct parse-function callers (mostly tests) keep
             // extracting; the production scan path overrides this from policy.
             artifacts_enabled: true,
+            latency_duration_ms_sum: 0,
+            latency_duration_ms_count: 0,
+            latency_ttft_ms_sum: 0,
+            latency_ttft_ms_count: 0,
         }
     }
 
@@ -903,6 +923,10 @@ impl SnapshotAccumulator {
             reasoning_output_tokens: totals.reasoning_output_tokens,
             unattributed_total_tokens: totals.unattributed_total_tokens,
             request_count: totals.request_count,
+            avg_duration_ms: (self.latency_duration_ms_count > 0)
+                .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
+            avg_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
+                .then(|| self.latency_ttft_ms_sum / self.latency_ttft_ms_count),
             model_usage,
             usage_buckets,
             session_display_name: self.title.clone(),
@@ -1313,6 +1337,8 @@ fn codex_state_only_snapshot(
         reasoning_output_tokens: 0,
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
+        avg_duration_ms: None,
+        avg_time_to_first_token_ms: None,
         model_usage,
         usage_buckets,
         session_display_name: display_name,
@@ -1993,6 +2019,22 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             timestamp.as_deref(),
             implicit_request_count,
         );
+    }
+    // Per-turn latency from the rollout `task_complete` event. Codex emits
+    // `duration_ms` + `time_to_first_token_ms` only here (never over OTLP), so
+    // accumulate them per session for the session-level latency average.
+    if string_eq_at(value, &["payload", "type"], "task_complete") {
+        if let Some(duration_ms) = u64_at(value, &["payload", "duration_ms"]) {
+            accumulator.latency_duration_ms_sum = accumulator
+                .latency_duration_ms_sum
+                .saturating_add(duration_ms);
+            accumulator.latency_duration_ms_count += 1;
+        }
+        if let Some(ttft_ms) = u64_at(value, &["payload", "time_to_first_token_ms"]) {
+            accumulator.latency_ttft_ms_sum =
+                accumulator.latency_ttft_ms_sum.saturating_add(ttft_ms);
+            accumulator.latency_ttft_ms_count += 1;
+        }
     }
 }
 
@@ -3876,6 +3918,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_parser_aggregates_task_complete_latency_per_session() {
+        let path = temp_file("codex-latency");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-07T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019ea3b2-2186-7c93-b560-bf587a080094\"}}\n",
+                "{\"timestamp\":\"2026-06-07T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":25},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-06-07T10:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\",\"duration_ms\":2000,\"time_to_first_token_ms\":100}}\n",
+                "{\"timestamp\":\"2026-06-07T10:09:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\",\"duration_ms\":4000,\"time_to_first_token_ms\":300}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(&path, "2026-06-07T10:10:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        // Session-level averages across the two task_complete turns:
+        // duration (2000 + 4000) / 2 = 3000; ttft (100 + 300) / 2 = 200.
+        assert_eq!(item.avg_duration_ms, Some(3000));
+        assert_eq!(item.avg_time_to_first_token_ms, Some(200));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_transcript_title_wins_over_sidecar_titles() {
         let path = temp_file("codex-title-priority");
         fs::write(
@@ -4715,6 +4785,8 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            avg_duration_ms: None,
+            avg_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             session_display_name: None,
@@ -6308,6 +6380,8 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            avg_duration_ms: None,
+            avg_time_to_first_token_ms: None,
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
