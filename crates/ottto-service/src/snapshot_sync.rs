@@ -3,7 +3,9 @@ use crate::backfill::{
     current_parser_version as backfill_current_parser_version, load_backfill_state,
     pending_backfill_sources, run_backfill, save_backfill_state,
 };
-use crate::detected_uses::{aggregate_detected_uses, merge_detected_uses};
+use crate::detected_uses::{
+    aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
+};
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
@@ -512,6 +514,8 @@ fn update_detected_uses_cache(
     let merged = merge_detected_uses(
         read_detected_uses_cache(&path),
         aggregate_detected_uses(snapshots),
+        OffsetDateTime::now_utc(),
+        TimeDuration::days(DETECTED_USE_RETENTION_DAYS),
     );
 
     std::fs::create_dir_all(&dir)

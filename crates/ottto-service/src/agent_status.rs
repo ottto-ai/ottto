@@ -232,11 +232,11 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         }
         Err(message) => {
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-            snapshot.diagnostics.push(AgentStatusDiagnostic {
-                code: "codex_usage_probe_failed".to_string(),
-                severity: AgentDiagnosticSeverity::Warning,
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "codex_usage_probe_failed",
+                AgentDiagnosticSeverity::Warning,
                 message,
-            });
+            ));
         }
     }
     snapshot.context = Some(AgentContextStatus {
@@ -348,11 +348,11 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         }
         Err(message) => {
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-            snapshot.diagnostics.push(AgentStatusDiagnostic {
-                code: "claude_statusline_cache_unavailable".to_string(),
-                severity: AgentDiagnosticSeverity::Warning,
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "claude_statusline_cache_unavailable",
+                AgentDiagnosticSeverity::Warning,
                 message,
-            });
+            ));
         }
     }
     snapshot.context = Some(AgentContextStatus {
@@ -375,11 +375,11 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         ),
     ];
     if version.command_found && version.success {
-        snapshot.diagnostics.push(AgentStatusDiagnostic {
-            code: "claude_version_detected".to_string(),
-            severity: AgentDiagnosticSeverity::Info,
-            message: "Claude Code CLI version detected.".to_string(),
-        });
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_version_detected",
+            AgentDiagnosticSeverity::Info,
+            "Claude Code CLI version detected.",
+        ));
     }
     append_current_plan_observation(&mut snapshot);
     snapshot
@@ -518,11 +518,11 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
     ));
     if settings.is_some() {
         snapshot.collection_method = AgentStatusCollectionMethod::ConfigFile;
-        snapshot.diagnostics.push(AgentStatusDiagnostic {
-            code: "pi_agent_settings_detected".to_string(),
-            severity: AgentDiagnosticSeverity::Info,
-            message: "Pi model route read from ~/.pi/agent/settings.json.".to_string(),
-        });
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "pi_agent_settings_detected",
+            AgentDiagnosticSeverity::Info,
+            "Pi model route read from ~/.pi/agent/settings.json.",
+        ));
     }
     snapshot.quota_windows = vec![unsupported_quota_window("usage")];
     snapshot.context = Some(AgentContextStatus {
@@ -673,11 +673,11 @@ fn append_codex_workspace_observations(snapshot: &mut AgentStatusSnapshot) {
         return;
     }
     snapshot.plan_observations.extend(observations);
-    snapshot.diagnostics.push(AgentStatusDiagnostic {
-        code: "codex_workspace_memberships_detected".to_string(),
-        severity: AgentDiagnosticSeverity::Info,
-        message: "Codex ID token includes additional OpenAI workspaces; plan is shown only when the token explicitly claims it.".to_string(),
-    });
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        "codex_workspace_memberships_detected",
+        AgentDiagnosticSeverity::Info,
+        "Codex ID token includes additional OpenAI workspaces; plan is shown only when the token explicitly claims it.",
+    ));
 }
 
 fn collection_method_key(method: &AgentStatusCollectionMethod) -> &'static str {
@@ -781,11 +781,11 @@ fn not_installed_snapshot(
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::High,
     });
-    snapshot.diagnostics.push(AgentStatusDiagnostic {
-        code: "agent_cli_not_found".to_string(),
-        severity: AgentDiagnosticSeverity::Warning,
-        message: format!("{binary} was not found on PATH or in known local metadata."),
-    });
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        "agent_cli_not_found",
+        AgentDiagnosticSeverity::Warning,
+        format!("{binary} was not found on PATH or in known local metadata."),
+    ));
     snapshot
 }
 
@@ -2619,11 +2619,11 @@ fn command_diagnostic(code: &str, message: &str, output: &CommandOutput) -> Agen
     } else {
         " stderr redacted".to_string()
     };
-    AgentStatusDiagnostic {
-        code: code.to_string(),
-        severity: AgentDiagnosticSeverity::Warning,
-        message: format!("{message}{status}.{stderr_hint}"),
-    }
+    AgentStatusDiagnostic::source(
+        code,
+        AgentDiagnosticSeverity::Warning,
+        format!("{message}{status}.{stderr_hint}"),
+    )
 }
 
 fn extract_email(text: &str) -> Option<String> {

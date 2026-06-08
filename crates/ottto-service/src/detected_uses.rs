@@ -20,12 +20,20 @@
 use std::collections::BTreeMap;
 
 use ottto_protocol::{DetectedUse, DetectedUseQuotaWindowState, DetectedUseTokenSample};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{SnapshotItem, SnapshotModelUsage};
 
 /// Maximum number of token-volume sparkline points retained per destination,
 /// most recent first dropped from the front. Bounds the cache file size.
 const MAX_TOKEN_SAMPLES: usize = 24;
+
+/// Destinations whose most recent activity is older than this window are pruned
+/// on the next merge. The merge unions groups by key with no natural expiry, so
+/// without this a stale or once-misclassified destination (e.g. a one-off
+/// gateway misread months ago) would linger on the card forever. A pruned
+/// destination re-appears the moment it is used again.
+pub const DETECTED_USE_RETENTION_DAYS: i64 = 90;
 
 /// Grouping key matching the Companion's `DetectedUse.id`:
 /// `(gateway_provider, plan_fingerprint, account_identifier_hash)`. The daemon
@@ -94,6 +102,8 @@ pub fn aggregate_detected_uses(snapshots: &[SnapshotItem]) -> Vec<DetectedUse> {
 pub fn merge_detected_uses(
     existing: Vec<DetectedUse>,
     fresh: Vec<DetectedUse>,
+    now: OffsetDateTime,
+    retention: Duration,
 ) -> Vec<DetectedUse> {
     let mut by_key: BTreeMap<GroupKey, DetectedUse> = BTreeMap::new();
     for entry in existing.into_iter().chain(fresh) {
@@ -107,7 +117,21 @@ pub fn merge_detected_uses(
             }
         }
     }
-    by_key.into_values().collect()
+    let cutoff = now - retention;
+    by_key
+        .into_values()
+        .filter(|entry| detected_use_is_fresh(entry, cutoff))
+        .collect()
+}
+
+/// Retain a destination unless its last activity is strictly older than
+/// `cutoff`. Empty or unparseable timestamps are kept — we never prune on an
+/// ambiguous timestamp, only on one we can confirm is stale.
+fn detected_use_is_fresh(entry: &DetectedUse, cutoff: OffsetDateTime) -> bool {
+    match OffsetDateTime::parse(entry.last_seen_at.trim(), &Rfc3339) {
+        Ok(seen) => seen >= cutoff,
+        Err(_) => true,
+    }
 }
 
 #[derive(Default)]
@@ -608,7 +632,13 @@ mod tests {
             ),
         ]);
 
-        let merged = merge_detected_uses(existing, fresh);
+        let now = OffsetDateTime::parse("2026-05-27T15:00:00Z", &Rfc3339).unwrap();
+        let merged = merge_detected_uses(
+            existing,
+            fresh,
+            now,
+            Duration::days(DETECTED_USE_RETENTION_DAYS),
+        );
         assert_eq!(merged.len(), 2);
 
         let pro = merged
@@ -626,5 +656,51 @@ mod tests {
         assert!(merged
             .iter()
             .any(|use_entry| use_entry.subscription_product.as_deref() == Some("team")));
+    }
+
+    fn detected_use(gateway: &str, last_seen_at: &str) -> DetectedUse {
+        DetectedUse {
+            gateway_provider: gateway.to_string(),
+            plan_fingerprint: None,
+            account_identifier_hash: None,
+            subscription_product: None,
+            account_label: None,
+            last_seen_at: last_seen_at.to_string(),
+            token_volume_recent: Vec::new(),
+            quota_window_state: DetectedUseQuotaWindowState::Unknown,
+            quota_used_percent: None,
+            quota_resets_at: None,
+        }
+    }
+
+    #[test]
+    fn merge_evicts_destinations_older_than_retention() {
+        // The "Anthropic API usage · 246d ago" phantom: an `anthropic` group
+        // frozen months ago while a current `openai` group keeps refreshing.
+        // After retention the stale group must be pruned, the fresh one kept.
+        let existing = vec![
+            detected_use("anthropic", "2025-10-05T13:12:31Z"),
+            detected_use("openai", "2026-06-08T17:36:00Z"),
+        ];
+        let now = OffsetDateTime::parse("2026-06-08T18:00:00Z", &Rfc3339).unwrap();
+
+        let merged = merge_detected_uses(
+            existing,
+            Vec::new(),
+            now,
+            Duration::days(DETECTED_USE_RETENTION_DAYS),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].gateway_provider, "openai");
+    }
+
+    #[test]
+    fn merge_keeps_destinations_with_unparseable_timestamps() {
+        // Never prune on an ambiguous timestamp.
+        let existing = vec![detected_use("openai", "")];
+        let now = OffsetDateTime::parse("2026-06-08T18:00:00Z", &Rfc3339).unwrap();
+        let merged = merge_detected_uses(existing, Vec::new(), now, Duration::days(90));
+        assert_eq!(merged.len(), 1);
     }
 }
