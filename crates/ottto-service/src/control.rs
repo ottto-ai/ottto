@@ -59,6 +59,7 @@ const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -3163,7 +3164,12 @@ fn publish_scan_result(
             connection.setup_run_id
         ),
     );
-    backend_post_json(&url, scan, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_post_json_with_timeout(
+        &url,
+        scan,
+        &[("X-Ottto-Setup-Run-Token", setup_run_token)],
+        SETUP_SCAN_RESULT_HTTP_TIMEOUT,
+    )
 }
 
 fn save_setup_answer(
@@ -7733,9 +7739,18 @@ fn backend_post_json<T: DeserializeOwned>(
     body: &impl Serialize,
     headers: &[(&str, &str)],
 ) -> Result<T, LocalApiError> {
+    backend_post_json_with_timeout(url, body, headers, BACKEND_REQUEST_TIMEOUT)
+}
+
+fn backend_post_json_with_timeout<T: DeserializeOwned>(
+    url: &str,
+    body: &impl Serialize,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<T, LocalApiError> {
     let mut request = ureq::post(url)
         .set("Accept", "application/json")
-        .timeout(BACKEND_REQUEST_TIMEOUT);
+        .timeout(timeout);
     for (key, value) in headers {
         request = request.set(key, value);
     }
@@ -11499,6 +11514,39 @@ log_user_prompt = true
         assert!(SETUP_VERIFICATION_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
     }
 
+    #[test]
+    fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
+        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
+        assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn publish_scan_result_accepts_response_slower_than_generic_timeout() {
+        let api_base_url = delayed_setup_scan_result_server(
+            "setup_slow_scan",
+            BACKEND_REQUEST_TIMEOUT + Duration::from_secs(1),
+        );
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_slow_scan".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+
+        let started = Instant::now();
+        let detail = publish_scan_result(
+            &api_base_url,
+            &connection,
+            "otsr_test",
+            &minimal_setup_scan_payload(),
+        )
+        .expect("scan-result POST should use setup-specific timeout");
+
+        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
+        assert_eq!(detail.run.id, "setup_slow_scan");
+    }
+
     fn setup_verify_action_backend_error_server(
         completed_body: Arc<Mutex<Option<serde_json::Value>>>,
     ) -> String {
@@ -11556,6 +11604,24 @@ log_user_prompt = true
 
     fn setup_run_cancelled_scan_server() -> String {
         setup_run_terminal_scan_server("setup_cancelled", "Setup run cancelled")
+    }
+
+    fn delayed_setup_scan_result_server(setup_run_id: &'static str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept setup scan");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.contains(&format!(
+                "/api/v1/setup-runs/{setup_run_id}/local-client/scan-result"
+            )));
+            thread::sleep(delay);
+            let body = format!(
+                r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
+            );
+            write_json_response(&mut stream, 200, "OK", &body);
+        });
+        format!("http://{address}")
     }
 
     fn setup_run_terminal_scan_server(setup_run_id: &'static str, detail: &'static str) -> String {
@@ -11703,6 +11769,20 @@ log_user_prompt = true
             }
         }
         String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn minimal_setup_scan_payload() -> SetupScanPayload {
+        SetupScanPayload {
+            machine: BTreeMap::from([
+                ("id".to_string(), json!("machine_test")),
+                ("name".to_string(), json!("Test Mac")),
+            ]),
+            companion: BTreeMap::from([("client_name".to_string(), json!(OTTTO_CLIENT_NAME))]),
+            relay_runtime: BTreeMap::from([("state".to_string(), json!("unknown"))]),
+            service: BTreeMap::from([("state".to_string(), json!("running"))]),
+            sources: Vec::new(),
+            missing_fields: Vec::new(),
+        }
     }
 
     fn http_request_complete(request: &[u8]) -> bool {
