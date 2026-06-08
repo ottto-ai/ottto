@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
@@ -1482,6 +1482,72 @@ pub struct AgentContextQuery {
     pub all_machines: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCostsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub all_machines: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_channel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_plan_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub all_machines: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalControlCommand {
@@ -1496,6 +1562,14 @@ pub enum LocalControlCommand {
     AgentContext {
         #[serde(default)]
         query: AgentContextQuery,
+    },
+    AgentCosts {
+        #[serde(default)]
+        query: AgentCostsQuery,
+    },
+    AgentSessions {
+        #[serde(default)]
+        query: AgentSessionsQuery,
     },
     AuthStart,
     AuthComplete {
@@ -1896,6 +1970,89 @@ mod tests {
                     ),
                     max_tokens: Some(4000),
                     all_machines: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_costs_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_costs",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_costs",
+            "query": {
+                "days": 14,
+                "range": "last_7_days",
+                "timezone": "America/New_York",
+                "source": "codex",
+                "machine_id": "otm_test",
+                "source_plan_profile_id": "018fe251-b6f3-7cc8-9f82-01a76449d111",
+                "bucket": "day",
+                "mode": "full",
+                "all_machines": false
+            }
+        }))
+        .expect("agent costs request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentCosts {
+                query: AgentCostsQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: None,
+                    end_date: None,
+                    timezone: Some("America/New_York".to_string()),
+                    source: Some("codex".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    bucket: Some("day".to_string()),
+                    mode: Some("full".to_string()),
+                    all_machines: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn agent_sessions_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_agent_sessions",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "cli",
+            "command": "agent_sessions",
+            "query": {
+                "limit": 25,
+                "range": "today",
+                "source": "claude_code",
+                "model": "claude-opus-4-8",
+                "machine_id": "otm_test",
+                "sort_by": "cost",
+                "sort_dir": "desc",
+                "search": "expensive",
+                "all_machines": false
+            }
+        }))
+        .expect("agent sessions request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AgentSessions {
+                query: AgentSessionsQuery {
+                    limit: Some(25),
+                    range: Some("today".to_string()),
+                    source: Some("claude_code".to_string()),
+                    model: Some("claude-opus-4-8".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    sort_by: Some("cost".to_string()),
+                    sort_dir: Some("desc".to_string()),
+                    search: Some("expensive".to_string()),
+                    all_machines: false,
+                    ..AgentSessionsQuery::default()
                 }
             }
         );

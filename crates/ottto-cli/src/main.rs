@@ -6,9 +6,9 @@ use ottto_core::{
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
-    AgentContextQuery, CliError, CliErrorCode, CliErrorResponse, DiagnosticsUploadApproval,
-    LocalControlCommand, LocalControlRequest, LocalControlResponse, RedactedValue, SourceKind,
-    LOCAL_CONTROL_PROTOCOL_VERSION,
+    AgentContextQuery, AgentCostsQuery, AgentSessionsQuery, CliError, CliErrorCode,
+    CliErrorResponse, DiagnosticsUploadApproval, LocalControlCommand, LocalControlRequest,
+    LocalControlResponse, RedactedValue, SourceKind, LOCAL_CONTROL_PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -61,6 +61,10 @@ enum Command {
     AgentStatus(SourceArgs),
     #[command(about = "Print cloud context for AI agents")]
     Context(ContextArgs),
+    #[command(about = "Print cloud cost breakdown for AI agents")]
+    Costs(CostsArgs),
+    #[command(about = "Print cloud sessions for AI agents")]
+    Sessions(SessionsArgs),
     #[command(about = "Connect this Mac through a browser claim")]
     Setup(SetupArgs),
     #[command(about = "Sign in and connect this Mac through a browser claim")]
@@ -177,6 +181,185 @@ impl ContextArgs {
             machine_id: non_empty_option(self.machine_id.as_deref()),
             source_plan_profile_id: non_empty_option(self.source_plan_profile_id.as_deref()),
             max_tokens: self.max_tokens,
+            all_machines: self.all_machines,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(
+        ArgGroup::new("source_selector")
+            .args(["source", "app"])
+            .multiple(false)
+    )
+)]
+struct CostsArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(long, value_name = "DAYS", help = "Number of days to include")]
+    days: Option<u16>,
+    #[arg(long, value_name = "RANGE", help = "Calendar range preset")]
+    range: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window start date"
+    )]
+    start_date: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window end date"
+    )]
+    end_date: Option<String>,
+    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    timezone: Option<String>,
+    #[arg(long, value_name = "SOURCE", help = "Source slug to filter costs to")]
+    source: Option<String>,
+    #[arg(long, value_enum, help = "App/source alias to filter costs to")]
+    app: Option<SourceArg>,
+    #[arg(
+        long,
+        value_name = "MACHINE_ID",
+        help = "Override the local machine filter"
+    )]
+    machine_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROFILE_ID",
+        help = "Filter by source plan profile id"
+    )]
+    source_plan_profile_id: Option<String>,
+    #[arg(long, value_name = "BUCKET", help = "Cost bucket such as day or hour")]
+    bucket: Option<String>,
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "Breakdown mode such as full or overview"
+    )]
+    mode: Option<String>,
+    #[arg(long, help = "Request account-wide costs instead of this Mac")]
+    all_machines: bool,
+}
+
+impl CostsArgs {
+    fn query(&self) -> AgentCostsQuery {
+        AgentCostsQuery {
+            days: self.days,
+            range: non_empty_option(self.range.as_deref()),
+            start_date: non_empty_option(self.start_date.as_deref()),
+            end_date: non_empty_option(self.end_date.as_deref()),
+            timezone: non_empty_option(self.timezone.as_deref()),
+            source: selected_source_slug(self.source.as_deref(), self.app),
+            machine_id: non_empty_option(self.machine_id.as_deref()),
+            source_plan_profile_id: non_empty_option(self.source_plan_profile_id.as_deref()),
+            bucket: non_empty_option(self.bucket.as_deref()),
+            mode: non_empty_option(self.mode.as_deref()),
+            all_machines: self.all_machines,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(
+    group(
+        ArgGroup::new("source_selector")
+            .args(["source", "app"])
+            .multiple(false)
+    )
+)]
+struct SessionsArgs {
+    #[arg(long, help = "Print one final JSON object and no human summary text")]
+    json: bool,
+    #[arg(
+        long,
+        value_name = "LIMIT",
+        help = "Maximum number of sessions to return"
+    )]
+    limit: Option<u16>,
+    #[arg(
+        long,
+        value_name = "CURSOR",
+        help = "Pagination cursor from a prior response"
+    )]
+    cursor: Option<String>,
+    #[arg(long, value_name = "RANGE", help = "Calendar range preset")]
+    range: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window start date"
+    )]
+    start_date: Option<String>,
+    #[arg(
+        long,
+        value_name = "YYYY-MM-DD",
+        help = "Inclusive custom window end date"
+    )]
+    end_date: Option<String>,
+    #[arg(long, value_name = "TZ", help = "IANA timezone for calendar windows")]
+    timezone: Option<String>,
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        help = "Source slug to filter sessions to"
+    )]
+    source: Option<String>,
+    #[arg(long, value_enum, help = "App/source alias to filter sessions to")]
+    app: Option<SourceArg>,
+    #[arg(long, value_name = "MODEL", help = "Model name filter")]
+    model: Option<String>,
+    #[arg(long, value_name = "PROVIDER", help = "Billing provider filter")]
+    billing_provider: Option<String>,
+    #[arg(long, value_name = "CHANNEL", help = "Billing channel filter")]
+    billing_channel: Option<String>,
+    #[arg(
+        long,
+        value_name = "MACHINE_ID",
+        help = "Override the local machine filter"
+    )]
+    machine_id: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROFILE_ID",
+        help = "Filter by source plan profile id"
+    )]
+    source_plan_profile_id: Option<String>,
+    #[arg(long, value_name = "USD", help = "Minimum session cost")]
+    min_cost: Option<f64>,
+    #[arg(long, value_name = "USD", help = "Maximum session cost")]
+    max_cost: Option<f64>,
+    #[arg(long, value_name = "FIELD", help = "Sort field")]
+    sort_by: Option<String>,
+    #[arg(long, value_name = "DIR", help = "Sort direction, asc or desc")]
+    sort_dir: Option<String>,
+    #[arg(long, value_name = "TEXT", help = "Search text")]
+    search: Option<String>,
+    #[arg(long, help = "Request account-wide sessions instead of this Mac")]
+    all_machines: bool,
+}
+
+impl SessionsArgs {
+    fn query(&self) -> AgentSessionsQuery {
+        AgentSessionsQuery {
+            limit: self.limit,
+            cursor: non_empty_option(self.cursor.as_deref()),
+            range: non_empty_option(self.range.as_deref()),
+            start_date: non_empty_option(self.start_date.as_deref()),
+            end_date: non_empty_option(self.end_date.as_deref()),
+            timezone: non_empty_option(self.timezone.as_deref()),
+            source: selected_source_slug(self.source.as_deref(), self.app),
+            model: non_empty_option(self.model.as_deref()),
+            billing_provider: non_empty_option(self.billing_provider.as_deref()),
+            billing_channel: non_empty_option(self.billing_channel.as_deref()),
+            machine_id: non_empty_option(self.machine_id.as_deref()),
+            source_plan_profile_id: non_empty_option(self.source_plan_profile_id.as_deref()),
+            min_cost: self.min_cost.map(|value| value.to_string()),
+            max_cost: self.max_cost.map(|value| value.to_string()),
+            sort_by: non_empty_option(self.sort_by.as_deref()),
+            sort_dir: non_empty_option(self.sort_dir.as_deref()),
+            search: non_empty_option(self.search.as_deref()),
             all_machines: self.all_machines,
         }
     }
@@ -403,6 +586,22 @@ fn validate_cli(cli: &Cli) -> Result<(), CliError> {
         return Err(CliError {
             code: CliErrorCode::InvalidRequest,
             message: "ottto context is agent JSON only; pass --json".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    if matches!(&cli.command, Command::Costs(args) if !args.json) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto costs is agent JSON only; pass --json".to_string(),
+            retryable: false,
+            details: BTreeMap::new(),
+        });
+    }
+    if matches!(&cli.command, Command::Sessions(args) if !args.json) {
+        return Err(CliError {
+            code: CliErrorCode::InvalidRequest,
+            message: "ottto sessions is agent JSON only; pass --json".to_string(),
             retryable: false,
             details: BTreeMap::new(),
         });
@@ -1245,6 +1444,12 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Context(args) => LocalControlCommand::AgentContext {
             query: args.query(),
         },
+        Command::Costs(args) => LocalControlCommand::AgentCosts {
+            query: args.query(),
+        },
+        Command::Sessions(args) => LocalControlCommand::AgentSessions {
+            query: args.query(),
+        },
         Command::ClaudeCodeStatusline(_) => unreachable!("statusLine helper is handled directly"),
         Command::Setup(args) | Command::Login(args) => LocalControlCommand::Setup {
             sources: Vec::new(),
@@ -1306,6 +1511,8 @@ fn command_json(command: &Command) -> bool {
         Command::Setup(args) | Command::Login(args) => args.json,
         Command::Logout(args) => args.json,
         Command::Context(args) => args.json,
+        Command::Costs(args) => args.json,
+        Command::Sessions(args) => args.json,
         Command::AgentStatus(args) | Command::Fix(args) => args.json,
         Command::Verify(args) => args.json,
         Command::Diagnostics {
@@ -1324,6 +1531,10 @@ fn non_empty_option(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn selected_source_slug(source: Option<&str>, app: Option<SourceArg>) -> Option<String> {
+    non_empty_option(source).or_else(|| app.map(|source| source.slug().to_string()))
 }
 
 fn request_id() -> String {
@@ -1396,6 +1607,8 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
         LocalControlCommand::AgentContext { .. } => "agent_context",
+        LocalControlCommand::AgentCosts { .. } => "agent_costs",
+        LocalControlCommand::AgentSessions { .. } => "agent_sessions",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
@@ -1633,7 +1846,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 19] = [
+        let commands: [(&str, &[&str]); 21] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
@@ -1650,6 +1863,8 @@ mod tests {
                 &["ottto", "agent-status", "--help"],
             ),
             ("ottto context --help", &["ottto", "context", "--help"]),
+            ("ottto costs --help", &["ottto", "costs", "--help"]),
+            ("ottto sessions --help", &["ottto", "sessions", "--help"]),
             ("ottto setup --help", &["ottto", "setup", "--help"]),
             ("ottto login --help", &["ottto", "login", "--help"]),
             ("ottto account --help", &["ottto", "account", "--help"]),
@@ -1705,6 +1920,25 @@ mod tests {
         assert_eq!(
             error.message,
             "ottto context is agent JSON only; pass --json"
+        );
+    }
+
+    #[test]
+    fn costs_requires_json_mode() {
+        let cli = Cli::parse_from(["ottto", "costs"]);
+        let error = validate_cli(&cli).expect_err("costs requires json");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert_eq!(error.message, "ottto costs is agent JSON only; pass --json");
+    }
+
+    #[test]
+    fn sessions_requires_json_mode() {
+        let cli = Cli::parse_from(["ottto", "sessions"]);
+        let error = validate_cli(&cli).expect_err("sessions requires json");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "ottto sessions is agent JSON only; pass --json"
         );
     }
 
@@ -2290,6 +2524,132 @@ mod tests {
                 query: AgentContextQuery {
                     source: Some("bedrock".to_string()),
                     ..AgentContextQuery::default()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn costs_builds_agent_costs_request() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "costs",
+            "--json",
+            "--days",
+            "14",
+            "--range",
+            "last_7_days",
+            "--start-date",
+            "2026-06-01",
+            "--end-date",
+            "2026-06-05",
+            "--timezone",
+            "America/Los_Angeles",
+            "--source",
+            "vertex",
+            "--machine-id",
+            "otm_test",
+            "--source-plan-profile-id",
+            "018fe251-b6f3-7cc8-9f82-01a76449d111",
+            "--bucket",
+            "day",
+            "--mode",
+            "full",
+        ]);
+        validate_cli(&cli).expect("costs json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentCosts {
+                query: AgentCostsQuery {
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: Some("vertex".to_string()),
+                    machine_id: Some("otm_test".to_string()),
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    bucket: Some("day".to_string()),
+                    mode: Some("full".to_string()),
+                    all_machines: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn sessions_builds_agent_sessions_request() {
+        let cli = Cli::parse_from([
+            "ottto",
+            "sessions",
+            "--json",
+            "--limit",
+            "25",
+            "--cursor",
+            "next_123",
+            "--range",
+            "today",
+            "--start-date",
+            "2026-06-01",
+            "--end-date",
+            "2026-06-05",
+            "--timezone",
+            "America/Los_Angeles",
+            "--app",
+            "codex",
+            "--model",
+            "gpt-5.3-codex",
+            "--billing-provider",
+            "openai",
+            "--billing-channel",
+            "subscription",
+            "--source-plan-profile-id",
+            "018fe251-b6f3-7cc8-9f82-01a76449d111",
+            "--min-cost",
+            "1.25",
+            "--max-cost",
+            "7.5",
+            "--sort-by",
+            "cost",
+            "--sort-dir",
+            "desc",
+            "--search",
+            "roadmap",
+            "--all-machines",
+        ]);
+        validate_cli(&cli).expect("sessions json valid");
+        let invocation = invocation_from_cli(cli);
+
+        assert_eq!(invocation.output_mode, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::AgentSessions {
+                query: AgentSessionsQuery {
+                    limit: Some(25),
+                    cursor: Some("next_123".to_string()),
+                    range: Some("today".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: Some("codex".to_string()),
+                    model: Some("gpt-5.3-codex".to_string()),
+                    billing_provider: Some("openai".to_string()),
+                    billing_channel: Some("subscription".to_string()),
+                    machine_id: None,
+                    source_plan_profile_id: Some(
+                        "018fe251-b6f3-7cc8-9f82-01a76449d111".to_string()
+                    ),
+                    min_cost: Some("1.25".to_string()),
+                    max_cost: Some("7.5".to_string()),
+                    sort_by: Some("cost".to_string()),
+                    sort_dir: Some("desc".to_string()),
+                    search: Some("roadmap".to_string()),
+                    all_machines: true,
                 }
             }
         );

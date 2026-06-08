@@ -21,10 +21,11 @@ Every adapter must:
   monitors, or local source files
 - summarize redacted status facts instead of pasting raw diagnostics payloads
 
-Agents that need product context should call `ottto context --json` instead of
-parsing local session files or the human web UI. The command is intentionally
-JSON-only and returns backend-computed account, machine, subscription, usage,
-cost, and recommendation context through the connected local daemon.
+Agents that need product context should call `ottto context --json`, `ottto
+costs --json`, or `ottto sessions --json` instead of parsing local session
+files or the human web UI. These commands are intentionally JSON-only and return
+backend-computed account, machine, subscription, usage, cost, recommendation,
+and session facts through the connected local daemon.
 
 ## MCP Decision
 

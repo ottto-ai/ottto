@@ -170,8 +170,8 @@ fi
 if [[ ! "$commit" =~ ^[0-9a-f]{7,40}$ ]]; then
   fail "Stable closeout manifest commit is not a git SHA prefix: $commit"
 fi
-if ! jq -e '.min_protocol_version == 13' "$MANIFEST" >/dev/null; then
-  fail "Stable closeout manifest min_protocol_version must be 13"
+if ! jq -e '.min_protocol_version == 14' "$MANIFEST" >/dev/null; then
+  fail "Stable closeout manifest min_protocol_version must be 14"
 fi
 
 gate="$(jq -c '.quality_gates.stable_clean_machine_qa // empty' "$MANIFEST")"
@@ -288,7 +288,7 @@ for owner in "${supported_owners[@]}"; do
         and .local_platform.version == $version
         and .local_platform.release_channel == $channel
         and .local_platform.install_owner == $owner
-        and .local_platform.protocol_version == 13
+        and .local_platform.protocol_version == 14
         and .local_platform.release_manifest_sha256 == $manifest_sha
     ' "$evidence_path" >/dev/null; then
     fail "Stable clean-machine QA evidence has invalid local-platform runtime binding for install owner: $owner"

@@ -151,8 +151,8 @@ fi
 if [[ -z "$min_supported_version" ]]; then
   fail "Stable manifest is missing min_supported_version"
 fi
-if [[ "$min_protocol_version" != "13" ]]; then
-  fail "Stable manifest min_protocol_version must be 13"
+if [[ "$min_protocol_version" != "14" ]]; then
+  fail "Stable manifest min_protocol_version must be 14"
 fi
 if [[ "$supported_owner_count" -lt 1 ]]; then
   fail "Stable manifest must list supported install owners"
@@ -401,8 +401,8 @@ if local_platform.get("version") != candidate.get("version"):
     die("stable-candidate RC evidence local_platform.version must match candidate version")
 if local_platform.get("release_channel") != "stable-candidate":
     die("stable-candidate RC evidence local_platform.release_channel must be stable-candidate")
-if local_platform.get("protocol_version") != 13:
-    die("stable-candidate RC evidence local_platform.protocol_version must be 13")
+if local_platform.get("protocol_version") != 14:
+    die("stable-candidate RC evidence local_platform.protocol_version must be 14")
 if local_platform.get("release_manifest_sha256") != candidate_manifest_sha:
     die("stable-candidate RC evidence local_platform.release_manifest_sha256 must match candidate manifest")
 

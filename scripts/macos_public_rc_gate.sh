@@ -175,8 +175,8 @@ if candidate_manifest.get("channel") != "stable-candidate":
     die("stable-candidate manifest channel must be stable-candidate")
 candidate_version = require_string(candidate_manifest.get("version"), "stable-candidate manifest version")
 candidate_commit = require_string(candidate_manifest.get("commit"), "stable-candidate manifest commit")
-if candidate_manifest.get("min_protocol_version") != 13:
-    die("stable-candidate manifest min_protocol_version must be 13")
+if candidate_manifest.get("min_protocol_version") != 14:
+    die("stable-candidate manifest min_protocol_version must be 14")
 if not re.fullmatch(r"[0-9a-f]{7,40}", candidate_commit):
     die("stable-candidate manifest commit is not a git SHA prefix")
 
@@ -230,8 +230,8 @@ if local_platform.get("version") != candidate_version:
     die("evidence local_platform.version does not match stable-candidate manifest")
 if local_platform.get("release_channel") != "stable-candidate":
     die("evidence local_platform.release_channel must be stable-candidate")
-if local_platform.get("protocol_version") != 13:
-    die("evidence local_platform.protocol_version must be 13")
+if local_platform.get("protocol_version") != 14:
+    die("evidence local_platform.protocol_version must be 14")
 if local_platform.get("release_manifest_sha256") != candidate_sha:
     die("evidence local_platform.release_manifest_sha256 does not match stable-candidate manifest")
 if environment.get("host_kind") not in {"trusted_internal_macos", "clean_macos"}:
@@ -251,8 +251,8 @@ if stable_manifest_path is not None:
     if stable_manifest.get("channel") != "stable":
         die("stable manifest channel must be stable")
     stable_commit = require_string(stable_manifest.get("commit"), "stable manifest commit")
-    if stable_manifest.get("min_protocol_version") != 13:
-        die("stable manifest min_protocol_version must be 13")
+    if stable_manifest.get("min_protocol_version") != 14:
+        die("stable manifest min_protocol_version must be 14")
     if stable_commit != candidate_commit:
         die("stable manifest commit must match the stable-candidate RC commit")
     quality_gates = require_object(stable_manifest.get("quality_gates"), "stable quality_gates")
