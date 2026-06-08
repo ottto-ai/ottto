@@ -1,6 +1,6 @@
 {
   "request_id": "req_cli_diagnostics_upload_fixture",
-  "protocol_version": 14,
+  "protocol_version": 15,
   "token": "test-token",
   "client_kind": "cli",
   "command": "diagnostics_collect",

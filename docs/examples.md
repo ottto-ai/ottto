@@ -26,7 +26,8 @@ ottto sessions --json --limit 20 --source codex
 ottto sessions --json --all-machines --sort-by cost --sort-dir desc
 ```
 
-Use `context`, `costs`, and `sessions` only as machine-readable agent surfaces.
+Use `context`, `costs`, `sessions`, `recommendations`, and `provider-impact` only
+as machine-readable agent surfaces.
 They return backend-computed context, cost breakdowns, and session lists through
 the local daemon and require this Mac to be connected. `--app
 codex|claude-code|pi` is available as a local app alias, while `--source`

@@ -74,7 +74,7 @@
         "app_version": "unknown",
         "cli_version": "0.1.0",
         "daemon_version": "0.1.0",
-        "protocol_version": 14,
+        "protocol_version": 15,
         "build_id": "dev",
         "version_mismatch": false
       }

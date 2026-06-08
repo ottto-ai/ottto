@@ -106,7 +106,7 @@ jq -n \
     commit: "abcdef123456",
     generated_at: "2026-05-23T00:00:00Z",
     min_supported_version: "0.1.0",
-    min_protocol_version: 14,
+    min_protocol_version: 15,
     supported_install_owners: ["hosted_installer", "app_bundle", "homebrew"],
     rollback: {
       strategy: "channel_latest_pointer",

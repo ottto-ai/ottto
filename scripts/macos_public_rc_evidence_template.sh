@@ -150,8 +150,8 @@ if product != "ottto-local-platform":
     die(f"expected product=ottto-local-platform, got {product}")
 if channel != "stable-candidate":
     die(f"expected stable-candidate manifest, got channel={channel}")
-if min_protocol_version != 14:
-    die("manifest.min_protocol_version must be 14")
+if min_protocol_version != 15:
+    die("manifest.min_protocol_version must be 15")
 
 if arch not in {"arm64", "x86_64", "universal", "TODO_arm64_x86_64_or_universal"}:
     die("--arch must be arm64, x86_64, or universal", code=2)

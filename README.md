@@ -245,6 +245,9 @@ ottto costs --json --all-machines --bucket day
 ottto sessions --json
 ottto sessions --json --limit 20 --source codex
 ottto sessions --json --all-machines --sort-by cost --sort-dir desc
+ottto recommendations --json
+ottto provider-impact --json
+ottto provider-impact --json --provider openai --app codex --kind quota --limit 25
 ottto apps --json
 ottto apps detect --json
 ottto apps status --app codex --json
@@ -279,8 +282,8 @@ returning exit code `61`. Agents and headless flows can pass `--no-browser` to
 skip auto-open and `--no-wait` to return the fallback claim payload immediately
 with exit code `60`. `--watch` without `--json` exits as `invalid_request`.
 Human mode prints short summaries only and is not a parsing contract. `context`,
-`costs`, and `sessions` are agent-only JSON commands; omitting `--json` exits as
-`invalid_request`.
+`costs`, `sessions`, `recommendations`, and `provider-impact` are agent-only
+JSON commands; omitting `--json` exits as `invalid_request`.
 All commands call `ottto-service` through the local-control protocol except
 local uninstall cleanup and the hidden Claude Code status-line helper.
 
