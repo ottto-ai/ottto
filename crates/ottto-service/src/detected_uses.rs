@@ -339,6 +339,8 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 0,
+            avg_duration_ms: None,
+            avg_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets,
             session_display_name: None,
