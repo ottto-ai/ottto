@@ -117,9 +117,17 @@ pub fn merge_detected_uses(
             }
         }
     }
+    prune_stale_detected_uses(by_key.into_values().collect(), now, retention)
+}
+
+pub fn prune_stale_detected_uses(
+    entries: Vec<DetectedUse>,
+    now: OffsetDateTime,
+    retention: Duration,
+) -> Vec<DetectedUse> {
     let cutoff = now - retention;
-    by_key
-        .into_values()
+    entries
+        .into_iter()
         .filter(|entry| detected_use_is_fresh(entry, cutoff))
         .collect()
 }

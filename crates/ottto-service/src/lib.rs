@@ -16,6 +16,7 @@ pub mod snapshots;
 pub mod unix_socket;
 pub mod xpc_mach;
 
+use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
 use ottto_core::{
     default_connection_api_base_url, default_support_dir, empty_status, launch_agent_path,
     launchd_target, local_lifecycle_home_dir, source_state_file_name, FileConnectionStore,
@@ -47,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use thiserror::Error;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendErrorKind {
@@ -1575,11 +1576,25 @@ fn detected_uses_for_health(
     source: &SourceKind,
     agent_status: Option<&AgentStatusSnapshot>,
 ) -> Vec<DetectedUse> {
-    let mut detected = load_detected_uses_for_source(source);
+    let mut detected = prune_detected_uses_for_health(
+        load_detected_uses_for_source(source),
+        OffsetDateTime::now_utc(),
+    );
     if let Some(snapshot) = agent_status {
         merge_current_plan_quota(&mut detected, snapshot);
     }
     detected
+}
+
+fn prune_detected_uses_for_health(
+    detected: Vec<DetectedUse>,
+    now: OffsetDateTime,
+) -> Vec<DetectedUse> {
+    prune_stale_detected_uses(
+        detected,
+        now,
+        TimeDuration::days(DETECTED_USE_RETENTION_DAYS),
+    )
 }
 
 /// Overlay the current plan's live quota onto the detected use whose
@@ -2523,6 +2538,47 @@ mod tests {
             .iter()
             .find(|candidate| candidate.name == section)
             .and_then(|candidate| candidate.items.get(key))
+    }
+
+    #[test]
+    fn health_detected_uses_prunes_stale_cache_rows() {
+        use ottto_protocol::DetectedUseTokenSample;
+
+        let detected = vec![
+            DetectedUse {
+                gateway_provider: "anthropic".to_string(),
+                plan_fingerprint: None,
+                account_identifier_hash: None,
+                subscription_product: None,
+                account_label: None,
+                last_seen_at: "2025-10-05T13:12:31Z".to_string(),
+                token_volume_recent: vec![DetectedUseTokenSample {
+                    at: "2025-10-05T13:00:00Z".to_string(),
+                    tokens: 15_417_886,
+                }],
+                quota_window_state: DetectedUseQuotaWindowState::Unknown,
+                quota_used_percent: None,
+                quota_resets_at: None,
+            },
+            DetectedUse {
+                gateway_provider: "openai".to_string(),
+                plan_fingerprint: Some("pro::20598".to_string()),
+                account_identifier_hash: None,
+                subscription_product: Some("pro".to_string()),
+                account_label: Some("Pro".to_string()),
+                last_seen_at: "2026-06-08T17:36:00Z".to_string(),
+                token_volume_recent: Vec::new(),
+                quota_window_state: DetectedUseQuotaWindowState::Unknown,
+                quota_used_percent: None,
+                quota_resets_at: None,
+            },
+        ];
+        let now = OffsetDateTime::parse("2026-06-08T18:00:00Z", &Rfc3339).unwrap();
+
+        let pruned = prune_detected_uses_for_health(detected, now);
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].gateway_provider, "openai");
     }
 
     #[test]
