@@ -373,6 +373,8 @@ mod tests {
             request_count: 0,
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
+            max_duration_ms: None,
+            max_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets,
             session_display_name: None,

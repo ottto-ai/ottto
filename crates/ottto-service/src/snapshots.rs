@@ -193,6 +193,12 @@ pub struct SnapshotItem {
     pub avg_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avg_time_to_first_token_ms: Option<u64>,
+    // Slowest single turn of the session (max), the tail the average smooths
+    // over. Same availability as the avg fields above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_time_to_first_token_ms: Option<u64>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     pub session_display_name: Option<String>,
@@ -598,6 +604,9 @@ struct SnapshotAccumulator {
     latency_duration_ms_count: u64,
     latency_ttft_ms_sum: u64,
     latency_ttft_ms_count: u64,
+    // Max (slowest single turn) alongside the avg — the tail the average hides.
+    latency_duration_ms_max: u64,
+    latency_ttft_ms_max: u64,
 }
 
 impl SnapshotAccumulator {
@@ -625,6 +634,8 @@ impl SnapshotAccumulator {
             latency_duration_ms_count: 0,
             latency_ttft_ms_sum: 0,
             latency_ttft_ms_count: 0,
+            latency_duration_ms_max: 0,
+            latency_ttft_ms_max: 0,
         }
     }
 
@@ -927,6 +938,10 @@ impl SnapshotAccumulator {
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
             avg_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
                 .then(|| self.latency_ttft_ms_sum / self.latency_ttft_ms_count),
+            max_duration_ms: (self.latency_duration_ms_count > 0)
+                .then_some(self.latency_duration_ms_max),
+            max_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
+                .then_some(self.latency_ttft_ms_max),
             model_usage,
             usage_buckets,
             session_display_name: self.title.clone(),
@@ -1339,6 +1354,8 @@ fn codex_state_only_snapshot(
         request_count: 0,
         avg_duration_ms: None,
         avg_time_to_first_token_ms: None,
+        max_duration_ms: None,
+        max_time_to_first_token_ms: None,
         model_usage,
         usage_buckets,
         session_display_name: display_name,
@@ -2029,11 +2046,14 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                 .latency_duration_ms_sum
                 .saturating_add(duration_ms);
             accumulator.latency_duration_ms_count += 1;
+            accumulator.latency_duration_ms_max =
+                accumulator.latency_duration_ms_max.max(duration_ms);
         }
         if let Some(ttft_ms) = u64_at(value, &["payload", "time_to_first_token_ms"]) {
             accumulator.latency_ttft_ms_sum =
                 accumulator.latency_ttft_ms_sum.saturating_add(ttft_ms);
             accumulator.latency_ttft_ms_count += 1;
+            accumulator.latency_ttft_ms_max = accumulator.latency_ttft_ms_max.max(ttft_ms);
         }
     }
 }
@@ -3941,6 +3961,9 @@ mod tests {
         // duration (2000 + 4000) / 2 = 3000; ttft (100 + 300) / 2 = 200.
         assert_eq!(item.avg_duration_ms, Some(3000));
         assert_eq!(item.avg_time_to_first_token_ms, Some(200));
+        // Max (slowest turn): duration max(2000, 4000) = 4000; ttft max(100, 300) = 300.
+        assert_eq!(item.max_duration_ms, Some(4000));
+        assert_eq!(item.max_time_to_first_token_ms, Some(300));
 
         let _ = fs::remove_file(path);
     }
@@ -4787,6 +4810,8 @@ mod tests {
             request_count: 1,
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
+            max_duration_ms: None,
+            max_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             session_display_name: None,
@@ -6382,6 +6407,8 @@ mod tests {
             request_count: 1,
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
+            max_duration_ms: None,
+            max_time_to_first_token_ms: None,
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
