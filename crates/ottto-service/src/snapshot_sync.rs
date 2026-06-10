@@ -383,8 +383,8 @@ fn sync_source(
                 {
                     eprintln!(
                         "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
-                         for {}; refresh the relay device binding or reconnect this Mac before \
-                         retrying local usage sync.",
+                         for {}; start setup or sign in from the Ottto app before retrying \
+                         local usage sync.",
                         rejected.status,
                         source.api_slug(),
                     );
@@ -944,6 +944,10 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
         assert!(requests[0].contains("\"source\":\"codex\""));
+        assert!(requests[0].contains("\"client_name\":\"ottto-service\""));
+        assert!(requests[0].contains("\"client_version\":"));
+        assert!(requests[0].contains("\"machine_id\":\"otm_test\""));
+        assert!(requests[0].contains("\"platform\":"));
         assert!(requests[0].contains("X-Ottto-Device-Secret: device-secret"));
         assert!(requests[1].contains("POST /api/v1/agent-status/snapshots"));
         assert!(requests[1].contains("Authorization:"));

@@ -1,12 +1,12 @@
 use crate::snapshots::{SnapshotBatchRequest, SnapshotSource};
 use anyhow::{anyhow, Result};
 use ottto_core::{
-    ControlTokenStore, FileDeviceStore, KeychainSecretStore, LocalDeviceBinding,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, ControlTokenStore, FileDeviceStore, KeychainSecretStore,
+    LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::AgentStatusSnapshot;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
@@ -146,6 +146,21 @@ struct RelayTokenResponse {
     token: String,
 }
 
+pub fn relay_token_request_payload(device: &LocalDeviceBinding, source: &str) -> Value {
+    let mut payload = json!({
+        "source": source,
+        "platform": std::env::consts::OS,
+        "client_name": "ottto-service",
+        "client_version": compiled_release_version(),
+    });
+    if let Some(machine_id) = device.machine_id.as_deref().map(str::trim) {
+        if !machine_id.is_empty() {
+            payload["machine_id"] = json!(machine_id);
+        }
+    }
+    payload
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     api_base_url: String,
@@ -186,7 +201,7 @@ impl SnapshotApiClient {
             .post(&url)
             .set("Accept", "application/json")
             .set("X-Ottto-Device-Secret", device_secret)
-            .send_json(json!({ "source": source.api_slug() }))
+            .send_json(relay_token_request_payload(device, source.api_slug()))
             .map_err(|error| anyhow!("issue relay token failed: {error}"))?
             .into_json()
             .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;

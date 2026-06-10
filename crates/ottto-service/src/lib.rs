@@ -20,9 +20,9 @@ use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAY
 use ottto_core::{
     default_connection_api_base_url, default_support_dir, empty_status, launch_agent_path,
     launchd_target, local_lifecycle_home_dir, source_state_file_name, FileConnectionStore,
-    FileSourceStateStore, LocalConnectionBinding, LocalSourceState, RedactionPolicy,
-    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME,
-    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    FileSourceStateStore, LocalConnectionBinding, LocalDeviceBinding, LocalSourceState,
+    RedactionPolicy, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 #[cfg(target_os = "macos")]
 use ottto_core::{ControlTokenStore, KeychainSecretStore};
@@ -262,6 +262,18 @@ impl LocalDaemon {
         self
     }
 
+    /// Seed known registered sources from the persisted relay-device binding so
+    /// a freshly restarted daemon never reports a connected account with zero
+    /// sources while the slower agent scan is still pending. These rows are
+    /// intentionally `verifying` and carry no agent snapshot; a real scan or
+    /// verification result replaces them with authoritative health.
+    pub fn with_registered_device_sources(self, device: Option<LocalDeviceBinding>) -> Self {
+        if let Ok(mut state) = self.inner.lock() {
+            seed_registered_sources(&mut state, device.as_ref());
+        }
+        self
+    }
+
     /// Enable persistence of per-source first-seen timestamps under `dir`
     /// (`<dir>/<slug>-state.json`) and boot-load any existing files into the
     /// in-memory map. Production passes `default_sources_dir()`; constructors
@@ -324,8 +336,6 @@ impl LocalDaemon {
         let mut state = self.state()?;
         let previous_account = state.account.clone();
         state.pending_auth = Some(claim.clone());
-        state.sources.clear();
-        state.clear_source_state();
         state.account = LocalAccountBinding {
             state: LocalAccountState::ClaimPending,
             user: previous_account.user,
@@ -1172,6 +1182,73 @@ fn source_slug(source: &SourceKind) -> &'static str {
     }
 }
 
+fn source_from_slug(slug: &str) -> Option<SourceKind> {
+    match slug {
+        "codex" => Some(SourceKind::Codex),
+        "claude_code" | "claude-code" => Some(SourceKind::ClaudeCode),
+        "pi" => Some(SourceKind::Pi),
+        _ => None,
+    }
+}
+
+fn seed_registered_sources(state: &mut DaemonState, device: Option<&LocalDeviceBinding>) {
+    if state.account.state != LocalAccountState::Connected {
+        return;
+    }
+    let Some(device) = device else {
+        return;
+    };
+    let sources = device
+        .sources
+        .iter()
+        .filter_map(|slug| source_from_slug(slug))
+        .filter(|source| !state.sources.iter().any(|health| health.source == *source))
+        .collect::<Vec<_>>();
+    for source in sources {
+        state.sources.push(cached_source_health(state, source));
+    }
+}
+
+fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth {
+    let expected_account_id = state.account.user.as_ref().map(|user| user.id.clone());
+    SourceHealth {
+        source: source.clone(),
+        descriptor: source_descriptor(&source),
+        state: SourceState::Verifying,
+        grade: HealthGrade::Unknown,
+        account_binding: AccountBindingState {
+            expected_account_id,
+            observed_account_id: None,
+            matched: None,
+        },
+        config: SourceConfigState {
+            discovered: true,
+            path_hint: config_path_hint(&source).map(str::to_string),
+            fingerprint: None,
+            drift: Vec::new(),
+        },
+        collector: None,
+        agent_status: None,
+        plan_observations: Vec::new(),
+        detected_uses: Vec::new(),
+        last_seen_at: None,
+        last_verified_at: None,
+        problems: Vec::new(),
+        recommended_actions: Vec::new(),
+        connected_at: state.first_seen(&source),
+        telemetry_configured: telemetry_configured_for_source(&source),
+        reconciliation_enabled: state.reconciliation_enabled(&source),
+    }
+}
+
+fn config_path_hint(source: &SourceKind) -> Option<&'static str> {
+    match source {
+        SourceKind::Codex => Some("~/.codex/config.toml"),
+        SourceKind::ClaudeCode => Some("~/.claude/settings.json"),
+        SourceKind::Pi => None,
+    }
+}
+
 /// Boot-load persisted first-seen timestamps for all sources from `dir`, keyed
 /// by source slug. Missing or unreadable files are skipped (graceful empty),
 /// matching the lenient posture of the detected-uses cache.
@@ -1191,18 +1268,32 @@ fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
     map
 }
 
-/// Whether a local telemetry key is configured for `source`. Telemetry is a
-/// Codex / Claude Code concept, so Pi returns `None`. A keystore read error is
-/// treated as "not configured" rather than surfaced.
+/// Whether local live telemetry credentials are configured for `source`.
+/// Telemetry is a Codex / Claude Code concept, so Pi returns `None`. Both the
+/// legacy per-source key store and the relay-device setup-run path count: the
+/// latter is what Companion install actions provision on this Mac.
 fn telemetry_configured_for_source(source: &SourceKind) -> Option<bool> {
     match source {
         SourceKind::Codex | SourceKind::ClaudeCode => Some(
             keychain::TelemetryKeyStore::production()
                 .latest_key_id(source)
-                .is_ok_and(|key| key.is_some()),
+                .is_ok_and(|key| key.is_some())
+                || relay_device_credentials_include_source(source),
         ),
         SourceKind::Pi => None,
     }
+}
+
+fn relay_device_credentials_include_source(source: &SourceKind) -> bool {
+    let slug = source_slug(source);
+    crate::snapshot_client::load_snapshot_device_credentials()
+        .ok()
+        .is_some_and(|(device, _secret)| {
+            device
+                .sources
+                .iter()
+                .any(|configured_source| configured_source == slug)
+        })
 }
 
 const CONNECTOR_REGISTRY_JSON: &str = include_str!(env!("OTTTO_CONNECTOR_REGISTRY_PATH"));
@@ -1429,22 +1520,61 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
     // configured). connected_at is left untouched — it is a stable first-seen.
     let telemetry_configured = telemetry_configured_for_source(&snapshot.source);
     let reconciliation_enabled = state.reconciliation_enabled(&snapshot.source);
-    if let Some(existing) = state
+    if let Some(index) = state
         .sources
-        .iter_mut()
-        .find(|health| health.source == snapshot.source)
+        .iter()
+        .position(|health| health.source == snapshot.source)
     {
-        existing.agent_status = Some(snapshot.clone());
-        existing.last_seen_at = Some(snapshot.captured_at.clone());
-        existing.telemetry_configured = telemetry_configured;
-        existing.reconciliation_enabled = reconciliation_enabled;
-        if matches!(snapshot.status, AgentStatusState::Available) {
-            existing.last_verified_at = Some(snapshot.captured_at.clone());
+        let existing = state.sources[index].clone();
+        let mut refreshed = source_health_from_agent_status(state, snapshot);
+        let preserve_config_drift_health = refreshed.config.drift.is_empty()
+            && !existing.config.drift.is_empty()
+            && has_config_drift_problem(&existing);
+        if refreshed.config.path_hint.is_none() {
+            refreshed.config.path_hint = existing.config.path_hint.clone();
         }
+        if refreshed.config.fingerprint.is_none() {
+            refreshed.config.fingerprint = existing.config.fingerprint.clone();
+        }
+        let preserved_config_drift =
+            refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
+        if preserved_config_drift {
+            refreshed.config.drift = existing.config.drift.clone();
+        }
+        refreshed.config.discovered |= existing.config.discovered;
+        if refreshed.collector.is_none() {
+            refreshed.collector = existing.collector.clone();
+        }
+        if refreshed.connected_at.is_none() {
+            refreshed.connected_at = existing.connected_at.clone();
+        }
+        if refreshed.detected_uses.is_empty() {
+            refreshed.detected_uses = existing.detected_uses.clone();
+        }
+        refreshed.telemetry_configured = telemetry_configured;
+        refreshed.reconciliation_enabled = reconciliation_enabled;
+        if preserve_config_drift_health {
+            refreshed.state = existing.state.clone();
+            refreshed.grade = existing.grade.clone();
+            refreshed.problems = existing.problems.clone();
+            refreshed.recommended_actions = existing.recommended_actions.clone();
+            refreshed.last_verified_at = existing.last_verified_at.clone();
+        }
+        state.sources[index] = refreshed;
         return;
     }
     let health = source_health_from_agent_status(state, snapshot);
     state.sources.push(health);
+}
+
+fn has_config_drift_problem(health: &SourceHealth) -> bool {
+    health.problems.iter().any(|problem| {
+        [
+            StableProblemCode::ConfigMissing,
+            StableProblemCode::ConfigDrift,
+        ]
+        .contains(&problem.code)
+    })
 }
 
 fn source_health_from_agent_status(
@@ -1806,7 +1936,7 @@ fn repair_authority_for_state(state: &DaemonState) -> RepairAuthority {
             setup_run_id: None,
             message: StableMessage {
                 code: "setup_run_reconnect_required".to_string(),
-                text: "This Mac has no active Ottto setup-run binding. Open ottto.net/apps in your browser to reconnect before approving repair actions."
+                text: "This Mac has no active Ottto setup binding. Start setup from the Ottto app before approving repair actions."
                     .to_string(),
             },
         };
@@ -2370,6 +2500,24 @@ mod tests {
     }
 
     #[test]
+    fn auth_claim_preserves_existing_source_health() {
+        let daemon = daemon();
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("source health should update");
+
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.account.state, LocalAccountState::ClaimPending);
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+    }
+
+    #[test]
     fn verification_result_updates_source_health() {
         let daemon = daemon();
         let result = SourceVerificationResult {
@@ -2428,7 +2576,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "setup_run_token_invalid".to_string(),
-                text: "Open ottto.net/apps in your browser to refresh it.".to_string(),
+                text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
         };
@@ -2779,17 +2927,225 @@ mod tests {
     }
 
     #[test]
+    fn registered_device_sources_seed_status_after_restart_before_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-registered",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
+            .save(&LocalSourceState {
+                first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+            })
+            .expect("seed source state");
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec![
+                "codex".to_string(),
+                "claude_code".to_string(),
+                "unknown_source".to_string(),
+            ],
+        };
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(device));
+
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 2);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Verifying);
+        assert_eq!(status.sources[0].grade, HealthGrade::Unknown);
+        assert_eq!(
+            status.sources[0].connected_at.as_deref(),
+            Some("2026-05-05T10:15:00Z")
+        );
+        assert!(status.sources[0].agent_status.is_none());
+        assert_eq!(status.sources[1].source, SourceKind::ClaudeCode);
+        assert_eq!(status.sources[1].state, SourceState::Verifying);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seeded_source_promotes_when_agent_status_refresh_arrives() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-promote",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
+            .save(&LocalSourceState {
+                first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+            })
+            .expect("seed source state");
+
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::Verifying);
+        assert_eq!(status.sources[0].grade, HealthGrade::Unknown);
+
+        {
+            let mut state = restarted.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = restarted.status(TOKEN).expect("status after refresh");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:20:00Z")
+        );
+        assert_eq!(
+            status.sources[0].connected_at.as_deref(),
+            Some("2026-05-05T10:15:00Z")
+        );
+        assert_eq!(
+            status.sources[0].config.path_hint.as_deref(),
+            Some("~/.codex/config.toml")
+        );
+        assert!(status.sources[0].agent_status.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn available_agent_status_clears_stale_needs_confirmation() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            let mut stale = codex_health();
+            stale.source = SourceKind::ClaudeCode;
+            stale.descriptor = source_descriptor(&SourceKind::ClaudeCode);
+            stale.state = SourceState::NeedsConfirmation;
+            stale.grade = HealthGrade::Warning;
+            stale.config.path_hint = Some("~/.claude/settings.json".to_string());
+            stale.problems = vec![HealthProblem {
+                code: StableProblemCode::SecretMissing,
+                title: "Claude Code needs account confirmation".to_string(),
+                detail: "Ottto could not confirm a signed-in local account from safe CLI metadata."
+                    .to_string(),
+                retryable: true,
+            }];
+            state.sources = vec![stale];
+
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after refresh");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::ClaudeCode);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:20:00Z")
+        );
+        assert_eq!(
+            status.sources[0].config.path_hint.as_deref(),
+            Some("~/.claude/settings.json")
+        );
+        assert!(status.sources[0].agent_status.is_some());
+    }
+
+    #[test]
+    fn available_agent_status_preserves_config_drift_repair_state() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            let mut drifted = codex_health();
+            drifted.state = SourceState::NeedsRepair;
+            drifted.grade = HealthGrade::Warning;
+            drifted.config.drift = vec![ottto_protocol::ConfigDrift {
+                key: "env.OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                expected: RedactedValue::String("https://relay.ottto.net".to_string()),
+                observed: RedactedValue::String("http://localhost:4318".to_string()),
+            }];
+            drifted.problems = vec![HealthProblem {
+                code: StableProblemCode::ConfigDrift,
+                title: "Codex telemetry config drifted".to_string(),
+                detail: "Use Repair in the Ottto app to update it.".to_string(),
+                retryable: true,
+            }];
+            drifted.recommended_actions = vec![RepairAction {
+                action: RepairActionKind::WriteConfig,
+                title: "Repair Codex telemetry config".to_string(),
+                detail: "Use Repair in the Ottto app to update it.".to_string(),
+                requires_approval: true,
+                destructive: false,
+                approval: RepairActionApproval {
+                    surface: RepairApprovalSurface::None,
+                    setup_safe: true,
+                    server_backed: true,
+                    reason: "test repair approval".to_string(),
+                },
+                backup: None,
+            }];
+            drifted.last_verified_at = Some("2026-05-05T10:18:00Z".to_string());
+            state.sources = vec![drifted];
+
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after refresh");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::NeedsRepair);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:18:00Z")
+        );
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::ConfigDrift
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::WriteConfig
+        );
+        assert_eq!(status.sources[0].config.drift.len(), 1);
+        assert!(status.sources[0].agent_status.is_some());
+    }
+
+    #[test]
     #[serial]
-    fn telemetry_configured_reflects_keystore_and_skips_pi() {
+    fn telemetry_configured_reflects_keystore_or_relay_device_and_skips_pi() {
         let store_dir = std::env::temp_dir().join(format!(
             "ottto-telemetry-configured-test-{}",
             std::process::id()
         ));
+        let support_dir = store_dir.join("support");
+        let secret_dir = store_dir.join("secrets");
         let _ = std::fs::remove_dir_all(&store_dir);
-        let _guard = TestEnvVar::set(keychain::TELEMETRY_KEY_FILE_STORE_ENV, &store_dir);
+        let _key_guard = TestEnvVar::set(keychain::TELEMETRY_KEY_FILE_STORE_ENV, &store_dir);
+        let _support_guard = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secret_guard = TestEnvVar::set(ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_dir);
 
-        // Empty keystore: Codex / Claude are telemetry sources but unconfigured;
-        // Pi has no local telemetry concept at all.
+        // Empty keystore/device binding: Codex / Claude are telemetry sources but
+        // unconfigured; Pi has no local live-telemetry concept at all.
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::Codex),
             Some(false)
@@ -2800,7 +3156,32 @@ mod tests {
         );
         assert_eq!(telemetry_configured_for_source(&SourceKind::Pi), None);
 
-        // After a Codex key is stored, only Codex reports configured.
+        // Setup-run install provisions a relay device + fallback secret rather
+        // than a legacy per-source setup key. That must still count as live
+        // telemetry configured for the sources included in the binding.
+        ottto_core::FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["claude_code".to_string()],
+            })
+            .expect("save relay device binding");
+        std::fs::create_dir_all(&secret_dir).expect("create secret dir");
+        std::fs::write(
+            secret_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device_secret_test",
+        )
+        .expect("save relay device secret fallback");
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::Codex),
+            Some(false)
+        );
+        assert_eq!(
+            telemetry_configured_for_source(&SourceKind::ClaudeCode),
+            Some(true)
+        );
+
+        // After a legacy Codex key is stored, Codex also reports configured.
         keychain::TelemetryKeyStore::production()
             .save(&SourceKind::Codex, "key_test", "secret")
             .expect("save telemetry key");
@@ -2810,10 +3191,29 @@ mod tests {
         );
         assert_eq!(
             telemetry_configured_for_source(&SourceKind::ClaudeCode),
-            Some(false)
+            Some(true)
         );
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    fn available_agent_status(source: SourceKind, captured_at: &str) -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            source,
+            status: AgentStatusState::Available,
+            collection_method: ottto_protocol::AgentStatusCollectionMethod::CliJson,
+            captured_at: captured_at.to_string(),
+            expires_at: "2026-05-05T10:35:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        }
     }
 
     fn verified_codex(last_received_at: &str) -> SourceVerificationResult {

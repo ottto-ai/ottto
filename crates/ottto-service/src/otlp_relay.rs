@@ -1,5 +1,5 @@
 use crate::control::handle_request;
-use crate::snapshot_client::load_snapshot_device_credentials;
+use crate::snapshot_client::{load_snapshot_device_credentials, relay_token_request_payload};
 use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
@@ -37,6 +37,12 @@ const RELAY_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(30);
 /// reading our response — trips this and is dropped instead of pinning a
 /// worker thread forever.
 const RELAY_IO_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upstream relay HTTP calls run inside one daemon thread per local OTLP
+/// request. Bound every phase so a slow backend/network path cannot consume
+/// the LaunchAgent thread budget and starve status/XPC control calls.
+const RELAY_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const RELAY_UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum bytes accepted for a single request line or header line. Caps the
 /// per-line heap allocation a client can force with one unterminated line.
 const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
@@ -48,7 +54,7 @@ const MAX_HEADER_COUNT: usize = 100;
 /// Maximum number of relay connections handled at once. Bounds the blast
 /// radius of a local flood: connections over the cap are rejected with 503
 /// without spawning an unbounded worker.
-const MAX_CONCURRENT_RELAY_CONNECTIONS: usize = 128;
+const MAX_CONCURRENT_RELAY_CONNECTIONS: usize = 16;
 
 /// Live count of in-flight relay connections, released via [`ConnectionGuard`].
 static ACTIVE_RELAY_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -638,7 +644,15 @@ fn relay_token_cache() -> &'static Mutex<BTreeMap<RelayTokenCacheKey, CachedRela
 }
 
 fn upstream_http_agent() -> &'static ureq::Agent {
-    UPSTREAM_HTTP_AGENT.get_or_init(|| ureq::AgentBuilder::new().build())
+    UPSTREAM_HTTP_AGENT.get_or_init(build_upstream_http_agent)
+}
+
+fn build_upstream_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
+        .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
+        .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)
+        .build()
 }
 
 fn relay_token_refresh_after(token: &str, now: SystemTime) -> SystemTime {
@@ -687,7 +701,7 @@ fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<Strin
         .post(&url)
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", &device_secret)
-        .send_json(json!({ "source": source.api_slug() }))
+        .send_json(relay_token_request_payload(&device, source.api_slug()))
         .map_err(|error| anyhow!("issue relay token failed: {error}"))?
         .into_json()
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
@@ -1288,5 +1302,20 @@ mod tests {
 
         drop(guards);
         assert_eq!(ACTIVE_RELAY_CONNECTIONS.load(Ordering::SeqCst), baseline);
+    }
+
+    #[test]
+    fn relay_limits_leave_daemon_thread_headroom() {
+        const _: () = assert!(
+            MAX_CONCURRENT_RELAY_CONNECTIONS <= 16,
+            "relay workers must leave LaunchAgent thread headroom for local control"
+        );
+        assert!(
+            RELAY_UPSTREAM_CONNECT_TIMEOUT <= Duration::from_secs(3)
+                && RELAY_UPSTREAM_READ_TIMEOUT <= Duration::from_secs(10)
+                && RELAY_UPSTREAM_WRITE_TIMEOUT <= Duration::from_secs(10),
+            "upstream relay I/O must stay bounded so telemetry cannot starve the daemon"
+        );
+        let _agent = build_upstream_http_agent();
     }
 }

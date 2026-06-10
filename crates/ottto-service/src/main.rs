@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ottto_core::{
     compiled_release_version, generate_control_token, load_or_create_control_token,
-    FileAccountStore, FileConnectionStore, FileMachineStore, LocalMachineBinding,
-    OTTTO_SERVICE_BINARY_NAME,
+    FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore, LocalDeviceBinding,
+    LocalMachineBinding, OTTTO_SERVICE_BINARY_NAME,
 };
 use ottto_protocol::{MachineIdentity, OperatingSystem};
 use ottto_service::{current_rfc3339_timestamp, macos_service, ControlToken, LocalDaemon};
@@ -11,6 +11,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "ottto-service")]
@@ -89,7 +90,8 @@ fn main() -> Result<()> {
             )
             .with_account(FileAccountStore::default().load()?)
             .with_connection(FileConnectionStore::default().load()?)
-            .with_source_state_dir(ottto_core::default_sources_dir());
+            .with_source_state_dir(ottto_core::default_sources_dir())
+            .with_registered_device_sources(load_registered_device_sources());
             let status = daemon.status(&token)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
@@ -111,7 +113,8 @@ fn main() -> Result<()> {
                 )
                 .with_account(FileAccountStore::default().load()?)
                 .with_connection(FileConnectionStore::default().load()?)
-                .with_source_state_dir(ottto_core::default_sources_dir());
+                .with_source_state_dir(ottto_core::default_sources_dir())
+                .with_registered_device_sources(load_registered_device_sources());
                 if !once {
                     start_builtin_relays(&daemon);
                 }
@@ -139,23 +142,29 @@ fn main() -> Result<()> {
             )
             .with_account(FileAccountStore::default().load()?)
             .with_connection(FileConnectionStore::default().load()?)
-            .with_source_state_dir(ottto_core::default_sources_dir());
+            .with_source_state_dir(ottto_core::default_sources_dir())
+            .with_registered_device_sources(load_registered_device_sources());
             start_builtin_relays(&daemon);
             #[cfg(all(target_os = "macos", unix))]
             {
                 let socket = socket.unwrap_or_else(ottto_core::default_socket_path);
                 let socket_daemon = daemon.clone();
                 let socket_for_thread = socket.clone();
-                std::thread::spawn(move || {
-                    if let Err(error) = ottto_service::unix_socket::serve_unix_socket(
+                std::thread::spawn(move || loop {
+                    match ottto_service::unix_socket::serve_unix_socket(
                         &socket_for_thread,
-                        socket_daemon,
+                        socket_daemon.clone(),
                     ) {
-                        eprintln!(
-                            "debug socket listener {} stopped: {error}",
+                        Ok(()) => eprintln!(
+                            "debug socket listener {} exited; restarting",
                             socket_for_thread.display()
-                        );
+                        ),
+                        Err(error) => eprintln!(
+                            "debug socket listener {} stopped: {error}; restarting",
+                            socket_for_thread.display()
+                        ),
                     }
+                    std::thread::sleep(Duration::from_secs(1));
                 });
                 eprintln!(
                     "serving XPC Mach service {mach_service} with debug socket {}",
@@ -211,6 +220,16 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_registered_device_sources() -> Option<LocalDeviceBinding> {
+    match FileDeviceStore::default().load() {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("warning: failed to load relay device source cache: {error:#}");
+            None
+        }
+    }
 }
 
 fn handle_service_command(command: ServiceCommand) -> Result<()> {
@@ -484,6 +503,8 @@ fn current_os() -> OperatingSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
 
     #[test]
     fn service_bootstrap_clears_disabled_state_before_bootstrap() {
@@ -540,5 +561,44 @@ mod tests {
                 plan.kickstart_command,
             ],
         );
+    }
+
+    #[test]
+    fn malformed_registered_device_cache_is_ignored() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-service-device-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create support dir");
+        fs::write(root.join("device.json"), b"{not valid json").expect("write invalid device");
+        let _guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+
+        assert_eq!(load_registered_device_sources(), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
     }
 }

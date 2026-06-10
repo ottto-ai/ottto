@@ -8,6 +8,7 @@ use crate::{
     },
     current_rfc3339_timestamp, diagnostics_local_only_upload_report,
     keychain::TelemetryKeyStore,
+    snapshot_client::relay_token_request_payload,
     BackendErrorDetails, BackendErrorKind, LocalApiError, LocalDaemon, PendingAuthClaim,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -68,6 +69,7 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: u64 = 15;
 const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
+const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
 const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
 #[cfg(target_os = "macos")]
@@ -1641,14 +1643,9 @@ fn auth_reset(
         )?);
     }
 
-    FileAccountStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let _binding_lock = lock_setup_run_binding();
-    FileConnectionStore::default()
-        .reset()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    reset_local_account_files()?;
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
+    let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
     let mut reset = daemon.reset_account_for_authorized_client()?;
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
@@ -1671,6 +1668,20 @@ fn auth_reset(
         },
     };
     Ok(reset)
+}
+
+fn reset_local_account_files() -> Result<(), LocalApiError> {
+    FileAccountStore::default()
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let _binding_lock = lock_setup_run_binding();
+    FileConnectionStore::default()
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileDeviceStore::default()
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    Ok(())
 }
 
 fn cloud_logout_requires_connection_error() -> LocalApiError {
@@ -2422,7 +2433,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                     return "Ottto rejected the diagnostics upload. Sign in again or use a fresh support claim.".to_string();
                 }
                 if logout_disconnect {
-                    return "Ottto rejected the cloud logout for this Mac. Reconnect from ottto.net/apps or use `ottto logout --local-only` only to clear local state.".to_string();
+                    return "Ottto rejected the cloud logout for this Mac. Sign in from the Ottto app or use `ottto logout --local-only` only to clear local state.".to_string();
                 }
                 return "Ottto rejected the local setup request. Open the Ottto app from Ottto to attach an active setup run.".to_string();
             }
@@ -2439,7 +2450,7 @@ fn cli_error_message(error: &LocalApiError) -> String {
                     "Ottto rejected the diagnostics upload.".to_string()
                 }
                 BackendErrorKind::Rejected if logout_disconnect => {
-                    "Ottto rejected the cloud logout for this Mac. Reconnect from ottto.net/apps or use `ottto logout --local-only` only to clear local state.".to_string()
+                    "Ottto rejected the cloud logout for this Mac. Sign in from the Ottto app or use `ottto logout --local-only` only to clear local state.".to_string()
                 }
                 BackendErrorKind::Rejected => "Ottto rejected the local setup request.".to_string(),
                 BackendErrorKind::ResponseUnexpected if diagnostics_upload => {
@@ -3355,11 +3366,11 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
     match error {
         LocalApiError::SetupRunConnectionMissing => (
             "setup_run_connection_missing",
-            "This Mac needs to reconnect to Ottto. Open ottto.net/apps in your browser, then retry setup.".to_string(),
+            "This Mac needs an active Ottto setup flow. Start setup from the Ottto app, then retry.".to_string(),
         ),
         LocalApiError::SetupRunConnectionMismatch => (
             "setup_run_connection_mismatch",
-            "This setup action belongs to a different Ottto setup run. Start a fresh setup from ottto.net/apps.".to_string(),
+            "This setup action belongs to a different Ottto setup run. Start setup again from the Ottto app.".to_string(),
         ),
         LocalApiError::TimedOut(_) => (
             "setup_action_timed_out",
@@ -3373,13 +3384,13 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
             if details.status == Some(401) || details.status == Some(403) {
                 return (
                     "setup_action_rejected",
-                    "Ottto rejected this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+                    "Ottto rejected this setup action. Start setup from the Ottto app, then retry.".to_string(),
                 );
             }
             if details.status == Some(404) {
                 return (
                     "setup_run_missing",
-                    "Ottto could not find this setup run. Start a fresh setup from ottto.net/apps.".to_string(),
+                    "Ottto could not find this setup run. Start setup again from the Ottto app.".to_string(),
                 );
             }
             match details.kind {
@@ -3393,7 +3404,7 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
                 ),
                 BackendErrorKind::Rejected => (
                     "backend_rejected",
-                    "Ottto rejected this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+                    "Ottto rejected this setup action. Start setup from the Ottto app, then retry.".to_string(),
                 ),
                 BackendErrorKind::ResponseUnexpected => (
                     "backend_response_unexpected",
@@ -3419,7 +3430,7 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
         ),
         LocalApiError::InvalidRequest(_) => (
             "invalid_setup_action",
-            "Ottto could not run this setup action. Start a fresh setup from ottto.net/apps.".to_string(),
+            "Ottto could not run this setup action. Start setup again from the Ottto app.".to_string(),
         ),
         LocalApiError::Unauthorized
         | LocalApiError::LocalClientNotTrusted
@@ -3428,7 +3439,7 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
         | LocalApiError::NoPendingAuthClaim
         | LocalApiError::AuthClaimMismatch => (
             "setup_action_failed",
-            "Ottto could not finish this setup action. Reconnect this Mac from ottto.net/apps, then retry setup.".to_string(),
+            "Ottto could not finish this setup action. Start setup from the Ottto app, then retry.".to_string(),
         ),
     }
 }
@@ -5127,10 +5138,15 @@ fn run_verify_source_action(
         let result = smoke_failure_verification_result(source.clone(), &smoke, Some(smoke_after));
         daemon.record_verification_result(&result)?;
         let message = result.message.text.clone();
+        let action_status = match result.status {
+            SourceVerificationStatus::Verified | SourceVerificationStatus::Warning => "succeeded",
+            _ => "failed",
+        };
         return Ok((
-            "failed".to_string(),
+            action_status.to_string(),
             message.clone(),
             json!({
+                "status": verification_status_slug(&result.status),
                 "verified": false,
                 "records_seen": 0,
                 "last_record_id": serde_json::Value::Null,
@@ -5403,6 +5419,7 @@ fn run_bounded_command(
     let mut command = Command::new(program_path);
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(path_env) = crate::command_env::path_env() {
@@ -5427,7 +5444,7 @@ fn run_bounded_command(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let diagnostic = read_command_diagnostic(&mut child);
+                let (diagnostic, usage_limited) = read_command_diagnostic_with_flags(&mut child);
                 return SmokeResult {
                     command_found: true,
                     succeeded: status.success(),
@@ -5435,6 +5452,8 @@ fn run_bounded_command(
                     duration_ms: start.elapsed().as_millis(),
                     message: if status.success() {
                         format!("{display_name} smoke session completed.")
+                    } else if usage_limited {
+                        usage_limited_smoke_message(display_name)
                     } else if let Some(diagnostic) = diagnostic.as_deref() {
                         format!(
                             "{display_name} smoke session failed before telemetry could be sent: {diagnostic}"
@@ -5445,6 +5464,8 @@ fn run_bounded_command(
                     diagnostic,
                     error_code: if status.success() {
                         None
+                    } else if usage_limited {
+                        Some(SMOKE_USAGE_LIMIT_ERROR_CODE.to_string())
                     } else {
                         Some("smoke_command_failed".to_string())
                     },
@@ -5454,16 +5475,28 @@ fn run_bounded_command(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let (diagnostic, usage_limited) = read_command_diagnostic_with_flags(&mut child);
                 return SmokeResult {
                     command_found: true,
                     succeeded: false,
                     exit_status: None,
                     duration_ms: start.elapsed().as_millis(),
-                    message: format!(
+                    message: if usage_limited {
+                        usage_limited_smoke_message(display_name)
+                    } else {
+                        format!(
                         "{display_name} smoke session timed out before telemetry could be sent."
+                    )
+                    },
+                    diagnostic,
+                    error_code: Some(
+                        if usage_limited {
+                            SMOKE_USAGE_LIMIT_ERROR_CODE
+                        } else {
+                            "smoke_timeout"
+                        }
+                        .to_string(),
                     ),
-                    diagnostic: None,
-                    error_code: Some("smoke_timeout".to_string()),
                     local_session_observed: local_session_observed(before_session_count),
                 };
             }
@@ -5563,7 +5596,7 @@ fn issue_source_relay_token(
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", &device_secret)
         .timeout(BACKEND_REQUEST_TIMEOUT)
-        .send_json(json!({ "source": source_slug(source) }))
+        .send_json(relay_token_request_payload(&device, source_slug(source)))
         .map_err(|error| backend_error_from_ureq(&url, error))?
         .into_json()
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))?;
@@ -5834,23 +5867,26 @@ fn no_fresh_telemetry_code(source: &SourceKind, smoke: &SmokeResult) -> &'static
     }
 }
 
-fn read_command_diagnostic(child: &mut std::process::Child) -> Option<String> {
-    let stderr = read_redacted_pipe(&mut child.stderr);
-    let stdout = read_redacted_pipe(&mut child.stdout);
-    match (stderr, stdout) {
+fn read_command_diagnostic_with_flags(child: &mut std::process::Child) -> (Option<String>, bool) {
+    let stderr = read_pipe_raw(&mut child.stderr);
+    let stdout = read_pipe_raw(&mut child.stdout);
+    let raw = match (stderr, stdout) {
         (Some(stderr), Some(stdout)) => Some(format!("{stderr}; stdout: {stdout}")),
         (Some(stderr), None) => Some(stderr),
         (None, Some(stdout)) => Some(stdout),
         (None, None) => None,
-    }
+    };
+    let usage_limited = command_diagnostic_is_usage_limited(raw.as_deref());
+    let diagnostic = raw.as_deref().and_then(redact_command_diagnostic);
+    (diagnostic, usage_limited)
 }
 
-fn read_redacted_pipe<R: Read>(pipe: &mut Option<R>) -> Option<String> {
+fn read_pipe_raw<R: Read>(pipe: &mut Option<R>) -> Option<String> {
     let mut output = String::new();
     if let Some(mut pipe) = pipe.take() {
         let _ = pipe.read_to_string(&mut output);
     }
-    redact_command_diagnostic(&output)
+    (!output.trim().is_empty()).then_some(output)
 }
 
 fn redact_command_diagnostic(input: &str) -> Option<String> {
@@ -5901,6 +5937,20 @@ fn truncate_diagnostic(value: &str) -> String {
     truncated
 }
 
+fn command_diagnostic_is_usage_limited(diagnostic: Option<&str>) -> bool {
+    let Some(diagnostic) = diagnostic else {
+        return false;
+    };
+    let lowered = diagnostic.to_ascii_lowercase();
+    lowered.contains("usage limit")
+        || lowered.contains("purchase more credits")
+        || lowered.contains("quota")
+}
+
+fn usage_limited_smoke_message(display_name: &str) -> String {
+    format!("{display_name} is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify.")
+}
+
 fn smoke_failure_verification_result(
     source: SourceKind,
     smoke: &SmokeResult,
@@ -5916,10 +5966,15 @@ fn smoke_failure_verification_result_with_config(
     smoke: &SmokeResult,
     smoke_after: Option<String>,
 ) -> SourceVerificationResult {
+    let usage_limited = smoke.error_code.as_deref() == Some(SMOKE_USAGE_LIMIT_ERROR_CODE);
     verification_result_with_config(
         source,
         config,
-        SourceVerificationStatus::Failed,
+        if usage_limited {
+            SourceVerificationStatus::Warning
+        } else {
+            SourceVerificationStatus::Failed
+        },
         false,
         0,
         None,
@@ -6581,7 +6636,7 @@ fn verify_source(
             None,
             None,
             "reconnect_required",
-            "This Mac needs to reconnect to Ottto. Open ottto.net/apps in your browser to refresh, then try verifying again.",
+            "This Mac needs a fresh Ottto sign-in. Use Sign in in the Ottto app, then try verifying again.",
         );
         daemon.record_verification_result(&result)?;
         return Ok(result);
@@ -6603,7 +6658,7 @@ fn verify_source(
                     None,
                     None,
                     "setup_run_token_missing",
-                    "This Mac's local Ottto connection needs a fresh sign-in. Open Ottto in your browser, then try verifying again.",
+                    "This Mac's local Ottto connection needs a fresh sign-in. Use Sign in in the Ottto app, then try verifying again.",
                 );
                     daemon.record_verification_result(&result)?;
                     return Ok(result);
@@ -7292,17 +7347,13 @@ fn config_drift_verification_result(
         )
     } else if missing {
         format!(
-            "{} telemetry config is missing. Run `ottto verify --repair --app {}` or `ottto fix --app {}`.",
-            source_display_name(&source),
-            source_slug(&source),
-            source_slug(&source)
+            "{} telemetry config is missing. Use Repair in the Ottto app to update it, then run Verify again.",
+            source_display_name(&source)
         )
     } else {
         format!(
-            "{} telemetry config does not match the active Ottto relay. Run `ottto verify --repair --app {}` or `ottto fix --app {}`.",
-            source_display_name(&source),
-            source_slug(&source),
-            source_slug(&source)
+            "{} telemetry config does not match the active Ottto relay. Use Repair in the Ottto app to update it, then run Verify again.",
+            source_display_name(&source)
         )
     };
     verification_result_with_config(
@@ -7345,7 +7396,7 @@ fn verification_result_for_backend_error_with_config(
             None,
             smoke_after,
             "setup_run_connection_missing",
-            "This Mac needs to reconnect to Ottto. Open ottto.net/apps in your browser to refresh it, then try verifying again.",
+            "This Mac needs a fresh Ottto sign-in. Use Sign in in the Ottto app, then try verifying again.",
         );
     }
     if let LocalApiError::Backend(details) = error {
@@ -7368,7 +7419,7 @@ fn verification_result_for_backend_error_with_config(
                 } else {
                     "setup_run_token_invalid"
                 },
-                "Your Ottto session has expired. Open ottto.net/apps in your browser to refresh it, then try verifying again.",
+                "Your Ottto session has expired. Use Sign in in the Ottto app, then try verifying again.",
             );
         }
         if details.status == Some(404) {
@@ -7382,7 +7433,7 @@ fn verification_result_for_backend_error_with_config(
                 None,
                 smoke_after,
                 "setup_run_missing",
-                "We can't find an active Ottto session for this Mac. Open ottto.net/apps in your browser to start one, then try verifying again.",
+                "We can't find an active Ottto session for this Mac. Use Sign in in the Ottto app, then try verifying again.",
             );
         }
         if details.kind == BackendErrorKind::Rejected {
@@ -7396,7 +7447,7 @@ fn verification_result_for_backend_error_with_config(
                 None,
                 smoke_after,
                 "verification_service_rejected",
-                "Ottto couldn't verify this source. Open ottto.net/apps in your browser to refresh your session, then try again.",
+                "Ottto couldn't verify this source. Use Sign in in the Ottto app to refresh your session, then try again.",
             );
         }
     }
@@ -8334,6 +8385,55 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, CliErrorCode::InvalidRequest);
         assert!(error.message.contains("--local-only"));
+    }
+
+    #[test]
+    #[serial]
+    fn local_reset_file_cleanup_clears_relay_device_binding() {
+        let support_root = telemetry_key_store_root("local-reset-device-binding");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        FileAccountStore::default()
+            .save(&connected_account())
+            .expect("save account");
+        FileConnectionStore::default()
+            .save(&LocalConnectionBinding {
+                setup_run_id: "setup_test".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            })
+            .expect("save connection");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save device");
+
+        reset_local_account_files().expect("reset local files");
+
+        assert_eq!(
+            FileAccountStore::default()
+                .load()
+                .expect("load reset account")
+                .state,
+            LocalAccountState::NotConnected
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load reset connection"),
+            None
+        );
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("load reset device"),
+            None
+        );
     }
 
     #[test]
@@ -10562,6 +10662,37 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
     }
 
     #[test]
+    fn config_drift_verification_copy_points_to_app_repair() {
+        let missing = config_drift_verification_result(
+            SourceKind::Codex,
+            SourceConfigState {
+                discovered: false,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: None,
+                drift: vec![config_drift("codex.config_file", "present", "missing")],
+            },
+            false,
+        );
+        assert_eq!(missing.message.code, "config_missing");
+        assert!(missing.message.text.contains("Use Repair in the Ottto app"));
+        assert!(!missing.message.text.contains("ottto repair"));
+
+        let drifted = config_drift_verification_result(
+            SourceKind::Codex,
+            SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: vec![config_drift("otel.log_user_prompt", "false", "true")],
+            },
+            false,
+        );
+        assert_eq!(drifted.message.code, "config_drift");
+        assert!(drifted.message.text.contains("Use Repair in the Ottto app"));
+        assert!(!drifted.message.text.contains("ottto repair"));
+    }
+
+    #[test]
     fn claude_code_config_state_detects_settings_shape_without_env_fence_dependency() {
         let root = control_test_root("claude-config-state");
         fs::create_dir_all(&root).expect("create root");
@@ -11117,6 +11248,45 @@ log_user_prompt = true
     }
 
     #[test]
+    fn usage_limited_smoke_failure_maps_to_warning_verification_result() {
+        let smoke = SmokeResult {
+            command_found: true,
+            succeeded: false,
+            exit_status: None,
+            duration_ms: 45_000,
+            message: usage_limited_smoke_message("Codex"),
+            diagnostic: Some(
+                "ERROR: You've hit your usage limit. Visit settings to purchase more credits."
+                    .to_string(),
+            ),
+            error_code: Some(SMOKE_USAGE_LIMIT_ERROR_CODE.to_string()),
+            local_session_observed: None,
+        };
+
+        assert!(command_diagnostic_is_usage_limited(
+            smoke.diagnostic.as_deref()
+        ));
+        assert!(command_diagnostic_is_usage_limited(Some(&format!(
+            "{} ERROR: You've hit your usage limit. Visit settings to purchase more credits.",
+            "OpenAI Codex startup noise ".repeat(80)
+        ))));
+
+        let result = smoke_failure_verification_result(
+            SourceKind::Codex,
+            &smoke,
+            Some("2026-05-06T12:00:00Z".to_string()),
+        );
+
+        assert_eq!(result.status, SourceVerificationStatus::Warning);
+        assert!(!result.verified);
+        assert_eq!(result.message.code, SMOKE_USAGE_LIMIT_ERROR_CODE);
+        assert_eq!(
+            result.message.text,
+            "Codex is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify."
+        );
+    }
+
+    #[test]
     fn expired_setup_run_token_maps_to_reconnect_required_verification() {
         let error = LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -11147,7 +11317,8 @@ log_user_prompt = true
         assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
         assert!(!result.verified);
         assert_eq!(result.message.code, "setup_run_connection_missing");
-        assert!(result.message.text.contains("Open ottto.net/apps"));
+        assert!(result.message.text.contains("Use Sign in in the Ottto app"));
+        assert!(!result.message.text.contains("/apps"));
     }
 
     #[test]
