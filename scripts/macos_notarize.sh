@@ -101,8 +101,11 @@ stapler_retry() {
   local action="$1"
   local target="$2"
   local attempt
-  local max_attempts="${OTTTO_STAPLER_MAX_ATTEMPTS:-5}"
-  local sleep_seconds="${OTTTO_STAPLER_RETRY_SECONDS:-8}"
+  # Apple notary tickets can take minutes to propagate to the CDN after the
+  # submission is Accepted; stapler exits with Error 73 until then. Default to
+  # a ~6 minute retry window (19 sleeps of 20s) to ride that out.
+  local max_attempts="${OTTTO_STAPLER_MAX_ATTEMPTS:-20}"
+  local sleep_seconds="${OTTTO_STAPLER_RETRY_SECONDS:-20}"
 
   for attempt in $(seq 1 "$max_attempts"); do
     if xcrun stapler "$action" "$target"; then
