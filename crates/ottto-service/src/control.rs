@@ -1247,6 +1247,9 @@ fn repair_source(
         execute_write_config_repair(daemon, authorization, &source)?
     };
     let after = source_config_state_for_daemon(daemon, &source)?;
+    if after.drift.is_empty() {
+        daemon.record_config_repair_result(&source, after.clone())?;
+    }
 
     plan.status = if after.drift.is_empty() {
         RepairPlanStatus::Succeeded
