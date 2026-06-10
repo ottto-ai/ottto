@@ -570,6 +570,39 @@ impl LocalDaemon {
         Ok(())
     }
 
+    pub fn record_config_repair_result(
+        &self,
+        source: &SourceKind,
+        config: SourceConfigState,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        let Some(existing) = state
+            .sources
+            .iter_mut()
+            .find(|health| &health.source == source)
+        else {
+            return Ok(());
+        };
+
+        existing.config = config;
+        if existing.config.drift.is_empty() {
+            existing.problems.retain(|problem| {
+                !matches!(
+                    problem.code,
+                    StableProblemCode::ConfigMissing | StableProblemCode::ConfigDrift
+                )
+            });
+            existing
+                .recommended_actions
+                .retain(|action| action.action != RepairActionKind::WriteConfig);
+            if existing.state == SourceState::NeedsRepair && existing.problems.is_empty() {
+                existing.state = SourceState::Healthy;
+                existing.grade = HealthGrade::Ok;
+            }
+        }
+        Ok(())
+    }
+
     pub fn refresh_agent_status(
         &self,
         token: &str,
@@ -3128,6 +3161,76 @@ mod tests {
         );
         assert_eq!(status.sources[0].config.drift.len(), 1);
         assert!(status.sources[0].agent_status.is_some());
+    }
+
+    #[test]
+    fn config_repair_result_clears_cached_config_drift_repair_state() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            let mut drifted = codex_health();
+            drifted.state = SourceState::NeedsRepair;
+            drifted.grade = HealthGrade::Warning;
+            drifted.config.drift = vec![ottto_protocol::ConfigDrift {
+                key: "env.OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                expected: RedactedValue::String("https://relay.ottto.net".to_string()),
+                observed: RedactedValue::String("http://localhost:4318".to_string()),
+            }];
+            drifted.problems = vec![HealthProblem {
+                code: StableProblemCode::ConfigDrift,
+                title: "Codex telemetry config drifted".to_string(),
+                detail: "Use Repair in the Ottto app to update it.".to_string(),
+                retryable: true,
+            }];
+            drifted.recommended_actions = vec![RepairAction {
+                action: RepairActionKind::WriteConfig,
+                title: "Repair Codex telemetry config".to_string(),
+                detail: "Use Repair in the Ottto app to update it.".to_string(),
+                requires_approval: true,
+                destructive: false,
+                approval: RepairActionApproval {
+                    surface: RepairApprovalSurface::None,
+                    setup_safe: true,
+                    server_backed: true,
+                    reason: "test repair approval".to_string(),
+                },
+                backup: None,
+            }];
+            state.sources = vec![drifted];
+        }
+
+        daemon
+            .record_config_repair_result(
+                &SourceKind::Codex,
+                SourceConfigState {
+                    discovered: true,
+                    path_hint: Some("~/.codex/config.toml".to_string()),
+                    fingerprint: Some("sha256:clean".to_string()),
+                    drift: Vec::new(),
+                },
+            )
+            .expect("record clean config repair");
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:25:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after repair");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+        assert!(status.sources[0].config.drift.is_empty());
+        assert_eq!(
+            status.sources[0].config.fingerprint.as_deref(),
+            Some("sha256:clean")
+        );
     }
 
     #[test]
