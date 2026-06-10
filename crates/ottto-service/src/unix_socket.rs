@@ -38,15 +38,28 @@ pub fn serve_unix_socket_with_limit(
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod socket {}", path.display()))?;
 
-    for (served, stream) in listener.incoming().enumerate() {
-        let mut stream = stream.with_context(|| format!("accept socket {}", path.display()))?;
+    let mut served = 0_usize;
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("socket listener {} accept failed: {error}", path.display());
+                continue;
+            }
+        };
         let peer = local_client_peer(&stream);
         let response = match read_request(&mut stream) {
             Ok(request) => handle_request_with_peer(&daemon, request, peer),
             Err(error) => invalid_request_response(&error.to_string()),
         };
-        write_response(&mut stream, &response)?;
-        if max_requests.is_some_and(|limit| served + 1 >= limit) {
+        if let Err(error) = write_response(&mut stream, &response) {
+            eprintln!(
+                "socket listener {} response write failed: {error}",
+                path.display()
+            );
+        }
+        served += 1;
+        if max_requests.is_some_and(|limit| served >= limit) {
             break;
         }
     }
@@ -361,6 +374,45 @@ mod tests {
             .message
             .contains("unsupported local control protocol_version 10"));
 
+        server.join().expect("server thread should join").unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[serial]
+    fn unix_socket_keeps_serving_after_client_disconnects_before_response() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "disconnect"
+        ));
+        let daemon = daemon();
+        let server_path = path.clone();
+        let server =
+            thread::spawn(move || serve_unix_socket_with_limit(&server_path, daemon, Some(2)));
+
+        wait_for_socket(&path);
+        {
+            let mut stream = UnixStream::connect(&path).expect("connect socket");
+            stream.write_all(b"{").expect("write malformed request");
+        }
+
+        let response = request_unix_socket(
+            &path,
+            &LocalControlRequest {
+                request_id: "req_socket_after_disconnect".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        )
+        .expect("socket request after disconnect should succeed");
+
+        assert!(response.ok);
         server.join().expect("server thread should join").unwrap();
         let _ = fs::remove_file(path);
     }
