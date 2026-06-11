@@ -323,6 +323,9 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving local health projection sync"),
         Err(error) => eprintln!("local health projection sync unavailable: {error}"),
     }
+    // Reconfirm sources seeded `verifying` by the restart so they settle to real
+    // health in seconds instead of dwelling until the next client poll/session.
+    ottto_service::snapshot_sync::spawn_startup_source_reverify(daemon.clone());
 }
 
 fn home_dir() -> Result<PathBuf> {
