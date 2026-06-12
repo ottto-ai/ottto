@@ -5971,6 +5971,8 @@ fn command_diagnostic_is_usage_limited(diagnostic: Option<&str>) -> bool {
     };
     let lowered = diagnostic.to_ascii_lowercase();
     lowered.contains("usage limit")
+        || lowered.contains("weekly limit")
+        || lowered.contains("rate limit")
         || lowered.contains("purchase more credits")
         || lowered.contains("quota")
 }
@@ -11298,6 +11300,9 @@ log_user_prompt = true
             "{} ERROR: You've hit your usage limit. Visit settings to purchase more credits.",
             "OpenAI Codex startup noise ".repeat(80)
         ))));
+        assert!(command_diagnostic_is_usage_limited(Some(
+            "Claude Code smoke session failed: You've hit your weekly limit · resets 8am (Asia/Jerusalem)"
+        )));
 
         let result = smoke_failure_verification_result(
             SourceKind::Codex,
