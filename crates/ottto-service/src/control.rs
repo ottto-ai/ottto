@@ -2982,7 +2982,7 @@ fn setup_run_request_with_refresh<T>(
 ) -> Result<T, LocalApiError> {
     match request(setup_run_token) {
         Ok(response) => Ok(response),
-        Err(original) if matches!(&original, LocalApiError::Backend(details) if details.status == Some(401)) => {
+        Err(original) if is_setup_run_token_auth_error(&original) => {
             match refresh_setup_run_token_via_device_secret(api_base_url, connection) {
                 Ok(fresh_token) => request(&fresh_token),
                 Err(LocalApiError::SetupRunConnectionMissing) => Err(original),
@@ -2991,6 +2991,21 @@ fn setup_run_request_with_refresh<T>(
         }
         Err(other) => Err(other),
     }
+}
+
+fn is_setup_run_token_auth_error(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(details) = error else {
+        return false;
+    };
+    if details.status == Some(401) {
+        return true;
+    }
+    let Some(body) = details.body_excerpt.as_deref() else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    body.contains("setup run companion token expired")
+        || body.contains("setup run companion token is invalid")
 }
 
 fn get_agent_context_with_refresh(
@@ -11487,6 +11502,83 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn verify_refreshes_invalid_stored_setup_token_before_requiring_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-invalid-token-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-invalid-token-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_stale_verify")
+            .expect("persist stale setup token");
+        let api_base_url = verify_invalid_token_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_refresh".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should refresh invalid stored setup token");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load refreshed setup token"),
+            "otsr_verify_fresh"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn backend_cli_error_message_omits_endpoint_details() {
         let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -12160,6 +12252,53 @@ log_user_prompt = true
                         400,
                         "Bad Request",
                         r#"{"detail":"unexpected verify refresh request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_invalid_token_refresh_backend() -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind invalid verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected invalid-token refresh request"}"#,
                     );
                 }
             }
