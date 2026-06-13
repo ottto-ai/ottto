@@ -665,8 +665,12 @@ fn setup_run_agent_read_context(
         .connection_for_authorized_client()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
-    Ok((api_base_url, connection, setup_run_token))
+    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
+    Ok((
+        api_base_url,
+        credentials.connection,
+        credentials.setup_run_token,
+    ))
 }
 
 fn require_authorized_local_client(
@@ -2671,7 +2675,9 @@ fn setup_answer(
     let connection = connection
         .take()
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let connection = credentials.connection;
+    let setup_run_token = credentials.setup_run_token;
     let answer_type = match answer_type.trim() {
         "skip_source" | "disable_source" => answer_type.trim().to_string(),
         _ => {
@@ -2708,7 +2714,9 @@ fn setup_action(
     let connection = connection
         .take()
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let connection = credentials.connection;
+    let setup_run_token = credentials.setup_run_token;
     let action_type = match action_type.trim() {
         "install_source" | "verify_source" => action_type.trim().to_string(),
         _ => {
@@ -2901,8 +2909,21 @@ fn attach_setup_run_by_claim_code(
 
 #[derive(Debug, Deserialize)]
 struct SetupRunRefreshResponse {
+    setup_run_id: Option<String>,
     setup_run_token: String,
     expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshedSetupRunToken {
+    setup_run_token: String,
+    connection: LocalConnectionBinding,
+}
+
+#[derive(Debug, Clone)]
+struct SetupRunCredentials {
+    setup_run_token: String,
+    connection: LocalConnectionBinding,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2922,7 +2943,7 @@ struct SetupRunDisconnectResponse {
 fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
-) -> Result<String, LocalApiError> {
+) -> Result<RefreshedSetupRunToken, LocalApiError> {
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
@@ -2957,20 +2978,41 @@ fn refresh_setup_run_token_via_device_secret(
         .save(&response.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let mut refreshed = connection.clone();
+    if let Some(setup_run_id) = response
+        .setup_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        refreshed.setup_run_id = setup_run_id.to_string();
+    }
     refreshed.setup_run_token_expires_at = response.expires_at.clone();
     FileConnectionStore::default()
         .save(&refreshed)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    Ok(response.setup_run_token)
+    Ok(RefreshedSetupRunToken {
+        setup_run_token: response.setup_run_token,
+        connection: refreshed,
+    })
 }
 
 fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
-) -> Result<String, LocalApiError> {
+) -> Result<SetupRunCredentials, LocalApiError> {
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
-        Ok(token) => Ok(token),
-        Err(_) => refresh_setup_run_token_via_device_secret(api_base_url, connection),
+        Ok(token) => Ok(SetupRunCredentials {
+            setup_run_token: token,
+            connection: connection.clone(),
+        }),
+        Err(_) => {
+            refresh_setup_run_token_via_device_secret(api_base_url, connection).map(|refreshed| {
+                SetupRunCredentials {
+                    setup_run_token: refreshed.setup_run_token,
+                    connection: refreshed.connection,
+                }
+            })
+        }
     }
 }
 
@@ -2978,13 +3020,13 @@ fn setup_run_request_with_refresh<T>(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
-    request: impl Fn(&str) -> Result<T, LocalApiError>,
+    request: impl Fn(&LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
-    match request(setup_run_token) {
+    match request(connection, setup_run_token) {
         Ok(response) => Ok(response),
         Err(original) if is_setup_run_token_auth_error(&original) => {
             match refresh_setup_run_token_via_device_secret(api_base_url, connection) {
-                Ok(fresh_token) => request(&fresh_token),
+                Ok(refreshed) => request(&refreshed.connection, &refreshed.setup_run_token),
                 Err(LocalApiError::SetupRunConnectionMissing) => Err(original),
                 Err(other) => Err(other),
             }
@@ -3018,12 +3060,12 @@ fn get_agent_context_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_context_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3042,12 +3084,12 @@ fn get_agent_costs_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_costs_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3066,12 +3108,12 @@ fn get_agent_sessions_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_sessions_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3090,12 +3132,12 @@ fn get_agent_recommendations_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_recommendations_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3114,12 +3156,12 @@ fn get_agent_provider_impact_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_provider_impact_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3136,8 +3178,12 @@ fn disconnect_setup_run_with_refresh(
     match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token) {
         Ok(response) => Ok(response),
         Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-            let fresh_token = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-            disconnect_setup_run_local_client(api_base_url, connection, &fresh_token)
+            let refreshed = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+            disconnect_setup_run_local_client(
+                api_base_url,
+                &refreshed.connection,
+                &refreshed.setup_run_token,
+            )
         }
         Err(other) => Err(other),
     }
@@ -3187,16 +3233,21 @@ fn wait_for_setup_run_verification_with_refresh(
     smoke_after: &str,
     filters: Option<&SetupRunVerificationFilters>,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        wait_for_setup_run_verification_with_base(
-            api_base_url,
-            connection,
-            token,
-            source,
-            smoke_after,
-            filters,
-        )
-    })
+    setup_run_request_with_refresh(
+        api_base_url,
+        connection,
+        setup_run_token,
+        |active, token| {
+            wait_for_setup_run_verification_with_base(
+                api_base_url,
+                active,
+                token,
+                source,
+                smoke_after,
+                filters,
+            )
+        },
+    )
 }
 
 fn publish_scan_result(
@@ -3205,21 +3256,26 @@ fn publish_scan_result(
     setup_run_token: &str,
     scan: &SetupScanPayload,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
+    setup_run_request_with_refresh(
         api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/scan-result",
-            connection.setup_run_id
-        ),
-    );
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        backend_post_json_with_timeout(
-            &url,
-            scan,
-            &[("X-Ottto-Setup-Run-Token", token)],
-            SETUP_SCAN_RESULT_HTTP_TIMEOUT,
-        )
-    })
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/scan-result",
+                    active.setup_run_id
+                ),
+            );
+            backend_post_json_with_timeout(
+                &url,
+                scan,
+                &[("X-Ottto-Setup-Run-Token", token)],
+                SETUP_SCAN_RESULT_HTTP_TIMEOUT,
+            )
+        },
+    )
 }
 
 fn save_setup_answer(
@@ -3229,13 +3285,6 @@ fn save_setup_answer(
     source: &SourceKind,
     answer_type: &str,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/answers",
-            connection.setup_run_id
-        ),
-    );
     let body = json!({
         "source": source_slug(source),
         "answer_type": answer_type,
@@ -3243,9 +3292,21 @@ fn save_setup_answer(
             "reason": "companion_setup_continue",
         },
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
-    })
+    setup_run_request_with_refresh(
+        api_base_url,
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/answers",
+                    active.setup_run_id
+                ),
+            );
+            backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
+        },
+    )
 }
 
 fn queue_setup_action(
@@ -3255,13 +3316,6 @@ fn queue_setup_action(
     source: &SourceKind,
     action_type: &str,
 ) -> Result<SetupRunActionApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions",
-            connection.setup_run_id
-        ),
-    );
     let body = json!({
         "source": source_slug(source),
         "action_type": action_type,
@@ -3270,9 +3324,21 @@ fn queue_setup_action(
             "reason": "companion_setup_continue",
         },
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
-    })
+    setup_run_request_with_refresh(
+        api_base_url,
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/actions",
+                    active.setup_run_id
+                ),
+            );
+            backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
+        },
+    )
 }
 
 fn process_setup_actions(
@@ -3497,17 +3563,22 @@ fn get_next_setup_action(
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
 ) -> Result<SetupRunNextActionResponse, LocalApiError> {
-    let url = api_url_with_base(
+    setup_run_request_with_refresh(
         api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/next-action",
-            connection.setup_run_id
-        ),
-    );
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        heartbeat_setup_run(api_base_url, connection, token, "polling_next_action")?;
-        backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", token)])
-    })
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/next-action",
+                    active.setup_run_id
+                ),
+            );
+            heartbeat_setup_run(api_base_url, active, token, "polling_next_action")?;
+            backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", token)])
+        },
+    )
 }
 
 fn heartbeat_setup_run(
@@ -3546,13 +3617,6 @@ fn record_setup_action_event(
     action: &SetupRunActionApiResponse,
     event: SetupActionEvent<'_>,
 ) -> Result<(), LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions/{}/events",
-            connection.setup_run_id, action.id
-        ),
-    );
     let body = json!({
         "event_type": event.event_type,
         "status": event.status,
@@ -3560,10 +3624,21 @@ fn record_setup_action_event(
         "source": action.source,
         "metadata": event.metadata,
     });
-    let _: serde_json::Value =
-        setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    let _: serde_json::Value = setup_run_request_with_refresh(
+        api_base_url,
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/actions/{}/events",
+                    active.setup_run_id, action.id
+                ),
+            );
             backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
-        })?;
+        },
+    )?;
     Ok(())
 }
 
@@ -3583,21 +3658,26 @@ fn complete_setup_action(
     message: &str,
     result: serde_json::Value,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions/{}/complete",
-            connection.setup_run_id, action.id
-        ),
-    );
     let body = json!({
         "status": status,
         "message": message,
         "result": result,
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
-    })
+    setup_run_request_with_refresh(
+        api_base_url,
+        connection,
+        setup_run_token,
+        |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/actions/{}/complete",
+                    active.setup_run_id, action.id
+                ),
+            );
+            backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
+        },
+    )
 }
 
 fn run_install_source_action(
@@ -6689,15 +6769,15 @@ fn verify_source(
         return Ok(result);
     };
 
-    let setup_run_token = match setup_run_token_for_connection(
+    let setup_credentials = match setup_run_token_for_connection(
         &connection.api_base_url,
         &connection,
     ) {
-        Ok(token) => {
+        Ok(credentials) => {
             if recoverable_pending_account {
                 daemon.clear_recoverable_pending_auth_for_authorized_client()?;
             }
-            token
+            credentials
         }
         Err(_) => {
             let result = verification_result_with_config(
@@ -6716,6 +6796,8 @@ fn verify_source(
             return Ok(result);
         }
     };
+    let connection = setup_credentials.connection;
+    let setup_run_token = setup_credentials.setup_run_token;
 
     if source == SourceKind::Pi {
         let pi_token = setup_run_token.clone();
@@ -6728,10 +6810,10 @@ fn verify_source(
                         &connection.api_base_url,
                         &connection,
                     ) {
-                        Ok(fresh_token) => match run_pi_route_verification(
+                        Ok(refreshed) => match run_pi_route_verification(
                             &connection.api_base_url,
-                            &connection,
-                            &fresh_token,
+                            &refreshed.connection,
+                            &refreshed.setup_run_token,
                         ) {
                             Ok(retry) => retry,
                             Err(err) => verification_result_for_backend_error_with_config(
@@ -11579,6 +11661,85 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn verify_uses_rebound_setup_run_after_token_refresh() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-rebound-token-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-rebound-token-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_stale_verify")
+            .expect("persist stale setup token");
+        let api_base_url = verify_rebound_token_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_stale".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should retry against rebound setup run");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load rebound connection")
+                .expect("connection saved")
+                .setup_run_id,
+            "setup_verify_rebound"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn backend_cli_error_message_omits_endpoint_details() {
         let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -12299,6 +12460,55 @@ log_user_prompt = true
                         400,
                         "Bad Request",
                         r#"{"detail":"unexpected invalid-token refresh request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_rebound_token_refresh_backend() -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind rebound verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_id":"setup_verify_rebound","setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_verify_rebound/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_verify_stale/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected rebound-token refresh request"}"#,
                     );
                 }
             }
