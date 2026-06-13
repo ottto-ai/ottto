@@ -122,6 +122,15 @@ stapler_retry() {
   return 1
 }
 
+prepare_app_staple_target() {
+  local app_bundle="$1"
+  local ticket_path="$app_bundle/Contents/CodeResources"
+
+  if [[ -d "$app_bundle/Contents" && ! -e "$ticket_path" ]]; then
+    : > "$ticket_path"
+  fi
+}
+
 gatekeeper_assessment_type() {
   local kind="$1"
   if [[ "$kind" == "macos_app" ]]; then
@@ -236,6 +245,7 @@ while IFS= read -r artifact; do
       ditto -c -k --keepParent "$verification_path" "$app_notary_zip"
       notary_submit "$app_notary_zip"
       rm -f "$app_notary_zip"
+      prepare_app_staple_target "$verification_path"
       stapler_retry staple "$verification_path"
       stapler_retry validate "$verification_path"
       rebuild_dmg_from_app "$verification_path" "$path"
