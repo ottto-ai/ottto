@@ -1951,15 +1951,15 @@ fn update_state_from_manifest(
         ))
     } else if update_available {
         if manifest_tuple > current_tuple {
-            Some("newer release manifest version is available".to_string())
+            Some("A newer Ottto app is available.".to_string())
         } else {
             Some(format!(
-                "release manifest reports a different build ({}) for the same version",
+                "A newer Ottto app build is available ({})",
                 manifest.commit
             ))
         }
     } else {
-        Some("current build matches the release manifest channel".to_string())
+        Some("You are running the latest available version.".to_string())
     };
     let (update_command, update_instructions) = if update_required {
         update_route_for_owner(install_owner, &manifest.supported_install_owners)
@@ -6638,7 +6638,9 @@ fn verify_source(
     }
 
     let status = status_for(daemon, authorization)?;
-    if status.account.state != LocalAccountState::Connected {
+    let recoverable_pending_account =
+        status.account.state == LocalAccountState::ClaimPending && status.account.user.is_some();
+    if status.account.state != LocalAccountState::Connected && !recoverable_pending_account {
         let result = verification_result_with_config(
             source,
             config,
@@ -6672,13 +6674,18 @@ fn verify_source(
         return Ok(result);
     };
 
-    let setup_run_token = match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
-        Ok(token) => token,
+    let setup_run_token = match setup_run_token_for_connection(
+        &connection.api_base_url,
+        &connection,
+    ) {
+        Ok(token) => {
+            if recoverable_pending_account {
+                daemon.clear_recoverable_pending_auth_for_authorized_client()?;
+            }
+            token
+        }
         Err(_) => {
-            match refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection) {
-                Ok(token) => token,
-                Err(_) => {
-                    let result = verification_result_with_config(
+            let result = verification_result_with_config(
                     source,
                     config,
                     SourceVerificationStatus::ReconnectRequired,
@@ -6690,10 +6697,8 @@ fn verify_source(
                     "setup_run_token_missing",
                     "This Mac's local Ottto connection needs a fresh sign-in. Use Sign in in the Ottto app, then try verifying again.",
                 );
-                    daemon.record_verification_result(&result)?;
-                    return Ok(result);
-                }
-            }
+            daemon.record_verification_result(&result)?;
+            return Ok(result);
         }
     };
 
@@ -9005,7 +9010,7 @@ mod tests {
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("newer release manifest version"));
+            .contains("newer Ottto app"));
     }
 
     #[test]
@@ -11391,6 +11396,97 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn verify_refreshes_recoverable_pending_account_before_requiring_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-pending-account-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-pending-account-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        let api_base_url = verify_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_refresh".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some("claim_existing".to_string()),
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        daemon
+            .begin_auth_with_claim(PendingAuthClaim {
+                claim_code: "claim_refresh".to_string(),
+                claim_token: "token_refresh".to_string(),
+                nonce: "nonce_refresh".to_string(),
+                claim_url: "https://ottto.net/apps/setup?code=claim_refresh".to_string(),
+                expires_at: "2026-05-05T10:05:00Z".to_string(),
+            })
+            .expect("start recoverable pending auth");
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should refresh setup token");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load refreshed setup token"),
+            "otsr_verify_fresh"
+        );
+        assert_eq!(
+            daemon
+                .status_for_trusted_client()
+                .expect("status")
+                .account
+                .state,
+            LocalAccountState::Connected
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn backend_cli_error_message_omits_endpoint_details() {
         let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -12027,6 +12123,43 @@ log_user_prompt = true
                         404,
                         "Not Found",
                         r#"{"detail":"unexpected setup action request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_refresh_backend() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected verify refresh request"}"#,
                     );
                 }
             }

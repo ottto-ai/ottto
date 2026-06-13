@@ -452,6 +452,23 @@ impl LocalDaemon {
         }))
     }
 
+    pub fn clear_recoverable_pending_auth_for_authorized_client(
+        &self,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if state.account.state != LocalAccountState::ClaimPending {
+            return Ok(());
+        }
+        if state.connection.is_none() || state.account.user.is_none() {
+            return Ok(());
+        }
+        state.pending_auth = None;
+        state.account.state = LocalAccountState::Connected;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = None;
+        Ok(())
+    }
+
     pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
         self.reset_account_for_authorized_client()
     }
