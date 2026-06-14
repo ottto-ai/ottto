@@ -502,10 +502,19 @@ impl LocalDaemon {
     pub fn update_sources(
         &self,
         token: &str,
-        sources: Vec<SourceHealth>,
+        mut sources: Vec<SourceHealth>,
     ) -> Result<(), LocalApiError> {
         self.control_token.authorize(token)?;
         let mut state = self.state()?;
+        for refreshed in &mut sources {
+            if let Some(existing) = state
+                .sources
+                .iter()
+                .find(|health| health.source == refreshed.source)
+            {
+                preserve_config_drift_repair_state(refreshed, existing);
+            }
+        }
         state.sources = sources;
         Ok(())
     }
@@ -1577,19 +1586,11 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
     {
         let existing = state.sources[index].clone();
         let mut refreshed = source_health_from_agent_status(state, snapshot);
-        let preserve_config_drift_health = refreshed.config.drift.is_empty()
-            && !existing.config.drift.is_empty()
-            && has_config_drift_problem(&existing);
         if refreshed.config.path_hint.is_none() {
             refreshed.config.path_hint = existing.config.path_hint.clone();
         }
         if refreshed.config.fingerprint.is_none() {
             refreshed.config.fingerprint = existing.config.fingerprint.clone();
-        }
-        let preserved_config_drift =
-            refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
-        if preserved_config_drift {
-            refreshed.config.drift = existing.config.drift.clone();
         }
         refreshed.config.discovered |= existing.config.discovered;
         if refreshed.collector.is_none() {
@@ -1603,13 +1604,7 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         }
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
-        if preserve_config_drift_health {
-            refreshed.state = existing.state.clone();
-            refreshed.grade = existing.grade.clone();
-            refreshed.problems = existing.problems.clone();
-            refreshed.recommended_actions = existing.recommended_actions.clone();
-            refreshed.last_verified_at = existing.last_verified_at.clone();
-        }
+        preserve_config_drift_repair_state(&mut refreshed, &existing);
         state.sources[index] = refreshed;
         return;
     }
@@ -1625,6 +1620,21 @@ fn has_config_drift_problem(health: &SourceHealth) -> bool {
         ]
         .contains(&problem.code)
     })
+}
+
+fn preserve_config_drift_repair_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
+    let preserve_config_drift =
+        refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
+    if preserve_config_drift {
+        refreshed.config.drift = existing.config.drift.clone();
+    }
+    if preserve_config_drift && has_config_drift_problem(existing) {
+        refreshed.state = existing.state.clone();
+        refreshed.grade = existing.grade.clone();
+        refreshed.problems = existing.problems.clone();
+        refreshed.recommended_actions = existing.recommended_actions.clone();
+        refreshed.last_verified_at = existing.last_verified_at.clone();
+    }
 }
 
 fn source_health_from_agent_status(
@@ -2602,6 +2612,61 @@ mod tests {
             status.sources[0].last_verified_at.as_deref(),
             Some("2026-05-05T10:15:00Z")
         );
+    }
+
+    #[test]
+    fn source_update_preserves_config_drift_verification_failure() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("source health should update");
+
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:drifted".to_string()),
+                drift: vec![ottto_protocol::ConfigDrift {
+                    key: "otel.logs_endpoint".to_string(),
+                    expected: RedactedValue::String("http://127.0.0.1:43119/v1/logs".to_string()),
+                    observed: RedactedValue::String("http://127.0.0.1:44621/v1/logs".to_string()),
+                }],
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "config_drift".to_string(),
+                text: "Codex telemetry config does not match the active Ottto relay.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record config drift verification");
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("fresh source scan should not clear verification failure");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::NeedsRepair);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::ConfigDrift
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::WriteConfig
+        );
+        assert_eq!(status.sources[0].config.drift.len(), 1);
     }
 
     #[test]
