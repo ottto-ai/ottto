@@ -574,11 +574,7 @@ impl LocalDaemon {
         &self,
         result: &SourceVerificationResult,
     ) -> Result<(), LocalApiError> {
-        if matches!(
-            result.status,
-            SourceVerificationStatus::AccountNotConnected
-                | SourceVerificationStatus::ReconnectRequired
-        ) {
+        if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
         let mut state = self.state()?;
@@ -2733,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_required_verification_preserves_source_health() {
+    fn reconnect_required_verification_updates_source_health() {
         let daemon = daemon();
         daemon
             .update_sources(TOKEN, vec![codex_health()])
@@ -2764,9 +2760,16 @@ mod tests {
             .expect("record reconnect result");
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert!(status.sources[0].problems.is_empty());
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::VerifyTelemetry
+        );
     }
 
     #[test]
