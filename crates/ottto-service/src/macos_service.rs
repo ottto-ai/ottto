@@ -253,6 +253,7 @@ pub fn install_owner_label(owner: InstallOwner) -> &'static str {
         InstallOwner::Homebrew => "Homebrew",
         InstallOwner::HostedInstaller => "hosted-installer",
         InstallOwner::AppBundle => "app-bundle",
+        InstallOwner::Dev => "dev",
         InstallOwner::Unknown => "unknown-owner",
     }
 }
@@ -267,6 +268,9 @@ pub fn install_owner_repair_hint(owner: InstallOwner) -> &'static str {
         }
         InstallOwner::HostedInstaller => {
             "Rerun the hosted installer for hosted-installer ownership, or pass --migrate-owner for an intentional owner switch."
+        }
+        InstallOwner::Dev => {
+            "Use an explicit developer repair command for dev ownership; production self-repair will not rewrite it."
         }
         InstallOwner::Unknown => {
             "Inspect the existing LaunchAgent, then pass --migrate-owner only if replacing it is intentional."

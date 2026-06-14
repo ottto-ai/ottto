@@ -964,6 +964,9 @@ impl LocalDaemon {
                             ottto_protocol::InstallOwner::AppBundle => {
                                 Some("quit and relaunch the Ottto app")
                             }
+                            ottto_protocol::InstallOwner::Dev => {
+                                Some("run the explicit dev repair command")
+                            }
                             ottto_protocol::InstallOwner::Unknown => None,
                         }
                     })

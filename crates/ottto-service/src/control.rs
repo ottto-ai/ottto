@@ -2097,6 +2097,13 @@ fn update_route_for_owner(
                     .to_string(),
             ),
         ),
+        InstallOwner::Dev => (
+            None,
+            Some(
+                "Dev-owned installs must be updated with an explicit developer command."
+                    .to_string(),
+            ),
+        ),
         InstallOwner::Unknown => (
             None,
             Some("Install the latest Ottto local platform from the Apps page.".to_string()),
@@ -2116,6 +2123,7 @@ fn install_owner_label(install_owner: InstallOwner) -> &'static str {
         InstallOwner::Homebrew => "Homebrew",
         InstallOwner::HostedInstaller => "hosted-installer",
         InstallOwner::AppBundle => "app-bundled",
+        InstallOwner::Dev => "dev",
         InstallOwner::Unknown => "unknown-owner",
     }
 }
@@ -2272,6 +2280,7 @@ fn owner_repair_command(owner: InstallOwner) -> Option<&'static str> {
         InstallOwner::Homebrew => Some("brew services restart ottto"),
         InstallOwner::HostedInstaller => Some("rerun the Ottto installer"),
         InstallOwner::AppBundle => Some("quit and relaunch the Ottto app"),
+        InstallOwner::Dev => Some("run the explicit dev repair command"),
         InstallOwner::Unknown => None,
     }
 }
