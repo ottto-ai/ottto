@@ -98,6 +98,410 @@ pub struct DaemonStatus {
     pub generated_at: Rfc3339Timestamp,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthContractFixture {
+    pub fixture_schema_version: String,
+    pub case_id: String,
+    pub title: String,
+    pub contract_version: String,
+    pub stable_runtime_version: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_stable_input: Option<serde_json::Value>,
+    pub health: LocalMachineHealthV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<MachineRuntimeHeartbeatV1>,
+    #[serde(default)]
+    pub events: Vec<LocalHealthEventV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<LocalHealthCommandV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_result: Option<LocalHealthCommandResultV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_job: Option<BackfillJobV1>,
+    pub expected: LocalHealthFixtureExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthFixtureExpectation {
+    pub overall_state: LocalHealthOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<String>,
+    #[serde(default)]
+    pub preserved_login: bool,
+    #[serde(default)]
+    pub preserved_sources: Vec<SourceKind>,
+    #[serde(default)]
+    pub requires_public_runtime_followup: bool,
+    #[serde(default)]
+    pub requires_private_consumer_followup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalMachineHealthV1 {
+    pub schema_version: u16,
+    pub schema_version_name: String,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub revision: u64,
+    pub projection_revision: u64,
+    pub protocol_version: String,
+    pub projection_version: String,
+    pub event_schema_version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub observed_at: Rfc3339Timestamp,
+    pub computed_at: Rfc3339Timestamp,
+    pub fresh_until: Rfc3339Timestamp,
+    pub overall: LocalHealthOverall,
+    pub runtime: RuntimeIdentityV1,
+    pub account: LocalHealthAccountV1,
+    #[serde(default)]
+    pub sources: Vec<LocalHealthSourceV1>,
+    #[serde(default)]
+    pub blockers: Vec<LocalHealthBlockerV1>,
+    #[serde(default)]
+    pub evidence: Vec<LocalHealthEvidenceRefV1>,
+}
+
+pub type LocalMachineHealth = LocalMachineHealthV1;
+pub type CanonicalLocalHealth = LocalMachineHealthV1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthOverall {
+    pub state: LocalHealthOverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_blocker: Option<String>,
+    pub severity: LocalHealthSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthOverallState {
+    Healthy,
+    Degraded,
+    Blocked,
+    UpgradeRequired,
+    ReconnectRequired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthSeverity {
+    Info,
+    Warning,
+    Blocking,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeIdentityV1 {
+    pub install_owner: InstallOwner,
+    pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_bundle_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_pid: Option<u32>,
+    pub service_executable_path_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_executable_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_loaded_program_hash: Option<String>,
+    pub started_at: Rfc3339Timestamp,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub version_match: bool,
+    pub protocol_match: bool,
+    pub schema_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthAccountV1 {
+    pub state: LocalHealthAccountState,
+    pub device_state: LocalDeviceState,
+    pub setup_run_state: LocalSetupRunState,
+    pub setup_token_state: LocalSetupTokenState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_controls: Option<OrgTelemetryControlState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgTelemetryControlState {
+    pub read_only: bool,
+    pub can_mutate_sources: bool,
+    pub can_enable_telemetry: bool,
+    pub can_disable_telemetry: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthAccountState {
+    Connected,
+    ReconnectRequired,
+    NotConnected,
+    ClaimPending,
+    Blocked,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDeviceState {
+    Active,
+    Inactive,
+    StaleHeartbeat,
+    CollisionSuspected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSetupRunState {
+    Complete,
+    Pending,
+    RefreshRequired,
+    RebindRequired,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSetupTokenState {
+    Valid,
+    Expired,
+    RefreshRequired,
+    Rebound,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthSourceV1 {
+    pub source_id: String,
+    pub app: SourceKind,
+    pub state: LocalHealthSourceState,
+    pub authority: LocalHealthAuthority,
+    pub authority_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    pub projection_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthSourceState {
+    Healthy,
+    RepairRequired,
+    VerifyFailed,
+    PendingSetup,
+    Removed,
+    DisabledByPolicy,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthAuthority {
+    Runtime,
+    Heartbeat,
+    Backend,
+    Verify,
+    Command,
+    Backfill,
+    Diagnostics,
+    Setup,
+    Reducer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthBlockerV1 {
+    pub code: String,
+    pub severity: LocalHealthSeverity,
+    pub owner: String,
+    pub source: LocalHealthAuthority,
+    pub since: Rfc3339Timestamp,
+    pub clear_condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthEvidenceRefV1 {
+    pub event_id: String,
+    pub event_type: String,
+    pub authority: LocalHealthAuthority,
+    pub observed_at: Rfc3339Timestamp,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthEventV1 {
+    pub event_id: String,
+    pub event_schema_version: String,
+    pub event_type: String,
+    pub machine_id: String,
+    pub observed_at: Rfc3339Timestamp,
+    pub sequence: u64,
+    pub authority: LocalHealthAuthority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineRuntimeHeartbeatV1 {
+    pub schema_version: String,
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    pub daemon_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_bundle_version: Option<String>,
+    pub protocol_version: String,
+    pub health_schema_version: String,
+    pub executable_path: String,
+    pub install_owner: InstallOwner,
+    pub launchd_label: String,
+    pub started_at: Rfc3339Timestamp,
+    pub last_seen_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub health_projection_revision: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthCommandV1 {
+    pub action_id: String,
+    pub idempotency_key: String,
+    pub actor: LocalHealthCommandActor,
+    pub target: LocalHealthCommandTarget,
+    pub expected_projection_revision: u64,
+    pub command_schema_version: String,
+    pub command: String,
+    pub issued_at: Rfc3339Timestamp,
+    pub expires_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthCommandActor {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalHealthCommandTarget {
+    pub machine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<SourceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalHealthCommandResultV1 {
+    pub action_id: String,
+    pub idempotency_key: String,
+    pub command_schema_version: String,
+    pub status: LocalHealthCommandStatus,
+    pub terminal: bool,
+    pub started_projection_revision: u64,
+    pub completed_projection_revision: u64,
+    pub observed_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalHealthCommandStatus {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Rejected,
+    Deduped,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackfillJobV1 {
+    pub job_id: String,
+    pub machine_id: String,
+    pub source_id: String,
+    pub app_id: SourceKind,
+    pub from: Rfc3339Timestamp,
+    pub to: Rfc3339Timestamp,
+    pub reason: String,
+    pub schema_version: String,
+    pub priority: String,
+    pub retention_limit: String,
+    pub created_at: Rfc3339Timestamp,
+    pub expires_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<BackfillJobProgressV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillJobProgressV1 {
+    pub status: String,
+    pub accepted_chunks: u64,
+    pub deduped_chunks: u64,
+    pub rejected_chunks: u64,
+    pub completed_at: Rfc3339Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalAccountBinding {
     pub state: LocalAccountState,
@@ -1455,6 +1859,7 @@ pub enum InstallOwner {
     Homebrew,
     HostedInstaller,
     AppBundle,
+    Dev,
     #[default]
     Unknown,
 }
@@ -2560,6 +2965,306 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(PROTOCOL_VERSION as u64)
         );
+    }
+
+    #[test]
+    fn local_health_contract_matrix_matches_protocol_models() {
+        let fixtures = local_health_contract_fixtures();
+        let case_ids: std::collections::BTreeSet<_> = fixtures
+            .iter()
+            .map(|fixture| fixture.case_id.as_str())
+            .collect();
+        let required_case_ids = [
+            "current_healthy_v1",
+            "upgrade_0_1_27_login_sources_preserved",
+            "runtime_app_daemon_mismatch_red",
+            "protocol_schema_mismatch_upgrade_required",
+            "stale_heartbeat_red",
+            "inactive_device_red",
+            "verify_failure_wins_over_old_green",
+            "source_removed_sync_revision",
+            "backfill_success_cannot_green_current_failure",
+            "homebrew_owner_conflict_red",
+            "dev_owner_no_production_repair",
+            "read_only_org_telemetry_controls_disabled",
+            "setup_token_refresh_rebind",
+            "command_idempotency_terminal_result",
+            "object_authorization_rejection",
+            "machine_identity_collision_reconnect",
+            "corrupt_local_state_recovery",
+            "clock_skew_warning",
+            "diagnostics_redaction",
+        ];
+
+        assert_eq!(fixtures.len(), required_case_ids.len());
+        for case_id in required_case_ids {
+            assert!(
+                case_ids.contains(case_id),
+                "missing local health case {case_id}"
+            );
+        }
+
+        for fixture in &fixtures {
+            assert_eq!(
+                fixture.fixture_schema_version,
+                "local_health_contract_fixture.v1"
+            );
+            assert_eq!(fixture.contract_version, "local_machine_health.v1");
+            assert_eq!(fixture.health.schema_version, 1);
+            assert_eq!(
+                fixture.health.schema_version_name,
+                "local_machine_health.v1"
+            );
+            assert_eq!(fixture.health.projection_version, "health_projection.v1");
+            assert_eq!(fixture.health.event_schema_version, "local_health_event.v1");
+            assert!(
+                fixture
+                    .health
+                    .capabilities
+                    .iter()
+                    .any(|value| value == "health.v1"),
+                "{} must advertise health.v1",
+                fixture.case_id
+            );
+            assert_eq!(fixture.expected.overall_state, fixture.health.overall.state);
+            assert_eq!(
+                fixture.expected.primary_blocker,
+                fixture.health.overall.primary_blocker
+            );
+            assert_eq!(
+                fixture.health.revision, fixture.health.projection_revision,
+                "{} uses one canonical projection revision in Phase 0",
+                fixture.case_id
+            );
+            for source in &fixture.health.sources {
+                assert!(
+                    source.projection_revision <= fixture.health.projection_revision,
+                    "{} source projection revision moved past health projection",
+                    fixture.case_id
+                );
+            }
+            for event in &fixture.events {
+                assert_eq!(event.machine_id, fixture.health.machine_id);
+                assert_eq!(event.event_schema_version, "local_health_event.v1");
+            }
+            if let Some(heartbeat) = &fixture.heartbeat {
+                assert_eq!(heartbeat.schema_version, "machine_runtime_heartbeat.v1");
+                assert_eq!(heartbeat.machine_id, fixture.health.machine_id);
+                assert_eq!(
+                    heartbeat.health_projection_revision,
+                    fixture.health.projection_revision
+                );
+            }
+            if let Some(command) = &fixture.command {
+                assert_eq!(command.command_schema_version, "local_command.v1");
+                assert!(
+                    command.expires_at > command.issued_at,
+                    "{} command expiry should be after issue time",
+                    fixture.case_id
+                );
+            }
+            if let Some(result) = &fixture.command_result {
+                assert_eq!(result.command_schema_version, "local_command.v1");
+                assert!(
+                    result.terminal,
+                    "{} result should be terminal",
+                    fixture.case_id
+                );
+                let command = fixture
+                    .command
+                    .as_ref()
+                    .expect("command result must include command fixture");
+                assert_eq!(command.action_id, result.action_id);
+                assert_eq!(command.idempotency_key, result.idempotency_key);
+                assert!(
+                    result.completed_projection_revision >= result.started_projection_revision,
+                    "{} command result projection revision regressed",
+                    fixture.case_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_health_fixture_contract_pins_phase_zero_edge_cases() {
+        let fixtures = local_health_contract_fixtures();
+        let by_id = |case_id: &str| -> &LocalHealthContractFixture {
+            fixtures
+                .iter()
+                .find(|fixture| fixture.case_id == case_id)
+                .unwrap_or_else(|| panic!("missing local health fixture {case_id}"))
+        };
+
+        let upgrade = by_id("upgrade_0_1_27_login_sources_preserved");
+        assert!(upgrade.previous_stable_input.is_some());
+        assert!(upgrade.expected.preserved_login);
+        assert_eq!(
+            upgrade.expected.preserved_sources,
+            vec![SourceKind::Codex, SourceKind::ClaudeCode]
+        );
+
+        let mismatch = by_id("runtime_app_daemon_mismatch_red");
+        assert!(!mismatch.health.runtime.version_match);
+        assert_eq!(
+            mismatch.health.overall.primary_blocker.as_deref(),
+            Some("service_outdated")
+        );
+
+        let protocol = by_id("protocol_schema_mismatch_upgrade_required");
+        assert!(!protocol.health.runtime.protocol_match);
+        assert!(!protocol.health.runtime.schema_match);
+        assert_eq!(
+            protocol.health.overall.state,
+            LocalHealthOverallState::UpgradeRequired
+        );
+
+        let stale = by_id("stale_heartbeat_red");
+        assert_eq!(
+            stale.health.account.device_state,
+            LocalDeviceState::StaleHeartbeat
+        );
+
+        let inactive = by_id("inactive_device_red");
+        assert_eq!(
+            inactive.health.account.device_state,
+            LocalDeviceState::Inactive
+        );
+        assert_eq!(
+            inactive.health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+
+        let verify = by_id("verify_failure_wins_over_old_green");
+        assert_eq!(
+            verify.health.sources[0].authority,
+            LocalHealthAuthority::Verify
+        );
+        assert_eq!(
+            verify.health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+
+        let backfill = by_id("backfill_success_cannot_green_current_failure");
+        assert!(backfill.backfill_job.is_some());
+        assert_eq!(
+            backfill.health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+
+        let homebrew = by_id("homebrew_owner_conflict_red");
+        assert_eq!(
+            homebrew.health.runtime.install_owner,
+            InstallOwner::Homebrew
+        );
+
+        let dev = by_id("dev_owner_no_production_repair");
+        assert_eq!(dev.health.runtime.install_owner, InstallOwner::Dev);
+
+        let read_only = by_id("read_only_org_telemetry_controls_disabled");
+        let controls = read_only
+            .health
+            .account
+            .telemetry_controls
+            .as_ref()
+            .expect("read-only fixture should include telemetry controls");
+        assert!(controls.read_only);
+        assert!(!controls.can_enable_telemetry);
+        assert!(!controls.can_disable_telemetry);
+
+        let setup = by_id("setup_token_refresh_rebind");
+        assert_eq!(
+            setup.health.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+
+        let source_removed = by_id("source_removed_sync_revision");
+        assert_eq!(
+            source_removed.health.sources[0].state,
+            LocalHealthSourceState::Removed
+        );
+
+        let command = by_id("command_idempotency_terminal_result");
+        assert_eq!(
+            command
+                .command_result
+                .as_ref()
+                .expect("command result")
+                .status,
+            LocalHealthCommandStatus::Deduped
+        );
+
+        let object_auth = by_id("object_authorization_rejection");
+        assert_eq!(
+            object_auth
+                .command_result
+                .as_ref()
+                .expect("command result")
+                .status,
+            LocalHealthCommandStatus::Rejected
+        );
+
+        let collision = by_id("machine_identity_collision_reconnect");
+        assert_eq!(
+            collision.health.account.device_state,
+            LocalDeviceState::CollisionSuspected
+        );
+
+        let corrupt = by_id("corrupt_local_state_recovery");
+        assert_eq!(
+            corrupt.health.overall.primary_blocker.as_deref(),
+            Some("local_state_recovery_required")
+        );
+
+        let skew = by_id("clock_skew_warning");
+        assert_eq!(skew.health.overall.state, LocalHealthOverallState::Degraded);
+
+        let diagnostics = by_id("diagnostics_redaction");
+        assert_eq!(
+            diagnostics.health.sources[0].authority,
+            LocalHealthAuthority::Diagnostics
+        );
+    }
+
+    #[test]
+    fn diagnostics_local_health_fixture_is_redacted() {
+        let fixtures = local_health_contract_fixtures();
+        let diagnostics = fixtures
+            .iter()
+            .find(|fixture| fixture.case_id == "diagnostics_redaction")
+            .expect("diagnostics fixture");
+        let encoded =
+            serde_json::to_string(diagnostics).expect("diagnostics fixture should serialize");
+        for forbidden in [
+            "sk-",
+            "ghp_",
+            "password=",
+            concat!("BEGIN ", "PRIVATE KEY"),
+            "raw_cookie",
+            "hardware_serial_value",
+            "setup_secret_value",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostics fixture leaked forbidden marker {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Phase 1+ reducer work: fixtures are present, runtime reducer is not implemented yet"]
+    fn local_health_reducer_replays_contract_matrix() {
+        let fixtures = local_health_contract_fixtures();
+        assert!(
+            !fixtures.is_empty(),
+            "future reducer should replay each fixture into its expected health state"
+        );
+    }
+
+    fn local_health_contract_fixtures() -> Vec<LocalHealthContractFixture> {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/local-health/contract-matrix.v1.json"
+        ))
+        .expect("local health contract matrix should deserialize")
     }
 
     #[test]

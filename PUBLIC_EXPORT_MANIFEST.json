@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 188,
-  "content_sha256": "78b7e45a1902caf93b5cf871cb7cf8136ac3804e7618da590824480be7426ded",
+  "candidate_file_count": 190,
+  "content_sha256": "229aa92afac7718b392996a2fd3d50c2670e875ab72f97f7333ddeb3b0c0ea3d",
   "files": [
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "141066746d753a7ddc1851eaa564be73f00c1140609bb67a110fc88202b88832",
-      "size_bytes": 98013
+      "sha256": "6a767062abbfd924cdb491c4be1584d4a7dc38b2cb8af887c494d3269a80c5c3",
+      "size_bytes": 122493
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "e30ce86f9d8e48fafa12c93c7f4c157858680d5aa982558345925559a935f444",
-      "size_bytes": 491678
+      "sha256": "6905fd7e7c9bebea8299b75d51f3c11775aa1195f527dbd8b395a9a446344fc5",
+      "size_bytes": 492004
     },
     {
       "executable": false,
@@ -587,15 +587,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "ca3cc43d7e569f588198349692100a64ba0d915c7c225ba4925a43dd89208e2a",
-      "size_bytes": 134061
+      "sha256": "1563253e249481ee6e8a0f611cfad83b3499243be6227fa849bb88febc7a37ba",
+      "size_bytes": 134234
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/macos_service.rs",
-      "sha256": "c153cc73689c22b415ac67c5eb8e18d73e2061b07ce58adc81325d53c778fa4b",
-      "size_bytes": 19895
+      "sha256": "fb62d15cde68b22bb0b18f1b842feff6fd994b2e992c1abe00fe977da74ff280",
+      "size_bytes": 20090
     },
     {
       "executable": false,
@@ -841,6 +841,20 @@
       "path": "fixtures/diagnostics/redacted-bundle.json",
       "sha256": "36355e965b447131b75f5195de2072ab2589883cb872fc6079ad26b6a8d39e79",
       "size_bytes": 3082
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/local-health/README.md",
+      "sha256": "cc8d088c7182737b8e41fc3ec7b93136a3b746ba3fa2c06a23b7129afc76dd3c",
+      "size_bytes": 731
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/local-health/contract-matrix.v1.json",
+      "sha256": "6347d509264314b8ad670b483f72370433a56fe0493a4f6f8f292862becd5275",
+      "size_bytes": 60469
     },
     {
       "executable": false,
@@ -1319,9 +1333,9 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-14T12:41:36+00:00",
+  "generated_at": "2026-06-14T21:14:56+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 189,
+  "output_file_count": 191,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1354,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2046660b39a9da3e75ba096bba81daeb4ca6beff"
+  "source_commit": "846a7c2356b077624098d9415d22d82c1e718d1b"
 }
