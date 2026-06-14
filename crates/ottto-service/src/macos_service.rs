@@ -296,7 +296,9 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
     mach_services.insert(config.mach_service_name.clone(), Value::Boolean(true));
     root.insert("MachServices".to_string(), Value::Dictionary(mach_services));
     root.insert("RunAtLoad".to_string(), Value::Boolean(true));
-    root.insert("KeepAlive".to_string(), Value::Boolean(true));
+    let mut keep_alive = Dictionary::new();
+    keep_alive.insert("Crashed".to_string(), Value::Boolean(true));
+    root.insert("KeepAlive".to_string(), Value::Dictionary(keep_alive));
     root.insert(
         "StandardOutPath".to_string(),
         Value::String(config.stdout_path.display().to_string()),
@@ -407,7 +409,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            root.get("KeepAlive").and_then(Value::as_boolean),
+            root.get("KeepAlive")
+                .and_then(Value::as_dictionary)
+                .and_then(|keep_alive| keep_alive.get("Crashed"))
+                .and_then(Value::as_boolean),
             Some(true)
         );
 

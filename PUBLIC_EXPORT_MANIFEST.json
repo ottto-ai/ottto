@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "229aa92afac7718b392996a2fd3d50c2670e875ab72f97f7333ddeb3b0c0ea3d",
+  "content_sha256": "0eaa6c79ef6a48c4cc4651043126ed7eb528cd87b215397a5e91881543ca2822",
   "files": [
     {
       "executable": false,
@@ -461,8 +461,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/status.rs",
-      "sha256": "c5abcc06f59155aeb73e59ab733aef15d91af83e0e94fc9d199869cc5e978368",
-      "size_bytes": 4488
+      "sha256": "b5d4ae1992a26db6244f684f60355185c244e1de1249291512dee7c1178094ee",
+      "size_bytes": 4630
     },
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "6a767062abbfd924cdb491c4be1584d4a7dc38b2cb8af887c494d3269a80c5c3",
-      "size_bytes": 122493
+      "sha256": "0e6232217e69350a8a7a2b494e375c2c75aa9f8e006970c6553b12ba8ad7d7f7",
+      "size_bytes": 122966
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "6905fd7e7c9bebea8299b75d51f3c11775aa1195f527dbd8b395a9a446344fc5",
-      "size_bytes": 492004
+      "sha256": "ec803ad3bd4ceef39b2074001ba25eaf04ec43582b7dd1638a51e45b29b57a23",
+      "size_bytes": 495520
     },
     {
       "executable": false,
@@ -587,15 +587,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "1563253e249481ee6e8a0f611cfad83b3499243be6227fa849bb88febc7a37ba",
-      "size_bytes": 134234
+      "sha256": "6a561b9688b0bd3cba7323ccb41e5a309bedb466b44f835b9e1d68a1a5a2b227",
+      "size_bytes": 158669
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/macos_service.rs",
-      "sha256": "fb62d15cde68b22bb0b18f1b842feff6fd994b2e992c1abe00fe977da74ff280",
-      "size_bytes": 20090
+      "sha256": "e18a66f3164da861b433a772a9c2369a96a4bb53ae6c123915b4cdf76e0e2acf",
+      "size_bytes": 20342
     },
     {
       "executable": false,

@@ -418,6 +418,7 @@ fn handle_command(
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
+            crate::refresh_canonical_local_health(&mut status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
             Ok(value)
@@ -505,7 +506,31 @@ fn handle_command(
             }
         }
         LocalControlCommand::Verify { source, repair } => {
-            to_value(verify_source(daemon, &authorization, source, repair)?)
+            let result = verify_source(daemon, &authorization, source, repair)?;
+            let mut value = to_value(result)?;
+            let mut status = status_for(daemon, &authorization)?;
+            status.update.install_owner = detect_install_owner();
+            status.service_owner = service_owner_state(client_install_owner);
+            crate::refresh_canonical_local_health(&mut status);
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert(
+                    "canonical_health".to_string(),
+                    to_value(status.canonical_health)?,
+                );
+                object.insert(
+                    "runtime_heartbeat".to_string(),
+                    to_value(status.runtime_heartbeat)?,
+                );
+                object.insert(
+                    "local_health_events".to_string(),
+                    to_value(status.local_health_events)?,
+                );
+                object.insert(
+                    "command_ledger".to_string(),
+                    to_value(status.command_ledger)?,
+                );
+            }
+            Ok(value)
         }
         LocalControlCommand::Setup {
             sources,
@@ -10946,6 +10971,73 @@ log_user_prompt = true
         assert!(body.contains("http://127.0.0.1:43119/v1/logs"));
         assert!(body.contains("protocol = \"binary\""));
         assert!(body.contains("otel.log_user_prompt = false"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_json_exposes_canonical_health_failure() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-canonical-health");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let config_path = root.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[otel]
+log_user_prompt = true
+"#,
+        )
+        .expect("write drifted config");
+
+        let response = handle_request(
+            &daemon().with_account(connected_account()),
+            LocalControlRequest {
+                request_id: "req_verify_canonical".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: SourceKind::Codex,
+                    repair: false,
+                },
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(
+            payload.get("status").and_then(serde_json::Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            payload
+                .get("canonical_health")
+                .and_then(|health| health.get("overall"))
+                .and_then(|overall| overall.get("state"))
+                .and_then(serde_json::Value::as_str),
+            Some("blocked")
+        );
+        assert!(payload
+            .get("canonical_health")
+            .and_then(|health| health.get("blockers"))
+            .and_then(serde_json::Value::as_array)
+            .expect("blockers array")
+            .iter()
+            .any(
+                |blocker| blocker.get("code").and_then(serde_json::Value::as_str)
+                    == Some("config_drift")
+            ));
+        assert!(payload
+            .get("local_health_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("events array")
+            .iter()
+            .any(
+                |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("VerifyFailed")
+            ));
         let _ = fs::remove_dir_all(&root);
     }
 
