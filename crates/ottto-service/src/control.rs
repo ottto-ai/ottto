@@ -5381,6 +5381,7 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
             program: "codex",
             args: vec![
                 "exec",
+                "--json",
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
@@ -10038,6 +10039,20 @@ mod tests {
         assert!(command.args.iter().any(|arg| arg == "--no-context-files"));
         assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
         assert!(!command.args.iter().any(|arg| arg == "--help"));
+    }
+
+    #[test]
+    fn codex_smoke_command_uses_json_event_mode_for_otel_flush() {
+        let command = smoke_command(&SourceKind::Codex);
+
+        assert_eq!(command.program, "codex");
+        assert!(command.args.iter().any(|arg| arg == "exec"));
+        assert!(command.args.iter().any(|arg| arg == "--json"));
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "--skip-git-repo-check"));
+        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
     }
 
     #[test]
