@@ -512,7 +512,7 @@ impl LocalDaemon {
                 .iter()
                 .find(|health| health.source == refreshed.source)
             {
-                preserve_config_drift_repair_state(refreshed, existing);
+                preserve_blocking_verification_state(refreshed, existing);
             }
         }
         state.sources = sources;
@@ -1604,7 +1604,7 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         }
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
-        preserve_config_drift_repair_state(&mut refreshed, &existing);
+        preserve_blocking_verification_state(&mut refreshed, &existing);
         state.sources[index] = refreshed;
         return;
     }
@@ -1622,13 +1622,23 @@ fn has_config_drift_problem(health: &SourceHealth) -> bool {
     })
 }
 
-fn preserve_config_drift_repair_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
+fn has_verification_failure_problem(health: &SourceHealth) -> bool {
+    health
+        .problems
+        .iter()
+        .any(|problem| problem.code == StableProblemCode::TelemetryNotVerified)
+}
+
+fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
     let preserve_config_drift =
         refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
     if preserve_config_drift {
         refreshed.config.drift = existing.config.drift.clone();
     }
-    if preserve_config_drift && has_config_drift_problem(existing) {
+    let preserve_failed_verification =
+        existing.state == SourceState::Failed && has_verification_failure_problem(existing);
+    if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
+    {
         refreshed.state = existing.state.clone();
         refreshed.grade = existing.grade.clone();
         refreshed.problems = existing.problems.clone();
@@ -2667,6 +2677,59 @@ mod tests {
             RepairActionKind::WriteConfig
         );
         assert_eq!(status.sources[0].config.drift.len(), 1);
+    }
+
+    #[test]
+    fn source_update_preserves_failed_verification_result() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut healthy = codex_health();
+        healthy.source = SourceKind::Pi;
+        healthy.descriptor = source_descriptor(&SourceKind::Pi);
+        daemon
+            .update_sources(TOKEN, vec![healthy.clone()])
+            .expect("source health should update");
+
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_route_smoke_failed".to_string(),
+                text: "No Pi model routes passed smoke verification.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record failed verification");
+        daemon
+            .update_sources(TOKEN, vec![healthy])
+            .expect("fresh source scan should not clear failed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Pi);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::VerifyTelemetry
+        );
     }
 
     #[test]
