@@ -136,6 +136,12 @@ pub struct LocalDaemon {
     control_token: ControlToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalHealthUploadFailureKind {
+    AuthRejected,
+    BackendUnreachable,
+}
+
 #[derive(Debug, Clone)]
 struct DaemonState {
     machine: MachineIdentity,
@@ -748,6 +754,36 @@ impl LocalDaemon {
         Ok(())
     }
 
+    pub fn record_local_health_upload_succeeded(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        push_local_health_upload_event(
+            &mut state,
+            "LocalHealthUploadSucceeded",
+            "ok",
+            "canonical local health uploaded to Ottto",
+        );
+        Ok(())
+    }
+
+    pub fn record_local_health_upload_failed(
+        &self,
+        kind: LocalHealthUploadFailureKind,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        let (kind, message) = match kind {
+            LocalHealthUploadFailureKind::AuthRejected => (
+                "auth_rejected",
+                "Ottto rejected this Mac's relay device credentials",
+            ),
+            LocalHealthUploadFailureKind::BackendUnreachable => (
+                "backend_unreachable",
+                "Ottto could not be reached while uploading local health",
+            ),
+        };
+        push_local_health_upload_event(&mut state, "LocalHealthUploadFailed", kind, message);
+        Ok(())
+    }
+
     pub fn stop(&self, token: &str) -> Result<(), LocalApiError> {
         self.control_token.authorize(token)?;
         self.stop_authorized()
@@ -1287,6 +1323,32 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     status
 }
 
+fn push_local_health_upload_event(
+    state: &mut DaemonState,
+    event_type: &str,
+    kind: &str,
+    message: &str,
+) {
+    let sequence = next_local_health_sequence(state);
+    let observed_at = current_rfc3339_timestamp();
+    state.local_health_events.push(LocalHealthEventV1 {
+        event_id: format!("evt_local_health_upload_{kind}_{sequence}"),
+        event_schema_version: "local_health_event.v1".to_string(),
+        event_type: event_type.to_string(),
+        machine_id: state.machine.machine_id.clone(),
+        observed_at,
+        sequence,
+        authority: LocalHealthAuthority::Backend,
+        source_id: None,
+        action_id: None,
+        payload: serde_json::json!({
+            "kind": kind,
+            "message": message,
+            "current": true
+        }),
+    });
+}
+
 pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
@@ -1506,6 +1568,42 @@ fn runtime_heartbeat_for_status(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestLocalHealthUpload {
+    Succeeded,
+    AuthRejected { observed_at: String },
+    BackendUnreachable { observed_at: String },
+}
+
+fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
+    status
+        .local_health_events
+        .iter()
+        .filter(|event| {
+            event.event_type == "LocalHealthUploadFailed"
+                || event.event_type == "LocalHealthUploadSucceeded"
+        })
+        .max_by_key(|event| event.sequence)
+        .and_then(|event| {
+            if event.event_type == "LocalHealthUploadSucceeded" {
+                return Some(LatestLocalHealthUpload::Succeeded);
+            }
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)?;
+            match kind {
+                "auth_rejected" => Some(LatestLocalHealthUpload::AuthRejected {
+                    observed_at: event.observed_at.clone(),
+                }),
+                "backend_unreachable" => Some(LatestLocalHealthUpload::BackendUnreachable {
+                    observed_at: event.observed_at.clone(),
+                }),
+                _ => None,
+            }
+        })
+}
+
 fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
     let (state, setup_run_state, setup_token_state) = match status.account.state {
         LocalAccountState::Connected => (
@@ -1529,13 +1627,27 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             LocalSetupTokenState::Missing,
         ),
     };
+    let latest_upload = latest_local_health_upload(status);
+    let device_state = match latest_upload.as_ref() {
+        Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
+        Some(LatestLocalHealthUpload::BackendUnreachable { .. }) => LocalDeviceState::Unknown,
+        Some(LatestLocalHealthUpload::Succeeded) | None
+            if status.daemon == DaemonRuntimeState::Unavailable =>
+        {
+            LocalDeviceState::StaleHeartbeat
+        }
+        _ => LocalDeviceState::Active,
+    };
+    let (setup_run_state, setup_token_state) = match latest_upload.as_ref() {
+        Some(LatestLocalHealthUpload::AuthRejected { .. }) => (
+            LocalSetupRunState::RebindRequired,
+            LocalSetupTokenState::RefreshRequired,
+        ),
+        _ => (setup_run_state, setup_token_state),
+    };
     LocalHealthAccountV1 {
         state,
-        device_state: if status.daemon == DaemonRuntimeState::Unavailable {
-            LocalDeviceState::StaleHeartbeat
-        } else {
-            LocalDeviceState::Active
-        },
+        device_state,
         setup_run_state,
         setup_token_state,
         org_role: None,
@@ -1656,6 +1768,27 @@ fn local_health_blockers_for_status(
             &status.generated_at,
             "restart ottto-service and observe a fresh heartbeat",
         ));
+    }
+    match latest_local_health_upload(status) {
+        Some(LatestLocalHealthUpload::AuthRejected { observed_at }) => blockers.push(blocker(
+            "auth_missing",
+            LocalHealthSeverity::Blocking,
+            "backend",
+            LocalHealthAuthority::Backend,
+            &observed_at,
+            "rebind this Mac's relay device credentials before trusting cloud sync",
+        )),
+        Some(LatestLocalHealthUpload::BackendUnreachable { observed_at }) => {
+            blockers.push(blocker(
+                "backend_unreachable",
+                LocalHealthSeverity::Blocking,
+                "backend",
+                LocalHealthAuthority::Backend,
+                &observed_at,
+                "restore network access and upload a fresh local health projection",
+            ));
+        }
+        Some(LatestLocalHealthUpload::Succeeded) | None => {}
     }
     if matches!(
         account.state,
@@ -3353,6 +3486,72 @@ mod tests {
         assert_eq!(runtime.daemon_version, "0.1.28");
         assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
         assert!(!runtime.version_match);
+    }
+
+    #[test]
+    fn relay_token_auth_failure_marks_canonical_health_auth_missing() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let health = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(health.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(health.account.device_state, LocalDeviceState::Inactive);
+        assert_eq!(
+            health.account.setup_run_state,
+            LocalSetupRunState::RebindRequired
+        );
+        assert_eq!(
+            health.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("auth_missing")
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "auth_missing"));
+    }
+
+    #[test]
+    fn backend_unreachable_upload_failure_blocks_until_success_event() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
+            .expect("record upload failure");
+        let blocked = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(blocked.account.device_state, LocalDeviceState::Unknown);
+        assert_eq!(
+            blocked.overall.primary_blocker.as_deref(),
+            Some("backend_unreachable")
+        );
+
+        daemon
+            .record_local_health_upload_succeeded()
+            .expect("record upload success");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(recovered.account.device_state, LocalDeviceState::Active);
+        assert!(recovered
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "backend_unreachable"));
     }
 
     #[test]

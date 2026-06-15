@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "8245dbb21c058988b73f28855528c1237076c29a7ab87c1cfbf4bfccb5f6640c",
+  "content_sha256": "4dc9f8b7708a1572c168dbe17cd5d159cdd26b69282b00fce1794b4795dfd3d9",
   "files": [
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "76ea9f6aba69dfaa1c03b4416ea77dd00c5a09f99563d072f5c1a1314275d6cc",
-      "size_bytes": 161229
+      "sha256": "0fd63887bc4af32ccb84d7ca0fbf25343f089599847512fca137c1b82b07e590",
+      "size_bytes": 168434
     },
     {
       "executable": false,
@@ -608,22 +608,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "ed55dba7c0388d25e8e3a0d865fce3236e2a502af011c00fd20fd622dd9b8e63",
-      "size_bytes": 47803
+      "sha256": "505f8152601c0cadeb647d6f45363f364574fc6e5daa0d21c6565b75812d5307",
+      "size_bytes": 52228
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "d82329644920eb439dc85ea381fa6a3c49f2b8eb08f36464074a66c53dd69072",
-      "size_bytes": 16081
+      "sha256": "b4da5d0bbe2c081031d0b2fbab9144782d1d80f749379bc36736b0add622ffc8",
+      "size_bytes": 17658
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "8ea091ed71febcc69851c7ec6355533d91bdb148c6ad783135b8876bb80677fa",
-      "size_bytes": 46820
+      "sha256": "d04f4a2cbdd30f9267f9a3c57314c76f3fe877b414597ba2ccb1fff5524e2712",
+      "size_bytes": 47917
     },
     {
       "executable": false,
@@ -1333,7 +1333,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-15T09:15:53+00:00",
+  "generated_at": "2026-06-15T20:49:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e1b9e3776c24059cf708b315f6ad77381ee0f321"
+  "source_commit": "c3608722c71bd230bdd10c6a130f54be014da333"
 }
