@@ -152,9 +152,26 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
     };
     let api_base_url = snapshot_api_base_url();
     let client = SnapshotApiClient::new(api_base_url);
+    let enabled_sources = enabled_snapshot_sources(&device);
+
+    if let Some(source) = enabled_sources.first().copied() {
+        if let Err(error) = upload_local_health_projection_with(
+            &client,
+            &device,
+            &device_secret,
+            source,
+            &machine_id,
+            daemon,
+        ) {
+            eprintln!(
+                "local health projection upload skipped: {}",
+                safe_error(&error)
+            );
+        }
+    }
 
     let mut failed_sources = Vec::new();
-    for source in enabled_snapshot_sources(&device) {
+    for source in enabled_sources {
         if let Err(error) = sync_source(
             &client,
             &device,
@@ -179,6 +196,57 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
             failed_sources.len()
         ));
     }
+    Ok(())
+}
+
+pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
+        return Err(anyhow!("registered device has no enabled sources"));
+    };
+    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    upload_local_health_projection_with(
+        &client,
+        &device,
+        &device_secret,
+        source,
+        &machine_id,
+        daemon,
+    )
+}
+
+fn upload_local_health_projection_with(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Result<()> {
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let mut status = daemon
+        .status_for_trusted_client()
+        .map_err(|error| anyhow!("read local health status failed: {error}"))?;
+    crate::refresh_canonical_local_health(&mut status);
+    if status.machine.machine_id != machine_id {
+        return Err(anyhow!(
+            "local health machine identity does not match registered device"
+        ));
+    }
+    let heartbeat = status
+        .runtime_heartbeat
+        .as_ref()
+        .ok_or_else(|| anyhow!("runtime heartbeat projection is missing"))?;
+    let health = status
+        .canonical_health
+        .as_ref()
+        .ok_or_else(|| anyhow!("canonical local health projection is missing"))?;
+
+    client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
 

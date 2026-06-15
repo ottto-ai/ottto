@@ -4,7 +4,7 @@ use ottto_core::{
     compiled_release_version, ControlTokenStore, FileDeviceStore, KeychainSecretStore,
     LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
-use ottto_protocol::AgentStatusSnapshot;
+use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -281,6 +281,36 @@ impl SnapshotApiClient {
             .map_err(|error| anyhow!("upload agent status failed: {error}"))?
             .into_json()
             .map_err(|error| anyhow!("parse agent status response failed: {error}"))
+    }
+
+    pub fn upload_local_health_heartbeat(
+        &self,
+        relay_token: &str,
+        request: &MachineRuntimeHeartbeatV1,
+    ) -> Result<Value> {
+        self.agent
+            .post(&self.api_url("/api/v1/apps/health/heartbeat"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+            .map_err(|error| anyhow!("upload local health heartbeat failed: {error}"))?
+            .into_json()
+            .map_err(|error| anyhow!("parse local health heartbeat response failed: {error}"))
+    }
+
+    pub fn upload_local_health_projection(
+        &self,
+        relay_token: &str,
+        request: &LocalMachineHealthV1,
+    ) -> Result<Value> {
+        self.agent
+            .post(&self.api_url("/api/v1/apps/health/projection"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+            .map_err(|error| anyhow!("upload local health projection failed: {error}"))?
+            .into_json()
+            .map_err(|error| anyhow!("parse local health projection response failed: {error}"))
     }
 
     fn api_url(&self, path: &str) -> String {

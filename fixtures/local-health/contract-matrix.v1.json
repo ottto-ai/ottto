@@ -335,6 +335,52 @@
   },
   {
     "fixture_schema_version": "local_health_contract_fixture.v1",
+    "case_id": "all_verify_failures_win_over_old_green",
+    "title": "Codex, Claude Code, and Pi Verify failures beat older green app rows",
+    "contract_version": "local_machine_health.v1",
+    "stable_runtime_version": "0.1.30",
+    "tags": ["verify", "monotonicity", "red", "apps"],
+    "previous_stable_input": {"connected_apps": [{"app": "codex", "status": "green", "last_smoke_status": "verified"}, {"app": "claude_code", "status": "green", "last_smoke_status": "verified"}, {"app": "pi", "status": "green", "last_smoke_status": "verified"}]},
+    "health": {
+      "schema_version": 1,
+      "schema_version_name": "local_machine_health.v1",
+      "machine_id": "mach_all_verify_red",
+      "device_id": "dev_all_verify_red",
+      "org_id": "org_fixture",
+      "user_id": "usr_fixture_admin",
+      "revision": 181,
+      "projection_revision": 181,
+      "protocol_version": "local_control.v15",
+      "projection_version": "health_projection.v1",
+      "event_schema_version": "local_health_event.v1",
+      "capabilities": ["health.v1", "verify.codex", "verify.claude_code", "verify.pi", "source.repair"],
+      "observed_at": "2026-06-14T13:01:00Z",
+      "computed_at": "2026-06-14T13:01:02Z",
+      "fresh_until": "2026-06-14T13:06:02Z",
+      "overall": {"state": "blocked", "primary_blocker": "telemetry_not_verified", "severity": "blocking", "next_action": "repair_source"},
+      "runtime": {"install_owner": "app_bundle", "daemon_version": "0.1.30", "app_bundle_version": "0.1.30", "cli_version": "0.1.30", "service_version": "0.1.30", "service_pid": 4561, "service_executable_path_class": "app_bundle_helper", "service_executable_path": "/Applications/Ottto.app/Contents/Helpers/ottto-service", "service_executable_hash": "sha256:all-verify-red", "launchd_label": "net.ottto.service", "launchd_loaded_program_hash": "sha256:all-verify-red", "started_at": "2026-06-14T12:55:00Z", "last_seen_at": "2026-06-14T13:01:00Z", "boot_id": "boot_all_verify", "session_id": "login_all_verify", "version_match": true, "protocol_match": true, "schema_match": true},
+      "account": {"state": "connected", "device_state": "active", "setup_run_state": "complete", "setup_token_state": "valid", "org_role": "admin", "telemetry_controls": {"read_only": false, "can_mutate_sources": true, "can_enable_telemetry": true, "can_disable_telemetry": true}},
+      "sources": [
+        {"source_id": "src_codex", "app": "codex", "state": "verify_failed", "authority": "verify", "authority_at": "2026-06-14T13:01:00Z", "blocking_reason": "setup_run_token_invalid", "clear_condition": "newer verify pass for Codex on this machine", "next_action": "repair_source", "projection_revision": 181},
+        {"source_id": "src_claude_code", "app": "claude_code", "state": "verify_failed", "authority": "verify", "authority_at": "2026-06-14T13:01:00Z", "blocking_reason": "smoke_command_failed", "clear_condition": "newer verify pass for Claude Code on this machine", "next_action": "repair_source", "projection_revision": 181},
+        {"source_id": "src_pi", "app": "pi", "state": "verify_failed", "authority": "verify", "authority_at": "2026-06-14T13:01:00Z", "blocking_reason": "pi_route_smoke_failed", "clear_condition": "newer verify pass for Pi on this machine", "next_action": "repair_source", "projection_revision": 181}
+      ],
+      "blockers": [
+        {"code": "telemetry_not_verified", "severity": "blocking", "owner": "source", "source": "verify", "since": "2026-06-14T13:01:00Z", "clear_condition": "newer verify pass for Codex on this machine"},
+        {"code": "smoke_command_failed", "severity": "blocking", "owner": "source", "source": "verify", "since": "2026-06-14T13:01:00Z", "clear_condition": "newer verify pass for Claude Code on this machine"},
+        {"code": "pi_route_smoke_failed", "severity": "blocking", "owner": "source", "source": "verify", "since": "2026-06-14T13:01:00Z", "clear_condition": "newer verify pass for Pi on this machine"}
+      ],
+      "evidence": [
+        {"event_id": "evt_verify_codex_failed_current", "event_type": "VerifyFailed", "authority": "verify", "observed_at": "2026-06-14T13:01:00Z", "sequence": 181},
+        {"event_id": "evt_verify_claude_failed_current", "event_type": "VerifyFailed", "authority": "verify", "observed_at": "2026-06-14T13:01:00Z", "sequence": 181},
+        {"event_id": "evt_verify_pi_failed_current", "event_type": "VerifyFailed", "authority": "verify", "observed_at": "2026-06-14T13:01:00Z", "sequence": 181},
+        {"event_id": "evt_old_all_green_usage", "event_type": "UsageObserved", "authority": "backfill", "observed_at": "2026-06-13T13:00:00Z", "sequence": 121}
+      ]
+    },
+    "expected": {"overall_state": "blocked", "primary_blocker": "telemetry_not_verified"}
+  },
+  {
+    "fixture_schema_version": "local_health_contract_fixture.v1",
     "case_id": "source_removed_sync_revision",
     "title": "Source removal is a command event with projection revision sync",
     "contract_version": "local_machine_health.v1",

@@ -2990,6 +2990,7 @@ mod tests {
             "stale_heartbeat_red",
             "inactive_device_red",
             "verify_failure_wins_over_old_green",
+            "all_verify_failures_win_over_old_green",
             "source_removed_sync_revision",
             "backfill_success_cannot_green_current_failure",
             "homebrew_owner_conflict_red",
@@ -3151,6 +3152,15 @@ mod tests {
             verify.health.sources[0].state,
             LocalHealthSourceState::VerifyFailed
         );
+
+        let all_verify = by_id("all_verify_failures_win_over_old_green");
+        assert_eq!(all_verify.health.sources.len(), 3);
+        assert!(all_verify
+            .health
+            .sources
+            .iter()
+            .all(|source| source.authority == LocalHealthAuthority::Verify
+                && source.state == LocalHealthSourceState::VerifyFailed));
 
         let backfill = by_id("backfill_success_cannot_green_current_failure");
         assert!(backfill.backfill_job.is_some());
