@@ -55,6 +55,26 @@ impl std::fmt::Display for BatchAuthorizationRejected {
 
 impl std::error::Error for BatchAuthorizationRejected {}
 
+/// The backend refused to mint a relay token for this local device. Keep this
+/// typed so the daemon can mark canonical local health as an auth/rebind issue
+/// instead of treating the projection as merely delayed by a transient upload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayTokenAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for RelayTokenAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected relay token authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for RelayTokenAuthorizationRejected {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivityHintResponse {
     pub source: String,
@@ -202,7 +222,12 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("X-Ottto-Device-Secret", device_secret)
             .send_json(relay_token_request_payload(device, source.api_slug()))
-            .map_err(|error| anyhow!("issue relay token failed: {error}"))?
+            .map_err(|error| match error {
+                ureq::Error::Status(status @ (401 | 403), _response) => {
+                    anyhow::Error::new(RelayTokenAuthorizationRejected { status })
+                }
+                other => anyhow!("issue relay token failed: {other}"),
+            })?
             .into_json()
             .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
@@ -368,6 +393,19 @@ mod tests {
         assert_eq!(rejected.status, 401);
         assert!(err.to_string().contains("401"));
         assert!(err.to_string().contains("authorization"));
+        assert!(err.downcast_ref::<BatchRejected>().is_none());
+    }
+
+    #[test]
+    fn relay_token_authorization_rejected_downcasts_separately() {
+        let err = anyhow::Error::new(RelayTokenAuthorizationRejected { status: 403 });
+        let rejected = err
+            .downcast_ref::<RelayTokenAuthorizationRejected>()
+            .expect("RelayTokenAuthorizationRejected must downcast from anyhow::Error");
+        assert_eq!(rejected.status, 403);
+        assert!(err.to_string().contains("403"));
+        assert!(err.to_string().contains("relay token authorization"));
+        assert!(err.downcast_ref::<BatchAuthorizationRejected>().is_none());
         assert!(err.downcast_ref::<BatchRejected>().is_none());
     }
 

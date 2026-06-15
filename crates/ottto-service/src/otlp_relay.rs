@@ -325,6 +325,10 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
         return handle_whoami_request(&mut stream, &daemon, request);
     }
 
+    if request.path == "/local-health" {
+        return handle_local_health_request(&mut stream, &daemon, request);
+    }
+
     if request.method == "GET" && request.path == "/healthz" {
         return write_json_response(&mut stream, 200, relay_health_payload(source));
     }
@@ -478,6 +482,71 @@ fn handle_whoami_request(
             &cors_headers,
         ),
     }
+}
+
+/// CORS-gated loopback local-health probe for ottto.net running on the same Mac.
+/// This mirrors `/whoami`'s origin gate, then exposes only the canonical health
+/// projection needed for current-machine UI. Hardware UUID and secrets are never
+/// present in `DaemonStatus`; user/org ids are stripped before returning.
+fn handle_local_health_request(
+    stream: &mut TcpStream,
+    daemon: &LocalDaemon,
+    request: HttpRequest,
+) -> Result<()> {
+    let origin = request.headers.get("origin").map(String::as_str);
+    if let Some(origin) = origin {
+        if !is_allowed_control_origin(origin) {
+            return write_json_response(
+                stream,
+                403,
+                json!({"error":"origin_forbidden","message":"Origin is not allowed for local Ottto health"}),
+            );
+        }
+    }
+    let cors_headers = cors_headers(origin, "GET, OPTIONS");
+
+    if request.method == "OPTIONS" {
+        return write_raw_response_with_headers(
+            stream,
+            204,
+            "application/json",
+            b"",
+            &cors_headers,
+        );
+    }
+
+    if request.method != "GET" {
+        return write_json_response_with_headers(
+            stream,
+            404,
+            json!({"error":"not_found","message":"Unsupported local health endpoint"}),
+            &cors_headers,
+        );
+    }
+
+    match local_health_response_payload(daemon) {
+        Ok(payload) => write_json_response_with_headers(stream, 200, payload, &cors_headers),
+        Err(_) => write_json_response_with_headers(
+            stream,
+            503,
+            json!({"error":"unavailable","message":"Local health is not available"}),
+            &cors_headers,
+        ),
+    }
+}
+
+fn local_health_response_payload(daemon: &LocalDaemon) -> Result<serde_json::Value> {
+    let status = daemon.status_for_trusted_client()?;
+    let Some(mut health) = status.canonical_health else {
+        return Err(anyhow!("local health is not available"));
+    };
+    health.org_id = None;
+    health.user_id = None;
+    Ok(json!({
+        "machine_id": status.machine.machine_id,
+        "machine_name": status.machine.display_name,
+        "health": health,
+    }))
 }
 
 fn control_cors_headers(origin: Option<&str>) -> Vec<(String, String)> {
@@ -949,6 +1018,30 @@ fn client_disconnect_during_write(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ControlToken;
+    use ottto_protocol::{
+        LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
+        MachineIdentity, OperatingSystem,
+    };
+
+    const TOKEN: &str = "test-control-token";
+
+    fn test_daemon() -> LocalDaemon {
+        LocalDaemon::new(
+            MachineIdentity {
+                machine_id: "machine_test".to_string(),
+                installation_id: "install_test".to_string(),
+                display_name: "Test Mac".to_string(),
+                hostname: "test-mac.local".to_string(),
+                os: OperatingSystem::Macos,
+                arch: "arm64".to_string(),
+                local_platform_version: "0.1.31-rc1".to_string(),
+                hardware_uuid: None,
+            },
+            ControlToken::new(TOKEN).expect("token should be valid"),
+            "2026-06-15T19:12:48Z",
+        )
+    }
 
     #[test]
     fn state_fingerprint_is_short_and_stable() {
@@ -1090,6 +1183,34 @@ mod tests {
             headers.get("Vary").map(String::as_str),
             Some("Origin, Access-Control-Request-Private-Network")
         );
+    }
+
+    #[test]
+    fn local_health_response_payload_strips_account_identifiers() {
+        let daemon = test_daemon().with_account(LocalAccountBinding {
+            state: LocalAccountState::Connected,
+            user: Some(LocalAccountUser {
+                id: "user_1".to_string(),
+                email: "ron@example.com".to_string(),
+                display_name: Some("Ron".to_string()),
+            }),
+            organization: Some(LocalAccountOrganization {
+                id: "org_1".to_string(),
+                name: "Ottto".to_string(),
+            }),
+            connected_at: Some("2026-06-15T19:00:00Z".to_string()),
+            last_refreshed_at: Some("2026-06-15T19:10:00Z".to_string()),
+            message: None,
+        });
+
+        let payload = local_health_response_payload(&daemon).expect("payload");
+
+        assert_eq!(payload["machine_id"], "machine_test");
+        assert_eq!(payload["machine_name"], "Test Mac");
+        assert_eq!(payload["health"]["machine_id"], "machine_test");
+        assert!(payload["health"].get("user_id").is_none());
+        assert!(payload["health"].get("org_id").is_none());
+        assert_eq!(payload["health"]["account"]["state"], "connected");
     }
 
     #[test]

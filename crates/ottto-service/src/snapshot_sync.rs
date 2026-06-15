@@ -9,7 +9,7 @@ use crate::detected_uses::{
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
-    SnapshotApiClient, SnapshotStatusRequest,
+    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
@@ -17,6 +17,7 @@ use crate::snapshots::{
     MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
+use crate::LocalHealthUploadFailureKind;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
@@ -155,7 +156,7 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
     let enabled_sources = enabled_snapshot_sources(&device);
 
     if let Some(source) = enabled_sources.first().copied() {
-        if let Err(error) = upload_local_health_projection_with(
+        if let Err(error) = upload_local_health_projection_reporting(
             &client,
             &device,
             &device_secret,
@@ -208,7 +209,7 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
         return Err(anyhow!("registered device has no enabled sources"));
     };
     let client = SnapshotApiClient::new(snapshot_api_base_url());
-    upload_local_health_projection_with(
+    upload_local_health_projection_reporting(
         &client,
         &device,
         &device_secret,
@@ -216,6 +217,45 @@ pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
         &machine_id,
         daemon,
     )
+}
+
+fn upload_local_health_projection_reporting(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Result<()> {
+    match upload_local_health_projection_with(
+        client,
+        device,
+        device_secret,
+        source,
+        machine_id,
+        daemon,
+    ) {
+        Ok(()) => {
+            let _ = daemon.record_local_health_upload_succeeded();
+            Ok(())
+        }
+        Err(error) => {
+            let _ =
+                daemon.record_local_health_upload_failed(local_health_upload_failure_kind(&error));
+            Err(error)
+        }
+    }
+}
+
+fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadFailureKind {
+    if error
+        .downcast_ref::<RelayTokenAuthorizationRejected>()
+        .is_some()
+    {
+        LocalHealthUploadFailureKind::AuthRejected
+    } else {
+        LocalHealthUploadFailureKind::BackendUnreachable
+    }
 }
 
 fn upload_local_health_projection_with(
