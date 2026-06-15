@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "0eaa6c79ef6a48c4cc4651043126ed7eb528cd87b215397a5e91881543ca2822",
+  "content_sha256": "8245dbb21c058988b73f28855528c1237076c29a7ab87c1cfbf4bfccb5f6640c",
   "files": [
     {
       "executable": false,
@@ -482,8 +482,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "0e6232217e69350a8a7a2b494e375c2c75aa9f8e006970c6553b12ba8ad7d7f7",
-      "size_bytes": 122966
+      "sha256": "e5e5ff3898181347c37edd3c054a84a6070c550eebf62b5cb2a562093a037bb0",
+      "size_bytes": 123389
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "ec803ad3bd4ceef39b2074001ba25eaf04ec43582b7dd1638a51e45b29b57a23",
-      "size_bytes": 495520
+      "sha256": "5892a8afb6cfa76b6b5c3630254e9cfea428ec82f1277535a425bd55da9eceec",
+      "size_bytes": 495813
     },
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "6a561b9688b0bd3cba7323ccb41e5a309bedb466b44f835b9e1d68a1a5a2b227",
-      "size_bytes": 158669
+      "sha256": "76ea9f6aba69dfaa1c03b4416ea77dd00c5a09f99563d072f5c1a1314275d6cc",
+      "size_bytes": 161229
     },
     {
       "executable": false,
@@ -615,15 +615,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "cf8e279ed5703ebd2320c42b4512281b96940736cca3fdbc04a1d17ced99271f",
-      "size_bytes": 14829
+      "sha256": "d82329644920eb439dc85ea381fa6a3c49f2b8eb08f36464074a66c53dd69072",
+      "size_bytes": 16081
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "fc839b38bb32a8e2bb97dd63b9113a586bae610c3f460ae498e5f77da85f342f",
-      "size_bytes": 44557
+      "sha256": "8ea091ed71febcc69851c7ec6355533d91bdb148c6ad783135b8876bb80677fa",
+      "size_bytes": 46820
     },
     {
       "executable": false,
@@ -853,8 +853,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/local-health/contract-matrix.v1.json",
-      "sha256": "6347d509264314b8ad670b483f72370433a56fe0493a4f6f8f292862becd5275",
-      "size_bytes": 60469
+      "sha256": "5c5332caf6d32ce9f9701aa66c9729b2df24bae485d2914bf9d459b3cdb47cf6",
+      "size_bytes": 65299
     },
     {
       "executable": false,
@@ -1333,7 +1333,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-14T21:14:56+00:00",
+  "generated_at": "2026-06-15T09:15:53+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "846a7c2356b077624098d9415d22d82c1e718d1b"
+  "source_commit": "e1b9e3776c24059cf708b315f6ad77381ee0f321"
 }

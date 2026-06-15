@@ -512,6 +512,12 @@ fn handle_command(
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
             crate::refresh_canonical_local_health(&mut status);
+            if let Err(error) = crate::snapshot_sync::upload_local_health_projection_now(daemon) {
+                eprintln!(
+                    "manual local health projection upload skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
             if let serde_json::Value::Object(object) = &mut value {
                 object.insert(
                     "canonical_health".to_string(),

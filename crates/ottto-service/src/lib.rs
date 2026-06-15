@@ -1392,6 +1392,18 @@ fn next_status_projection_revision(status: &DaemonStatus) -> u64 {
 }
 
 fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> RuntimeIdentityV1 {
+    runtime_identity_for_status_with_installed_app_version(
+        status,
+        observed_at,
+        &ottto_core::compiled_release_version(),
+    )
+}
+
+fn runtime_identity_for_status_with_installed_app_version(
+    status: &DaemonStatus,
+    observed_at: &str,
+    installed_app_version: &str,
+) -> RuntimeIdentityV1 {
     let executable_path = std::env::current_exe().ok();
     let install_owner = if status.service_owner.daemon_owner != InstallOwner::Unknown {
         status.service_owner.daemon_owner
@@ -1401,13 +1413,14 @@ fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> Runt
             .map(ottto_core::install_owner_for_path)
             .unwrap_or(InstallOwner::Unknown)
     };
-    let daemon_version = status.daemon_version.clone();
+    let daemon_version = service_release_version(status);
+    let app_bundle_version =
+        (install_owner == InstallOwner::AppBundle).then(|| installed_app_version.to_string());
     RuntimeIdentityV1 {
         install_owner,
         daemon_version: daemon_version.clone(),
-        app_bundle_version: (install_owner == InstallOwner::AppBundle)
-            .then(ottto_core::compiled_release_version),
-        cli_version: Some(ottto_core::compiled_release_version()),
+        app_bundle_version: app_bundle_version.clone(),
+        cli_version: Some(installed_app_version.to_string()),
         service_version: Some(daemon_version.clone()),
         service_pid: Some(std::process::id()),
         service_executable_path_class: match install_owner {
@@ -1426,15 +1439,35 @@ fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> Runt
         last_seen_at: observed_at.to_string(),
         boot_id: std::env::var("OTTTO_BOOT_ID").ok(),
         session_id: std::env::var("OTTTO_SESSION_ID").ok(),
-        version_match: !runtime_version_mismatch(install_owner, &daemon_version),
+        version_match: !runtime_version_mismatch(
+            install_owner,
+            &daemon_version,
+            app_bundle_version.as_deref(),
+        ),
         protocol_match: status.protocol_version == PROTOCOL_VERSION,
         schema_match: true,
     }
 }
 
-fn runtime_version_mismatch(install_owner: InstallOwner, daemon_version: &str) -> bool {
+fn service_release_version(status: &DaemonStatus) -> String {
+    let machine_version = status.machine.local_platform_version.trim();
+    if !machine_version.is_empty() {
+        return machine_version.to_string();
+    }
+    let update_version = status.update.current_version.trim();
+    if !update_version.is_empty() {
+        return update_version.to_string();
+    }
+    ottto_core::compiled_release_version()
+}
+
+fn runtime_version_mismatch(
+    install_owner: InstallOwner,
+    daemon_version: &str,
+    app_bundle_version: Option<&str>,
+) -> bool {
     install_owner == InstallOwner::AppBundle
-        && daemon_version != ottto_core::compiled_release_version()
+        && app_bundle_version.is_some_and(|expected| daemon_version != expected)
 }
 
 fn runtime_heartbeat_for_status(
@@ -3281,6 +3314,45 @@ mod tests {
             .iter()
             .any(|blocker| blocker.code == "owner_conflict"));
         assert!(health.runtime.version_match);
+    }
+
+    #[test]
+    fn runtime_identity_uses_platform_version_not_internal_crate_version() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.daemon_version = "0.1.0".to_string();
+        status.machine.local_platform_version = "0.1.30-rc1".to_string();
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+
+        assert_eq!(runtime.daemon_version, "0.1.30-rc1");
+        assert_eq!(runtime.service_version.as_deref(), Some("0.1.30-rc1"));
+        assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
+        assert!(runtime.version_match);
+    }
+
+    #[test]
+    fn runtime_identity_still_blocks_old_app_bundle_service() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.daemon_version = "0.1.0".to_string();
+        status.machine.local_platform_version = "0.1.28".to_string();
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+
+        assert_eq!(runtime.daemon_version, "0.1.28");
+        assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
+        assert!(!runtime.version_match);
     }
 
     #[test]
