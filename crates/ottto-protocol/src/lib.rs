@@ -83,7 +83,7 @@ pub struct MachineIdentity {
     pub hardware_uuid: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub protocol_version: u16,
     pub daemon_version: String,
@@ -95,6 +95,14 @@ pub struct DaemonStatus {
     pub relay: RelayState,
     pub sources: Vec<SourceHealth>,
     pub update: UpdateState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_health: Option<CanonicalLocalHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_heartbeat: Option<MachineRuntimeHeartbeatV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_health_events: Vec<LocalHealthEventV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_ledger: Vec<LocalHealthCommandResultV1>,
     pub generated_at: Rfc3339Timestamp,
 }
 

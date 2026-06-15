@@ -37,6 +37,10 @@ pub fn empty_status(machine: MachineIdentity, now: impl Into<String>) -> DaemonS
             update_command: None,
             update_instructions: None,
         },
+        canonical_health: None,
+        runtime_heartbeat: None,
+        local_health_events: Vec::new(),
+        command_ledger: Vec::new(),
         generated_at: now.into(),
     }
 }
