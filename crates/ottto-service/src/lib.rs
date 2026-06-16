@@ -604,8 +604,9 @@ impl LocalDaemon {
             return Ok(());
         }
         let mut state = self.state()?;
+        let observed_at = current_rfc3339_timestamp();
         state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
-        let health = source_health_from_verification(&state, result);
+        let health = source_health_from_verification(&state, result, &observed_at);
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -616,10 +617,6 @@ impl LocalDaemon {
             state.sources.push(health);
         }
         state.persist_source_state(&result.source);
-        let observed_at = result
-            .last_received_at
-            .clone()
-            .unwrap_or_else(|| state.now.clone());
         let sequence = next_local_health_sequence(&state);
         let machine_id = state.machine.machine_id.clone();
         let source_slug = source_slug(&result.source);
@@ -2164,6 +2161,7 @@ fn registry_source(source: &SourceKind) -> &'static RegistrySourceEntry {
 fn source_health_from_verification(
     state: &DaemonState,
     result: &SourceVerificationResult,
+    observed_at: &str,
 ) -> SourceHealth {
     let user_id = state.account.user.as_ref().map(|user| user.id.clone());
     let agent_status = state
@@ -2300,9 +2298,12 @@ fn source_health_from_verification(
         detected_uses,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.verified {
-            result.last_received_at.clone()
+            result
+                .last_received_at
+                .clone()
+                .or_else(|| Some(observed_at.to_string()))
         } else {
-            None
+            Some(observed_at.to_string())
         },
         problems,
         recommended_actions,
@@ -3380,6 +3381,50 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == "health.v1"));
+    }
+
+    #[test]
+    fn failed_verification_uses_fresh_attempt_time() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        daemon
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        let last_verified_at = status.sources[0]
+            .last_verified_at
+            .as_deref()
+            .expect("failed verify attempts still stamp an attempt time");
+        assert_ne!(last_verified_at, "2026-05-05T10:15:00Z");
+        assert_ne!(last_verified_at, "2026-05-05T09:10:00Z");
+
+        let command = status
+            .command_ledger
+            .iter()
+            .find(|entry| entry.action_id == "verify_codex")
+            .expect("verify command ledger entry");
+        assert_eq!(command.observed_at, last_verified_at);
+        assert_ne!(command.observed_at, "2026-05-05T10:15:00Z");
+
+        let event = status
+            .local_health_events
+            .iter()
+            .find(|entry| entry.event_id.starts_with("evt_verify_codex_"))
+            .expect("verify event");
+        assert_eq!(event.observed_at, last_verified_at);
+
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("canonical Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority_at, last_verified_at);
     }
 
     #[test]
