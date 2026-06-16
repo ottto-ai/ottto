@@ -59,6 +59,33 @@ exit 0
 SH
 chmod +x "$FAKE_BIN/ditto"
 
+cat > "$FAKE_BIN/touch" <<'SH'
+#!/usr/bin/env sh
+printf 'touch %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+if [ "${OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL:-}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      */Ottto.app/Contents/CodeResources)
+        state="${OTTTO_NOTARIZE_TEST_TOUCH_STATE:?touch state required}"
+        if [ ! -f "$state" ]; then
+          printf 'failed-once\n' > "$state"
+          exit 1
+        fi
+        ;;
+    esac
+  done
+fi
+exec /usr/bin/touch "$@"
+SH
+chmod +x "$FAKE_BIN/touch"
+
+cat > "$FAKE_BIN/xattr" <<'SH'
+#!/usr/bin/env sh
+printf 'xattr %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+exit 0
+SH
+chmod +x "$FAKE_BIN/xattr"
+
 cat > "$FAKE_BIN/hdiutil" <<'SH'
 #!/usr/bin/env sh
 printf 'hdiutil %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
@@ -82,7 +109,7 @@ CLI_ZIP="$TMP_DIR/ottto-macos-arm64.zip"
 CLI_BIN="$TMP_DIR/ottto"
 DAEMON_ZIP="$TMP_DIR/ottto-service-macos-arm64.zip"
 DAEMON_BIN="$TMP_DIR/ottto-service"
-mkdir -p "$APP_BUNDLE"
+mkdir -p "$APP_BUNDLE/Contents"
 make_artifact "$APP_DMG"
 make_artifact "$APP_BUNDLE/Ottto"
 make_artifact "$CLI_ZIP"
@@ -204,7 +231,10 @@ fi
 
 APP_MANIFEST="$TMP_DIR/app-manifest.json"
 APP_LOG="$TMP_DIR/app.log"
+APP_TOUCH_STATE="$TMP_DIR/app-touch-state"
 write_manifest "$APP_MANIFEST"
+OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL=1 \
+  OTTTO_NOTARIZE_TEST_TOUCH_STATE="$APP_TOUCH_STATE" \
 OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
   OTTTO_NOTARIZE_TEST_LOG="$APP_LOG" \
   PATH="$FAKE_BIN:$PATH" \
@@ -215,6 +245,14 @@ OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
 
 if ! grep -q "ditto -c -k --keepParent .*Ottto.app .*ottto-app-notary.*\\.zip" "$APP_LOG"; then
   echo "Expected app bundle to be zipped for notarization before DMG rebuild" >&2
+  exit 1
+fi
+if ! grep -q "touch .*Ottto.app/Contents/CodeResources" "$APP_LOG"; then
+  echo "Expected app staple preparation to create a CodeResources placeholder" >&2
+  exit 1
+fi
+if ! grep -q "xattr -d com.apple.provenance .*Ottto.app/Contents" "$APP_LOG"; then
+  echo "Expected app staple preparation to clear provenance xattr after placeholder creation failure" >&2
   exit 1
 fi
 if ! grep -q "hdiutil create -volname Ottto -srcfolder .* -ov -format UDZO .*Ottto-macos-arm64.dmg" "$APP_LOG"; then
