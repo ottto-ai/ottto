@@ -149,8 +149,7 @@ struct DaemonState {
     sources: Vec<SourceHealth>,
     /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
     /// from `<source_state_dir>/<slug>-state.json` and stamped on first
-    /// observation; drives `SourceHealth.connected_at`. Persisted (unlike
-    /// `sources`) so it survives daemon restarts.
+    /// observation; drives `SourceHealth.connected_at`.
     source_first_seen: BTreeMap<String, String>,
     /// Most recent `local_usage_reconciliation_enabled` per source slug,
     /// recorded by the snapshot-sync loop; drives
@@ -158,7 +157,7 @@ struct DaemonState {
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
     /// Directory for the persisted per-source state files. `None` keeps
-    /// first-seen purely in-memory (tests); production sets it via
+    /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
     source_state_dir: Option<PathBuf>,
     local_health_events: Vec<LocalHealthEventV1>,
@@ -194,19 +193,30 @@ impl DaemonState {
         }
         self.source_first_seen
             .insert(slug.to_string(), observed_at.to_string());
+        self.persist_source_state(source);
+    }
+
+    fn persist_source_state(&self, source: &SourceKind) {
+        let slug = source_slug(source);
         if let Some(dir) = self.source_state_dir.as_ref() {
             let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+            let last_health = self
+                .sources
+                .iter()
+                .find(|health| health.source == *source)
+                .cloned();
             if let Err(error) = store.save(&LocalSourceState {
-                first_seen_at: Some(observed_at.to_string()),
+                first_seen_at: self.first_seen(source),
+                last_health,
             }) {
-                eprintln!("failed to persist first-seen for {slug}: {error}");
+                eprintln!("failed to persist source state for {slug}: {error}");
             }
         }
     }
 
     /// Clear the in-memory first-seen + reconciliation maps and delete the
     /// persisted per-source state files. Called at the account reset sites so a
-    /// fresh account starts with a fresh first-seen history.
+    /// fresh account starts with a fresh source history.
     fn clear_source_state(&mut self) {
         if let Some(dir) = self.source_state_dir.as_ref() {
             for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
@@ -289,14 +299,15 @@ impl LocalDaemon {
         self
     }
 
-    /// Enable persistence of per-source first-seen timestamps under `dir`
+    /// Enable persistence of per-source state under `dir`
     /// (`<dir>/<slug>-state.json`) and boot-load any existing files into the
-    /// in-memory map. Production passes `default_sources_dir()`; constructors
-    /// that omit this keep first-seen purely in-memory.
+    /// in-memory map/source rows. Production passes `default_sources_dir()`;
+    /// constructors that omit this keep source state purely in-memory.
     pub fn with_source_state_dir(self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         if let Ok(mut state) = self.inner.lock() {
             state.source_first_seen = load_source_first_seen(&dir);
+            state.sources = load_source_health(&state, &dir);
             state.source_state_dir = Some(dir);
         }
         self
@@ -604,6 +615,7 @@ impl LocalDaemon {
         } else {
             state.sources.push(health);
         }
+        state.persist_source_state(&result.source);
         let observed_at = result
             .last_received_at
             .clone()
@@ -690,6 +702,7 @@ impl LocalDaemon {
                 existing.grade = HealthGrade::Ok;
             }
         }
+        state.persist_source_state(source);
         Ok(())
     }
 
@@ -2015,6 +2028,42 @@ fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
         }
     }
     map
+}
+
+/// Boot-load the most recent verification-derived source health rows. Missing
+/// or unreadable files are skipped, and rows whose persisted source does not
+/// match the file slug are ignored so a corrupt file cannot poison another
+/// source.
+fn load_source_health(state: &DaemonState, dir: &Path) -> Vec<SourceHealth> {
+    let mut sources = Vec::new();
+    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+        let slug = source_slug(&source);
+        let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+        let Ok(Some(LocalSourceState {
+            last_health: Some(mut health),
+            ..
+        })) = store.load()
+        else {
+            continue;
+        };
+        if health.source != source {
+            continue;
+        }
+        normalize_persisted_source_health(state, &mut health);
+        sources.push(health);
+    }
+    sources
+}
+
+fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
+    health.descriptor = source_descriptor(&health.source);
+    health.account_binding.expected_account_id =
+        state.account.user.as_ref().map(|user| user.id.clone());
+    if health.connected_at.is_none() {
+        health.connected_at = state.first_seen(&health.source);
+    }
+    health.telemetry_configured = telemetry_configured_for_source(&health.source);
+    health.reconciliation_enabled = state.reconciliation_enabled(&health.source);
 }
 
 /// Whether local live telemetry credentials are configured for `source`.
@@ -4022,6 +4071,111 @@ mod tests {
     }
 
     #[test]
+    fn failed_verification_persists_across_restart_and_registered_seed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-verify-failed",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let initial = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        initial
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+        restarted
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("auth_missing"),
+            "backend auth can be the top blocker without hiding source failures"
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+        assert_eq!(health.sources[0].authority, LocalHealthAuthority::Verify);
+        assert_eq!(
+            health.sources[0].blocking_reason.as_deref(),
+            Some("telemetry_not_verified")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_verification_replaces_persisted_failure_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-verify-recovered",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let initial = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        initial
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let recovered = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        recovered
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record successful verification");
+
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:20:00Z")
+        );
+        assert_eq!(
+            status.canonical_health.expect("canonical health").sources[0].state,
+            LocalHealthSourceState::Healthy
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn registered_device_sources_seed_status_after_restart_before_scan() {
         let dir = std::env::temp_dir().join(format!(
             "ottto-source-state-test-{}-registered",
@@ -4031,6 +4185,7 @@ mod tests {
         FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+                last_health: None,
             })
             .expect("seed source state");
 
@@ -4074,6 +4229,7 @@ mod tests {
         FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+                last_health: None,
             })
             .expect("seed source state");
 
@@ -4399,6 +4555,29 @@ mod tests {
             message: StableMessage {
                 code: "verified".to_string(),
                 text: "Saw recent Codex telemetry.".to_string(),
+            },
+            route_results: Vec::new(),
+        }
+    }
+
+    fn failed_codex_reconnect() -> SourceVerificationResult {
+        SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::ReconnectRequired,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: Some("2026-05-05T10:15:00Z".to_string()),
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "setup_run_token_invalid".to_string(),
+                text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
         }
