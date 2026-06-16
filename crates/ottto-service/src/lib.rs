@@ -1618,7 +1618,7 @@ fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealth
 }
 
 fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
-    let (state, setup_run_state, setup_token_state) = match status.account.state {
+    let (mut state, mut setup_run_state, mut setup_token_state) = match status.account.state {
         LocalAccountState::Connected => (
             LocalHealthAccountState::Connected,
             LocalSetupRunState::Complete,
@@ -1641,6 +1641,15 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
         ),
     };
     let latest_upload = latest_local_health_upload(status);
+    if matches!(
+        latest_upload,
+        Some(LatestLocalHealthUpload::AuthRejected { .. })
+    ) && !matches!(state, LocalHealthAccountState::NotConnected)
+    {
+        state = LocalHealthAccountState::ReconnectRequired;
+        setup_run_state = LocalSetupRunState::RebindRequired;
+        setup_token_state = LocalSetupTokenState::RefreshRequired;
+    }
     let device_state = match latest_upload.as_ref() {
         Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
         Some(LatestLocalHealthUpload::BackendUnreachable { .. }) => LocalDeviceState::Unknown,
@@ -1650,13 +1659,6 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
             LocalDeviceState::StaleHeartbeat
         }
         _ => LocalDeviceState::Active,
-    };
-    let (setup_run_state, setup_token_state) = match latest_upload.as_ref() {
-        Some(LatestLocalHealthUpload::AuthRejected { .. }) => (
-            LocalSetupRunState::RebindRequired,
-            LocalSetupTokenState::RefreshRequired,
-        ),
-        _ => (setup_run_state, setup_token_state),
     };
     LocalHealthAccountV1 {
         state,
@@ -3538,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_token_auth_failure_marks_canonical_health_auth_missing() {
+    fn relay_token_auth_failure_marks_canonical_health_reconnect_required() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
 
         daemon
@@ -3550,7 +3552,10 @@ mod tests {
             .expect("status")
             .canonical_health
             .expect("canonical health");
-        assert_eq!(health.account.state, LocalHealthAccountState::Connected);
+        assert_eq!(
+            health.account.state,
+            LocalHealthAccountState::ReconnectRequired
+        );
         assert_eq!(health.account.device_state, LocalDeviceState::Inactive);
         assert_eq!(
             health.account.setup_run_state,
@@ -3560,7 +3565,10 @@ mod tests {
             health.account.setup_token_state,
             LocalSetupTokenState::RefreshRequired
         );
-        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
         assert_eq!(
             health.overall.primary_blocker.as_deref(),
             Some("auth_missing")
@@ -4108,7 +4116,10 @@ mod tests {
         );
 
         let health = status.canonical_health.expect("canonical health");
-        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
         assert_eq!(
             health.overall.primary_blocker.as_deref(),
             Some("auth_missing"),
