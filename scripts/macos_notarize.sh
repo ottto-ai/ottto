@@ -127,7 +127,13 @@ prepare_app_staple_target() {
   local ticket_path="$app_bundle/Contents/CodeResources"
 
   if [[ -d "$app_bundle/Contents" && ! -e "$ticket_path" ]]; then
-    : > "$ticket_path"
+    if ! touch "$ticket_path" 2>/dev/null; then
+      if command -v xattr >/dev/null 2>&1; then
+        xattr -d com.apple.provenance "$app_bundle" 2>/dev/null || true
+        xattr -d com.apple.provenance "$app_bundle/Contents" 2>/dev/null || true
+      fi
+      touch "$ticket_path"
+    fi
   fi
 }
 
