@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "ea0432afb4310ecd3859a2022ac2d1999a8fad34e70db5fea7cec0e60a08bdda",
+  "content_sha256": "54fb16e06c74c8e5d9cde165f383980adddfdb94a0590ed28dafa04f8af16d66",
   "files": [
     {
       "executable": false,
@@ -13,8 +13,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "bae069ec85ed093c35b4501676ba9f331dd4d3155ca54a02c7eebff94543d0ea",
-      "size_bytes": 3030
+      "sha256": "ead1e4d1b8f4461d0786f3942485d3989bf4ed2fefe30783dc84cef3749610b5",
+      "size_bytes": 3091
     },
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "c18a3569abb6b3088a22576f5545f4813a75cb261088f0f16eb849dbad201eb8",
-      "size_bytes": 175589
+      "sha256": "05e86e990ab20492508bb6a3385da66bc490d146bea6b10cbc1fe829b2375f29",
+      "size_bytes": 175792
     },
     {
       "executable": false,
