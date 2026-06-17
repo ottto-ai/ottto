@@ -1694,6 +1694,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::Status { .. } => "status",
         LocalControlCommand::AuthStatus => "auth_status",
         LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        LocalControlCommand::PersonalMeterLocalSnapshot { .. } => "personal_meter_local_snapshot",
         LocalControlCommand::AgentContext { .. } => "agent_context",
         LocalControlCommand::AgentCosts { .. } => "agent_costs",
         LocalControlCommand::AgentSessions { .. } => "agent_sessions",
