@@ -859,7 +859,7 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
                 let error = response
                     .error
                     .unwrap_or_else(|| internal_error("missing daemon error"));
-                if error.code == CliErrorCode::NeedsUserAction
+                if setup_error_should_start_browser_claim(&error)
                     && args.claim_code.is_none()
                     && browser_claim.is_none()
                 {
@@ -1079,6 +1079,50 @@ fn setup_claim_already_claimed_error(error: &CliError) -> bool {
             .contains("setup code is claimed"),
         _ => false,
     })
+}
+
+fn setup_error_should_start_browser_claim(error: &CliError) -> bool {
+    if error.code == CliErrorCode::NeedsUserAction {
+        return true;
+    }
+    if error.code != CliErrorCode::BackendRejected {
+        return false;
+    }
+    let endpoint = error.details.get("endpoint").and_then(|value| match value {
+        RedactedValue::String(value) => Some(value.to_ascii_lowercase()),
+        _ => None,
+    });
+    let status = error.details.get("status").and_then(|value| match value {
+        RedactedValue::Number(value) => Some(*value),
+        _ => None,
+    });
+    let body = error
+        .details
+        .get("body_excerpt")
+        .and_then(|value| match value {
+            RedactedValue::String(value) => Some(value.to_ascii_lowercase()),
+            _ => None,
+        });
+    let setup_run_endpoint = endpoint.as_deref().is_some_and(|value| {
+        value.contains("/api/v1/setup-runs/") && value.contains("/local-client/")
+    });
+    if setup_run_endpoint && matches!(status, Some(401 | 403 | 404 | 410)) {
+        return true;
+    }
+    body.as_deref().is_some_and(|value| {
+        value.contains("attach an active setup run")
+            || value.contains("setup run companion token expired")
+            || value.contains("setup_run_companion_token_expired")
+            || value.contains("setup run expired")
+            || value.contains("setup_run_expired")
+            || value.contains("setup run cancelled")
+            || value.contains("setup_run_cancelled")
+            || value.contains("setup run missing")
+            || value.contains("setup run not found")
+    }) || error
+        .message
+        .to_ascii_lowercase()
+        .contains("attach an active setup run")
 }
 
 fn browser_claim_from_payload(payload: &serde_json::Value) -> Result<BrowserClaimState, CliError> {
@@ -2240,6 +2284,62 @@ mod tests {
             )]),
         };
         assert!(setup_claim_already_claimed_error(&already_claimed));
+    }
+
+    #[test]
+    fn setup_rejected_stale_run_starts_fresh_browser_claim() {
+        let rejected = CliError {
+            code: CliErrorCode::BackendRejected,
+            message: "Ottto rejected the local setup request. Open the Ottto app from Ottto to attach an active setup run.".to_string(),
+            retryable: false,
+            details: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    RedactedValue::String(
+                        "/api/v1/setup-runs/setup_stale/local-client/scan-result".to_string(),
+                    ),
+                ),
+                ("status".to_string(), RedactedValue::Number(401)),
+                (
+                    "body_excerpt".to_string(),
+                    RedactedValue::String(
+                        r#"{"detail":"Setup run companion token expired"}"#.to_string(),
+                    ),
+                ),
+            ]),
+        };
+
+        assert!(setup_error_should_start_browser_claim(&rejected));
+
+        let unrelated = CliError {
+            code: CliErrorCode::BackendRejected,
+            message: "Ottto rejected the diagnostics upload.".to_string(),
+            retryable: false,
+            details: BTreeMap::from([
+                (
+                    "endpoint".to_string(),
+                    RedactedValue::String(
+                        "/api/v1/setup-runs/setup_stale/local-client/diagnostics".to_string(),
+                    ),
+                ),
+                ("status".to_string(), RedactedValue::Number(401)),
+            ]),
+        };
+        assert!(
+            setup_error_should_start_browser_claim(&unrelated),
+            "setup/login owns this helper, so any setup-run local-client auth rejection should start a fresh claim"
+        );
+
+        let non_setup = CliError {
+            code: CliErrorCode::BackendRejected,
+            message: "Ottto rejected the diagnostics upload.".to_string(),
+            retryable: false,
+            details: BTreeMap::from([(
+                "endpoint".to_string(),
+                RedactedValue::String("/api/v1/diagnostics/uploads".to_string()),
+            )]),
+        };
+        assert!(!setup_error_should_start_browser_claim(&non_setup));
     }
 
     #[test]
