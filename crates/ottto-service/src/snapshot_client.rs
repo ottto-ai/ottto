@@ -75,6 +75,43 @@ impl std::fmt::Display for RelayTokenAuthorizationRejected {
 
 impl std::error::Error for RelayTokenAuthorizationRejected {}
 
+/// The backend rejected the local-health contract payload. Keep this distinct
+/// from transport failures so the daemon never calls schema drift "unreachable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalHealthProjectionRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for LocalHealthProjectionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected local health projection: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for LocalHealthProjectionRejected {}
+
+/// The backend refused the relay token on a local-health upload endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalHealthAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for LocalHealthAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected local health authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for LocalHealthAuthorizationRejected {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivityHintResponse {
     pub source: String,
@@ -313,14 +350,28 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &MachineRuntimeHeartbeatV1,
     ) -> Result<Value> {
-        self.agent
+        match self
+            .agent
             .post(&self.api_url("/api/v1/apps/health/heartbeat"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
-            .map_err(|error| anyhow!("upload local health heartbeat failed: {error}"))?
-            .into_json()
-            .map_err(|error| anyhow!("parse local health heartbeat response failed: {error}"))
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse local health heartbeat response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow::Error::new(LocalHealthProjectionRejected {
+                    status: code,
+                }))
+            }
+            Err(error) => Err(anyhow!("upload local health heartbeat failed: {error}")),
+        }
     }
 
     pub fn upload_local_health_projection(
@@ -328,14 +379,28 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &LocalMachineHealthV1,
     ) -> Result<Value> {
-        self.agent
+        match self
+            .agent
             .post(&self.api_url("/api/v1/apps/health/projection"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
-            .map_err(|error| anyhow!("upload local health projection failed: {error}"))?
-            .into_json()
-            .map_err(|error| anyhow!("parse local health projection response failed: {error}"))
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse local health projection response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(LocalHealthAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow::Error::new(LocalHealthProjectionRejected {
+                    status: code,
+                }))
+            }
+            Err(error) => Err(anyhow!("upload local health projection failed: {error}")),
+        }
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -407,6 +472,28 @@ mod tests {
         assert!(err.to_string().contains("relay token authorization"));
         assert!(err.downcast_ref::<BatchAuthorizationRejected>().is_none());
         assert!(err.downcast_ref::<BatchRejected>().is_none());
+    }
+
+    #[test]
+    fn local_health_rejections_downcast_separately() {
+        let rejected = anyhow::Error::new(LocalHealthProjectionRejected { status: 422 });
+        assert!(rejected
+            .downcast_ref::<LocalHealthProjectionRejected>()
+            .is_some());
+        assert!(rejected
+            .downcast_ref::<LocalHealthAuthorizationRejected>()
+            .is_none());
+        assert!(rejected
+            .downcast_ref::<RelayTokenAuthorizationRejected>()
+            .is_none());
+
+        let unauthorized = anyhow::Error::new(LocalHealthAuthorizationRejected { status: 401 });
+        assert!(unauthorized
+            .downcast_ref::<LocalHealthAuthorizationRejected>()
+            .is_some());
+        assert!(unauthorized
+            .downcast_ref::<LocalHealthProjectionRejected>()
+            .is_none());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::detected_uses::{
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
+    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
@@ -281,10 +282,18 @@ fn local_health_upload_should_refresh_setup_run(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RelayTokenAuthorizationRejected>()
         .is_some()
+        || error
+            .downcast_ref::<LocalHealthAuthorizationRejected>()
+            .is_some()
 }
 
 fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadFailureKind {
-    if local_health_upload_should_refresh_setup_run(error) {
+    if error
+        .downcast_ref::<LocalHealthProjectionRejected>()
+        .is_some()
+    {
+        LocalHealthUploadFailureKind::ContractRejected
+    } else if local_health_upload_should_refresh_setup_run(error) {
         LocalHealthUploadFailureKind::AuthRejected
     } else {
         LocalHealthUploadFailureKind::BackendUnreachable
@@ -865,6 +874,10 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
         "machine identity is unavailable"
     } else if text.contains("issue relay token failed") {
         "relay token request failed"
+    } else if text.contains("backend rejected local health projection") {
+        "local health projection rejected"
+    } else if text.contains("backend rejected local health authorization") {
+        "local health authorization rejected"
     } else if text.contains("get activity hint failed") {
         "activity hint request failed"
     } else if text.contains("upload agent status failed")
@@ -1048,6 +1061,38 @@ mod tests {
         assert_eq!(
             safe_error(&anyhow!("issue relay token failed: rejected")),
             "relay token request failed"
+        );
+        assert_eq!(
+            safe_error(&anyhow::Error::new(LocalHealthProjectionRejected {
+                status: 422
+            })),
+            "local health projection rejected"
+        );
+        assert_eq!(
+            safe_error(&anyhow::Error::new(LocalHealthAuthorizationRejected {
+                status: 401
+            })),
+            "local health authorization rejected"
+        );
+    }
+
+    #[test]
+    fn local_health_upload_failures_are_classified_by_contract_boundary() {
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow::Error::new(LocalHealthProjectionRejected {
+                status: 422
+            })),
+            LocalHealthUploadFailureKind::ContractRejected
+        );
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow::Error::new(
+                LocalHealthAuthorizationRejected { status: 401 }
+            )),
+            LocalHealthUploadFailureKind::AuthRejected
+        );
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow!("upload local health projection failed")),
+            LocalHealthUploadFailureKind::BackendUnreachable
         );
     }
 

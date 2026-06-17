@@ -143,6 +143,7 @@ pub struct LocalDaemon {
 pub enum LocalHealthUploadFailureKind {
     AuthRejected,
     BackendUnreachable,
+    ContractRejected,
 }
 
 #[derive(Debug, Clone)]
@@ -791,6 +792,10 @@ impl LocalDaemon {
             LocalHealthUploadFailureKind::BackendUnreachable => (
                 "backend_unreachable",
                 "Ottto could not be reached while uploading local health",
+            ),
+            LocalHealthUploadFailureKind::ContractRejected => (
+                "contract_rejected",
+                "Ottto rejected this daemon's local health projection contract",
             ),
         };
         push_local_health_upload_event(&mut state, "LocalHealthUploadFailed", kind, message);
@@ -1587,6 +1592,7 @@ enum LatestLocalHealthUpload {
     Succeeded,
     AuthRejected { observed_at: String },
     BackendUnreachable { observed_at: String },
+    ContractRejected { observed_at: String },
 }
 
 fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
@@ -1611,6 +1617,9 @@ fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealth
                     observed_at: event.observed_at.clone(),
                 }),
                 "backend_unreachable" => Some(LatestLocalHealthUpload::BackendUnreachable {
+                    observed_at: event.observed_at.clone(),
+                }),
+                "contract_rejected" => Some(LatestLocalHealthUpload::ContractRejected {
                     observed_at: event.observed_at.clone(),
                 }),
                 _ => None,
@@ -1654,6 +1663,7 @@ fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV
     let device_state = match latest_upload.as_ref() {
         Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
         Some(LatestLocalHealthUpload::BackendUnreachable { .. }) => LocalDeviceState::Unknown,
+        Some(LatestLocalHealthUpload::ContractRejected { .. }) => LocalDeviceState::Active,
         Some(LatestLocalHealthUpload::Succeeded) | None
             if status.daemon == DaemonRuntimeState::Unavailable =>
         {
@@ -1680,23 +1690,25 @@ fn local_health_source_for_status(
     source: &SourceHealth,
     projection_revision: u64,
 ) -> LocalHealthSourceV1 {
-    let authority = if source.last_verified_at.is_some()
-        || matches!(
-            source.state,
-            SourceState::Healthy | SourceState::NeedsRepair | SourceState::Failed
-        ) {
+    let has_verify_attention =
+        source.last_verified_at.is_some() && has_verification_failure_problem(source);
+    let authority = if source.last_verified_at.is_some() {
         LocalHealthAuthority::Verify
     } else {
         LocalHealthAuthority::Runtime
     };
-    let state = match source.state {
-        SourceState::Healthy => LocalHealthSourceState::Healthy,
-        SourceState::NeedsRepair => LocalHealthSourceState::RepairRequired,
-        SourceState::NeedsConfirmation => LocalHealthSourceState::PendingSetup,
-        SourceState::NotFound => LocalHealthSourceState::PendingSetup,
-        SourceState::Verifying => LocalHealthSourceState::Unknown,
-        SourceState::Failed => LocalHealthSourceState::VerifyFailed,
-        SourceState::Unsupported => LocalHealthSourceState::DisabledByPolicy,
+    let state = if has_verify_attention {
+        LocalHealthSourceState::VerifyFailed
+    } else {
+        match source.state {
+            SourceState::Healthy => LocalHealthSourceState::Healthy,
+            SourceState::NeedsRepair => LocalHealthSourceState::RepairRequired,
+            SourceState::NeedsConfirmation => LocalHealthSourceState::PendingSetup,
+            SourceState::NotFound => LocalHealthSourceState::PendingSetup,
+            SourceState::Verifying => LocalHealthSourceState::Unknown,
+            SourceState::Failed => LocalHealthSourceState::VerifyFailed,
+            SourceState::Unsupported => LocalHealthSourceState::DisabledByPolicy,
+        }
     };
     let blocking_reason = source
         .problems
@@ -1833,6 +1845,16 @@ fn local_health_blockers_for_status(
                 LocalHealthAuthority::Backend,
                 &observed_at,
                 "restore network access and upload a fresh local health projection",
+            ));
+        }
+        Some(LatestLocalHealthUpload::ContractRejected { observed_at }) => {
+            blockers.push(blocker(
+                "local_health_contract_rejected",
+                LocalHealthSeverity::Blocking,
+                "backend",
+                LocalHealthAuthority::Backend,
+                &observed_at,
+                "upgrade Ottto or backend contract support so local health projection validates",
             ));
         }
         Some(LatestLocalHealthUpload::Succeeded) | None => {}
@@ -2546,7 +2568,11 @@ fn source_health_from_verification(
                 (SourceState::Healthy, HealthGrade::Ok, Vec::new())
             }
             SourceVerificationStatus::Warning => (
-                SourceState::Healthy,
+                if result.verified {
+                    SourceState::Healthy
+                } else {
+                    SourceState::NeedsConfirmation
+                },
                 HealthGrade::Warning,
                 vec![HealthProblem {
                     code: StableProblemCode::TelemetryNotVerified,
@@ -2714,7 +2740,7 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
         refreshed.config.drift = existing.config.drift.clone();
     }
     let preserve_failed_verification =
-        existing.state == SourceState::Failed && has_verification_failure_problem(existing);
+        existing.last_verified_at.is_some() && has_verification_failure_problem(existing);
     if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
     {
         refreshed.state = existing.state.clone();
@@ -2814,11 +2840,7 @@ fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         last_seen_at: Some(snapshot.captured_at.clone()),
-        last_verified_at: if matches!(snapshot.status, AgentStatusState::Available) {
-            Some(snapshot.captured_at)
-        } else {
-            None
-        },
+        last_verified_at: None,
         problems,
         recommended_actions: Vec::new(),
         connected_at: state.first_seen(&snapshot.source),
@@ -4023,6 +4045,33 @@ mod tests {
     }
 
     #[test]
+    fn contract_rejected_upload_failure_is_not_backend_unreachable() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::ContractRejected)
+            .expect("record upload failure");
+
+        let health = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(health.account.device_state, LocalDeviceState::Active);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("local_health_contract_rejected")
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "local_health_contract_rejected"));
+        assert!(health
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "backend_unreachable"));
+    }
+
+    #[test]
     fn phase_zero_red_fixtures_are_never_green() {
         let fixtures: Vec<LocalHealthContractFixture> = serde_json::from_str(include_str!(
             "../../../fixtures/local-health/contract-matrix.v1.json"
@@ -4107,6 +4156,162 @@ mod tests {
         assert_eq!(
             status.sources[0].recommended_actions[0].action,
             RepairActionKind::VerifyTelemetry
+        );
+    }
+
+    #[test]
+    fn available_agent_status_does_not_stamp_verification_authority() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after refresh");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(
+            status.sources[0].last_verified_at.is_none(),
+            "local availability scans must not masquerade as Verify attempts"
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+    }
+
+    #[test]
+    fn available_agent_status_preserves_no_fresh_telemetry_verification() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::NoFreshTelemetry,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "no_fresh_telemetry".to_string(),
+                text: "No fresh Codex telemetry was processed after the smoke prompt.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("failed verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some(attempt_at.as_str())
+        );
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert_eq!(source.authority_at, attempt_at);
+    }
+
+    #[test]
+    fn warning_verification_without_success_never_projects_healthy() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_oauth_reauth_required".to_string(),
+                text: "Pi provider OAuth re-auth is required before telemetry can be trusted."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record warning verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("warning verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Pi, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some(attempt_at.as_str())
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("telemetry_not_verified")
         );
     }
 
@@ -4678,10 +4883,7 @@ mod tests {
         assert_eq!(status.sources[0].source, SourceKind::Codex);
         assert_eq!(status.sources[0].state, SourceState::Healthy);
         assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some("2026-05-05T10:20:00Z")
-        );
+        assert!(status.sources[0].last_verified_at.is_none());
         assert_eq!(
             status.sources[0].connected_at.as_deref(),
             Some("2026-05-05T10:15:00Z")
@@ -4727,10 +4929,7 @@ mod tests {
         assert_eq!(status.sources[0].state, SourceState::Healthy);
         assert_eq!(status.sources[0].grade, HealthGrade::Ok);
         assert!(status.sources[0].problems.is_empty());
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some("2026-05-05T10:20:00Z")
-        );
+        assert!(status.sources[0].last_verified_at.is_none());
         assert_eq!(
             status.sources[0].config.path_hint.as_deref(),
             Some("~/.claude/settings.json")
