@@ -1624,6 +1624,7 @@ fn complete_pending_auth_claim(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    persist_claim_relay_device_credentials(&completed)?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -1663,6 +1664,47 @@ fn complete_pending_auth_claim(
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(response)
+}
+
+fn persist_claim_relay_device_credentials(
+    completed: &SetupClaimCompleteResponse,
+) -> Result<(), LocalApiError> {
+    match (&completed.relay_device, &completed.relay_device_secret) {
+        (None, None) => Ok(()),
+        (Some(device), Some(device_secret)) => {
+            if device.sources.is_empty() || device_secret.trim().is_empty() {
+                return Err(claim_completion_response_unexpected(
+                    "claim completion returned incomplete relay-device credentials",
+                ));
+            }
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    device_id: device.id.clone(),
+                    machine_id: device
+                        .machine_id
+                        .clone()
+                        .or_else(|| completed.machine_id.clone()),
+                    sources: device.sources.clone(),
+                })
+                .map_err(|_| LocalApiError::StatePoisoned)?;
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .save(device_secret)
+                .map_err(|_| LocalApiError::StatePoisoned)?;
+            Ok(())
+        }
+        _ => Err(claim_completion_response_unexpected(
+            "claim completion returned partial relay-device credentials",
+        )),
+    }
+}
+
+fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
+    LocalApiError::Backend(BackendErrorDetails {
+        kind: BackendErrorKind::ResponseUnexpected,
+        endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
+        status: None,
+        body_excerpt: Some(detail.to_string()),
+    })
 }
 
 fn auth_reset(
@@ -1750,9 +1792,18 @@ struct SetupClaimCompleteResponse {
     setup_run_token: String,
     setup_run_token_expires_at: String,
     machine_id: Option<String>,
+    relay_device: Option<SetupClaimCompleteRelayDevice>,
+    relay_device_secret: Option<String>,
     connected_at: String,
     user: SetupClaimCompleteUser,
     organization: SetupClaimCompleteOrganization,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupClaimCompleteRelayDevice {
+    id: String,
+    machine_id: Option<String>,
+    sources: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1801,12 +1852,22 @@ fn complete_setup_claim(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
-    let body = json!({
+    let mut body = json!({
         "nonce": claim.nonce,
         "machine_id": machine.machine_id,
+        "hardware_uuid": machine.hardware_uuid,
         "machine_name": machine.display_name,
         "platform": "macos",
     });
+    if let Some(device) = FileDeviceStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("relay_device_id".to_string(), json!(device.device_id));
+            object.insert("relay_device_sources".to_string(), json!(device.sources));
+        }
+    }
     backend_post_json(
         &url,
         &body,
@@ -8560,6 +8621,140 @@ mod tests {
                 .load()
                 .expect("load reset device"),
             None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_persists_rotated_relay_device_credentials() {
+        let support_root = telemetry_key_store_root("claim-complete-relay-device");
+        let secret_root = telemetry_key_store_root("claim-complete-relay-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+
+        persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
+            setup_run_id: "setup_claim".to_string(),
+            setup_run_token: "otsr_claim".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_claim".to_string()),
+            relay_device: Some(SetupClaimCompleteRelayDevice {
+                id: "device_claim".to_string(),
+                machine_id: None,
+                sources: vec![
+                    "claude_code".to_string(),
+                    "codex".to_string(),
+                    "pi".to_string(),
+                ],
+            }),
+            relay_device_secret: Some("otdev_rotated_claim".to_string()),
+            connected_at: "2026-05-05T09:20:00Z".to_string(),
+            user: SetupClaimCompleteUser {
+                id: "user_claim".to_string(),
+                email: "claim@example.com".to_string(),
+                display_name: None,
+            },
+            organization: SetupClaimCompleteOrganization {
+                id: "org_claim".to_string(),
+                name: "Claim Org".to_string(),
+            },
+        })
+        .expect("persist claim relay device");
+
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("load device")
+                .expect("device saved"),
+            LocalDeviceBinding {
+                device_id: "device_claim".to_string(),
+                machine_id: Some("machine_claim".to_string()),
+                sources: vec![
+                    "claude_code".to_string(),
+                    "codex".to_string(),
+                    "pi".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("relay device secret saved"),
+            "otdev_rotated_claim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_request_includes_existing_relay_device_identity() {
+        let support_root = telemetry_key_store_root("claim-complete-request-device");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_existing_claim".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string(), "pi".to_string()],
+            })
+            .expect("persist existing relay device");
+
+        let captured_request = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+        let address = listener.local_addr().expect("claim backend address");
+        let captured_request_for_thread = captured_request.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept claim complete");
+            let request = read_complete_http_request(&mut stream);
+            *captured_request_for_thread
+                .lock()
+                .expect("captured request lock") = Some(request);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_claim","setup_run_token":"otsr_claim","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_claim","email":"claim@example.com","display_name":null},"organization":{"id":"org_claim","name":"Claim Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_existing".to_string(),
+                claim_token: "token_existing".to_string(),
+                nonce: "nonce_existing".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+        )
+        .expect("complete setup claim");
+
+        let request = captured_request
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("request captured");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("claim request json");
+        assert_eq!(
+            body.get("relay_device_id")
+                .and_then(serde_json::Value::as_str),
+            Some("device_existing_claim")
+        );
+        assert_eq!(
+            body.get("relay_device_sources")
+                .and_then(serde_json::Value::as_array)
+                .map(|sources| sources
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["codex", "pi"])
+        );
+        assert_eq!(
+            body.get("hardware_uuid"),
+            Some(&serde_json::Value::Null),
+            "claim completion must send hardware_uuid when known and null otherwise"
         );
     }
 
