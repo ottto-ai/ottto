@@ -7177,7 +7177,9 @@ fn verify_pi_subscription_oauth_route_passively(
     // transcripts (no live `pi`), so it can't burn the rotating OAuth token. The
     // mtime bound matches the passive lookback window. Non-fatal on error.
     let import_since = SystemTime::now()
-        .checked_sub(Duration::from_secs(u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600))
+        .checked_sub(Duration::from_secs(
+            u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
+        ))
         .unwrap_or(UNIX_EPOCH);
     if let Err(error) = import_recent_pi_route_sessions(api_base_url, route, import_since) {
         eprintln!("Pi passive route session import failed (non-fatal): {error}");
@@ -10436,7 +10438,11 @@ mod tests {
         let included = pi_session_files_modified_since([session.clone()], before);
         assert_eq!(included, vec![session.clone()]);
         let at = pi_session_files_modified_since([session.clone()], modified);
-        assert_eq!(at, vec![session.clone()], "mtime == since must be inclusive");
+        assert_eq!(
+            at,
+            vec![session.clone()],
+            "mtime == since must be inclusive"
+        );
 
         // Unreadable / missing paths are dropped, not panicked on.
         let missing = root.join("does-not-exist.jsonl");
