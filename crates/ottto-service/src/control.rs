@@ -427,6 +427,13 @@ fn handle_command(
         LocalControlCommand::AgentStatusRefresh { source } => {
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
+        LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
+            let status = status_for(daemon, &authorization)?;
+            to_value(crate::personal_meter_local_snapshot_from_status(
+                &status,
+                source.as_ref(),
+            ))
+        }
         LocalControlCommand::AgentContext { query } => agent_context(daemon, &authorization, query),
         LocalControlCommand::AgentCosts { query } => agent_costs(daemon, &authorization, query),
         LocalControlCommand::AgentSessions { query } => {
