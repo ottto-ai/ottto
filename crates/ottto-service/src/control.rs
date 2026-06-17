@@ -5745,6 +5745,45 @@ fn import_new_pi_route_sessions(
     upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
 }
 
+/// Upload local Pi session files modified at or after `since` for `route`. Used
+/// by the passive (no-live-smoke) subscription-OAuth verify path so a fresh user
+/// `pi` run is imported and counts as observed usage. This only UPLOADS existing
+/// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
+/// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
+/// verify from re-uploading the user's entire session history.
+fn import_recent_pi_route_sessions(
+    api_base_url: &str,
+    route: &PiModelRoute,
+    since: SystemTime,
+) -> Result<Option<serde_json::Value>, LocalApiError> {
+    let session_files = pi_session_files_modified_since(pi_session_files(), since);
+    if session_files.is_empty() {
+        return Ok(None);
+    }
+    let relay_token = issue_pi_relay_token(api_base_url)?;
+    upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+}
+
+/// Keep only session files whose on-disk mtime is at or after `since`. Files
+/// whose metadata can't be read are dropped (treated as not-recent), matching
+/// the conservative behavior of the live-import path. Pure helper so the mtime
+/// bound used by `import_recent_pi_route_sessions` is unit-testable without the
+/// relay-token / upload network calls.
+fn pi_session_files_modified_since(
+    files: impl IntoIterator<Item = PathBuf>,
+    since: SystemTime,
+) -> Vec<PathBuf> {
+    files
+        .into_iter()
+        .filter(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| modified >= since)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct RelayTokenApiResponse {
     token: String,
@@ -7131,6 +7170,20 @@ fn verify_pi_subscription_oauth_route_passively(
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
     let lookback = rfc3339_hours_ago(PI_PASSIVE_LOOKBACK_HOURS);
+    // Import recent local Pi sessions BEFORE polling so a fresh user `pi` run is
+    // uploaded and counts as observed usage — otherwise a valid OAuth route with
+    // real recent usage is mislabeled `pi_oauth_reauth_required` just because the
+    // local_sessions collector hasn't uploaded it yet. This only uploads existing
+    // transcripts (no live `pi`), so it can't burn the rotating OAuth token. The
+    // mtime bound matches the passive lookback window. Non-fatal on error.
+    let import_since = SystemTime::now()
+        .checked_sub(Duration::from_secs(
+            u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
+        ))
+        .unwrap_or(UNIX_EPOCH);
+    if let Err(error) = import_recent_pi_route_sessions(api_base_url, route, import_since) {
+        eprintln!("Pi passive route session import failed (non-fatal): {error}");
+    }
     let local_session_observed = Some(!pi_session_files().is_empty());
     let filters = if pi_route_is_unscoped(route) {
         None
@@ -10356,6 +10409,45 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_session_files_modified_since_filters_on_mtime() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-pi-recent-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&root).expect("create session dir");
+        let session = root.join("session.jsonl");
+        fs::write(&session, "{}\n").expect("write session");
+        let modified = fs::metadata(&session)
+            .and_then(|metadata| metadata.modified())
+            .expect("read session mtime");
+
+        // A boundary just after the file's mtime excludes it...
+        let after = modified + Duration::from_secs(60);
+        assert!(
+            pi_session_files_modified_since([session.clone()], after).is_empty(),
+            "file older than `since` must be filtered out"
+        );
+
+        // ...and a boundary before (or equal to) the mtime includes it.
+        let before = modified - Duration::from_secs(60);
+        let included = pi_session_files_modified_since([session.clone()], before);
+        assert_eq!(included, vec![session.clone()]);
+        let at = pi_session_files_modified_since([session.clone()], modified);
+        assert_eq!(
+            at,
+            vec![session.clone()],
+            "mtime == since must be inclusive"
+        );
+
+        // Unreadable / missing paths are dropped, not panicked on.
+        let missing = root.join("does-not-exist.jsonl");
+        assert!(pi_session_files_modified_since([missing], before).is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
