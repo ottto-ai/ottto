@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "2cce68b184a0c97c24dd5cee6db9a42d1fbb571936ce141179350ddbdf34a3b4",
+  "content_sha256": "9a74c055eb51ff12b26c8f6f0624d2f7b8c2610bd8a0a8962ae40554ea6c80d2",
   "files": [
     {
       "executable": false,
@@ -363,8 +363,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "c1c195f1bfb4203b5213e97c3c23fc8dd2391daace678a08fdd9cae2253c5b10",
-      "size_bytes": 106780
+      "sha256": "9d7cbc4a3c897169a8f2a5e07d4285ff6404aa565fe696fb151762a0cf0fbb67",
+      "size_bytes": 110730
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "89c15a2bdbd32bf1340392244dd31e919dd29f757be4563f4c51cd46e1a60097",
-      "size_bytes": 496101
+      "sha256": "c44ab6d938afb55b6b58fea7e168ae64a8d91c879f6dfa04b62ba9f567a71fdc",
+      "size_bytes": 496476
     },
     {
       "executable": false,
@@ -587,8 +587,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "bfcf32cffd960fb10504feecef119191e93d8f2c827aaf99fd028638fdc24c82",
-      "size_bytes": 197338
+      "sha256": "e77f69f8acb80d8cdeddcce1573216373fcb9fc461cc0eab895ffd4522e4ceb1",
+      "size_bytes": 199828
     },
     {
       "executable": false,
@@ -622,8 +622,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "d04f4a2cbdd30f9267f9a3c57314c76f3fe877b414597ba2ccb1fff5524e2712",
-      "size_bytes": 47917
+      "sha256": "bf52b5f675737ce8619f1f76b7612c44c80a1dfe5f0479fe37052d24d81d8247",
+      "size_bytes": 54951
     },
     {
       "executable": false,
@@ -1333,7 +1333,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-17T02:30:16+00:00",
+  "generated_at": "2026-06-17T03:48:31+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [

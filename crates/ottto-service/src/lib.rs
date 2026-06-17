@@ -1385,11 +1385,12 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
     let runtime = runtime_identity_for_status(status, &observed_at);
     let heartbeat = runtime_heartbeat_for_status(status, &runtime, projection_revision);
     let account = local_health_account_for_status(status);
-    let sources = status
+    let mut sources = status
         .sources
         .iter()
         .map(|source| local_health_source_for_status(source, projection_revision))
         .collect::<Vec<_>>();
+    apply_account_prerequisite_to_sources(&account, &mut sources);
     let blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
     let evidence = events
@@ -1722,6 +1723,37 @@ fn local_health_source_for_status(
             .first()
             .map(|action| format!("{:?}", action.action)),
         projection_revision: projection_revision.saturating_sub(1),
+    }
+}
+
+fn apply_account_prerequisite_to_sources(
+    account: &LocalHealthAccountV1,
+    sources: &mut [LocalHealthSourceV1],
+) {
+    let account_blocks_source_trust =
+        matches!(
+            account.state,
+            LocalHealthAccountState::ReconnectRequired | LocalHealthAccountState::NotConnected
+        ) || matches!(
+            account.device_state,
+            LocalDeviceState::Inactive | LocalDeviceState::StaleHeartbeat
+        ) || matches!(account.setup_run_state, LocalSetupRunState::RebindRequired)
+            || matches!(
+                account.setup_token_state,
+                LocalSetupTokenState::Missing | LocalSetupTokenState::RefreshRequired
+            );
+    if !account_blocks_source_trust {
+        return;
+    }
+    for source in sources {
+        if source.state != LocalHealthSourceState::Healthy {
+            continue;
+        }
+        source.state = LocalHealthSourceState::Unknown;
+        source.authority = LocalHealthAuthority::Backend;
+        source.blocking_reason = Some("auth_missing".to_string());
+        source.clear_condition = Some("sign in to Ottto and rebind this machine".to_string());
+        source.next_action = Some("sign_in".to_string());
     }
 }
 
@@ -3926,6 +3958,36 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.code == "auth_missing"));
+    }
+
+    #[test]
+    fn auth_rejected_upload_prevents_healthy_source_projection() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record successful verification");
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::Unknown,
+            "source projection must not stay healthy while the account/device prerequisite is blocking"
+        );
+        assert_eq!(
+            health.sources[0].blocking_reason.as_deref(),
+            Some("auth_missing")
+        );
+        assert_eq!(health.sources[0].next_action.as_deref(), Some("sign_in"));
     }
 
     #[test]

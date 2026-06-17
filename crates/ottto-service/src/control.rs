@@ -3024,6 +3024,14 @@ fn refresh_setup_run_token_via_device_secret(
     })
 }
 
+pub(crate) fn refresh_setup_run_token_for_persisted_connection() -> Result<(), LocalApiError> {
+    let connection = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+    refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection).map(|_| ())
+}
+
 fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
