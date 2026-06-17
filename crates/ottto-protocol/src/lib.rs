@@ -714,6 +714,146 @@ pub enum DetectedUseQuotaWindowState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalSnapshot {
+    pub schema_version: String,
+    pub generated_at: Rfc3339Timestamp,
+    pub machine_id: String,
+    #[serde(default)]
+    pub sources: Vec<PersonalMeterLocalSourceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalSourceSnapshot {
+    pub source: SourceKind,
+    pub app: String,
+    /// Local runtime evidence is never a backend-owned meter total. Consumers
+    /// must reconcile it as local freshness/pending evidence only.
+    pub included_in_totals: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<PersonalMeterLocalAccount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    pub pending_local_delta: PersonalMeterLocalDelta,
+    pub freshness: PersonalMeterLocalFreshness,
+    pub collector: PersonalMeterLocalCollector,
+    #[serde(default)]
+    pub confidence: AgentStatusConfidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalAccount {
+    pub login_state: AgentLoginState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default)]
+    pub confidence: AgentStatusConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalDelta {
+    pub status: PersonalMeterLocalValueStatus,
+    pub included_in_totals: bool,
+    pub basis: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd_micros: Option<u64>,
+    #[serde(default)]
+    pub detected_use_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_token_volume: Vec<DetectedUseTokenSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalFreshness {
+    pub status: PersonalMeterLocalFreshnessStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_last_success_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalMeterLocalCollector {
+    pub status: PersonalMeterLocalCollectorStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<LocalCollectorState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_usage_reconciliation_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_started_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_finished_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub last_uploaded_count: u64,
+    #[serde(default)]
+    pub last_scanned_session_count: u64,
+    #[serde(default)]
+    pub last_scanned_file_count: u64,
+    #[serde(default)]
+    pub last_scan_cap_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalValueStatus {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalFreshnessStatus {
+    Fresh,
+    Stale,
+    Error,
+    Unsupported,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonalMeterLocalCollectorStatus {
+    Ok,
+    Disabled,
+    Failing,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDescriptor {
     pub source: SourceKind,
     pub display_name: String,
@@ -2055,6 +2195,10 @@ pub enum LocalControlCommand {
     AgentStatusRefresh {
         source: Option<SourceKind>,
     },
+    PersonalMeterLocalSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<SourceKind>,
+    },
     AgentContext {
         #[serde(default)]
         query: AgentContextQuery,
@@ -3353,6 +3497,27 @@ mod tests {
     }
 
     #[test]
+    fn personal_meter_local_snapshot_command_round_trips() {
+        let request = serde_json::from_str::<LocalControlRequest>(&format!(
+            r#"{{"request_id":"req_meter","protocol_version":{PROTOCOL_VERSION},"command":"personal_meter_local_snapshot","source":"codex"}}"#
+        ))
+        .expect("personal meter local snapshot request should deserialize");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::PersonalMeterLocalSnapshot {
+                source: Some(SourceKind::Codex),
+            }
+        );
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(
+            encoded["command"],
+            serde_json::json!("personal_meter_local_snapshot")
+        );
+        assert_eq!(encoded["source"], serde_json::json!("codex"));
+    }
+
+    #[test]
     fn local_control_request_requires_protocol_version() {
         let error = serde_json::from_str::<LocalControlRequest>(
             r#"{"request_id":"req_missing","command":"status"}"#,
@@ -3474,5 +3639,91 @@ mod tests {
         assert!(!object.contains_key("quota_used_percent"));
         assert_eq!(object["token_volume_recent"], serde_json::json!([]));
         assert_eq!(object["quota_window_state"], serde_json::json!("unknown"));
+    }
+
+    #[test]
+    fn personal_meter_snapshot_keeps_local_evidence_out_of_totals() {
+        let snapshot = PersonalMeterLocalSnapshot {
+            schema_version: "personal_meter.local_snapshot.v1".to_string(),
+            generated_at: "2026-06-17T09:00:00Z".to_string(),
+            machine_id: "machine_test".to_string(),
+            sources: vec![PersonalMeterLocalSourceSnapshot {
+                source: SourceKind::Codex,
+                app: "codex".to_string(),
+                included_in_totals: false,
+                provider: Some("openai".to_string()),
+                account: Some(PersonalMeterLocalAccount {
+                    login_state: AgentLoginState::SignedIn,
+                    label: Some("ron@example.com".to_string()),
+                    account_identifier_hash: Some("acct_hash".to_string()),
+                    confidence: AgentStatusConfidence::High,
+                }),
+                model: Some("gpt-5-codex".to_string()),
+                plan: Some("ChatGPT Plus".to_string()),
+                quota_windows: Vec::new(),
+                pending_local_delta: PersonalMeterLocalDelta {
+                    status: PersonalMeterLocalValueStatus::Unknown,
+                    included_in_totals: false,
+                    basis: "backend_inclusion_watermark_unavailable".to_string(),
+                    since: None,
+                    until: None,
+                    total_tokens: None,
+                    request_count: None,
+                    estimated_cost_usd_micros: None,
+                    detected_use_count: 1,
+                    recent_token_volume: vec![DetectedUseTokenSample {
+                        at: "2026-06-17T08:00:00Z".to_string(),
+                        tokens: 2048,
+                    }],
+                },
+                freshness: PersonalMeterLocalFreshness {
+                    status: PersonalMeterLocalFreshnessStatus::Fresh,
+                    captured_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    expires_at: Some("2026-06-17T09:10:00Z".to_string()),
+                    last_seen_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    last_verified_at: Some("2026-06-17T08:55:00Z".to_string()),
+                    collector_last_success_at: Some("2026-06-17T08:56:00Z".to_string()),
+                },
+                collector: PersonalMeterLocalCollector {
+                    status: PersonalMeterLocalCollectorStatus::Ok,
+                    state: Some(LocalCollectorState::Warm),
+                    local_usage_reconciliation_enabled: Some(true),
+                    last_scan_started_at: Some("2026-06-17T08:55:30Z".to_string()),
+                    last_scan_finished_at: Some("2026-06-17T08:56:00Z".to_string()),
+                    last_success_at: Some("2026-06-17T08:56:00Z".to_string()),
+                    last_uploaded_count: 1,
+                    last_scanned_session_count: 1,
+                    last_scanned_file_count: 1,
+                    last_scan_cap_hit: false,
+                    collector_version: Some("local-enriched/1".to_string()),
+                    parser_version: Some("codex-jsonl/1".to_string()),
+                },
+                confidence: AgentStatusConfidence::High,
+                warnings: Vec::new(),
+                recommendation: None,
+            }],
+        };
+
+        let value = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        assert_eq!(
+            value["sources"][0]["included_in_totals"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["included_in_totals"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["status"],
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            value["sources"][0]["pending_local_delta"]["basis"],
+            serde_json::json!("backend_inclusion_watermark_unavailable")
+        );
+
+        let parsed: PersonalMeterLocalSnapshot =
+            serde_json::from_value(value).expect("snapshot round-trips");
+        assert_eq!(parsed, snapshot);
     }
 }

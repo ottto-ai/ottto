@@ -40,6 +40,9 @@ use ottto_protocol::{
     LocalHealthEvidenceRefV1, LocalHealthOverall, LocalHealthOverallState, LocalHealthSeverity,
     LocalHealthSourceState, LocalHealthSourceV1, LocalMachineHealthV1, LocalSetupRunState,
     LocalSetupTokenState, MachineIdentity, MachineRuntimeHeartbeatV1, OrgTelemetryControlState,
+    PersonalMeterLocalAccount, PersonalMeterLocalCollector, PersonalMeterLocalCollectorStatus,
+    PersonalMeterLocalDelta, PersonalMeterLocalFreshness, PersonalMeterLocalFreshnessStatus,
+    PersonalMeterLocalSnapshot, PersonalMeterLocalSourceSnapshot, PersonalMeterLocalValueStatus,
     RedactedValue, RedactionCategory, RedactionReport, RedactionSurface, RelayRuntimeState,
     RelayState, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
     RepairAuthority, RepairAuthorityMode, RepairBackupMetadata, RepairBackupScope, RepairPlan,
@@ -1931,6 +1934,307 @@ pub fn current_rfc3339_timestamp() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+pub fn personal_meter_local_snapshot_from_status(
+    status: &DaemonStatus,
+    source_filter: Option<&SourceKind>,
+) -> PersonalMeterLocalSnapshot {
+    let sources = status
+        .sources
+        .iter()
+        .filter(|health| {
+            source_filter
+                .map(|source| health.source == *source)
+                .unwrap_or(true)
+        })
+        .map(personal_meter_source_from_health)
+        .collect();
+
+    PersonalMeterLocalSnapshot {
+        schema_version: "personal_meter.local_snapshot.v1".to_string(),
+        generated_at: status.generated_at.clone(),
+        machine_id: status.machine.machine_id.clone(),
+        sources,
+    }
+}
+
+fn personal_meter_source_from_health(health: &SourceHealth) -> PersonalMeterLocalSourceSnapshot {
+    let agent_status = health.agent_status.as_ref();
+    let account_status = agent_status.and_then(|snapshot| snapshot.account.as_ref());
+    let model_status = agent_status.and_then(|snapshot| snapshot.model.as_ref());
+    let current_plan = current_plan_observation(health);
+
+    let provider = account_status
+        .and_then(|account| account.provider.clone())
+        .or_else(|| model_status.and_then(|model| model.provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.billing_provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.gateway_provider.clone()))
+        .or_else(|| {
+            health
+                .detected_uses
+                .first()
+                .map(|use_record| use_record.gateway_provider.clone())
+        });
+    let account = account_status.map(|account| PersonalMeterLocalAccount {
+        login_state: account.login_state.clone(),
+        label: account
+            .email
+            .clone()
+            .or_else(|| current_plan.and_then(|plan| plan.account_label.clone()))
+            .or_else(|| {
+                health
+                    .detected_uses
+                    .first()
+                    .and_then(|use_record| use_record.account_label.clone())
+            }),
+        account_identifier_hash: account
+            .account_identifier_hash
+            .clone()
+            .or_else(|| current_plan.and_then(|plan| plan.account_identifier_hash.clone()))
+            .or_else(|| {
+                health
+                    .detected_uses
+                    .first()
+                    .and_then(|use_record| use_record.account_identifier_hash.clone())
+            }),
+        confidence: account.confidence.clone(),
+    });
+    let model = model_status
+        .and_then(|model| {
+            model
+                .active_model
+                .clone()
+                .or_else(|| model.default_model.clone())
+        })
+        .or_else(|| {
+            agent_status.and_then(|snapshot| {
+                snapshot
+                    .quota_windows
+                    .iter()
+                    .find_map(|window| window.model.clone())
+            })
+        });
+    let plan = account_status
+        .and_then(|account| {
+            account
+                .subscription_product
+                .clone()
+                .or_else(|| account.plan_type.clone())
+        })
+        .or_else(|| {
+            current_plan.and_then(|plan| {
+                plan.subscription_product
+                    .clone()
+                    .or_else(|| plan.plan_type.clone())
+            })
+        })
+        .or_else(|| {
+            health
+                .detected_uses
+                .first()
+                .and_then(|use_record| use_record.subscription_product.clone())
+        });
+    let confidence = account_status
+        .map(|account| account.confidence.clone())
+        .or_else(|| current_plan.map(|plan| plan.confidence.clone()))
+        .unwrap_or_default();
+
+    PersonalMeterLocalSourceSnapshot {
+        source: health.source.clone(),
+        app: source_slug(&health.source).to_string(),
+        included_in_totals: false,
+        provider,
+        account,
+        model,
+        plan,
+        quota_windows: agent_status
+            .map(|snapshot| snapshot.quota_windows.clone())
+            .unwrap_or_default(),
+        pending_local_delta: personal_meter_delta(health),
+        freshness: personal_meter_freshness(health),
+        collector: personal_meter_collector(health),
+        confidence,
+        warnings: personal_meter_warnings(health),
+        recommendation: health
+            .recommended_actions
+            .first()
+            .map(|action| action.title.clone()),
+    }
+}
+
+fn current_plan_observation(
+    health: &SourceHealth,
+) -> Option<&ottto_protocol::AgentStatusPlanObservation> {
+    health
+        .plan_observations
+        .iter()
+        .find(|plan| plan.is_current == Some(true))
+        .or_else(|| health.plan_observations.first())
+}
+
+fn personal_meter_delta(health: &SourceHealth) -> PersonalMeterLocalDelta {
+    let recent_token_volume = aggregate_recent_token_volume(health);
+    let has_local_usage_evidence =
+        !health.detected_uses.is_empty() || !recent_token_volume.is_empty();
+    let reconciliation_disabled = health.reconciliation_enabled == Some(false);
+    let (status, basis) = if reconciliation_disabled {
+        (
+            PersonalMeterLocalValueStatus::Unavailable,
+            "local_usage_reconciliation_disabled",
+        )
+    } else if has_local_usage_evidence {
+        (
+            PersonalMeterLocalValueStatus::Unknown,
+            "backend_inclusion_watermark_unavailable",
+        )
+    } else if health.reconciliation_enabled == Some(true) {
+        (
+            PersonalMeterLocalValueStatus::Unknown,
+            "no_local_usage_evidence_yet",
+        )
+    } else {
+        (
+            PersonalMeterLocalValueStatus::Unavailable,
+            "local_usage_reconciliation_policy_unknown",
+        )
+    };
+
+    PersonalMeterLocalDelta {
+        status,
+        included_in_totals: false,
+        basis: basis.to_string(),
+        since: None,
+        until: None,
+        total_tokens: None,
+        request_count: None,
+        estimated_cost_usd_micros: None,
+        detected_use_count: health.detected_uses.len() as u64,
+        recent_token_volume,
+    }
+}
+
+fn aggregate_recent_token_volume(
+    health: &SourceHealth,
+) -> Vec<ottto_protocol::DetectedUseTokenSample> {
+    let mut by_timestamp = BTreeMap::<String, u64>::new();
+    for use_record in &health.detected_uses {
+        for sample in &use_record.token_volume_recent {
+            *by_timestamp.entry(sample.at.clone()).or_default() += sample.tokens;
+        }
+    }
+    by_timestamp
+        .into_iter()
+        .map(|(at, tokens)| ottto_protocol::DetectedUseTokenSample { at, tokens })
+        .collect()
+}
+
+fn personal_meter_freshness(health: &SourceHealth) -> PersonalMeterLocalFreshness {
+    let agent_status = health.agent_status.as_ref();
+    let collector_last_success_at = health
+        .collector
+        .as_ref()
+        .and_then(|collector| collector.last_success_at.clone());
+    let status = if let Some(snapshot) = agent_status {
+        if snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Error)
+        {
+            PersonalMeterLocalFreshnessStatus::Error
+        } else if snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Stale)
+        {
+            PersonalMeterLocalFreshnessStatus::Stale
+        } else {
+            match snapshot.status {
+                AgentStatusState::Available => PersonalMeterLocalFreshnessStatus::Fresh,
+                AgentStatusState::Error => PersonalMeterLocalFreshnessStatus::Error,
+                AgentStatusState::Unsupported | AgentStatusState::NotInstalled => {
+                    PersonalMeterLocalFreshnessStatus::Unsupported
+                }
+                AgentStatusState::Degraded
+                | AgentStatusState::AuthRequired
+                | AgentStatusState::Unknown => PersonalMeterLocalFreshnessStatus::Unknown,
+            }
+        }
+    } else if collector_last_success_at.is_some() {
+        PersonalMeterLocalFreshnessStatus::Unknown
+    } else {
+        PersonalMeterLocalFreshnessStatus::Unavailable
+    };
+
+    PersonalMeterLocalFreshness {
+        status,
+        captured_at: agent_status.map(|snapshot| snapshot.captured_at.clone()),
+        expires_at: agent_status.map(|snapshot| snapshot.expires_at.clone()),
+        last_seen_at: health.last_seen_at.clone(),
+        last_verified_at: health.last_verified_at.clone(),
+        collector_last_success_at,
+    }
+}
+
+fn personal_meter_collector(health: &SourceHealth) -> PersonalMeterLocalCollector {
+    let status = match (&health.collector, health.reconciliation_enabled) {
+        (_, Some(false)) => PersonalMeterLocalCollectorStatus::Disabled,
+        (Some(collector), _) if collector.state == ottto_protocol::LocalCollectorState::Failing => {
+            PersonalMeterLocalCollectorStatus::Failing
+        }
+        (Some(_), _) => PersonalMeterLocalCollectorStatus::Ok,
+        (None, Some(true)) => PersonalMeterLocalCollectorStatus::Unknown,
+        (None, None) => PersonalMeterLocalCollectorStatus::Unavailable,
+    };
+    let collector = health.collector.as_ref();
+
+    PersonalMeterLocalCollector {
+        status,
+        state: collector.map(|collector| collector.state.clone()),
+        local_usage_reconciliation_enabled: health.reconciliation_enabled,
+        last_scan_started_at: collector
+            .and_then(|collector| collector.last_scan_started_at.clone()),
+        last_scan_finished_at: collector
+            .and_then(|collector| collector.last_scan_finished_at.clone()),
+        last_success_at: collector.and_then(|collector| collector.last_success_at.clone()),
+        last_uploaded_count: collector
+            .map(|collector| collector.last_uploaded_count)
+            .unwrap_or_default(),
+        last_scanned_session_count: collector
+            .map(|collector| collector.last_scanned_session_count)
+            .unwrap_or_default(),
+        last_scanned_file_count: collector
+            .map(|collector| collector.last_scanned_file_count)
+            .unwrap_or_default(),
+        last_scan_cap_hit: collector
+            .map(|collector| collector.last_scan_cap_hit)
+            .unwrap_or_default(),
+        collector_version: collector.and_then(|collector| collector.collector_version.clone()),
+        parser_version: collector.and_then(|collector| collector.parser_version.clone()),
+    }
+}
+
+fn personal_meter_warnings(health: &SourceHealth) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(health.problems.iter().map(|problem| problem.title.clone()));
+    if let Some(agent_status) = health.agent_status.as_ref() {
+        warnings.extend(
+            agent_status
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    matches!(
+                        diagnostic.severity,
+                        ottto_protocol::AgentDiagnosticSeverity::Warning
+                            | ottto_protocol::AgentDiagnosticSeverity::Error
+                    )
+                })
+                .map(|diagnostic| diagnostic.message.clone()),
+        );
+    }
+    warnings.truncate(8);
+    warnings
+}
+
 fn bound_user(account: &LocalAccountBinding) -> Option<&LocalAccountUser> {
     account.user.as_ref()
 }
@@ -2811,9 +3115,9 @@ fn source_display_name(source: &SourceKind) -> String {
 mod tests {
     use super::*;
     use ottto_protocol::{
-        AccountBindingState, HealthGrade, LocalAccountOrganization, LocalHealthContractFixture,
-        LocalHealthOverallState, LocalHealthSourceState, OperatingSystem, SourceConfigState,
-        SourceState,
+        AccountBindingState, DetectedUseTokenSample, HealthGrade, LocalAccountOrganization,
+        LocalHealthContractFixture, LocalHealthOverallState, LocalHealthSourceState,
+        OperatingSystem, SourceConfigState, SourceState,
     };
     use serial_test::serial;
 
@@ -3887,8 +4191,6 @@ mod tests {
 
     #[test]
     fn health_detected_uses_prunes_stale_cache_rows() {
-        use ottto_protocol::DetectedUseTokenSample;
-
         let detected = vec![
             DetectedUse {
                 gateway_provider: "anthropic".to_string(),
@@ -3897,7 +4199,7 @@ mod tests {
                 subscription_product: None,
                 account_label: None,
                 last_seen_at: "2025-10-05T13:12:31Z".to_string(),
-                token_volume_recent: vec![DetectedUseTokenSample {
+                token_volume_recent: vec![ottto_protocol::DetectedUseTokenSample {
                     at: "2025-10-05T13:00:00Z".to_string(),
                     tokens: 15_417_886,
                 }],
@@ -4572,6 +4874,178 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn personal_meter_local_snapshot_uses_local_evidence_not_totals() {
+        let daemon = daemon();
+        daemon
+            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .expect("record reconciliation");
+        let mut snapshot = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
+        snapshot.account = Some(ottto_protocol::AgentAccountStatus {
+            login_state: ottto_protocol::AgentLoginState::SignedIn,
+            provider: Some("openai".to_string()),
+            auth_method: Some("oauth".to_string()),
+            email: Some("ron@example.com".to_string()),
+            account_id: None,
+            organization_id: None,
+            organization_label: None,
+            plan_type: Some("plus".to_string()),
+            subscription_product: Some("ChatGPT Plus".to_string()),
+            billing_channel: Some("chatgpt".to_string()),
+            account_identifier_hash: Some("acct_hash".to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("local_status".to_string()),
+            billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
+            confidence: ottto_protocol::AgentStatusConfidence::High,
+        });
+        snapshot.model = Some(ottto_protocol::AgentModelStatus {
+            active_model: Some("gpt-5-codex".to_string()),
+            default_model: None,
+            provider: Some("openai".to_string()),
+            available_models: Vec::new(),
+            available_model_details: Vec::new(),
+            context_window_tokens: None,
+        });
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "weekly".to_string(),
+            scope: ottto_protocol::AgentQuotaWindowScope::Account,
+            status: AgentQuotaWindowStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            model: None,
+            account_label: Some("ron@example.com".to_string()),
+            window_seconds: Some(604_800),
+            started_at: Some("2026-05-04T00:00:00Z".to_string()),
+            resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+            quota: Some(100),
+            remaining: Some(42),
+            used_percent: Some(58),
+            left_percent: Some(42),
+        }];
+        snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            observed_at: Some("2026-05-05T10:20:00Z".to_string()),
+            evidence_method: Some("local_status".to_string()),
+            source_session_id: None,
+            provider: Some("openai".to_string()),
+            billing_provider: Some("openai".to_string()),
+            model_provider: Some("openai".to_string()),
+            billing_channel: Some("chatgpt".to_string()),
+            auth_mode: Some("oauth".to_string()),
+            gateway_provider: None,
+            subscription_product: Some("ChatGPT Plus".to_string()),
+            plan_type: Some("plus".to_string()),
+            account_label: Some("ron@example.com".to_string()),
+            account_id: None,
+            organization_label: None,
+            organization_id: None,
+            account_identifier_hash: Some("acct_hash".to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("local_status".to_string()),
+            billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
+            confidence: ottto_protocol::AgentStatusConfidence::High,
+            is_current: Some(true),
+        }];
+
+        {
+            let mut state = daemon.state().expect("state");
+            upsert_agent_status_snapshot(&mut state, snapshot);
+            let health = state.sources.first_mut().expect("source health");
+            health.collector = Some(ottto_protocol::LocalCollectorHealth {
+                state: ottto_protocol::LocalCollectorState::Warm,
+                last_scan_started_at: Some("2026-05-05T10:19:00Z".to_string()),
+                last_scan_finished_at: Some("2026-05-05T10:19:30Z".to_string()),
+                last_success_at: Some("2026-05-05T10:19:30Z".to_string()),
+                last_uploaded_count: 3,
+                last_scanned_session_count: 2,
+                last_scanned_file_count: 2,
+                last_backfill_window_days: 183,
+                last_backfill_file_limit: 1_000,
+                last_discovered_file_count: 2,
+                last_skipped_file_count_due_to_limit: 0,
+                last_scan_cap_hit: false,
+                next_retry_at: None,
+                collector_version: Some("local-enriched/1".to_string()),
+                parser_version: Some("codex-jsonl/1".to_string()),
+            });
+            health.detected_uses = vec![DetectedUse {
+                gateway_provider: "openai".to_string(),
+                plan_fingerprint: Some("plus".to_string()),
+                account_identifier_hash: Some("acct_hash".to_string()),
+                subscription_product: Some("ChatGPT Plus".to_string()),
+                account_label: Some("ron@example.com".to_string()),
+                last_seen_at: "2026-05-05T10:19:30Z".to_string(),
+                token_volume_recent: vec![DetectedUseTokenSample {
+                    at: "2026-05-05T10:00:00Z".to_string(),
+                    tokens: 4096,
+                }],
+                quota_window_state: DetectedUseQuotaWindowState::Ok,
+                quota_used_percent: Some(58),
+                quota_resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+            }];
+        }
+
+        let response = crate::control::handle_request(
+            &daemon,
+            ottto_protocol::LocalControlRequest {
+                request_id: "req_meter".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some(TOKEN.to_string()),
+                client_kind: Some(ottto_protocol::LocalClientKind::Cli),
+                client_install_owner: None,
+                command: ottto_protocol::LocalControlCommand::PersonalMeterLocalSnapshot {
+                    source: Some(SourceKind::Codex),
+                },
+            },
+        );
+
+        assert!(response.ok, "response should succeed: {:?}", response.error);
+        let payload: PersonalMeterLocalSnapshot =
+            serde_json::from_value(response.payload.expect("personal meter payload"))
+                .expect("payload should match protocol type");
+        assert_eq!(payload.schema_version, "personal_meter.local_snapshot.v1");
+        assert_eq!(payload.machine_id, "machine_test");
+        assert_eq!(payload.sources.len(), 1);
+        let source = &payload.sources[0];
+        assert_eq!(source.source, SourceKind::Codex);
+        assert!(!source.included_in_totals);
+        assert_eq!(source.provider.as_deref(), Some("openai"));
+        assert_eq!(source.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(source.plan.as_deref(), Some("ChatGPT Plus"));
+        assert_eq!(
+            source
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some("acct_hash")
+        );
+        assert_eq!(source.quota_windows.len(), 1);
+        assert_eq!(
+            source.freshness.status,
+            PersonalMeterLocalFreshnessStatus::Fresh
+        );
+        assert_eq!(
+            source.collector.status,
+            PersonalMeterLocalCollectorStatus::Ok
+        );
+        assert_eq!(source.collector.last_uploaded_count, 3);
+        assert_eq!(
+            source.pending_local_delta.status,
+            PersonalMeterLocalValueStatus::Unknown
+        );
+        assert!(!source.pending_local_delta.included_in_totals);
+        assert_eq!(
+            source.pending_local_delta.basis,
+            "backend_inclusion_watermark_unavailable"
+        );
+        assert_eq!(source.pending_local_delta.total_tokens, None);
+        assert_eq!(source.pending_local_delta.detected_use_count, 1);
+        assert_eq!(
+            source.pending_local_delta.recent_token_volume[0].tokens,
+            4096
+        );
     }
 
     fn available_agent_status(source: SourceKind, captured_at: &str) -> AgentStatusSnapshot {
