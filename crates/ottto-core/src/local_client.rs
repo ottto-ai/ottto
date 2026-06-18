@@ -60,8 +60,8 @@ fn request_unix_socket_with_timeout(
     stream
         .read_to_string(&mut response)
         .with_context(|| format!("read socket response {}", path.display()))?;
-    Ok(serde_json::from_str(&response)
-        .with_context(|| format!("parse socket response {}", path.display()))?)
+    serde_json::from_str(&response)
+        .with_context(|| format!("parse socket response {}", path.display()))
 }
 
 #[cfg(not(unix))]
