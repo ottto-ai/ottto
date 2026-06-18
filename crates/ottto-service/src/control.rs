@@ -63,7 +63,11 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
-const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+// Poll long enough for slow-arriving agent telemetry (codex batches + flushes
+// its token records, then the relay forwards them) to reach the backend before
+// we give up — claude/pi still return early on success. Kept under
+// SETUP_VERIFICATION_HTTP_TIMEOUT (120s).
+const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(110);
 const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: u64 = 15;
 const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
