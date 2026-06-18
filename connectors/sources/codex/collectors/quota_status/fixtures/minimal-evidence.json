@@ -12,6 +12,14 @@
         "status": "ok",
         "quota_window": "weekly",
         "remaining_ratio": 0.64,
+        "credit_balances": [
+          {
+            "name": "reset_bank",
+            "unit": "resets",
+            "remaining": 2,
+            "status": "ok"
+          }
+        ],
         "reset_at": "2026-05-21T00:00:00Z",
         "observed_at": "2026-05-20T08:03:00Z"
       }
@@ -29,7 +37,7 @@
   ],
   "upload_policy": {
     "uploads_raw_content": false,
-    "boundary": "Quota window metadata, reset timestamps, remaining ratios, and plan profile evidence only.",
+    "boundary": "Quota window metadata, reset timestamps, remaining ratios, reset-credit counts, and plan profile evidence only.",
     "redacts": [
       "prompt",
       "response",
