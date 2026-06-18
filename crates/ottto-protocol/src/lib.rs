@@ -1361,6 +1361,7 @@ pub enum AgentCreditBalanceUnit {
     Credits,
     Usd,
     Tokens,
+    Resets,
     #[default]
     Unknown,
 }

@@ -15,14 +15,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
@@ -210,14 +212,14 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         "credits",
         "Codex credit balance was not available from the local account probe.",
     );
-    match collect_codex_oauth_usage() {
+    match collect_codex_usage() {
         Ok(usage) => {
             if !usage.quota_windows.is_empty() {
                 snapshot.collection_method = AgentStatusCollectionMethod::AppServer;
                 snapshot.quota_windows = usage.quota_windows;
                 quota_capability = supported_capability(
                     "quota_windows",
-                    "Collected from the local Codex OAuth account usage endpoint.",
+                    "Collected from the local Codex app-server rate-limit endpoint.",
                 );
             } else {
                 snapshot.quota_windows = vec![unsupported_quota_window("usage")];
@@ -226,7 +228,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
                 snapshot.credit_balances = usage.credit_balances;
                 credits_capability = supported_capability(
                     "credits",
-                    "Collected from the local Codex OAuth account usage endpoint.",
+                    "Collected from the local Codex app-server rate-limit endpoint.",
                 );
             }
         }
@@ -268,6 +270,18 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
     append_codex_workspace_observations(&mut snapshot);
     snapshot.runtime_defaults = build_codex_runtime_defaults(&snapshot.captured_at);
     snapshot
+}
+
+fn collect_codex_usage() -> Result<CodexUsageProbe, String> {
+    match collect_codex_app_server_usage() {
+        Ok(usage) => Ok(usage),
+        Err(app_server_message) if legacy_codex_oauth_usage_enabled() => {
+            collect_codex_oauth_usage().map_err(|oauth_message| {
+                format!("{app_server_message} Legacy OAuth usage fallback failed: {oauth_message}")
+            })
+        }
+        Err(message) => Err(message),
+    }
 }
 
 /// Assemble display-safe Codex runtime defaults from `~/.codex/config.toml` for
@@ -943,6 +957,272 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
     })
 }
 
+fn collect_codex_app_server_usage() -> Result<CodexUsageProbe, String> {
+    let value = call_codex_app_server_rate_limits()?;
+    Ok(CodexUsageProbe {
+        quota_windows: codex_app_server_quota_windows(&value),
+        credit_balances: codex_app_server_credit_balances(&value),
+    })
+}
+
+fn call_codex_app_server_rate_limits() -> Result<Value, String> {
+    let Some(program_path) = crate::command_env::executable_path("codex") else {
+        return Err("Codex CLI was not found for app-server rate-limit collection.".to_string());
+    };
+    let mut command = Command::new(program_path);
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(path_env) = crate::command_env::path_env() {
+        command.env("PATH", path_env);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| "Codex app-server could not be started.".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Codex app-server stdout was unavailable.".to_string())?;
+    let (sender, receiver) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                let _ = sender.send(value);
+            }
+        }
+    });
+
+    let write_result = (|| -> Result<(), String> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Codex app-server stdin was unavailable.".to_string())?;
+        let initialize = serde_json::json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "ottto_local_platform",
+                    "title": "Ottto Local Platform",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "optOutNotificationMethods": ["account/rateLimits/updated"]
+                }
+            }
+        });
+        let initialized = serde_json::json!({"method": "initialized"});
+        let read = serde_json::json!({
+            "method": "account/rateLimits/read",
+            "id": "ottto_rate_limits"
+        });
+        for message in [initialize, initialized, read] {
+            serde_json::to_writer(&mut stdin, &message)
+                .map_err(|_| "Codex app-server request serialization failed.".to_string())?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|_| "Codex app-server request write failed.".to_string())?;
+        }
+        stdin
+            .flush()
+            .map_err(|_| "Codex app-server request flush failed.".to_string())?;
+        Ok(())
+    })();
+    if let Err(message) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(message);
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < CODEX_APP_SERVER_TIMEOUT {
+        let remaining = CODEX_APP_SERVER_TIMEOUT
+            .checked_sub(start.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(0));
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(message) => {
+                if message.get("id").and_then(Value::as_str) == Some("ottto_rate_limits") {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if message.get("error").is_some() {
+                        return Err("Codex app-server rate-limit read failed.".to_string());
+                    }
+                    return message.get("result").cloned().ok_or_else(|| {
+                        "Codex app-server rate-limit read returned no result.".to_string()
+                    });
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("Codex app-server rate-limit read timed out.".to_string())
+}
+
+fn codex_app_server_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
+    let Some(rate_limit) = codex_app_server_rate_limit_snapshot(value) else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    if let Some(primary) = rate_limit.get("primary") {
+        if let Some(window) = codex_app_server_quota_window("session", primary) {
+            windows.push(window);
+        }
+    }
+    if let Some(secondary) = rate_limit.get("secondary") {
+        if let Some(window) = codex_app_server_quota_window("weekly", secondary) {
+            windows.push(window);
+        }
+    }
+    windows
+}
+
+fn codex_app_server_rate_limit_snapshot(value: &Value) -> Option<&Value> {
+    let by_limit_id = value.get("rateLimitsByLimitId").and_then(Value::as_object);
+    by_limit_id
+        .and_then(|map| map.get("codex"))
+        .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
+        .or_else(|| {
+            value
+                .get("rateLimits")
+                .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
+        })
+        .or_else(|| {
+            by_limit_id.and_then(|map| {
+                map.values()
+                    .find(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
+            })
+        })
+}
+
+fn codex_rate_limit_snapshot_has_usage(value: &Value) -> bool {
+    value.get("primary").is_some()
+        || value.get("secondary").is_some()
+        || value.get("credits").is_some()
+}
+
+fn codex_app_server_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindow> {
+    let used_percent = json_u8(value, &["usedPercent", "used_percent"]);
+    let left_percent = used_percent.map(|used| 100_u8.saturating_sub(used));
+    let resets_at = json_timestamp_rfc3339(value, &["resetsAt", "resets_at"]);
+    let window_seconds = json_u64(value, &["windowDurationMins", "window_duration_mins"])
+        .map(|minutes| minutes.saturating_mul(60));
+    let started_at = resets_at
+        .as_deref()
+        .zip(window_seconds)
+        .and_then(|(reset, seconds)| rfc3339_minus_seconds(reset, seconds));
+    if used_percent.is_none() && resets_at.is_none() && window_seconds.is_none() {
+        return None;
+    }
+    Some(AgentQuotaWindow {
+        name: name.to_string(),
+        scope: AgentQuotaWindowScope::Account,
+        status: match left_percent {
+            Some(0) => AgentQuotaWindowStatus::Exhausted,
+            Some(value) if value <= 20 => AgentQuotaWindowStatus::NearLimit,
+            Some(_) => AgentQuotaWindowStatus::Ok,
+            None => AgentQuotaWindowStatus::Unknown,
+        },
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        model: None,
+        account_label: None,
+        window_seconds,
+        started_at,
+        resets_at,
+        quota: None,
+        remaining: None,
+        used_percent,
+        left_percent,
+    })
+}
+
+fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
+    let mut balances = Vec::new();
+    if let Some(rate_limit) = codex_app_server_rate_limit_snapshot(value) {
+        if let Some(credits) = rate_limit.get("credits") {
+            if let Some(balance) = codex_credit_balance_from_credits_snapshot(credits) {
+                balances.push(balance);
+            }
+        }
+    }
+    if let Some(reset_credits) = value.get("rateLimitResetCredits") {
+        if let Some(remaining) = json_u64(reset_credits, &["availableCount", "available_count"]) {
+            balances.push(AgentCreditBalance {
+                name: "reset_bank".to_string(),
+                status: if remaining == 0 {
+                    AgentCreditBalanceStatus::Exhausted
+                } else {
+                    AgentCreditBalanceStatus::Ok
+                },
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                unit: AgentCreditBalanceUnit::Resets,
+                account_label: None,
+                remaining: Some(remaining),
+                used: None,
+                quota: None,
+                unlimited: Some(false),
+                updated_at: None,
+            });
+        }
+    }
+    balances
+}
+
+fn codex_credit_balance_from_credits_snapshot(credits: &Value) -> Option<AgentCreditBalance> {
+    let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
+    let unlimited = json_bool(credits, &["unlimited"]);
+    let has_credits = json_bool(credits, &["hasCredits", "has_credits"]).unwrap_or(false);
+    if remaining.is_none() && unlimited.is_none() && !has_credits {
+        return None;
+    }
+    Some(AgentCreditBalance {
+        name: "credits".to_string(),
+        status: codex_credit_balance_status(remaining, unlimited, has_credits),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Credits,
+        account_label: None,
+        remaining,
+        used: None,
+        quota: None,
+        unlimited,
+        updated_at: None,
+    })
+}
+
+fn codex_credit_balance_status(
+    remaining: Option<u64>,
+    unlimited: Option<bool>,
+    has_credits: bool,
+) -> AgentCreditBalanceStatus {
+    if unlimited == Some(true) {
+        AgentCreditBalanceStatus::Unlimited
+    } else if remaining == Some(0) {
+        AgentCreditBalanceStatus::Exhausted
+    } else if remaining.is_some_and(|value| value > 0 && value <= 5) {
+        AgentCreditBalanceStatus::Low
+    } else if remaining.is_some() || has_credits {
+        AgentCreditBalanceStatus::Ok
+    } else {
+        AgentCreditBalanceStatus::Unknown
+    }
+}
+
+fn legacy_codex_oauth_usage_enabled() -> bool {
+    std::env::var("OTTTO_CODEX_LEGACY_OAUTH_USAGE")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn collect_codex_oauth_usage() -> Result<CodexUsageProbe, String> {
     let credentials = read_codex_auth_credentials()
         .ok_or_else(|| "Codex OAuth credentials were not found.".to_string())?;
@@ -1045,17 +1325,7 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     if remaining.is_none() && unlimited.is_none() && !has_credits {
         return Vec::new();
     }
-    let status = if unlimited == Some(true) {
-        AgentCreditBalanceStatus::Unlimited
-    } else if remaining == Some(0) {
-        AgentCreditBalanceStatus::Exhausted
-    } else if remaining.is_some_and(|value| value > 0 && value <= 5) {
-        AgentCreditBalanceStatus::Low
-    } else if remaining.is_some() || has_credits {
-        AgentCreditBalanceStatus::Ok
-    } else {
-        AgentCreditBalanceStatus::Unknown
-    };
+    let status = codex_credit_balance_status(remaining, unlimited, has_credits);
     vec![AgentCreditBalance {
         name: "credits".to_string(),
         status,
@@ -2977,6 +3247,102 @@ mod tests {
         assert_eq!(windows[1].name, "weekly");
         assert_eq!(windows[1].left_percent, Some(99));
         assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].remaining, Some(0));
+    }
+
+    #[test]
+    fn codex_app_server_parser_extracts_windows_and_reset_bank() {
+        let json = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex_bengalfox",
+                "primary": {
+                    "usedPercent": 9,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1779049800
+                },
+                "secondary": {
+                    "usedPercent": 37,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1779613200
+                },
+                "credits": {
+                    "hasCredits": true,
+                    "unlimited": false,
+                    "balance": "4"
+                },
+                "planType": "pro"
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "limitId": "codex_bengalfox",
+                    "primary": {"usedPercent": 9, "windowDurationMins": 300, "resetsAt": 1779049800}
+                },
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 3,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1779049800
+                    },
+                    "secondary": {
+                        "usedPercent": 5,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1779613200
+                    },
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": "12.4"
+                    },
+                    "planType": "pro"
+                }
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 2
+            }
+        });
+
+        let windows = codex_app_server_quota_windows(&json);
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].name, "session");
+        assert_eq!(windows[0].left_percent, Some(97));
+        assert_eq!(
+            windows[0].started_at.as_deref(),
+            Some("2026-05-17T15:30:00Z")
+        );
+        assert_eq!(windows[1].name, "weekly");
+        assert_eq!(windows[1].left_percent, Some(95));
+        assert_eq!(credits.len(), 2);
+        assert_eq!(credits[0].name, "credits");
+        assert_eq!(credits[0].remaining, Some(12));
+        assert_eq!(credits[1].name, "reset_bank");
+        assert_eq!(credits[1].unit, AgentCreditBalanceUnit::Resets);
+        assert_eq!(credits[1].status, AgentCreditBalanceStatus::Ok);
+        assert_eq!(credits[1].remaining, Some(2));
+    }
+
+    #[test]
+    fn codex_app_server_parser_preserves_zero_reset_bank_count() {
+        let json = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": null,
+                "secondary": null,
+                "credits": null
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 0
+            }
+        });
+
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].name, "reset_bank");
+        assert_eq!(credits[0].unit, AgentCreditBalanceUnit::Resets);
         assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
         assert_eq!(credits[0].remaining, Some(0));
     }
