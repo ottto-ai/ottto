@@ -553,9 +553,10 @@ mod tests {
 
     #[test]
     fn file_control_token_store_round_trips_with_user_only_permissions() {
-        let path =
+        let dir =
             std::env::temp_dir().join(format!("ottto-control-token-test-{}", std::process::id()));
-        let _ = fs::remove_file(&path);
+        let path = dir.join(CONTROL_TOKEN_FILE_NAME);
+        let _ = fs::remove_dir_all(&dir);
         let store = FileControlTokenStore::new(&path);
 
         assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
@@ -571,6 +572,7 @@ mod tests {
 
         store.delete().expect("delete token");
         assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -622,11 +624,12 @@ mod tests {
     fn overwriting_existing_secret_file_keeps_user_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "ottto-control-token-overwrite-{}",
             std::process::id()
         ));
-        let _ = fs::remove_file(&path);
+        let path = dir.join(CONTROL_TOKEN_FILE_NAME);
+        let _ = fs::remove_dir_all(&dir);
         let store = FileControlTokenStore::new(&path);
 
         store.save("first_value").expect("save first");
@@ -635,7 +638,7 @@ mod tests {
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
