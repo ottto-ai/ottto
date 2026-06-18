@@ -2703,6 +2703,7 @@ fn setup_run(
         "detected_sources": detected_sources,
         "next_question": detail.next_question,
         "next_action": detail.next_action,
+        "setup_claim_url": detail.setup_claim_url,
         "actions": action_results,
     }))
 }
@@ -2859,6 +2860,12 @@ struct SetupRunDetailApiResponse {
     sources: Vec<SetupRunSourceApiResponse>,
     next_action: Option<SetupRunActionApiResponse>,
     next_question: Option<serde_json::Value>,
+    // Web claim URL the app opens when a setup run waits on browser approval
+    // (e.g. a verify_source that found no fresh telemetry transitions to
+    // waiting_for_user). Surfaced to the Swift app so it can open the re-claim
+    // tab instead of leaving the user stuck on "waiting for approval".
+    #[serde(default)]
+    setup_claim_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2968,6 +2975,7 @@ fn setup_result_from_detail(
         "detected_sources": detected_sources,
         "next_question": detail.next_question,
         "next_action": detail.next_action,
+        "setup_claim_url": detail.setup_claim_url,
         "actions": action_results,
     }))
 }
