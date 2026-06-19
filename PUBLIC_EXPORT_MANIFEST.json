@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "a05a615030526070f151c07be81e3994b77715f0664cd5712aaf075ecc9c6ad4",
+  "content_sha256": "764888a0b2a1362aca7c30bcd37c5c9ee2b7ccb83884f1dc07f0f0746bf33396",
   "files": [
     {
       "executable": false,
@@ -13,8 +13,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "ead1e4d1b8f4461d0786f3942485d3989bf4ed2fefe30783dc84cef3749610b5",
-      "size_bytes": 3091
+      "sha256": "b45c36dbd71d2db26a8131005a9f3b956c838b149fb264bc3c08e05767566e27",
+      "size_bytes": 3149
     },
     {
       "executable": false,
@@ -440,8 +440,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/local_client.rs",
-      "sha256": "e0f97ab614012270bddf29127f0d169bf8083b1f8037ab87c29d232f50b64474",
-      "size_bytes": 4508
+      "sha256": "111891244a924a14a6347a52143d422935a606725f65b7ad2c29451ee39898b5",
+      "size_bytes": 4669
     },
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "c5c9e2129e68e72d99329a3103beb4bb9acbf89c0e9246b6b9af63514eada077",
-      "size_bytes": 136701
+      "sha256": "4581ab8c8d3e117917ed969812337a734653133cd187e72fa56371d3e5b73dae",
+      "size_bytes": 140997
     },
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "8305d426a44254f2d25aa415b3edc26566eecc3030a233e7596adfb091e007af",
-      "size_bytes": 509504
+      "sha256": "55d6780c6c62ae84bbba093b343f36e6b7f9246d15e5c54ca9b33f7c2011dade",
+      "size_bytes": 510327
     },
     {
       "executable": false,
@@ -1333,7 +1333,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-18T23:10:35+00:00",
+  "generated_at": "2026-06-19T09:31:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "094af7a27fd8335c9f2b012049896383e383f740"
+  "source_commit": "b442d77254a5f1c41ebf2f685ee37f87bdd58d9e"
 }
