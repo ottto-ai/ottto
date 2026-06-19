@@ -149,20 +149,31 @@ unregister_duplicate_companion_apps() {
   local candidate_path
   local bundle_id
 
-  if ! command -v mdfind >/dev/null 2>&1 || ! command -v plutil >/dev/null 2>&1; then
-    return 0
-  fi
-
   target_path="$(canonical_app_path "$app_target")"
-  while IFS= read -r candidate; do
+  {
+    if command -v mdfind >/dev/null 2>&1; then
+      mdfind 'kMDItemCFBundleIdentifier == "net.ottto.Companion"' 2>/dev/null || true
+    fi
+    "$lsregister" -dump 2>/dev/null | awk '
+      /^path:[[:space:]]/ {
+        path = $0
+        sub(/^path:[[:space:]]+/, "", path)
+        sub(/[[:space:]]+\(0x[0-9a-fA-F]+\).*$/, "", path)
+      }
+      /^identifier:[[:space:]]+net[.]ottto[.]Companion$/ && path != "" {
+        print path
+      }
+    ' || true
+  } | sort -u | while IFS= read -r candidate; do
     [[ -n "$candidate" && -d "$candidate" ]] || continue
-    [[ -f "$candidate/Contents/Info.plist" ]] || continue
     candidate_path="$(canonical_app_path "$candidate")"
     [[ "$candidate_path" != "$target_path" ]] || continue
-    bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$candidate/Contents/Info.plist" 2>/dev/null || true)"
-    [[ "$bundle_id" == "net.ottto.Companion" ]] || continue
+    if command -v plutil >/dev/null 2>&1 && [[ -f "$candidate/Contents/Info.plist" ]]; then
+      bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$candidate/Contents/Info.plist" 2>/dev/null || true)"
+      [[ "$bundle_id" == "net.ottto.Companion" ]] || continue
+    fi
     "$lsregister" -u "$candidate" >/dev/null 2>&1 || true
-  done < <(mdfind 'kMDItemCFBundleIdentifier == "net.ottto.Companion"' 2>/dev/null || true)
+  done
 }
 
 register_installed_app() {
