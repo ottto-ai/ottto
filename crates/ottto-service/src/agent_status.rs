@@ -194,15 +194,11 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
 
     let models = run_command_capture("codex", &["debug", "models", "--bundled"], COMMAND_TIMEOUT);
     let mut model_status = collect_model_status_from_output(&models, "openai");
-    if model_status.available_models.is_empty() {
-        if let Some(config_model) = read_codex_config_model() {
-            if snapshot.collection_method == AgentStatusCollectionMethod::CommandProbe {
-                snapshot.collection_method = AgentStatusCollectionMethod::ConfigFile;
-            }
-            model_status.default_model = Some(config_model.clone());
-            model_status.active_model = Some(config_model);
-        }
-    }
+    apply_codex_config_model(
+        &mut model_status,
+        read_codex_config_model(),
+        &mut snapshot.collection_method,
+    );
     snapshot.model = Some(model_status);
     let mut quota_capability = unsupported_capability(
         "quota_windows",
@@ -1779,6 +1775,44 @@ pub(crate) fn read_pi_smoke_routes() -> Vec<PiModelRoute> {
     Vec::new()
 }
 
+fn apply_codex_config_model(
+    model_status: &mut AgentModelStatus,
+    config_model: Option<String>,
+    collection_method: &mut AgentStatusCollectionMethod,
+) {
+    let Some(config_model) = config_model else {
+        return;
+    };
+    let config_model = config_model.trim();
+    if config_model.is_empty() {
+        return;
+    }
+    let config_model = config_model.to_string();
+    let only_config_available = model_status.available_models.is_empty();
+    model_status.active_model = Some(config_model.clone());
+    model_status.default_model = Some(config_model.clone());
+    if !model_status
+        .available_models
+        .iter()
+        .any(|model| model == &config_model)
+    {
+        let mut available_models = Vec::with_capacity(model_status.available_models.len() + 1);
+        available_models.push(config_model.clone());
+        available_models.extend(
+            model_status
+                .available_models
+                .iter()
+                .filter(|model| model.trim() != config_model.as_str())
+                .take(MAX_AVAILABLE_MODELS.saturating_sub(1))
+                .cloned(),
+        );
+        model_status.available_models = available_models;
+    }
+    if only_config_available && *collection_method == AgentStatusCollectionMethod::CommandProbe {
+        *collection_method = AgentStatusCollectionMethod::ConfigFile;
+    }
+}
+
 fn collect_pi_model_status(
     settings: Option<&Value>,
     list_models: Option<&CommandOutput>,
@@ -2403,6 +2437,9 @@ fn looks_like_model_name(value: &str) -> bool {
     if value.len() < 2 || value.len() > 128 || value.contains('/') || value.contains('\\') {
         return false;
     }
+    if is_codex_automatic_review_model_label(value) {
+        return false;
+    }
     let lower = value.to_ascii_lowercase();
     lower.contains("gpt")
         || lower.contains("claude")
@@ -2411,6 +2448,18 @@ fn looks_like_model_name(value: &str) -> bool {
         || lower.contains("o4")
         || lower.contains("o5")
         || lower.contains("model")
+}
+
+fn is_codex_automatic_review_model_label(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let tokens = lower
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    tokens.contains(&"automatic")
+        && tokens.contains(&"approval")
+        && tokens.contains(&"review")
+        && tokens.contains(&"codex")
 }
 
 fn looks_like_safe_model_id(value: &str) -> bool {
@@ -3206,6 +3255,67 @@ for line in sys.stdin:
             snapshot.context.and_then(|context| context.used_percent),
             Some(72)
         );
+    }
+
+    #[test]
+    fn codex_model_parser_drops_automatic_review_prose() {
+        let output = CommandOutput {
+            command_found: true,
+            success: true,
+            status_code: Some(0),
+            stdout: serde_json::json!({
+                "models": [
+                    {"name": "Automatic approval review model for Codex."},
+                    {"id": "gpt-5.4-codex"}
+                ]
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let status = collect_model_status_from_output(&output, "openai");
+
+        assert_eq!(status.active_model.as_deref(), Some("gpt-5.4-codex"));
+        assert!(!status
+            .available_models
+            .iter()
+            .any(|model| model.contains("approval review")));
+    }
+
+    #[test]
+    fn codex_config_model_overrides_bundled_debug_model_summary() {
+        let output = CommandOutput {
+            command_found: true,
+            success: true,
+            status_code: Some(0),
+            stdout: serde_json::json!({
+                "models": [
+                    {"id": "gpt-5.4-codex"}
+                ]
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let mut status = collect_model_status_from_output(&output, "openai");
+        let mut collection_method = AgentStatusCollectionMethod::CommandProbe;
+
+        apply_codex_config_model(
+            &mut status,
+            Some("gpt-5.5".to_string()),
+            &mut collection_method,
+        );
+
+        assert_eq!(status.active_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(status.default_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            status.available_models.first().map(String::as_str),
+            Some("gpt-5.5")
+        );
+        assert!(status
+            .available_models
+            .iter()
+            .any(|model| model == "gpt-5.4-codex"));
+        assert_eq!(collection_method, AgentStatusCollectionMethod::CommandProbe);
     }
 
     #[test]
