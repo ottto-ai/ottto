@@ -176,6 +176,30 @@ unregister_duplicate_companion_apps() {
   done
 }
 
+detach_duplicate_companion_volumes() {
+  local app_target="$1"
+  local target_path
+  local candidate
+  local candidate_path
+  local bundle_id
+  local volume
+
+  if ! command -v hdiutil >/dev/null 2>&1 || ! command -v plutil >/dev/null 2>&1; then
+    return 0
+  fi
+
+  target_path="$(canonical_app_path "$app_target")"
+  for candidate in /Volumes/*/Ottto.app; do
+    [[ -d "$candidate" && -f "$candidate/Contents/Info.plist" ]] || continue
+    candidate_path="$(canonical_app_path "$candidate")"
+    [[ "$candidate_path" != "$target_path" ]] || continue
+    bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$candidate/Contents/Info.plist" 2>/dev/null || true)"
+    [[ "$bundle_id" == "net.ottto.Companion" ]] || continue
+    volume="$(dirname "$candidate")"
+    hdiutil detach "$volume" >/dev/null 2>&1 || hdiutil detach -force "$volume" >/dev/null 2>&1 || true
+  done
+}
+
 register_installed_app() {
   local app_target="$1"
   local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
@@ -185,6 +209,7 @@ register_installed_app() {
     return 0
   fi
 
+  detach_duplicate_companion_volumes "$app_target"
   unregister_duplicate_companion_apps "$app_target" "$lsregister"
   if ! "$lsregister" -f "$app_target" >/dev/null 2>&1; then
     echo "Warning: failed to register $app_target with LaunchServices; ottto:// links may require opening the app once." >&2
