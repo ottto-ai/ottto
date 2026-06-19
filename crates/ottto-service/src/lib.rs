@@ -2733,14 +2733,24 @@ fn has_verification_failure_problem(health: &SourceHealth) -> bool {
         .any(|problem| problem.code == StableProblemCode::TelemetryNotVerified)
 }
 
+fn has_soft_no_fresh_telemetry_problem(health: &SourceHealth) -> bool {
+    health.state == SourceState::NeedsConfirmation
+        && health.grade == HealthGrade::Warning
+        && health.problems.iter().any(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && problem.title == "No recent telemetry found"
+        })
+}
+
 fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
     let preserve_config_drift =
         refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
     if preserve_config_drift {
         refreshed.config.drift = existing.config.drift.clone();
     }
-    let preserve_failed_verification =
-        existing.last_verified_at.is_some() && has_verification_failure_problem(existing);
+    let preserve_failed_verification = existing.last_verified_at.is_some()
+        && has_verification_failure_problem(existing)
+        && !has_soft_no_fresh_telemetry_problem(existing);
     if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
     {
         refreshed.state = existing.state.clone();
@@ -4188,7 +4198,7 @@ mod tests {
     }
 
     #[test]
-    fn available_agent_status_preserves_no_fresh_telemetry_verification() {
+    fn available_agent_status_clears_no_fresh_telemetry_verification() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
             source: SourceKind::Codex,
@@ -4230,15 +4240,10 @@ mod tests {
         }
 
         let status = daemon.status(TOKEN).expect("status after scan");
-        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some(attempt_at.as_str())
-        );
-        assert_eq!(
-            status.sources[0].problems[0].code,
-            StableProblemCode::TelemetryNotVerified
-        );
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].problems.is_empty());
         let source = status
             .canonical_health
             .expect("canonical health")
@@ -4246,9 +4251,16 @@ mod tests {
             .into_iter()
             .find(|source| source.app == SourceKind::Codex)
             .expect("Codex source");
-        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
-        assert_eq!(source.authority, LocalHealthAuthority::Verify);
-        assert_eq!(source.authority_at, attempt_at);
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert_eq!(source.authority_at, "2026-05-05T10:40:00Z");
+        assert!(
+            status
+                .command_ledger
+                .iter()
+                .any(|entry| entry.observed_at == attempt_at),
+            "the soft verify attempt remains in the ledger for support triage"
+        );
     }
 
     #[test]
