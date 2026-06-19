@@ -175,7 +175,7 @@ candidate manifest download, artifact checksums, hosted candidate installer,
 app launch, service readiness, `status --json`, browser-claim setup, Codex
 verification, diagnostics redaction, update check, rollback notes, and static
 stable formula and hosted-installer review. The evidence must also bind the
-exercised local runtime to `ottto-service`, `net.ottto.service`, protocol v13,
+exercised local runtime to `ottto-service`, `net.ottto.service`, protocol v15,
 the stable-candidate version/channel, and candidate release-manifest SHA-256.
 Stable preflight refuses a stable manifest unless
 `quality_gates.stable_candidate_rc` points at passing evidence from a
@@ -389,7 +389,7 @@ AWS/CDN prerequisites before publish:
 4. Confirm the manifest marks every artifact `signed=true`, `notarized=true`,
    and `gatekeeper_assessed=true`.
 5. Confirm the manifest includes `min_supported_version`,
-   `min_protocol_version: 13`, non-empty `supported_install_owners`, and
+   `min_protocol_version: 15`, non-empty `supported_install_owners`, and
    rollback metadata for the immutable versioned prefix plus channel latest
    pointer.
 6. Confirm `ottto-local-platform-sbom.cdx.json` exists, matches the manifest
@@ -474,7 +474,7 @@ stable_clean_machine_qa`, `status: passed`, match the exact manifest
 `product`, `channel`, `version`, `commit`, and SHA-256, declare
 `environment.host_kind: clean_macos`, and include one passing entry for each
 supported install owner. Each owner entry must bind the installed local runtime
-to `ottto-service`, `net.ottto.service`, protocol v13, the exact stable
+to `ottto-service`, `net.ottto.service`, protocol v15, the exact stable
 version/channel, that install owner, and the release-manifest SHA-256. The gate
 rejects extra required install owners, unknown per-owner check names, private
 repo paths, local user paths, claim codes, setup-run tokens, account IDs,
