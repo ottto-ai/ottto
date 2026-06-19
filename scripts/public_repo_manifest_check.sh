@@ -50,6 +50,7 @@ import hashlib
 import json
 import re
 import stat
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -84,22 +85,59 @@ def validate_relative_path(raw: object, *, context: str) -> str:
     return path.as_posix()
 
 
-def collect_actual_records(root: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    entries = sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())
-    for path in entries:
+def git_inventory(root: Path) -> list[Path] | None:
+    git_dir = root / ".git"
+    if not git_dir.exists():
+        return None
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        die(f"git inventory failed: {proc.stderr.decode('utf-8', errors='replace').strip()}")
+    paths: list[Path] = []
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        rel = raw.decode("utf-8")
+        if rel == "PUBLIC_EXPORT_MANIFEST.json":
+            continue
+        validate_relative_path(rel, context="actual file")
+        paths.append(root / rel)
+    return sorted(paths, key=lambda item: item.relative_to(root).as_posix())
+
+
+def filesystem_inventory(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         relative = path.relative_to(root)
         parts = relative.parts
         if parts and parts[0] == ".git":
             continue
+        if not path.is_file():
+            continue
+        rel = relative.as_posix()
+        if rel == "PUBLIC_EXPORT_MANIFEST.json":
+            continue
+        validate_relative_path(rel, context="actual file")
+        paths.append(path)
+    return paths
+
+
+def collect_actual_records(root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    entries = git_inventory(root)
+    if entries is None:
+        entries = filesystem_inventory(root)
+    for path in entries:
+        relative = path.relative_to(root)
         rel = relative.as_posix()
         if path.is_symlink():
             die(f"public manifest does not support symlinked files: {rel}")
         if not path.is_file():
             continue
-        if rel == "PUBLIC_EXPORT_MANIFEST.json":
-            continue
-        validate_relative_path(rel, context="actual file")
         mode = stat.S_IMODE(path.stat().st_mode)
         records.append(
             {

@@ -118,6 +118,36 @@ if "$SCRIPT" --staged-output "$bad_digest" >/tmp/public-manifest-digest.out 2>&1
 fi
 grep -q "manifest content_sha256 mismatch" /tmp/public-manifest-digest.out
 
+git_checkout="$tmp_dir/git-checkout"
+mkdir -p "$git_checkout/scripts"
+cat > "$git_checkout/.gitignore" <<'EOF'
+target/
+EOF
+cat > "$git_checkout/README.md" <<'EOF'
+# Public Manifest Fixture
+EOF
+cat > "$git_checkout/scripts/tool.sh" <<'EOF'
+#!/usr/bin/env bash
+echo ok
+EOF
+chmod +x "$git_checkout/scripts/tool.sh"
+write_manifest "$git_checkout"
+git -C "$git_checkout" init -q
+git -C "$git_checkout" config user.email "test@example.com"
+git -C "$git_checkout" config user.name "Test"
+git -C "$git_checkout" add .
+git -C "$git_checkout" commit -qm init
+mkdir -p "$git_checkout/target"
+printf 'ignored build output\n' > "$git_checkout/target/noise.txt"
+PUBLIC_MANIFEST_REPO_ROOT="$git_checkout" "$SCRIPT" >/tmp/public-manifest-git-ignored.out
+grep -q "checked 3 file hash record" /tmp/public-manifest-git-ignored.out
+printf 'unignored extra\n' > "$git_checkout/extra.txt"
+if PUBLIC_MANIFEST_REPO_ROOT="$git_checkout" "$SCRIPT" >/tmp/public-manifest-git-extra.out 2>&1; then
+  echo "Expected untracked non-ignored file to fail manifest check" >&2
+  exit 1
+fi
+grep -q "manifest output_file_count does not match actual files" /tmp/public-manifest-git-extra.out
+
 real_output="$tmp_dir/real-output"
 "$BUNDLE_SCRIPT" --output-dir "$real_output" --force >/tmp/public-manifest-real-bundle.out
 "$real_output/scripts/public_repo_manifest_check.sh" --staged-output "$real_output" >/tmp/public-manifest-real.out

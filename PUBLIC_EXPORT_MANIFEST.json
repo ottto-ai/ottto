@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "58c1bdd5445ddad9d4887c008aaf34a817b0cf7fba2234dc7b61a1ba26f60efe",
+  "content_sha256": "8586f6a39b5af95dd051ae6bbbf1145cde607050d4140e09753a0eecab3ca62a",
   "files": [
     {
       "executable": false,
@@ -1133,29 +1133,29 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_manifest_check.sh",
-      "sha256": "b338fc204879df00fb7811197812482b6229c5b924e93ba3ba0cd46fb6317d56",
-      "size_bytes": 8738
+      "sha256": "8e80ee6a5f33201af90a95dc32ea8f70bcd1edd51effab56d489c32ca5654521",
+      "size_bytes": 9967
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_secret_scan.sh",
-      "sha256": "bab5ec086cc89ab82266aad5c4fa33d47b16fde0f93426c1a09b1e416035f05e",
-      "size_bytes": 10837
+      "sha256": "4306a8700e21b075162a398223be790189088d872a0062b3b225eacb5c579642",
+      "size_bytes": 11108
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_skeleton_check.sh",
-      "sha256": "99db07fdf56d727911b453b178595afaebbad94f62cd28c3b45fc23969c2badc",
-      "size_bytes": 8525
+      "sha256": "f5253b9b4fb96d16581a5c8985e55715eff3105e417c8f43d46986a71cfee5b1",
+      "size_bytes": 8765
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "0e94136bae9550310235a2a99511bdbb16bc1b54f8b2d20172f0c68654dbabb1",
-      "size_bytes": 7139
+      "sha256": "74a323d92f1d5fc130324f6898734543b7582bd42c9f9dfc631b27d376f6b8f0",
+      "size_bytes": 7199
     },
     {
       "executable": true,
@@ -1308,32 +1308,32 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_manifest_check.sh",
-      "sha256": "43e3679518cff91f0055ac8772e6f6c337f3fb783c9806da78bb41441fdbb3c1",
-      "size_bytes": 3962
+      "sha256": "c0725e1ee282647457b2768984bad2faac0e00c1bc8c2e5b613c87a555b38d19",
+      "size_bytes": 5116
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_secret_scan.sh",
-      "sha256": "1c6aa49435e92b0e99e325e0b8425e29a47b28d2dcf8a246332861d941d0e024",
-      "size_bytes": 3572
+      "sha256": "56c6aef27b89d0b386931e3e149a512fc68eaeec63ecc00cfb7214f421b4de29",
+      "size_bytes": 4518
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_skeleton_check.sh",
-      "sha256": "240d635d1a843afb1f96930c5666e8beacadf5157fdb2df8d8c3894c4ece1372",
-      "size_bytes": 1478
+      "sha256": "f0249c063a9cf3ced73203dce6eeadd12cd288c438c43750e01f7b0f639b84f2",
+      "size_bytes": 2412
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_surface_ci.sh",
-      "sha256": "3c6d6d416a1e77c9d0be78966cc30f641cb1eb1ca8f2f41c7f3c5d2f3ac96403",
-      "size_bytes": 1374
+      "sha256": "f67eaeee2bfcd1edd458e36754cf24fdf799d0f1c76d5450acddd45436d97921",
+      "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-19T17:04:51+00:00",
+  "generated_at": "2026-06-19T17:24:57+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d21fb22429ff911b8f917c9aed1de7405cbf56d8"
+  "source_commit": "a292dba8998eeaea1feaa51f114a49ada929b10f"
 }

@@ -187,7 +187,8 @@ run_step "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
 run_step "generate self-exported public bundle" bash scripts/public_repo_export_bundle.sh --force
 run_step "verify self-exported manifest" \
   bash scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto
-run_step "verify public skeleton" bash scripts/public_repo_skeleton_check.sh
+run_step "verify public skeleton" \
+  bash -c 'PUBLIC_SKELETON_REPO_ROOT=dist/public-export/ottto scripts/public_repo_skeleton_check.sh'
 run_step "scan self-exported public bundle" \
   bash scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto
 run_step "verify self-exported public contracts" \

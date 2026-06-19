@@ -13,6 +13,7 @@ real_output="$tmp_dir/real-output"
 "$real_output/scripts/public_repo_surface_ci.sh" --staged-output "$real_output" >/tmp/public-surface-ci.out
 grep -q "completed public surface checks" /tmp/public-surface-ci.out
 grep -q "generate self-exported public bundle" /tmp/public-surface-ci.out
+grep -q "PUBLIC_SKELETON_REPO_ROOT=dist/public-export/ottto" "$real_output/scripts/public_repo_surface_ci.sh"
 grep -q "verify self-exported public contracts" /tmp/public-surface-ci.out
 grep -q "test stable preflight gate" /tmp/public-surface-ci.out
 grep -q "test stable closeout gate" /tmp/public-surface-ci.out

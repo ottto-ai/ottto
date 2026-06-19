@@ -25,11 +25,12 @@ Scans the public export candidate set for private paths and secret-like content
 before public repo bootstrap. The scan covers:
 
 - current tracked export candidates
-- historical blobs for paths that ever lived under export roots
+- historical blobs for paths that lived under export roots on the current branch
 - optional root-shaped staged bundle output
 
 Override PUBLIC_EXPORT_REPO_ROOT or PUBLIC_EXPORT_*_FILE environment variables
-for tests.
+for tests. Set PUBLIC_SECRET_SCAN_ALL_REFS=1 for a whole-local-repository audit
+that intentionally scans every local ref.
 USAGE
 }
 
@@ -68,6 +69,8 @@ roots_file = Path(sys.argv[2]).resolve()
 deny_patterns_file = Path(sys.argv[3]).resolve()
 staged_output_arg = sys.argv[4]
 staged_output_dir = Path(staged_output_arg).resolve() if staged_output_arg else None
+scan_all_refs = os.environ.get("PUBLIC_SECRET_SCAN_ALL_REFS") == "1"
+history_ref_args = ["--all"] if scan_all_refs else []
 
 
 def die(message: str, code: int = 2) -> None:
@@ -142,7 +145,7 @@ def tracked_candidates() -> list[str]:
 def historical_paths(current_candidates: list[str]) -> list[str]:
     paths: set[str] = set(current_candidates)
     for root_entry in config_lines(roots_file):
-        paths.update(git_lines("log", "--all", "--name-only", "--format=", "--", root_entry))
+        paths.update(git_lines("log", *history_ref_args, "--name-only", "--format=", "--", root_entry))
     return sorted(path for path in paths if path)
 
 
@@ -232,7 +235,7 @@ def scan_history(paths: list[str], denies: list[tuple[str, re.Pattern[str], str,
     for path in paths:
         if is_self_check_fixture(path):
             continue
-        commits = git_lines("log", "--all", "--format=%H", "--", path, check=False)
+        commits = git_lines("log", *history_ref_args, "--format=%H", "--", path, check=False)
         for commit in commits:
             if not blob_exists(commit, path):
                 continue
