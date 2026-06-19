@@ -13,6 +13,12 @@ if ! grep -Fq "macos_dev_install.sh is for dev/preview/stable-candidate builds" 
   exit 1
 fi
 
+if ! grep -Fq "LaunchServices registration helper" "$ROOT/scripts/macos_dev_install.sh" || \
+  ! grep -Fq "register_installed_app \"\$app_target\"" "$ROOT/scripts/macos_dev_install.sh"; then
+  echo "Local macOS installer must register installed Ottto.app for ottto:// handoff" >&2
+  exit 1
+fi
+
 if grep -Fq "This installer only accepts dev/preview manifests" "$ROOT/scripts/macos_package.sh"; then
   echo "Generated hosted installer still has stale dev/preview-only text" >&2
   exit 1
