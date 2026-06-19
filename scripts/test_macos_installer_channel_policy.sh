@@ -15,6 +15,8 @@ fi
 
 if ! grep -Fq "LaunchServices registration helper" "$ROOT/scripts/macos_dev_install.sh" || \
   ! grep -Fq "register_installed_app \"\$app_target\"" "$ROOT/scripts/macos_dev_install.sh" || \
+  ! grep -Fq "detach_duplicate_companion_volumes \"\$app_target\"" "$ROOT/scripts/macos_dev_install.sh" || \
+  ! grep -Fq "hdiutil detach \"\$volume\"" "$ROOT/scripts/macos_dev_install.sh" || \
   ! grep -Fq "unregister_duplicate_companion_apps \"\$app_target\" \"\$lsregister\"" "$ROOT/scripts/macos_dev_install.sh" || \
   ! grep -Fq "\"\$lsregister\" -dump" "$ROOT/scripts/macos_dev_install.sh" || \
   ! grep -Fq "\"\$lsregister\" -u \"\$candidate\"" "$ROOT/scripts/macos_dev_install.sh"; then
