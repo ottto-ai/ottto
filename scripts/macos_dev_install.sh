@@ -128,6 +128,20 @@ cleanup_legacy_service() {
   rm -f "$legacy_target" "$legacy_plist"
 }
 
+register_installed_app() {
+  local app_target="$1"
+  local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+  if [[ ! -x "$lsregister" ]]; then
+    echo "Warning: LaunchServices registration helper was not found; ottto:// links may require opening $app_target once." >&2
+    return 0
+  fi
+
+  if ! "$lsregister" -f "$app_target" >/dev/null 2>&1; then
+    echo "Warning: failed to register $app_target with LaunchServices; ottto:// links may require opening the app once." >&2
+  fi
+}
+
 copy_app_artifact() {
   local app_artifact="$1"
   local app_target="$2"
@@ -228,6 +242,8 @@ install -m 0755 "$tmp_dir/daemon/ottto-service" "$daemon_target"
 if [[ "$CLEAR_QUARANTINE" == "true" ]] && command -v xattr >/dev/null 2>&1; then
   xattr -dr com.apple.quarantine "$app_target" "$cli_target" "$daemon_target" 2>/dev/null || true
 fi
+
+register_installed_app "$app_target"
 
 if [[ "$WRITE_LAUNCH_AGENT" == "true" ]]; then
   if [[ "$BOOTSTRAP_LAUNCH_AGENT" == "true" ]]; then
