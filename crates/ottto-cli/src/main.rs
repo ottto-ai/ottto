@@ -2,9 +2,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
-    local_lifecycle_home_dir, request_unix_socket_with_timeout, UninstallExecutionOptions,
-    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT, OTTTO_SERVICE_BINARY_NAME,
-    OTTTO_SOCKET_ENV,
+    load_or_create_control_token, local_lifecycle_home_dir, request_unix_socket_with_timeout,
+    UninstallExecutionOptions, LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     AgentContextQuery, AgentCostsQuery, AgentProviderImpactQuery, AgentRecommendationsQuery,
@@ -1555,9 +1555,7 @@ fn print_error(error: CliError, output_mode: OutputMode, request_id: Option<&str
 fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
     let socket_overridden = cli.socket.is_some();
     let env_socket_present = std::env::var_os(OTTTO_SOCKET_ENV).is_some();
-    let token = cli.token.unwrap_or_else(|| {
-        client_control_token().unwrap_or_else(|_| "local-development-control-token".to_string())
-    });
+    let token = cli.token.unwrap_or_else(default_cli_control_token);
     let socket = cli.socket.unwrap_or_else(default_socket_path);
     Invocation {
         socket,
@@ -1575,6 +1573,15 @@ fn build_invocation(cli: Cli, output_mode: OutputMode) -> Invocation {
         },
         output_mode,
         auto_start: should_auto_start(socket_overridden, cli.no_autostart, env_socket_present),
+    }
+}
+
+fn default_cli_control_token() -> String {
+    match client_control_token() {
+        Ok(token) => token,
+        Err(_) if !cfg!(debug_assertions) => load_or_create_control_token()
+            .unwrap_or_else(|_| "local-development-control-token".to_string()),
+        Err(_) => "local-development-control-token".to_string(),
     }
 }
 

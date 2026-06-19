@@ -349,7 +349,6 @@ fn service_bootstrap_commands(
     }
     commands.push(plan.enable_command.clone());
     commands.push(plan.bootstrap_command.clone());
-    commands.push(plan.kickstart_command.clone());
     commands
 }
 
@@ -539,7 +538,7 @@ mod tests {
 
         assert_eq!(commands[0], plan.enable_command);
         assert_eq!(commands[1], plan.bootstrap_command);
-        assert_eq!(commands[2], plan.kickstart_command);
+        assert_eq!(commands.len(), 2);
     }
 
     #[test]
@@ -564,7 +563,6 @@ mod tests {
                 ],
                 plan.enable_command,
                 plan.bootstrap_command,
-                plan.kickstart_command,
             ],
         );
     }
