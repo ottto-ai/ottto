@@ -463,9 +463,11 @@ fn sync_source(
     ) {
         Ok(scan_result) => scan_result,
         Err(error) => {
-            let _ = report_status(
+            let _ = report_status_with_fresh_relay_token(
                 client,
-                &relay_token,
+                device,
+                device_secret,
+                source,
                 CollectorStatus {
                     source,
                     machine_id,
@@ -515,6 +517,11 @@ fn sync_source(
     let mut accepted = 0;
 
     for chunk in scan_result.snapshots.chunks(SNAPSHOT_BATCH_LIMIT) {
+        // A first Codex/Claude scan can spend several minutes parsing local
+        // history and retroactive backfill before the first upload. Relay
+        // tokens are intentionally short-lived, so mint them at the network
+        // boundary instead of reusing the pre-scan activity-hint token.
+        let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: source.api_slug().to_string(),
@@ -522,7 +529,7 @@ fn sync_source(
             collector_version: Some(COLLECTOR_VERSION.to_string()),
             snapshots: chunk.to_vec(),
         };
-        let response = match client.upload_batch(&relay_token, &request) {
+        let response = match client.upload_batch(&upload_relay_token, &request) {
             Ok(response) => response,
             Err(error) => {
                 // Distinguish authorization failures from backend payload
@@ -572,9 +579,11 @@ fn sync_source(
                         "upload local snapshots",
                     )
                 };
-                let _ = report_status(
+                let _ = report_status_with_fresh_relay_token(
                     client,
-                    &relay_token,
+                    device,
+                    device_secret,
+                    source,
                     CollectorStatus {
                         source,
                         machine_id,
@@ -587,9 +596,11 @@ fn sync_source(
             }
         };
         if response.disabled {
-            report_status(
+            report_status_with_fresh_relay_token(
                 client,
-                &relay_token,
+                device,
+                device_secret,
+                source,
                 CollectorStatus {
                     source,
                     machine_id,
@@ -636,9 +647,11 @@ fn sync_source(
         }
     }
 
-    report_status(
+    report_status_with_fresh_relay_token(
         client,
-        &relay_token,
+        device,
+        device_secret,
+        source,
         CollectorStatus {
             source,
             machine_id,
@@ -763,6 +776,17 @@ fn report_status(
     };
     client.report_status(relay_token, &request)?;
     Ok(())
+}
+
+fn report_status_with_fresh_relay_token(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    status: CollectorStatus<'_>,
+) -> Result<()> {
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    report_status(client, &relay_token, status)
 }
 
 fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
@@ -1271,6 +1295,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn collector_status_report_mints_fresh_relay_token() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = snapshot_status_server(captured.clone());
+        let client = SnapshotApiClient::new(api_base_url);
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts: SyncCounts::for_policy(30),
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report status with fresh relay token");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[0].contains("X-Ottto-Device-Secret: device-secret"));
+        assert!(requests[0].contains("\"source\":\"codex\""));
+        assert!(requests[1].contains("POST /api/v1/agent-session-snapshots/status"));
+        assert!(requests[1].contains("Authorization:"));
+        assert!(requests[1].contains("relay-token-codex"));
+        assert!(requests[1].contains("\"schema_version\":5"));
+        assert!(requests[1].contains("\"source\":\"codex\""));
+        assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -1438,6 +1501,34 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write local health response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn snapshot_status_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot status backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept snapshot status request");
+                let request = read_complete_http_request(&mut stream);
+                captured
+                    .lock()
+                    .expect("capture snapshot status request")
+                    .push(request);
+                let body = if index == 0 {
+                    r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
+                } else {
+                    r#"{"accepted":true,"source":"codex","machine_id":"otm_test","disabled":false}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write snapshot status response");
             }
         });
         format!("http://{address}")
