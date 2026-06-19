@@ -5607,6 +5607,9 @@ fn run_bounded_command(
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
     }
+    if program == "pi" {
+        command.envs(crate::command_env::provider_env());
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -10475,6 +10478,39 @@ mod tests {
             .windows(2)
             .any(|args| args[0] == "--thinking" && args[1] == "high"));
         assert_eq!(command.args.last().map(String::as_str), Some(SMOKE_PROMPT));
+    }
+
+    #[test]
+    #[serial]
+    fn pi_smoke_subprocess_receives_provider_environment() {
+        let root = control_test_root("pi-smoke-provider-env");
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\n[ \"$GEMINI_API_KEY\" = ottto-test-key ] || { echo missing provider env >&2; exit 42; }\necho ok\n",
+        )
+        .expect("write fake pi");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake pi executable");
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        let _provider_guard = EnvVarGuard::set_str("GEMINI_API_KEY", "ottto-test-key");
+
+        let result = run_bounded_command("pi", &[], Duration::from_secs(5), "Pi", None);
+
+        assert!(
+            result.succeeded,
+            "message={} diagnostic={:?} exit={:?}",
+            result.message, result.diagnostic, result.exit_status
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1,8 +1,30 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const COMMAND_SEARCH_PATH_ENV: &str = "OTTTO_COMMAND_SEARCH_PATH";
+const INTERACTIVE_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
+const PROVIDER_ENV_KEYS: &[&str] = &[
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_CLOUD_REGION",
+    "GCLOUD_PROJECT",
+    "GCP_PROJECT",
+    "CLOUDSDK_CONFIG",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "VERTEXAI_PROJECT",
+    "VERTEXAI_LOCATION",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+];
 
 pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
     executable_search_dirs().into_iter().find_map(|dir| {
@@ -20,6 +42,101 @@ pub(crate) fn path_env() -> Option<OsString> {
         return path_env_from_override(Some(path_var));
     }
     path_env_from(env::var_os("PATH"), env::var_os("HOME"))
+}
+
+pub(crate) fn provider_env() -> BTreeMap<String, OsString> {
+    let current = current_provider_env();
+    let missing_shell_env = (current.len() < PROVIDER_ENV_KEYS.len())
+        .then(interactive_shell_provider_env)
+        .flatten();
+    provider_env_from_sources(&current, missing_shell_env.as_ref())
+}
+
+fn current_provider_env() -> BTreeMap<String, OsString> {
+    PROVIDER_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            let value = env::var_os(key)?;
+            non_empty_env_value(value).map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+fn provider_env_from_sources(
+    current: &BTreeMap<String, OsString>,
+    shell: Option<&BTreeMap<String, OsString>>,
+) -> BTreeMap<String, OsString> {
+    let mut values = BTreeMap::new();
+    for key in PROVIDER_ENV_KEYS {
+        if let Some(value) = current
+            .get(*key)
+            .cloned()
+            .or_else(|| shell.and_then(|shell| shell.get(*key).cloned()))
+            .and_then(non_empty_env_value)
+        {
+            values.insert((*key).to_string(), value);
+        }
+    }
+    values
+}
+
+fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
+    let home = env::var_os("HOME")?;
+    let path = path_env_from(None, Some(home.clone()))?;
+    let mut command = Command::new("/bin/zsh");
+    command
+        .args(["-lic", "/usr/bin/env"])
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child.wait_with_output().ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                return Some(parse_provider_env_output(&output.stdout));
+            }
+            Ok(None) if start.elapsed() >= INTERACTIVE_SHELL_ENV_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn parse_provider_env_output(output: &[u8]) -> BTreeMap<String, OsString> {
+    let mut values = BTreeMap::new();
+    let text = String::from_utf8_lossy(output);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if PROVIDER_ENV_KEYS.contains(&key) {
+            if let Some(value) = non_empty_env_value(OsString::from(value)) {
+                values.insert(key.to_string(), value);
+            }
+        }
+    }
+    values
+}
+
+fn non_empty_env_value(value: OsString) -> Option<OsString> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn executable_search_dirs() -> Vec<PathBuf> {
@@ -124,5 +241,70 @@ mod tests {
         let path_env = path_env_from_override(Some(override_path)).expect("path env");
         let dirs = env::split_paths(&path_env).collect::<Vec<_>>();
         assert_eq!(dirs, vec![PathBuf::from("/tmp/ottto-only-bin")]);
+    }
+
+    #[test]
+    fn provider_env_prefers_current_process_and_fills_from_shell() {
+        let mut current = BTreeMap::new();
+        current.insert(
+            "GOOGLE_CLOUD_PROJECT".to_string(),
+            OsString::from("current-project"),
+        );
+        let mut shell = BTreeMap::new();
+        shell.insert(
+            "GOOGLE_CLOUD_PROJECT".to_string(),
+            OsString::from("shell-project"),
+        );
+        shell.insert(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_string(),
+            OsString::from("/tmp/google.json"),
+        );
+
+        let env = provider_env_from_sources(&current, Some(&shell));
+
+        assert_eq!(
+            env.get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("current-project"))
+        );
+        assert_eq!(
+            env.get("GOOGLE_APPLICATION_CREDENTIALS"),
+            Some(&OsString::from("/tmp/google.json"))
+        );
+    }
+
+    #[test]
+    fn provider_env_ignores_unallowlisted_and_empty_values() {
+        let current = BTreeMap::new();
+        let mut shell = BTreeMap::new();
+        shell.insert("PASSWORD".to_string(), OsString::from("secret"));
+        shell.insert("GOOGLE_CLOUD_LOCATION".to_string(), OsString::new());
+        shell.insert("GEMINI_API_KEY".to_string(), OsString::from("gemini-key"));
+
+        let env = provider_env_from_sources(&current, Some(&shell));
+
+        assert!(!env.contains_key("PASSWORD"));
+        assert!(!env.contains_key("GOOGLE_CLOUD_LOCATION"));
+        assert_eq!(
+            env.get("GEMINI_API_KEY"),
+            Some(&OsString::from("gemini-key"))
+        );
+    }
+
+    #[test]
+    fn parse_provider_env_output_keeps_only_allowlisted_keys() {
+        let env = parse_provider_env_output(
+            b"GOOGLE_CLOUD_PROJECT=ottto\nPATH=/tmp\nVERTEXAI_LOCATION=us-central1\nMALICIOUS=value\n",
+        );
+
+        assert_eq!(
+            env.get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("ottto"))
+        );
+        assert_eq!(
+            env.get("VERTEXAI_LOCATION"),
+            Some(&OsString::from("us-central1"))
+        );
+        assert!(!env.contains_key("PATH"));
+        assert!(!env.contains_key("MALICIOUS"));
     }
 }
