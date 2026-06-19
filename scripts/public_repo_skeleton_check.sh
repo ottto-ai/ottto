@@ -21,6 +21,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 failures=0
+is_git_checkout=false
 
 fail() {
   echo "public-skeleton: $*" >&2
@@ -60,6 +61,9 @@ require_grep() {
 
 deny_path() {
   if [[ -e "$REPO_ROOT/$1" ]]; then
+    if [[ "$is_git_checkout" == "true" ]] && git -C "$REPO_ROOT" check-ignore -q -- "$1"; then
+      return
+    fi
     fail "private or non-root-shaped path must not exist: $1"
   fi
 }
@@ -67,6 +71,9 @@ deny_path() {
 if [[ ! -d "$REPO_ROOT" ]]; then
   echo "public-skeleton: repository root is not a directory: $REPO_ROOT" >&2
   exit 2
+fi
+if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  is_git_checkout=true
 fi
 
 required_dirs=(

@@ -116,4 +116,27 @@ if run_scan "$path_repo" >/tmp/public-secret-path.out 2>&1; then
 fi
 grep -q "current export path denied" /tmp/public-secret-path.out
 
+side_ref_repo="$tmp_dir/side-ref"
+init_repo "$side_ref_repo"
+cat > "$side_ref_repo/public/README.md" <<'EOF'
+# Public Files
+EOF
+git -C "$side_ref_repo" add .
+git -C "$side_ref_repo" commit -qm clean
+main_branch="$(git -C "$side_ref_repo" branch --show-current)"
+git -C "$side_ref_repo" checkout -qb unrelated-local-ref
+mkdir -p "$side_ref_repo/public/target"
+cat > "$side_ref_repo/public/target/noise.txt" <<'EOF'
+Raw operator output: /Users/ronshub/private
+EOF
+git -C "$side_ref_repo" add .
+git -C "$side_ref_repo" commit -qm unrelated-build-output
+git -C "$side_ref_repo" checkout -q "$main_branch"
+run_scan "$side_ref_repo" >/tmp/public-secret-side-ref-default.out
+if PUBLIC_SECRET_SCAN_ALL_REFS=1 run_scan "$side_ref_repo" >/tmp/public-secret-side-ref-all.out 2>&1; then
+  echo "Expected explicit all-refs secret scan to fail on unrelated local branch" >&2
+  exit 1
+fi
+grep -q "historical content denied" /tmp/public-secret-side-ref-all.out
+
 echo "public_repo_secret_scan tests passed"
