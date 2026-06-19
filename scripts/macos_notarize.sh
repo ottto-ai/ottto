@@ -122,6 +122,21 @@ stapler_retry() {
   return 1
 }
 
+prepare_app_staple_target() {
+  local app_bundle="$1"
+  local ticket_path="$app_bundle/Contents/CodeResources"
+
+  if [[ -d "$app_bundle/Contents" && ! -e "$ticket_path" ]]; then
+    if ! touch "$ticket_path" 2>/dev/null; then
+      if command -v xattr >/dev/null 2>&1; then
+        xattr -d com.apple.provenance "$app_bundle" 2>/dev/null || true
+        xattr -d com.apple.provenance "$app_bundle/Contents" 2>/dev/null || true
+      fi
+      touch "$ticket_path"
+    fi
+  fi
+}
+
 gatekeeper_assessment_type() {
   local kind="$1"
   if [[ "$kind" == "macos_app" ]]; then
@@ -169,6 +184,38 @@ rebuild_dmg_from_app() {
   hdiutil create -volname "Ottto" -srcfolder "$staging" -ov -format UDZO "$dmg_path" >/dev/null
   rm -rf "$staging"
   codesign --force --timestamp --sign "$sign_identity" "$dmg_path"
+}
+
+# Staple the notarization ticket onto the nested Sparkle helper bundles.
+#
+# Sparkle copies its Updater.app out to ~/Library/Caches/<app>/org.sparkle-project.Sparkle/
+# Launcher/<rand>/Updater.app and launchd spawns it (and the Installer/Downloader XPC
+# services) as standalone processes. Stapling only the OUTER app leaves those nested
+# bundles without their own ticket, so the copied-out Updater.app depends on an ONLINE
+# Gatekeeper notarization check. On the build machine that check passes; on a clean,
+# offline, or firewalled customer Mac it fails and macOS kills the helper with
+# "Gatekeeper policy (Malware) blocked execution" -> "Installer never started archive
+# extraction" -> "An error occurred while starting the installer", breaking in-app
+# updates. Stapling each nested bundle embeds the ticket so the copies pass Gatekeeper
+# OFFLINE. The nested bundles were already notarized recursively when the app was
+# submitted, so their tickets exist; stapling them does not invalidate the outer app
+# signature (stapler stores the ticket outside the sealed resource envelope).
+staple_nested_sparkle() {
+  local app_bundle="$1"
+  local sparkle_versions="$app_bundle/Contents/Frameworks/Sparkle.framework/Versions/B"
+  if [[ ! -d "$sparkle_versions" ]]; then
+    return 0
+  fi
+  local nested
+  for nested in \
+    "$sparkle_versions/Updater.app" \
+    "$sparkle_versions/XPCServices/Installer.xpc" \
+    "$sparkle_versions/XPCServices/Downloader.xpc"; do
+    if [[ -e "$nested" ]]; then
+      stapler_retry staple "$nested"
+      stapler_retry validate "$nested"
+    fi
+  done
 }
 
 matches_filter() {
@@ -236,8 +283,12 @@ while IFS= read -r artifact; do
       ditto -c -k --keepParent "$verification_path" "$app_notary_zip"
       notary_submit "$app_notary_zip"
       rm -f "$app_notary_zip"
+      prepare_app_staple_target "$verification_path"
       stapler_retry staple "$verification_path"
       stapler_retry validate "$verification_path"
+      # Staple the nested Sparkle helper bundles before rebuilding the DMG so the
+      # shipped DMG carries an app whose copied-out updater passes Gatekeeper offline.
+      staple_nested_sparkle "$verification_path"
       rebuild_dmg_from_app "$verification_path" "$path"
       notary_submit "$path"
     fi

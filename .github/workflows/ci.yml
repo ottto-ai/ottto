@@ -60,8 +60,11 @@ jobs:
           persist-credentials: false
 
       - name: Install script prerequisites
+        env:
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
         run: |
           set -euo pipefail
+          brew untap aws/tap azure/bicep 2>/dev/null || true
           if ! command -v jq >/dev/null 2>&1; then
             brew install jq
           fi

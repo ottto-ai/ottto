@@ -33,15 +33,23 @@ use ottto_protocol::{
     CollectorRiskClass, ConnectorMaturity, ConnectorReviewTier, DaemonRuntimeState, DaemonStatus,
     DetectedUse, DetectedUseQuotaWindowState, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
     DiagnosticsSection, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
-    DiagnosticsUploadStatus, EventStatus, HealthGrade, HealthProblem, LocalAccountBinding,
-    LocalAccountState, LocalAccountUser, MachineIdentity, RedactedValue, RedactionCategory,
-    RedactionReport, RedactionSurface, RelayRuntimeState, RelayState, RepairAction,
-    RepairActionApproval, RepairActionKind, RepairApprovalSurface, RepairAuthority,
-    RepairAuthorityMode, RepairBackupMetadata, RepairBackupScope, RepairPlan, RepairPlanStatus,
-    SourceConfigState, SourceDescriptor, SourceHealth, SourceKind, SourceOperation,
-    SourceOperationDescriptor, SourceOperationState, SourceState, SourceStateOwner,
-    SourceVerificationResult, SourceVerificationStatus, StableMessage, StableProblemCode,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
+    DiagnosticsUploadStatus, EventStatus, HealthGrade, HealthProblem, InstallOwner,
+    LocalAccountBinding, LocalAccountState, LocalAccountUser, LocalDeviceState,
+    LocalHealthAccountState, LocalHealthAccountV1, LocalHealthAuthority, LocalHealthBlockerV1,
+    LocalHealthCommandResultV1, LocalHealthCommandStatus, LocalHealthEventV1,
+    LocalHealthEvidenceRefV1, LocalHealthOverall, LocalHealthOverallState, LocalHealthSeverity,
+    LocalHealthSourceState, LocalHealthSourceV1, LocalMachineHealthV1, LocalSetupRunState,
+    LocalSetupTokenState, MachineIdentity, MachineRuntimeHeartbeatV1, OrgTelemetryControlState,
+    PersonalMeterLocalAccount, PersonalMeterLocalCollector, PersonalMeterLocalCollectorStatus,
+    PersonalMeterLocalDelta, PersonalMeterLocalFreshness, PersonalMeterLocalFreshnessStatus,
+    PersonalMeterLocalSnapshot, PersonalMeterLocalSourceSnapshot, PersonalMeterLocalValueStatus,
+    RedactedValue, RedactionCategory, RedactionReport, RedactionSurface, RelayRuntimeState,
+    RelayState, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
+    RepairAuthority, RepairAuthorityMode, RepairBackupMetadata, RepairBackupScope, RepairPlan,
+    RepairPlanStatus, RuntimeIdentityV1, SourceConfigState, SourceDescriptor, SourceHealth,
+    SourceKind, SourceOperation, SourceOperationDescriptor, SourceOperationState, SourceState,
+    SourceStateOwner, SourceVerificationResult, SourceVerificationStatus, StableMessage,
+    StableProblemCode, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -131,6 +139,13 @@ pub struct LocalDaemon {
     control_token: ControlToken,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalHealthUploadFailureKind {
+    AuthRejected,
+    BackendUnreachable,
+    ContractRejected,
+}
+
 #[derive(Debug, Clone)]
 struct DaemonState {
     machine: MachineIdentity,
@@ -138,8 +153,7 @@ struct DaemonState {
     sources: Vec<SourceHealth>,
     /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
     /// from `<source_state_dir>/<slug>-state.json` and stamped on first
-    /// observation; drives `SourceHealth.connected_at`. Persisted (unlike
-    /// `sources`) so it survives daemon restarts.
+    /// observation; drives `SourceHealth.connected_at`.
     source_first_seen: BTreeMap<String, String>,
     /// Most recent `local_usage_reconciliation_enabled` per source slug,
     /// recorded by the snapshot-sync loop; drives
@@ -147,9 +161,11 @@ struct DaemonState {
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
     /// Directory for the persisted per-source state files. `None` keeps
-    /// first-seen purely in-memory (tests); production sets it via
+    /// source state purely in-memory (tests); production sets it via
     /// `with_source_state_dir(default_sources_dir())`.
     source_state_dir: Option<PathBuf>,
+    local_health_events: Vec<LocalHealthEventV1>,
+    command_ledger: Vec<LocalHealthCommandResultV1>,
     account: LocalAccountBinding,
     connection: Option<LocalConnectionBinding>,
     pending_auth: Option<PendingAuthClaim>,
@@ -181,19 +197,30 @@ impl DaemonState {
         }
         self.source_first_seen
             .insert(slug.to_string(), observed_at.to_string());
+        self.persist_source_state(source);
+    }
+
+    fn persist_source_state(&self, source: &SourceKind) {
+        let slug = source_slug(source);
         if let Some(dir) = self.source_state_dir.as_ref() {
             let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+            let last_health = self
+                .sources
+                .iter()
+                .find(|health| health.source == *source)
+                .cloned();
             if let Err(error) = store.save(&LocalSourceState {
-                first_seen_at: Some(observed_at.to_string()),
+                first_seen_at: self.first_seen(source),
+                last_health,
             }) {
-                eprintln!("failed to persist first-seen for {slug}: {error}");
+                eprintln!("failed to persist source state for {slug}: {error}");
             }
         }
     }
 
     /// Clear the in-memory first-seen + reconciliation maps and delete the
     /// persisted per-source state files. Called at the account reset sites so a
-    /// fresh account starts with a fresh first-seen history.
+    /// fresh account starts with a fresh source history.
     fn clear_source_state(&mut self) {
         if let Some(dir) = self.source_state_dir.as_ref() {
             for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
@@ -237,6 +264,8 @@ impl LocalDaemon {
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
                 source_state_dir: None,
+                local_health_events: Vec::new(),
+                command_ledger: Vec::new(),
                 account: LocalAccountBinding::not_connected(),
                 connection: None,
                 pending_auth: None,
@@ -274,14 +303,15 @@ impl LocalDaemon {
         self
     }
 
-    /// Enable persistence of per-source first-seen timestamps under `dir`
+    /// Enable persistence of per-source state under `dir`
     /// (`<dir>/<slug>-state.json`) and boot-load any existing files into the
-    /// in-memory map. Production passes `default_sources_dir()`; constructors
-    /// that omit this keep first-seen purely in-memory.
+    /// in-memory map/source rows. Production passes `default_sources_dir()`;
+    /// constructors that omit this keep source state purely in-memory.
     pub fn with_source_state_dir(self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         if let Ok(mut state) = self.inner.lock() {
             state.source_first_seen = load_source_first_seen(&dir);
+            state.sources = load_source_health(&state, &dir);
             state.source_state_dir = Some(dir);
         }
         self
@@ -452,6 +482,23 @@ impl LocalDaemon {
         }))
     }
 
+    pub fn clear_recoverable_pending_auth_for_authorized_client(
+        &self,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if state.account.state != LocalAccountState::ClaimPending {
+            return Ok(());
+        }
+        if state.connection.is_none() || state.account.user.is_none() {
+            return Ok(());
+        }
+        state.pending_auth = None;
+        state.account.state = LocalAccountState::Connected;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = None;
+        Ok(())
+    }
+
     pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
         self.reset_account_for_authorized_client()
     }
@@ -485,10 +532,19 @@ impl LocalDaemon {
     pub fn update_sources(
         &self,
         token: &str,
-        sources: Vec<SourceHealth>,
+        mut sources: Vec<SourceHealth>,
     ) -> Result<(), LocalApiError> {
         self.control_token.authorize(token)?;
         let mut state = self.state()?;
+        for refreshed in &mut sources {
+            if let Some(existing) = state
+                .sources
+                .iter()
+                .find(|health| health.source == refreshed.source)
+            {
+                preserve_blocking_verification_state(refreshed, existing);
+            }
+        }
         state.sources = sources;
         Ok(())
     }
@@ -548,16 +604,13 @@ impl LocalDaemon {
         &self,
         result: &SourceVerificationResult,
     ) -> Result<(), LocalApiError> {
-        if matches!(
-            result.status,
-            SourceVerificationStatus::AccountNotConnected
-                | SourceVerificationStatus::ReconnectRequired
-        ) {
+        if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
         let mut state = self.state()?;
+        let observed_at = current_rfc3339_timestamp();
         state.stamp_first_seen(&result.source, result.last_received_at.as_deref());
-        let health = source_health_from_verification(&state, result);
+        let health = source_health_from_verification(&state, result, &observed_at);
         if let Some(existing) = state
             .sources
             .iter_mut()
@@ -567,6 +620,56 @@ impl LocalDaemon {
         } else {
             state.sources.push(health);
         }
+        state.persist_source_state(&result.source);
+        let sequence = next_local_health_sequence(&state);
+        let machine_id = state.machine.machine_id.clone();
+        let source_slug = source_slug(&result.source);
+        let action_id = format!("verify_{source_slug}");
+        state.local_health_events.push(LocalHealthEventV1 {
+            event_id: format!("evt_verify_{source_slug}_{sequence}"),
+            event_schema_version: "local_health_event.v1".to_string(),
+            event_type: if result.status == SourceVerificationStatus::Verified {
+                "VerifyPassed".to_string()
+            } else {
+                "VerifyFailed".to_string()
+            },
+            machine_id: machine_id.clone(),
+            observed_at: observed_at.clone(),
+            sequence,
+            authority: LocalHealthAuthority::Verify,
+            source_id: Some(format!("src_{source_slug}")),
+            action_id: Some(action_id.clone()),
+            payload: serde_json::json!({
+                "status": result.status,
+                "records_seen": result.records_seen,
+                "current": true
+            }),
+        });
+        state.command_ledger.push(LocalHealthCommandResultV1 {
+            action_id,
+            idempotency_key: format!("verify:{machine_id}:{source_slug}"),
+            command_schema_version: "local_command.v1".to_string(),
+            status: if result.status == SourceVerificationStatus::Verified {
+                LocalHealthCommandStatus::Succeeded
+            } else {
+                LocalHealthCommandStatus::Failed
+            },
+            terminal: true,
+            started_projection_revision: sequence.saturating_sub(1),
+            completed_projection_revision: sequence,
+            observed_at,
+            error_code: if result.status == SourceVerificationStatus::Verified {
+                None
+            } else {
+                Some(result.message.code.clone())
+            },
+            message: Some(result.message.text.clone()),
+            result: serde_json::json!({
+                "source": result.source,
+                "status": result.status,
+                "verified": result.verified
+            }),
+        });
         Ok(())
     }
 
@@ -600,6 +703,7 @@ impl LocalDaemon {
                 existing.grade = HealthGrade::Ok;
             }
         }
+        state.persist_source_state(source);
         Ok(())
     }
 
@@ -661,6 +765,40 @@ impl LocalDaemon {
     fn set_relay_state_authorized(&self, relay: RelayState) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         state.relay = relay;
+        Ok(())
+    }
+
+    pub fn record_local_health_upload_succeeded(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        push_local_health_upload_event(
+            &mut state,
+            "LocalHealthUploadSucceeded",
+            "ok",
+            "canonical local health uploaded to Ottto",
+        );
+        Ok(())
+    }
+
+    pub fn record_local_health_upload_failed(
+        &self,
+        kind: LocalHealthUploadFailureKind,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        let (kind, message) = match kind {
+            LocalHealthUploadFailureKind::AuthRejected => (
+                "auth_rejected",
+                "Ottto rejected this Mac's relay device credentials",
+            ),
+            LocalHealthUploadFailureKind::BackendUnreachable => (
+                "backend_unreachable",
+                "Ottto could not be reached while uploading local health",
+            ),
+            LocalHealthUploadFailureKind::ContractRejected => (
+                "contract_rejected",
+                "Ottto rejected this daemon's local health projection contract",
+            ),
+        };
+        push_local_health_upload_event(&mut state, "LocalHealthUploadFailed", kind, message);
         Ok(())
     }
 
@@ -942,6 +1080,9 @@ impl LocalDaemon {
                             ottto_protocol::InstallOwner::AppBundle => {
                                 Some("quit and relaunch the Ottto app")
                             }
+                            ottto_protocol::InstallOwner::Dev => {
+                                Some("run the explicit dev repair command")
+                            }
                             ottto_protocol::InstallOwner::Unknown => None,
                         }
                     })
@@ -1194,13 +1335,958 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     };
     status.relay = state.relay.clone();
     status.sources = state.sources.clone();
+    status.local_health_events = state.local_health_events.clone();
+    status.command_ledger = state.command_ledger.clone();
+    refresh_canonical_local_health(&mut status);
     status
+}
+
+fn push_local_health_upload_event(
+    state: &mut DaemonState,
+    event_type: &str,
+    kind: &str,
+    message: &str,
+) {
+    let sequence = next_local_health_sequence(state);
+    let observed_at = current_rfc3339_timestamp();
+    state.local_health_events.push(LocalHealthEventV1 {
+        event_id: format!("evt_local_health_upload_{kind}_{sequence}"),
+        event_schema_version: "local_health_event.v1".to_string(),
+        event_type: event_type.to_string(),
+        machine_id: state.machine.machine_id.clone(),
+        observed_at,
+        sequence,
+        authority: LocalHealthAuthority::Backend,
+        source_id: None,
+        action_id: None,
+        payload: serde_json::json!({
+            "kind": kind,
+            "message": message,
+            "current": true
+        }),
+    });
+}
+
+pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
+    let observed_at = status.generated_at.clone();
+    let projection_revision = next_status_projection_revision(status);
+    let runtime_event = LocalHealthEventV1 {
+        event_id: format!("evt_runtime_observed_{projection_revision}"),
+        event_schema_version: "local_health_event.v1".to_string(),
+        event_type: "MachineRuntimeObserved".to_string(),
+        machine_id: status.machine.machine_id.clone(),
+        observed_at: observed_at.clone(),
+        sequence: projection_revision,
+        authority: LocalHealthAuthority::Runtime,
+        source_id: None,
+        action_id: None,
+        payload: serde_json::json!({
+            "daemon_state": status.daemon,
+            "service_owner": status.service_owner,
+        }),
+    };
+    let mut events = status.local_health_events.clone();
+    events.push(runtime_event.clone());
+    let runtime = runtime_identity_for_status(status, &observed_at);
+    let heartbeat = runtime_heartbeat_for_status(status, &runtime, projection_revision);
+    let account = local_health_account_for_status(status);
+    let mut sources = status
+        .sources
+        .iter()
+        .map(|source| local_health_source_for_status(source, projection_revision))
+        .collect::<Vec<_>>();
+    apply_account_prerequisite_to_sources(&account, &mut sources);
+    let blockers = local_health_blockers_for_status(status, &runtime, &account, &sources);
+    let overall = local_health_overall(&blockers, &runtime, &account, &sources);
+    let evidence = events
+        .iter()
+        .map(|event| LocalHealthEvidenceRefV1 {
+            event_id: event.event_id.clone(),
+            event_type: event.event_type.clone(),
+            authority: event.authority.clone(),
+            observed_at: event.observed_at.clone(),
+            sequence: event.sequence,
+        })
+        .collect::<Vec<_>>();
+
+    status.runtime_heartbeat = Some(heartbeat);
+    status.local_health_events = events;
+    status.canonical_health = Some(LocalMachineHealthV1 {
+        schema_version: 1,
+        schema_version_name: "local_machine_health.v1".to_string(),
+        machine_id: status.machine.machine_id.clone(),
+        device_id: None,
+        org_id: status
+            .account
+            .organization
+            .as_ref()
+            .map(|organization| organization.id.clone()),
+        user_id: status.account.user.as_ref().map(|user| user.id.clone()),
+        revision: projection_revision,
+        projection_revision,
+        protocol_version: format!("local_control.v{}", status.protocol_version),
+        projection_version: "health_projection.v1".to_string(),
+        event_schema_version: "local_health_event.v1".to_string(),
+        capabilities: local_health_capabilities(status),
+        observed_at,
+        computed_at: status.generated_at.clone(),
+        fresh_until: status.generated_at.clone(),
+        overall,
+        runtime,
+        account,
+        sources,
+        blockers,
+        evidence,
+    });
+}
+
+fn next_local_health_sequence(state: &DaemonState) -> u64 {
+    state
+        .local_health_events
+        .iter()
+        .map(|event| event.sequence)
+        .chain(
+            state
+                .command_ledger
+                .iter()
+                .map(|result| result.completed_projection_revision),
+        )
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn next_status_projection_revision(status: &DaemonStatus) -> u64 {
+    status
+        .local_health_events
+        .iter()
+        .map(|event| event.sequence)
+        .chain(
+            status
+                .command_ledger
+                .iter()
+                .map(|result| result.completed_projection_revision),
+        )
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn runtime_identity_for_status(status: &DaemonStatus, observed_at: &str) -> RuntimeIdentityV1 {
+    runtime_identity_for_status_with_installed_app_version(
+        status,
+        observed_at,
+        &ottto_core::compiled_release_version(),
+    )
+}
+
+fn runtime_identity_for_status_with_installed_app_version(
+    status: &DaemonStatus,
+    observed_at: &str,
+    installed_app_version: &str,
+) -> RuntimeIdentityV1 {
+    let executable_path = std::env::current_exe().ok();
+    let install_owner = if status.service_owner.daemon_owner != InstallOwner::Unknown {
+        status.service_owner.daemon_owner
+    } else {
+        executable_path
+            .as_deref()
+            .map(ottto_core::install_owner_for_path)
+            .unwrap_or(InstallOwner::Unknown)
+    };
+    let daemon_version = service_release_version(status);
+    let app_bundle_version =
+        (install_owner == InstallOwner::AppBundle).then(|| installed_app_version.to_string());
+    RuntimeIdentityV1 {
+        install_owner,
+        daemon_version: daemon_version.clone(),
+        app_bundle_version: app_bundle_version.clone(),
+        cli_version: Some(installed_app_version.to_string()),
+        service_version: Some(daemon_version.clone()),
+        service_pid: Some(std::process::id()),
+        service_executable_path_class: match install_owner {
+            InstallOwner::AppBundle => "app_bundle_helper",
+            InstallOwner::Homebrew => "homebrew",
+            InstallOwner::HostedInstaller => "hosted_installer",
+            InstallOwner::Dev => "dev",
+            InstallOwner::Unknown => "unknown",
+        }
+        .to_string(),
+        service_executable_path: executable_path.map(|path| path.display().to_string()),
+        service_executable_hash: None,
+        launchd_label: Some(ottto_core::MACOS_LAUNCH_AGENT_LABEL.to_string()),
+        launchd_loaded_program_hash: None,
+        started_at: observed_at.to_string(),
+        last_seen_at: observed_at.to_string(),
+        boot_id: std::env::var("OTTTO_BOOT_ID").ok(),
+        session_id: std::env::var("OTTTO_SESSION_ID").ok(),
+        version_match: !runtime_version_mismatch(
+            install_owner,
+            &daemon_version,
+            app_bundle_version.as_deref(),
+        ),
+        protocol_match: status.protocol_version == PROTOCOL_VERSION,
+        schema_match: true,
+    }
+}
+
+fn service_release_version(status: &DaemonStatus) -> String {
+    let machine_version = status.machine.local_platform_version.trim();
+    if !machine_version.is_empty() {
+        return machine_version.to_string();
+    }
+    let update_version = status.update.current_version.trim();
+    if !update_version.is_empty() {
+        return update_version.to_string();
+    }
+    ottto_core::compiled_release_version()
+}
+
+fn runtime_version_mismatch(
+    install_owner: InstallOwner,
+    daemon_version: &str,
+    app_bundle_version: Option<&str>,
+) -> bool {
+    install_owner == InstallOwner::AppBundle
+        && app_bundle_version.is_some_and(|expected| daemon_version != expected)
+}
+
+fn runtime_heartbeat_for_status(
+    status: &DaemonStatus,
+    runtime: &RuntimeIdentityV1,
+    projection_revision: u64,
+) -> MachineRuntimeHeartbeatV1 {
+    MachineRuntimeHeartbeatV1 {
+        schema_version: "machine_runtime_heartbeat.v1".to_string(),
+        machine_id: status.machine.machine_id.clone(),
+        account_id: status.account.user.as_ref().map(|user| user.id.clone()),
+        org_id: status
+            .account
+            .organization
+            .as_ref()
+            .map(|organization| organization.id.clone()),
+        daemon_version: runtime.daemon_version.clone(),
+        app_bundle_version: runtime.app_bundle_version.clone(),
+        protocol_version: format!("local_control.v{}", status.protocol_version),
+        health_schema_version: "local_machine_health.v1".to_string(),
+        executable_path: runtime
+            .service_executable_path
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        install_owner: runtime.install_owner,
+        launchd_label: runtime
+            .launchd_label
+            .clone()
+            .unwrap_or_else(|| ottto_core::MACOS_LAUNCH_AGENT_LABEL.to_string()),
+        started_at: runtime.started_at.clone(),
+        last_seen_at: runtime.last_seen_at.clone(),
+        boot_id: runtime.boot_id.clone(),
+        session_id: runtime.session_id.clone(),
+        health_projection_revision: projection_revision,
+        capabilities: local_health_capabilities(status),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LatestLocalHealthUpload {
+    Succeeded,
+    AuthRejected { observed_at: String },
+    BackendUnreachable { observed_at: String },
+    ContractRejected { observed_at: String },
+}
+
+fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
+    status
+        .local_health_events
+        .iter()
+        .filter(|event| {
+            event.event_type == "LocalHealthUploadFailed"
+                || event.event_type == "LocalHealthUploadSucceeded"
+        })
+        .max_by_key(|event| event.sequence)
+        .and_then(|event| {
+            if event.event_type == "LocalHealthUploadSucceeded" {
+                return Some(LatestLocalHealthUpload::Succeeded);
+            }
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)?;
+            match kind {
+                "auth_rejected" => Some(LatestLocalHealthUpload::AuthRejected {
+                    observed_at: event.observed_at.clone(),
+                }),
+                "backend_unreachable" => Some(LatestLocalHealthUpload::BackendUnreachable {
+                    observed_at: event.observed_at.clone(),
+                }),
+                "contract_rejected" => Some(LatestLocalHealthUpload::ContractRejected {
+                    observed_at: event.observed_at.clone(),
+                }),
+                _ => None,
+            }
+        })
+}
+
+fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
+    let (mut state, mut setup_run_state, mut setup_token_state) = match status.account.state {
+        LocalAccountState::Connected => (
+            LocalHealthAccountState::Connected,
+            LocalSetupRunState::Complete,
+            LocalSetupTokenState::Valid,
+        ),
+        LocalAccountState::ClaimPending => (
+            LocalHealthAccountState::ClaimPending,
+            LocalSetupRunState::Pending,
+            LocalSetupTokenState::Unknown,
+        ),
+        LocalAccountState::ResetRequired | LocalAccountState::Error => (
+            LocalHealthAccountState::ReconnectRequired,
+            LocalSetupRunState::RebindRequired,
+            LocalSetupTokenState::RefreshRequired,
+        ),
+        LocalAccountState::NotConnected => (
+            LocalHealthAccountState::NotConnected,
+            LocalSetupRunState::Unknown,
+            LocalSetupTokenState::Missing,
+        ),
+    };
+    let latest_upload = latest_local_health_upload(status);
+    if matches!(
+        latest_upload,
+        Some(LatestLocalHealthUpload::AuthRejected { .. })
+    ) && !matches!(state, LocalHealthAccountState::NotConnected)
+    {
+        state = LocalHealthAccountState::ReconnectRequired;
+        setup_run_state = LocalSetupRunState::RebindRequired;
+        setup_token_state = LocalSetupTokenState::RefreshRequired;
+    }
+    let device_state = match latest_upload.as_ref() {
+        Some(LatestLocalHealthUpload::AuthRejected { .. }) => LocalDeviceState::Inactive,
+        Some(LatestLocalHealthUpload::BackendUnreachable { .. }) => LocalDeviceState::Unknown,
+        Some(LatestLocalHealthUpload::ContractRejected { .. }) => LocalDeviceState::Active,
+        Some(LatestLocalHealthUpload::Succeeded) | None
+            if status.daemon == DaemonRuntimeState::Unavailable =>
+        {
+            LocalDeviceState::StaleHeartbeat
+        }
+        _ => LocalDeviceState::Active,
+    };
+    LocalHealthAccountV1 {
+        state,
+        device_state,
+        setup_run_state,
+        setup_token_state,
+        org_role: None,
+        telemetry_controls: Some(OrgTelemetryControlState {
+            read_only: false,
+            can_mutate_sources: true,
+            can_enable_telemetry: true,
+            can_disable_telemetry: true,
+        }),
+    }
+}
+
+fn local_health_source_for_status(
+    source: &SourceHealth,
+    projection_revision: u64,
+) -> LocalHealthSourceV1 {
+    let has_verify_attention =
+        source.last_verified_at.is_some() && has_verification_failure_problem(source);
+    let authority = if source.last_verified_at.is_some() {
+        LocalHealthAuthority::Verify
+    } else {
+        LocalHealthAuthority::Runtime
+    };
+    let state = if has_verify_attention {
+        LocalHealthSourceState::VerifyFailed
+    } else {
+        match source.state {
+            SourceState::Healthy => LocalHealthSourceState::Healthy,
+            SourceState::NeedsRepair => LocalHealthSourceState::RepairRequired,
+            SourceState::NeedsConfirmation => LocalHealthSourceState::PendingSetup,
+            SourceState::NotFound => LocalHealthSourceState::PendingSetup,
+            SourceState::Verifying => LocalHealthSourceState::Unknown,
+            SourceState::Failed => LocalHealthSourceState::VerifyFailed,
+            SourceState::Unsupported => LocalHealthSourceState::DisabledByPolicy,
+        }
+    };
+    let blocking_reason = source
+        .problems
+        .first()
+        .map(|problem| stable_problem_code_slug(&problem.code).to_string());
+    LocalHealthSourceV1 {
+        source_id: format!("src_{}", source_slug(&source.source)),
+        app: source.source.clone(),
+        state,
+        authority,
+        authority_at: source
+            .last_verified_at
+            .clone()
+            .or_else(|| source.last_seen_at.clone())
+            .or_else(|| source.connected_at.clone())
+            .unwrap_or_else(current_rfc3339_timestamp),
+        blocking_reason,
+        clear_condition: source
+            .problems
+            .first()
+            .map(|_| "run Verify after repairing local source configuration".to_string()),
+        next_action: source
+            .recommended_actions
+            .first()
+            .map(|action| format!("{:?}", action.action)),
+        projection_revision: projection_revision.saturating_sub(1),
+    }
+}
+
+fn apply_account_prerequisite_to_sources(
+    account: &LocalHealthAccountV1,
+    sources: &mut [LocalHealthSourceV1],
+) {
+    let account_blocks_source_trust =
+        matches!(
+            account.state,
+            LocalHealthAccountState::ReconnectRequired | LocalHealthAccountState::NotConnected
+        ) || matches!(
+            account.device_state,
+            LocalDeviceState::Inactive | LocalDeviceState::StaleHeartbeat
+        ) || matches!(account.setup_run_state, LocalSetupRunState::RebindRequired)
+            || matches!(
+                account.setup_token_state,
+                LocalSetupTokenState::Missing | LocalSetupTokenState::RefreshRequired
+            );
+    if !account_blocks_source_trust {
+        return;
+    }
+    for source in sources {
+        if source.state != LocalHealthSourceState::Healthy {
+            continue;
+        }
+        source.state = LocalHealthSourceState::Unknown;
+        source.authority = LocalHealthAuthority::Backend;
+        source.blocking_reason = Some("auth_missing".to_string());
+        source.clear_condition = Some("sign in to Ottto and rebind this machine".to_string());
+        source.next_action = Some("sign_in".to_string());
+    }
+}
+
+fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
+    match code {
+        StableProblemCode::ConfigMissing => "config_missing",
+        StableProblemCode::ConfigDrift => "config_drift",
+        StableProblemCode::SecretMissing => "secret_missing",
+        StableProblemCode::SecretExpired => "secret_expired",
+        StableProblemCode::RelayUnavailable => "relay_unavailable",
+        StableProblemCode::TelemetryNotVerified => "telemetry_not_verified",
+        StableProblemCode::SourceNotInstalled => "source_not_installed",
+        StableProblemCode::UnsupportedPlatform => "unsupported_platform",
+        StableProblemCode::Unknown => "unknown",
+    }
+}
+
+fn local_health_blockers_for_status(
+    status: &DaemonStatus,
+    runtime: &RuntimeIdentityV1,
+    account: &LocalHealthAccountV1,
+    sources: &[LocalHealthSourceV1],
+) -> Vec<LocalHealthBlockerV1> {
+    let mut blockers = Vec::new();
+    if !runtime.protocol_match || !runtime.schema_match {
+        blockers.push(blocker(
+            "protocol_mismatch",
+            LocalHealthSeverity::Blocking,
+            "runtime",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "upgrade Ottto local runtime so protocol and health schema match",
+        ));
+    } else if status.service_owner.owner_drift {
+        blockers.push(blocker(
+            "owner_conflict",
+            LocalHealthSeverity::Blocking,
+            "runtime",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "reconcile LaunchAgent owner before repair or upgrade",
+        ));
+    } else if !runtime.version_match {
+        blockers.push(blocker(
+            "service_outdated",
+            LocalHealthSeverity::Blocking,
+            "runtime",
+            LocalHealthAuthority::Runtime,
+            &status.generated_at,
+            "daemon reports same version/hash as installed owner",
+        ));
+    }
+    if account.device_state == LocalDeviceState::StaleHeartbeat {
+        blockers.push(blocker(
+            "stale_heartbeat",
+            LocalHealthSeverity::Blocking,
+            "runtime",
+            LocalHealthAuthority::Heartbeat,
+            &status.generated_at,
+            "restart ottto-service and observe a fresh heartbeat",
+        ));
+    }
+    match latest_local_health_upload(status) {
+        Some(LatestLocalHealthUpload::AuthRejected { observed_at }) => blockers.push(blocker(
+            "auth_missing",
+            LocalHealthSeverity::Blocking,
+            "backend",
+            LocalHealthAuthority::Backend,
+            &observed_at,
+            "rebind this Mac's relay device credentials before trusting cloud sync",
+        )),
+        Some(LatestLocalHealthUpload::BackendUnreachable { observed_at }) => {
+            blockers.push(blocker(
+                "backend_unreachable",
+                LocalHealthSeverity::Blocking,
+                "backend",
+                LocalHealthAuthority::Backend,
+                &observed_at,
+                "restore network access and upload a fresh local health projection",
+            ));
+        }
+        Some(LatestLocalHealthUpload::ContractRejected { observed_at }) => {
+            blockers.push(blocker(
+                "local_health_contract_rejected",
+                LocalHealthSeverity::Blocking,
+                "backend",
+                LocalHealthAuthority::Backend,
+                &observed_at,
+                "upgrade Ottto or backend contract support so local health projection validates",
+            ));
+        }
+        Some(LatestLocalHealthUpload::Succeeded) | None => {}
+    }
+    if matches!(
+        account.state,
+        LocalHealthAccountState::ReconnectRequired | LocalHealthAccountState::NotConnected
+    ) {
+        blockers.push(blocker(
+            "reconnect_required",
+            LocalHealthSeverity::Blocking,
+            "account",
+            LocalHealthAuthority::Setup,
+            &status.generated_at,
+            "sign in to Ottto and rebind this machine",
+        ));
+    }
+    for source in sources {
+        if matches!(
+            source.state,
+            LocalHealthSourceState::RepairRequired | LocalHealthSourceState::VerifyFailed
+        ) {
+            blockers.push(blocker(
+                source.blocking_reason.as_deref().unwrap_or("config_drift"),
+                LocalHealthSeverity::Blocking,
+                "source",
+                source.authority.clone(),
+                &source.authority_at,
+                source
+                    .clear_condition
+                    .as_deref()
+                    .unwrap_or("repair the source and rerun Verify"),
+            ));
+        }
+    }
+    blockers
+}
+
+fn blocker(
+    code: &str,
+    severity: LocalHealthSeverity,
+    owner: &str,
+    source: LocalHealthAuthority,
+    since: &str,
+    clear_condition: &str,
+) -> LocalHealthBlockerV1 {
+    LocalHealthBlockerV1 {
+        code: code.to_string(),
+        severity,
+        owner: owner.to_string(),
+        source,
+        since: since.to_string(),
+        clear_condition: clear_condition.to_string(),
+    }
+}
+
+fn local_health_overall(
+    blockers: &[LocalHealthBlockerV1],
+    runtime: &RuntimeIdentityV1,
+    account: &LocalHealthAccountV1,
+    sources: &[LocalHealthSourceV1],
+) -> LocalHealthOverall {
+    if !runtime.protocol_match || !runtime.schema_match {
+        return LocalHealthOverall {
+            state: LocalHealthOverallState::UpgradeRequired,
+            primary_blocker: Some("protocol_mismatch".to_string()),
+            severity: LocalHealthSeverity::Blocking,
+            next_action: Some("upgrade_local_runtime".to_string()),
+        };
+    }
+    if matches!(
+        account.state,
+        LocalHealthAccountState::ReconnectRequired | LocalHealthAccountState::NotConnected
+    ) {
+        return LocalHealthOverall {
+            state: LocalHealthOverallState::ReconnectRequired,
+            primary_blocker: blockers.first().map(|blocker| blocker.code.clone()),
+            severity: LocalHealthSeverity::Blocking,
+            next_action: Some("sign_in".to_string()),
+        };
+    }
+    if let Some(blocker) = blockers.first() {
+        return LocalHealthOverall {
+            state: LocalHealthOverallState::Blocked,
+            primary_blocker: Some(blocker.code.clone()),
+            severity: LocalHealthSeverity::Blocking,
+            next_action: Some("repair_or_verify".to_string()),
+        };
+    }
+    if sources.iter().any(|source| {
+        matches!(
+            source.state,
+            LocalHealthSourceState::PendingSetup
+                | LocalHealthSourceState::DisabledByPolicy
+                | LocalHealthSourceState::Unknown
+        )
+    }) {
+        return LocalHealthOverall {
+            state: LocalHealthOverallState::Degraded,
+            primary_blocker: None,
+            severity: LocalHealthSeverity::Warning,
+            next_action: Some("finish_source_setup".to_string()),
+        };
+    }
+    LocalHealthOverall {
+        state: LocalHealthOverallState::Healthy,
+        primary_blocker: None,
+        severity: LocalHealthSeverity::Info,
+        next_action: None,
+    }
+}
+
+fn local_health_capabilities(status: &DaemonStatus) -> Vec<String> {
+    let mut capabilities = vec![
+        "health.v1".to_string(),
+        "service.reconcile".to_string(),
+        "source.remove".to_string(),
+        "backfill.v1".to_string(),
+    ];
+    for source in &status.sources {
+        capabilities.push(format!("verify.{}", source_slug(&source.source)));
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities
 }
 
 pub fn current_rfc3339_timestamp() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+pub fn personal_meter_local_snapshot_from_status(
+    status: &DaemonStatus,
+    source_filter: Option<&SourceKind>,
+) -> PersonalMeterLocalSnapshot {
+    let sources = status
+        .sources
+        .iter()
+        .filter(|health| {
+            source_filter
+                .map(|source| health.source == *source)
+                .unwrap_or(true)
+        })
+        .map(personal_meter_source_from_health)
+        .collect();
+
+    PersonalMeterLocalSnapshot {
+        schema_version: "personal_meter.local_snapshot.v1".to_string(),
+        generated_at: status.generated_at.clone(),
+        machine_id: status.machine.machine_id.clone(),
+        sources,
+    }
+}
+
+fn personal_meter_source_from_health(health: &SourceHealth) -> PersonalMeterLocalSourceSnapshot {
+    let agent_status = health.agent_status.as_ref();
+    let account_status = agent_status.and_then(|snapshot| snapshot.account.as_ref());
+    let model_status = agent_status.and_then(|snapshot| snapshot.model.as_ref());
+    let current_plan = current_plan_observation(health);
+
+    let provider = account_status
+        .and_then(|account| account.provider.clone())
+        .or_else(|| model_status.and_then(|model| model.provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.billing_provider.clone()))
+        .or_else(|| current_plan.and_then(|plan| plan.gateway_provider.clone()))
+        .or_else(|| {
+            health
+                .detected_uses
+                .first()
+                .map(|use_record| use_record.gateway_provider.clone())
+        });
+    let account = account_status.map(|account| PersonalMeterLocalAccount {
+        login_state: account.login_state.clone(),
+        label: account
+            .email
+            .clone()
+            .or_else(|| current_plan.and_then(|plan| plan.account_label.clone()))
+            .or_else(|| {
+                health
+                    .detected_uses
+                    .first()
+                    .and_then(|use_record| use_record.account_label.clone())
+            }),
+        account_identifier_hash: account
+            .account_identifier_hash
+            .clone()
+            .or_else(|| current_plan.and_then(|plan| plan.account_identifier_hash.clone()))
+            .or_else(|| {
+                health
+                    .detected_uses
+                    .first()
+                    .and_then(|use_record| use_record.account_identifier_hash.clone())
+            }),
+        confidence: account.confidence.clone(),
+    });
+    let model = model_status
+        .and_then(|model| {
+            model
+                .active_model
+                .clone()
+                .or_else(|| model.default_model.clone())
+        })
+        .or_else(|| {
+            agent_status.and_then(|snapshot| {
+                snapshot
+                    .quota_windows
+                    .iter()
+                    .find_map(|window| window.model.clone())
+            })
+        });
+    let plan = account_status
+        .and_then(|account| {
+            account
+                .subscription_product
+                .clone()
+                .or_else(|| account.plan_type.clone())
+        })
+        .or_else(|| {
+            current_plan.and_then(|plan| {
+                plan.subscription_product
+                    .clone()
+                    .or_else(|| plan.plan_type.clone())
+            })
+        })
+        .or_else(|| {
+            health
+                .detected_uses
+                .first()
+                .and_then(|use_record| use_record.subscription_product.clone())
+        });
+    let confidence = account_status
+        .map(|account| account.confidence.clone())
+        .or_else(|| current_plan.map(|plan| plan.confidence.clone()))
+        .unwrap_or_default();
+
+    PersonalMeterLocalSourceSnapshot {
+        source: health.source.clone(),
+        app: source_slug(&health.source).to_string(),
+        included_in_totals: false,
+        provider,
+        account,
+        model,
+        plan,
+        quota_windows: agent_status
+            .map(|snapshot| snapshot.quota_windows.clone())
+            .unwrap_or_default(),
+        pending_local_delta: personal_meter_delta(health),
+        freshness: personal_meter_freshness(health),
+        collector: personal_meter_collector(health),
+        confidence,
+        warnings: personal_meter_warnings(health),
+        recommendation: health
+            .recommended_actions
+            .first()
+            .map(|action| action.title.clone()),
+    }
+}
+
+fn current_plan_observation(
+    health: &SourceHealth,
+) -> Option<&ottto_protocol::AgentStatusPlanObservation> {
+    health
+        .plan_observations
+        .iter()
+        .find(|plan| plan.is_current == Some(true))
+        .or_else(|| health.plan_observations.first())
+}
+
+fn personal_meter_delta(health: &SourceHealth) -> PersonalMeterLocalDelta {
+    let recent_token_volume = aggregate_recent_token_volume(health);
+    let has_local_usage_evidence =
+        !health.detected_uses.is_empty() || !recent_token_volume.is_empty();
+    let reconciliation_disabled = health.reconciliation_enabled == Some(false);
+    let (status, basis) = if reconciliation_disabled {
+        (
+            PersonalMeterLocalValueStatus::Unavailable,
+            "local_usage_reconciliation_disabled",
+        )
+    } else if has_local_usage_evidence {
+        (
+            PersonalMeterLocalValueStatus::Unknown,
+            "backend_inclusion_watermark_unavailable",
+        )
+    } else if health.reconciliation_enabled == Some(true) {
+        (
+            PersonalMeterLocalValueStatus::Unknown,
+            "no_local_usage_evidence_yet",
+        )
+    } else {
+        (
+            PersonalMeterLocalValueStatus::Unavailable,
+            "local_usage_reconciliation_policy_unknown",
+        )
+    };
+
+    PersonalMeterLocalDelta {
+        status,
+        included_in_totals: false,
+        basis: basis.to_string(),
+        since: None,
+        until: None,
+        total_tokens: None,
+        request_count: None,
+        estimated_cost_usd_micros: None,
+        detected_use_count: health.detected_uses.len() as u64,
+        recent_token_volume,
+    }
+}
+
+fn aggregate_recent_token_volume(
+    health: &SourceHealth,
+) -> Vec<ottto_protocol::DetectedUseTokenSample> {
+    let mut by_timestamp = BTreeMap::<String, u64>::new();
+    for use_record in &health.detected_uses {
+        for sample in &use_record.token_volume_recent {
+            *by_timestamp.entry(sample.at.clone()).or_default() += sample.tokens;
+        }
+    }
+    by_timestamp
+        .into_iter()
+        .map(|(at, tokens)| ottto_protocol::DetectedUseTokenSample { at, tokens })
+        .collect()
+}
+
+fn personal_meter_freshness(health: &SourceHealth) -> PersonalMeterLocalFreshness {
+    let agent_status = health.agent_status.as_ref();
+    let collector_last_success_at = health
+        .collector
+        .as_ref()
+        .and_then(|collector| collector.last_success_at.clone());
+    let status = if let Some(snapshot) = agent_status {
+        if snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Error)
+        {
+            PersonalMeterLocalFreshnessStatus::Error
+        } else if snapshot
+            .quota_windows
+            .iter()
+            .any(|window| window.freshness == AgentQuotaWindowFreshness::Stale)
+        {
+            PersonalMeterLocalFreshnessStatus::Stale
+        } else {
+            match snapshot.status {
+                AgentStatusState::Available => PersonalMeterLocalFreshnessStatus::Fresh,
+                AgentStatusState::Error => PersonalMeterLocalFreshnessStatus::Error,
+                AgentStatusState::Unsupported | AgentStatusState::NotInstalled => {
+                    PersonalMeterLocalFreshnessStatus::Unsupported
+                }
+                AgentStatusState::Degraded
+                | AgentStatusState::AuthRequired
+                | AgentStatusState::Unknown => PersonalMeterLocalFreshnessStatus::Unknown,
+            }
+        }
+    } else if collector_last_success_at.is_some() {
+        PersonalMeterLocalFreshnessStatus::Unknown
+    } else {
+        PersonalMeterLocalFreshnessStatus::Unavailable
+    };
+
+    PersonalMeterLocalFreshness {
+        status,
+        captured_at: agent_status.map(|snapshot| snapshot.captured_at.clone()),
+        expires_at: agent_status.map(|snapshot| snapshot.expires_at.clone()),
+        last_seen_at: health.last_seen_at.clone(),
+        last_verified_at: health.last_verified_at.clone(),
+        collector_last_success_at,
+    }
+}
+
+fn personal_meter_collector(health: &SourceHealth) -> PersonalMeterLocalCollector {
+    let status = match (&health.collector, health.reconciliation_enabled) {
+        (_, Some(false)) => PersonalMeterLocalCollectorStatus::Disabled,
+        (Some(collector), _) if collector.state == ottto_protocol::LocalCollectorState::Failing => {
+            PersonalMeterLocalCollectorStatus::Failing
+        }
+        (Some(_), _) => PersonalMeterLocalCollectorStatus::Ok,
+        (None, Some(true)) => PersonalMeterLocalCollectorStatus::Unknown,
+        (None, None) => PersonalMeterLocalCollectorStatus::Unavailable,
+    };
+    let collector = health.collector.as_ref();
+
+    PersonalMeterLocalCollector {
+        status,
+        state: collector.map(|collector| collector.state.clone()),
+        local_usage_reconciliation_enabled: health.reconciliation_enabled,
+        last_scan_started_at: collector
+            .and_then(|collector| collector.last_scan_started_at.clone()),
+        last_scan_finished_at: collector
+            .and_then(|collector| collector.last_scan_finished_at.clone()),
+        last_success_at: collector.and_then(|collector| collector.last_success_at.clone()),
+        last_uploaded_count: collector
+            .map(|collector| collector.last_uploaded_count)
+            .unwrap_or_default(),
+        last_scanned_session_count: collector
+            .map(|collector| collector.last_scanned_session_count)
+            .unwrap_or_default(),
+        last_scanned_file_count: collector
+            .map(|collector| collector.last_scanned_file_count)
+            .unwrap_or_default(),
+        last_scan_cap_hit: collector
+            .map(|collector| collector.last_scan_cap_hit)
+            .unwrap_or_default(),
+        collector_version: collector.and_then(|collector| collector.collector_version.clone()),
+        parser_version: collector.and_then(|collector| collector.parser_version.clone()),
+    }
+}
+
+fn personal_meter_warnings(health: &SourceHealth) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(health.problems.iter().map(|problem| problem.title.clone()));
+    if let Some(agent_status) = health.agent_status.as_ref() {
+        warnings.extend(
+            agent_status
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    matches!(
+                        diagnostic.severity,
+                        ottto_protocol::AgentDiagnosticSeverity::Warning
+                            | ottto_protocol::AgentDiagnosticSeverity::Error
+                    )
+                })
+                .map(|diagnostic| diagnostic.message.clone()),
+        );
+    }
+    warnings.truncate(8);
+    warnings
 }
 
 fn bound_user(account: &LocalAccountBinding) -> Option<&LocalAccountUser> {
@@ -1301,6 +2387,42 @@ fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
     map
 }
 
+/// Boot-load the most recent verification-derived source health rows. Missing
+/// or unreadable files are skipped, and rows whose persisted source does not
+/// match the file slug are ignored so a corrupt file cannot poison another
+/// source.
+fn load_source_health(state: &DaemonState, dir: &Path) -> Vec<SourceHealth> {
+    let mut sources = Vec::new();
+    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+        let slug = source_slug(&source);
+        let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
+        let Ok(Some(LocalSourceState {
+            last_health: Some(mut health),
+            ..
+        })) = store.load()
+        else {
+            continue;
+        };
+        if health.source != source {
+            continue;
+        }
+        normalize_persisted_source_health(state, &mut health);
+        sources.push(health);
+    }
+    sources
+}
+
+fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
+    health.descriptor = source_descriptor(&health.source);
+    health.account_binding.expected_account_id =
+        state.account.user.as_ref().map(|user| user.id.clone());
+    if health.connected_at.is_none() {
+        health.connected_at = state.first_seen(&health.source);
+    }
+    health.telemetry_configured = telemetry_configured_for_source(&health.source);
+    health.reconciliation_enabled = state.reconciliation_enabled(&health.source);
+}
+
 /// Whether local live telemetry credentials are configured for `source`.
 /// Telemetry is a Codex / Claude Code concept, so Pi returns `None`. Both the
 /// legacy per-source key store and the relay-device setup-run path count: the
@@ -1397,6 +2519,7 @@ fn registry_source(source: &SourceKind) -> &'static RegistrySourceEntry {
 fn source_health_from_verification(
     state: &DaemonState,
     result: &SourceVerificationResult,
+    observed_at: &str,
 ) -> SourceHealth {
     let user_id = state.account.user.as_ref().map(|user| user.id.clone());
     let agent_status = state
@@ -1445,7 +2568,11 @@ fn source_health_from_verification(
                 (SourceState::Healthy, HealthGrade::Ok, Vec::new())
             }
             SourceVerificationStatus::Warning => (
-                SourceState::Healthy,
+                if result.verified {
+                    SourceState::Healthy
+                } else {
+                    SourceState::NeedsConfirmation
+                },
                 HealthGrade::Warning,
                 vec![HealthProblem {
                     code: StableProblemCode::TelemetryNotVerified,
@@ -1533,9 +2660,12 @@ fn source_health_from_verification(
         detected_uses,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.verified {
-            result.last_received_at.clone()
+            result
+                .last_received_at
+                .clone()
+                .or_else(|| Some(observed_at.to_string()))
         } else {
-            None
+            Some(observed_at.to_string())
         },
         problems,
         recommended_actions,
@@ -1560,19 +2690,11 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
     {
         let existing = state.sources[index].clone();
         let mut refreshed = source_health_from_agent_status(state, snapshot);
-        let preserve_config_drift_health = refreshed.config.drift.is_empty()
-            && !existing.config.drift.is_empty()
-            && has_config_drift_problem(&existing);
         if refreshed.config.path_hint.is_none() {
             refreshed.config.path_hint = existing.config.path_hint.clone();
         }
         if refreshed.config.fingerprint.is_none() {
             refreshed.config.fingerprint = existing.config.fingerprint.clone();
-        }
-        let preserved_config_drift =
-            refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
-        if preserved_config_drift {
-            refreshed.config.drift = existing.config.drift.clone();
         }
         refreshed.config.discovered |= existing.config.discovered;
         if refreshed.collector.is_none() {
@@ -1586,13 +2708,7 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
         }
         refreshed.telemetry_configured = telemetry_configured;
         refreshed.reconciliation_enabled = reconciliation_enabled;
-        if preserve_config_drift_health {
-            refreshed.state = existing.state.clone();
-            refreshed.grade = existing.grade.clone();
-            refreshed.problems = existing.problems.clone();
-            refreshed.recommended_actions = existing.recommended_actions.clone();
-            refreshed.last_verified_at = existing.last_verified_at.clone();
-        }
+        preserve_blocking_verification_state(&mut refreshed, &existing);
         state.sources[index] = refreshed;
         return;
     }
@@ -1608,6 +2724,31 @@ fn has_config_drift_problem(health: &SourceHealth) -> bool {
         ]
         .contains(&problem.code)
     })
+}
+
+fn has_verification_failure_problem(health: &SourceHealth) -> bool {
+    health
+        .problems
+        .iter()
+        .any(|problem| problem.code == StableProblemCode::TelemetryNotVerified)
+}
+
+fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
+    let preserve_config_drift =
+        refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
+    if preserve_config_drift {
+        refreshed.config.drift = existing.config.drift.clone();
+    }
+    let preserve_failed_verification =
+        existing.last_verified_at.is_some() && has_verification_failure_problem(existing);
+    if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
+    {
+        refreshed.state = existing.state.clone();
+        refreshed.grade = existing.grade.clone();
+        refreshed.problems = existing.problems.clone();
+        refreshed.recommended_actions = existing.recommended_actions.clone();
+        refreshed.last_verified_at = existing.last_verified_at.clone();
+    }
 }
 
 fn source_health_from_agent_status(
@@ -1699,11 +2840,7 @@ fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         last_seen_at: Some(snapshot.captured_at.clone()),
-        last_verified_at: if matches!(snapshot.status, AgentStatusState::Available) {
-            Some(snapshot.captured_at)
-        } else {
-            None
-        },
+        last_verified_at: None,
         problems,
         recommended_actions: Vec::new(),
         connected_at: state.first_seen(&snapshot.source),
@@ -2032,8 +3169,9 @@ fn source_display_name(source: &SourceKind) -> String {
 mod tests {
     use super::*;
     use ottto_protocol::{
-        AccountBindingState, HealthGrade, LocalAccountOrganization, OperatingSystem,
-        SourceConfigState, SourceState,
+        AccountBindingState, DetectedUseTokenSample, HealthGrade, LocalAccountOrganization,
+        LocalHealthContractFixture, LocalHealthOverallState, LocalHealthSourceState,
+        OperatingSystem, SourceConfigState, SourceState,
     };
     use serial_test::serial;
 
@@ -2552,7 +3690,7 @@ mod tests {
 
     #[test]
     fn verification_result_updates_source_health() {
-        let daemon = daemon();
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
             source: SourceKind::Codex,
             config: SourceConfigState {
@@ -2585,10 +3723,600 @@ mod tests {
             status.sources[0].last_verified_at.as_deref(),
             Some("2026-05-05T10:15:00Z")
         );
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        assert_eq!(health.overall.state, LocalHealthOverallState::Healthy);
+        assert_eq!(
+            status
+                .runtime_heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.health_projection_revision),
+            Some(health.projection_revision)
+        );
+        assert!(health
+            .capabilities
+            .iter()
+            .any(|capability| capability == "health.v1"));
     }
 
     #[test]
-    fn reconnect_required_verification_preserves_source_health() {
+    fn failed_verification_uses_fresh_attempt_time() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        daemon
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        let last_verified_at = status.sources[0]
+            .last_verified_at
+            .as_deref()
+            .expect("failed verify attempts still stamp an attempt time");
+        assert_ne!(last_verified_at, "2026-05-05T10:15:00Z");
+        assert_ne!(last_verified_at, "2026-05-05T09:10:00Z");
+
+        let command = status
+            .command_ledger
+            .iter()
+            .find(|entry| entry.action_id == "verify_codex")
+            .expect("verify command ledger entry");
+        assert_eq!(command.observed_at, last_verified_at);
+        assert_ne!(command.observed_at, "2026-05-05T10:15:00Z");
+
+        let event = status
+            .local_health_events
+            .iter()
+            .find(|entry| entry.event_id.starts_with("evt_verify_codex_"))
+            .expect("verify event");
+        assert_eq!(event.observed_at, last_verified_at);
+
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("canonical Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority_at, last_verified_at);
+    }
+
+    #[test]
+    fn source_update_preserves_config_drift_verification_failure() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("source health should update");
+
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:drifted".to_string()),
+                drift: vec![ottto_protocol::ConfigDrift {
+                    key: "otel.logs_endpoint".to_string(),
+                    expected: RedactedValue::String("http://127.0.0.1:43119/v1/logs".to_string()),
+                    observed: RedactedValue::String("http://127.0.0.1:44621/v1/logs".to_string()),
+                }],
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "config_drift".to_string(),
+                text: "Codex telemetry config does not match the active Ottto relay.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record config drift verification");
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("fresh source scan should not clear verification failure");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::NeedsRepair);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::ConfigDrift
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::WriteConfig
+        );
+        assert_eq!(status.sources[0].config.drift.len(), 1);
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("config_drift")
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::RepairRequired
+        );
+        assert_eq!(
+            health.sources[0].authority,
+            LocalHealthAuthority::Verify,
+            "current verify failure must outrank an older green source scan"
+        );
+        assert!(status
+            .local_health_events
+            .iter()
+            .any(|event| event.event_type == "VerifyFailed"));
+    }
+
+    #[test]
+    fn canonical_health_marks_protocol_mismatch_upgrade_required() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.protocol_version = PROTOCOL_VERSION - 1;
+        refresh_canonical_local_health(&mut status);
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::UpgradeRequired
+        );
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("protocol_mismatch")
+        );
+        assert!(!health.runtime.protocol_match);
+    }
+
+    #[test]
+    fn canonical_health_marks_owner_drift_blocked() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.service_owner.daemon_owner = InstallOwner::Homebrew;
+        status.service_owner.client_owner = InstallOwner::AppBundle;
+        status.service_owner.owner_drift = true;
+        refresh_canonical_local_health(&mut status);
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("owner_conflict")
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "owner_conflict"));
+        assert!(health.runtime.version_match);
+    }
+
+    #[test]
+    fn runtime_identity_uses_platform_version_not_internal_crate_version() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.daemon_version = "0.1.0".to_string();
+        status.machine.local_platform_version = "0.1.30-rc1".to_string();
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+
+        assert_eq!(runtime.daemon_version, "0.1.30-rc1");
+        assert_eq!(runtime.service_version.as_deref(), Some("0.1.30-rc1"));
+        assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
+        assert!(runtime.version_match);
+    }
+
+    #[test]
+    fn runtime_identity_still_blocks_old_app_bundle_service() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut status = daemon.status(TOKEN).expect("status");
+        status.daemon_version = "0.1.0".to_string();
+        status.machine.local_platform_version = "0.1.28".to_string();
+        status.service_owner.daemon_owner = InstallOwner::AppBundle;
+
+        let runtime = runtime_identity_for_status_with_installed_app_version(
+            &status,
+            "2026-06-15T08:00:00Z",
+            "0.1.30-rc1",
+        );
+
+        assert_eq!(runtime.daemon_version, "0.1.28");
+        assert_eq!(runtime.app_bundle_version.as_deref(), Some("0.1.30-rc1"));
+        assert!(!runtime.version_match);
+    }
+
+    #[test]
+    fn relay_token_auth_failure_marks_canonical_health_reconnect_required() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let health = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            health.account.state,
+            LocalHealthAccountState::ReconnectRequired
+        );
+        assert_eq!(health.account.device_state, LocalDeviceState::Inactive);
+        assert_eq!(
+            health.account.setup_run_state,
+            LocalSetupRunState::RebindRequired
+        );
+        assert_eq!(
+            health.account.setup_token_state,
+            LocalSetupTokenState::RefreshRequired
+        );
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("auth_missing")
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "auth_missing"));
+    }
+
+    #[test]
+    fn auth_rejected_upload_prevents_healthy_source_projection() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record successful verification");
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::Unknown,
+            "source projection must not stay healthy while the account/device prerequisite is blocking"
+        );
+        assert_eq!(
+            health.sources[0].blocking_reason.as_deref(),
+            Some("auth_missing")
+        );
+        assert_eq!(health.sources[0].next_action.as_deref(), Some("sign_in"));
+    }
+
+    #[test]
+    fn backend_unreachable_upload_failure_blocks_until_success_event() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
+            .expect("record upload failure");
+        let blocked = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(blocked.account.device_state, LocalDeviceState::Unknown);
+        assert_eq!(
+            blocked.overall.primary_blocker.as_deref(),
+            Some("backend_unreachable")
+        );
+
+        daemon
+            .record_local_health_upload_succeeded()
+            .expect("record upload success");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(recovered.account.device_state, LocalDeviceState::Active);
+        assert!(recovered
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "backend_unreachable"));
+    }
+
+    #[test]
+    fn contract_rejected_upload_failure_is_not_backend_unreachable() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::ContractRejected)
+            .expect("record upload failure");
+
+        let health = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(health.account.device_state, LocalDeviceState::Active);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("local_health_contract_rejected")
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "local_health_contract_rejected"));
+        assert!(health
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "backend_unreachable"));
+    }
+
+    #[test]
+    fn phase_zero_red_fixtures_are_never_green() {
+        let fixtures: Vec<LocalHealthContractFixture> = serde_json::from_str(include_str!(
+            "../../../fixtures/local-health/contract-matrix.v1.json"
+        ))
+        .expect("fixtures deserialize");
+
+        for fixture in fixtures {
+            if fixture.expected.overall_state == LocalHealthOverallState::Healthy {
+                continue;
+            }
+            assert_ne!(
+                fixture.health.overall.state,
+                LocalHealthOverallState::Healthy,
+                "{} must not replay as healthy",
+                fixture.case_id
+            );
+            if fixture
+                .tags
+                .iter()
+                .any(|tag| tag == "verify" || tag == "backfill")
+            {
+                assert!(
+                    fixture
+                        .health
+                        .sources
+                        .iter()
+                        .any(|source| source.state == LocalHealthSourceState::VerifyFailed),
+                    "{} should preserve current verify failure",
+                    fixture.case_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_update_preserves_failed_verification_result() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut healthy = codex_health();
+        healthy.source = SourceKind::Pi;
+        healthy.descriptor = source_descriptor(&SourceKind::Pi);
+        daemon
+            .update_sources(TOKEN, vec![healthy.clone()])
+            .expect("source health should update");
+
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_route_smoke_failed".to_string(),
+                text: "No Pi model routes passed smoke verification.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record failed verification");
+        daemon
+            .update_sources(TOKEN, vec![healthy])
+            .expect("fresh source scan should not clear failed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Pi);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::VerifyTelemetry
+        );
+    }
+
+    #[test]
+    fn available_agent_status_does_not_stamp_verification_authority() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after refresh");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert!(
+            status.sources[0].last_verified_at.is_none(),
+            "local availability scans must not masquerade as Verify attempts"
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+    }
+
+    #[test]
+    fn available_agent_status_preserves_no_fresh_telemetry_verification() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::NoFreshTelemetry,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "no_fresh_telemetry".to_string(),
+                text: "No fresh Codex telemetry was processed after the smoke prompt.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("failed verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some(attempt_at.as_str())
+        );
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert_eq!(source.authority_at, attempt_at);
+    }
+
+    #[test]
+    fn warning_verification_without_success_never_projects_healthy() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_oauth_reauth_required".to_string(),
+                text: "Pi provider OAuth re-auth is required before telemetry can be trusted."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record warning verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("warning verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Pi, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some(attempt_at.as_str())
+        );
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("telemetry_not_verified")
+        );
+    }
+
+    #[test]
+    fn reconnect_required_verification_updates_source_health() {
         let daemon = daemon();
         daemon
             .update_sources(TOKEN, vec![codex_health()])
@@ -2619,9 +4347,16 @@ mod tests {
             .expect("record reconnect result");
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(status.sources.len(), 1);
-        assert_eq!(status.sources[0].state, SourceState::Healthy);
-        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert!(status.sources[0].problems.is_empty());
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::VerifyTelemetry
+        );
     }
 
     #[test]
@@ -2723,8 +4458,6 @@ mod tests {
 
     #[test]
     fn health_detected_uses_prunes_stale_cache_rows() {
-        use ottto_protocol::DetectedUseTokenSample;
-
         let detected = vec![
             DetectedUse {
                 gateway_provider: "anthropic".to_string(),
@@ -2733,7 +4466,7 @@ mod tests {
                 subscription_product: None,
                 account_label: None,
                 last_seen_at: "2025-10-05T13:12:31Z".to_string(),
-                token_volume_recent: vec![DetectedUseTokenSample {
+                token_volume_recent: vec![ottto_protocol::DetectedUseTokenSample {
                     at: "2025-10-05T13:00:00Z".to_string(),
                     tokens: 15_417_886,
                 }],
@@ -2960,6 +4693,114 @@ mod tests {
     }
 
     #[test]
+    fn failed_verification_persists_across_restart_and_registered_seed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-verify-failed",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let initial = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        initial
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+        restarted
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+
+        let health = status.canonical_health.expect("canonical health");
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::ReconnectRequired
+        );
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("auth_missing"),
+            "backend auth can be the top blocker without hiding source failures"
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::VerifyFailed
+        );
+        assert_eq!(health.sources[0].authority, LocalHealthAuthority::Verify);
+        assert_eq!(
+            health.sources[0].blocking_reason.as_deref(),
+            Some("telemetry_not_verified")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn successful_verification_replaces_persisted_failure_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-verify-recovered",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let initial = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        initial
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+
+        let recovered = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone());
+        recovered
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record successful verification");
+
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+        assert_eq!(
+            status.sources[0].last_verified_at.as_deref(),
+            Some("2026-05-05T10:20:00Z")
+        );
+        assert_eq!(
+            status.canonical_health.expect("canonical health").sources[0].state,
+            LocalHealthSourceState::Healthy
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn registered_device_sources_seed_status_after_restart_before_scan() {
         let dir = std::env::temp_dir().join(format!(
             "ottto-source-state-test-{}-registered",
@@ -2969,6 +4810,7 @@ mod tests {
         FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+                last_health: None,
             })
             .expect("seed source state");
 
@@ -3012,6 +4854,7 @@ mod tests {
         FileSourceStateStore::new(dir.join(source_state_file_name("codex")))
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
+                last_health: None,
             })
             .expect("seed source state");
 
@@ -3040,10 +4883,7 @@ mod tests {
         assert_eq!(status.sources[0].source, SourceKind::Codex);
         assert_eq!(status.sources[0].state, SourceState::Healthy);
         assert_eq!(status.sources[0].grade, HealthGrade::Ok);
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some("2026-05-05T10:20:00Z")
-        );
+        assert!(status.sources[0].last_verified_at.is_none());
         assert_eq!(
             status.sources[0].connected_at.as_deref(),
             Some("2026-05-05T10:15:00Z")
@@ -3089,10 +4929,7 @@ mod tests {
         assert_eq!(status.sources[0].state, SourceState::Healthy);
         assert_eq!(status.sources[0].grade, HealthGrade::Ok);
         assert!(status.sources[0].problems.is_empty());
-        assert_eq!(
-            status.sources[0].last_verified_at.as_deref(),
-            Some("2026-05-05T10:20:00Z")
-        );
+        assert!(status.sources[0].last_verified_at.is_none());
         assert_eq!(
             status.sources[0].config.path_hint.as_deref(),
             Some("~/.claude/settings.json")
@@ -3300,6 +5137,178 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    #[test]
+    fn personal_meter_local_snapshot_uses_local_evidence_not_totals() {
+        let daemon = daemon();
+        daemon
+            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .expect("record reconciliation");
+        let mut snapshot = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
+        snapshot.account = Some(ottto_protocol::AgentAccountStatus {
+            login_state: ottto_protocol::AgentLoginState::SignedIn,
+            provider: Some("openai".to_string()),
+            auth_method: Some("oauth".to_string()),
+            email: Some("ron@example.com".to_string()),
+            account_id: None,
+            organization_id: None,
+            organization_label: None,
+            plan_type: Some("plus".to_string()),
+            subscription_product: Some("ChatGPT Plus".to_string()),
+            billing_channel: Some("chatgpt".to_string()),
+            account_identifier_hash: Some("acct_hash".to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("local_status".to_string()),
+            billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
+            confidence: ottto_protocol::AgentStatusConfidence::High,
+        });
+        snapshot.model = Some(ottto_protocol::AgentModelStatus {
+            active_model: Some("gpt-5-codex".to_string()),
+            default_model: None,
+            provider: Some("openai".to_string()),
+            available_models: Vec::new(),
+            available_model_details: Vec::new(),
+            context_window_tokens: None,
+        });
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "weekly".to_string(),
+            scope: ottto_protocol::AgentQuotaWindowScope::Account,
+            status: AgentQuotaWindowStatus::Ok,
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            model: None,
+            account_label: Some("ron@example.com".to_string()),
+            window_seconds: Some(604_800),
+            started_at: Some("2026-05-04T00:00:00Z".to_string()),
+            resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+            quota: Some(100),
+            remaining: Some(42),
+            used_percent: Some(58),
+            left_percent: Some(42),
+        }];
+        snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            observed_at: Some("2026-05-05T10:20:00Z".to_string()),
+            evidence_method: Some("local_status".to_string()),
+            source_session_id: None,
+            provider: Some("openai".to_string()),
+            billing_provider: Some("openai".to_string()),
+            model_provider: Some("openai".to_string()),
+            billing_channel: Some("chatgpt".to_string()),
+            auth_mode: Some("oauth".to_string()),
+            gateway_provider: None,
+            subscription_product: Some("ChatGPT Plus".to_string()),
+            plan_type: Some("plus".to_string()),
+            account_label: Some("ron@example.com".to_string()),
+            account_id: None,
+            organization_label: None,
+            organization_id: None,
+            account_identifier_hash: Some("acct_hash".to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("local_status".to_string()),
+            billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
+            confidence: ottto_protocol::AgentStatusConfidence::High,
+            is_current: Some(true),
+        }];
+
+        {
+            let mut state = daemon.state().expect("state");
+            upsert_agent_status_snapshot(&mut state, snapshot);
+            let health = state.sources.first_mut().expect("source health");
+            health.collector = Some(ottto_protocol::LocalCollectorHealth {
+                state: ottto_protocol::LocalCollectorState::Warm,
+                last_scan_started_at: Some("2026-05-05T10:19:00Z".to_string()),
+                last_scan_finished_at: Some("2026-05-05T10:19:30Z".to_string()),
+                last_success_at: Some("2026-05-05T10:19:30Z".to_string()),
+                last_uploaded_count: 3,
+                last_scanned_session_count: 2,
+                last_scanned_file_count: 2,
+                last_backfill_window_days: 183,
+                last_backfill_file_limit: 1_000,
+                last_discovered_file_count: 2,
+                last_skipped_file_count_due_to_limit: 0,
+                last_scan_cap_hit: false,
+                next_retry_at: None,
+                collector_version: Some("local-enriched/1".to_string()),
+                parser_version: Some("codex-jsonl/1".to_string()),
+            });
+            health.detected_uses = vec![DetectedUse {
+                gateway_provider: "openai".to_string(),
+                plan_fingerprint: Some("plus".to_string()),
+                account_identifier_hash: Some("acct_hash".to_string()),
+                subscription_product: Some("ChatGPT Plus".to_string()),
+                account_label: Some("ron@example.com".to_string()),
+                last_seen_at: "2026-05-05T10:19:30Z".to_string(),
+                token_volume_recent: vec![DetectedUseTokenSample {
+                    at: "2026-05-05T10:00:00Z".to_string(),
+                    tokens: 4096,
+                }],
+                quota_window_state: DetectedUseQuotaWindowState::Ok,
+                quota_used_percent: Some(58),
+                quota_resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+            }];
+        }
+
+        let response = crate::control::handle_request(
+            &daemon,
+            ottto_protocol::LocalControlRequest {
+                request_id: "req_meter".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some(TOKEN.to_string()),
+                client_kind: Some(ottto_protocol::LocalClientKind::Cli),
+                client_install_owner: None,
+                command: ottto_protocol::LocalControlCommand::PersonalMeterLocalSnapshot {
+                    source: Some(SourceKind::Codex),
+                },
+            },
+        );
+
+        assert!(response.ok, "response should succeed: {:?}", response.error);
+        let payload: PersonalMeterLocalSnapshot =
+            serde_json::from_value(response.payload.expect("personal meter payload"))
+                .expect("payload should match protocol type");
+        assert_eq!(payload.schema_version, "personal_meter.local_snapshot.v1");
+        assert_eq!(payload.machine_id, "machine_test");
+        assert_eq!(payload.sources.len(), 1);
+        let source = &payload.sources[0];
+        assert_eq!(source.source, SourceKind::Codex);
+        assert!(!source.included_in_totals);
+        assert_eq!(source.provider.as_deref(), Some("openai"));
+        assert_eq!(source.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(source.plan.as_deref(), Some("ChatGPT Plus"));
+        assert_eq!(
+            source
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some("acct_hash")
+        );
+        assert_eq!(source.quota_windows.len(), 1);
+        assert_eq!(
+            source.freshness.status,
+            PersonalMeterLocalFreshnessStatus::Fresh
+        );
+        assert_eq!(
+            source.collector.status,
+            PersonalMeterLocalCollectorStatus::Ok
+        );
+        assert_eq!(source.collector.last_uploaded_count, 3);
+        assert_eq!(
+            source.pending_local_delta.status,
+            PersonalMeterLocalValueStatus::Unknown
+        );
+        assert!(!source.pending_local_delta.included_in_totals);
+        assert_eq!(
+            source.pending_local_delta.basis,
+            "backend_inclusion_watermark_unavailable"
+        );
+        assert_eq!(source.pending_local_delta.total_tokens, None);
+        assert_eq!(source.pending_local_delta.detected_use_count, 1);
+        assert_eq!(
+            source.pending_local_delta.recent_token_volume[0].tokens,
+            4096
+        );
+    }
+
     fn available_agent_status(source: SourceKind, captured_at: &str) -> AgentStatusSnapshot {
         AgentStatusSnapshot {
             source,
@@ -3337,6 +5346,29 @@ mod tests {
             message: StableMessage {
                 code: "verified".to_string(),
                 text: "Saw recent Codex telemetry.".to_string(),
+            },
+            route_results: Vec::new(),
+        }
+    }
+
+    fn failed_codex_reconnect() -> SourceVerificationResult {
+        SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::ReconnectRequired,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: Some("2026-05-05T10:15:00Z".to_string()),
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "setup_run_token_invalid".to_string(),
+                text: "Use Sign in in the Ottto app to refresh it.".to_string(),
             },
             route_results: Vec::new(),
         }

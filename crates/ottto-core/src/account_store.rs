@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ottto_protocol::LocalAccountBinding;
+use ottto_protocol::{LocalAccountBinding, SourceHealth};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -90,14 +90,16 @@ pub struct LocalMachineBinding {
     pub hardware_uuid: Option<String>,
 }
 
-/// Persisted daemon-side state for a single source. Today it only carries the
-/// real first-seen timestamp (so `SourceHealth.connected_at` survives daemon
-/// restarts and account resets clear it); kept as its own struct so future
-/// per-source daemon state can be added without a new file.
+/// Persisted daemon-side state for a single source. It carries the real
+/// first-seen timestamp and the most recent verification-derived health so a
+/// daemon restart cannot hide a current Verify failure behind registered-device
+/// placeholders.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LocalSourceState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_health: Option<SourceHealth>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +470,7 @@ mod tests {
         let store = FileSourceStateStore::new(&path);
         let state = LocalSourceState {
             first_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
+            last_health: None,
         };
 
         assert_eq!(store.load().expect("load missing"), None);

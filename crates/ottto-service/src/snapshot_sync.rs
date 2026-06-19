@@ -9,7 +9,8 @@ use crate::detected_uses::{
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
-    SnapshotApiClient, SnapshotStatusRequest,
+    LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
+    RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
     apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
@@ -17,6 +18,7 @@ use crate::snapshots::{
     MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
+use crate::LocalHealthUploadFailureKind;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
@@ -152,9 +154,26 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
     };
     let api_base_url = snapshot_api_base_url();
     let client = SnapshotApiClient::new(api_base_url);
+    let enabled_sources = enabled_snapshot_sources(&device);
+
+    if let Some(source) = enabled_sources.first().copied() {
+        if let Err(error) = upload_local_health_projection_reporting(
+            &client,
+            &device,
+            &device_secret,
+            source,
+            &machine_id,
+            daemon,
+        ) {
+            eprintln!(
+                "local health projection upload skipped: {}",
+                safe_error(&error)
+            );
+        }
+    }
 
     let mut failed_sources = Vec::new();
-    for source in enabled_snapshot_sources(&device) {
+    for source in enabled_sources {
         if let Err(error) = sync_source(
             &client,
             &device,
@@ -179,6 +198,137 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
             failed_sources.len()
         ));
     }
+    Ok(())
+}
+
+pub fn upload_local_health_projection_now(daemon: &LocalDaemon) -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let Some(source) = enabled_snapshot_sources(&device).first().copied() else {
+        return Err(anyhow!("registered device has no enabled sources"));
+    };
+    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    upload_local_health_projection_reporting(
+        &client,
+        &device,
+        &device_secret,
+        source,
+        &machine_id,
+        daemon,
+    )
+}
+
+fn upload_local_health_projection_reporting(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Result<()> {
+    match upload_local_health_projection_with(
+        client,
+        device,
+        device_secret,
+        source,
+        machine_id,
+        daemon,
+    ) {
+        Ok(()) => {
+            let _ = daemon.record_local_health_upload_succeeded();
+            Ok(())
+        }
+        Err(error) if local_health_upload_should_refresh_setup_run(&error) => {
+            if let Err(refresh_error) =
+                crate::control::refresh_setup_run_token_for_persisted_connection()
+            {
+                let _ = daemon
+                    .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
+                return Err(error.context(format!(
+                    "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
+                )));
+            }
+            match upload_local_health_projection_with(
+                client,
+                device,
+                device_secret,
+                source,
+                machine_id,
+                daemon,
+            ) {
+                Ok(()) => {
+                    let _ = daemon.record_local_health_upload_succeeded();
+                    Ok(())
+                }
+                Err(retry_error) => {
+                    let _ = daemon.record_local_health_upload_failed(
+                        local_health_upload_failure_kind(&retry_error),
+                    );
+                    Err(retry_error)
+                }
+            }
+        }
+        Err(error) => {
+            let _ =
+                daemon.record_local_health_upload_failed(local_health_upload_failure_kind(&error));
+            Err(error)
+        }
+    }
+}
+
+fn local_health_upload_should_refresh_setup_run(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RelayTokenAuthorizationRejected>()
+        .is_some()
+        || error
+            .downcast_ref::<LocalHealthAuthorizationRejected>()
+            .is_some()
+}
+
+fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadFailureKind {
+    if error
+        .downcast_ref::<LocalHealthProjectionRejected>()
+        .is_some()
+    {
+        LocalHealthUploadFailureKind::ContractRejected
+    } else if local_health_upload_should_refresh_setup_run(error) {
+        LocalHealthUploadFailureKind::AuthRejected
+    } else {
+        LocalHealthUploadFailureKind::BackendUnreachable
+    }
+}
+
+fn upload_local_health_projection_with(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    daemon: &LocalDaemon,
+) -> Result<()> {
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let mut status = daemon
+        .status_for_trusted_client()
+        .map_err(|error| anyhow!("read local health status failed: {error}"))?;
+    crate::refresh_canonical_local_health(&mut status);
+    if status.machine.machine_id != machine_id {
+        return Err(anyhow!(
+            "local health machine identity does not match registered device"
+        ));
+    }
+    let heartbeat = status
+        .runtime_heartbeat
+        .as_ref()
+        .ok_or_else(|| anyhow!("runtime heartbeat projection is missing"))?;
+    let health = status
+        .canonical_health
+        .as_ref()
+        .ok_or_else(|| anyhow!("canonical local health projection is missing"))?;
+
+    client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
+    client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
 
@@ -724,6 +874,10 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
         "machine identity is unavailable"
     } else if text.contains("issue relay token failed") {
         "relay token request failed"
+    } else if text.contains("backend rejected local health projection") {
+        "local health projection rejected"
+    } else if text.contains("backend rejected local health authorization") {
+        "local health authorization rejected"
     } else if text.contains("get activity hint failed") {
         "activity hint request failed"
     } else if text.contains("upload agent status failed")
@@ -746,10 +900,14 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ControlToken;
     use ottto_core::{
-        FileDeviceStore, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SECRET_FALLBACK_DIR_ENV,
+        FileDeviceStore, LocalConnectionBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_SECRET_FALLBACK_DIR_ENV, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
     };
-    use ottto_protocol::{AgentStatusCollectionMethod, AgentStatusState};
+    use ottto_protocol::{
+        AgentStatusCollectionMethod, AgentStatusState, MachineIdentity, OperatingSystem,
+    };
     use serial_test::serial;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -904,6 +1062,38 @@ mod tests {
             safe_error(&anyhow!("issue relay token failed: rejected")),
             "relay token request failed"
         );
+        assert_eq!(
+            safe_error(&anyhow::Error::new(LocalHealthProjectionRejected {
+                status: 422
+            })),
+            "local health projection rejected"
+        );
+        assert_eq!(
+            safe_error(&anyhow::Error::new(LocalHealthAuthorizationRejected {
+                status: 401
+            })),
+            "local health authorization rejected"
+        );
+    }
+
+    #[test]
+    fn local_health_upload_failures_are_classified_by_contract_boundary() {
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow::Error::new(LocalHealthProjectionRejected {
+                status: 422
+            })),
+            LocalHealthUploadFailureKind::ContractRejected
+        );
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow::Error::new(
+                LocalHealthAuthorizationRejected { status: 401 }
+            )),
+            LocalHealthUploadFailureKind::AuthRejected
+        );
+        assert_eq!(
+            local_health_upload_failure_kind(&anyhow!("upload local health projection failed")),
+            LocalHealthUploadFailureKind::BackendUnreachable
+        );
     }
 
     #[test]
@@ -1004,6 +1194,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    #[serial]
+    fn local_health_upload_refreshes_inactive_device_before_retry() {
+        let root = test_dir("local-health-upload-reactivates-device");
+        let support_dir = root.join("support");
+        let secrets_dir = root.join("secrets");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = local_health_reactivation_server(captured.clone());
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save device");
+        FileConnectionStore::default()
+            .save(&LocalConnectionBinding {
+                setup_run_id: "setup_stale".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("otm_test".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.clone(),
+            })
+            .expect("save connection");
+        std::fs::write(
+            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            "device-secret",
+        )
+        .expect("save device secret");
+        std::fs::write(
+            secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
+            "otsr_stale",
+        )
+        .expect("save setup token");
+
+        let client = SnapshotApiClient::new(api_base_url);
+        upload_local_health_projection_reporting(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            &test_daemon("otm_test"),
+        )
+        .expect("upload retries after refresh");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[1].contains("POST /api/v1/setup-runs/setup_stale/local-client/refresh"));
+        assert!(requests[1].contains("\"device_secret\":\"device-secret\""));
+        assert!(requests[2].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[3].contains("POST /api/v1/apps/health/heartbeat"));
+        assert!(requests[4].contains("POST /api/v1/apps/health/projection"));
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load refreshed connection")
+                .expect("connection exists")
+                .setup_run_id,
+            "setup_fresh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT))
+                .expect("read refreshed setup token"),
+            "otsr_fresh"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -1060,6 +1327,23 @@ mod tests {
             diagnostics: Vec::new(),
             runtime_defaults: None,
         }
+    }
+
+    fn test_daemon(machine_id: &str) -> LocalDaemon {
+        LocalDaemon::new(
+            MachineIdentity {
+                machine_id: machine_id.to_string(),
+                installation_id: "install_test".to_string(),
+                display_name: "Test Mac".to_string(),
+                hostname: "test-mac.local".to_string(),
+                os: OperatingSystem::Macos,
+                arch: "arm64".to_string(),
+                local_platform_version: "0.1.35".to_string(),
+                hardware_uuid: None,
+            },
+            ControlToken::new("token").expect("valid token"),
+            "2026-06-16T10:00:00Z",
+        )
     }
 
     fn agent_status_upload_server(captured: Arc<Mutex<Vec<String>>>) -> String {
@@ -1119,6 +1403,41 @@ mod tests {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write agent status response");
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn local_health_reactivation_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local health backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().expect("accept local health request");
+                let request = read_complete_http_request(&mut stream);
+                captured
+                    .lock()
+                    .expect("capture local health request")
+                    .push(request);
+                let (status, body) = match index {
+                    0 => ("403 Forbidden", r#"{"error":"inactive"}"#),
+                    1 => (
+                        "200 OK",
+                        r#"{"setup_run_id":"setup_fresh","setup_run_token":"otsr_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    ),
+                    2 => (
+                        "200 OK",
+                        r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#,
+                    ),
+                    _ => ("200 OK", r#"{"ok":true}"#),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write local health response");
             }
         });
         format!("http://{address}")

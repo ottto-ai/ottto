@@ -63,7 +63,11 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
-const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+// Poll long enough for slow-arriving agent telemetry (codex batches + flushes
+// its token records, then the relay forwards them) to reach the backend before
+// we give up — claude/pi still return early on success. Kept under
+// SETUP_VERIFICATION_HTTP_TIMEOUT (120s).
+const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(110);
 const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: u64 = 15;
 const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
@@ -418,6 +422,7 @@ fn handle_command(
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
+            crate::refresh_canonical_local_health(&mut status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
             Ok(value)
@@ -425,6 +430,13 @@ fn handle_command(
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
         LocalControlCommand::AgentStatusRefresh { source } => {
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
+        }
+        LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
+            let status = status_for(daemon, &authorization)?;
+            to_value(crate::personal_meter_local_snapshot_from_status(
+                &status,
+                source.as_ref(),
+            ))
         }
         LocalControlCommand::AgentContext { query } => agent_context(daemon, &authorization, query),
         LocalControlCommand::AgentCosts { query } => agent_costs(daemon, &authorization, query),
@@ -505,7 +517,37 @@ fn handle_command(
             }
         }
         LocalControlCommand::Verify { source, repair } => {
-            to_value(verify_source(daemon, &authorization, source, repair)?)
+            let result = verify_source(daemon, &authorization, source, repair)?;
+            let mut value = to_value(result)?;
+            let mut status = status_for(daemon, &authorization)?;
+            status.update.install_owner = detect_install_owner();
+            status.service_owner = service_owner_state(client_install_owner);
+            crate::refresh_canonical_local_health(&mut status);
+            if let Err(error) = crate::snapshot_sync::upload_local_health_projection_now(daemon) {
+                eprintln!(
+                    "manual local health projection upload skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert(
+                    "canonical_health".to_string(),
+                    to_value(status.canonical_health)?,
+                );
+                object.insert(
+                    "runtime_heartbeat".to_string(),
+                    to_value(status.runtime_heartbeat)?,
+                );
+                object.insert(
+                    "local_health_events".to_string(),
+                    to_value(status.local_health_events)?,
+                );
+                object.insert(
+                    "command_ledger".to_string(),
+                    to_value(status.command_ledger)?,
+                );
+            }
+            Ok(value)
         }
         LocalControlCommand::Setup {
             sources,
@@ -665,8 +707,12 @@ fn setup_run_agent_read_context(
         .connection_for_authorized_client()?
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
     let api_base_url = validated_api_base_url(Some(connection.api_base_url.as_str()))?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
-    Ok((api_base_url, connection, setup_run_token))
+    let credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
+    Ok((
+        api_base_url,
+        credentials.connection,
+        credentials.setup_run_token,
+    ))
 }
 
 fn require_authorized_local_client(
@@ -1520,13 +1566,24 @@ fn refresh_agent_status_for(
         }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }?;
-    if let Err(error) = crate::snapshot_sync::upload_agent_status_snapshots(&snapshots) {
-        eprintln!(
-            "manual agent status upload skipped: {}",
-            crate::snapshot_sync::safe_error(&error)
-        );
-    }
+    upload_agent_status_snapshots_in_background(snapshots.clone());
     Ok(snapshots)
+}
+
+fn upload_agent_status_snapshots_in_background(snapshots: Vec<AgentStatusSnapshot>) {
+    let spawn_result = thread::Builder::new()
+        .name("ottto-agent-status-upload".to_string())
+        .spawn(move || {
+            if let Err(error) = crate::snapshot_sync::upload_agent_status_snapshots(&snapshots) {
+                eprintln!(
+                    "manual agent status upload skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("manual agent status upload skipped: {error}");
+    }
 }
 
 fn auth_start(
@@ -1582,6 +1639,7 @@ fn complete_pending_auth_claim(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    persist_claim_relay_device_credentials(&completed)?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -1621,6 +1679,47 @@ fn complete_pending_auth_claim(
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(response)
+}
+
+fn persist_claim_relay_device_credentials(
+    completed: &SetupClaimCompleteResponse,
+) -> Result<(), LocalApiError> {
+    match (&completed.relay_device, &completed.relay_device_secret) {
+        (None, None) => Ok(()),
+        (Some(device), Some(device_secret)) => {
+            if device.sources.is_empty() || device_secret.trim().is_empty() {
+                return Err(claim_completion_response_unexpected(
+                    "claim completion returned incomplete relay-device credentials",
+                ));
+            }
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    device_id: device.id.clone(),
+                    machine_id: device
+                        .machine_id
+                        .clone()
+                        .or_else(|| completed.machine_id.clone()),
+                    sources: device.sources.clone(),
+                })
+                .map_err(|_| LocalApiError::StatePoisoned)?;
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .save(device_secret)
+                .map_err(|_| LocalApiError::StatePoisoned)?;
+            Ok(())
+        }
+        _ => Err(claim_completion_response_unexpected(
+            "claim completion returned partial relay-device credentials",
+        )),
+    }
+}
+
+fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
+    LocalApiError::Backend(BackendErrorDetails {
+        kind: BackendErrorKind::ResponseUnexpected,
+        endpoint: "/api/v1/setup-claims/[claim]/local-client/complete".to_string(),
+        status: None,
+        body_excerpt: Some(detail.to_string()),
+    })
 }
 
 fn auth_reset(
@@ -1708,9 +1807,18 @@ struct SetupClaimCompleteResponse {
     setup_run_token: String,
     setup_run_token_expires_at: String,
     machine_id: Option<String>,
+    relay_device: Option<SetupClaimCompleteRelayDevice>,
+    relay_device_secret: Option<String>,
     connected_at: String,
     user: SetupClaimCompleteUser,
     organization: SetupClaimCompleteOrganization,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupClaimCompleteRelayDevice {
+    id: String,
+    machine_id: Option<String>,
+    sources: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1759,12 +1867,22 @@ fn complete_setup_claim(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
-    let body = json!({
+    let mut body = json!({
         "nonce": claim.nonce,
         "machine_id": machine.machine_id,
+        "hardware_uuid": machine.hardware_uuid,
         "machine_name": machine.display_name,
         "platform": "macos",
     });
+    if let Some(device) = FileDeviceStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("relay_device_id".to_string(), json!(device.device_id));
+            object.insert("relay_device_sources".to_string(), json!(device.sources));
+        }
+    }
     backend_post_json(
         &url,
         &body,
@@ -1951,15 +2069,15 @@ fn update_state_from_manifest(
         ))
     } else if update_available {
         if manifest_tuple > current_tuple {
-            Some("newer release manifest version is available".to_string())
+            Some("A newer Ottto app is available.".to_string())
         } else {
             Some(format!(
-                "release manifest reports a different build ({}) for the same version",
+                "A newer Ottto app build is available ({})",
                 manifest.commit
             ))
         }
     } else {
-        Some("current build matches the release manifest channel".to_string())
+        Some("You are running the latest available version.".to_string())
     };
     let (update_command, update_instructions) = if update_required {
         update_route_for_owner(install_owner, &manifest.supported_install_owners)
@@ -2093,6 +2211,13 @@ fn update_route_for_owner(
                     .to_string(),
             ),
         ),
+        InstallOwner::Dev => (
+            None,
+            Some(
+                "Dev-owned installs must be updated with an explicit developer command."
+                    .to_string(),
+            ),
+        ),
         InstallOwner::Unknown => (
             None,
             Some("Install the latest Ottto local platform from the Apps page.".to_string()),
@@ -2112,6 +2237,7 @@ fn install_owner_label(install_owner: InstallOwner) -> &'static str {
         InstallOwner::Homebrew => "Homebrew",
         InstallOwner::HostedInstaller => "hosted-installer",
         InstallOwner::AppBundle => "app-bundled",
+        InstallOwner::Dev => "dev",
         InstallOwner::Unknown => "unknown-owner",
     }
 }
@@ -2268,6 +2394,7 @@ fn owner_repair_command(owner: InstallOwner) -> Option<&'static str> {
         InstallOwner::Homebrew => Some("brew services restart ottto"),
         InstallOwner::HostedInstaller => Some("rerun the Ottto installer"),
         InstallOwner::AppBundle => Some("quit and relaunch the Ottto app"),
+        InstallOwner::Dev => Some("run the explicit dev repair command"),
         InstallOwner::Unknown => None,
     }
 }
@@ -2533,24 +2660,26 @@ fn setup_run(
         }
     }
     let setup_run_token = setup_run_token.ok_or(LocalApiError::SetupRunConnectionMissing)?;
+    let mut credentials = SetupRunCredentials {
+        setup_run_token,
+        connection,
+    };
 
     let scan = build_local_scan(&status.machine, sources);
-    let mut detail = match publish_scan_result(&api_base_url, &connection, &setup_run_token, &scan)
-    {
+    let mut detail = match publish_scan_result(&api_base_url, &mut credentials, &scan) {
         Ok(detail) => detail,
         Err(error) if is_terminal_setup_run_scan_error(&error) => {
-            clear_setup_run_connection_if_current(daemon, &connection, &setup_run_token)?;
+            clear_setup_run_connection_if_current(
+                daemon,
+                &credentials.connection,
+                &credentials.setup_run_token,
+            )?;
             return Err(LocalApiError::SetupRunConnectionMissing);
         }
         Err(error) => return Err(error),
     };
-    let action_results = process_setup_actions(
-        daemon,
-        &api_base_url,
-        &connection,
-        &setup_run_token,
-        &status.machine,
-    )?;
+    let action_results =
+        process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     if let Some(last) = action_results.last() {
         if let Some(refreshed) = &last.detail {
             detail = refreshed.clone();
@@ -2579,12 +2708,13 @@ fn setup_run(
 
     Ok(json!({
         "status": detail.run.status,
-        "setup_run_id": connection.setup_run_id,
+        "setup_run_id": credentials.connection.setup_run_id,
         "claim_code_provided": claim_code_provided,
         "source_count": source_count,
         "detected_sources": detected_sources,
         "next_question": detail.next_question,
         "next_action": detail.next_action,
+        "setup_claim_url": detail.setup_claim_url,
         "actions": action_results,
     }))
 }
@@ -2671,7 +2801,7 @@ fn setup_answer(
     let connection = connection
         .take()
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let mut credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
     let answer_type = match answer_type.trim() {
         "skip_source" | "disable_source" => answer_type.trim().to_string(),
         _ => {
@@ -2680,14 +2810,8 @@ fn setup_answer(
             ))
         }
     };
-    let detail = save_setup_answer(
-        &api_base_url,
-        &connection,
-        &setup_run_token,
-        &source,
-        &answer_type,
-    )?;
-    setup_result_from_detail(&connection, detail, false, Vec::new())
+    let detail = save_setup_answer(&api_base_url, &mut credentials, &source, &answer_type)?;
+    setup_result_from_detail(&credentials.connection, detail, false, Vec::new())
 }
 
 fn setup_action(
@@ -2708,7 +2832,7 @@ fn setup_action(
     let connection = connection
         .take()
         .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let setup_run_token = setup_run_token_for_connection(&api_base_url, &connection)?;
+    let mut credentials = setup_run_token_for_connection(&api_base_url, &connection)?;
     let action_type = match action_type.trim() {
         "install_source" | "verify_source" => action_type.trim().to_string(),
         _ => {
@@ -2717,20 +2841,9 @@ fn setup_action(
             ))
         }
     };
-    queue_setup_action(
-        &api_base_url,
-        &connection,
-        &setup_run_token,
-        &source,
-        &action_type,
-    )?;
-    let action_results = process_setup_actions(
-        daemon,
-        &api_base_url,
-        &connection,
-        &setup_run_token,
-        &status.machine,
-    )?;
+    queue_setup_action(&api_base_url, &mut credentials, &source, &action_type)?;
+    let action_results =
+        process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
     let detail = action_results
         .last()
@@ -2740,7 +2853,7 @@ fn setup_action(
                 "queued setup action did not return a setup-run detail".to_string(),
             )
         })?;
-    setup_result_from_detail(&connection, detail, false, action_results)
+    setup_result_from_detail(&credentials.connection, detail, false, action_results)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2758,6 +2871,12 @@ struct SetupRunDetailApiResponse {
     sources: Vec<SetupRunSourceApiResponse>,
     next_action: Option<SetupRunActionApiResponse>,
     next_question: Option<serde_json::Value>,
+    // Web claim URL the app opens when a setup run waits on browser approval
+    // (e.g. a verify_source that found no fresh telemetry transitions to
+    // waiting_for_user). Surfaced to the Swift app so it can open the re-claim
+    // tab instead of leaving the user stuck on "waiting for approval".
+    #[serde(default)]
+    setup_claim_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2867,6 +2986,7 @@ fn setup_result_from_detail(
         "detected_sources": detected_sources,
         "next_question": detail.next_question,
         "next_action": detail.next_action,
+        "setup_claim_url": detail.setup_claim_url,
         "actions": action_results,
     }))
 }
@@ -2901,8 +3021,21 @@ fn attach_setup_run_by_claim_code(
 
 #[derive(Debug, Deserialize)]
 struct SetupRunRefreshResponse {
+    setup_run_id: Option<String>,
     setup_run_token: String,
     expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshedSetupRunToken {
+    setup_run_token: String,
+    connection: LocalConnectionBinding,
+}
+
+#[derive(Debug, Clone)]
+struct SetupRunCredentials {
+    setup_run_token: String,
+    connection: LocalConnectionBinding,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2922,7 +3055,7 @@ struct SetupRunDisconnectResponse {
 fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
-) -> Result<String, LocalApiError> {
+) -> Result<RefreshedSetupRunToken, LocalApiError> {
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
@@ -2957,40 +3090,89 @@ fn refresh_setup_run_token_via_device_secret(
         .save(&response.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let mut refreshed = connection.clone();
+    if let Some(setup_run_id) = response
+        .setup_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        refreshed.setup_run_id = setup_run_id.to_string();
+    }
     refreshed.setup_run_token_expires_at = response.expires_at.clone();
     FileConnectionStore::default()
         .save(&refreshed)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    Ok(response.setup_run_token)
+    Ok(RefreshedSetupRunToken {
+        setup_run_token: response.setup_run_token,
+        connection: refreshed,
+    })
+}
+
+pub(crate) fn refresh_setup_run_token_for_persisted_connection() -> Result<(), LocalApiError> {
+    let connection = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+    refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection).map(|_| ())
 }
 
 fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
-) -> Result<String, LocalApiError> {
+) -> Result<SetupRunCredentials, LocalApiError> {
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
-        Ok(token) => Ok(token),
-        Err(_) => refresh_setup_run_token_via_device_secret(api_base_url, connection),
+        Ok(token) => Ok(SetupRunCredentials {
+            setup_run_token: token,
+            connection: connection.clone(),
+        }),
+        Err(_) => {
+            refresh_setup_run_token_via_device_secret(api_base_url, connection).map(|refreshed| {
+                SetupRunCredentials {
+                    setup_run_token: refreshed.setup_run_token,
+                    connection: refreshed.connection,
+                }
+            })
+        }
     }
 }
 
-fn setup_run_request_with_refresh<T>(
+fn setup_run_request_with_refresh_mut<T>(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    request: impl Fn(&str) -> Result<T, LocalApiError>,
+    credentials: &mut SetupRunCredentials,
+    request: impl Fn(&LocalConnectionBinding, &str) -> Result<T, LocalApiError>,
 ) -> Result<T, LocalApiError> {
-    match request(setup_run_token) {
+    match request(&credentials.connection, &credentials.setup_run_token) {
         Ok(response) => Ok(response),
-        Err(original) if matches!(&original, LocalApiError::Backend(details) if details.status == Some(401)) => {
-            match refresh_setup_run_token_via_device_secret(api_base_url, connection) {
-                Ok(fresh_token) => request(&fresh_token),
+        Err(original) if is_setup_run_token_auth_error(&original) => {
+            match refresh_setup_run_token_via_device_secret(api_base_url, &credentials.connection) {
+                Ok(refreshed) => {
+                    *credentials = SetupRunCredentials {
+                        setup_run_token: refreshed.setup_run_token,
+                        connection: refreshed.connection,
+                    };
+                    request(&credentials.connection, &credentials.setup_run_token)
+                }
                 Err(LocalApiError::SetupRunConnectionMissing) => Err(original),
                 Err(other) => Err(other),
             }
         }
         Err(other) => Err(other),
     }
+}
+
+fn is_setup_run_token_auth_error(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(details) = error else {
+        return false;
+    };
+    if details.status == Some(401) {
+        return true;
+    }
+    let Some(body) = details.body_excerpt.as_deref() else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    body.contains("setup run companion token expired")
+        || body.contains("setup run companion token is invalid")
 }
 
 fn get_agent_context_with_refresh(
@@ -3003,12 +3185,12 @@ fn get_agent_context_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_context_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3027,12 +3209,12 @@ fn get_agent_costs_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_costs_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3051,12 +3233,12 @@ fn get_agent_sessions_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_sessions_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3075,12 +3257,12 @@ fn get_agent_recommendations_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_recommendations_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3099,12 +3281,12 @@ fn get_agent_provider_impact_with_refresh(
         Ok(value) => Ok(value),
         Err(error) => {
             if matches!(&error, LocalApiError::Backend(details) if details.status == Some(401)) {
-                let refreshed_token =
+                let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
                 return get_agent_provider_impact_with_base(
                     api_base_url,
-                    connection,
-                    &refreshed_token,
+                    &refreshed.connection,
+                    &refreshed.setup_run_token,
                     query,
                 );
             }
@@ -3121,8 +3303,12 @@ fn disconnect_setup_run_with_refresh(
     match disconnect_setup_run_local_client(api_base_url, connection, setup_run_token) {
         Ok(response) => Ok(response),
         Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
-            let fresh_token = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-            disconnect_setup_run_local_client(api_base_url, connection, &fresh_token)
+            let refreshed = refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
+            disconnect_setup_run_local_client(
+                api_base_url,
+                &refreshed.connection,
+                &refreshed.setup_run_token,
+            )
         }
         Err(other) => Err(other),
     }
@@ -3154,28 +3340,39 @@ fn wait_for_verification_with_refresh(
     source: &SourceKind,
     smoke_after: &str,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
-    wait_for_setup_run_verification_with_refresh(
+    let mut credentials = SetupRunCredentials {
+        setup_run_token: setup_run_token.to_string(),
+        connection: connection.clone(),
+    };
+    wait_for_verification_with_refresh_mut(api_base_url, &mut credentials, source, smoke_after)
+}
+
+fn wait_for_verification_with_refresh_mut(
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    source: &SourceKind,
+    smoke_after: &str,
+) -> Result<SetupRunVerificationResponse, LocalApiError> {
+    wait_for_setup_run_verification_with_refresh_mut(
         api_base_url,
-        connection,
-        setup_run_token,
+        credentials,
         source,
         smoke_after,
         None,
     )
 }
 
-fn wait_for_setup_run_verification_with_refresh(
+fn wait_for_setup_run_verification_with_refresh_mut(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     source: &SourceKind,
     smoke_after: &str,
     filters: Option<&SetupRunVerificationFilters>,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
         wait_for_setup_run_verification_with_base(
             api_base_url,
-            connection,
+            active,
             token,
             source,
             smoke_after,
@@ -3186,18 +3383,17 @@ fn wait_for_setup_run_verification_with_refresh(
 
 fn publish_scan_result(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     scan: &SetupScanPayload,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/scan-result",
-            connection.setup_run_id
-        ),
-    );
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/scan-result",
+                active.setup_run_id
+            ),
+        );
         backend_post_json_with_timeout(
             &url,
             scan,
@@ -3209,18 +3405,10 @@ fn publish_scan_result(
 
 fn save_setup_answer(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     source: &SourceKind,
     answer_type: &str,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/answers",
-            connection.setup_run_id
-        ),
-    );
     let body = json!({
         "source": source_slug(source),
         "answer_type": answer_type,
@@ -3228,25 +3416,24 @@ fn save_setup_answer(
             "reason": "companion_setup_continue",
         },
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/answers",
+                active.setup_run_id
+            ),
+        );
         backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
     })
 }
 
 fn queue_setup_action(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     source: &SourceKind,
     action_type: &str,
 ) -> Result<SetupRunActionApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions",
-            connection.setup_run_id
-        ),
-    );
     let body = json!({
         "source": source_slug(source),
         "action_type": action_type,
@@ -3255,7 +3442,14 @@ fn queue_setup_action(
             "reason": "companion_setup_continue",
         },
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/actions",
+                active.setup_run_id
+            ),
+        );
         backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
     })
 }
@@ -3263,13 +3457,12 @@ fn queue_setup_action(
 fn process_setup_actions(
     daemon: &LocalDaemon,
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     machine: &MachineIdentity,
 ) -> Result<Vec<SetupActionResult>, LocalApiError> {
     let mut results = Vec::new();
     for _ in 0..8 {
-        let next = get_next_setup_action(api_base_url, connection, setup_run_token)?;
+        let next = get_next_setup_action(api_base_url, credentials)?;
         let Some(action) = next.action else {
             break;
         };
@@ -3277,8 +3470,7 @@ fn process_setup_actions(
         let source = source_slug.as_deref().and_then(source_from_slug);
         if let Err(error) = record_setup_action_event(
             api_base_url,
-            connection,
-            setup_run_token,
+            credentials,
             &action,
             SetupActionEvent {
                 event_type: "action.started",
@@ -3291,8 +3483,7 @@ fn process_setup_actions(
                 setup_action_execution_error_result(&action, source.as_ref(), &error);
             let detail = complete_setup_action(
                 api_base_url,
-                connection,
-                setup_run_token,
+                credentials,
                 &action,
                 &status,
                 &message,
@@ -3308,24 +3499,12 @@ fn process_setup_actions(
             continue;
         }
         let action_outcome = match action.action_type.as_str() {
-            "install_source" => run_install_source_action(
-                daemon,
-                api_base_url,
-                connection,
-                setup_run_token,
-                &action,
-                machine,
-            ),
+            "install_source" => {
+                run_install_source_action(daemon, api_base_url, credentials, &action, machine)
+            }
             "verify_source" => {
                 if let Some(source) = source.clone() {
-                    run_verify_source_action(
-                        daemon,
-                        api_base_url,
-                        connection,
-                        setup_run_token,
-                        &action,
-                        source,
-                    )
+                    run_verify_source_action(daemon, api_base_url, credentials, &action, source)
                 } else {
                     Ok((
                         "failed".to_string(),
@@ -3353,8 +3532,7 @@ fn process_setup_actions(
         };
         let detail = complete_setup_action(
             api_base_url,
-            connection,
-            setup_run_token,
+            credentials,
             &action,
             &status,
             &message,
@@ -3479,18 +3657,17 @@ struct SetupRunNextActionResponse {
 
 fn get_next_setup_action(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
 ) -> Result<SetupRunNextActionResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/next-action",
-            connection.setup_run_id
-        ),
-    );
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
-        heartbeat_setup_run(api_base_url, connection, token, "polling_next_action")?;
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/next-action",
+                active.setup_run_id
+            ),
+        );
+        heartbeat_setup_run(api_base_url, active, token, "polling_next_action")?;
         backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", token)])
     })
 }
@@ -3526,18 +3703,10 @@ fn heartbeat_setup_run(
 
 fn record_setup_action_event(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     event: SetupActionEvent<'_>,
 ) -> Result<(), LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions/{}/events",
-            connection.setup_run_id, action.id
-        ),
-    );
     let body = json!({
         "event_type": event.event_type,
         "status": event.status,
@@ -3546,7 +3715,14 @@ fn record_setup_action_event(
         "metadata": event.metadata,
     });
     let _: serde_json::Value =
-        setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+        setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/actions/{}/events",
+                    active.setup_run_id, action.id
+                ),
+            );
             backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
         })?;
     Ok(())
@@ -3561,26 +3737,25 @@ struct SetupActionEvent<'a> {
 
 fn complete_setup_action(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     status: &str,
     message: &str,
     result: serde_json::Value,
 ) -> Result<SetupRunDetailApiResponse, LocalApiError> {
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/actions/{}/complete",
-            connection.setup_run_id, action.id
-        ),
-    );
     let body = json!({
         "status": status,
         "message": message,
         "result": result,
     });
-    setup_run_request_with_refresh(api_base_url, connection, setup_run_token, |token| {
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/actions/{}/complete",
+                active.setup_run_id, action.id
+            ),
+        );
         backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
     })
 }
@@ -3588,8 +3763,7 @@ fn complete_setup_action(
 fn run_install_source_action(
     daemon: &LocalDaemon,
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     machine: &MachineIdentity,
 ) -> Result<(String, String, serde_json::Value), LocalApiError> {
@@ -3603,13 +3777,6 @@ fn run_install_source_action(
             }),
         ));
     };
-    let url = api_url_with_base(
-        api_base_url,
-        &format!(
-            "/api/v1/setup-runs/{}/local-client/install-sessions",
-            connection.setup_run_id
-        ),
-    );
     let body = json!({
         "action_id": action.id,
         "source": source,
@@ -3620,7 +3787,16 @@ fn run_install_source_action(
         "setup_origin": "companion_setup_run",
     });
     let install_session: InstallSessionApiResponse =
-        backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])?;
+        setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!(
+                    "/api/v1/setup-runs/{}/local-client/install-sessions",
+                    active.setup_run_id
+                ),
+            );
+            backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
+        })?;
     let Some(source_kind) = source_from_slug(source) else {
         return Ok((
             "failed".to_string(),
@@ -3669,7 +3845,7 @@ fn run_install_source_action(
                 .device
                 .machine_id
                 .clone()
-                .or_else(|| connection.machine_id.clone())
+                .or_else(|| credentials.connection.machine_id.clone())
                 .or_else(|| Some(machine.machine_id.clone())),
             sources: registered.device.sources.clone(),
         })
@@ -3848,7 +4024,12 @@ fn run_install_source_action(
                 device_id: Some(&device_id),
             },
         )?;
-        match emit_setup_run_verification_marker(api_base_url, &source_kind, connection, machine) {
+        match emit_setup_run_verification_marker(
+            api_base_url,
+            &source_kind,
+            &credentials.connection,
+            machine,
+        ) {
             Ok(marker_id) => {
                 record_install_session_event(
                     api_base_url,
@@ -5125,26 +5306,18 @@ fn claude_code_relay_env_with_base(
 fn run_verify_source_action(
     daemon: &LocalDaemon,
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
     source: SourceKind,
 ) -> Result<(String, String, serde_json::Value), LocalApiError> {
     if source == SourceKind::Pi {
-        return run_pi_verify_source_action(
-            daemon,
-            api_base_url,
-            connection,
-            setup_run_token,
-            action,
-        );
+        return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
     record_setup_action_event(
         api_base_url,
-        connection,
-        setup_run_token,
+        credentials,
         action,
         SetupActionEvent {
             event_type: "smoke.completed",
@@ -5187,13 +5360,8 @@ fn run_verify_source_action(
             }),
         ));
     }
-    let verification = wait_for_verification_with_refresh(
-        api_base_url,
-        connection,
-        setup_run_token,
-        &source,
-        &smoke_after,
-    )?;
+    let verification =
+        wait_for_verification_with_refresh_mut(api_base_url, credentials, &source, &smoke_after)?;
     let no_telemetry_code = no_fresh_telemetry_code(&source, &smoke);
     let verification_message = if verification.verified {
         format!(
@@ -5256,15 +5424,13 @@ fn run_verify_source_action(
 fn run_pi_verify_source_action(
     daemon: &LocalDaemon,
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
 ) -> Result<(String, String, serde_json::Value), LocalApiError> {
-    let result = run_pi_route_verification(api_base_url, connection, setup_run_token)?;
+    let result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
     record_setup_action_event(
         api_base_url,
-        connection,
-        setup_run_token,
+        credentials,
         action,
         SetupActionEvent {
             event_type: "smoke.completed",
@@ -5354,6 +5520,7 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
             program: "codex",
             args: vec![
                 "exec",
+                "--json",
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
@@ -5599,6 +5766,45 @@ fn import_new_pi_route_sessions(
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
     upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+}
+
+/// Upload local Pi session files modified at or after `since` for `route`. Used
+/// by the passive (no-live-smoke) subscription-OAuth verify path so a fresh user
+/// `pi` run is imported and counts as observed usage. This only UPLOADS existing
+/// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
+/// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
+/// verify from re-uploading the user's entire session history.
+fn import_recent_pi_route_sessions(
+    api_base_url: &str,
+    route: &PiModelRoute,
+    since: SystemTime,
+) -> Result<Option<serde_json::Value>, LocalApiError> {
+    let session_files = pi_session_files_modified_since(pi_session_files(), since);
+    if session_files.is_empty() {
+        return Ok(None);
+    }
+    let relay_token = issue_pi_relay_token(api_base_url)?;
+    upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+}
+
+/// Keep only session files whose on-disk mtime is at or after `since`. Files
+/// whose metadata can't be read are dropped (treated as not-recent), matching
+/// the conservative behavior of the live-import path. Pure helper so the mtime
+/// bound used by `import_recent_pi_route_sessions` is unit-testable without the
+/// relay-token / upload network calls.
+fn pi_session_files_modified_since(
+    files: impl IntoIterator<Item = PathBuf>,
+    since: SystemTime,
+) -> Vec<PathBuf> {
+    files
+        .into_iter()
+        .filter(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| modified >= since)
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -6638,7 +6844,9 @@ fn verify_source(
     }
 
     let status = status_for(daemon, authorization)?;
-    if status.account.state != LocalAccountState::Connected {
+    let recoverable_pending_account =
+        status.account.state == LocalAccountState::ClaimPending && status.account.user.is_some();
+    if status.account.state != LocalAccountState::Connected && !recoverable_pending_account {
         let result = verification_result_with_config(
             source,
             config,
@@ -6672,13 +6880,18 @@ fn verify_source(
         return Ok(result);
     };
 
-    let setup_run_token = match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
-        Ok(token) => token,
+    let setup_credentials = match setup_run_token_for_connection(
+        &connection.api_base_url,
+        &connection,
+    ) {
+        Ok(credentials) => {
+            if recoverable_pending_account {
+                daemon.clear_recoverable_pending_auth_for_authorized_client()?;
+            }
+            credentials
+        }
         Err(_) => {
-            match refresh_setup_run_token_via_device_secret(&connection.api_base_url, &connection) {
-                Ok(token) => token,
-                Err(_) => {
-                    let result = verification_result_with_config(
+            let result = verification_result_with_config(
                     source,
                     config,
                     SourceVerificationStatus::ReconnectRequired,
@@ -6690,12 +6903,12 @@ fn verify_source(
                     "setup_run_token_missing",
                     "This Mac's local Ottto connection needs a fresh sign-in. Use Sign in in the Ottto app, then try verifying again.",
                 );
-                    daemon.record_verification_result(&result)?;
-                    return Ok(result);
-                }
-            }
+            daemon.record_verification_result(&result)?;
+            return Ok(result);
         }
     };
+    let connection = setup_credentials.connection;
+    let setup_run_token = setup_credentials.setup_run_token;
 
     if source == SourceKind::Pi {
         let pi_token = setup_run_token.clone();
@@ -6708,10 +6921,10 @@ fn verify_source(
                         &connection.api_base_url,
                         &connection,
                     ) {
-                        Ok(fresh_token) => match run_pi_route_verification(
+                        Ok(refreshed) => match run_pi_route_verification(
                             &connection.api_base_url,
-                            &connection,
-                            &fresh_token,
+                            &refreshed.connection,
+                            &refreshed.setup_run_token,
                         ) {
                             Ok(retry) => retry,
                             Err(err) => verification_result_for_backend_error_with_config(
@@ -6850,6 +7063,17 @@ fn run_pi_route_verification(
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    let mut credentials = SetupRunCredentials {
+        setup_run_token: setup_run_token.to_string(),
+        connection: connection.clone(),
+    };
+    run_pi_route_verification_with_credentials(api_base_url, &mut credentials)
+}
+
+fn run_pi_route_verification_with_credentials(
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+) -> Result<SourceVerificationResult, LocalApiError> {
     let mut routes = read_pi_smoke_routes();
     if routes.is_empty() {
         routes.push(PiModelRoute {
@@ -6868,19 +7092,20 @@ fn run_pi_route_verification(
         });
     }
 
-    let route_results = routes
-        .iter()
-        .map(|route| {
-            run_one_pi_route_verification(api_base_url, connection, setup_run_token, route)
-        })
-        .collect::<Vec<_>>();
+    let mut route_results = Vec::new();
+    for route in &routes {
+        route_results.push(run_one_pi_route_verification(
+            api_base_url,
+            credentials,
+            route,
+        ));
+    }
     Ok(pi_route_aggregate_result(route_results))
 }
 
 fn run_one_pi_route_verification(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
     // A subscription-OAuth route (openai-codex / anthropic / github-copilot)
@@ -6892,12 +7117,7 @@ fn run_one_pi_route_verification(
     // re-auth Warning (not a hard smoke Failed) when none is fresh. Non-OAuth
     // routes (api_key / gateway / service_account) still run a live smoke.
     if route_is_subscription_oauth(route) {
-        return verify_pi_subscription_oauth_route_passively(
-            api_base_url,
-            connection,
-            setup_run_token,
-            route,
-        );
+        return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
     let before_session_files = pi_session_files();
@@ -6919,10 +7139,9 @@ fn run_one_pi_route_verification(
             billing_provider: route.classification.billing_provider.clone(),
         })
     };
-    match wait_for_setup_run_verification_with_refresh(
+    match wait_for_setup_run_verification_with_refresh_mut(
         api_base_url,
-        connection,
-        setup_run_token,
+        credentials,
         &SourceKind::Pi,
         &smoke_after,
         filters.as_ref(),
@@ -6970,11 +7189,24 @@ fn rfc3339_hours_ago(hours: u32) -> String {
 /// re-auth Warning (never a hard smoke failure); backend error -> error result.
 fn verify_pi_subscription_oauth_route_passively(
     api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
+    credentials: &mut SetupRunCredentials,
     route: &PiModelRoute,
 ) -> SourceRouteVerificationResult {
     let lookback = rfc3339_hours_ago(PI_PASSIVE_LOOKBACK_HOURS);
+    // Import recent local Pi sessions BEFORE polling so a fresh user `pi` run is
+    // uploaded and counts as observed usage — otherwise a valid OAuth route with
+    // real recent usage is mislabeled `pi_oauth_reauth_required` just because the
+    // local_sessions collector hasn't uploaded it yet. This only uploads existing
+    // transcripts (no live `pi`), so it can't burn the rotating OAuth token. The
+    // mtime bound matches the passive lookback window. Non-fatal on error.
+    let import_since = SystemTime::now()
+        .checked_sub(Duration::from_secs(
+            u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
+        ))
+        .unwrap_or(UNIX_EPOCH);
+    if let Err(error) = import_recent_pi_route_sessions(api_base_url, route, import_since) {
+        eprintln!("Pi passive route session import failed (non-fatal): {error}");
+    }
     let local_session_observed = Some(!pi_session_files().is_empty());
     let filters = if pi_route_is_unscoped(route) {
         None
@@ -6987,14 +7219,16 @@ fn verify_pi_subscription_oauth_route_passively(
     };
     // A single query is enough: no smoke runs, so polling for 60s can't make new
     // records appear — they either already exist in the lookback window or not.
-    match get_setup_run_verification_with_base(
-        api_base_url,
-        connection,
-        setup_run_token,
-        &SourceKind::Pi,
-        &lookback,
-        filters.as_ref(),
-    ) {
+    match setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        get_setup_run_verification_with_base(
+            api_base_url,
+            active,
+            token,
+            &SourceKind::Pi,
+            &lookback,
+            filters.as_ref(),
+        )
+    }) {
         Ok(verification) if verification.verified => pi_route_passive_result(
             route,
             SourceVerificationStatus::Verified,
@@ -8223,6 +8457,19 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[test]
+    fn manual_agent_status_upload_dispatch_returns_without_network_wait() {
+        let started = Instant::now();
+
+        upload_agent_status_snapshots_in_background(Vec::new());
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "manual upload dispatch blocked for {:?}",
+            started.elapsed()
+        );
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -8463,6 +8710,140 @@ mod tests {
                 .load()
                 .expect("load reset device"),
             None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_persists_rotated_relay_device_credentials() {
+        let support_root = telemetry_key_store_root("claim-complete-relay-device");
+        let secret_root = telemetry_key_store_root("claim-complete-relay-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+
+        persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
+            setup_run_id: "setup_claim".to_string(),
+            setup_run_token: "otsr_claim".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_claim".to_string()),
+            relay_device: Some(SetupClaimCompleteRelayDevice {
+                id: "device_claim".to_string(),
+                machine_id: None,
+                sources: vec![
+                    "claude_code".to_string(),
+                    "codex".to_string(),
+                    "pi".to_string(),
+                ],
+            }),
+            relay_device_secret: Some("otdev_rotated_claim".to_string()),
+            connected_at: "2026-05-05T09:20:00Z".to_string(),
+            user: SetupClaimCompleteUser {
+                id: "user_claim".to_string(),
+                email: "claim@example.com".to_string(),
+                display_name: None,
+            },
+            organization: SetupClaimCompleteOrganization {
+                id: "org_claim".to_string(),
+                name: "Claim Org".to_string(),
+            },
+        })
+        .expect("persist claim relay device");
+
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("load device")
+                .expect("device saved"),
+            LocalDeviceBinding {
+                device_id: "device_claim".to_string(),
+                machine_id: Some("machine_claim".to_string()),
+                sources: vec![
+                    "claude_code".to_string(),
+                    "codex".to_string(),
+                    "pi".to_string(),
+                ],
+            }
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("relay device secret saved"),
+            "otdev_rotated_claim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_request_includes_existing_relay_device_identity() {
+        let support_root = telemetry_key_store_root("claim-complete-request-device");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_existing_claim".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string(), "pi".to_string()],
+            })
+            .expect("persist existing relay device");
+
+        let captured_request = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+        let address = listener.local_addr().expect("claim backend address");
+        let captured_request_for_thread = captured_request.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept claim complete");
+            let request = read_complete_http_request(&mut stream);
+            *captured_request_for_thread
+                .lock()
+                .expect("captured request lock") = Some(request);
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_claim","setup_run_token":"otsr_claim","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_claim","email":"claim@example.com","display_name":null},"organization":{"id":"org_claim","name":"Claim Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_existing".to_string(),
+                claim_token: "token_existing".to_string(),
+                nonce: "nonce_existing".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+        )
+        .expect("complete setup claim");
+
+        let request = captured_request
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("request captured");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("claim request json");
+        assert_eq!(
+            body.get("relay_device_id")
+                .and_then(serde_json::Value::as_str),
+            Some("device_existing_claim")
+        );
+        assert_eq!(
+            body.get("relay_device_sources")
+                .and_then(serde_json::Value::as_array)
+                .map(|sources| sources
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()),
+            Some(vec!["codex", "pi"])
+        );
+        assert_eq!(
+            body.get("hardware_uuid"),
+            Some(&serde_json::Value::Null),
+            "claim completion must send hardware_uuid when known and null otherwise"
         );
     }
 
@@ -9005,7 +9386,7 @@ mod tests {
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("newer release manifest version"));
+            .contains("newer Ottto app"));
     }
 
     #[test]
@@ -10000,6 +10381,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_smoke_command_uses_json_event_mode_for_otel_flush() {
+        let command = smoke_command(&SourceKind::Codex);
+
+        assert_eq!(command.program, "codex");
+        assert!(command.args.iter().any(|arg| arg == "exec"));
+        assert!(command.args.iter().any(|arg| arg == "--json"));
+        assert!(command
+            .args
+            .iter()
+            .any(|arg| arg == "--skip-git-repo-check"));
+        assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
+    }
+
+    #[test]
     fn pi_smoke_command_includes_route_provider_model_and_thinking() {
         let route = PiModelRoute {
             provider: "google-vertex".to_string(),
@@ -10050,6 +10445,45 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_session_files_modified_since_filters_on_mtime() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-pi-recent-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        fs::create_dir_all(&root).expect("create session dir");
+        let session = root.join("session.jsonl");
+        fs::write(&session, "{}\n").expect("write session");
+        let modified = fs::metadata(&session)
+            .and_then(|metadata| metadata.modified())
+            .expect("read session mtime");
+
+        // A boundary just after the file's mtime excludes it...
+        let after = modified + Duration::from_secs(60);
+        assert!(
+            pi_session_files_modified_since([session.clone()], after).is_empty(),
+            "file older than `since` must be filtered out"
+        );
+
+        // ...and a boundary before (or equal to) the mtime includes it.
+        let before = modified - Duration::from_secs(60);
+        let included = pi_session_files_modified_since([session.clone()], before);
+        assert_eq!(included, vec![session.clone()]);
+        let at = pi_session_files_modified_since([session.clone()], modified);
+        assert_eq!(
+            at,
+            vec![session.clone()],
+            "mtime == since must be inclusive"
+        );
+
+        // Unreadable / missing paths are dropped, not panicked on.
+        let missing = root.join("does-not-exist.jsonl");
+        assert!(pi_session_files_modified_since([missing], before).is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10886,6 +11320,73 @@ log_user_prompt = true
 
     #[test]
     #[serial]
+    fn verify_json_exposes_canonical_health_failure() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-canonical-health");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let config_path = root.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[otel]
+log_user_prompt = true
+"#,
+        )
+        .expect("write drifted config");
+
+        let response = handle_request(
+            &daemon().with_account(connected_account()),
+            LocalControlRequest {
+                request_id: "req_verify_canonical".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: SourceKind::Codex,
+                    repair: false,
+                },
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(
+            payload.get("status").and_then(serde_json::Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            payload
+                .get("canonical_health")
+                .and_then(|health| health.get("overall"))
+                .and_then(|overall| overall.get("state"))
+                .and_then(serde_json::Value::as_str),
+            Some("blocked")
+        );
+        assert!(payload
+            .get("canonical_health")
+            .and_then(|health| health.get("blockers"))
+            .and_then(serde_json::Value::as_array)
+            .expect("blockers array")
+            .iter()
+            .any(
+                |blocker| blocker.get("code").and_then(serde_json::Value::as_str)
+                    == Some("config_drift")
+            ));
+        assert!(payload
+            .get("local_health_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("events array")
+            .iter()
+            .any(
+                |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("VerifyFailed")
+            ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
     fn verify_patch_disabled_skips_repair_writes() {
         let _lock = lock_backend_test_env();
         let root = control_test_root("verify-patch-disabled");
@@ -11391,6 +11892,253 @@ log_user_prompt = true
     }
 
     #[test]
+    #[serial]
+    fn verify_refreshes_recoverable_pending_account_before_requiring_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-pending-account-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-pending-account-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        let api_base_url = verify_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_refresh".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: Some("claim_existing".to_string()),
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        daemon
+            .begin_auth_with_claim(PendingAuthClaim {
+                claim_code: "claim_refresh".to_string(),
+                claim_token: "token_refresh".to_string(),
+                nonce: "nonce_refresh".to_string(),
+                claim_url: "https://ottto.net/apps/setup?code=claim_refresh".to_string(),
+                expires_at: "2026-05-05T10:05:00Z".to_string(),
+            })
+            .expect("start recoverable pending auth");
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should refresh setup token");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load refreshed setup token"),
+            "otsr_verify_fresh"
+        );
+        assert_eq!(
+            daemon
+                .status_for_trusted_client()
+                .expect("status")
+                .account
+                .state,
+            LocalAccountState::Connected
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_refreshes_invalid_stored_setup_token_before_requiring_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-invalid-token-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-invalid-token-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_stale_verify")
+            .expect("persist stale setup token");
+        let api_base_url = verify_invalid_token_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_refresh".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should refresh invalid stored setup token");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load refreshed setup token"),
+            "otsr_verify_fresh"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_uses_rebound_setup_run_after_token_refresh() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-rebound-token-refresh");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("verify-rebound-token-refresh-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        create_control_test_dir(&root.join(".codex"));
+        let fake_codex = fake_binary_path(&root, "codex");
+        fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex smoke");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("mark fake codex executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let _path_guard = EnvVarGuard::set_os(
+            "PATH",
+            fake_codex
+                .parent()
+                .expect("fake binary parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+        patch_codex_config_at_with_relay_base(
+            &root.join(".codex/config.toml"),
+            &support_root,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("seed clean config");
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_stale_verify")
+            .expect("persist stale setup token");
+        let api_base_url = verify_rebound_token_refresh_backend();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_verify_stale".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("verification should retry against rebound setup run");
+
+        assert_eq!(result.status, SourceVerificationStatus::Verified);
+        assert!(result.verified);
+        assert_eq!(result.message.code, "verified");
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load rebound connection")
+                .expect("connection saved")
+                .setup_run_id,
+            "setup_verify_rebound"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn backend_cli_error_message_omits_endpoint_details() {
         let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -11762,14 +12510,13 @@ log_user_prompt = true
             .with_account(connected_account())
             .with_connection(Some(connection.clone()));
 
-        let results = process_setup_actions(
-            &daemon,
-            &api_base_url,
-            &connection,
-            "otsr_test",
-            &test_machine(),
-        )
-        .expect("setup action should complete as failed instead of wedging");
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_test".to_string(),
+            connection,
+        };
+        let results =
+            process_setup_actions(&daemon, &api_base_url, &mut credentials, &test_machine())
+                .expect("setup action should complete as failed instead of wedging");
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].action_type, "verify_source");
@@ -11842,18 +12589,224 @@ log_user_prompt = true
             claim_code: None,
             api_base_url: api_base_url.clone(),
         };
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_test".to_string(),
+            connection,
+        };
 
         let started = Instant::now();
         let detail = publish_scan_result(
             &api_base_url,
-            &connection,
-            "otsr_test",
+            &mut credentials,
             &minimal_setup_scan_payload(),
         )
         .expect("scan-result POST should use setup-specific timeout");
 
         assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
         assert_eq!(detail.run.id, "setup_slow_scan");
+    }
+
+    #[test]
+    #[serial]
+    fn install_source_action_uses_rebound_credentials_for_install_session_and_completion() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("install-source-rebound-credentials");
+        let support_root = root.join("support");
+        let secret_root = telemetry_key_store_root("install-source-rebound-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_existing".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["pi".to_string()],
+            })
+            .expect("persist existing relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_existing")
+            .expect("persist relay device secret");
+        KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+            .save("otsr_install_stale")
+            .expect("persist stale setup token");
+        let install_session_request = Arc::new(Mutex::new(None));
+        let completed_body = Arc::new(Mutex::new(None));
+        let api_base_url = setup_install_source_rebind_server(
+            install_session_request.clone(),
+            completed_body.clone(),
+        );
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_install_stale".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist stale connection binding");
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_install_stale".to_string(),
+            connection: connection.clone(),
+        };
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+
+        let results =
+            process_setup_actions(&daemon, &api_base_url, &mut credentials, &test_machine())
+                .expect("install_source should refresh, rebind, and complete");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].action_type, "install_source");
+        assert_eq!(results[0].source.as_deref(), Some("pi"));
+        assert_eq!(results[0].status, "succeeded");
+        assert_eq!(credentials.connection.setup_run_id, "setup_install_fresh");
+        assert_eq!(credentials.setup_run_token, "otsr_install_fresh");
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("load rebound connection")
+                .expect("connection saved")
+                .setup_run_id,
+            "setup_install_fresh"
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("load refreshed setup token"),
+            "otsr_install_fresh"
+        );
+        let install_request = install_session_request
+            .lock()
+            .expect("install request lock")
+            .clone()
+            .expect("install session request observed");
+        assert!(install_request
+            .contains("/api/v1/setup-runs/setup_install_fresh/local-client/install-sessions"));
+        assert!(install_request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh"));
+        assert!(!install_request.contains("setup_install_stale"));
+        assert!(!install_request.contains("otsr_install_stale"));
+        let body_guard = completed_body.lock().expect("completed body lock");
+        let body = body_guard.as_ref().expect("complete body observed");
+        assert_eq!(
+            body.get("status").and_then(serde_json::Value::as_str),
+            Some("succeeded")
+        );
+        let result = body.get("result").expect("completion result");
+        assert_eq!(
+            result
+                .get("install_session_id")
+                .and_then(serde_json::Value::as_str),
+            Some("install_session_fresh")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn setup_install_source_rebind_server(
+        install_session_request: Arc<Mutex<Option<String>>>,
+        completed_body: Arc<Mutex<Option<serde_json::Value>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind install source backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let mut next_action_calls = 0_u8;
+            for _ in 0..24 {
+                let (mut stream, _) = listener.accept().expect("accept setup install request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/api/v1/setup-runs/setup_install_stale/local-client/heartbeat")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_stale")
+                {
+                    write_json_response(
+                        &mut stream,
+                        401,
+                        "Unauthorized",
+                        r#"{"detail":"Setup run companion token expired"}"#,
+                    );
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_stale/local-client/refresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_id":"setup_install_fresh","setup_run_token":"otsr_install_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_fresh/local-client/heartbeat")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh")
+                {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_fresh/local-client/next-action")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh")
+                {
+                    let body = if next_action_calls == 0 {
+                        r#"{"action":{"id":"action_install_pi","action_type":"install_source","source":"pi"}}"#
+                    } else {
+                        r#"{"action":null}"#
+                    };
+                    next_action_calls += 1;
+                    write_json_response(&mut stream, 200, "OK", body);
+                    if next_action_calls > 1 {
+                        break;
+                    }
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_fresh/local-client/actions/action_install_pi/events")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh")
+                {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_fresh/local-client/install-sessions")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh")
+                {
+                    *install_session_request
+                        .lock()
+                        .expect("install request lock") = Some(request);
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"install_session_id":"install_session_fresh","install_session_token":"install_token_fresh"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/telemetry/devices/install-sessions/install_session_fresh/events",
+                ) && request.contains("X-Ottto-Install-Session-Token: install_token_fresh")
+                {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request.contains("/api/v1/telemetry/devices/register") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_secret_install"}"#,
+                    );
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_install_fresh/local-client/actions/action_install_pi/complete")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_install_fresh")
+                {
+                    let body: serde_json::Value =
+                        serde_json::from_str(http_request_body(&request)).expect("complete json");
+                    *completed_body.lock().expect("completed body lock") = Some(body);
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"run":{"id":"setup_install_fresh","status":"complete","machine_id":"machine_test"},"sources":[{"source":"pi","detected":true,"readiness_percent":100,"state":"verified","missing_fields":[]}],"next_action":null,"next_question":null}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"stale or unexpected setup install request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
     }
 
     fn setup_verify_action_token_refresh_server(
@@ -12027,6 +12980,139 @@ log_user_prompt = true
                         404,
                         "Not Found",
                         r#"{"detail":"unexpected setup action request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_refresh_backend() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected verify refresh request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_invalid_token_refresh_backend() -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind invalid verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else if request.contains("/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected invalid-token refresh request"}"#,
+                    );
+                }
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn verify_rebound_token_refresh_backend() -> String {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind rebound verify refresh backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept verify request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/refresh") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"setup_run_id":"setup_verify_rebound","setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
+                    );
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_verify_rebound/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"verified":true,"records_seen":1,"last_record_id":"rec_test","last_received_at":"2026-06-11T18:00:00Z","smoke_after":"2026-06-11T17:59:00Z"}"#,
+                    );
+                    break;
+                } else if request
+                    .contains("/api/v1/setup-runs/setup_verify_stale/local-client/verification")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"unexpected rebound-token refresh request"}"#,
                     );
                 }
             }
