@@ -23,8 +23,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(8);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
@@ -999,31 +999,31 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
         }
     });
 
-    let write_result = (|| -> Result<(), String> {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Codex app-server stdin was unavailable.".to_string())?;
-        let initialize = serde_json::json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "ottto_local_platform",
-                    "title": "Ottto Local Platform",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                    "optOutNotificationMethods": ["account/rateLimits/updated"]
-                }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Codex app-server stdin was unavailable.".to_string())?;
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 1,
+        "params": {
+            "clientInfo": {
+                "name": "ottto_local_platform",
+                "title": "Ottto Local Platform",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true,
+                "optOutNotificationMethods": ["account/rateLimits/updated"]
             }
-        });
-        let initialized = serde_json::json!({"method": "initialized"});
-        let read = serde_json::json!({
-            "method": "account/rateLimits/read",
-            "id": "ottto_rate_limits"
-        });
+        }
+    });
+    let initialized = serde_json::json!({"method": "initialized"});
+    let read = serde_json::json!({
+        "method": "account/rateLimits/read",
+        "id": "ottto_rate_limits"
+    });
+    let write_result = (|| -> Result<(), String> {
         for message in [initialize, initialized, read] {
             serde_json::to_writer(&mut stdin, &message)
                 .map_err(|_| "Codex app-server request serialization failed.".to_string())?;
@@ -1033,10 +1033,10 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
         }
         stdin
             .flush()
-            .map_err(|_| "Codex app-server request flush failed.".to_string())?;
-        Ok(())
+            .map_err(|_| "Codex app-server request flush failed.".to_string())
     })();
     if let Err(message) = write_result {
+        drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
         return Err(message);
@@ -1050,6 +1050,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
         match receiver.recv_timeout(remaining.min(Duration::from_millis(250))) {
             Ok(message) => {
                 if message.get("id").and_then(Value::as_str) == Some("ottto_rate_limits") {
+                    drop(stdin);
                     let _ = child.kill();
                     let _ = child.wait();
                     if message.get("error").is_some() {
@@ -1064,6 +1065,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
     Err("Codex app-server rate-limit read timed out.".to_string())
@@ -2978,17 +2980,14 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
         }
     };
 
+    let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+    let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
+
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = pipe.read_to_string(&mut stdout);
-                }
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
+                let stdout = join_pipe_reader(stdout_reader);
+                let stderr = join_pipe_reader(stderr_reader);
                 return CommandOutput {
                     command_found: true,
                     success: status.success(),
@@ -3000,6 +2999,8 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
                 return CommandOutput {
                     command_found: true,
                     success: false,
@@ -3011,6 +3012,8 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(_) => {
                 let _ = child.kill();
+                let _ = join_pipe_reader(stdout_reader);
+                let _ = join_pipe_reader(stderr_reader);
                 return CommandOutput {
                     command_found: true,
                     success: false,
@@ -3021,6 +3024,23 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
             }
         }
     }
+}
+
+fn spawn_pipe_reader<R>(mut pipe: R) -> thread::JoinHandle<String>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = String::new();
+        let _ = pipe.read_to_string(&mut output);
+        output
+    })
+}
+
+fn join_pipe_reader(reader: Option<thread::JoinHandle<String>>) -> String {
+    reader
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default()
 }
 
 fn executable_exists(program: &str) -> bool {
@@ -3050,6 +3070,116 @@ fn home_path(relative: &str) -> PathBuf {
 mod tests {
     use super::*;
     use ottto_core::ClaudeStatusLineRateLimitWindow;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_os(key: &'static str, value: OsString) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn run_command_capture_drains_large_stdout_before_waiting() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-command-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let executable = dir.join("large-output");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 200000 ]; do\n  printf x\n  i=$((i + 1))\ndone\n",
+        )
+        .expect("write executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+
+        let _guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+        let output = run_command_capture("large-output", &[], Duration::from_secs(5));
+
+        assert!(output.success, "{output:?}");
+        assert_eq!(output.stdout.len(), 200000);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial]
+    fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
+        let dir = std::env::temp_dir().join(format!("ottto-app-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let helper = dir.join("fake_codex.py");
+        std::fs::write(
+            &helper,
+            r#"import select
+import sys
+
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+
+for line in sys.stdin:
+    if '"id":1' in line:
+        print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
+    if "account/rateLimits/read" in line:
+        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if ready and sys.stdin.readline() == "":
+            sys.exit(0)
+        print('{"id":"ottto_rate_limits","result":{"rateLimitResetCredits":{"availableCount":2},"rateLimitsByLimitId":{},"rateLimits":{}}}', flush=True)
+        sys.exit(0)
+"#,
+        )
+        .expect("write helper");
+        let executable = dir.join("codex");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/python3 '{}' \"$@\"\n",
+                helper.display()
+            ),
+        )
+        .expect("write executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+
+        let _guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+        let value = call_codex_app_server_rate_limits().expect("rate limits");
+
+        assert_eq!(
+            value
+                .pointer("/rateLimitResetCredits/availableCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn codex_text_parser_extracts_account_model_quota_and_context() {
