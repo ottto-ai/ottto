@@ -49,7 +49,16 @@ pub fn kickstart_macos_launch_agent() -> Result<()> {
     let target = macos_launch_agent_target();
     run_launchctl(&["enable", &target])?;
     ensure_launch_agent_loaded(&domain, &target)?;
-    run_launchctl(&["kickstart", "-k", &target])
+    match run_launchctl(&["kickstart", "-k", &target]) {
+        Ok(()) => Ok(()),
+        Err(kickstart_error) => {
+            rebootstrap_launch_agent(&domain, &target).map_err(|rebootstrap_error| {
+                kickstart_error.context(format!(
+                    "rebootstrap after kickstart failure also failed: {rebootstrap_error:#}"
+                ))
+            })
+        }
+    }
 }
 
 fn ensure_launch_agent_loaded(domain: &str, target: &str) -> Result<()> {
@@ -64,6 +73,28 @@ fn ensure_launch_agent_loaded(domain: &str, target: &str) -> Result<()> {
         return Ok(());
     }
 
+    let plist = plist_path.display().to_string();
+    match run_launchctl(&["bootstrap", domain, &plist]) {
+        Ok(()) => Ok(()),
+        Err(_error) if wait_for_launch_agent_loaded(target) => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "bootstrap LaunchAgent {} into {domain}",
+                plist_path.display()
+            )
+        }),
+    }
+}
+
+fn rebootstrap_launch_agent(domain: &str, target: &str) -> Result<()> {
+    let Some(plist_path) = user_launch_agent_path() else {
+        anyhow::bail!("LaunchAgent plist path is unavailable");
+    };
+    if !plist_path.exists() {
+        anyhow::bail!("LaunchAgent plist is missing at {}", plist_path.display());
+    }
+
+    let _ = run_launchctl(&["bootout", target]);
     let plist = plist_path.display().to_string();
     match run_launchctl(&["bootstrap", domain, &plist]) {
         Ok(()) => Ok(()),
