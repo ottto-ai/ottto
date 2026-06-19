@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+// Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);

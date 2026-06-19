@@ -29,7 +29,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
-const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+// Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 const SNAPSHOT_BATCH_LIMIT: usize = 100;

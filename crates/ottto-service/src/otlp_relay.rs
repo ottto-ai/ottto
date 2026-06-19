@@ -26,7 +26,9 @@ pub const LOCAL_RELAY_HEADER: &str = "X-Ottto-Local-Relay";
 pub const CODEX_RELAY_SOURCE: &str = "codex";
 pub const CLAUDE_CODE_RELAY_SOURCE: &str = "claude_code";
 
-const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+// Direct API host. The apex `ottto.net/backend` proxy is retired with the
+// marketing-site cutover; paths append to this base identically.
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const LOCAL_RELAY_FALLBACK_BASE_PORT: u16 = 44120;
 const LOCAL_RELAY_FALLBACK_SPAN: u16 = 2000;
 const LOCAL_RELAY_FALLBACK_ATTEMPTS: u16 = 24;
@@ -583,8 +585,10 @@ fn cors_headers(origin: Option<&str>, allow_methods: &str) -> Vec<(String, Strin
 }
 
 fn is_allowed_control_origin(origin: &str) -> bool {
-    matches!(origin, "https://ottto.net" | "https://www.ottto.net")
-        || is_loopback_origin(origin, "http", "localhost")
+    matches!(
+        origin,
+        "https://ottto.net" | "https://www.ottto.net" | "https://app.ottto.net"
+    ) || is_loopback_origin(origin, "http", "localhost")
         || is_loopback_origin(origin, "http", "127.0.0.1")
         || is_loopback_origin(origin, "https", "localhost")
         || is_loopback_origin(origin, "https", "127.0.0.1")
@@ -1155,6 +1159,7 @@ mod tests {
     #[test]
     fn control_origin_allowlist_accepts_production_and_loopback_only() {
         assert!(is_allowed_control_origin("https://ottto.net"));
+        assert!(is_allowed_control_origin("https://app.ottto.net"));
         assert!(is_allowed_control_origin("http://localhost:3000"));
         assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
