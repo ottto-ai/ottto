@@ -78,6 +78,12 @@ enum ServiceCommand {
 }
 
 fn main() -> Result<()> {
+    // This is a background service: it must never block on an interactive
+    // keychain modal (e.g. "Keychain Not Found"). Disable Security UI for the
+    // whole process up front so a transient keychain failure logs and retries
+    // instead of stalling behind a dialog no user is present to answer.
+    ottto_core::disable_keychain_user_interaction();
+
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {

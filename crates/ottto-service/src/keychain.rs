@@ -435,8 +435,10 @@ fn save_keychain_secret(
 
     let service = telemetry_key_service(source)?;
     let _ = delete_keychain_secret(source, key_id);
-    set_generic_password(service, key_id, secret.as_bytes())
-        .map_err(|error| TelemetryKeychainError::Store(error.to_string()))
+    ottto_core::token_store::with_default_keychain_retry(|| {
+        set_generic_password(service, key_id, secret.as_bytes())
+    })
+    .map_err(|error| TelemetryKeychainError::Store(error.to_string()))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -459,7 +461,9 @@ fn load_keychain_secret(
     use security_framework_sys::base::errSecItemNotFound;
 
     let service = telemetry_key_service(source)?;
-    match get_generic_password(service, key_id) {
+    match ottto_core::token_store::with_default_keychain_retry(|| {
+        get_generic_password(service, key_id)
+    }) {
         Ok(bytes) => String::from_utf8(bytes).map_err(|_| TelemetryKeychainError::InvalidUtf8),
         Err(error) if error.code() == errSecItemNotFound => Err(TelemetryKeychainError::Missing),
         Err(error) => Err(TelemetryKeychainError::Store(error.to_string())),
@@ -483,7 +487,9 @@ fn delete_keychain_secret(
     use security_framework_sys::base::errSecItemNotFound;
 
     let service = telemetry_key_service(source)?;
-    match delete_generic_password(service, key_id) {
+    match ottto_core::token_store::with_default_keychain_retry(|| {
+        delete_generic_password(service, key_id)
+    }) {
         Ok(()) => Ok(true),
         Err(error) if error.code() == errSecItemNotFound => Ok(false),
         Err(error) => match keychain_delete_with_security_cli(service, key_id) {

@@ -221,6 +221,86 @@ impl ControlTokenStore for KeychainSecretStore {
     }
 }
 
+/// macOS `errSecNoSuchKeychain`. The Security framework hands a long-lived
+/// process a database session for the login keychain, but macOS atomically
+/// replaces `login.keychain-db` (a *new inode*) on every keychain write — by any
+/// app — which strands that session. Reads then fail with this status, and a
+/// store would pop a blocking "Keychain Not Found" modal. Re-resolving the
+/// default keychain and retrying once recovers in-process, without the daemon
+/// restart the local watchdog currently forces.
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_NO_SUCH_KEYCHAIN: i32 = -25294;
+
+/// Runs a keychain operation and, if it fails with `errSecNoSuchKeychain`,
+/// re-resolves the default keychain via `reresolve` and retries `op` exactly
+/// once. Success, or any other error (e.g. `errSecItemNotFound`), is returned
+/// unchanged — and the retry runs at most once, so a keychain that never
+/// recovers falls through to the file fallback instead of spinning. Kept generic
+/// and free of macOS types so the retry/re-resolve contract is unit-testable on
+/// every platform.
+#[cfg(any(target_os = "macos", test))]
+fn run_with_keychain_retry<T, E>(
+    mut op: impl FnMut() -> Result<T, E>,
+    is_missing_keychain: impl Fn(&E) -> bool,
+    mut reresolve: impl FnMut(),
+) -> Result<T, E> {
+    match op() {
+        Err(error) if is_missing_keychain(&error) => {
+            reresolve();
+            op()
+        }
+        other => other,
+    }
+}
+
+/// Disables interactive Security UI for this process. A background daemon must
+/// never block on a keychain modal (the "Keychain Not Found — A keychain cannot
+/// be found to store …" dialog, whose "Reset To Defaults" button is destructive);
+/// a transient failure has to log and retry instead. Process-global and
+/// idempotent: the service calls this once at startup and every keychain call on
+/// every thread then inherits it. The interactive CLI deliberately does not call
+/// it, so its keychain prompts (where a human is present) are preserved.
+#[cfg(target_os = "macos")]
+pub fn disable_keychain_user_interaction() {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<()> = OnceLock::new();
+    DISABLED.get_or_init(|| unsafe {
+        // Boolean(0) == false. Best-effort: ignore the OSStatus — even if this
+        // ever fails we still want a logged keychain error over a blocking modal.
+        let _ = security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn disable_keychain_user_interaction() {}
+
+/// Re-resolves the process default keychain so the next call binds to the
+/// *current* `login.keychain-db` rather than the stranded session described on
+/// [`ERR_SEC_NO_SUCH_KEYCHAIN`]. `SecKeychain::default()` performs a fresh
+/// `SecKeychainCopyDefault`; the handle drops immediately — we never cache a
+/// `SecKeychainRef` across operations.
+#[cfg(target_os = "macos")]
+fn reresolve_default_keychain() {
+    use security_framework::os::macos::keychain::SecKeychain;
+    let _ = SecKeychain::default();
+}
+
+/// Runs a keychain `op`, re-resolving the default keychain and retrying once if
+/// it reports `errSecNoSuchKeychain`. Shared by the control-token, setup-run, and
+/// relay-device-secret stores here and by the telemetry key store in
+/// `ottto-service`. The caller keeps its own error mapping (e.g.
+/// `errSecItemNotFound` → "missing") by inspecting the returned error.
+#[cfg(target_os = "macos")]
+pub fn with_default_keychain_retry<T>(
+    op: impl FnMut() -> security_framework::base::Result<T>,
+) -> security_framework::base::Result<T> {
+    run_with_keychain_retry(
+        op,
+        |error| error.code() == ERR_SEC_NO_SUCH_KEYCHAIN,
+        reresolve_default_keychain,
+    )
+}
+
 #[cfg(target_os = "macos")]
 const KEYCHAIN_OPERATION_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -250,13 +330,15 @@ fn keychain_load(account: &'static str) -> Result<String, TokenStoreError> {
     use security_framework::passwords::get_generic_password;
     use security_framework_sys::base::errSecItemNotFound;
 
-    let bytes = match get_generic_password(OTTTO_KEYCHAIN_SERVICE, account) {
-        Ok(bytes) => bytes,
-        Err(error) if error.code() == errSecItemNotFound => {
-            return Err(TokenStoreError::Missing);
-        }
-        Err(error) => return Err(TokenStoreError::Store(error.to_string())),
-    };
+    let bytes =
+        match with_default_keychain_retry(|| get_generic_password(OTTTO_KEYCHAIN_SERVICE, account))
+        {
+            Ok(bytes) => bytes,
+            Err(error) if error.code() == errSecItemNotFound => {
+                return Err(TokenStoreError::Missing);
+            }
+            Err(error) => return Err(TokenStoreError::Store(error.to_string())),
+        };
     String::from_utf8(bytes).map_err(|_| TokenStoreError::InvalidUtf8)
 }
 
@@ -264,8 +346,10 @@ fn keychain_load(account: &'static str) -> Result<String, TokenStoreError> {
 fn keychain_save(account: &'static str, token: &str) -> Result<(), TokenStoreError> {
     use security_framework::passwords::set_generic_password;
 
-    set_generic_password(OTTTO_KEYCHAIN_SERVICE, account, token.as_bytes())
-        .map_err(|error| TokenStoreError::Store(error.to_string()))
+    with_default_keychain_retry(|| {
+        set_generic_password(OTTTO_KEYCHAIN_SERVICE, account, token.as_bytes())
+    })
+    .map_err(|error| TokenStoreError::Store(error.to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -273,7 +357,7 @@ fn keychain_delete(account: &'static str) -> Result<(), TokenStoreError> {
     use security_framework::passwords::delete_generic_password;
     use security_framework_sys::base::errSecItemNotFound;
 
-    match delete_generic_password(OTTTO_KEYCHAIN_SERVICE, account) {
+    match with_default_keychain_retry(|| delete_generic_password(OTTTO_KEYCHAIN_SERVICE, account)) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == errSecItemNotFound => Ok(()),
         Err(error) => match keychain_delete_with_security_cli(account) {
@@ -714,5 +798,84 @@ mod tests {
             Some(1),
             b"permission denied"
         ));
+    }
+
+    #[test]
+    fn keychain_retry_reresolves_once_then_succeeds_on_missing_keychain() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // First call hits the stranded login-keychain session (errSecNoSuchKeychain);
+        // the second, after re-resolving the default keychain, succeeds.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Err(ERR_SEC_NO_SUCH_KEYCHAIN)
+                } else {
+                    Ok("relay-device-secret")
+                }
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Ok("relay-device-secret"));
+        assert_eq!(
+            attempts.get(),
+            2,
+            "must retry exactly once after re-resolve"
+        );
+        assert_eq!(
+            reresolves.get(),
+            1,
+            "the default keychain must be re-resolved before the retry"
+        );
+    }
+
+    #[test]
+    fn keychain_retry_does_not_retry_unrelated_errors() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // errSecItemNotFound (-25300) means the item is genuinely absent, not a
+        // stranded keychain handle: surface it immediately, no re-resolve.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(-25300)
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Err(-25300));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(reresolves.get(), 0);
+    }
+
+    #[test]
+    fn keychain_retry_gives_up_after_a_single_retry() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u32);
+        let reresolves = Cell::new(0_u32);
+        // A keychain that never recovers must not spin: re-resolve once, retry
+        // once, then return the error so the file fallback can take over.
+        let result: Result<&str, i32> = run_with_keychain_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(ERR_SEC_NO_SUCH_KEYCHAIN)
+            },
+            |code| *code == ERR_SEC_NO_SUCH_KEYCHAIN,
+            || reresolves.set(reresolves.get() + 1),
+        );
+
+        assert_eq!(result, Err(ERR_SEC_NO_SUCH_KEYCHAIN));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(reresolves.get(), 1);
     }
 }

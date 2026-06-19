@@ -38,8 +38,8 @@ pub use status::{
     release_channel_from_str,
 };
 pub use token_store::{
-    client_control_token, generate_control_token, load_or_create_control_token, ControlTokenStore,
-    KeychainSecretStore, TokenStoreError, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE,
-    OTTTO_LEGACY_KEYCHAIN_SERVICE, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    client_control_token, disable_keychain_user_interaction, generate_control_token,
+    load_or_create_control_token, ControlTokenStore, KeychainSecretStore, TokenStoreError,
+    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
+    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
