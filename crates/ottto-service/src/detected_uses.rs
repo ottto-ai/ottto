@@ -328,6 +328,7 @@ mod tests {
             cache_creation_5m_tokens: 0,
             cache_creation_1h_tokens: 0,
             reasoning_output_tokens: 0,
+            reasoning_effort: None,
             unattributed_total_tokens: 0,
             request_count: 1,
             selector_context,
