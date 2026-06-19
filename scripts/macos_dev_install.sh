@@ -128,6 +128,43 @@ cleanup_legacy_service() {
   rm -f "$legacy_target" "$legacy_plist"
 }
 
+canonical_app_path() {
+  local path="$1"
+  local parent
+  local base
+  parent="$(dirname "$path")"
+  base="$(basename "$path")"
+  if [[ -d "$parent" ]]; then
+    (cd -P "$parent" && printf '%s/%s\n' "$(pwd)" "$base")
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+unregister_duplicate_companion_apps() {
+  local app_target="$1"
+  local lsregister="$2"
+  local target_path
+  local candidate
+  local candidate_path
+  local bundle_id
+
+  if ! command -v mdfind >/dev/null 2>&1 || ! command -v plutil >/dev/null 2>&1; then
+    return 0
+  fi
+
+  target_path="$(canonical_app_path "$app_target")"
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" && -d "$candidate" ]] || continue
+    [[ -f "$candidate/Contents/Info.plist" ]] || continue
+    candidate_path="$(canonical_app_path "$candidate")"
+    [[ "$candidate_path" != "$target_path" ]] || continue
+    bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$candidate/Contents/Info.plist" 2>/dev/null || true)"
+    [[ "$bundle_id" == "net.ottto.Companion" ]] || continue
+    "$lsregister" -u "$candidate" >/dev/null 2>&1 || true
+  done < <(mdfind 'kMDItemCFBundleIdentifier == "net.ottto.Companion"' 2>/dev/null || true)
+}
+
 register_installed_app() {
   local app_target="$1"
   local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
@@ -137,6 +174,7 @@ register_installed_app() {
     return 0
   fi
 
+  unregister_duplicate_companion_apps "$app_target" "$lsregister"
   if ! "$lsregister" -f "$app_target" >/dev/null 2>&1; then
     echo "Warning: failed to register $app_target with LaunchServices; ottto:// links may require opening the app once." >&2
   fi
