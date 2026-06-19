@@ -56,8 +56,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table};
 
-const DEFAULT_API_BASE_URL: &str = "https://ottto.net/backend";
+// Direct API host (was the apex `ottto.net/backend` proxy, retired in the
+// marketing-site cutover). Matches DIRECT_API_BASE_URL below.
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
+// Legacy apex proxy base persisted by daemons installed before the marketing
+// cutover. Still trusted/recognized so existing installs keep ingesting until
+// they re-onboard onto the direct api.ottto.net base.
+const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -5956,6 +5962,8 @@ fn is_trusted_otlp_endpoint(value: &str) -> bool {
         || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
         || value == DIRECT_API_BASE_URL
         || value.starts_with(&format!("{DIRECT_API_BASE_URL}/"))
+        || value == LEGACY_API_BASE_URL
+        || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
         || has_loopback_http_origin(value, "localhost")
         || has_loopback_http_origin(value, "127.0.0.1")
 }
@@ -6682,8 +6690,10 @@ fn is_production_api_base_url(value: &str) -> bool {
     }
     value == DEFAULT_API_BASE_URL
         || value == DIRECT_API_BASE_URL
+        || value == LEGACY_API_BASE_URL
         || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
         || value.starts_with(&format!("{DIRECT_API_BASE_URL}/"))
+        || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
 }
 
 fn is_trusted_api_base_url(value: &str) -> bool {
@@ -6693,6 +6703,8 @@ fn is_trusted_api_base_url(value: &str) -> bool {
 
     value == DEFAULT_API_BASE_URL
         || value == DIRECT_API_BASE_URL
+        || value == LEGACY_API_BASE_URL
+        || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"))
         || value.starts_with("http://localhost")
         || value.starts_with("http://127.0.0.1")
 }
