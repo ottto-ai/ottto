@@ -33,7 +33,8 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // context)" window are attributed separately (see
 // CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS). The per-row selector shape
 // changed, so the bump re-walks every Claude session once to re-emit at v8.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v16";
+// v17: Codex per-model usage now carries per-turn reasoning_effort
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v8";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
@@ -238,6 +239,8 @@ pub struct SnapshotModelUsage {
     pub cache_creation_5m_tokens: u64,
     pub cache_creation_1h_tokens: u64,
     pub reasoning_output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
@@ -545,6 +548,10 @@ struct BucketRowAccumulator {
     selector_context: BTreeMap<String, String>,
     selector_sources: BTreeMap<String, String>,
     usage: UsageTotals,
+    // Per-turn reasoning effort tier (Codex). "First non-empty wins" — set on
+    // first insert, only filled on merge when still absent. Deliberately NOT a
+    // RowKey dimension, so it never affects row identity/dedup.
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -585,6 +592,10 @@ struct SnapshotAccumulator {
     last_activity_at: Option<String>,
     workspace_hash: Option<String>,
     latest_model: Option<String>,
+    // Most-recently-observed Codex per-turn reasoning effort tier. Updated as
+    // lines stream past so the next usage row picks up the effort co-located
+    // with that turn's token_count.
+    latest_reasoning_effort: Option<String>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     usage_buckets: BTreeMap<String, UsageBucketState>,
@@ -622,6 +633,7 @@ impl SnapshotAccumulator {
             last_activity_at: None,
             workspace_hash: None,
             latest_model: None,
+            latest_reasoning_effort: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             usage_buckets: BTreeMap::new(),
@@ -761,6 +773,7 @@ impl SnapshotAccumulator {
         usage: UsageTotals,
         selector: SelectorCapture,
         timestamp: Option<&str>,
+        effort: Option<String>,
     ) {
         if usage.is_zero() {
             return;
@@ -797,6 +810,11 @@ impl SnapshotAccumulator {
                     row.selector_sources.insert(field, source);
                 }
                 row.usage.add(&usage);
+                // First non-empty wins: only adopt the incoming effort when the
+                // row has not yet captured one.
+                if row.reasoning_effort.is_none() {
+                    row.reasoning_effort = effort;
+                }
             }
             None => {
                 bucket.rows.insert(
@@ -805,6 +823,7 @@ impl SnapshotAccumulator {
                         selector_context: reduced_context,
                         selector_sources: reduced_sources,
                         usage,
+                        reasoning_effort: effort,
                     },
                 );
             }
@@ -824,6 +843,8 @@ impl SnapshotAccumulator {
         // request count. v5 implemented this via a separate note_activity
         // call; v6 folds it in here so the row totals reconcile.
         implicit_request_count: Option<u64>,
+        // Per-turn reasoning effort tier (Codex), attached to the same usage row.
+        effort: Option<String>,
     ) -> Option<UsageTotals> {
         if usage.is_zero() {
             return None;
@@ -852,7 +873,13 @@ impl SnapshotAccumulator {
         if delta.is_zero() {
             return None;
         }
-        self.add_usage_with_selector(Some(resolved_model), delta.clone(), selector, timestamp);
+        self.add_usage_with_selector(
+            Some(resolved_model),
+            delta.clone(),
+            selector,
+            timestamp,
+            effort,
+        );
         Some(delta)
     }
 
@@ -984,6 +1011,10 @@ fn merge_session_row(
                 existing.selector_sources.insert(field, source);
             }
             existing.usage.add(&row.usage);
+            // First non-empty wins across the session aggregation too.
+            if existing.reasoning_effort.is_none() {
+                existing.reasoning_effort = row.reasoning_effort;
+            }
         }
         None => {
             session_rows.insert(row_key, row);
@@ -1000,6 +1031,7 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
         cache_creation_5m_tokens: row.usage.cache_creation_5m_tokens,
         cache_creation_1h_tokens: row.usage.cache_creation_1h_tokens,
         reasoning_output_tokens: row.usage.reasoning_output_tokens,
+        reasoning_effort: row.reasoning_effort.clone(),
         unattributed_total_tokens: row.usage.unattributed_total_tokens,
         request_count: row.usage.request_count,
         selector_context: row.selector_context.clone(),
@@ -1306,6 +1338,7 @@ fn codex_state_only_snapshot(
         cache_creation_5m_tokens: 0,
         cache_creation_1h_tokens: 0,
         reasoning_output_tokens: 0,
+        reasoning_effort: None,
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
         selector_context: BTreeMap::new(),
@@ -2015,6 +2048,9 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     );
     let selector = codex_selector_from_line(value);
     accumulator.set_selector(selector.clone());
+    if let Some(effort) = codex_reasoning_effort(value) {
+        accumulator.latest_reasoning_effort = Some(effort);
+    }
     if let Some(usage) = codex_total_usage(value) {
         // Codex cumulative totals carry request_count as a session-wide count.
         // When the field is missing the parser defaults it to 1 so deltas
@@ -2035,6 +2071,7 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             selector,
             timestamp.as_deref(),
             implicit_request_count,
+            accumulator.latest_reasoning_effort.clone(),
         );
     }
     // Per-turn latency from the rollout `task_complete` event. Codex emits
@@ -2256,6 +2293,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             usage,
             selector,
             timestamp.as_deref(),
+            // Claude Code surfaces per-turn effort via OTLP, not this snapshot path.
+            None,
         );
     }
     // Artifact scraping clones and tokenizes every tool-result blob on the
@@ -2540,7 +2579,14 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(usage) = pi_message_end_usage(value) {
                 let mut selector = accumulator.current_selector.clone();
                 selector.merge(pi_selector_from_message_end(value));
-                accumulator.add_usage_with_selector(model, usage, selector, timestamp.as_deref());
+                accumulator.add_usage_with_selector(
+                    model,
+                    usage,
+                    selector,
+                    timestamp.as_deref(),
+                    // Pi does not emit a per-turn reasoning effort tier.
+                    None,
+                );
             }
             accumulator.note_time(timestamp);
         }
@@ -3499,6 +3545,46 @@ fn string_eq_at(value: &Value, path: &[&str], expected: &str) -> bool {
     string_at(value, path).is_some_and(|value| value == expected)
 }
 
+// Per-turn Codex reasoning effort tier. Codex emits it co-located with the
+// turn's `total_token_usage` (token_count.info / payload.info) and also on the
+// `turn_context` payload (directly as `effort` or nested under
+// collaboration_mode.settings.reasoning_effort). Read the usage-co-located form
+// first so the effort attaches to the same turn's usage row.
+fn codex_reasoning_effort(value: &Value) -> Option<String> {
+    string_at(value, &["token_count", "info", "reasoning_effort"])
+        .or_else(|| string_at(value, &["payload", "info", "reasoning_effort"]))
+        .or_else(|| string_at(value, &["turn_context", "payload", "effort"]))
+        .or_else(|| string_at(value, &["payload", "effort"]))
+        .or_else(|| {
+            string_at(
+                value,
+                &[
+                    "turn_context",
+                    "payload",
+                    "collaboration_mode",
+                    "settings",
+                    "reasoning_effort",
+                ],
+            )
+        })
+        // Rollout `turn_context` lines carry `payload` at the top level (no
+        // wrapping `turn_context` key) — mirror how the model field is read via
+        // both `turn_context.payload.model` and the unwrapped `payload.model`.
+        .or_else(|| {
+            string_at(
+                value,
+                &[
+                    "payload",
+                    "collaboration_mode",
+                    "settings",
+                    "reasoning_effort",
+                ],
+            )
+        })
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn u64_at(value: &Value, path: &[&str]) -> Option<u64> {
     let mut current = value;
     for key in path {
@@ -3808,7 +3894,7 @@ mod tests {
                 "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-1f58-7580-afe7-e8d4f969b0f7\"}}\n",
                 "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_name_updated\",\"thread_id\":\"019dfb9a-1f58-7580-afe7-e8d4f969b0f7\",\"thread_name\":\"Improve sessions UI\"}}\n",
                 "{\"timestamp\":\"2026-05-06T10:02:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\",\"cwd\":\"/Users/example/work\"}}\n",
-                "{\"timestamp\":\"2026-05-06T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":40,\"output_tokens\":25,\"reasoning_output_tokens\":7,\"request_count\":3},\"model_context_window\":258400},\"rate_limits\":{\"limit_id\":\"codex\"}}}\n"
+                "{\"timestamp\":\"2026-05-06T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"reasoning_effort\":\"high\",\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":40,\"output_tokens\":25,\"reasoning_output_tokens\":7,\"request_count\":3},\"model_context_window\":258400},\"rate_limits\":{\"limit_id\":\"codex\"}}}\n"
             ),
         )
         .expect("write fixture");
@@ -3850,6 +3936,16 @@ mod tests {
         assert_eq!(bucket.model_usage.len(), 1);
         assert_eq!(bucket.model_usage[0].request_count, 3);
         assert_eq!(item.model_usage[0].model, "gpt-5.5");
+        // Per-turn reasoning effort tier rides on the model_usage row (item-level
+        // aggregate and per-bucket row both carry it).
+        assert_eq!(
+            item.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            bucket.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
             Some("inclusive_cached")
@@ -5020,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_reads_nested_selector_aliases_without_reasoning_effort() {
+    fn codex_parser_reads_nested_selector_aliases_and_captures_reasoning_effort() {
         let path = temp_file("codex-selector-aliases");
         fs::write(
             &path,
@@ -5058,6 +5154,75 @@ mod tests {
                 .map(String::as_str),
             Some("payload.info.actual_service_tier")
         );
+        // The per-turn reasoning_effort co-located with total_token_usage is now
+        // captured onto the usage row (previously dropped).
+        assert_eq!(
+            item.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_captures_max_reasoning_effort_round_trip() {
+        let path = temp_file("codex-effort-max");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-555555555555\"}}\n",
+                "{\"timestamp\":\"2026-05-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\"}}\n",
+                "{\"timestamp\":\"2026-05-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"reasoning_effort\":\"max\",\"total_token_usage\":{\"input_tokens\":50,\"output_tokens\":12,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-20T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("max"));
+        // Round-trips through serde under the exact wire key the backend reads.
+        let value = serde_json::to_value(&item.model_usage[0]).expect("serialize row");
+        assert_eq!(value["reasoning_effort"], json!("max"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_reads_reasoning_effort_from_turn_context_collaboration_mode() {
+        // No usage-co-located effort; falls back to the turn_context
+        // collaboration_mode.settings.reasoning_effort path. The turn_context
+        // line precedes the token_count line so latest_reasoning_effort is set
+        // before the usage row is built.
+        let path = temp_file("codex-effort-collab");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-cafe-7000-9000-666666666666\"}}\n",
+                "{\"timestamp\":\"2026-05-21T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.5\",\"collaboration_mode\":{\"settings\":{\"reasoning_effort\":\"low\"}}}}\n",
+                "{\"timestamp\":\"2026-05-21T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-21T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("low"));
 
         let _ = fs::remove_file(path);
     }
@@ -6335,6 +6500,7 @@ mod tests {
             "cache_creation_5m_tokens",
             "cache_creation_1h_tokens",
             "reasoning_output_tokens",
+            "reasoning_effort",
             "unattributed_total_tokens",
             "request_count",
             "selector_context",
@@ -6364,6 +6530,7 @@ mod tests {
             cache_creation_5m_tokens: 5,
             cache_creation_1h_tokens: 0,
             reasoning_output_tokens: 0,
+            reasoning_effort: None,
             unattributed_total_tokens: 0,
             request_count: 1,
             selector_context: BTreeMap::from([
