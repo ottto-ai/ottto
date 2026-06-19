@@ -1566,13 +1566,24 @@ fn refresh_agent_status_for(
         }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }?;
-    if let Err(error) = crate::snapshot_sync::upload_agent_status_snapshots(&snapshots) {
-        eprintln!(
-            "manual agent status upload skipped: {}",
-            crate::snapshot_sync::safe_error(&error)
-        );
-    }
+    upload_agent_status_snapshots_in_background(snapshots.clone());
     Ok(snapshots)
+}
+
+fn upload_agent_status_snapshots_in_background(snapshots: Vec<AgentStatusSnapshot>) {
+    let spawn_result = thread::Builder::new()
+        .name("ottto-agent-status-upload".to_string())
+        .spawn(move || {
+            if let Err(error) = crate::snapshot_sync::upload_agent_status_snapshots(&snapshots) {
+                eprintln!(
+                    "manual agent status upload skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("manual agent status upload skipped: {error}");
+    }
 }
 
 fn auth_start(
@@ -8444,6 +8455,19 @@ mod tests {
         TELEMETRY_CONTROL_BACKEND_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn manual_agent_status_upload_dispatch_returns_without_network_wait() {
+        let started = Instant::now();
+
+        upload_agent_status_snapshots_in_background(Vec::new());
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "manual upload dispatch blocked for {:?}",
+            started.elapsed()
+        );
     }
 
     struct EnvVarGuard {

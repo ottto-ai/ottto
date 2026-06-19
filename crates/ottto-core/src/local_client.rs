@@ -6,7 +6,7 @@ use std::net::Shutdown;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const LOCAL_CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub fn default_socket_path() -> PathBuf {
     if let Ok(path) = std::env::var(OTTTO_SOCKET_ENV) {
@@ -99,6 +99,11 @@ mod tests {
             Some(value) => std::env::set_var(OTTTO_SOCKET_ENV, value),
             None => std::env::remove_var(OTTTO_SOCKET_ENV),
         }
+    }
+
+    #[test]
+    fn local_control_timeout_covers_slow_agent_status_refreshes() {
+        assert!(LOCAL_CONTROL_SOCKET_TIMEOUT >= Duration::from_secs(45));
     }
 
     #[cfg(unix)]
