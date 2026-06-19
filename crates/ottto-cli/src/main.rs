@@ -2,8 +2,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use ottto_core::{
     client_control_token, default_socket_path, execute_local_uninstall,
     ingest_claude_statusline_payload, install_owner_for_path, kickstart_macos_launch_agent,
-    local_lifecycle_home_dir, request_unix_socket, UninstallExecutionOptions,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SOCKET_ENV,
+    local_lifecycle_home_dir, request_unix_socket_with_timeout, UninstallExecutionOptions,
+    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT, OTTTO_SERVICE_BINARY_NAME,
+    OTTTO_SOCKET_ENV,
 };
 use ottto_protocol::{
     AgentContextQuery, AgentCostsQuery, AgentProviderImpactQuery, AgentRecommendationsQuery,
@@ -748,41 +749,80 @@ fn run(invocation: Invocation) -> i32 {
     }
 }
 
+/// Commands that drive a server-side agent-status refresh — telemetry collect +
+/// upload across every connected source. They run far longer than ordinary
+/// control commands, so they need the wider refresh timeout.
+fn is_refresh_command(command: &LocalControlCommand) -> bool {
+    matches!(
+        command,
+        LocalControlCommand::Status {
+            refresh_agent_status: true,
+        } | LocalControlCommand::AgentStatusRefresh { .. }
+    )
+}
+
+/// Read/write timeout for a control-socket round-trip, widened for the refresh
+/// path so a slow-but-alive refresh is not misread as a dead daemon. Plain
+/// `status` (no refresh) and every other command keep the tight ordinary bound.
+fn control_socket_timeout(command: &LocalControlCommand) -> Duration {
+    if is_refresh_command(command) {
+        LOCAL_CONTROL_REFRESH_TIMEOUT
+    } else {
+        LOCAL_CONTROL_SOCKET_TIMEOUT
+    }
+}
+
 fn request_with_autostart(
     invocation: &Invocation,
     request: &LocalControlRequest,
 ) -> Result<LocalControlResponse, CliError> {
-    match request_unix_socket(&invocation.socket, request) {
+    let timeout = control_socket_timeout(&request.command);
+    match request_unix_socket_with_timeout(&invocation.socket, request, timeout) {
         Ok(response) => Ok(response),
-        Err(error) if invocation.auto_start => match autostart_and_retry(invocation, request) {
-            Ok(response) => Ok(response),
-            Err(autostart_error) => Err(daemon_unavailable_error(
-                error.to_string(),
-                &invocation.socket,
-                true,
-                Some(autostart_error.to_string()),
-            )),
-        },
-        Err(error) => Err(daemon_unavailable_error(
-            error.to_string(),
-            &invocation.socket,
-            false,
-            None,
-        )),
+        Err(error) => {
+            // Only kickstart+retry when the daemon was not accepting
+            // connections. A post-connect timeout means the daemon is alive but
+            // busy (e.g. a slow multi-source agent-status refresh); restarting
+            // it would interrupt healthy in-flight work and not help anyway.
+            if invocation.auto_start && error.is_connect_failure() {
+                match autostart_and_retry(invocation, request, timeout) {
+                    Ok(response) => Ok(response),
+                    Err(autostart_error) => Err(daemon_unavailable_error(
+                        error.to_string(),
+                        &invocation.socket,
+                        true,
+                        Some(autostart_error.to_string()),
+                    )),
+                }
+            } else {
+                Err(daemon_unavailable_error(
+                    error.to_string(),
+                    &invocation.socket,
+                    false,
+                    None,
+                ))
+            }
+        }
     }
 }
 
 fn autostart_and_retry(
     invocation: &Invocation,
     request: &LocalControlRequest,
+    timeout: Duration,
 ) -> anyhow::Result<LocalControlResponse> {
     kickstart_macos_launch_agent()?;
     let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..60 {
         thread::sleep(Duration::from_millis(500));
-        match request_unix_socket(&invocation.socket, request) {
+        match request_unix_socket_with_timeout(&invocation.socket, request, timeout) {
             Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
+            // Keep waiting only while the freshly-kickstarted daemon is still
+            // coming up (connect still failing). Once we can connect, a
+            // transport error won't be cured by retrying, so surface it now
+            // instead of looping up to 30s.
+            Err(error) if error.is_connect_failure() => last_error = Some(error.into_anyhow()),
+            Err(error) => return Err(error.into_anyhow()),
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("daemon did not accept local requests")))
@@ -1939,6 +1979,49 @@ mod tests {
     fn invocation_from_cli(cli: Cli) -> Invocation {
         let mode = output_mode(command_json(&cli.command), cli.watch).expect("valid output mode");
         build_invocation(cli, mode)
+    }
+
+    #[test]
+    fn refresh_commands_get_timeout_exceeding_server_worst_case() {
+        // The daemon refreshes agent status serially across all three sources
+        // (Codex, Claude Code, Pi); each source's collect+upload round-trip can
+        // take ~18s in the worst case, so a full refresh can run ~54s server-side
+        // before the CLI ever sees a byte. The refresh timeout must clear that
+        // summed worst case; a too-tight bound is exactly what made a slow refresh
+        // look like a dead daemon. Non-refresh commands keep the tight bound.
+        const SERVER_WORST_CASE_PER_SOURCE: Duration = Duration::from_secs(18);
+        const REFRESHED_SOURCE_COUNT: u32 = 3;
+        let summed_worst_case = SERVER_WORST_CASE_PER_SOURCE * REFRESHED_SOURCE_COUNT;
+
+        for command in [
+            LocalControlCommand::Status {
+                refresh_agent_status: true,
+            },
+            LocalControlCommand::AgentStatusRefresh { source: None },
+        ] {
+            assert!(
+                is_refresh_command(&command),
+                "{command:?} should be treated as a refresh command"
+            );
+            assert!(
+                control_socket_timeout(&command) > summed_worst_case,
+                "refresh timeout {:?} must exceed summed server worst case {:?}",
+                control_socket_timeout(&command),
+                summed_worst_case,
+            );
+        }
+
+        // Plain status (no refresh) does not refresh and keeps the tight 10s
+        // bound — well under the summed refresh worst case.
+        let plain_status = LocalControlCommand::Status {
+            refresh_agent_status: false,
+        };
+        assert!(!is_refresh_command(&plain_status));
+        assert_eq!(
+            control_socket_timeout(&plain_status),
+            LOCAL_CONTROL_SOCKET_TIMEOUT
+        );
+        assert!(control_socket_timeout(&plain_status) < summed_worst_case);
     }
 
     fn status_response() -> LocalControlResponse {
