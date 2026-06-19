@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "0bd66eab57b42f620af5bafd867ce68ee0c14367fa18dee0c8254552feb7951a",
+  "content_sha256": "259b1371779bbad8eeaa541610ec548d1e9492e79134d399b11891a2ff220902",
   "files": [
     {
       "executable": false,
@@ -69,7 +69,7 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "4e19fc63869e0effb54e6cdba829c503e6bb9118dceb9f78b9420f457a636ab0",
+      "sha256": "569d52412f511b5c2126b0dca01ff94418292b194a72e7eb662d2ab5dbc448a4",
       "size_bytes": 41716
     },
     {
@@ -713,7 +713,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/release-verification.md",
-      "sha256": "14c3b42d1777fbf4e8f0d5ccad00859911592d072306e9dfd27a0864fef11841",
+      "sha256": "62ca049704ec4e1706c89ad6b922dbe3a7ef7da7b31a480745cfb93cfc87892d",
       "size_bytes": 8041
     },
     {
@@ -923,7 +923,7 @@
       "executable": false,
       "mode": "0644",
       "path": "release/README.md",
-      "sha256": "e1cae7f1a9083e28f76a092e9730bc3dbb7e34d68233b1168ab58853bab51e6e",
+      "sha256": "c66f0cf3f092f7ddf0be9f4dabfe2f8a5c32375ca194bbd19e60ce637ae64349",
       "size_bytes": 24389
     },
     {
@@ -1333,7 +1333,7 @@
       "size_bytes": 1374
     }
   ],
-  "generated_at": "2026-06-19T13:18:13+00:00",
+  "generated_at": "2026-06-19T14:55:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b9b64261c849c054e2ea57abd2a77c46e16de942"
+  "source_commit": "8676b3afb55c94279377e6a99531eafb7226c7a3"
 }

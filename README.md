@@ -58,7 +58,7 @@ diagnostics, update, rollback, and static install-owner checks. The
 stable-candidate RC gate rejects candidate macOS artifacts that are not marked
 signed, notarized, and Gatekeeper-assessed, and its evidence skeleton requires
 explicit signature, notarization, Gatekeeper, and local-runtime pass/fail facts
-bound to `ottto-service`, `net.ottto.service`, protocol v13, the
+bound to `ottto-service`, `net.ottto.service`, protocol v15, the
 stable-candidate version/channel, and candidate release-manifest SHA-256.
 Stable closeout then requires clean-machine evidence for each advertised install
 owner, including setup, app detection, Codex verify/fix, diagnostics, logout,
@@ -66,7 +66,7 @@ update/upgrade, uninstall, reinstall, post-reinstall status, re-onboard after a
 local Keychain wipe, and owner-specific trust checks before `latest` can be
 treated as externally ready. Each owner entry must also bind the installed local
 runtime to `ottto-service`,
-`net.ottto.service`, protocol v13, the exact stable version/channel, install
+`net.ottto.service`, protocol v15, the exact stable version/channel, install
 owner, and release-manifest SHA-256. The closeout gate rejects extra required
 install owners and unknown per-owner check names so the matrix cannot pass with
 unreviewed launch evidence.
@@ -429,7 +429,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   manifest version, commit, and SHA-256 and prove every advertised install owner
   passed its install, service, status, update, uninstall, and trust checks while
   binding that owner to the `ottto-service` runtime, `net.ottto.service`,
-  protocol v13, stable channel/version, and release-manifest SHA-256.
+  protocol v15, stable channel/version, and release-manifest SHA-256.
 - a CycloneDX SBOM generator plus release-manifest `supply_chain` contract for
   SLSA v1.2 Build Track provenance. Stable release gates require the SBOM URL
   and SHA-256 under the immutable prefix, verified SBOM attestation with
