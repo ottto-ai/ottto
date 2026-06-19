@@ -5187,10 +5187,7 @@ mod tests {
         .next()
         .expect("snapshot");
 
-        assert_eq!(
-            item.model_usage[0].reasoning_effort.as_deref(),
-            Some("max")
-        );
+        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("max"));
         // Round-trips through serde under the exact wire key the backend reads.
         let value = serde_json::to_value(&item.model_usage[0]).expect("serialize row");
         assert_eq!(value["reasoning_effort"], json!("max"));
@@ -5225,10 +5222,7 @@ mod tests {
         .next()
         .expect("snapshot");
 
-        assert_eq!(
-            item.model_usage[0].reasoning_effort.as_deref(),
-            Some("low")
-        );
+        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("low"));
 
         let _ = fs::remove_file(path);
     }
