@@ -24,7 +24,10 @@ pub use lifecycle::{
     execute_local_uninstall, launch_agent_path, launchd_target, local_lifecycle_home_dir,
     plan_local_uninstall, LifecycleError, UninstallExecutionOptions,
 };
-pub use local_client::{default_socket_path, request_unix_socket};
+pub use local_client::{
+    default_socket_path, request_unix_socket, request_unix_socket_with_timeout, LocalRequestError,
+    LOCAL_CONTROL_REFRESH_TIMEOUT, LOCAL_CONTROL_SOCKET_TIMEOUT,
+};
 pub use local_service::{
     install_owner_for_path, kickstart_macos_launch_agent, macos_launch_agent_target,
     user_launchctl_domain, MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL,
