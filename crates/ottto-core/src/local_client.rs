@@ -6,7 +6,59 @@ use std::net::Shutdown;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const LOCAL_CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(45);
+/// Read/write bound for ordinary control-socket commands. These reply quickly,
+/// so a tight bound surfaces a wedged daemon fast.
+pub const LOCAL_CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Read/write bound for agent-status refresh commands. The daemon refreshes
+/// agent status by collecting and uploading telemetry for every connected
+/// source **serially** (Codex, Claude Code, Pi), and each source's
+/// collect+upload round-trip can take ~18s in the worst case — far over the 10s
+/// ordinary bound. Too short a bound here makes a slow-but-alive refresh look
+/// like a dead daemon, so refresh commands get a budget well above the summed
+/// server-side worst case.
+pub const LOCAL_CONTROL_REFRESH_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Why a control-socket round-trip failed, so the caller can decide whether an
+/// autostart kickstart is warranted.
+#[derive(Debug)]
+pub enum LocalRequestError {
+    /// The control socket could not be connected: the daemon is not accepting
+    /// connections (not running, wrong socket path). Autostarting it is the
+    /// right recovery.
+    Connect(anyhow::Error),
+    /// The connection succeeded but the request/response round-trip failed
+    /// (write, read timeout, or parse). A read timeout here means the daemon is
+    /// alive but busy; kickstarting it would needlessly restart healthy work.
+    Transport(anyhow::Error),
+}
+
+impl LocalRequestError {
+    /// True when the failure happened before a connection was established, i.e.
+    /// the daemon is not accepting connections and an autostart is warranted.
+    pub fn is_connect_failure(&self) -> bool {
+        matches!(self, LocalRequestError::Connect(_))
+    }
+
+    /// Unwrap to the underlying error for callers that only need the message.
+    pub fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            LocalRequestError::Connect(error) | LocalRequestError::Transport(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for LocalRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocalRequestError::Connect(error) | LocalRequestError::Transport(error) => {
+                write!(f, "{error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocalRequestError {}
 
 pub fn default_socket_path() -> PathBuf {
     if let Ok(path) = std::env::var(OTTTO_SOCKET_ENV) {
@@ -30,38 +82,55 @@ pub fn request_unix_socket(
     request: &LocalControlRequest,
 ) -> Result<LocalControlResponse> {
     request_unix_socket_with_timeout(path, request, LOCAL_CONTROL_SOCKET_TIMEOUT)
+        .map_err(LocalRequestError::into_anyhow)
 }
 
+/// Like [`request_unix_socket`] but with a caller-chosen read/write timeout, and
+/// a typed error that distinguishes a pre-connect failure (the daemon is not
+/// accepting connections) from a post-connect transport failure (the daemon is
+/// alive but the round-trip stalled or failed). Callers use that distinction to
+/// avoid kickstarting a daemon that is merely busy.
 #[cfg(unix)]
-fn request_unix_socket_with_timeout(
+pub fn request_unix_socket_with_timeout(
     path: &std::path::Path,
     request: &LocalControlRequest,
     timeout: Duration,
-) -> Result<LocalControlResponse> {
+) -> std::result::Result<LocalControlResponse, LocalRequestError> {
     use std::os::unix::net::UnixStream;
 
-    let mut stream =
-        UnixStream::connect(path).with_context(|| format!("connect socket {}", path.display()))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .with_context(|| format!("set socket write timeout {}", path.display()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .with_context(|| format!("set socket read timeout {}", path.display()))?;
-    let request = serde_json::to_vec(request)?;
-    stream
-        .write_all(&request)
-        .with_context(|| format!("write socket request {}", path.display()))?;
-    stream
-        .shutdown(Shutdown::Write)
-        .with_context(|| format!("finish socket request {}", path.display()))?;
+    // A failure to connect means the daemon is not accepting connections; an
+    // autostart is the right recovery for it.
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("connect socket {}", path.display()))
+        .map_err(LocalRequestError::Connect)?;
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .with_context(|| format!("read socket response {}", path.display()))?;
-    serde_json::from_str(&response)
-        .with_context(|| format!("parse socket response {}", path.display()))
+    // Once connected, every remaining step (timeout setup, write, read, parse)
+    // is a transport failure: the daemon is alive, so a read timeout means it is
+    // busy, not absent.
+    let mut exchange = || -> Result<LocalControlResponse> {
+        stream
+            .set_write_timeout(Some(timeout))
+            .with_context(|| format!("set socket write timeout {}", path.display()))?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .with_context(|| format!("set socket read timeout {}", path.display()))?;
+        let request = serde_json::to_vec(request)?;
+        stream
+            .write_all(&request)
+            .with_context(|| format!("write socket request {}", path.display()))?;
+        stream
+            .shutdown(Shutdown::Write)
+            .with_context(|| format!("finish socket request {}", path.display()))?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .with_context(|| format!("read socket response {}", path.display()))?;
+        serde_json::from_str(&response)
+            .with_context(|| format!("parse socket response {}", path.display()))
+    };
+
+    exchange().map_err(LocalRequestError::Transport)
 }
 
 #[cfg(not(unix))]
@@ -70,6 +139,18 @@ pub fn request_unix_socket(
     _request: &LocalControlRequest,
 ) -> Result<LocalControlResponse> {
     anyhow::bail!("unix socket transport is not supported: {}", path.display())
+}
+
+#[cfg(not(unix))]
+pub fn request_unix_socket_with_timeout(
+    path: &std::path::Path,
+    _request: &LocalControlRequest,
+    _timeout: Duration,
+) -> std::result::Result<LocalControlResponse, LocalRequestError> {
+    Err(LocalRequestError::Connect(anyhow::anyhow!(
+        "unix socket transport is not supported: {}",
+        path.display()
+    )))
 }
 
 #[cfg(test)]
@@ -127,10 +208,34 @@ mod tests {
             request_unix_socket_with_timeout(&path, &status_request(), Duration::from_millis(50))
                 .expect_err("stalled daemon response should time out");
         assert!(
+            matches!(error, LocalRequestError::Transport(_)),
+            "a stalled reply after a successful connect is a transport failure, not a connect failure: {error:#}"
+        );
+        assert!(
             error.to_string().contains("read socket response"),
             "{error:#}"
         );
         let _ = std::fs::remove_file(&path);
         server.join().expect("timeout test server joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_unix_socket_classifies_missing_daemon_as_connect_failure() {
+        // No listener is bound, so the connect itself fails. That must be a
+        // Connect error (autostart is the right recovery), never a Transport
+        // error (which would imply an alive-but-busy daemon).
+        let path = std::env::temp_dir().join(format!(
+            "ottto-local-client-missing-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let error =
+            request_unix_socket_with_timeout(&path, &status_request(), Duration::from_millis(50))
+                .expect_err("connecting to a missing socket must fail");
+        assert!(
+            error.is_connect_failure(),
+            "a missing daemon socket must classify as a connect failure: {error:#}"
+        );
     }
 }

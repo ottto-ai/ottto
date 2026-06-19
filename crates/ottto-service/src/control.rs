@@ -2687,36 +2687,17 @@ fn setup_run(
     }
     request_snapshot_sync_after_setup_actions(daemon, &action_results);
 
-    let source_count = detail
-        .sources
-        .iter()
-        .filter(|source| source.detected)
-        .count();
-    let detected_sources = detail
-        .sources
-        .iter()
-        .filter(|source| source.detected)
-        .map(|source| {
-            json!({
-                "source": source.source,
-                "state": source.state,
-                "readiness_percent": source.readiness_percent,
-                "missing_fields": source.missing_fields,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "status": detail.run.status,
-        "setup_run_id": credentials.connection.setup_run_id,
-        "claim_code_provided": claim_code_provided,
-        "source_count": source_count,
-        "detected_sources": detected_sources,
-        "next_question": detail.next_question,
-        "next_action": detail.next_action,
-        "setup_claim_url": detail.setup_claim_url,
-        "actions": action_results,
-    }))
+    // Build the wire result with the same builder the setup-answer and
+    // setup-action paths use. Previously this path inlined a byte-identical
+    // `json!`, which let a field drift between the two builders; routing through
+    // `setup_result_from_detail` guarantees a field threaded for one entry point
+    // (e.g. `setup_claim_url`, the verify browser-approval URL) reaches them all.
+    setup_result_from_detail(
+        &credentials.connection,
+        detail,
+        claim_code_provided,
+        action_results,
+    )
 }
 
 fn clear_setup_run_connection_if_current(
@@ -8292,6 +8273,61 @@ mod tests {
     use super::*;
     use crate::agent_status::PiRouteClassification;
     use ottto_protocol::{RepairAuthority, RepairAuthorityMode};
+
+    #[test]
+    fn setup_result_threads_setup_claim_url_from_backend_detail() {
+        // The verify browser-approval flow depends on `setup_claim_url` reaching
+        // the Swift app: when the backend detail carries it, the wire result must
+        // surface it; when it does not, the field must be JSON null (never a
+        // stale/borrowed value). `setup_result_from_detail` is the single builder
+        // shared by the setup-run, setup-answer, and setup-action paths, so
+        // guarding it here guards every entry point.
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_claim_url_thread".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: DIRECT_API_BASE_URL.to_string(),
+        };
+
+        let with_claim: SetupRunDetailApiResponse = serde_json::from_value(json!({
+            "run": {
+                "id": "setup_claim_url_thread",
+                "status": "waiting_for_user",
+                "machine_id": "machine_test"
+            },
+            "sources": [],
+            "next_action": null,
+            "next_question": null,
+            "setup_claim_url": "https://ottto.net/setup/claim?code=otsc_abc123"
+        }))
+        .expect("detail with setup_claim_url decodes");
+
+        let result = setup_result_from_detail(&connection, with_claim, false, Vec::new())
+            .expect("setup result builds");
+        assert_eq!(
+            result["setup_claim_url"],
+            json!("https://ottto.net/setup/claim?code=otsc_abc123")
+        );
+        assert_eq!(result["status"], json!("waiting_for_user"));
+
+        // Absent in the backend detail -> JSON null, never omitted or stale.
+        let without_claim: SetupRunDetailApiResponse = serde_json::from_value(json!({
+            "run": {
+                "id": "setup_claim_url_thread",
+                "status": "ready",
+                "machine_id": "machine_test"
+            },
+            "sources": [],
+            "next_action": null,
+            "next_question": null
+        }))
+        .expect("detail without setup_claim_url decodes");
+
+        let result_none = setup_result_from_detail(&connection, without_claim, false, Vec::new())
+            .expect("setup result builds");
+        assert_eq!(result_none["setup_claim_url"], serde_json::Value::Null);
+    }
 
     fn subscription_oauth_route() -> PiModelRoute {
         PiModelRoute {
