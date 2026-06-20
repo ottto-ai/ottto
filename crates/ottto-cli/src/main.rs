@@ -749,23 +749,25 @@ fn run(invocation: Invocation) -> i32 {
     }
 }
 
-/// Commands that drive a server-side agent-status refresh — telemetry collect +
-/// upload across every connected source. They run far longer than ordinary
-/// control commands, so they need the wider refresh timeout.
-fn is_refresh_command(command: &LocalControlCommand) -> bool {
+/// Commands that can run live smoke, telemetry collect, or backend verification
+/// work before replying. They run far longer than ordinary control commands, so
+/// they need the wider local-control timeout.
+fn is_long_running_command(command: &LocalControlCommand) -> bool {
     matches!(
         command,
         LocalControlCommand::Status {
             refresh_agent_status: true,
         } | LocalControlCommand::AgentStatusRefresh { .. }
+            | LocalControlCommand::SetupAction { .. }
+            | LocalControlCommand::Verify { .. }
     )
 }
 
-/// Read/write timeout for a control-socket round-trip, widened for the refresh
-/// path so a slow-but-alive refresh is not misread as a dead daemon. Plain
-/// `status` (no refresh) and every other command keep the tight ordinary bound.
+/// Read/write timeout for a control-socket round-trip, widened for commands that
+/// legitimately stay busy server-side. Plain `status` and ordinary commands keep
+/// the tight bound.
 fn control_socket_timeout(command: &LocalControlCommand) -> Duration {
-    if is_refresh_command(command) {
+    if is_long_running_command(command) {
         LOCAL_CONTROL_REFRESH_TIMEOUT
     } else {
         LOCAL_CONTROL_SOCKET_TIMEOUT
@@ -1989,13 +1991,12 @@ mod tests {
     }
 
     #[test]
-    fn refresh_commands_get_timeout_exceeding_server_worst_case() {
-        // The daemon refreshes agent status serially across all three sources
-        // (Codex, Claude Code, Pi); each source's collect+upload round-trip can
-        // take ~18s in the worst case, so a full refresh can run ~54s server-side
-        // before the CLI ever sees a byte. The refresh timeout must clear that
-        // summed worst case; a too-tight bound is exactly what made a slow refresh
-        // look like a dead daemon. Non-refresh commands keep the tight bound.
+    fn long_running_commands_get_timeout_exceeding_server_worst_case() {
+        // The daemon can refresh/verify across Codex, Claude Code, and Pi. Each
+        // source's smoke or collect+upload round-trip can take ~18s in the worst
+        // case, so a multi-source operation can run ~54s server-side before the
+        // CLI ever sees a byte. The long timeout must clear that summed worst
+        // case; a too-tight bound makes healthy work look like a dead daemon.
         const SERVER_WORST_CASE_PER_SOURCE: Duration = Duration::from_secs(18);
         const REFRESHED_SOURCE_COUNT: u32 = 3;
         let summed_worst_case = SERVER_WORST_CASE_PER_SOURCE * REFRESHED_SOURCE_COUNT;
@@ -2005,25 +2006,34 @@ mod tests {
                 refresh_agent_status: true,
             },
             LocalControlCommand::AgentStatusRefresh { source: None },
+            LocalControlCommand::Verify {
+                source: SourceKind::Codex,
+                repair: false,
+            },
+            LocalControlCommand::SetupAction {
+                source: SourceKind::Codex,
+                action_type: "verify_source".to_string(),
+                api_base_url: None,
+            },
         ] {
             assert!(
-                is_refresh_command(&command),
-                "{command:?} should be treated as a refresh command"
+                is_long_running_command(&command),
+                "{command:?} should be treated as a long-running command"
             );
             assert!(
                 control_socket_timeout(&command) > summed_worst_case,
-                "refresh timeout {:?} must exceed summed server worst case {:?}",
+                "long timeout {:?} must exceed summed server worst case {:?}",
                 control_socket_timeout(&command),
                 summed_worst_case,
             );
         }
 
-        // Plain status (no refresh) does not refresh and keeps the tight 10s
-        // bound — well under the summed refresh worst case.
+        // Plain status (no refresh) keeps the ordinary bound — under the summed
+        // long-running worst case.
         let plain_status = LocalControlCommand::Status {
             refresh_agent_status: false,
         };
-        assert!(!is_refresh_command(&plain_status));
+        assert!(!is_long_running_command(&plain_status));
         assert_eq!(
             control_socket_timeout(&plain_status),
             LOCAL_CONTROL_SOCKET_TIMEOUT
