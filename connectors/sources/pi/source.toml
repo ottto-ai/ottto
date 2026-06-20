@@ -19,5 +19,6 @@ operations = [
 collectors = [
   "local_sessions",
   "live_batches",
-  "route_status"
+  "route_status",
+  "identity_probe"
 ]

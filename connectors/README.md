@@ -77,9 +77,11 @@ active collectors should list every record family they produce.
 - `uploads_raw_content`: whether the collector is allowed to upload raw
   prompts, responses, command output, tool output, local paths, or secrets. The
   checked-in official collectors set this to `false`.
-- `emits`: record families the collector can produce, for example
-  `local_usage_snapshots`, `telemetry_records`, `agent_status_snapshots`, and
-  `source_plan_profiles`.
+- `emits`: source record families the collector can produce, for example
+  `local_usage_snapshots`, `telemetry_records` (the live telemetry collector
+  family, not the retired PostgreSQL serving table), `agent_status_snapshots`,
+  and `source_plan_profiles`. The backend projects live telemetry into
+  `usage_turn_fact` and gold cost/session read models after ingest.
 
 ## Fixture Expectations
 

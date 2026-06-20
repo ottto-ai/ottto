@@ -1,0 +1,39 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "claude_code",
+  "collector_id": "identity_probe",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "identity_probe_events",
+      "sample": {
+        "source_id": "claude_code",
+        "collector_id": "identity_probe",
+        "api_provider": "firstParty",
+        "auth_method": "claude.ai",
+        "account_identifier_hash": "sha256_account_email_hash_fixture",
+        "subscription_type": "max",
+        "trigger": "idle_tick",
+        "observed_at": "2026-05-28T08:08:00Z"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Documented claude auth status JSON fields, hashed account identifier, subscription label, observed timestamp, and probe trigger only. No token bytes. No Keychain access. Vertex/Bedrock novelty triggers may additionally read ~/.claude/settings.json env values (ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION) without exposing credentials.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret",
+      "email",
+      "org_id"
+    ]
+  }
+}

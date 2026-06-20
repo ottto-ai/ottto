@@ -3224,7 +3224,13 @@ mod tests {
                 .iter()
                 .map(|collector| collector.collector_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["local_sessions", "otel_config", "quota_status"]
+            vec![
+                "identity_probe",
+                "local_sessions",
+                "logs2_trace",
+                "otel_config",
+                "quota_status"
+            ]
         );
     }
 

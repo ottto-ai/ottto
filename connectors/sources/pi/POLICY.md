@@ -7,6 +7,7 @@ Review tier: `official`
 - `local_sessions` defaults on for official pilot installs because it uploads aggregate usage and metadata only.
 - `live_batches` requires an authenticated Pi/Ottto live path and keeps normalized assistant-message usage bounded to the existing ingestion contract.
 - `route_status` defaults on when local non-secret route metadata is available.
+- `identity_probe` defaults on as a parity stub: it runs no subprocess, reads no files, and never accesses Keychain. It emits `not_applicable` heartbeats so the resolver can distinguish intentional absence from collector failure.
 
 ## Documented Surfaces
 
@@ -19,6 +20,7 @@ Review tier: `official`
 - Pi `source_id` remains `pi` even when the model or billing provider is OpenAI, Anthropic, Vertex, Bedrock, OpenRouter, Vercel AI Gateway, or another gateway.
 - Do not infer gateway or fast/speed mode from provider/model identity. Preserve explicit selector and route evidence only.
 - Do not scrape browser sessions, cookies, private account pages, or provider dashboards.
+- `identity_probe` must remain a stub until/unless Pi ships a documented identity CLI. It must never read token bytes, access Keychain items, scan disk for credentials, or call any provider account endpoint.
 
 ## Local-Only Behavior
 

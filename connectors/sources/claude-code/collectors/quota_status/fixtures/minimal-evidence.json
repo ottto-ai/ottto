@@ -13,7 +13,17 @@
         "rate_limit_window": "weekly",
         "remaining_ratio": 0.58,
         "reset_at": "2026-05-21T00:00:00Z",
-        "observed_at": "2026-05-20T08:08:00Z"
+        "observed_at": "2026-05-20T08:08:00Z",
+        "evidence_receipts": [
+          {
+            "schema_version": "agent_status_evidence_receipt.v1",
+            "receipt_id": "agent_status_evidence_receipt.v1:claude_code:quota_status:weekly",
+            "receipt_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "collector_id": "quota_status",
+            "evidence_kind": "quota_status",
+            "customer_rollout_excluded": true
+          }
+        ]
       }
     },
     {
@@ -23,7 +33,17 @@
         "collector_id": "quota_status",
         "plan_label": "Claude Pro",
         "quota_basis": "documented_status_line_rate_limits",
-        "confidence": "observed"
+        "confidence": "observed",
+        "evidence_receipts": [
+          {
+            "schema_version": "agent_status_evidence_receipt.v1",
+            "receipt_id": "agent_status_evidence_receipt.v1:claude_code:plan_identity:pro",
+            "receipt_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "collector_id": "quota_status",
+            "evidence_kind": "plan_identity",
+            "customer_rollout_excluded": true
+          }
+        ]
       }
     }
   ],

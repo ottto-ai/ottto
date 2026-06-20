@@ -1,0 +1,43 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "identity_probe",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "identity_probe_events",
+      "sample": {
+        "source_id": "codex",
+        "collector_id": "identity_probe",
+        "api_provider": "openai",
+        "auth_method": "chatgpt_tokens",
+        "account_identifier_hash": "sha256_tokens_account_id_hash_fixture",
+        "subscription_type": null,
+        "trigger": "cold_start",
+        "observed_at": "2026-05-28T08:08:00Z"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Documented codex doctor JSON fields and the hashed tokens.account_id from ~/.codex/auth.json only. No token bytes, no refresh tokens, no id_tokens, no access tokens, no Keychain reads. fsevents watcher fires only on tokens.account_id change (full OpenAI user swap), not on Personal-vs-Team toggling (that signal comes from rate_limits.plan_type in the JSONL).",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret",
+      "access_token",
+      "id_token",
+      "refresh_token",
+      "tokens.id_token",
+      "tokens.access_token",
+      "tokens.refresh_token"
+    ]
+  }
+}

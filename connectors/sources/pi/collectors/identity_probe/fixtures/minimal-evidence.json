@@ -1,0 +1,39 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "pi",
+  "collector_id": "identity_probe",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "identity_probe_events",
+      "sample": {
+        "source_id": "pi",
+        "collector_id": "identity_probe",
+        "api_provider": null,
+        "auth_method": null,
+        "account_identifier_hash": null,
+        "subscription_type": null,
+        "status": "not_applicable",
+        "reason": "pi_has_no_identity_cli_today",
+        "trigger": "idle_tick",
+        "observed_at": "2026-05-28T08:08:00Z"
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Heartbeat-only stub. Emits not_applicable status so the resolver can distinguish intentional absence from collector failure. No CLI subprocess, no file reads, no Keychain access. Per-turn gateway_provider already lives in Pi's message_end events and feeds the resolver without identity_probe pairing.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "api_key",
+      "cookie",
+      "password",
+      "secret"
+    ]
+  }
+}

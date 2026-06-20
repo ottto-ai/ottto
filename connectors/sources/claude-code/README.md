@@ -7,5 +7,6 @@ Collectors:
 - `local_sessions`: reads local Claude Code project JSONL files through `ottto-locald` and uploads aggregate local usage snapshots.
 - `otel_config`: describes the managed live telemetry environment/settings capability.
 - `quota_status`: describes the documented status-line `rate_limits` evidence captured by Ottto's local wrapper.
+- `identity_probe`: subprocesses `claude auth status --json` and reads `~/.claude/settings.json` env values to surface per-machine identity (`apiProvider`, `authMethod`, `subscriptionType`) for observation-time billing attribution. Never reads token bytes or Keychain items.
 
 Raw prompts, responses, tool output, command output, local paths, cookies, and provider credentials must not be uploaded by these collectors.
