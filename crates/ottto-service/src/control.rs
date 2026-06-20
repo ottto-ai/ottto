@@ -2399,9 +2399,15 @@ fn client_owner_conflict(client_owner: InstallOwner, service_owner: InstallOwner
     if client_owner == service_owner {
         return false;
     }
-    // The signed app bundle is the stable UI/control surface for the hosted
-    // installer, whose daemon and LaunchAgent intentionally live under ~/.ottto.
-    if client_owner == InstallOwner::AppBundle && service_owner == InstallOwner::HostedInstaller {
+    // The signed app bundle and legacy hosted-installer CLI are compatible
+    // local control surfaces during migration. The launchd/plist owners still
+    // decide real service drift; merely asking from the other compatible client
+    // must not poison canonical health.
+    if matches!(
+        (client_owner, service_owner),
+        (InstallOwner::AppBundle, InstallOwner::HostedInstaller)
+            | (InstallOwner::HostedInstaller, InstallOwner::AppBundle)
+    ) {
         return false;
     }
     true
@@ -9475,10 +9481,22 @@ mod tests {
     }
 
     #[test]
-    fn hosted_installer_client_does_not_mask_app_bundle_service_drift() {
-        assert!(client_owner_conflict(
+    fn hosted_installer_client_can_report_app_bundle_service_health() {
+        assert!(!client_owner_conflict(
             InstallOwner::HostedInstaller,
             InstallOwner::AppBundle
+        ));
+        assert!(!client_owner_conflict(
+            InstallOwner::HostedInstaller,
+            InstallOwner::HostedInstaller
+        ));
+        assert!(client_owner_conflict(
+            InstallOwner::HostedInstaller,
+            InstallOwner::Homebrew
+        ));
+        assert!(client_owner_conflict(
+            InstallOwner::HostedInstaller,
+            InstallOwner::Dev
         ));
     }
 
