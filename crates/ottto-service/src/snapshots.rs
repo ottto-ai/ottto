@@ -12,7 +12,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
-pub const COLLECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub fn collector_version() -> String {
+    ottto_core::compiled_release_version()
+}
+
+#[cfg(test)]
+mod collector_version_tests {
+    use super::*;
+
+    #[test]
+    fn collector_version_uses_packaged_release_version() {
+        assert_eq!(collector_version(), ottto_core::compiled_release_version());
+    }
+}
+
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest

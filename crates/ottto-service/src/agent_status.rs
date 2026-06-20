@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
-    default_support_dir, read_claude_statusline_cache, ClaudeStatusLineRateLimitCache,
+    compiled_release_version, default_support_dir, read_claude_statusline_cache,
+    ClaudeStatusLineRateLimitCache,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -1006,7 +1007,7 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
             "clientInfo": {
                 "name": "ottto_local_platform",
                 "title": "Ottto Local Platform",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": compiled_release_version()
             },
             "capabilities": {
                 "experimentalApi": true,

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub fn empty_status(machine: MachineIdentity, now: impl Into<String>) -> DaemonStatus {
     DaemonStatus {
         protocol_version: PROTOCOL_VERSION,
-        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+        daemon_version: compiled_release_version(),
         machine,
         account: LocalAccountBinding::not_connected(),
         daemon: DaemonRuntimeState::Running,
@@ -123,6 +123,7 @@ mod tests {
         );
 
         assert_eq!(status.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(status.daemon_version, compiled_release_version());
         assert_eq!(status.sources.len(), 0);
         assert_eq!(status.update.current_version, compiled_release_version());
     }

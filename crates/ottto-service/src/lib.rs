@@ -18,10 +18,10 @@ pub mod xpc_mach;
 
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
 use ottto_core::{
-    default_connection_api_base_url, default_support_dir, empty_status, launch_agent_path,
-    launchd_target, local_lifecycle_home_dir, source_state_file_name, FileConnectionStore,
-    FileSourceStateStore, LocalConnectionBinding, LocalDeviceBinding, LocalSourceState,
-    RedactionPolicy, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, default_connection_api_base_url, default_support_dir, empty_status,
+    launch_agent_path, launchd_target, local_lifecycle_home_dir, source_state_file_name,
+    FileConnectionStore, FileSourceStateStore, LocalConnectionBinding, LocalDeviceBinding,
+    LocalSourceState, RedactionPolicy, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 #[cfg(target_os = "macos")]
@@ -961,8 +961,9 @@ impl LocalDaemon {
             .map(|state| state.owner_drift)
             .unwrap_or(false);
         let keychain_item_count = local_secret_presence_count();
-        let version_mismatch = status.protocol_version != PROTOCOL_VERSION
-            || status.daemon_version != env!("CARGO_PKG_VERSION");
+        let current_version = compiled_release_version();
+        let version_mismatch =
+            status.protocol_version != PROTOCOL_VERSION || status.daemon_version != current_version;
         let stale_registrations = if launch_agent_path_drift {
             vec![launchd_target()]
         } else {
@@ -995,7 +996,7 @@ impl LocalDaemon {
         );
         versions.insert(
             "cli_version".to_string(),
-            RedactedValue::String(env!("CARGO_PKG_VERSION").to_string()),
+            RedactedValue::String(current_version),
         );
         versions.insert(
             "daemon_version".to_string(),

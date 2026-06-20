@@ -13,8 +13,8 @@ use crate::snapshot_client::{
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
-    apply_upload_policy, scan_source_roots_with_artifacts, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotSource, SnapshotUploadPolicy, SourceScanResult, COLLECTOR_VERSION,
+    apply_upload_policy, collector_version, scan_source_roots_with_artifacts, ScanIndex,
+    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy, SourceScanResult,
     MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
@@ -555,7 +555,7 @@ fn sync_source(
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: source.api_slug().to_string(),
             machine_id: machine_id.to_string(),
-            collector_version: Some(COLLECTOR_VERSION.to_string()),
+            collector_version: Some(collector_version()),
             snapshots: chunk.to_vec(),
         };
         let response = match client.upload_batch(&upload_relay_token, &request) {
@@ -800,7 +800,7 @@ fn report_status(
         last_scan_cap_hit: status.counts.scan_cap_hit,
         consecutive_failures,
         next_retry_at: None,
-        collector_version: Some(COLLECTOR_VERSION.to_string()),
+        collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
     };
     client.report_status(relay_token, &request)?;
