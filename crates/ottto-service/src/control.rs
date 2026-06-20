@@ -5361,21 +5361,19 @@ fn run_verify_source_action(
     }
     let verification =
         wait_for_verification_with_refresh_mut(api_base_url, credentials, &source, &smoke_after)?;
-    let no_telemetry_code = no_fresh_telemetry_code(&source, &smoke);
+    let failure_code = verification_failure_code(&source, &smoke, &verification);
     let verification_message = if verification.verified {
         format!(
             "Saw {} recent {} telemetry records.",
             verification.records_seen,
             source_display_name(&source)
         )
-    } else if source == SourceKind::Pi && smoke.local_session_observed == Some(true) {
-        "Pi created a local session, but Ottto did not receive matching telemetry for this setup run. Check the backend binding and local upload path, then retry Verify.".to_string()
-    } else if source == SourceKind::Pi {
-        "Pi smoke completed, but no new local Pi session file was observed and Ottto did not receive telemetry. Check the configured Pi provider route, then retry Verify.".to_string()
     } else {
-        format!(
-            "No fresh {} telemetry was processed after the smoke prompt.",
-            source_display_name(&source)
+        verification_failure_message(
+            &source,
+            &smoke,
+            &failure_code,
+            verification.clear_condition.as_deref(),
         )
     };
     let result = verification_result(
@@ -5393,7 +5391,7 @@ fn run_verify_source_action(
         if verification.verified {
             "verified"
         } else {
-            no_telemetry_code
+            &failure_code
         },
         &verification_message,
     );
@@ -5414,7 +5412,7 @@ fn run_verify_source_action(
             "last_received_at": verification.last_received_at,
             "smoke_after": verification.smoke_after,
             "smoke": smoke_result_metadata(&smoke),
-            "error_code": if verification.verified { serde_json::Value::Null } else { json!(no_telemetry_code) },
+            "error_code": if verification.verified { serde_json::Value::Null } else { json!(failure_code) },
             "error_message": if verification.verified { serde_json::Value::Null } else { json!(result.message.text) },
         }),
     ))
@@ -6103,6 +6101,48 @@ fn no_fresh_telemetry_code(source: &SourceKind, smoke: &SmokeResult) -> &'static
     } else {
         "no_fresh_telemetry"
     }
+}
+
+fn verification_failure_code(
+    source: &SourceKind,
+    smoke: &SmokeResult,
+    verification: &SetupRunVerificationResponse,
+) -> String {
+    verification
+        .error_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| no_fresh_telemetry_code(source, smoke).to_string())
+}
+
+fn verification_failure_message(
+    source: &SourceKind,
+    smoke: &SmokeResult,
+    code: &str,
+    clear_condition: Option<&str>,
+) -> String {
+    if code == "telemetry_disabled_by_admin" {
+        return format!(
+            "{} telemetry is turned off in this workspace. Turn telemetry on in Ottto, then retry Verify.",
+            source_display_name(source)
+        );
+    }
+    if code == no_fresh_telemetry_code(source, smoke) {
+        return no_fresh_telemetry_message(source, smoke);
+    }
+    if let Some(clear_condition) = clear_condition
+        .map(str::trim)
+        .filter(|condition| !condition.is_empty())
+    {
+        return format!(
+            "{} verification could not complete. {}",
+            source_display_name(source),
+            clear_condition
+        );
+    }
+    no_fresh_telemetry_message(source, smoke)
 }
 
 fn read_command_diagnostic_with_flags(child: &mut std::process::Child) -> (Option<String>, bool) {
@@ -7028,18 +7068,27 @@ fn verify_source(
                     }
                 ),
             ),
-            Ok(response) => verification_result_with_config(
-                source.clone(),
-                config,
-                SourceVerificationStatus::NoFreshTelemetry,
-                false,
-                response.records_seen,
-                response.last_record_id,
-                response.last_received_at,
-                Some(response.smoke_after),
-                no_fresh_telemetry_code(&source, &smoke),
-                &no_fresh_telemetry_message(&source, &smoke),
-            ),
+            Ok(response) => {
+                let failure_code = verification_failure_code(&source, &smoke, &response);
+                let failure_message = verification_failure_message(
+                    &source,
+                    &smoke,
+                    &failure_code,
+                    response.clear_condition.as_deref(),
+                );
+                verification_result_with_config(
+                    source.clone(),
+                    config,
+                    SourceVerificationStatus::NoFreshTelemetry,
+                    false,
+                    response.records_seen,
+                    response.last_record_id,
+                    response.last_received_at,
+                    Some(response.smoke_after),
+                    &failure_code,
+                    &failure_message,
+                )
+            }
             Err(error) => verification_result_for_backend_error_with_config(
                 source,
                 config,
@@ -7758,6 +7807,10 @@ struct SetupRunVerificationResponse {
     last_record_id: Option<String>,
     last_received_at: Option<String>,
     smoke_after: String,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    clear_condition: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -9937,7 +9990,7 @@ mod tests {
         let fake_codex = fake_binary_path(&install_root, "codex");
         let _home_guard = EnvVarGuard::set_path("HOME", &install_root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")
@@ -11960,6 +12013,41 @@ log_user_prompt = true
     }
 
     #[test]
+    fn backend_verification_error_code_overrides_no_fresh_fallback() {
+        let smoke = SmokeResult {
+            command_found: true,
+            succeeded: true,
+            exit_status: Some(0),
+            duration_ms: 12_000,
+            message: "Codex smoke session completed.".to_string(),
+            diagnostic: None,
+            error_code: None,
+            local_session_observed: None,
+        };
+        let verification = SetupRunVerificationResponse {
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: "2026-06-20T02:00:00Z".to_string(),
+            error_code: Some("telemetry_disabled_by_admin".to_string()),
+            clear_condition: Some("Turn telemetry on in Settings.".to_string()),
+        };
+
+        let code = verification_failure_code(&SourceKind::Codex, &smoke, &verification);
+        let message = verification_failure_message(
+            &SourceKind::Codex,
+            &smoke,
+            &code,
+            verification.clear_condition.as_deref(),
+        );
+
+        assert_eq!(code, "telemetry_disabled_by_admin");
+        assert!(message.contains("turned off in this workspace"));
+        assert!(!message.contains("No Codex telemetry arrived"));
+    }
+
+    #[test]
     fn expired_setup_run_token_maps_to_reconnect_required_verification() {
         let error = LocalApiError::Backend(BackendErrorDetails {
             kind: BackendErrorKind::Rejected,
@@ -12049,7 +12137,7 @@ log_user_prompt = true
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")
@@ -12140,7 +12228,7 @@ log_user_prompt = true
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")
@@ -12217,7 +12305,7 @@ log_user_prompt = true
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")
@@ -12530,7 +12618,7 @@ log_user_prompt = true
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")
@@ -12629,7 +12717,7 @@ log_user_prompt = true
             .expect("mark fake codex executable");
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
         let _path_guard = EnvVarGuard::set_os(
-            "PATH",
+            "OTTTO_COMMAND_SEARCH_PATH",
             fake_codex
                 .parent()
                 .expect("fake binary parent")

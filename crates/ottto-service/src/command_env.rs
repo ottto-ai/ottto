@@ -27,14 +27,50 @@ const PROVIDER_ENV_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
-    executable_search_dirs().into_iter().find_map(|dir| {
-        let candidate = dir.join(program);
-        if candidate.is_file() {
-            Some(candidate)
-        } else {
-            None
+    executable_search_dirs_for_program(program)
+        .into_iter()
+        .find_map(|dir| {
+            let candidate = dir.join(program);
+            if candidate.is_file() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+}
+
+fn executable_search_dirs_for_program(program: &str) -> Vec<PathBuf> {
+    if let Some(path_var) = env::var_os(COMMAND_SEARCH_PATH_ENV) {
+        return executable_search_dirs_from(Some(path_var), None, false);
+    }
+    executable_search_dirs_for_program_with_home(program, env::var_os("HOME"))
+}
+
+fn executable_search_dirs_for_program_with_home(
+    program: &str,
+    home: Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if program == "codex" {
+        push_unique(
+            &mut dirs,
+            PathBuf::from("/Applications/Codex.app/Contents/Resources"),
+        );
+        if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
+            push_unique(
+                &mut dirs,
+                PathBuf::from(home)
+                    .join("Applications")
+                    .join("Codex.app")
+                    .join("Contents")
+                    .join("Resources"),
+            );
         }
-    })
+    }
+    for dir in executable_search_dirs_from(env::var_os("PATH"), home, true) {
+        push_unique(&mut dirs, dir);
+    }
+    dirs
 }
 
 pub(crate) fn path_env() -> Option<OsString> {
@@ -139,13 +175,6 @@ fn non_empty_env_value(value: OsString) -> Option<OsString> {
     (!value.is_empty()).then_some(value)
 }
 
-fn executable_search_dirs() -> Vec<PathBuf> {
-    if let Some(path_var) = env::var_os(COMMAND_SEARCH_PATH_ENV) {
-        return executable_search_dirs_from(Some(path_var), None, false);
-    }
-    executable_search_dirs_from(env::var_os("PATH"), env::var_os("HOME"), true)
-}
-
 fn path_env_from(path_var: Option<OsString>, home: Option<OsString>) -> Option<OsString> {
     env::join_paths(executable_search_dirs_from(path_var, home, true)).ok()
 }
@@ -210,6 +239,25 @@ mod tests {
         assert!(dirs.contains(&PathBuf::from("/Users/tester/.local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
         assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
+    }
+
+    #[test]
+    fn codex_executable_prefers_desktop_bundle_locations() {
+        let dirs = executable_search_dirs_for_program_with_home(
+            "codex",
+            Some(OsString::from("/Users/tester")),
+        );
+
+        assert_eq!(
+            dirs.first(),
+            Some(&PathBuf::from("/Applications/Codex.app/Contents/Resources"))
+        );
+        assert_eq!(
+            dirs.get(1),
+            Some(&PathBuf::from(
+                "/Users/tester/Applications/Codex.app/Contents/Resources"
+            ))
+        );
     }
 
     #[test]
