@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
@@ -538,6 +539,52 @@ struct CodexStateThread {
     model: Option<String>,
 }
 
+/// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
+/// debug DB.
+///
+/// Codex fast mode is "request-is-cost": a turn whose `response.create`
+/// websocket request asked for `service_tier="priority"` is billed at the
+/// priority (fast) rate regardless of what the server served — and that request
+/// tier is the ONLY reliable fast-mode signal. The rollout jsonl carries no
+/// service_tier, and the served tier on `response.completed` is always
+/// `"default"`. So we read the requested tier out of `logs_2.sqlite`.
+///
+/// Keyed by `turn_id` (a globally-unique UUIDv7 from the request's `turn.id`
+/// tracing span), which matches `turn_context.payload.turn_id` in the rollout
+/// jsonl. Because turn ids are globally unique, one map joins per turn across
+/// every session without any session scoping. Only priority (fast) turns are
+/// retained; an absent turn is standard, so the set stays tiny.
+#[derive(Debug, Clone, Default)]
+struct CodexTurnTraceMap {
+    priority_turns: BTreeSet<String>,
+}
+
+impl CodexTurnTraceMap {
+    fn is_priority_turn(&self, turn_id: &str) -> bool {
+        self.priority_turns.contains(turn_id)
+    }
+}
+
+/// Local opt-out for the experimental Codex fast-mode trace read. Defaults on;
+/// set `OTTTO_CODEX_FAST_MODE_TRACE=off` (also accepts `0`/`false`/`no`/
+/// `disabled`) to skip the `logs_2.sqlite` read entirely, after which every
+/// Codex turn classifies as standard. The master local-usage switch
+/// (`local_usage_reconciliation_enabled`) already gates all collection; this is
+/// a finer opt-out specific to reading the undocumented debug DB.
+fn codex_fast_mode_trace_enabled() -> bool {
+    codex_fast_mode_trace_enabled_from(std::env::var("OTTTO_CODEX_FAST_MODE_TRACE").ok().as_deref())
+}
+
+fn codex_fast_mode_trace_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        ),
+        None => true,
+    }
+}
+
 // v6 row identity. Mirrors the backend's `_usage_row_key`
 // (model, selector_hash, billing_hash) tuple so daemon-side aggregation
 // dedupes the same rows the backend would have deduped on receipt. Without
@@ -609,6 +656,13 @@ struct SnapshotAccumulator {
     // lines stream past so the next usage row picks up the effort co-located
     // with that turn's token_count.
     latest_reasoning_effort: Option<String>,
+    // Most-recently-observed Codex turn id (from `turn_context.payload.turn_id`).
+    // The token_count event carries no turn id, so the running turn id is what
+    // joins each usage row to its `logs_2` fast-mode signal.
+    latest_turn_id: Option<String>,
+    // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
+    // read-only across every session file in the cycle via `Arc`.
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     usage_buckets: BTreeMap<String, UsageBucketState>,
@@ -647,6 +701,8 @@ impl SnapshotAccumulator {
             workspace_hash: None,
             latest_model: None,
             latest_reasoning_effort: None,
+            latest_turn_id: None,
+            codex_turn_traces: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             usage_buckets: BTreeMap::new(),
@@ -778,6 +834,20 @@ impl SnapshotAccumulator {
         // Running display context for usage rows. Row keys are derived
         // per-line from the merged selector inside add_usage_with_selector.
         self.current_selector.merge(selector);
+    }
+
+    /// True when the running turn (`latest_turn_id`) paid for Codex fast mode,
+    /// per the `logs_2` request tier. Used to stamp `service_tier=priority` onto
+    /// that turn's usage row only — never onto `current_selector`, so the signal
+    /// does not bleed into later standard turns of the same session.
+    fn current_turn_is_priority(&self) -> bool {
+        let (Some(traces), Some(turn_id)) = (
+            self.codex_turn_traces.as_ref(),
+            self.latest_turn_id.as_ref(),
+        ) else {
+            return false;
+        };
+        traces.is_priority_turn(turn_id)
     }
 
     fn add_usage_with_selector(
@@ -1196,6 +1266,16 @@ fn scan_source_roots_with_limit(
     } else {
         CodexTitleMetadata::default()
     };
+    // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
+    // it read-only across every session file via Arc. Skipped when the local
+    // opt-out is set.
+    let codex_turn_traces = (source == SnapshotSource::Codex && codex_fast_mode_trace_enabled())
+        .then(|| {
+            Arc::new(CodexTurnTraceMap::load_from_roots(
+                roots,
+                backfill_window_days,
+            ))
+        });
     let mut files = Vec::new();
     for root in roots {
         collect_recent_jsonl_files(
@@ -1225,6 +1305,7 @@ fn scan_source_roots_with_limit(
                 collected_at,
                 source_file_fingerprint.clone(),
                 &codex_title_metadata,
+                codex_turn_traces.clone(),
             )?,
             SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_artifacts(
                 &candidate.path,
@@ -1439,6 +1520,7 @@ pub fn parse_codex_jsonl_file(
         collected_at,
         source_file_fingerprint,
         &CodexTitleMetadata::default(),
+        None,
     )
 }
 
@@ -1447,6 +1529,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
     collected_at: &str,
     source_file_fingerprint: String,
     title_metadata: &CodexTitleMetadata,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
@@ -1455,6 +1538,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(title_metadata),
+        codex_turn_traces,
         // Codex lines never feed the artifact scraper; the value is moot.
         true,
     )
@@ -1484,6 +1568,7 @@ fn parse_claude_code_jsonl_file_with_artifacts(
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         None,
+        None,
         artifacts_enabled,
     )
 }
@@ -1500,11 +1585,13 @@ pub fn parse_pi_jsonl_file(
         SnapshotSource::Pi,
         apply_pi_line,
         None,
+        None,
         // Pi lines never feed the artifact scraper; the value is moot.
         true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_jsonl_file(
     path: &Path,
     collected_at: &str,
@@ -1512,6 +1599,7 @@ fn parse_jsonl_file(
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
 ) -> Result<Vec<SnapshotItem>> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
@@ -1522,6 +1610,7 @@ fn parse_jsonl_file(
         SnapshotAccumulator::new(source)
     };
     accumulator.artifacts_enabled = artifacts_enabled;
+    accumulator.codex_turn_traces = codex_turn_traces;
     read_bounded_jsonl_lines(reader, MAX_JSONL_LINE_BYTES, |value| {
         apply_line(value, &mut accumulator);
     })
@@ -2064,6 +2153,14 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if let Some(effort) = codex_reasoning_effort(value) {
         accumulator.latest_reasoning_effort = Some(effort);
     }
+    // Track the running turn id from `turn_context` (the token_count event that
+    // emits usage carries none). It joins each usage row to its `logs_2`
+    // fast-mode signal. Lines without a turn id leave the running value intact.
+    if let Some(turn_id) = string_at(value, &["turn_context", "payload", "turn_id"])
+        .or_else(|| string_at(value, &["payload", "turn_id"]))
+    {
+        accumulator.latest_turn_id = Some(turn_id);
+    }
     if let Some(usage) = codex_total_usage(value) {
         // Codex cumulative totals carry request_count as a session-wide count.
         // When the field is missing the parser defaults it to 1 so deltas
@@ -2075,13 +2172,25 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         } else {
             Some(1)
         };
+        // Stamp the fast-mode tier onto THIS turn's usage row only — passed as
+        // the per-line selector, never merged into current_selector — so a fast
+        // turn prices at the priority rate without leaking into later standard
+        // turns of the same session.
+        let mut usage_selector = selector;
+        if accumulator.current_turn_is_priority() {
+            usage_selector.insert(
+                "service_tier",
+                "priority".to_string(),
+                "derived_from_logs_2",
+            );
+        }
         accumulator.set_cumulative_usage_with_selector(
             string_at(value, &["token_count", "info", "model"])
                 .or_else(|| string_at(value, &["payload", "info", "model"]))
                 .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
-            selector,
+            usage_selector,
             timestamp.as_deref(),
             implicit_request_count,
             accumulator.latest_reasoning_effort.clone(),
@@ -2809,6 +2918,147 @@ impl CodexTitleMetadata {
         metadata.sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
         metadata
     }
+}
+
+// `logs_2.sqlite` can be ~1GB+ with a live WAL and a concurrent writer (Codex
+// itself). The read is best-effort, read-only, time-bounded, and row-capped so
+// it can never disrupt Codex or stall the snapshot cycle. Any error (missing
+// file, locked DB, schema churn) yields an empty map and every turn then
+// classifies as standard — the read is never load-bearing for collection.
+const CODEX_LOGS2_MAX_ROWS: i64 = 50_000;
+const CODEX_LOGS2_BUSY_TIMEOUT_MS: u64 = 400;
+// The trace read window pads the session backfill window so a turn near a
+// window edge still finds its request row. Capped so a stale/huge DB can never
+// widen the scan unboundedly.
+const CODEX_LOGS2_WINDOW_PAD_DAYS: u64 = 1;
+const CODEX_LOGS2_MAX_WINDOW_DAYS: u64 = 14;
+
+impl CodexTurnTraceMap {
+    fn load_from_roots(roots: &[PathBuf], backfill_window_days: u64) -> Self {
+        let mut map = Self::default();
+        let mut codex_dirs = BTreeSet::new();
+        for root in roots {
+            if let Some(parent) = root.parent() {
+                codex_dirs.insert(parent.to_path_buf());
+            }
+        }
+        let since_epoch = codex_logs2_since_epoch(backfill_window_days);
+        for codex_dir in codex_dirs {
+            // The live DB lives directly under ~/.codex; a `sqlite/` subdir copy
+            // exists on some installs. Read whichever is present.
+            for db_path in [
+                codex_dir.join("logs_2.sqlite"),
+                codex_dir.join("sqlite").join("logs_2.sqlite"),
+            ] {
+                load_codex_logs2_priority_turns(&db_path, since_epoch, &mut map.priority_turns);
+            }
+        }
+        map
+    }
+}
+
+fn codex_logs2_since_epoch(backfill_window_days: u64) -> i64 {
+    let window_days = backfill_window_days
+        .saturating_add(CODEX_LOGS2_WINDOW_PAD_DAYS)
+        .min(CODEX_LOGS2_MAX_WINDOW_DAYS);
+    let span = window_days.saturating_mul(86_400);
+    let now = unix_seconds(SystemTime::now()).unwrap_or(0);
+    now.saturating_sub(span) as i64
+}
+
+fn load_codex_logs2_priority_turns(
+    path: &Path,
+    since_epoch: i64,
+    priority_turns: &mut BTreeSet<String>,
+) {
+    if !path.exists() {
+        return;
+    }
+    // URI `mode=ro` so a WAL database with a concurrent writer is safe to read.
+    let uri = format!("file:{}?mode=ro", path.to_string_lossy());
+    let Ok(connection) = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) else {
+        return;
+    };
+    let _ = connection.busy_timeout(std::time::Duration::from_millis(
+        CODEX_LOGS2_BUSY_TIMEOUT_MS,
+    ));
+    // Only `response.create` request rows carry the *requested* service_tier.
+    // The `idx_logs_ts` index bounds the scan to the recent window; the LIKE
+    // then filters to the sparse request rows (hundreds, not the full table).
+    let Ok(mut statement) = connection.prepare(
+        "SELECT feedback_log_body FROM logs \
+         WHERE ts >= ?1 AND feedback_log_body LIKE '%websocket request:%' \
+         ORDER BY ts DESC LIMIT ?2",
+    ) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map(
+        rusqlite::params![since_epoch, CODEX_LOGS2_MAX_ROWS],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return;
+    };
+    for body in rows.flatten() {
+        if let Some(turn_id) = codex_logs2_priority_turn_from_body(&body) {
+            priority_turns.insert(turn_id);
+        }
+    }
+}
+
+/// Parse one `feedback_log_body` row. Returns the `turn_id` when the row is a
+/// `response.create` request that asked for `service_tier="priority"`.
+///
+/// Privacy: the row's JSON payload contains the full prompt (`input`,
+/// `instructions`, `tools`). We read ONLY the `type` and `service_tier` fields
+/// and the `turn.id` tracing span; no prompt or output content is retained.
+fn codex_logs2_priority_turn_from_body(body: &str) -> Option<String> {
+    const MARKER: &str = "websocket request:";
+    let idx = body.rfind(MARKER)?;
+    let prefix = &body[..idx];
+    let json_text = body[idx + MARKER.len()..].trim();
+    let value: Value = serde_json::from_str(json_text).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("response.create") {
+        return None;
+    }
+    let tier = value.get("service_tier").and_then(Value::as_str)?;
+    if !tier.eq_ignore_ascii_case("priority") {
+        return None;
+    }
+    codex_logs2_span_field(prefix, "turn.id")
+        .or_else(|| codex_logs2_span_field(prefix, "turn_id"))
+        .filter(|turn_id| !turn_id.is_empty())
+}
+
+/// Extract a `key=value` field from a tracing-span prefix, where the value is
+/// terminated by whitespace, `,`, `{`, or `}`. The key must sit on an
+/// identifier boundary so `turn_id` does not match inside `parent_turn_id`.
+fn codex_logs2_span_field(prefix: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    let mut search_start = 0;
+    while let Some(rel) = prefix[search_start..].find(&needle) {
+        let at = search_start + rel;
+        let boundary = at == 0
+            || !prefix[..at]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                .unwrap_or(false);
+        let value_start = at + needle.len();
+        if boundary {
+            let value: String = prefix[value_start..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ',' | '{' | '}'))
+                .collect();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+        search_start = value_start;
+    }
+    None
 }
 
 fn load_codex_session_index_titles(
@@ -4104,6 +4354,7 @@ mod tests {
             "2026-05-14T10:04:00Z",
             "file-fingerprint".to_string(),
             &metadata,
+            None,
         )
         .expect("parse")
         .into_iter()
@@ -4983,6 +5234,7 @@ mod tests {
             "2026-05-14T10:04:00Z",
             "file-fingerprint".to_string(),
             &first,
+            None,
         )
         .expect("parse first")
         .into_iter()
@@ -4993,6 +5245,7 @@ mod tests {
             "2026-05-14T10:04:00Z",
             "file-fingerprint".to_string(),
             &second,
+            None,
         )
         .expect("parse second")
         .into_iter()
@@ -5124,6 +5377,232 @@ mod tests {
         assert_eq!(standard.output_tokens, 30);
         assert_eq!(fast.input_tokens, 200);
         assert_eq!(fast.output_tokens, 60);
+
+        let _ = fs::remove_file(path);
+    }
+
+    // turn ids reused across the logs_2 reader + injection tests.
+    const FAST_TURN: &str = "019ee443-7197-7d51-84a0-727a6b2655cb";
+    const STD_TURN: &str = "019ee421-1b3b-71c3-a0a8-ec9f645bf521";
+
+    fn priority_request_body(turn_id: &str) -> String {
+        format!(
+            "session_loop{{thread_id=019ee443-4c18-71c3-843e-847232f694b0}}:\
+             turn{{otel.name=\"session_task.turn\" turn.id={turn_id} \
+             codex.turn.reasoning_effort=xhigh}}: websocket request: \
+             {{\"type\":\"response.create\",\"service_tier\":\"priority\",\
+             \"model\":\"gpt-5.5\",\"instructions\":\"REDACTED PROMPT\"}}"
+        )
+    }
+
+    #[test]
+    fn codex_logs2_priority_turn_from_body_extracts_turn_id_for_priority() {
+        let body = priority_request_body(FAST_TURN);
+        assert_eq!(
+            codex_logs2_priority_turn_from_body(&body).as_deref(),
+            Some(FAST_TURN)
+        );
+    }
+
+    #[test]
+    fn codex_logs2_priority_turn_from_body_ignores_standard_and_non_request() {
+        // No service_tier (standard) -> not a fast turn.
+        let standard = "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
+             websocket request: {\"type\":\"response.create\",\"model\":\"gpt-5.5\"}";
+        assert_eq!(codex_logs2_priority_turn_from_body(standard), None);
+        // service_tier=auto is the default, not priority.
+        let auto = "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
+             websocket request: {\"type\":\"response.create\",\"service_tier\":\"auto\"}";
+        assert_eq!(codex_logs2_priority_turn_from_body(auto), None);
+        // Wrong message type.
+        let other = "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
+             websocket request: {\"type\":\"response.cancel\",\"service_tier\":\"priority\"}";
+        assert_eq!(codex_logs2_priority_turn_from_body(other), None);
+        // No request marker at all.
+        assert_eq!(codex_logs2_priority_turn_from_body("nothing here"), None);
+    }
+
+    #[test]
+    fn codex_logs2_span_field_respects_identifier_boundary() {
+        let prefix = "submission.id=XYZ parent_turn_id=AAA turn.id=BBB next=1";
+        // `turn.id` sits on a boundary (space before) -> matched.
+        assert_eq!(
+            codex_logs2_span_field(prefix, "turn.id").as_deref(),
+            Some("BBB")
+        );
+        // `turn_id` appears only inside `parent_turn_id` -> rejected by boundary.
+        assert_eq!(codex_logs2_span_field(prefix, "turn_id"), None);
+        // Value terminates at brace.
+        assert_eq!(
+            codex_logs2_span_field("a turn.id=CCC}", "turn.id").as_deref(),
+            Some("CCC")
+        );
+    }
+
+    #[test]
+    fn codex_fast_mode_trace_opt_out_defaults_on() {
+        assert!(codex_fast_mode_trace_enabled_from(None));
+        assert!(codex_fast_mode_trace_enabled_from(Some("on")));
+        assert!(codex_fast_mode_trace_enabled_from(Some("1")));
+        assert!(codex_fast_mode_trace_enabled_from(Some("")));
+        for off in ["off", "0", "false", "no", "disabled", "OFF", " Off "] {
+            assert!(
+                !codex_fast_mode_trace_enabled_from(Some(off)),
+                "expected {off:?} to disable the trace"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_logs2_reader_collects_priority_turns_from_sqlite() {
+        let codex_dir = temp_dir("codex-logs2-reader");
+        let db_path = codex_dir.join("logs_2.sqlite");
+        let now = unix_seconds(SystemTime::now()).expect("now") as i64;
+        {
+            let connection = Connection::open(&db_path).expect("create db");
+            connection
+                .execute(
+                    "CREATE TABLE logs (id INTEGER PRIMARY KEY, ts INTEGER, feedback_log_body TEXT)",
+                    [],
+                )
+                .expect("create table");
+            // In-window priority turn -> collected.
+            connection
+                .execute(
+                    "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
+                    rusqlite::params![now, priority_request_body(FAST_TURN)],
+                )
+                .expect("insert fast");
+            // In-window standard turn -> ignored.
+            connection
+                .execute(
+                    "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        now,
+                        "turn{turn.id=019ee421-1b3b-71c3-a0a8-ec9f645bf521}: \
+                         websocket request: {\"type\":\"response.create\",\"model\":\"gpt-5.5\"}"
+                    ],
+                )
+                .expect("insert std");
+            // Out-of-window priority turn -> excluded by ts bound.
+            connection
+                .execute(
+                    "INSERT INTO logs (ts, feedback_log_body) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        now - 60 * 86_400,
+                        priority_request_body("019e0000-0000-7000-8000-000000000000")
+                    ],
+                )
+                .expect("insert old");
+        }
+
+        let roots = vec![codex_dir.join("sessions")];
+        let map = CodexTurnTraceMap::load_from_roots(&roots, 7);
+        assert!(map.is_priority_turn(FAST_TURN));
+        assert!(!map.is_priority_turn(STD_TURN));
+        assert!(!map.is_priority_turn("019e0000-0000-7000-8000-000000000000"));
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn codex_logs2_tier_stamps_priority_on_fast_turn_only() {
+        // Session-cumulative token_count emits one delta per turn. The fast turn
+        // (in the logs_2 priority map) must price as priority; the standard turn
+        // must carry no service_tier, proving the signal does not bleed forward.
+        let path = temp_file("codex-logs2-inject");
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-06-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019ee443-4c18-71c3-843e-847232f694b0\"}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{fast}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":300,\"output_tokens\":90,\"request_count\":1}},\"model\":\"gpt-5.5\"}}}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:03:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{std}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:04:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":400,\"output_tokens\":120,\"request_count\":2}},\"model\":\"gpt-5.5\"}}}}}}\n"
+                ),
+                fast = FAST_TURN,
+                std = STD_TURN,
+            ),
+        )
+        .expect("write fixture");
+
+        let mut map = CodexTurnTraceMap::default();
+        map.priority_turns.insert(FAST_TURN.to_string());
+
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-06-20T10:05:00Z",
+            "file-fingerprint".to_string(),
+            &CodexTitleMetadata::default(),
+            Some(Arc::new(map)),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 2);
+        let fast = item
+            .model_usage
+            .iter()
+            .find(|row| {
+                row.selector_context.get("service_tier").map(String::as_str) == Some("priority")
+            })
+            .expect("priority row");
+        assert_eq!(fast.input_tokens, 300);
+        assert_eq!(fast.output_tokens, 90);
+        assert_eq!(
+            fast.selector_sources
+                .get("service_tier")
+                .map(String::as_str),
+            Some("derived_from_logs_2")
+        );
+        let standard = item
+            .model_usage
+            .iter()
+            .find(|row| !row.selector_context.contains_key("service_tier"))
+            .expect("standard row");
+        assert_eq!(standard.input_tokens, 100);
+        assert_eq!(standard.output_tokens, 30);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_logs2_tier_absent_map_leaves_turns_standard() {
+        // Same fast turn, but no trace map: the parser is unchanged and stamps
+        // no service_tier (regression guard for the default path).
+        let path = temp_file("codex-logs2-none");
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-06-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019ee443-4c18-71c3-843e-847232f694b0\"}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:01:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.5\",\"turn_id\":\"{fast}\"}}}}\n",
+                    "{{\"timestamp\":\"2026-06-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":300,\"output_tokens\":90,\"request_count\":1}},\"model\":\"gpt-5.5\"}}}}}}\n"
+                ),
+                fast = FAST_TURN,
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-06-20T10:05:00Z",
+            "file-fingerprint".to_string(),
+            &CodexTitleMetadata::default(),
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 1);
+        assert!(!item.model_usage[0]
+            .selector_context
+            .contains_key("service_tier"));
 
         let _ = fs::remove_file(path);
     }
@@ -5267,6 +5746,7 @@ mod tests {
             "2026-05-19T10:04:00Z",
             "file-fingerprint".to_string(),
             &metadata,
+            None,
         )
         .expect("parse")
         .into_iter()
@@ -5400,6 +5880,7 @@ mod tests {
             "2026-05-19T10:04:00Z",
             "file-fingerprint".to_string(),
             &metadata,
+            None,
         )
         .expect("parse")
         .into_iter()
@@ -5457,6 +5938,7 @@ mod tests {
             "2026-05-19T10:04:00Z",
             "file-fingerprint".to_string(),
             &metadata,
+            None,
         )
         .expect("parse")
         .into_iter()
