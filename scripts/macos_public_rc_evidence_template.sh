@@ -158,7 +158,7 @@ if arch not in {"arm64", "x86_64", "universal", "TODO_arm64_x86_64_or_universal"
 
 if not checked_at:
     checked_at = (
-        dt.datetime.now(dt.UTC)
+        dt.datetime.now(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
