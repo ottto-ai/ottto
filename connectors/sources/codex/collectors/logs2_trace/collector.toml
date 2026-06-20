@@ -1,0 +1,15 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "logs2_trace"
+display_name = "Codex fast-mode trace"
+
+operations = ["collect_usage"]
+data_source_kind = "local_enriched"
+default_state = "enabled"
+
+review_tier = "ottto_labs"
+maturity = "undocumented_surface"
+risk_classes = []
+
+uploads_raw_content = false
+emits = ["local_usage_fast_mode_tier"]

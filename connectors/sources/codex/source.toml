@@ -18,6 +18,8 @@ operations = [
 
 collectors = [
   "local_sessions",
+  "logs2_trace",
   "otel_config",
-  "quota_status"
+  "quota_status",
+  "identity_probe"
 ]

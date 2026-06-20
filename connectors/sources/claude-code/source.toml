@@ -19,5 +19,6 @@ operations = [
 collectors = [
   "local_sessions",
   "otel_config",
-  "quota_status"
+  "quota_status",
+  "identity_probe"
 ]

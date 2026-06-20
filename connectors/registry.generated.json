@@ -20,6 +20,27 @@
       "manifest_path": "connectors/sources/claude-code/source.toml",
       "collectors": [
         {
+          "collector_id": "identity_probe",
+          "display_name": "Identity probe",
+          "operations": [
+            "detect",
+            "verify",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [
+            "auth_adjacent"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "identity_probe_events"
+          ],
+          "manifest_path": "connectors/sources/claude-code/collectors/identity_probe/collector.toml"
+        },
+        {
           "collector_id": "local_sessions",
           "display_name": "Local sessions",
           "operations": [
@@ -107,6 +128,28 @@
       "manifest_path": "connectors/sources/codex/source.toml",
       "collectors": [
         {
+          "collector_id": "identity_probe",
+          "display_name": "Identity probe",
+          "operations": [
+            "detect",
+            "verify",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [
+            "auth_adjacent",
+            "hidden_credential_read"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "identity_probe_events"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/identity_probe/collector.toml"
+        },
+        {
           "collector_id": "local_sessions",
           "display_name": "Local sessions",
           "operations": [
@@ -127,6 +170,23 @@
             "local_usage_workspace_labels"
           ],
           "manifest_path": "connectors/sources/codex/collectors/local_sessions/collector.toml"
+        },
+        {
+          "collector_id": "logs2_trace",
+          "display_name": "Codex fast-mode trace",
+          "operations": [
+            "collect_usage"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "ottto_labs",
+          "maturity": "undocumented_surface",
+          "risk_classes": [],
+          "uploads_raw_content": false,
+          "emits": [
+            "local_usage_fast_mode_tier"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/logs2_trace/collector.toml"
         },
         {
           "collector_id": "otel_config",
@@ -195,6 +255,25 @@
       ],
       "manifest_path": "connectors/sources/pi/source.toml",
       "collectors": [
+        {
+          "collector_id": "identity_probe",
+          "display_name": "Identity probe",
+          "operations": [
+            "detect",
+            "verify",
+            "diagnostics"
+          ],
+          "data_source_kind": "local_enriched",
+          "default_state": "enabled",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [],
+          "uploads_raw_content": false,
+          "emits": [
+            "identity_probe_events"
+          ],
+          "manifest_path": "connectors/sources/pi/collectors/identity_probe/collector.toml"
+        },
         {
           "collector_id": "live_batches",
           "display_name": "Live usage batches",

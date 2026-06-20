@@ -17,11 +17,22 @@
             "name": "reset_bank",
             "unit": "resets",
             "remaining": 2,
-            "status": "ok"
+            "status": "ok",
+            "freshness": "fresh"
           }
         ],
         "reset_at": "2026-05-21T00:00:00Z",
-        "observed_at": "2026-05-20T08:03:00Z"
+        "observed_at": "2026-05-20T08:03:00Z",
+        "evidence_receipts": [
+          {
+            "schema_version": "agent_status_evidence_receipt.v1",
+            "receipt_id": "agent_status_evidence_receipt.v1:codex:quota_status:weekly",
+            "receipt_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "collector_id": "quota_status",
+            "evidence_kind": "quota_status",
+            "customer_rollout_excluded": true
+          }
+        ]
       }
     },
     {
@@ -31,13 +42,23 @@
         "collector_id": "quota_status",
         "plan_label": "ChatGPT Plus",
         "quota_basis": "local_status_snapshot",
-        "confidence": "observed"
+        "confidence": "observed",
+        "evidence_receipts": [
+          {
+            "schema_version": "agent_status_evidence_receipt.v1",
+            "receipt_id": "agent_status_evidence_receipt.v1:codex:plan_identity:plus",
+            "receipt_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "collector_id": "quota_status",
+            "evidence_kind": "plan_identity",
+            "customer_rollout_excluded": true
+          }
+        ]
       }
     }
   ],
   "upload_policy": {
     "uploads_raw_content": false,
-    "boundary": "Quota window metadata, reset timestamps, remaining ratios, reset-credit counts, and plan profile evidence only.",
+    "boundary": "Quota window metadata, reset timestamps, remaining ratios, explicit reset-bank counts, credit balances, and plan profile evidence only.",
     "redacts": [
       "prompt",
       "response",

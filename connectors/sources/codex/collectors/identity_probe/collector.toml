@@ -1,0 +1,22 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "identity_probe"
+display_name = "Identity probe"
+
+operations = ["detect", "verify", "diagnostics"]
+data_source_kind = "local_enriched"
+# ``~/.codex/auth.json`` is a plain-JSON file that also stores OAuth tokens.
+# Even though the probe only extracts (and hashes) ``tokens.account_id``,
+# opening that file is classified as a hidden-credential-file read by the
+# connector-manifest safety rules. Keep it gated behind the setup path so
+# the user explicitly opts in.
+default_state = "requires_setup"
+
+review_tier = "official"
+maturity = "beta"
+risk_classes = ["auth_adjacent", "hidden_credential_read"]
+
+uploads_raw_content = false
+emits = [
+  "identity_probe_events"
+]

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 190,
-  "content_sha256": "815ab097b34ee0a2660a2ca21d836b92e25598decc458c00894b962bade2b691",
+  "candidate_file_count": 198,
+  "content_sha256": "a1bde8aac001109c0589b603e67cd98e74b030606b0ec63e0d106a47daea265f",
   "files": [
     {
       "executable": false,
@@ -118,29 +118,43 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "3729cb0fc2ac25ce73477ccca01fd3c6081f6645d59704900699d636b541bc63",
-      "size_bytes": 10359
+      "sha256": "a8b8fdd0e29c93514ae8b00c8d941d8a4d9eb7449e2fee7d15a58e8afc15197c",
+      "size_bytes": 10557
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/registry.generated.json",
-      "sha256": "5c30a909e3204a969ad04f384b2604348d4b6098f7b5d9a2bf7e0f48eca1decd",
-      "size_bytes": 8035
+      "sha256": "31bb85266f2c6647f00fb4b5edfc8561af2e4b0b78b95687f0af0cbc0aa3f804",
+      "size_bytes": 10567
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/POLICY.md",
-      "sha256": "99dcd91f3cddaf4ed1bdd48a2389d26b92404eed79f73930b21a052e8b268220",
-      "size_bytes": 1489
+      "sha256": "1a8565431dff0c2d219d924176e4a86f76cb0f3d2411d6070a22e74ce6efa13a",
+      "size_bytes": 2498
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/README.md",
-      "sha256": "36d6c7431125867f4f233437e6c960e16663e9fb9909f3dd37173f8e26bd915b",
-      "size_bytes": 757
+      "sha256": "9d2f1e5f7330683cad49cf6f1869bc32b0b35fdddb9e3978e60977df0d8b6d46",
+      "size_bytes": 1032
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/identity_probe/collector.toml",
+      "sha256": "f02220079562f07e66f75fd1c76e15e084a9ecde412c2f575827bfaf5e3fef34",
+      "size_bytes": 387
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/claude-code/collectors/identity_probe/fixtures/minimal-evidence.json",
+      "sha256": "9bdbe966320bfd0415f5d34bc4045dd1e3a868051e613e5e98fb401d93b2ef7c",
+      "size_bytes": 1246
     },
     {
       "executable": false,
@@ -181,8 +195,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/collectors/quota_status/fixtures/minimal-evidence.json",
-      "sha256": "54b850069783053872d09effc69b075439741a0ecb841c323e7e07e2e75d4b7b",
-      "size_bytes": 1197
+      "sha256": "a40af6591a90e08291e33d03dcf41466de539f520c868f7c79c840c8e1a670fc",
+      "size_bytes": 2124
     },
     {
       "executable": false,
@@ -195,22 +209,36 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/source.toml",
-      "sha256": "98dac76fadf88115fd155d6c09f025a272b325f80a63691e26c2b76a43e82006",
-      "size_bytes": 384
+      "sha256": "99c6736441b000023cb046ffe1695f5500285f98382936e43806a14eeb070300",
+      "size_bytes": 404
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/POLICY.md",
-      "sha256": "e467d4f0559ba71ec6e8684c7fc88982551f063d6c881858b4f1b81f85f6523a",
-      "size_bytes": 2257
+      "sha256": "98f9061d55a96203ab6e5a04a76f372051f8fde39a07b402dfd51b58308d3073",
+      "size_bytes": 4326
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/README.md",
-      "sha256": "143122abc5c17dd1b12ca2b25667129d024485d0265fd541ab8286cff9b1f711",
-      "size_bytes": 956
+      "sha256": "32ca77269fee09df20c057509fa8aa76bcd79c0929583217d6c0d50a3af14037",
+      "size_bytes": 2193
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/identity_probe/collector.toml",
+      "sha256": "de074670da79298be75929dd5c167b7bb121a8a297d0717b51910b8fb90e1fe1",
+      "size_bytes": 744
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/identity_probe/fixtures/minimal-evidence.json",
+      "sha256": "3f8a3ac51604e34b78e8072e2802ace751d89668adda8f8e05cc3f30cdacd381",
+      "size_bytes": 1379
     },
     {
       "executable": false,
@@ -225,6 +253,20 @@
       "path": "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json",
       "sha256": "6e1d3a4bec2a8587d5acfa725c303bf2237a94bbe06553fdf3d2231882c86210",
       "size_bytes": 2065
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/logs2_trace/collector.toml",
+      "sha256": "c13064c475cee25f99ad758c058afe43b121d314702b8e6b6b250872c1f91326",
+      "size_bytes": 371
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/logs2_trace/fixtures/minimal-evidence.json",
+      "sha256": "0b7866367735414aee1a68f43296a8e70f61e75d14dff70bf46ac7ae3afb1a8a",
+      "size_bytes": 1100
     },
     {
       "executable": false,
@@ -251,36 +293,50 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/collectors/quota_status/fixtures/minimal-evidence.json",
-      "sha256": "afb45e4a124a28dc531dc30814ea882a7fa669279e371fdf7e784d67a8ed3bc6",
-      "size_bytes": 1353
+      "sha256": "0ed3079142a55a4acacc00c02905267baebbae96edc7acb28086898c6e5cb455",
+      "size_bytes": 2327
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/fixtures/local_sessions/minimal-session.jsonl",
-      "sha256": "0c3fb14a9dd3885ca513d69aff1526487d35bb16d47050db77178cfe3c04f390",
-      "size_bytes": 430
+      "sha256": "fc0b41d0369eb87d6dbbaac7571463b575f6e1e03e22f5bf34bf73fc5bfd2e44",
+      "size_bytes": 481
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/source.toml",
-      "sha256": "654d14ddbfc920fac5f4c749b2056a6c97f23966aebfd0f2566dbcc68fd9e807",
-      "size_bytes": 366
+      "sha256": "b9ddb67dfcdfd4f414c0e3fcbba304c3ee89841d22147d98ad572b05391af600",
+      "size_bytes": 403
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/pi/POLICY.md",
-      "sha256": "65da48d1d06bc2f627be7e4405497ab235f5fbd919071b685288d1977f67f7d6",
-      "size_bytes": 1558
+      "sha256": "67e85ccfcdb9ee1b27975cdad1a0e77bde1dd06b2decba9553ac89e534f63950",
+      "size_bytes": 1996
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/pi/README.md",
-      "sha256": "ccb412a7e879c0876a3c866af9d474ae928276b26ef5bf03337411ef9efc116e",
-      "size_bytes": 855
+      "sha256": "fa83d64bf19c05ab620b1772cac98681fb697756d4d86121625d36efde002edf",
+      "size_bytes": 1183
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/identity_probe/collector.toml",
+      "sha256": "30385be04f057ca80e7ed4ed9d84c20fc4b6b1c90de18eebdeaa8a3eae28e789",
+      "size_bytes": 363
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/pi/collectors/identity_probe/fixtures/minimal-evidence.json",
+      "sha256": "1dd8972bbb7c3dfeed2c1ae4f85c89b0e11bd6151b6da4dd7fd477b864dc8161",
+      "size_bytes": 1201
     },
     {
       "executable": false,
@@ -335,8 +391,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/pi/source.toml",
-      "sha256": "da1885058d4ffd216de43c541ee310fd19f9da4f6e4c552088b2bd6d43bde0b7",
-      "size_bytes": 356
+      "sha256": "62cd38684030db1a57bda9d6391e070d06c384e9695e4365a923fb68e83e85cb",
+      "size_bytes": 376
     },
     {
       "executable": false,
@@ -587,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "5bd38a9e20e40e462012e57c0cdeb280ce962b8c49430a64003a531845f15758",
-      "size_bytes": 208482
+      "sha256": "d3b83c5c7dee0e3d0e37a18054c3a05d452e52c90526c79e725edcc1b0157c59",
+      "size_bytes": 208609
     },
     {
       "executable": false,
@@ -1333,9 +1389,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-20T12:32:10+00:00",
+  "generated_at": "2026-06-20T19:03:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 191,
+  "output_file_count": 199,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1368,5 +1424,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ab3b61c741f45c61dd362e5c88a6b09ca3232abe"
+  "source_commit": "b665f12843c672e2a625502f011e593dd1c5d4c7"
 }
