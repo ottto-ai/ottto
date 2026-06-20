@@ -299,6 +299,10 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving local snapshot sync"),
         Err(error) => eprintln!("local snapshot sync unavailable: {error}"),
     }
+    match ottto_service::snapshot_sync::spawn_local_health_projection_sync(daemon.clone()) {
+        Ok(()) => eprintln!("serving local health projection sync"),
+        Err(error) => eprintln!("local health projection sync unavailable: {error}"),
+    }
 }
 
 fn home_dir() -> Result<PathBuf> {

@@ -32,6 +32,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 const SNAPSHOT_BATCH_LIMIT: usize = 100;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
@@ -99,6 +100,24 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             std::thread::sleep(SNAPSHOT_SYNC_INTERVAL);
         })
         .context("spawn local snapshot sync")?;
+    Ok(())
+}
+
+pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
+    std::thread::Builder::new()
+        .name("ottto-local-health-sync".to_string())
+        .spawn(move || loop {
+            if let Err(error) = upload_local_health_projection_now(&daemon) {
+                if !local_health_upload_can_wait_quietly(&error) {
+                    eprintln!(
+                        "local health projection upload skipped: {}",
+                        safe_error(&error)
+                    );
+                }
+            }
+            std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
+        })
+        .context("spawn local health projection sync")?;
     Ok(())
 }
 
@@ -299,6 +318,15 @@ fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadF
     } else {
         LocalHealthUploadFailureKind::BackendUnreachable
     }
+}
+
+fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> bool {
+    matches!(
+        safe_error(error),
+        "relay device credentials are unavailable" | "machine identity is unavailable"
+    ) || error
+        .to_string()
+        .contains("registered device has no enabled sources")
 }
 
 fn upload_local_health_projection_with(
@@ -1058,6 +1086,12 @@ mod tests {
     }
 
     #[test]
+    fn local_health_heartbeat_cadence_is_not_bound_to_snapshot_scans() {
+        assert!(LOCAL_HEALTH_PROJECTION_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
+        assert!(LOCAL_HEALTH_PROJECTION_INTERVAL <= Duration::from_secs(60));
+    }
+
+    #[test]
     fn api_base_url_prefers_persisted_connection_then_env() {
         assert_eq!(
             normalize_api_base_url(
@@ -1099,6 +1133,22 @@ mod tests {
             })),
             "local health authorization rejected"
         );
+    }
+
+    #[test]
+    fn local_health_loop_waits_quietly_for_claim_credentials() {
+        assert!(local_health_upload_can_wait_quietly(&anyhow!(
+            "relay device credentials are missing"
+        )));
+        assert!(local_health_upload_can_wait_quietly(&anyhow!(
+            "machine identity is missing"
+        )));
+        assert!(local_health_upload_can_wait_quietly(&anyhow!(
+            "registered device has no enabled sources"
+        )));
+        assert!(!local_health_upload_can_wait_quietly(&anyhow!(
+            "upload local health projection failed"
+        )));
     }
 
     #[test]
