@@ -48,8 +48,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS). The per-row selector shape
 // changed, so the bump re-walks every Claude session once to re-emit at v8.
 // v17: Codex per-model usage now carries per-turn reasoning_effort
+// claude_code v9: each Claude Code session origin now carries
+// `used_workflow_orchestration` (true when the local
+// `<session>/workflows/wf_*.json` footprint is present, i.e. the Workflow tool
+// / dynamic multi-agent orchestration ran). The bump re-walks every Claude
+// session once so already-scanned sessions re-emit with the new origin field.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v8";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v9";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -170,6 +175,8 @@ pub struct SnapshotOrigin {
     pub is_sidechain: Option<bool>, // Claude: subagent (Task tool)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>, // Claude: "bg"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_workflow_orchestration: Option<bool>, // Claude: Workflow tool ran (local wf_*.json footprint)
 }
 
 impl SnapshotOrigin {
@@ -182,6 +189,7 @@ impl SnapshotOrigin {
             && self.entrypoint.is_none()
             && self.is_sidechain.is_none()
             && self.session_kind.is_none()
+            && self.used_workflow_orchestration.is_none()
     }
 }
 
@@ -585,6 +593,47 @@ fn codex_fast_mode_trace_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
+/// Finer opt-out (mirrors `codex_fast_mode_trace_enabled`) for the per-session
+/// Claude Code `workflows/` directory stat that detects dynamic workflow
+/// orchestration. `OTTTO_CLAUDE_WORKFLOW_DETECT=off` (or 0/false/no/disabled)
+/// skips the filesystem probe entirely, after which every Claude session
+/// reports no workflow-orchestration signal.
+fn claude_workflow_detect_enabled() -> bool {
+    claude_workflow_detect_enabled_from(
+        std::env::var("OTTTO_CLAUDE_WORKFLOW_DETECT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no" | "disabled"
+        ),
+        None => true,
+    }
+}
+
+/// True when `dir` (a Claude Code session's `workflows/` sibling directory)
+/// contains at least one `wf_*.json` orchestration manifest. The Workflow tool
+/// writes one manifest per run; manifest filenames are truncated
+/// (e.g. `wf_60f3dab6-4fa.json`), so match on the `wf_`/`.json` affixes rather
+/// than an exact name. Best-effort: a missing directory or any read error
+/// yields `false` and never disrupts collection.
+fn claude_workflows_dir_has_manifest(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("wf_") && name.ends_with(".json"))
+    })
+}
+
 // v6 row identity. Mirrors the backend's `_usage_row_key`
 // (model, selector_hash, billing_hash) tuple so daemon-side aggregation
 // dedupes the same rows the backend would have deduped on receipt. Without
@@ -967,7 +1016,7 @@ impl SnapshotAccumulator {
     }
 
     fn into_items(
-        self,
+        mut self,
         path: &Path,
         collected_at: &str,
         source_file_fingerprint: String,
@@ -988,6 +1037,17 @@ impl SnapshotAccumulator {
         else {
             return Vec::new();
         };
+        // Claude Code dynamic workflow orchestration (the Workflow tool, e.g.
+        // `ultracode`) leaves a local manifest at
+        // `<projectDir>/<sessionId>/workflows/wf_*.json` -- a sibling directory
+        // of the `<sessionId>.jsonl` we just parsed. Stat it so the backend can
+        // surface a per-session "workflow orchestration ran" signal. Best-effort
+        // only: absence/errors -> false, never load-bearing for collection.
+        if self.source == SnapshotSource::ClaudeCode && claude_workflow_detect_enabled() {
+            let workflows_dir = path.with_extension("").join("workflows");
+            self.origin.used_workflow_orchestration =
+                Some(claude_workflows_dir_has_manifest(&workflows_dir));
+        }
         let collector = match self.source {
             SnapshotSource::Codex => "codex_jsonl".to_string(),
             SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
@@ -5991,8 +6051,51 @@ mod tests {
         let origin = item.origin.expect("origin forwarded");
         assert_eq!(origin.entrypoint.as_deref(), Some("cli"));
         assert_eq!(origin.is_sidechain, Some(true));
+        // No sibling `<session>/workflows/wf_*.json` footprint -> detection ran
+        // and reported false (not None / unknown).
+        assert_eq!(origin.used_workflow_orchestration, Some(false));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_parser_detects_workflow_orchestration_footprint() {
+        // The Workflow tool (dynamic orchestration, e.g. `ultracode`) leaves a
+        // local manifest at `<projectDir>/<sessionId>/workflows/wf_*.json`, a
+        // sibling of the `<sessionId>.jsonl` we parse. Presence -> Some(true).
+        let dir = temp_dir("claude-wf");
+        let path = dir.join("claude-wf-session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-wf-session\",\"entrypoint\":\"cli\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-wf-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let workflows_dir = path.with_extension("").join("workflows");
+        fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+        // Manifest filenames are truncated in practice (e.g. wf_60f3dab6-4fa.json).
+        fs::write(workflows_dir.join("wf_60f3dab6-4fa.json"), "{}").expect("write manifest");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-05-06T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let origin = item.origin.expect("origin forwarded");
+        assert_eq!(origin.used_workflow_orchestration, Some(true));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_workflow_detect_env_opt_out_parses() {
+        assert!(claude_workflow_detect_enabled_from(None));
+        assert!(claude_workflow_detect_enabled_from(Some("on")));
+        assert!(!claude_workflow_detect_enabled_from(Some("off")));
+        assert!(!claude_workflow_detect_enabled_from(Some("0")));
+        assert!(!claude_workflow_detect_enabled_from(Some(" Disabled ")));
     }
 
     #[test]
