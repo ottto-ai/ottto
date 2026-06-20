@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "1b0c7d52450b13c3871fa47d7d861e97efffa4c7e1705b2c64419c6b072dc5fc",
+  "content_sha256": "87e5e075dd6f0539143bc3ee7e16fd551890c1d11074d2fb9f3024c0d9d3e77e",
   "files": [
     {
       "executable": false,
@@ -566,8 +566,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "77c2bee46fec7f83d94958174709b867e233f4a469a8473f947393665da1aac1",
-      "size_bytes": 514365
+      "sha256": "768d2c7f4c1c602849d10a3c474d436760d56ace9f89720de9ac98d74cede6b9",
+      "size_bytes": 517100
     },
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_public_rc_evidence_template.sh",
-      "sha256": "8aaf227ff8108a4257a32daefdf05389b94608814eb79f52fbf3668c54a2bf89",
-      "size_bytes": 6617
+      "sha256": "df02af76d166bfd3c6db8d79c5a448b8aa1a8d4b1e485dc7e6fb52c4ba7ce02a",
+      "size_bytes": 6626
     },
     {
       "executable": true,
@@ -1091,8 +1091,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_stable_qa_evidence_template.sh",
-      "sha256": "81359ad59064c9b7cbc2f01bb73bfc352c3230e35d9d8fd81643e00ef147d379",
-      "size_bytes": 9500
+      "sha256": "9dda5ba586a4785c1e25c79f19544f4c5a6f8f449c863173955cd92009f10e8f",
+      "size_bytes": 9509
     },
     {
       "executable": true,
@@ -1333,7 +1333,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-19T23:30:40+00:00",
+  "generated_at": "2026-06-20T00:43:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 191,
   "public_roots": [
@@ -1368,5 +1368,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "41db2063e02347bece6fe39bae19f3c0a90eba9c"
+  "source_commit": "22c49b8e8a4b6caac81ccd177b7ebe10aef5c382"
 }

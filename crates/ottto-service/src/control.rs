@@ -1078,7 +1078,20 @@ fn telemetry_control_with_detector(
             require_non_empty_field(Some(secret.expose_secret()), "ingest_key")?;
         }
         TelemetryControlAction::DisableTelemetry => {
-            require_non_empty_field(key_id.as_deref(), "key_id")?;
+            // Older installs, manually repaired installs, or installs that lost the
+            // key index can still have local agent config patched to the Ottto
+            // relay even though there is no indexed ingest key id to revoke.
+            // Disabling live telemetry must still remove that local config; key
+            // deletion is best-effort and only possible when the caller knows the
+            // key id.
+            if key_id
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(LocalApiError::InvalidRequest(
+                    "key_id must not be empty when provided".to_string(),
+                ));
+            }
         }
         TelemetryControlAction::Status => {}
     }
@@ -1165,17 +1178,16 @@ fn telemetry_control_with_detector(
             }
         }
         TelemetryControlAction::DisableTelemetry => {
-            let key_id = key_id
-                .as_deref()
-                .expect("disable key_id validated before backend call");
             remove_telemetry_config(daemon, &source)?;
-            TelemetryKeyStore::production()
-                .delete(&source, key_id)
-                .map_err(|error| {
-                    LocalApiError::LocalOperationFailed(format!(
-                        "telemetry key removal failed: {error}"
-                    ))
-                })?;
+            if let Some(key_id) = key_id.as_deref() {
+                TelemetryKeyStore::production()
+                    .delete(&source, key_id)
+                    .map_err(|error| {
+                        LocalApiError::LocalOperationFailed(format!(
+                            "telemetry key removal failed: {error}"
+                        ))
+                    })?;
+            }
         }
         TelemetryControlAction::Status => {}
     }
@@ -10106,6 +10118,49 @@ mod tests {
             store.load(&SourceKind::Codex, "key_disable"),
             Err(TelemetryKeychainError::Missing)
         ));
+        let config = fs::read_to_string(config_path).expect("read config");
+        assert!(!config.contains("# ottto:start"));
+        assert!(!config.contains("# ottto:end"));
+        assert!(!codex_config_has_relay_otel(&config));
+    }
+
+    #[test]
+    #[serial]
+    fn telemetry_control_disable_without_indexed_key_removes_local_config() {
+        let _guard = lock_backend_test_env();
+        let store_root = telemetry_key_store_root("disable-no-index");
+        let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
+        let install_root = telemetry_key_store_root("disable-no-index-install");
+        let _home_guard = EnvVarGuard::set_path("HOME", &install_root);
+        let config_path = install_root.join(".codex/config.toml");
+        patch_codex_config_at(&config_path, &install_root.join("backups")).expect("seed config");
+
+        let api_base_url = control_token_validation_server(200);
+        let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_telemetry_disable_no_index".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
+                command: LocalControlCommand::TelemetryControl {
+                    action: TelemetryControlAction::DisableTelemetry,
+                    source: SourceKind::Codex,
+                    control_token: test_control_token("disable_telemetry", "codex", 300),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
+                    key_id: None,
+                    organization_id: None,
+                    otlp_endpoint: None,
+                    ingest_key: None,
+                },
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload.get("key_id"), Some(&serde_json::Value::Null));
         let config = fs::read_to_string(config_path).expect("read config");
         assert!(!config.contains("# ottto:start"));
         assert!(!config.contains("# ottto:end"));
