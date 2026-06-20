@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 190,
-  "content_sha256": "b7eb233bc00228ef7466510676e46306b566c7a25820751b5a6efadeec69d227",
+  "content_sha256": "b3d3accbce8a2f50f974977487bdc2688c11a2a3e72794ee62f2f7af381dc539",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/xpc_mach.rs",
-      "sha256": "d41e43629a19fc47aa654006abef4be60dda6aec0ace8286b507b442bfeba8d8",
-      "size_bytes": 2935
+      "sha256": "f694e094a0acfa12fe7d27d1ae506943ac23362dc6259e909c6b45476efec475",
+      "size_bytes": 5987
     },
     {
       "executable": false,
