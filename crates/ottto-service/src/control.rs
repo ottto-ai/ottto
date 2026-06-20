@@ -1657,7 +1657,7 @@ fn complete_pending_auth_claim(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    persist_claim_relay_device_credentials(&completed)?;
+    let relay_credentials_persisted = persist_claim_relay_device_credentials(&completed)?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -1696,14 +1696,17 @@ fn complete_pending_auth_claim(
             api_base_url: validated_api_base_url(None)?,
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    if relay_credentials_persisted {
+        request_snapshot_sync_after_device_registration(daemon);
+    }
     Ok(response)
 }
 
 fn persist_claim_relay_device_credentials(
     completed: &SetupClaimCompleteResponse,
-) -> Result<(), LocalApiError> {
+) -> Result<bool, LocalApiError> {
     match (&completed.relay_device, &completed.relay_device_secret) {
-        (None, None) => Ok(()),
+        (None, None) => Ok(false),
         (Some(device), Some(device_secret)) => {
             if device.sources.is_empty() || device_secret.trim().is_empty() {
                 return Err(claim_completion_response_unexpected(
@@ -1723,7 +1726,7 @@ fn persist_claim_relay_device_credentials(
             KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
                 .save(device_secret)
                 .map_err(|_| LocalApiError::StatePoisoned)?;
-            Ok(())
+            Ok(true)
         }
         _ => Err(claim_completion_response_unexpected(
             "claim completion returned partial relay-device credentials",
@@ -8850,7 +8853,7 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
+        let persisted = persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
             setup_run_id: "setup_claim".to_string(),
             setup_run_token: "otsr_claim".to_string(),
             setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -8878,6 +8881,7 @@ mod tests {
         })
         .expect("persist claim relay device");
 
+        assert!(persisted);
         assert_eq!(
             FileDeviceStore::default()
                 .load()
@@ -8898,6 +8902,43 @@ mod tests {
                 .load()
                 .expect("relay device secret saved"),
             "otdev_rotated_claim"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_without_relay_device_credentials_does_not_request_sync() {
+        let support_root = telemetry_key_store_root("claim-complete-no-relay-device");
+        let secret_root = telemetry_key_store_root("claim-complete-no-relay-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+
+        let persisted = persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
+            setup_run_id: "setup_claim".to_string(),
+            setup_run_token: "otsr_claim".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_claim".to_string()),
+            relay_device: None,
+            relay_device_secret: None,
+            connected_at: "2026-05-05T09:20:00Z".to_string(),
+            user: SetupClaimCompleteUser {
+                id: "user_claim".to_string(),
+                email: "claim@example.com".to_string(),
+                display_name: None,
+            },
+            organization: SetupClaimCompleteOrganization {
+                id: "org_claim".to_string(),
+                name: "Claim Org".to_string(),
+            },
+        })
+        .expect("persist no claim relay device");
+
+        assert!(!persisted);
+        assert_eq!(
+            FileDeviceStore::default().load().expect("load device"),
+            None
         );
     }
 
