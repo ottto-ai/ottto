@@ -2366,9 +2366,9 @@ fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
             )
         };
 
-    owner_drift |= known_owner_conflict(client_owner, daemon_owner)
-        || known_owner_conflict(client_owner, plist_owner)
-        || known_owner_conflict(client_owner, loaded_owner);
+    owner_drift |= client_owner_conflict(client_owner, daemon_owner)
+        || client_owner_conflict(client_owner, plist_owner)
+        || client_owner_conflict(client_owner, loaded_owner);
 
     ServiceOwnerState {
         daemon_owner,
@@ -2389,8 +2389,19 @@ fn service_owner_state(client_owner: InstallOwner) -> ServiceOwnerState {
     }
 }
 
-fn known_owner_conflict(left: InstallOwner, right: InstallOwner) -> bool {
-    left != InstallOwner::Unknown && right != InstallOwner::Unknown && left != right
+fn client_owner_conflict(client_owner: InstallOwner, service_owner: InstallOwner) -> bool {
+    if client_owner == InstallOwner::Unknown || service_owner == InstallOwner::Unknown {
+        return false;
+    }
+    if client_owner == service_owner {
+        return false;
+    }
+    // The signed app bundle is the stable UI/control surface for the hosted
+    // installer, whose daemon and LaunchAgent intentionally live under ~/.ottto.
+    if client_owner == InstallOwner::AppBundle && service_owner == InstallOwner::HostedInstaller {
+        return false;
+    }
+    true
 }
 
 fn preferred_repair_owner(
@@ -9396,6 +9407,38 @@ mod tests {
         assert!(!commits_equivalent("436d0f2a", "deadbeef"));
         assert!(!commits_equivalent("436", "436d0f2a"));
         assert!(commits_equivalent("", ""));
+    }
+
+    #[test]
+    fn app_bundle_client_can_control_hosted_installer_service() {
+        assert!(!client_owner_conflict(
+            InstallOwner::AppBundle,
+            InstallOwner::HostedInstaller
+        ));
+        assert!(!client_owner_conflict(
+            InstallOwner::AppBundle,
+            InstallOwner::AppBundle
+        ));
+        assert!(!client_owner_conflict(
+            InstallOwner::AppBundle,
+            InstallOwner::Unknown
+        ));
+        assert!(client_owner_conflict(
+            InstallOwner::AppBundle,
+            InstallOwner::Homebrew
+        ));
+        assert!(client_owner_conflict(
+            InstallOwner::AppBundle,
+            InstallOwner::Dev
+        ));
+    }
+
+    #[test]
+    fn hosted_installer_client_does_not_mask_app_bundle_service_drift() {
+        assert!(client_owner_conflict(
+            InstallOwner::HostedInstaller,
+            InstallOwner::AppBundle
+        ));
     }
 
     #[test]
