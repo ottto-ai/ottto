@@ -580,11 +580,13 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str) -> McpServerInp
     }
 }
 
-/// Build the full inventory payload for one agent on this machine.
+/// Build the full inventory payload for one agent on this machine. `machine_id`
+/// is omitted from the payload when `None` (e.g. a `mcp-inventory` dump on a
+/// machine with no registered device).
 fn build_inventory(
     home: &Path,
     source: SnapshotSource,
-    machine_id: &str,
+    machine_id: Option<&str>,
 ) -> McpInventoryIngestRequest {
     let loading_mode = loading_mode_for(source);
     let servers = discover_servers(home, source)
@@ -593,10 +595,81 @@ fn build_inventory(
         .collect();
     McpInventoryIngestRequest {
         agent_source: agent_source_for(source).to_string(),
-        machine_id: Some(machine_id.to_string()),
+        machine_id: machine_id.map(str::to_string),
         context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
         servers,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory dump (list-only, no upload) — for `ottto-service mcp-inventory` and
+// the cross-tool validation harness (parity vs the reference Python harvester).
+// ---------------------------------------------------------------------------
+
+/// Map a CLI agent string to a [`SnapshotSource`].
+fn source_for_agent(agent: &str) -> Option<SnapshotSource> {
+    match agent {
+        "claude-code" | "claude_code" | "claude" => Some(SnapshotSource::ClaudeCode),
+        "codex" => Some(SnapshotSource::Codex),
+        _ => None,
+    }
+}
+
+/// This machine's id, resolved exactly as the upload path does so a dump payload
+/// is representative of the real ingest request. Secret-free (no keychain) so a
+/// dump works before registration:
+/// * a registered device → its `machine_id` (via `snapshot_machine_id`, which
+///   itself falls back to the machine store);
+/// * no registered device → the machine store directly (a fresh/unregistered
+///   machine may still surface its id for local inspection);
+/// * a device binding that exists but is unreadable → `None`, NOT the legacy
+///   machine-store id — the upload path could not resolve that principal either,
+///   so the dump must not silently diverge from it.
+fn best_effort_machine_id() -> Option<String> {
+    match ottto_core::FileDeviceStore::default().load() {
+        Ok(Some(device)) => crate::snapshot_sync::snapshot_machine_id(&device)
+            .ok()
+            .flatten(),
+        Ok(None) => machine_store_id(),
+        Err(_) => None,
+    }
+}
+
+fn machine_store_id() -> Option<String> {
+    ottto_core::FileMachineStore::default()
+        .load()
+        .ok()
+        .flatten()
+        .map(|machine| machine.machine_id)
+        .filter(|id| !id.is_empty())
+}
+
+/// Harvest one agent's configured-MCP inventory and return it as the JSON the
+/// backend ingest accepts — WITHOUT uploading. List-only (`initialize` +
+/// `tools/list`); never executes a tool. Powers `ottto-service mcp-inventory` and
+/// the validation harness's daemon≡harvester fidelity check.
+pub fn dump_inventory(agent: &str) -> Result<Value> {
+    let source = source_for_agent(agent)
+        .ok_or_else(|| anyhow!("unknown agent (expected claude-code or codex)"))?;
+    let home = crate::snapshot_sync::home_dir()?;
+    let inventory = build_inventory(&home, source, best_effort_machine_id().as_deref());
+    serde_json::to_value(&inventory).map_err(|error| anyhow!("encode inventory: {error}"))
+}
+
+/// Dump every supported agent's inventory as a JSON array (the default when no
+/// `--agent` is given).
+pub fn dump_all_inventories() -> Result<Value> {
+    let home = crate::snapshot_sync::home_dir()?;
+    let machine_id = best_effort_machine_id();
+    let inventories: Vec<Value> = [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+        .into_iter()
+        .map(|source| {
+            let inventory = build_inventory(&home, source, machine_id.as_deref());
+            serde_json::to_value(&inventory)
+        })
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| anyhow!("encode inventory: {error}"))?;
+    Ok(Value::Array(inventories))
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +941,7 @@ fn harvest_source(
         Err(_) => {}
     }
 
-    let inventory = build_inventory(home, source, machine_id);
+    let inventory = build_inventory(home, source, Some(machine_id));
     let hash = inventory_hash(&inventory)?;
     let path = cache_path(support_dir, source);
     let now = OffsetDateTime::now_utc();
@@ -1166,10 +1239,90 @@ url = "https://remote.test/mcp"
     #[test]
     fn build_inventory_for_pi_has_no_servers() {
         let home = test_home("pi-build");
-        let inventory = build_inventory(&home, SnapshotSource::Pi, "otm_test");
+        let inventory = build_inventory(&home, SnapshotSource::Pi, Some("otm_test"));
         assert_eq!(inventory.agent_source, "pi");
         assert!(inventory.servers.is_empty());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn build_inventory_omits_machine_id_when_absent() {
+        let home = test_home("no-machine");
+        let value =
+            serde_json::to_value(build_inventory(&home, SnapshotSource::ClaudeCode, None)).unwrap();
+        assert!(
+            value.get("machine_id").is_none(),
+            "machine_id omitted when None"
+        );
+        let with_id = serde_json::to_value(build_inventory(
+            &home,
+            SnapshotSource::ClaudeCode,
+            Some("otm_x"),
+        ))
+        .unwrap();
+        assert_eq!(with_id["machine_id"], json!("otm_x"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn source_for_agent_maps_known_agents() {
+        assert_eq!(
+            source_for_agent("claude-code"),
+            Some(SnapshotSource::ClaudeCode)
+        );
+        assert_eq!(
+            source_for_agent("claude_code"),
+            Some(SnapshotSource::ClaudeCode)
+        );
+        assert_eq!(source_for_agent("codex"), Some(SnapshotSource::Codex));
+        assert_eq!(source_for_agent("nope"), None);
+    }
+
+    /// `dump_inventory` harvests an agent's configured servers into the ingest
+    /// shape without uploading. Drives a real mock stdio MCP server via HOME.
+    #[test]
+    #[serial_test::serial]
+    fn dump_inventory_harvests_without_upload() {
+        let (home, _support) = mock_cc_home("dump");
+        let _home_guard = EnvGuard::set("HOME", home.to_string_lossy().as_ref());
+
+        let value = dump_inventory("claude-code").expect("dump");
+        assert_eq!(value["agent_source"], json!("claude-code"));
+        let servers = value["servers"].as_array().expect("servers array");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["server"], json!("echo-srv"));
+        assert_eq!(servers[0]["reachable"], json!(true));
+        assert_eq!(servers[0]["tools"][0]["name"], json!("echo"));
+
+        assert!(dump_inventory("bogus").is_err());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Minimal scoped env-var guard for the HOME-dependent dump test.
+    struct EnvGuard {
+        key: String,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
     }
 
     /// End-to-end stdio handshake against a tiny in-repo mock MCP server: a

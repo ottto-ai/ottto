@@ -43,6 +43,15 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Print this machine's configured-MCP inventory (the always-on schema
+    /// footprint) as JSON, WITHOUT uploading. List-only: runs `initialize` +
+    /// `tools/list` against each configured server and never executes a tool.
+    /// For local inspection and the cross-tool validation harness.
+    McpInventory {
+        /// `claude-code` or `codex`; omit to dump both as a JSON array.
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,6 +96,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
+        Command::McpInventory { agent } => {
+            let value = match agent.as_deref() {
+                Some(agent) => ottto_service::mcp_inventory::dump_inventory(agent)?,
+                None => ottto_service::mcp_inventory::dump_all_inventories()?,
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
