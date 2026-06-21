@@ -346,6 +346,36 @@ impl SnapshotApiClient {
             .map_err(|error| anyhow!("parse agent status response failed: {error}"))
     }
 
+    /// POST a configured-MCP inventory capture to the footprint ingest endpoint.
+    ///
+    /// Auth is the same source-scoped relay token used for snapshot batches; the
+    /// backend validates the relay principal and enforces the agent_source
+    /// scope. The body is the pre-built `McpInventoryIngestRequest` JSON. A
+    /// 401/403 surfaces as a relay-authorization error so the caller can refresh
+    /// credentials; 400/422 means the inventory contract drifted.
+    pub fn upload_mcp_inventory(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/mcp/inventory"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse mcp inventory response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected mcp inventory: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload mcp inventory failed: {error}")),
+        }
+    }
+
     pub fn upload_local_health_heartbeat(
         &self,
         relay_token: &str,
