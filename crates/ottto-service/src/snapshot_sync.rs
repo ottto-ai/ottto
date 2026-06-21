@@ -459,24 +459,11 @@ fn sync_source(
         );
     }
 
-    // Harvest the configured-MCP context footprint (Claude Code / Codex). This
-    // is independent of usage-snapshot reconciliation, so it runs before the
-    // reconciliation-disabled early return. Best-effort: a failed handshake or
-    // upload is logged with a redacted phase label and never aborts the sync.
-    if let Err(error) = crate::mcp_inventory::sync_mcp_inventory(
-        client,
-        device,
-        device_secret,
-        source,
-        machine_id,
-        home,
-    ) {
-        eprintln!(
-            "mcp inventory sync skipped for {}: {}",
-            source.api_slug(),
-            safe_error(&error)
-        );
-    }
+    // The configured-MCP context-footprint harvest runs on its own slower
+    // schedule (run-at-start + every 6 h, `spawn_mcp_inventory_sync`), NOT on the
+    // 5-minute snapshot sync: each harvest spawns every configured MCP server's
+    // stdio process, so doing it every cycle would be needlessly intrusive and
+    // re-POST unchanged inventories 12×/hour. See `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
         report_status(
@@ -837,7 +824,7 @@ fn report_status_with_fresh_relay_token(
     report_status(client, &relay_token, status)
 }
 
-fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
+pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
     [
         SnapshotSource::Codex,
         SnapshotSource::ClaudeCode,
@@ -853,7 +840,7 @@ fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> 
     .collect()
 }
 
-fn snapshot_api_base_url() -> String {
+pub(crate) fn snapshot_api_base_url() -> String {
     normalize_api_base_url(
         FileConnectionStore::default()
             .load()
@@ -872,7 +859,7 @@ fn normalize_api_base_url(connection_value: Option<String>, env_value: Option<St
         .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
 }
 
-fn snapshot_machine_id(device: &LocalDeviceBinding) -> Result<Option<String>> {
+pub(crate) fn snapshot_machine_id(device: &LocalDeviceBinding) -> Result<Option<String>> {
     if let Some(machine_id) = device.machine_id.as_ref().filter(|value| !value.is_empty()) {
         return Ok(Some(machine_id.clone()));
     }
@@ -915,7 +902,7 @@ fn snapshot_index_path(
     ))
 }
 
-fn home_dir() -> Result<PathBuf> {
+pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("HOME is not set"))

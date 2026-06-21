@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 199,
-  "content_sha256": "8893e58b26609b8e4176039fcb2cdf6042b9e1d6faf08894a7cb361a9a84b1f9",
+  "content_sha256": "27d20c36e22be9089284c232338ff550b768c504c6a993f4e700c06402101a6e",
   "files": [
     {
       "executable": false,
@@ -657,15 +657,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "8d3a46225b5611f6bb4d63be4802728740d824f63311f396b477d35490ae2342",
-      "size_bytes": 20141
+      "sha256": "5154d02e4097e296e81f522293e28c0dbbf88bd36b99314f517a4d707d0cfa3c",
+      "size_bytes": 20357
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/mcp_inventory.rs",
-      "sha256": "9094326c1b1dc8a7a0632f26bacb6572556229dc9b18b410b67d42cbea0f3df9",
-      "size_bytes": 33422
+      "sha256": "ac7e43a063a4af26f25d79b79822c8d820cf3f200fbe9fb3fa98bd4c241b1373",
+      "size_bytes": 52778
     },
     {
       "executable": false,
@@ -685,8 +685,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "36213a4b4866e01cf1026c41f8fa437d669dc7599092a430203c4b2a289636cf",
-      "size_bytes": 63545
+      "sha256": "ab0fa7fa0310ff655e8669dba2e0b2841b99b77b3fbaecafc48d57c56757e1fa",
+      "size_bytes": 63337
     },
     {
       "executable": false,
