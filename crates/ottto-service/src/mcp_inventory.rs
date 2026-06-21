@@ -18,23 +18,37 @@
 //! discovered and reported as `reachable = false` with empty tools (cost zero)
 //! until a network MCP client lands — see `TODO(mcp-http-transport)` below.
 
-use crate::snapshot_client::SnapshotApiClient;
+use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
-use ottto_core::LocalDeviceBinding;
-use serde::Serialize;
+use ottto_core::{default_support_dir, LocalDeviceBinding};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 /// Per-server handshake budget. Generous because a cold MCP server may need to
 /// install/launch a runtime, but bounded so one slow server cannot stall the
 /// sync loop. Mirrors harvest.py's 45s ceiling.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How often the harvest loop runs. Deliberately slow: a harvest spawns every
+/// configured MCP server's stdio process, so the cost belongs on a 6-hourly
+/// cadence (run-at-start + every 6 h), not the 5-minute snapshot sync. The
+/// per-server schema cost only changes when the user edits their MCP config.
+const MCP_HARVEST_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Even when the inventory is byte-identical, re-POST at least this often so the
+/// snapshot's `captured_at` stays fresh and a long-running machine never reads as
+/// stale on the Optimize page. Between these, an unchanged inventory is skipped
+/// entirely (no relay token minted, no POST).
+const MCP_HARVEST_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// MCP protocol revision we advertise on `initialize`. Servers negotiate down
 /// if they only speak an older revision; `tools/list` is stable across these.
@@ -586,32 +600,213 @@ fn build_inventory(
 }
 
 // ---------------------------------------------------------------------------
-// Sync hook
+// Unchanged-inventory cache
 // ---------------------------------------------------------------------------
 
-/// Harvest + upload the configured-MCP inventory for one agent source.
+/// Persisted per-source record of the last successfully-uploaded inventory, so a
+/// byte-identical inventory can skip the upload entirely on the next cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InventoryCacheEntry {
+    /// The destination principal that received this upload (`device_id`,
+    /// `machine_id`, API base URL). A skip is only valid against the SAME
+    /// destination: if the daemon is re-claimed/re-onboarded (new device or
+    /// machine id) or repointed at another backend, the new principal has no
+    /// inventory yet, so an unchanged config must still re-POST.
+    identity: String,
+    /// SHA-256 of the canonical `(agent_source, servers)` content.
+    inventory_sha256: String,
+    /// RFC3339 timestamp of the last successful POST (drives the staleness
+    /// force-refresh).
+    posted_at: String,
+}
+
+/// The destination identity an upload was attributed to. A change in any
+/// component invalidates the skip cache.
+fn destination_identity(
+    device: &LocalDeviceBinding,
+    machine_id: &str,
+    api_base_url: &str,
+) -> String {
+    format!("{}|{}|{}", device.device_id, machine_id, api_base_url)
+}
+
+fn cache_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    support_dir
+        .join("mcp_inventory")
+        .join(format!("{}.json", source.api_slug()))
+}
+
+fn read_cache(path: &Path) -> Option<InventoryCacheEntry> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write the cache atomically (temp + rename) so a crash mid-write never leaves a
+/// torn record that would force a redundant re-POST. Best-effort: a write error
+/// is non-fatal (it only costs one extra upload next cycle).
+fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(payload) = serde_json::to_vec(entry) else {
+        return;
+    };
+    let temp = path.with_extension("json.tmp");
+    if std::fs::write(&temp, &payload).is_ok() {
+        let _ = std::fs::rename(&temp, path);
+    }
+}
+
+/// SHA-256 over the inventory's meaningful content. `machine_id` and
+/// `context_window_tokens` are constant per machine, so only `agent_source` and
+/// the harvested `servers` participate — the hash changes exactly when the user's
+/// configured MCP surface (servers, reachability, tool schemas) changes.
+fn inventory_hash(inventory: &McpInventoryIngestRequest) -> Result<String> {
+    let canonical = serde_json::to_vec(&json!({
+        "agent_source": inventory.agent_source,
+        "servers": inventory.servers,
+    }))
+    .map_err(|error| anyhow!("hash encode failed: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn cache_is_stale(entry: &InventoryCacheEntry, now: OffsetDateTime) -> bool {
+    // An unparseable timestamp is treated as stale so a corrupt record always
+    // re-POSTs rather than pinning a machine to a never-refreshing snapshot.
+    let Ok(posted) = OffsetDateTime::parse(&entry.posted_at, &Rfc3339) else {
+        return true;
+    };
+    (now - posted).whole_seconds() >= MCP_HARVEST_MAX_STALENESS_SECS
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler + per-source harvest
+// ---------------------------------------------------------------------------
+
+/// Spawn the configured-MCP harvest loop: run-at-start, then every 6 h.
 ///
-/// Mints a fresh source-scoped relay token (the same auth as snapshot batches)
-/// and POSTs the inventory to `/api/v1/mcp/inventory`. Discovery and the
-/// per-server handshakes are best-effort: a failed handshake yields an
-/// unreachable server, not an aborted sync.
-pub fn sync_mcp_inventory(
+/// Independent of the 5-minute snapshot sync (see `MCP_HARVEST_INTERVAL`).
+/// Gating is implicit and safe: harvest only runs for sources the relay device
+/// has been granted (`enabled_snapshot_sources`), and only when the device is
+/// registered at all — so telemetry-off ⇒ no device/sources ⇒ no harvest.
+pub fn spawn_mcp_inventory_sync() -> Result<()> {
+    let home = crate::snapshot_sync::home_dir()?;
+    let support_dir = default_support_dir();
+    std::thread::Builder::new()
+        .name("ottto-mcp-inventory-sync".to_string())
+        .spawn(move || loop {
+            if let Err(error) = harvest_all_once(&home, &support_dir) {
+                eprintln!(
+                    "mcp inventory harvest skipped: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
+            std::thread::sleep(MCP_HARVEST_INTERVAL);
+        })
+        .map_err(|error| anyhow!("spawn mcp inventory sync: {error}"))?;
+    Ok(())
+}
+
+/// One harvest cycle across every granted agent source on this machine.
+fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+    let client = SnapshotApiClient::new(api_base_url.clone());
+
+    let mut failed = Vec::new();
+    for source in crate::snapshot_sync::enabled_snapshot_sources(&device) {
+        // Pi has no MCP-config surface; nothing to harvest.
+        if matches!(source, SnapshotSource::Pi) {
+            continue;
+        }
+        if let Err(error) = harvest_source(
+            &client,
+            &device,
+            &device_secret,
+            source,
+            &machine_id,
+            &api_base_url,
+            home,
+            support_dir,
+        ) {
+            eprintln!(
+                "mcp inventory harvest skipped for {}: {}",
+                source.api_slug(),
+                crate::snapshot_sync::safe_error(&error)
+            );
+            failed.push(source.api_slug());
+        }
+    }
+    if !failed.is_empty() {
+        return Err(anyhow!(
+            "mcp inventory harvest failed for {} source(s)",
+            failed.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Harvest + (conditionally) upload the configured-MCP inventory for one agent
+/// source.
+///
+/// Builds the inventory, then short-circuits when it is byte-identical to the
+/// last successfully-uploaded one AND that upload is still fresh — no relay token
+/// is minted and no POST is made. Otherwise it mints a fresh source-scoped relay
+/// token (the same auth as snapshot batches), POSTs to `/api/v1/mcp/inventory`,
+/// and records the hash only after a successful upload so a failed POST retries.
+/// Discovery and the per-server handshakes are best-effort: a failed handshake
+/// yields an unreachable server, not an aborted harvest.
+#[allow(clippy::too_many_arguments)]
+fn harvest_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
     machine_id: &str,
+    api_base_url: &str,
     home: &Path,
+    support_dir: &Path,
 ) -> Result<()> {
-    // Pi has no MCP-config surface; nothing to harvest.
-    if matches!(source, SnapshotSource::Pi) {
-        return Ok(());
-    }
     let inventory = build_inventory(home, source, machine_id);
+    let hash = inventory_hash(&inventory)?;
+    let identity = destination_identity(device, machine_id, api_base_url);
+    let path = cache_path(support_dir, source);
+    let now = OffsetDateTime::now_utc();
+
+    if let Some(entry) = read_cache(&path) {
+        // Skip only when the SAME destination already has this exact inventory
+        // and the upload is still fresh. A new device/machine/backend (re-claim,
+        // re-onboard, repoint) invalidates the skip so the new principal is
+        // populated immediately.
+        if entry.identity == identity
+            && entry.inventory_sha256 == hash
+            && !cache_is_stale(&entry, now)
+        {
+            return Ok(());
+        }
+    }
+
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let payload =
         serde_json::to_value(&inventory).map_err(|error| anyhow!("encode inventory: {error}"))?;
     client.upload_mcp_inventory(&relay_token, &payload)?;
+
+    write_cache(
+        &path,
+        &InventoryCacheEntry {
+            identity,
+            inventory_sha256: hash,
+            posted_at: now.format(&Rfc3339).unwrap_or_default(),
+        },
+    );
     Ok(())
 }
 
@@ -919,6 +1114,292 @@ done
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].description, "Echo input");
         assert_eq!(tools[0].input_schema["type"], json!("object"));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    fn sample_inventory(server: &str, tool: &str) -> McpInventoryIngestRequest {
+        McpInventoryIngestRequest {
+            agent_source: "claude-code".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            servers: vec![McpServerInput {
+                server: server.to_string(),
+                transport: Some("stdio".to_string()),
+                reachable: true,
+                loading_mode: "on_demand".to_string(),
+                tools: vec![McpToolInput {
+                    name: tool.to_string(),
+                    description: String::new(),
+                    input_schema: json!({ "type": "object" }),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn inventory_hash_is_content_sensitive_and_machine_independent() {
+        let a = sample_inventory("fetch", "get");
+        let b = sample_inventory("fetch", "get");
+        assert_eq!(
+            inventory_hash(&a).unwrap(),
+            inventory_hash(&b).unwrap(),
+            "identical content hashes equal"
+        );
+
+        // machine_id is excluded from the hash (constant per machine).
+        let mut c = sample_inventory("fetch", "get");
+        c.machine_id = Some("otm_other".to_string());
+        assert_eq!(inventory_hash(&a).unwrap(), inventory_hash(&c).unwrap());
+
+        // A changed tool set changes the hash.
+        let d = sample_inventory("fetch", "post");
+        assert_ne!(inventory_hash(&a).unwrap(), inventory_hash(&d).unwrap());
+    }
+
+    #[test]
+    fn cache_freshness_tracks_max_staleness() {
+        let now = OffsetDateTime::from_unix_timestamp(1_750_000_000).unwrap();
+        let fresh = InventoryCacheEntry {
+            identity: "d|m|u".to_string(),
+            inventory_sha256: "x".to_string(),
+            posted_at: now.format(&Rfc3339).unwrap(),
+        };
+        assert!(!cache_is_stale(&fresh, now));
+        assert!(!cache_is_stale(
+            &fresh,
+            now + time::Duration::seconds(MCP_HARVEST_MAX_STALENESS_SECS - 1)
+        ));
+        assert!(cache_is_stale(
+            &fresh,
+            now + time::Duration::seconds(MCP_HARVEST_MAX_STALENESS_SECS)
+        ));
+
+        // An unparseable timestamp is treated as stale (force a re-POST).
+        let corrupt = InventoryCacheEntry {
+            identity: "d|m|u".to_string(),
+            inventory_sha256: "x".to_string(),
+            posted_at: "not-a-timestamp".to_string(),
+        };
+        assert!(cache_is_stale(&corrupt, now));
+    }
+
+    #[test]
+    fn harvest_interval_is_six_hours() {
+        assert_eq!(MCP_HARVEST_INTERVAL, Duration::from_secs(6 * 60 * 60));
+    }
+
+    /// Write a CC home whose single configured stdio server is a mock MCP server
+    /// speaking line-delimited JSON-RPC. Returns `(home, support_dir)`.
+    fn mock_cc_home(name: &str) -> (PathBuf, PathBuf) {
+        let home = test_home(name);
+        let support_dir = home.join("support");
+        fs::create_dir_all(&support_dir).unwrap();
+        let script = home.join("mock_mcp.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*|*'"method": "initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}'
+      ;;
+    *'"method":"tools/list"'*|*'"method": "tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object"}}]}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_string(&json!({
+                "mcpServers": {
+                    "echo-srv": { "command": script.to_string_lossy(), "args": [] }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (home, support_dir)
+    }
+
+    /// Mock backend accepting exactly `count` requests; even-indexed requests get
+    /// a relay-token response, odd-indexed get an inventory ack. Each captured
+    /// request (line + headers + full body) is pushed to `captured`. Returns the
+    /// `http://addr` base URL and the server thread handle.
+    fn mock_backend(
+        captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        count: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock backend");
+        let address = listener.local_addr().expect("addr");
+        let handle = std::thread::spawn(move || {
+            for index in 0..count {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0_u8; 4096];
+                let mut request = Vec::new();
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    // Stop once the full body (per Content-Length) has arrived.
+                    if let Some(end) = request
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        if request.len() >= end + content_length.unwrap_or(0) {
+                            break;
+                        }
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let body = if index % 2 == 0 {
+                    r#"{"token":"relay-token","expires_at":"2099-01-01T00:00:00Z"}"#
+                } else {
+                    r#"{"snapshot_id":"snap_1"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn cc_device(device_id: &str) -> LocalDeviceBinding {
+        LocalDeviceBinding {
+            device_id: device_id.to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["claude_code".to_string()],
+        }
+    }
+
+    /// End-to-end: a first harvest uploads, an unchanged second harvest skips the
+    /// upload entirely (no relay token minted, no POST) — the Phase 3 exit
+    /// criterion. Drives a real mock stdio MCP server + a mock backend.
+    #[test]
+    fn harvest_source_uploads_then_skips_unchanged_inventory() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-skip");
+        // Accepts exactly the cycle-1 pair; cycle 2 must make zero connections.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 2);
+        let client = SnapshotApiClient::new(base.clone());
+        let device = cc_device("device_test");
+
+        // Cycle 1: uploads.
+        harvest_source(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("cycle 1 harvest");
+
+        // Cycle 2: identical inventory + same destination → skip (no network).
+        harvest_source(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("cycle 2 harvest");
+
+        server.join().expect("server thread");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one relay-token + one inventory POST across both cycles"
+        );
+        assert!(requests[0].contains("/api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[1].contains("POST /api/v1/mcp/inventory"));
+        assert!(requests[1].contains("\"server\":\"echo-srv\""));
+        assert!(requests[1].contains("\"name\":\"echo\""));
+        // The cache file records the uploaded hash for the skip.
+        assert!(cache_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Regression for the re-claim/re-onboard gap: an identical inventory uploaded
+    /// to a NEW destination (different `device_id`) must re-POST, not skip — the
+    /// new backend principal has no inventory yet.
+    #[test]
+    fn harvest_source_reposts_after_destination_identity_change() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-reonboard");
+        // Both cycles upload (2 pairs) despite byte-identical inventory.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 4);
+        let client = SnapshotApiClient::new(base.clone());
+
+        // Cycle 1: original device.
+        harvest_source(
+            &client,
+            &cc_device("device_old"),
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("cycle 1 harvest");
+
+        // Cycle 2: re-claimed device (new device_id) → identity differs → re-POST.
+        harvest_source(
+            &client,
+            &cc_device("device_new"),
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("cycle 2 harvest");
+
+        server.join().expect("server thread");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4, "both destinations are populated");
+        assert!(requests[0].contains("/api/v1/telemetry/devices/device_old/relay-token"));
+        assert!(requests[1].contains("POST /api/v1/mcp/inventory"));
+        assert!(requests[2].contains("/api/v1/telemetry/devices/device_new/relay-token"));
+        assert!(requests[3].contains("POST /api/v1/mcp/inventory"));
 
         let _ = fs::remove_dir_all(&home);
     }
