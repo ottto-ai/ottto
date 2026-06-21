@@ -459,6 +459,25 @@ fn sync_source(
         );
     }
 
+    // Harvest the configured-MCP context footprint (Claude Code / Codex). This
+    // is independent of usage-snapshot reconciliation, so it runs before the
+    // reconciliation-disabled early return. Best-effort: a failed handshake or
+    // upload is logged with a redacted phase label and never aborts the sync.
+    if let Err(error) = crate::mcp_inventory::sync_mcp_inventory(
+        client,
+        device,
+        device_secret,
+        source,
+        machine_id,
+        home,
+    ) {
+        eprintln!(
+            "mcp inventory sync skipped for {}: {}",
+            source.api_slug(),
+            safe_error(&error)
+        );
+    }
+
     if !activity_hint.local_usage_reconciliation_enabled {
         report_status(
             client,
@@ -945,6 +964,11 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
         "local snapshot upload failed"
     } else if text.contains("report snapshot status failed") {
         "local collector status upload failed"
+    } else if text.contains("mcp inventory")
+        || text.contains("mcp handshake")
+        || text.contains("mcp server")
+    {
+        "mcp inventory sync failed"
     } else {
         "sync failed"
     }

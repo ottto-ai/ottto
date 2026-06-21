@@ -7,6 +7,7 @@ pub mod control;
 pub mod detected_uses;
 pub mod keychain;
 pub mod macos_service;
+pub mod mcp_inventory;
 pub mod otlp_relay;
 pub mod snapshot_client;
 pub mod snapshot_sync;

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 198,
-  "content_sha256": "02bf0b5ee07755ac3586564bcb510b1fc9e0e7566d206b4ef8f5e7cdafaf1980",
+  "candidate_file_count": 199,
+  "content_sha256": "8893e58b26609b8e4176039fcb2cdf6042b9e1d6faf08894a7cb361a9a84b1f9",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "d3b83c5c7dee0e3d0e37a18054c3a05d452e52c90526c79e725edcc1b0157c59",
-      "size_bytes": 208609
+      "sha256": "3b832fcfeda18759752330c6de41683810c65915c44fe4a493407e9f7e0de0fd",
+      "size_bytes": 208632
     },
     {
       "executable": false,
@@ -663,6 +663,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/mcp_inventory.rs",
+      "sha256": "9094326c1b1dc8a7a0632f26bacb6572556229dc9b18b410b67d42cbea0f3df9",
+      "size_bytes": 33422
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
       "sha256": "c150254f04851944233c996301a326be6dedfd6ceab4ca18923035a21328f206",
       "size_bytes": 52474
@@ -671,15 +678,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "3c78538e51507ed1c063b478cf2750fe1c40741c7535e9dca118537c823e9857",
-      "size_bytes": 20741
+      "sha256": "df7bebacc685f0e3c63214ddc825dfcde4469c079fe4e44cccec3a043d5f4b80",
+      "size_bytes": 22193
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "8fbb8f0d75b0869006e8b892691e75adcae62d2c1b4bcf4880de1cbad33b647d",
-      "size_bytes": 62729
+      "sha256": "36213a4b4866e01cf1026c41f8fa437d669dc7599092a430203c4b2a289636cf",
+      "size_bytes": 63545
     },
     {
       "executable": false,
@@ -1391,7 +1398,7 @@
   ],
   "generated_at": "2026-06-20T21:59:19+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 199,
+  "output_file_count": 200,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
