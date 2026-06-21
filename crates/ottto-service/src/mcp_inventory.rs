@@ -30,13 +30,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-/// Per-server handshake budget. Generous because a cold MCP server may need to
-/// install/launch a runtime, but bounded so one slow server cannot stall the
-/// sync loop. Mirrors harvest.py's 45s ceiling.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Per-server handshake budget. Generous enough for a cold MCP server to
+/// launch/initialize, but tighter than harvest.py's 45s ceiling because the
+/// daemon harvests unattended and an unreachable server otherwise burns the full
+/// timeout. Combined with bounded concurrency this caps per-cycle wall-clock.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many servers are harvested concurrently. Bounds parallel subprocess
+/// fan-out (one stdio child + one reader thread each) while keeping a slow/cold
+/// server from serializing the whole cycle: wall-clock ≈ ⌈servers/K⌉ × timeout.
+const MCP_HARVEST_MAX_CONCURRENCY: usize = 4;
+
+/// Soft per-cycle wall-clock budget. Once a cycle exceeds it the harvest stops
+/// launching new server probes and reports `throttled` (and skips the upload of a
+/// partial inventory) so a pathological config can never run the background
+/// thread unbounded. A normal 2–6 server machine finishes far inside this.
+const MCP_HARVEST_CYCLE_BUDGET: Duration = Duration::from_secs(90);
 
 /// How often the harvest loop runs. Deliberately slow: a harvest spawns every
 /// configured MCP server's stdio process, so the cost belongs on a 6-hourly
@@ -580,25 +592,178 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str) -> McpServerInp
     }
 }
 
-/// Build the full inventory payload for one agent on this machine. `machine_id`
-/// is omitted from the payload when `None` (e.g. a `mcp-inventory` dump on a
-/// machine with no registered device).
+/// One harvest cycle's outcome: the assembled payload, whether the wall-clock
+/// budget forced an early stop, and resource metrics for the cycle.
+struct BuildResult {
+    inventory: McpInventoryIngestRequest,
+    metrics: HarvestMetrics,
+}
+
+/// Harvest the configured servers concurrently, at most
+/// [`MCP_HARVEST_MAX_CONCURRENCY`] at a time, stopping before a chunk once
+/// `deadline` passes. Returns the harvested servers (in discovery order, minus
+/// any dropped by the budget) and whether the cycle was throttled.
+fn harvest_servers(
+    configured: &[ConfiguredServer],
+    loading_mode: &'static str,
+    deadline: Instant,
+) -> (Vec<McpServerInput>, bool) {
+    let mut out: Vec<McpServerInput> = Vec::with_capacity(configured.len());
+    let mut throttled = false;
+    for chunk in configured.chunks(MCP_HARVEST_MAX_CONCURRENCY) {
+        // The deadline is checked between chunks (not mid-probe), so a cycle can
+        // overrun by at most one chunk's handshake timeout — acceptable for a
+        // soft budget, and it keeps every launched probe's result.
+        if Instant::now() >= deadline {
+            throttled = true;
+            break;
+        }
+        let handles: Vec<_> = chunk
+            .iter()
+            .cloned()
+            .map(|server| {
+                let mode = loading_mode.to_string();
+                std::thread::Builder::new()
+                    .name("ottto-mcp-harvest-worker".to_string())
+                    .spawn(move || harvest_server(&server, &mode))
+            })
+            .collect();
+        for (handle, server) in handles.into_iter().zip(chunk.iter()) {
+            match handle {
+                // A spawn failure or a panicked worker degrades that one server to
+                // unreachable rather than dropping it from the inventory silently.
+                Ok(joined) => out.push(
+                    joined
+                        .join()
+                        .unwrap_or_else(|_| unreachable_server(server, loading_mode)),
+                ),
+                Err(_) => out.push(unreachable_server(server, loading_mode)),
+            }
+        }
+    }
+    (out, throttled)
+}
+
+/// A configured server reported unreachable with no tools (cost zero).
+fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServerInput {
+    McpServerInput {
+        server: server.name.clone(),
+        transport: Some(server.transport.label().to_string()),
+        reachable: false,
+        loading_mode: loading_mode.to_string(),
+        tools: Vec::new(),
+    }
+}
+
+/// Build the full inventory payload for one agent on this machine, bounded by
+/// `deadline`. `machine_id` is omitted from the payload when `None` (e.g. a
+/// `mcp-inventory` dump on a machine with no registered device).
 fn build_inventory(
     home: &Path,
     source: SnapshotSource,
     machine_id: Option<&str>,
-) -> McpInventoryIngestRequest {
+    deadline: Instant,
+) -> BuildResult {
+    let started = Instant::now();
     let loading_mode = loading_mode_for(source);
-    let servers = discover_servers(home, source)
-        .iter()
-        .map(|server| harvest_server(server, loading_mode))
-        .collect();
-    McpInventoryIngestRequest {
-        agent_source: agent_source_for(source).to_string(),
-        machine_id: machine_id.map(str::to_string),
-        context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
-        servers,
+    let configured = discover_servers(home, source);
+    let (servers, throttled) = harvest_servers(&configured, loading_mode, deadline);
+    let reachable = servers.iter().filter(|s| s.reachable).count();
+    let metrics = HarvestMetrics {
+        source,
+        wall: started.elapsed(),
+        configured: configured.len(),
+        reachable,
+        unreachable: servers.len() - reachable,
+        dropped: configured.len() - servers.len(),
+        throttled,
+    };
+    BuildResult {
+        inventory: McpInventoryIngestRequest {
+            agent_source: agent_source_for(source).to_string(),
+            machine_id: machine_id.map(str::to_string),
+            context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+            servers,
+        },
+        metrics,
     }
+}
+
+/// A relaxed deadline for the interactive `mcp-inventory` dump: the user asked
+/// for it and wants every server, so harvest is effectively unbounded.
+fn unbounded_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(3600)
+}
+
+// ---------------------------------------------------------------------------
+// Resource metrics
+// ---------------------------------------------------------------------------
+
+/// Per-cycle harvest metrics, emitted as a single greppable `mcp_harvest_metrics`
+/// log line for live benchmarking + alerting. Never includes any server command,
+/// url, or schema.
+struct HarvestMetrics {
+    source: SnapshotSource,
+    wall: Duration,
+    configured: usize,
+    reachable: usize,
+    unreachable: usize,
+    dropped: usize,
+    throttled: bool,
+}
+
+impl HarvestMetrics {
+    fn log(&self) {
+        let (self_rss_mb, children_rss_mb, cpu_s) = process_resource_usage();
+        eprintln!(
+            "mcp_harvest_metrics source={} wall_ms={} configured={} reachable={} \
+             unreachable={} dropped={} throttled={} max_rss_self_mb={} \
+             max_rss_children_mb={} cpu_s={:.2}",
+            self.source.api_slug(),
+            self.wall.as_millis(),
+            self.configured,
+            self.reachable,
+            self.unreachable,
+            self.dropped,
+            self.throttled,
+            self_rss_mb,
+            children_rss_mb,
+            cpu_s,
+        );
+    }
+}
+
+/// Peak RSS (self + reaped children, MB) and total CPU seconds for the process,
+/// via `getrusage`. macOS reports `ru_maxrss` in bytes; Linux in kilobytes.
+fn process_resource_usage() -> (u64, u64, f64) {
+    fn rusage(who: libc::c_int) -> Option<libc::rusage> {
+        // SAFETY: getrusage writes a fully-initialized rusage on success.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(who, &mut usage) } == 0 {
+            Some(usage)
+        } else {
+            None
+        }
+    }
+    fn max_rss_mb(usage: &libc::rusage) -> u64 {
+        let raw = usage.ru_maxrss.max(0) as u64;
+        if cfg!(target_os = "macos") {
+            raw / (1024 * 1024)
+        } else {
+            raw / 1024
+        }
+    }
+    fn cpu_seconds(usage: &libc::rusage) -> f64 {
+        let part = |t: &libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
+        part(&usage.ru_utime) + part(&usage.ru_stime)
+    }
+    let self_usage = rusage(libc::RUSAGE_SELF);
+    let children_usage = rusage(libc::RUSAGE_CHILDREN);
+    let self_rss = self_usage.as_ref().map(max_rss_mb).unwrap_or(0);
+    let children_rss = children_usage.as_ref().map(max_rss_mb).unwrap_or(0);
+    let cpu = self_usage.as_ref().map(cpu_seconds).unwrap_or(0.0)
+        + children_usage.as_ref().map(cpu_seconds).unwrap_or(0.0);
+    (self_rss, children_rss, cpu)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,8 +817,13 @@ pub fn dump_inventory(agent: &str) -> Result<Value> {
     let source = source_for_agent(agent)
         .ok_or_else(|| anyhow!("unknown agent (expected claude-code or codex)"))?;
     let home = crate::snapshot_sync::home_dir()?;
-    let inventory = build_inventory(&home, source, best_effort_machine_id().as_deref());
-    serde_json::to_value(&inventory).map_err(|error| anyhow!("encode inventory: {error}"))
+    let built = build_inventory(
+        &home,
+        source,
+        best_effort_machine_id().as_deref(),
+        unbounded_deadline(),
+    );
+    serde_json::to_value(&built.inventory).map_err(|error| anyhow!("encode inventory: {error}"))
 }
 
 /// Dump every supported agent's inventory as a JSON array (the default when no
@@ -664,8 +834,8 @@ pub fn dump_all_inventories() -> Result<Value> {
     let inventories: Vec<Value> = [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
         .into_iter()
         .map(|source| {
-            let inventory = build_inventory(&home, source, machine_id.as_deref());
-            serde_json::to_value(&inventory)
+            let built = build_inventory(&home, source, machine_id.as_deref(), unbounded_deadline());
+            serde_json::to_value(&built.inventory)
         })
         .collect::<std::result::Result<_, _>>()
         .map_err(|error| anyhow!("encode inventory: {error}"))?;
@@ -941,7 +1111,21 @@ fn harvest_source(
         Err(_) => {}
     }
 
-    let inventory = build_inventory(home, source, Some(machine_id));
+    let BuildResult { inventory, metrics } = build_inventory(
+        home,
+        source,
+        Some(machine_id),
+        Instant::now() + MCP_HARVEST_CYCLE_BUDGET,
+    );
+    metrics.log();
+
+    // A throttled cycle harvested only part of the configured surface; uploading
+    // it would drop the un-probed servers from /optimize. Skip the POST and leave
+    // the cache untouched so the next cycle retries the full harvest.
+    if metrics.throttled {
+        return Ok(());
+    }
+
     let hash = inventory_hash(&inventory)?;
     let path = cache_path(support_dir, source);
     let now = OffsetDateTime::now_utc();
@@ -1239,29 +1423,100 @@ url = "https://remote.test/mcp"
     #[test]
     fn build_inventory_for_pi_has_no_servers() {
         let home = test_home("pi-build");
-        let inventory = build_inventory(&home, SnapshotSource::Pi, Some("otm_test"));
-        assert_eq!(inventory.agent_source, "pi");
-        assert!(inventory.servers.is_empty());
+        let built = build_inventory(
+            &home,
+            SnapshotSource::Pi,
+            Some("otm_test"),
+            unbounded_deadline(),
+        );
+        assert_eq!(built.inventory.agent_source, "pi");
+        assert!(built.inventory.servers.is_empty());
+        assert!(!built.metrics.throttled);
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn build_inventory_omits_machine_id_when_absent() {
         let home = test_home("no-machine");
-        let value =
-            serde_json::to_value(build_inventory(&home, SnapshotSource::ClaudeCode, None)).unwrap();
+        let value = serde_json::to_value(
+            build_inventory(
+                &home,
+                SnapshotSource::ClaudeCode,
+                None,
+                unbounded_deadline(),
+            )
+            .inventory,
+        )
+        .unwrap();
         assert!(
             value.get("machine_id").is_none(),
             "machine_id omitted when None"
         );
-        let with_id = serde_json::to_value(build_inventory(
-            &home,
-            SnapshotSource::ClaudeCode,
-            Some("otm_x"),
-        ))
+        let with_id = serde_json::to_value(
+            build_inventory(
+                &home,
+                SnapshotSource::ClaudeCode,
+                Some("otm_x"),
+                unbounded_deadline(),
+            )
+            .inventory,
+        )
         .unwrap();
         assert_eq!(with_id["machine_id"], json!("otm_x"));
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn harvest_servers_throttles_when_deadline_passed() {
+        // A deadline already in the past drops every server and flags throttled.
+        let configured = vec![
+            ConfiguredServer {
+                name: "a".to_string(),
+                transport: Transport::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                },
+            },
+            ConfiguredServer {
+                name: "b".to_string(),
+                transport: Transport::Http {
+                    url: "https://x.test".to_string(),
+                },
+            },
+        ];
+        let past = Instant::now() - Duration::from_secs(1);
+        let (servers, throttled) = harvest_servers(&configured, "on_demand", past);
+        assert!(throttled);
+        assert!(servers.is_empty(), "no probes launched after the deadline");
+    }
+
+    #[test]
+    fn harvest_servers_completes_within_budget() {
+        // Network transports return instantly (unreachable); a generous deadline
+        // harvests them all with no throttle.
+        let configured: Vec<ConfiguredServer> = (0..6)
+            .map(|i| ConfiguredServer {
+                name: format!("s{i}"),
+                transport: Transport::Http {
+                    url: "https://x.test".to_string(),
+                },
+            })
+            .collect();
+        let (servers, throttled) = harvest_servers(
+            &configured,
+            "always_on",
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(!throttled);
+        assert_eq!(servers.len(), 6);
+        assert!(servers.iter().all(|s| !s.reachable));
+    }
+
+    #[test]
+    fn harvest_bounds_are_set_for_unattended_use() {
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(MCP_HARVEST_MAX_CONCURRENCY, 4);
+        assert_eq!(MCP_HARVEST_CYCLE_BUDGET, Duration::from_secs(90));
     }
 
     #[test]
