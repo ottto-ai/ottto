@@ -128,6 +128,11 @@ pub struct ActivityHintResponse {
     pub workspace_labels_enabled: bool,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
+    // Opt-out (default on). The backend resolves the full cascade (telemetry-off
+    // / source-disabled / harvest-off ⇒ false); the daemon honors it per cycle.
+    // Defaults true so an older backend that omits the field keeps harvesting.
+    #[serde(default = "default_true")]
+    pub mcp_inventory_harvest_enabled: bool,
     pub recommended_scan_after: String,
 }
 

@@ -685,6 +685,67 @@ fn cache_is_stale(entry: &InventoryCacheEntry, now: OffsetDateTime) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Opt-out controls
+// ---------------------------------------------------------------------------
+
+/// Env var that disables the MCP harvest on this machine regardless of the org
+/// setting (a local kill-switch for power users / CI).
+const LOCAL_DISABLE_ENV: &str = "OTTTO_MCP_HARVEST_DISABLED";
+
+/// True when the machine-local override disables the harvest: either the
+/// `OTTTO_MCP_HARVEST_DISABLED` env var is truthy, or a sentinel file exists at
+/// `<support>/mcp_inventory/disabled`.
+fn local_harvest_disabled(support_dir: &Path) -> bool {
+    if std::env::var(LOCAL_DISABLE_ENV)
+        .map(|value| is_truthy(&value))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    support_dir.join("mcp_inventory").join("disabled").exists()
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Path of the per-source marker recording that the org last disabled the harvest
+/// for this source. The file stores the destination identity it applies to, so a
+/// transient activity-hint failure keeps honoring a prior opt-out only for the
+/// SAME destination — a re-claim/re-onboard/repoint never inherits a stale marker.
+fn org_disabled_marker_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    support_dir
+        .join("mcp_inventory")
+        .join(format!("{}.org_disabled", source.api_slug()))
+}
+
+/// Read the destination identity an org-disabled marker applies to, if present.
+fn read_org_disabled_marker(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Record that the org disabled the harvest for `identity`. Best-effort: a write
+/// error is non-fatal (it only weakens the outage fallback, never blocks harvest).
+fn write_org_disabled_marker(path: &Path, identity: &str) {
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(path, identity.as_bytes());
+}
+
+/// Clear any org-disabled marker (the org re-enabled, or a fresh observation).
+fn clear_org_disabled_marker(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler + per-source harvest
 // ---------------------------------------------------------------------------
 
@@ -714,6 +775,13 @@ pub fn spawn_mcp_inventory_sync() -> Result<()> {
 
 /// One harvest cycle across every granted agent source on this machine.
 fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
+    // Local kill-switch: a user can disable the harvest on their own machine
+    // (independent of the org setting) by setting `OTTTO_MCP_HARVEST_DISABLED` or
+    // dropping `<support>/mcp_inventory/disabled`. Checked first, so a disabled
+    // machine does nothing — no credentials read, no network.
+    if local_harvest_disabled(support_dir) {
+        return Ok(());
+    }
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -757,11 +825,12 @@ fn harvest_all_once(home: &Path, support_dir: &Path) -> Result<()> {
 /// Harvest + (conditionally) upload the configured-MCP inventory for one agent
 /// source.
 ///
-/// Builds the inventory, then short-circuits when it is byte-identical to the
-/// last successfully-uploaded one AND that upload is still fresh — no relay token
-/// is minted and no POST is made. Otherwise it mints a fresh source-scoped relay
-/// token (the same auth as snapshot batches), POSTs to `/api/v1/mcp/inventory`,
-/// and records the hash only after a successful upload so a failed POST retries.
+/// Mints a source-scoped relay token and first polls the backend activity hint
+/// for the org's `mcp_inventory_harvest_enabled` (the full telemetry cascade). A
+/// disabled org short-circuits before any MCP server is spawned. When enabled, it
+/// builds the inventory and uploads it, skipping the POST when the inventory is
+/// byte-identical to the last upload for the SAME destination and still fresh.
+/// The hash is recorded only after a successful upload so a failed POST retries.
 /// Discovery and the per-server handshakes are best-effort: a failed handshake
 /// yields an unreachable server, not an aborted harvest.
 #[allow(clippy::too_many_arguments)]
@@ -775,15 +844,38 @@ fn harvest_source(
     home: &Path,
     support_dir: &Path,
 ) -> Result<()> {
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    let identity = destination_identity(device, machine_id, api_base_url);
+
+    // Honor the org opt-out within one cycle. The activity hint resolves the full
+    // cascade (telemetry-off / source-disabled / harvest-off ⇒ false). The marker
+    // records the destination that last opted out, so a transient hint failure
+    // still respects a prior opt-out — but only for the SAME destination. A
+    // re-claim/re-onboard/repoint (different identity) never inherits the marker
+    // and falls through to harvesting, the default-on behavior.
+    let marker = org_disabled_marker_path(support_dir, source);
+    match client.get_activity_hint(&relay_token) {
+        Ok(hint) => {
+            if !hint.mcp_inventory_harvest_enabled {
+                write_org_disabled_marker(&marker, &identity);
+                return Ok(());
+            }
+            clear_org_disabled_marker(&marker);
+        }
+        Err(_) if read_org_disabled_marker(&marker).as_deref() == Some(identity.as_str()) => {
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
     let inventory = build_inventory(home, source, machine_id);
     let hash = inventory_hash(&inventory)?;
-    let identity = destination_identity(device, machine_id, api_base_url);
     let path = cache_path(support_dir, source);
     let now = OffsetDateTime::now_utc();
 
     if let Some(entry) = read_cache(&path) {
-        // Skip only when the SAME destination already has this exact inventory
-        // and the upload is still fresh. A new device/machine/backend (re-claim,
+        // Skip the upload when the SAME destination already has this exact
+        // inventory and it is still fresh. A new device/machine/backend (re-claim,
         // re-onboard, repoint) invalidates the skip so the new principal is
         // populated immediately.
         if entry.identity == identity
@@ -794,7 +886,6 @@ fn harvest_source(
         }
     }
 
-    let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let payload =
         serde_json::to_value(&inventory).map_err(|error| anyhow!("encode inventory: {error}"))?;
     client.upload_mcp_inventory(&relay_token, &payload)?;
@@ -1229,20 +1320,30 @@ done
         (home, support_dir)
     }
 
-    /// Mock backend accepting exactly `count` requests; even-indexed requests get
-    /// a relay-token response, odd-indexed get an inventory ack. Each captured
-    /// request (line + headers + full body) is pushed to `captured`. Returns the
-    /// `http://addr` base URL and the server thread handle.
+    /// How the mock backend answers the activity-hint poll.
+    #[derive(Clone, Copy)]
+    enum HintMode {
+        Enabled,
+        Disabled,
+        Error,
+    }
+
+    /// Mock backend accepting exactly `count` requests, dispatching by path:
+    /// `/relay-token` → token, `/activity-hints` → an activity hint carrying the
+    /// requested `mcp_inventory_harvest_enabled` (or HTTP 500 for `Error`), and
+    /// anything else → an inventory ack. Each captured request (line + headers +
+    /// full body) is pushed to `captured`.
     fn mock_backend(
         captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         count: usize,
+        hint: HintMode,
     ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::Read;
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock backend");
         let address = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
-            for index in 0..count {
+            for _ in 0..count {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut buf = [0_u8; 4096];
@@ -1270,17 +1371,32 @@ done
                         }
                     }
                 }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
-                let body = if index % 2 == 0 {
-                    r#"{"token":"relay-token","expires_at":"2099-01-01T00:00:00Z"}"#
+                let text = String::from_utf8_lossy(&request).to_string();
+                captured.lock().unwrap().push(text.clone());
+                let (status, body) = if text.contains("/relay-token") {
+                    (
+                        "200 OK",
+                        r#"{"token":"relay-token","expires_at":"2099-01-01T00:00:00Z"}"#
+                            .to_string(),
+                    )
+                } else if text.contains("/activity-hints") {
+                    match hint {
+                        HintMode::Error => {
+                            ("500 Internal Server Error", r#"{"error":"x"}"#.to_string())
+                        }
+                        mode => (
+                            "200 OK",
+                            format!(
+                                r#"{{"source":"claude_code","server_time":"2099-01-01T00:00:00Z","record_count_15m":0,"record_count_24h":0,"local_usage_reconciliation_enabled":true,"backfill_window_days":183,"recommended_scan_after":"2099-01-01T00:00:00Z","mcp_inventory_harvest_enabled":{}}}"#,
+                                matches!(mode, HintMode::Enabled)
+                            ),
+                        ),
+                    }
                 } else {
-                    r#"{"snapshot_id":"snap_1"}"#
+                    ("200 OK", r#"{"snapshot_id":"snap_1"}"#.to_string())
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -1297,58 +1413,63 @@ done
         }
     }
 
-    /// End-to-end: a first harvest uploads, an unchanged second harvest skips the
-    /// upload entirely (no relay token minted, no POST) — the Phase 3 exit
-    /// criterion. Drives a real mock stdio MCP server + a mock backend.
+    fn run_harvest(
+        client: &SnapshotApiClient,
+        device: &LocalDeviceBinding,
+        base: &str,
+        home: &Path,
+        support_dir: &Path,
+    ) -> Result<()> {
+        harvest_source(
+            client,
+            device,
+            "device-secret",
+            SnapshotSource::ClaudeCode,
+            "otm_test",
+            base,
+            home,
+            support_dir,
+        )
+    }
+
+    fn inventory_post_count(requests: &[String]) -> usize {
+        requests
+            .iter()
+            .filter(|r| r.contains("POST /api/v1/mcp/inventory"))
+            .count()
+    }
+
+    /// End-to-end: a first harvest uploads; an unchanged second harvest still
+    /// polls the org setting (relay token + activity hint) but skips the upload —
+    /// the unchanged-skip + Phase-4 per-cycle gate. Drives a real mock stdio MCP
+    /// server + a mock backend.
     #[test]
     fn harvest_source_uploads_then_skips_unchanged_inventory() {
         use std::sync::{Arc, Mutex};
 
         let (home, support_dir) = mock_cc_home("harvest-skip");
-        // Accepts exactly the cycle-1 pair; cycle 2 must make zero connections.
+        // Cycle 1: token + hint + inventory (3). Cycle 2: token + hint, no POST (2).
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (base, server) = mock_backend(captured.clone(), 2);
+        let (base, server) = mock_backend(captured.clone(), 5, HintMode::Enabled);
         let client = SnapshotApiClient::new(base.clone());
         let device = cc_device("device_test");
 
-        // Cycle 1: uploads.
-        harvest_source(
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &base,
-            &home,
-            &support_dir,
-        )
-        .expect("cycle 1 harvest");
-
-        // Cycle 2: identical inventory + same destination → skip (no network).
-        harvest_source(
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &base,
-            &home,
-            &support_dir,
-        )
-        .expect("cycle 2 harvest");
+        run_harvest(&client, &device, &base, &home, &support_dir).expect("cycle 1 harvest");
+        run_harvest(&client, &device, &base, &home, &support_dir).expect("cycle 2 harvest");
 
         server.join().expect("server thread");
         let requests = captured.lock().unwrap().clone();
         assert_eq!(
-            requests.len(),
-            2,
-            "exactly one relay-token + one inventory POST across both cycles"
+            inventory_post_count(&requests),
+            1,
+            "exactly one inventory POST across both cycles (cycle 2 skips)"
         );
-        assert!(requests[0].contains("/api/v1/telemetry/devices/device_test/relay-token"));
-        assert!(requests[1].contains("POST /api/v1/mcp/inventory"));
-        assert!(requests[1].contains("\"server\":\"echo-srv\""));
-        assert!(requests[1].contains("\"name\":\"echo\""));
-        // The cache file records the uploaded hash for the skip.
+        let post = requests
+            .iter()
+            .find(|r| r.contains("POST /api/v1/mcp/inventory"))
+            .expect("an inventory POST");
+        assert!(post.contains("\"server\":\"echo-srv\""));
+        assert!(post.contains("\"name\":\"echo\""));
         assert!(cache_path(&support_dir, SnapshotSource::ClaudeCode).exists());
 
         let _ = fs::remove_dir_all(&home);
@@ -1362,31 +1483,22 @@ done
         use std::sync::{Arc, Mutex};
 
         let (home, support_dir) = mock_cc_home("harvest-reonboard");
-        // Both cycles upload (2 pairs) despite byte-identical inventory.
+        // Two full cycles (token + hint + inventory each) = 6 requests.
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (base, server) = mock_backend(captured.clone(), 4);
+        let (base, server) = mock_backend(captured.clone(), 6, HintMode::Enabled);
         let client = SnapshotApiClient::new(base.clone());
 
-        // Cycle 1: original device.
-        harvest_source(
+        run_harvest(
             &client,
             &cc_device("device_old"),
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
             &base,
             &home,
             &support_dir,
         )
         .expect("cycle 1 harvest");
-
-        // Cycle 2: re-claimed device (new device_id) → identity differs → re-POST.
-        harvest_source(
+        run_harvest(
             &client,
             &cc_device("device_new"),
-            "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
             &base,
             &home,
             &support_dir,
@@ -1395,11 +1507,141 @@ done
 
         server.join().expect("server thread");
         let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 4, "both destinations are populated");
-        assert!(requests[0].contains("/api/v1/telemetry/devices/device_old/relay-token"));
-        assert!(requests[1].contains("POST /api/v1/mcp/inventory"));
-        assert!(requests[2].contains("/api/v1/telemetry/devices/device_new/relay-token"));
-        assert!(requests[3].contains("POST /api/v1/mcp/inventory"));
+        assert_eq!(
+            inventory_post_count(&requests),
+            2,
+            "both destinations are populated"
+        );
+        assert!(requests
+            .iter()
+            .any(|r| r.contains("/api/v1/telemetry/devices/device_old/relay-token")));
+        assert!(requests
+            .iter()
+            .any(|r| r.contains("/api/v1/telemetry/devices/device_new/relay-token")));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Phase 4: when the org has the harvest setting off (the activity hint reports
+    /// `mcp_inventory_harvest_enabled=false`), the source is skipped before any
+    /// upload and a persisted marker records the opt-out.
+    #[test]
+    fn harvest_source_skips_when_org_disabled() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-org-off");
+        // token + hint(disabled); no inventory POST.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 2, HintMode::Disabled);
+        let client = SnapshotApiClient::new(base.clone());
+
+        run_harvest(
+            &client,
+            &cc_device("device_test"),
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("harvest honors org opt-out");
+
+        server.join().expect("server thread");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            inventory_post_count(&requests),
+            0,
+            "no upload when org-disabled"
+        );
+        assert!(org_disabled_marker_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+        assert!(!cache_path(&support_dir, SnapshotSource::ClaudeCode).exists());
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Phase 4 fail-safe: when the activity hint is unreachable but a prior
+    /// org-disabled marker exists FOR THIS destination, the harvest stays off
+    /// (honors the last-known opt-out) rather than falling back to default-on.
+    #[test]
+    fn harvest_source_honors_last_known_opt_out_on_hint_failure() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-outage");
+        // token + hint(500); marker for THIS destination present → skip, no upload.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 2, HintMode::Error);
+        let client = SnapshotApiClient::new(base.clone());
+        let device = cc_device("device_test");
+        write_org_disabled_marker(
+            &org_disabled_marker_path(&support_dir, SnapshotSource::ClaudeCode),
+            &destination_identity(&device, "otm_test", &base),
+        );
+
+        run_harvest(&client, &device, &base, &home, &support_dir)
+            .expect("harvest tolerates hint outage");
+
+        server.join().expect("server thread");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            inventory_post_count(&requests),
+            0,
+            "outage keeps honoring the prior opt-out"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Regression for the stale-marker gap: an org-disabled marker left by a
+    /// DIFFERENT destination (re-claim/re-onboard/repoint) must not suppress the
+    /// new principal's harvest during a hint outage.
+    #[test]
+    fn harvest_source_ignores_stale_marker_for_other_destination() {
+        use std::sync::{Arc, Mutex};
+
+        let (home, support_dir) = mock_cc_home("harvest-stale-marker");
+        // A marker from a prior, unrelated destination.
+        write_org_disabled_marker(
+            &org_disabled_marker_path(&support_dir, SnapshotSource::ClaudeCode),
+            "device_old|otm_old|http://old.invalid",
+        );
+        // token + hint(500) + inventory POST — the stale marker is ignored.
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (base, server) = mock_backend(captured.clone(), 3, HintMode::Error);
+        let client = SnapshotApiClient::new(base.clone());
+
+        run_harvest(
+            &client,
+            &cc_device("device_new"),
+            &base,
+            &home,
+            &support_dir,
+        )
+        .expect("harvest proceeds despite a foreign marker");
+
+        server.join().expect("server thread");
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            inventory_post_count(&requests),
+            1,
+            "new destination is populated despite a stale marker"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn local_override_disables_harvest() {
+        let home = test_home("harvest-local-override");
+        let support_dir = home.join("support");
+        fs::create_dir_all(support_dir.join("mcp_inventory")).unwrap();
+        assert!(!local_harvest_disabled(&support_dir));
+        // Sentinel file.
+        fs::write(support_dir.join("mcp_inventory").join("disabled"), b"").unwrap();
+        assert!(local_harvest_disabled(&support_dir));
+
+        assert!(is_truthy("1"));
+        assert!(is_truthy("TRUE"));
+        assert!(is_truthy(" on "));
+        assert!(!is_truthy("0"));
+        assert!(!is_truthy("off"));
 
         let _ = fs::remove_dir_all(&home);
     }
