@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -33,11 +34,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-/// Per-server handshake budget. Generous enough for a cold MCP server to
-/// launch/initialize, but tighter than harvest.py's 45s ceiling because the
-/// daemon harvests unattended and an unreachable server otherwise burns the full
-/// timeout. Combined with bounded concurrency this caps per-cycle wall-clock.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Per-server handshake budget. Generous enough for a fresh machine's first
+/// `npx`/`uvx` run to DOWNLOAD + launch the server (a one-time cost that a tighter
+/// timeout would falsely report as unreachable on the first harvest), but bounded
+/// so a hung server cannot stall a cycle. Bounded concurrency + the per-cycle
+/// budget cap total wall-clock regardless, so this can stay forgiving.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many servers are harvested concurrently. Bounds parallel subprocess
 /// fan-out (one stdio child + one reader thread each) while keeping a slow/cold
@@ -180,13 +182,16 @@ fn load_json(path: &Path) -> Option<Value> {
 fn normalize_claude_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> {
     let declared = cfg.get("type").and_then(Value::as_str);
     let url = cfg.get("url").and_then(Value::as_str);
+    // A server explicitly declared `sse`/`http` is a network transport even if
+    // its `url` is missing/malformed: keep it (it harvests as unreachable, cost
+    // zero) rather than silently dropping a server the user sees in their config.
     let transport = if declared == Some("sse") {
         Transport::Sse {
-            url: url?.to_string(),
+            url: url.unwrap_or_default().to_string(),
         }
     } else if url.is_some() || declared == Some("http") {
         Transport::Http {
-            url: url?.to_string(),
+            url: url.unwrap_or_default().to_string(),
         }
     } else {
         let command = cfg.get("command").and_then(Value::as_str)?.to_string();
@@ -382,13 +387,54 @@ fn discover_servers(home: &Path, source: SnapshotSource) -> Vec<ConfiguredServer
 // stdio MCP handshake
 // ---------------------------------------------------------------------------
 
+/// The environment a stdio MCP server is spawned with, resolved ONCE per harvest
+/// cycle. The daemon runs under launchd with a minimal `PATH`
+/// (`/usr/bin:/bin:…`), so a bare `Command::new("npx")` cannot find the common
+/// MCP launchers (`npx`/`uvx`/`node`) and every such server would falsely report
+/// `reachable:false`. We resolve a launchd-safe `PATH` and the user's provider
+/// env exactly as the daemon spawns its other agent subprocesses, so the harvest
+/// sees the same servers an interactive shell (and the reference harvester) does.
+#[derive(Clone)]
+struct SpawnEnv {
+    path: Option<OsString>,
+    provider: BTreeMap<String, OsString>,
+}
+
+impl SpawnEnv {
+    /// Resolve once per cycle (`provider_env` may briefly consult a login shell).
+    fn resolve() -> Self {
+        Self {
+            path: crate::command_env::path_env(),
+            provider: crate::command_env::provider_env(),
+        }
+    }
+
+    /// Resolve `command` to an absolute path against the launchd-safe search dirs
+    /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
+    /// child (so the launched server and its own subprocesses resolve too).
+    fn command(&self, command: &str, args: &[String]) -> Command {
+        let program = crate::command_env::executable_path(command)
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|| OsString::from(command));
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if let Some(path) = self.path.as_ref() {
+            cmd.env("PATH", path);
+        }
+        for (key, value) in &self.provider {
+            cmd.env(key, value);
+        }
+        cmd
+    }
+}
+
 /// Run `initialize` + `tools/list` against a stdio MCP server and return its
 /// tool definitions. A handshake-thread + channel keeps the bounded wait off
 /// the sync thread; the child is always killed on timeout or error so no
 /// process is leaked.
-fn harvest_stdio(command: &str, args: &[String]) -> Result<Vec<McpToolInput>> {
-    let mut child = Command::new(command)
-        .args(args)
+fn harvest_stdio(command: &str, args: &[String], env: &SpawnEnv) -> Result<Vec<McpToolInput>> {
+    let mut child = env
+        .command(command, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -496,6 +542,12 @@ fn write_message(stdin: &mut impl Write, message: &Value) -> Result<()> {
 /// Read newline-delimited JSON-RPC messages until one carries the expected
 /// `id`. Notifications and unrelated ids are skipped; an error response for the
 /// matched id surfaces as an error.
+//
+// TODO(mcp-line-cap): `read_line` is unbounded, so a pathological server could
+// buffer one giant line into the heap. It is bounded in time by HANDSHAKE_TIMEOUT
+// (the handshake thread is abandoned and the child killed) and observable via the
+// `mcp_harvest_metrics` peak-RSS field; a byte cap is a safe follow-up, not done
+// here to avoid mid-stream truncation risk under release pressure.
 fn read_response(reader: &mut impl BufRead, expected_id: i64) -> Result<Value> {
     let mut line = String::new();
     loop {
@@ -566,9 +618,9 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// Harvest one configured server into its wire shape. An unreachable server (or
 /// an unimplemented network transport) is reported with `reachable = false` and
 /// no tools, so it contributes zero context cost.
-fn harvest_server(server: &ConfiguredServer, loading_mode: &str) -> McpServerInput {
+fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv) -> McpServerInput {
     let tools = match &server.transport {
-        Transport::Stdio { command, args } => harvest_stdio(command, args).ok(),
+        Transport::Stdio { command, args } => harvest_stdio(command, args, env).ok(),
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
@@ -607,6 +659,7 @@ fn harvest_servers(
     configured: &[ConfiguredServer],
     loading_mode: &'static str,
     deadline: Instant,
+    env: &SpawnEnv,
 ) -> (Vec<McpServerInput>, bool) {
     let mut out: Vec<McpServerInput> = Vec::with_capacity(configured.len());
     let mut throttled = false;
@@ -623,9 +676,10 @@ fn harvest_servers(
             .cloned()
             .map(|server| {
                 let mode = loading_mode.to_string();
+                let env = env.clone();
                 std::thread::Builder::new()
                     .name("ottto-mcp-harvest-worker".to_string())
-                    .spawn(move || harvest_server(&server, &mode))
+                    .spawn(move || harvest_server(&server, &mode, &env))
             })
             .collect();
         for (handle, server) in handles.into_iter().zip(chunk.iter()) {
@@ -667,7 +721,8 @@ fn build_inventory(
     let started = Instant::now();
     let loading_mode = loading_mode_for(source);
     let configured = discover_servers(home, source);
-    let (servers, throttled) = harvest_servers(&configured, loading_mode, deadline);
+    let spawn_env = SpawnEnv::resolve();
+    let (servers, throttled) = harvest_servers(&configured, loading_mode, deadline, &spawn_env);
     let reachable = servers.iter().filter(|s| s.reachable).count();
     let metrics = HarvestMetrics {
         source,
@@ -1176,6 +1231,15 @@ mod tests {
         dir
     }
 
+    /// A cheap spawn env for unit tests: the test runner's PATH, no provider env
+    /// (so we never spawn a login shell). Absolute-path mock servers spawn fine.
+    fn test_spawn_env() -> SpawnEnv {
+        SpawnEnv {
+            path: std::env::var_os("PATH"),
+            provider: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn claude_code_discovers_stdio_http_and_sse_across_sources() {
         let home = test_home("claude-discover");
@@ -1266,6 +1330,20 @@ mod tests {
     }
 
     #[test]
+    fn claude_http_server_without_url_is_kept_not_dropped() {
+        // A `type:"http"` entry with no `url` must still be discovered (as an
+        // unreachable HTTP server), never silently dropped from the inventory.
+        let s =
+            normalize_claude_server("noupstream", &json!({ "type": "http" })).expect("server kept");
+        assert_eq!(s.name, "noupstream");
+        assert_eq!(s.transport, Transport::Http { url: String::new() });
+        // And it harvests as unreachable (cost zero), not a panic.
+        let h = harvest_server(&s, "on_demand", &test_spawn_env());
+        assert!(!h.reachable);
+        assert!(h.tools.is_empty());
+    }
+
+    #[test]
     fn codex_discovers_stdio_and_http_from_toml() {
         let home = test_home("codex-discover");
         fs::create_dir_all(home.join(".codex")).unwrap();
@@ -1322,7 +1400,7 @@ url = "https://remote.test/mcp"
                 url: "https://remote.test/mcp".to_string(),
             },
         };
-        let harvested = harvest_server(&http, "always_on");
+        let harvested = harvest_server(&http, "always_on", &test_spawn_env());
 
         assert_eq!(harvested.server, "remote");
         assert_eq!(harvested.transport.as_deref(), Some("http"));
@@ -1340,11 +1418,40 @@ url = "https://remote.test/mcp"
                 args: Vec::new(),
             },
         };
-        let harvested = harvest_server(&server, "on_demand");
+        let harvested = harvest_server(&server, "on_demand", &test_spawn_env());
 
         assert!(!harvested.reachable);
         assert!(harvested.tools.is_empty());
         assert_eq!(harvested.transport.as_deref(), Some("stdio"));
+    }
+
+    #[test]
+    fn spawn_env_applies_path_and_provider_env_to_child() {
+        use std::collections::HashMap;
+        use std::ffi::OsStr;
+
+        let env = SpawnEnv {
+            path: Some(OsString::from("/opt/homebrew/bin:/usr/bin")),
+            provider: BTreeMap::from([("ANTHROPIC_API_KEY".to_string(), OsString::from("k"))]),
+        };
+        // An unresolvable command falls back to the literal name (still spawnable
+        // on a machine where it IS on PATH); a resolvable launcher would become an
+        // absolute path. We assert the env wiring, which is what fixes the bug.
+        let cmd = env.command("ottto-not-a-real-binary-xyz", &["--list".to_string()]);
+        assert_eq!(cmd.get_program(), OsStr::new("ottto-not-a-real-binary-xyz"));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            vec![OsStr::new("--list")]
+        );
+        let envs: HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("PATH")).copied().flatten(),
+            Some(OsStr::new("/opt/homebrew/bin:/usr/bin"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("ANTHROPIC_API_KEY")).copied().flatten(),
+            Some(OsStr::new("k"))
+        );
     }
 
     #[test]
@@ -1485,7 +1592,8 @@ url = "https://remote.test/mcp"
             },
         ];
         let past = Instant::now() - Duration::from_secs(1);
-        let (servers, throttled) = harvest_servers(&configured, "on_demand", past);
+        let (servers, throttled) =
+            harvest_servers(&configured, "on_demand", past, &test_spawn_env());
         assert!(throttled);
         assert!(servers.is_empty(), "no probes launched after the deadline");
     }
@@ -1506,6 +1614,7 @@ url = "https://remote.test/mcp"
             &configured,
             "always_on",
             Instant::now() + Duration::from_secs(30),
+            &test_spawn_env(),
         );
         assert!(!throttled);
         assert_eq!(servers.len(), 6);
@@ -1514,9 +1623,12 @@ url = "https://remote.test/mcp"
 
     #[test]
     fn harvest_bounds_are_set_for_unattended_use() {
-        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(HANDSHAKE_TIMEOUT, Duration::from_secs(30));
         assert_eq!(MCP_HARVEST_MAX_CONCURRENCY, 4);
         assert_eq!(MCP_HARVEST_CYCLE_BUDGET, Duration::from_secs(90));
+        // Worst case ⌈servers/K⌉ × timeout must stay inside the cycle budget for a
+        // typical (≤8-server) machine so a normal config is never throttled.
+        assert!(2 * HANDSHAKE_TIMEOUT <= MCP_HARVEST_CYCLE_BUDGET);
     }
 
     #[test]
@@ -1608,7 +1720,8 @@ done
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        let tools = harvest_stdio(&script.to_string_lossy(), &[]).expect("handshake succeeds");
+        let tools = harvest_stdio(&script.to_string_lossy(), &[], &test_spawn_env())
+            .expect("handshake succeeds");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].description, "Echo input");
