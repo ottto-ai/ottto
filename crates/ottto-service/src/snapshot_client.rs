@@ -1,8 +1,8 @@
 use crate::snapshots::{SnapshotBatchRequest, SnapshotSource};
 use anyhow::{anyhow, Result};
 use ottto_core::{
-    compiled_release_version, ControlTokenStore, FileDeviceStore, KeychainSecretStore,
-    LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
+    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
@@ -17,21 +17,28 @@ const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The backend rejected a snapshot batch because the payload did not satisfy the
-/// strict daemon/backend contract. Surfaced as a typed error so `snapshot_sync`
-/// can emit a loud, specific diagnostic and report `schema_rejected` instead of
-/// burying real contract drift as a generic upload failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// strict daemon/backend contract. Carries the redacted response body so support
+/// can see the actual validator failure instead of guessing schema-version drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchRejected {
     pub status: u16,
+    pub body_excerpt: Option<String>,
 }
 
 impl std::fmt::Display for BatchRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "backend rejected snapshot batch: HTTP {} (likely daemon/backend schema mismatch)",
-            self.status
-        )
+        match self.body_excerpt.as_deref() {
+            Some(body) => write!(
+                f,
+                "backend rejected snapshot batch payload: HTTP {} body_excerpt={}",
+                self.status, body
+            ),
+            None => write!(
+                f,
+                "backend rejected snapshot batch payload: HTTP {}",
+                self.status
+            ),
+        }
     }
 }
 
@@ -311,11 +318,14 @@ impl SnapshotApiClient {
                 }))
             }
             // Validation-like statuses mean the backend refused the payload
-            // contract. We deliberately do NOT echo the response body: it can
-            // carry backend-internal detail, and the status code plus daemon
-            // schema version is enough to diagnose and act on.
-            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
-                Err(anyhow::Error::new(BatchRejected { status: code }))
+            // contract. Keep a redacted/truncated body excerpt so field logs show
+            // the exact validator failure (for example, missing usage_buckets)
+            // without leaking tokens, paths, account IDs, or machine IDs.
+            Err(ureq::Error::Status(code @ (400 | 422), response)) => {
+                Err(anyhow::Error::new(BatchRejected {
+                    status: code,
+                    body_excerpt: response_body_excerpt(response),
+                }))
             }
             Err(error) => Err(anyhow!("upload snapshot batch failed: {error}")),
         }
@@ -452,6 +462,35 @@ fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
         .build()
 }
 
+fn response_body_excerpt(response: ureq::Response) -> Option<String> {
+    response
+        .into_string()
+        .ok()
+        .and_then(|body| safe_response_body_excerpt(&body))
+}
+
+fn safe_response_body_excerpt(body: &str) -> Option<String> {
+    let compact = body
+        .split_whitespace()
+        .take(80)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    Some(truncate_diagnostic(&redact_inline(&compact)))
+}
+
+fn truncate_diagnostic(value: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 500;
+    if value.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return value.to_string();
+    }
+    let mut truncated = value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
     let device = FileDeviceStore::default()
         .load()?
@@ -471,14 +510,25 @@ mod tests {
     fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
         // The upload_batch validation path wraps BatchRejected in anyhow::Error;
         // the snapshot_sync caller relies on downcast_ref to choose the loud
-        // schema-mismatch diagnostic over the generic network-error path.
-        let err = anyhow::Error::new(BatchRejected { status: 422 });
+        // payload-validation diagnostic over the generic network-error path.
+        let err = anyhow::Error::new(BatchRejected {
+            status: 422,
+            body_excerpt: Some(
+                r#"{"detail":"usage_buckets are required for schema_version 6 usage snapshots"}"#
+                    .to_string(),
+            ),
+        });
         let rejected = err
             .downcast_ref::<BatchRejected>()
             .expect("BatchRejected must downcast from anyhow::Error");
         assert_eq!(rejected.status, 422);
+        assert!(rejected
+            .body_excerpt
+            .as_deref()
+            .expect("body")
+            .contains("usage_buckets"));
         assert!(err.to_string().contains("422"));
-        assert!(err.to_string().contains("schema mismatch"));
+        assert!(err.to_string().contains("usage_buckets"));
 
         // A plain transport error must NOT masquerade as a schema rejection.
         let other = anyhow!("upload snapshot batch failed: connection refused");
@@ -552,6 +602,21 @@ mod tests {
         // health/status calls still fail quickly when production is unhealthy.
         assert!(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT >= Duration::from_secs(120));
         assert!(SNAPSHOT_HTTP_READ_TIMEOUT <= Duration::from_secs(15));
+    }
+
+    #[test]
+    fn snapshot_rejection_body_excerpt_is_redacted_and_bounded() {
+        let token = format!("ghp_{}", "AbCdEf1234567890aaaaaaaaaaaaaaaaaa");
+        let body = format!(
+            "{{\"detail\":\"usage_buckets are required Authorization: Bearer {token} machine_id otm_1234567890abcdef path /Users/ron/.codex/sessions/a.jsonl\"}}"
+        );
+        let excerpt = safe_response_body_excerpt(&body).expect("excerpt");
+        assert!(excerpt.contains("usage_buckets"));
+        assert!(excerpt.contains("[REDACTED]"));
+        assert!(excerpt.contains("[machine_id]"));
+        assert!(excerpt.contains("[path]"));
+        assert!(!excerpt.contains("/Users/ron"));
+        assert!(excerpt.chars().count() <= 503);
     }
 
     #[test]

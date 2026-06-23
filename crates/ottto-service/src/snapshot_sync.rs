@@ -13,9 +13,10 @@ use crate::snapshot_client::{
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
 };
 use crate::snapshots::{
-    apply_upload_policy, collector_version, scan_source_roots_with_artifacts, ScanIndex,
-    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy, SourceScanResult,
-    MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    apply_upload_policy, collector_version, scan_source_roots_with_artifacts,
+    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
+    SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -556,7 +557,6 @@ fn sync_source(
         // history and retroactive backfill before the first upload. Relay
         // tokens are intentionally short-lived, so mint them at the network
         // boundary instead of reusing the pre-scan activity-hint token.
-        let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: source.api_slug().to_string(),
@@ -564,6 +564,35 @@ fn sync_source(
             collector_version: Some(collector_version()),
             snapshots: chunk.to_vec(),
         };
+        if let Err(reason) = validate_snapshot_batch_request(&request) {
+            eprintln!(
+                "ottto-service: local snapshot batch failed daemon v{} contract preflight for {} — {}; usage/cost sync is NOT reaching the backend until the daemon serializer is fixed.",
+                SNAPSHOT_SCHEMA_VERSION,
+                source.api_slug(),
+                reason,
+            );
+            let state = CollectorState::Error {
+                code: "backend_validation_error",
+                message: "local snapshot batch failed daemon/backend contract preflight",
+            };
+            let _ = report_status_with_fresh_relay_token(
+                client,
+                device,
+                device_secret,
+                source,
+                CollectorStatus {
+                    source,
+                    machine_id,
+                    scan_started_at: &scan_started_at,
+                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    state,
+                },
+            );
+            return Err(anyhow!(
+                "local snapshot batch failed daemon/backend contract preflight: {reason}"
+            ));
+        }
+        let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
         let response = match client.upload_batch(&upload_relay_token, &request) {
             Ok(response) => response,
             Err(error) => {
@@ -588,22 +617,26 @@ fn sync_source(
                         "backend rejected snapshot batch authorization",
                     )
                 } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+                    let body = rejected
+                        .body_excerpt
+                        .as_deref()
+                        .unwrap_or("backend returned no validation detail");
                     eprintln!(
-                        "ottto-service: snapshot batch REJECTED by backend (HTTP {}) for {} — \
-                             daemon SNAPSHOT_SCHEMA_VERSION={} does not match what the backend \
-                             accepts; usage/cost sync is NOT reaching the backend until the daemon \
-                             or backend is updated. This is a schema/contract mismatch, not a \
-                             network error.",
+                        "ottto-service: snapshot batch payload rejected by backend (HTTP {}) for {} — \
+                         daemon SNAPSHOT_SCHEMA_VERSION={}; backend detail: {}; usage/cost sync is \
+                         NOT reaching the backend until the daemon payload or backend validator is \
+                         updated. This is a payload validation failure, not a network error.",
                         rejected.status,
                         source.api_slug(),
                         SNAPSHOT_SCHEMA_VERSION,
+                        body,
                     );
                     (
                         CollectorState::Error {
-                            code: "schema_rejected",
-                            message: "backend rejected snapshot batch (schema/contract mismatch)",
+                            code: "backend_validation_error",
+                            message: "backend rejected snapshot batch payload validation",
                         },
-                        "backend rejected snapshot batch (schema mismatch)",
+                        "backend rejected snapshot batch payload validation",
                     )
                 } else {
                     (
@@ -945,6 +978,10 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
         "agent status upload failed"
     } else if text.contains("scan local snapshots") {
         "local snapshot scan failed"
+    } else if text.contains("daemon/backend contract preflight")
+        || text.contains("backend rejected snapshot batch payload")
+    {
+        "local snapshot payload validation failed"
     } else if text.contains("upload local snapshots")
         || text.contains("upload snapshot batch failed")
     {
@@ -1131,6 +1168,18 @@ mod tests {
         assert_eq!(
             safe_error(&anyhow!("issue relay token failed: rejected")),
             "relay token request failed"
+        );
+        assert_eq!(
+            safe_error(&anyhow!(
+                "local snapshot batch failed daemon/backend contract preflight: snapshot[0]"
+            )),
+            "local snapshot payload validation failed"
+        );
+        assert_eq!(
+            safe_error(&anyhow!(
+                "backend rejected snapshot batch payload validation: HTTP 422"
+            )),
+            "local snapshot payload validation failed"
         );
         assert_eq!(
             safe_error(&anyhow::Error::new(LocalHealthProjectionRejected {
