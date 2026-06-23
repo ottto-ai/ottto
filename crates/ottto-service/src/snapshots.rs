@@ -497,6 +497,152 @@ impl UsageTotals {
     }
 }
 
+pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result<(), String> {
+    if request.schema_version != SNAPSHOT_SCHEMA_VERSION {
+        return Err(format!(
+            "schema_version {} does not match daemon SNAPSHOT_SCHEMA_VERSION {}",
+            request.schema_version, SNAPSHOT_SCHEMA_VERSION
+        ));
+    }
+    if request.snapshots.is_empty() {
+        return Err("snapshots must not be empty".to_string());
+    }
+    for (index, item) in request.snapshots.iter().enumerate() {
+        validate_snapshot_item(index, item)?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), String> {
+    let expected = usage_totals_from_item(item);
+    let expected_has_usage = usage_totals_has_usage(&expected);
+    if expected_has_usage && item.usage_buckets.is_empty() {
+        return Err(format!(
+            "snapshot[{index}] has usage totals but no usage_buckets"
+        ));
+    }
+
+    let mut top_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
+    for row in &item.model_usage {
+        let row_key = row_key_from_model_usage(row);
+        if top_rows
+            .insert(row_key, usage_totals_from_model_usage(row))
+            .is_some()
+        {
+            return Err(format!(
+                "snapshot[{index}] has duplicate top-level model_usage rows"
+            ));
+        }
+    }
+
+    let mut bucket_totals = UsageTotals::default();
+    let mut bucket_rows: BTreeMap<RowKey, UsageTotals> = BTreeMap::new();
+    for (bucket_index, bucket) in item.usage_buckets.iter().enumerate() {
+        if bucket.model_usage.is_empty() {
+            return Err(format!(
+                "snapshot[{index}].usage_buckets[{bucket_index}] has no model_usage rows"
+            ));
+        }
+        let mut seen_bucket_rows = BTreeSet::new();
+        for row in &bucket.model_usage {
+            let row_key = row_key_from_model_usage(row);
+            if !seen_bucket_rows.insert(row_key.clone()) {
+                return Err(format!(
+                    "snapshot[{index}].usage_buckets[{bucket_index}] has duplicate model_usage rows"
+                ));
+            }
+            let totals = usage_totals_from_model_usage(row);
+            bucket_totals.add(&totals);
+            bucket_rows.entry(row_key).or_default().add(&totals);
+        }
+    }
+
+    if !usage_totals_equal(&bucket_totals, &expected) {
+        return Err(format!(
+            "snapshot[{index}] usage_buckets totals do not match snapshot totals"
+        ));
+    }
+
+    if !bucket_rows.is_empty() {
+        if top_rows.keys().collect::<Vec<_>>() != bucket_rows.keys().collect::<Vec<_>>() {
+            return Err(format!(
+                "snapshot[{index}] usage_buckets model rows do not match top-level model_usage rows"
+            ));
+        }
+        for (row_key, top_totals) in &top_rows {
+            let bucket_row = bucket_rows.get(row_key).expect("checked key set");
+            if !usage_totals_equal(bucket_row, top_totals) {
+                return Err(format!(
+                    "snapshot[{index}] usage_buckets model row totals do not match top-level model_usage"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn usage_totals_from_item(item: &SnapshotItem) -> UsageTotals {
+    UsageTotals {
+        input_tokens: item.input_tokens,
+        output_tokens: item.output_tokens,
+        cache_read_tokens: item.cache_read_tokens,
+        cache_creation_5m_tokens: item.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: item.cache_creation_1h_tokens,
+        reasoning_output_tokens: item.reasoning_output_tokens,
+        unattributed_total_tokens: item.unattributed_total_tokens,
+        request_count: item.request_count,
+    }
+}
+
+fn usage_totals_from_model_usage(row: &SnapshotModelUsage) -> UsageTotals {
+    UsageTotals {
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_creation_5m_tokens: row.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: row.cache_creation_1h_tokens,
+        reasoning_output_tokens: row.reasoning_output_tokens,
+        unattributed_total_tokens: row.unattributed_total_tokens,
+        request_count: row.request_count,
+    }
+}
+
+fn usage_totals_has_usage(totals: &UsageTotals) -> bool {
+    !totals.is_zero() || totals.request_count > 0
+}
+
+fn usage_totals_equal(left: &UsageTotals, right: &UsageTotals) -> bool {
+    left.input_tokens == right.input_tokens
+        && left.output_tokens == right.output_tokens
+        && left.cache_read_tokens == right.cache_read_tokens
+        && left.cache_creation_5m_tokens == right.cache_creation_5m_tokens
+        && left.cache_creation_1h_tokens == right.cache_creation_1h_tokens
+        && left.reasoning_output_tokens == right.reasoning_output_tokens
+        && left.unattributed_total_tokens == right.unattributed_total_tokens
+        && left.request_count == right.request_count
+}
+
+fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
+    let selector_hash = if row.selector_context.is_empty() {
+        "base".to_string()
+    } else {
+        let payload =
+            serde_json::to_string(&row.selector_context).unwrap_or_else(|_| "{}".to_string());
+        sha256_hex(&[payload.as_str()])[..16].to_string()
+    };
+    RowKey {
+        model: row.model.clone(),
+        selector_hash,
+        auth_mode: row.auth_mode.clone(),
+        billing_channel: row.billing_channel.clone(),
+        billing_provider: row.billing_provider.clone(),
+        gateway_provider: row.gateway_provider.clone(),
+        model_provider: row.model_provider.clone(),
+        subscription_product: row.subscription_product.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SelectorCapture {
     context: BTreeMap<String, String>,
@@ -7208,6 +7354,7 @@ mod tests {
             collector_version: Some("local-enriched/1".to_string()),
             snapshots: vec![item],
         };
+        validate_snapshot_batch_request(&request).expect("canonical v6 batch passes preflight");
         let value = serde_json::to_value(&request).expect("serialize v6 batch");
 
         // (1) schema version is 6 — both the constant and the wire value.
@@ -7284,5 +7431,113 @@ mod tests {
             json!("long"),
             "context_bucket must be carried inside the row's selector_context"
         );
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_missing_usage_buckets() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].usage_buckets.clear();
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("no usage_buckets"), "{error}");
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_bucket_total_mismatch() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = 99;
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("totals do not match"), "{error}");
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_top_level_row_mismatch() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].model_usage[0].gateway_provider = Some("anthropic".to_string());
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("model rows do not match"), "{error}");
+    }
+
+    fn valid_v6_batch_request() -> SnapshotBatchRequest {
+        let row = SnapshotModelUsage {
+            model: "claude-opus-4-7".to_string(),
+            input_tokens: 100,
+            output_tokens: 40,
+            cache_read_tokens: 10,
+            cache_creation_5m_tokens: 5,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            reasoning_effort: None,
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            selector_context: BTreeMap::from([(
+                "service_tier".to_string(),
+                "standard".to_string(),
+            )]),
+            selector_sources: BTreeMap::from([(
+                "service_tier".to_string(),
+                "message.usage.service_tier".to_string(),
+            )]),
+            auth_mode: Some("service_account_oauth".to_string()),
+            billing_channel: Some("cloud".to_string()),
+            billing_provider: Some("google_cloud".to_string()),
+            gateway_provider: Some("vertex".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            subscription_product: None,
+        };
+        SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: SnapshotSource::ClaudeCode.api_slug().to_string(),
+            machine_id: "machine-contract-0001".to_string(),
+            collector_version: Some("local-enriched/1".to_string()),
+            snapshots: vec![SnapshotItem {
+                source_session_id: "claude-vertex-session-1".to_string(),
+                snapshot_fingerprint: "a".repeat(32),
+                status: "final".to_string(),
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_tokens: 10,
+                cache_creation_5m_tokens: 5,
+                cache_creation_1h_tokens: 0,
+                reasoning_output_tokens: 0,
+                unattributed_total_tokens: 0,
+                request_count: 1,
+                avg_duration_ms: None,
+                avg_time_to_first_token_ms: None,
+                max_duration_ms: None,
+                max_time_to_first_token_ms: None,
+                model_usage: vec![row.clone()],
+                usage_buckets: vec![SnapshotUsageBucket {
+                    bucket_start: "2026-05-28T17:00:00Z".to_string(),
+                    model_usage: vec![row],
+                    first_activity_at: Some("2026-05-28T17:05:00Z".to_string()),
+                    last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
+                }],
+                session_display_name: None,
+                session_display_name_source: None,
+                source_started_at: Some("2026-05-28T17:00:00Z".to_string()),
+                source_ended_at: Some("2026-05-28T17:45:00Z".to_string()),
+                source_last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
+                collected_at: "2026-05-28T17:46:00Z".to_string(),
+                workspace_hash: Some("b".repeat(32)),
+                workspace_display_label: None,
+                workspace_label_source: None,
+                source_file_fingerprint: Some("c".repeat(32)),
+                session_artifacts: Vec::new(),
+                provenance: SnapshotProvenance {
+                    collector: "claude_code_jsonl".to_string(),
+                    source_file_count: 1,
+                    input_token_scope: Some("uncached".to_string()),
+                    state_total_tokens: None,
+                    state_archived: None,
+                },
+                origin: None,
+            }],
+        }
     }
 }

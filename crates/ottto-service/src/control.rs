@@ -1652,7 +1652,13 @@ fn complete_pending_auth_claim(
     machine: &MachineIdentity,
     pending: PendingAuthClaim,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
-    let completed = complete_setup_claim(&pending, machine)?;
+    let completed = match complete_setup_claim(&pending, machine) {
+        Ok(completed) => completed,
+        Err(error) => {
+            log_auth_complete_backend_failure(&error);
+            return Err(error);
+        }
+    };
     let _binding_lock = lock_setup_run_binding();
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
@@ -1700,6 +1706,52 @@ fn complete_pending_auth_claim(
         request_snapshot_sync_after_device_registration(daemon);
     }
     Ok(response)
+}
+
+fn log_auth_complete_backend_failure(error: &LocalApiError) {
+    match error {
+        LocalApiError::Backend(details) => {
+            let status = details
+                .status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let body = details
+                .body_excerpt
+                .as_deref()
+                .unwrap_or("backend returned no response body");
+            eprintln!(
+                "ottto-service: auth_complete backend request failed endpoint={} status={} kind={:?} body_excerpt={}",
+                auth_complete_log_endpoint(&details.endpoint),
+                status,
+                details.kind,
+                body,
+            );
+        }
+        LocalApiError::TimedOut(detail) => {
+            eprintln!(
+                "ottto-service: auth_complete backend request timed out endpoint=/api/v1/setup-claims/[claim]/local-client/complete detail={}",
+                redact_inline(detail),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn auth_complete_log_endpoint(endpoint: &str) -> String {
+    let marker = "/api/v1/setup-claims/";
+    let Some(start) = endpoint.find(marker) else {
+        return endpoint.to_string();
+    };
+    let prefix_end = start + marker.len();
+    let Some(suffix_start) = endpoint[prefix_end..].find("/local-client/complete") else {
+        return endpoint.to_string();
+    };
+    let suffix_index = prefix_end + suffix_start;
+    format!(
+        "{}[claim]{}",
+        &endpoint[..prefix_end],
+        &endpoint[suffix_index..]
+    )
 }
 
 fn persist_claim_relay_device_credentials(
@@ -12482,6 +12534,24 @@ log_user_prompt = true
         );
         assert!(!error.message.contains("/api/v1"));
         assert!(!error.message.contains("req_private"));
+    }
+
+    #[test]
+    fn auth_complete_log_endpoint_redacts_claim_code() {
+        assert_eq!(
+            auth_complete_log_endpoint(
+                "https://api.ottto.net/api/v1/setup-claims/claim_private/local-client/complete"
+            ),
+            "https://api.ottto.net/api/v1/setup-claims/[claim]/local-client/complete"
+        );
+        assert_eq!(
+            auth_complete_log_endpoint("/api/v1/setup-claims/claim_private/local-client/complete"),
+            "/api/v1/setup-claims/[claim]/local-client/complete"
+        );
+        assert_eq!(
+            auth_complete_log_endpoint("/api/v1/setup-claims/claim_private/status"),
+            "/api/v1/setup-claims/claim_private/status"
+        );
     }
 
     #[test]
