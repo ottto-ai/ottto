@@ -66,6 +66,7 @@ const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -2651,6 +2652,9 @@ fn cli_error_message(error: &LocalApiError) -> String {
             "Setup needs browser approval. Open the Ottto app from Ottto, or run setup with a fresh claim code.".to_string()
         }
         LocalApiError::TimedOut(_) => {
+            if let Some(message) = agent_read_timeout_message(error) {
+                return message;
+            }
             "Timed out waiting for setup to complete. Open the Ottto app from Ottto and retry.".to_string()
         }
         LocalApiError::Backend(backend) => {
@@ -2702,6 +2706,34 @@ fn cli_error_message(error: &LocalApiError) -> String {
         }
         _ => error.to_string(),
     }
+}
+
+fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
+    let LocalApiError::TimedOut(reason) = error else {
+        return None;
+    };
+    if reason.contains("/local-client/agent-context") {
+        return Some(
+            "Timed out loading Ottto context. Retry in a moment or narrow the query.".to_string(),
+        );
+    }
+    if reason.contains("/local-client/costs") {
+        return Some(
+            "Timed out loading Ottto costs. Retry in a moment or narrow the query.".to_string(),
+        );
+    }
+    if reason.contains("/local-client/sessions") {
+        return Some(
+            "Timed out loading Ottto sessions. Retry in a moment or narrow the query.".to_string(),
+        );
+    }
+    if reason.contains("/local-client/recommendations") {
+        return Some("Timed out loading Ottto recommendations. Retry in a moment.".to_string());
+    }
+    if reason.contains("/local-client/provider-impact") {
+        return Some("Timed out loading Ottto provider-impact events. Retry in a moment or narrow the query.".to_string());
+    }
+    None
 }
 
 fn setup_run(
@@ -7958,7 +7990,7 @@ fn get_agent_context_with_base(
     query: &AgentContextQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     let url = agent_context_url(api_base_url, connection, query);
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn get_agent_costs_with_base(
@@ -7968,7 +8000,7 @@ fn get_agent_costs_with_base(
     query: &AgentCostsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     let url = agent_costs_url(api_base_url, connection, query);
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn get_agent_sessions_with_base(
@@ -7978,7 +8010,7 @@ fn get_agent_sessions_with_base(
     query: &AgentSessionsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     let url = agent_sessions_url(api_base_url, connection, query);
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn get_agent_recommendations_with_base(
@@ -7988,7 +8020,7 @@ fn get_agent_recommendations_with_base(
     query: &AgentRecommendationsQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     let url = agent_recommendations_url(api_base_url, connection, query);
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn get_agent_provider_impact_with_base(
@@ -7998,7 +8030,7 @@ fn get_agent_provider_impact_with_base(
     query: &AgentProviderImpactQuery,
 ) -> Result<serde_json::Value, LocalApiError> {
     let url = agent_provider_impact_url(api_base_url, connection, query);
-    backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    backend_get_agent_read_json(&url, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
 }
 
 fn agent_context_url(
@@ -8231,6 +8263,13 @@ fn backend_get_json<T: DeserializeOwned>(
     headers: &[(&str, &str)],
 ) -> Result<T, LocalApiError> {
     backend_get_json_with_timeout(url, headers, BACKEND_REQUEST_TIMEOUT)
+}
+
+fn backend_get_agent_read_json<T: DeserializeOwned>(
+    url: &str,
+    headers: &[(&str, &str)],
+) -> Result<T, LocalApiError> {
+    backend_get_json_with_timeout(url, headers, AGENT_READ_HTTP_TIMEOUT)
 }
 
 fn backend_get_json_with_timeout<T: DeserializeOwned>(
@@ -13021,6 +13060,32 @@ log_user_prompt = true
                     .to_string()
             ))
         );
+    }
+
+    #[test]
+    fn agent_read_timeout_message_names_read_surface() {
+        let error = cli_error(LocalApiError::TimedOut(
+            "backend request timed out for /api/v1/setup-runs/[id]/local-client/costs".to_string(),
+        ));
+
+        assert_eq!(error.code, CliErrorCode::TimedOut);
+        assert_eq!(
+            error.message,
+            "Timed out loading Ottto costs. Retry in a moment or narrow the query."
+        );
+        assert_eq!(
+            error.details.get("detail"),
+            Some(&RedactedValue::String(
+                "backend request timed out for /api/v1/setup-runs/[id]/local-client/costs"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn agent_read_http_timeout_covers_heavy_org_reads() {
+        assert!(AGENT_READ_HTTP_TIMEOUT >= Duration::from_secs(120));
+        assert!(AGENT_READ_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
     }
 
     #[test]

@@ -758,6 +758,13 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
         LocalControlCommand::Status {
             refresh_agent_status: true,
         } | LocalControlCommand::AgentStatusRefresh { .. }
+            | LocalControlCommand::AgentContext { .. }
+            | LocalControlCommand::AgentCosts { .. }
+            | LocalControlCommand::AgentSessions { .. }
+            | LocalControlCommand::AgentRecommendations { .. }
+            | LocalControlCommand::AgentProviderImpact { .. }
+            | LocalControlCommand::Setup { .. }
+            | LocalControlCommand::SetupAnswer { .. }
             | LocalControlCommand::SetupAction { .. }
             | LocalControlCommand::Verify { .. }
     )
@@ -888,7 +895,10 @@ fn run_setup(invocation: Invocation, args: SetupArgs) -> i32 {
                 let payload = response.payload.unwrap_or(serde_json::Value::Null);
                 let exit_code = setup_payload_exit_code(&payload);
                 last_setup_payload = Some(payload.clone());
-                if args.no_wait || setup_exit_is_terminal(exit_code) {
+                if args.no_wait
+                    || setup_exit_is_terminal(exit_code)
+                    || setup_payload_requires_user_decision(&payload)
+                {
                     return print_setup_payload(
                         response.request_id,
                         payload,
@@ -1008,6 +1018,15 @@ fn sleep_for_setup_poll() {
 
 fn setup_exit_is_terminal(exit_code: i32) -> bool {
     matches!(exit_code, 0 | 61 | 70)
+}
+
+fn setup_payload_requires_user_decision(payload: &serde_json::Value) -> bool {
+    payload
+        .get("next_question")
+        .is_some_and(|value| !value.is_null())
+        || payload
+            .get("next_action")
+            .is_some_and(|value| !value.is_null())
 }
 
 fn start_browser_claim(
@@ -2006,6 +2025,32 @@ mod tests {
                 refresh_agent_status: true,
             },
             LocalControlCommand::AgentStatusRefresh { source: None },
+            LocalControlCommand::AgentContext {
+                query: AgentContextQuery::default(),
+            },
+            LocalControlCommand::AgentCosts {
+                query: AgentCostsQuery::default(),
+            },
+            LocalControlCommand::AgentSessions {
+                query: AgentSessionsQuery::default(),
+            },
+            LocalControlCommand::AgentRecommendations {
+                query: AgentRecommendationsQuery::default(),
+            },
+            LocalControlCommand::AgentProviderImpact {
+                query: AgentProviderImpactQuery::default(),
+            },
+            LocalControlCommand::Setup {
+                sources: Vec::new(),
+                claim_code: None,
+                setup_run_id: None,
+                api_base_url: None,
+            },
+            LocalControlCommand::SetupAnswer {
+                source: SourceKind::Codex,
+                answer_type: "retry_source".to_string(),
+                api_base_url: None,
+            },
             LocalControlCommand::Verify {
                 source: SourceKind::Codex,
                 repair: false,
@@ -2277,6 +2322,10 @@ mod tests {
         assert_eq!(
             setup_payload_exit_code(&payload),
             CliErrorCode::NeedsUserAction.exit_code()
+        );
+        assert!(
+            setup_payload_requires_user_decision(&payload),
+            "watch mode should surface user decisions instead of polling to timeout"
         );
     }
 
