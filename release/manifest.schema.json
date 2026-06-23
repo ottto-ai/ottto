@@ -44,6 +44,10 @@
       "type": "string",
       "format": "date-time"
     },
+    "release_notes": {
+      "description": "User-facing What's new notes rendered by the macOS Updates screen and Sparkle appcast. Stable releases require a non-empty string at publish time; non-stable channels may omit it or set null.",
+      "type": ["string", "null"]
+    },
     "min_supported_version": {
       "type": "string",
       "minLength": 1

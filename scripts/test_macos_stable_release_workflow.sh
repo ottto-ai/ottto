@@ -41,6 +41,7 @@ require_grep '^[[:space:]]+- stable$' 'stable channel option'
 require_grep 'publish_intent:' 'publish_intent input'
 require_grep '^[[:space:]]+- none$' 'publish_intent none-only option'
 require_grep 'release_notes:' 'release_notes input'
+# shellcheck disable=SC2016 # This assertion intentionally matches literal "$RELEASE_NOTES".
 require_grep '--release-notes "\$RELEASE_NOTES"' 'release notes passed into macos_package before manifest signing'
 require_grep 'ottto-release-bootstrap' 'bootstrap signing runner label'
 require_grep 'ottto-signing-mac' 'release signing runner label'
