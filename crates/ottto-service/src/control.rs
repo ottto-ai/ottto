@@ -1988,6 +1988,8 @@ struct ReleaseManifest {
     min_supported_version: String,
     min_protocol_version: u16,
     supported_install_owners: Vec<InstallOwner>,
+    #[serde(default)]
+    release_notes: Option<String>,
     rollback: ReleaseRollback,
     #[serde(default)]
     artifacts: Vec<ReleaseArtifact>,
@@ -2041,6 +2043,7 @@ fn check_update_state() -> UpdateState {
             build_id,
             update_command: None,
             update_instructions: None,
+            release_notes: None,
         };
     };
 
@@ -2064,6 +2067,7 @@ fn update_state_from_manifest(
 ) -> UpdateState {
     if let Some(reason) = release_manifest_metadata_error(&manifest) {
         let download_url = app_download_url(&manifest);
+        let release_notes = normalized_release_notes(manifest.release_notes.as_deref());
         return UpdateState {
             current_version,
             latest_version: Some(manifest.version),
@@ -2079,11 +2083,13 @@ fn update_state_from_manifest(
             build_id: build_id.or(Some(manifest.commit)),
             update_command: None,
             update_instructions: None,
+            release_notes,
         };
     }
 
     if manifest.channel != local_channel {
         let download_url = app_download_url(&manifest);
+        let release_notes = normalized_release_notes(manifest.release_notes.as_deref());
         let latest_version = manifest.version.clone();
         let manifest_channel = manifest.channel.clone();
         return UpdateState {
@@ -2103,6 +2109,7 @@ fn update_state_from_manifest(
             build_id: build_id.or(Some(manifest.commit)),
             update_command: None,
             update_instructions: None,
+            release_notes,
         };
     }
 
@@ -2157,6 +2164,7 @@ fn update_state_from_manifest(
     } else {
         (None, None)
     };
+    let release_notes = normalized_release_notes(manifest.release_notes.as_deref());
     UpdateState {
         current_version,
         latest_version: Some(manifest.version),
@@ -2176,7 +2184,15 @@ fn update_state_from_manifest(
         build_id: build_id.or(Some(manifest.commit)),
         update_command,
         update_instructions,
+        release_notes,
     }
+}
+
+fn normalized_release_notes(release_notes: Option<&str>) -> Option<String> {
+    release_notes
+        .map(str::trim)
+        .filter(|notes| !notes.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn release_manifest_metadata_error(manifest: &ReleaseManifest) -> Option<String> {
@@ -9581,6 +9597,9 @@ mod tests {
                 InstallOwner::HostedInstaller,
                 InstallOwner::AppBundle,
             ],
+            release_notes: Some(
+                "- Fixes sign-in completion.\n- Improves local usage sync reliability.".to_string(),
+            ),
             rollback: ReleaseRollback {
                 strategy: "channel_latest_pointer".to_string(),
                 immutable_prefix:
@@ -9649,6 +9668,10 @@ mod tests {
         assert_eq!(state.gate, UpdateGate::SoftWarn);
         assert_eq!(state.install_owner, InstallOwner::Homebrew);
         assert_eq!(
+            state.release_notes.as_deref(),
+            Some("- Fixes sign-in completion.\n- Improves local usage sync reliability.")
+        );
+        assert_eq!(
             state.update_command.as_deref(),
             Some("brew update && brew upgrade ottto")
         );
@@ -9657,6 +9680,43 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("newer Ottto app"));
+    }
+
+    #[test]
+    fn update_state_keeps_release_notes_for_current_build() {
+        let state = update_state_from_manifest(
+            release_manifest_for_update("0.2.0", Some("0.1.0"), None),
+            "0.2.0".to_string(),
+            ReleaseChannel::Dev,
+            Some("2026-05-20T00:00:00Z".to_string()),
+            Some("deadbeef".to_string()),
+            InstallOwner::AppBundle,
+        );
+
+        assert_eq!(state.status, UpdateStatus::Current);
+        assert_eq!(state.gate, UpdateGate::Current);
+        assert_eq!(
+            state.release_notes.as_deref(),
+            Some("- Fixes sign-in completion.\n- Improves local usage sync reliability.")
+        );
+    }
+
+    #[test]
+    fn update_state_omits_blank_release_notes() {
+        let mut manifest = release_manifest_for_update("0.2.0", Some("0.1.0"), None);
+        manifest.release_notes = Some("  \n\t  ".to_string());
+
+        let state = update_state_from_manifest(
+            manifest,
+            "0.2.0".to_string(),
+            ReleaseChannel::Dev,
+            Some("2026-05-20T00:00:00Z".to_string()),
+            Some("deadbeef".to_string()),
+            InstallOwner::AppBundle,
+        );
+
+        assert_eq!(state.status, UpdateStatus::Current);
+        assert_eq!(state.release_notes, None);
     }
 
     #[test]

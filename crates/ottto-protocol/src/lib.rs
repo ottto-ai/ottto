@@ -1932,6 +1932,8 @@ pub struct UpdateState {
     pub update_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
