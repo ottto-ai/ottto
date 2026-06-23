@@ -36,6 +36,7 @@ pub fn empty_status(machine: MachineIdentity, now: impl Into<String>) -> DaemonS
             build_id: compiled_build_id(),
             update_command: None,
             update_instructions: None,
+            release_notes: None,
         },
         canonical_health: None,
         runtime_heartbeat: None,
