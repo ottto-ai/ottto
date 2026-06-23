@@ -18,6 +18,10 @@ on:
         description: Immutable HTTPS release prefix for workflow artifacts.
         required: true
         type: string
+      release_notes:
+        description: User-facing What's new text for the manifest and Sparkle appcast.
+        required: true
+        type: string
       publish_intent:
         description: Public workflow output only; CDN publication is manual and private.
         required: true
@@ -71,6 +75,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           CHANNEL: ${{ inputs.channel }}
           ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
           PUBLISH_INTENT: ${{ inputs.publish_intent }}
         run: |
           set -euo pipefail
@@ -96,6 +101,10 @@ jobs:
           fi
           if [[ "$PUBLISH_INTENT" != "none" ]]; then
             echo "The public workflow never publishes or promotes release channels." >&2
+            exit 1
+          fi
+          if [[ -z "${RELEASE_NOTES//[[:space:]]/}" ]]; then
+            echo "release_notes is required for macOS stable release artifacts." >&2
             exit 1
           fi
           case "$CHANNEL" in
@@ -143,12 +152,14 @@ jobs:
           VERSION: ${{ inputs.version }}
           CHANNEL: ${{ inputs.channel }}
           ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
           scripts/macos_package.sh \
             --version "$VERSION" \
             --channel "$CHANNEL" \
-            --artifact-base-url "$ARTIFACT_BASE_URL"
+            --artifact-base-url "$ARTIFACT_BASE_URL" \
+            --release-notes "$RELEASE_NOTES"
 
       - name: Notarize and staple artifacts
         run: |

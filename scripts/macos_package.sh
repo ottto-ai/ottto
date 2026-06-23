@@ -16,6 +16,7 @@ NOTARIZED="false"
 SKIP_BUILD="false"
 ARTIFACT_BASE_URL=""
 MIN_SUPPORTED_VERSION="${OTTTO_MIN_SUPPORTED_VERSION:-0.1.0}"
+RELEASE_NOTES="${OTTTO_RELEASE_NOTES:-}"
 
 usage() {
   cat <<'USAGE'
@@ -27,6 +28,7 @@ Options:
   --output-dir <path>        Output directory. Default: tools/ottto-local-platform/dist/macos
   --sign-identity <identity> Developer ID signing identity.
   --artifact-base-url <url>  Public URL prefix for generated artifacts.
+  --release-notes <text>     User-facing "What's new" notes for release manifests.
   --notarized               Mark artifacts notarized after external notarization.
   --skip-build              Reuse existing release build outputs.
   -h, --help                Show help.
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --artifact-base-url)
       ARTIFACT_BASE_URL="${2:?--artifact-base-url requires a value}"
+      shift 2
+      ;;
+    --release-notes)
+      RELEASE_NOTES="${2:?--release-notes requires a value}"
       shift 2
       ;;
     --notarized)
@@ -134,6 +140,12 @@ fi
 if [[ ! -f "$MAC_APP_ROOT/Package.swift" ]]; then
   echo "macOS app root is missing Package.swift: $MAC_APP_ROOT" >&2
   exit 2
+fi
+if [[ "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ]]; then
+  if ! grep -q '[^[:space:]]' <<<"$RELEASE_NOTES"; then
+    echo "--release-notes or OTTTO_RELEASE_NOTES is required for stable release channels" >&2
+    exit 2
+  fi
 fi
 
 COMMIT="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
@@ -431,6 +443,7 @@ jq -n \
   --arg channel "$CHANNEL" \
   --arg commit "$COMMIT" \
   --arg generated_at "$GENERATED_AT" \
+  --arg release_notes "$RELEASE_NOTES" \
   --arg min_supported_version "$MIN_SUPPORTED_VERSION" \
   --argjson min_protocol_version "$MIN_PROTOCOL_VERSION" \
   --arg rollback_immutable_prefix "$ARTIFACT_BASE_URL" \
@@ -476,6 +489,7 @@ jq -n \
     channel: $channel,
     commit: $commit,
     generated_at: $generated_at,
+    release_notes: (if ($release_notes | gsub("[[:space:]]"; "") | length) > 0 then $release_notes else null end),
     min_supported_version: $min_supported_version,
     min_protocol_version: $min_protocol_version,
     supported_install_owners: $supported_install_owners,

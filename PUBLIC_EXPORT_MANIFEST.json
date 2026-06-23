@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 199,
-  "content_sha256": "b1949f5affad136b4cc5af164f59fd97a646d918faf9af1f6ab955635ba207c4",
+  "content_sha256": "0a0c1689a4ed2242347094ae11cf5a784281931362cdaeb3695e146de09a6f2c",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/macos-stable-release.yml",
-      "sha256": "99752b76063b8530e0271917ec824935fe4df7340c66b1e5a5102993580d9e3b",
-      "size_bytes": 14541
+      "sha256": "e8a0c30147953a7121af8e570febd97ebf2731ab99c4082b2145741210303417",
+      "size_bytes": 15024
     },
     {
       "executable": false,
@@ -1105,8 +1105,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "9c7dafae6d911882df976624e404dea9d55f85c381119b1b9ccebaede7888b3c",
-      "size_bytes": 31716
+      "sha256": "7bb1b92fda16db235ec9042d7c247d1805ed1114c8e16d541b31ca0344126d33",
+      "size_bytes": 32344
     },
     {
       "executable": true,
@@ -1329,8 +1329,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_release_workflow.sh",
-      "sha256": "8f3ebeabf9baab160171c2fb262bd47f3b72d89a775ea892d4edbe093123be16",
-      "size_bytes": 4018
+      "sha256": "b83659fd3c0b37c859594a6860ab6e25c64f23332fb44372932fa31eaff25715",
+      "size_bytes": 4191
     },
     {
       "executable": true,
@@ -1396,7 +1396,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-23T13:32:31+00:00",
+  "generated_at": "2026-06-23T18:40:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 200,
   "public_roots": [
@@ -1431,5 +1431,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "696191106e7b9069151136a4d7a08b78f1281f67"
+  "source_commit": "23aa9d5830ccf11248159dda934e4697accdf4f3"
 }
