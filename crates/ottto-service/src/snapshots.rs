@@ -53,8 +53,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // `<session>/workflows/wf_*.json` footprint is present, i.e. the Workflow tool
 // / dynamic multi-agent orchestration ran). The bump re-walks every Claude
 // session once so already-scanned sessions re-emit with the new origin field.
+// claude_code v10: Claude Code `type=ai-title` rows now feed
+// `session_display_name_source=ai_title`, which the private API normalizes to
+// `local_transcript_title`. The bump re-walks existing project JSONL files so
+// sessions that previously only had first-prompt/fallback names can be
+// superseded by Claude's generated title.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v9";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v10";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -2565,7 +2570,8 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
     accumulator.note_time(timestamp.clone());
-    accumulator.set_title(
+    accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
+    accumulator.set_title_if_absent(
         string_at(value, &["summary"])
             .or_else(|| string_at(value, &["title"]))
             .or_else(|| string_at(value, &["metadata", "title"])),
@@ -6297,6 +6303,42 @@ mod tests {
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
             Some("uncached")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_prefers_ai_title_rows() {
+        let path = temp_file("claude-ai-title");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"claude-session-title\",\"aiTitle\":\"Tighten dashboard activity feed\"}\n",
+                "{\"timestamp\":\"2026-05-06T10:00:00Z\",\"sessionId\":\"claude-session-title\",\"summary\":\"Claude Code session\"}\n",
+                "{\"timestamp\":\"2026-05-06T10:01:00Z\",\"sessionId\":\"claude-session-title\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-05-06T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.source_session_id, "claude-session-title");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Tighten dashboard activity feed")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("ai_title")
         );
 
         let _ = fs::remove_file(path);
