@@ -3156,7 +3156,7 @@ mod tests {
         let executable = dir.join("large-output");
         std::fs::write(
             &executable,
-            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 200000 ]; do\n  printf x\n  i=$((i + 1))\ndone\n",
+            "#!/bin/sh\nexec /usr/bin/python3 -c 'import sys; sys.stdout.write(\"x\" * 200000)'\n",
         )
         .expect("write executable");
         let mut permissions = std::fs::metadata(&executable)
