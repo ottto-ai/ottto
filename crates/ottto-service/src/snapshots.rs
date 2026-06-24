@@ -86,12 +86,12 @@ pub const BACKFILL_WINDOW_DAYS: u64 = 730;
 // previously unbounded: a transcript whose monitored tool output embeds a huge
 // blob (one multi-hundred-MB/GB physical line) would be materialized whole in
 // RAM by the line reader (and cloned again by the artifact scraper), OOM-killing
-// the per-user daemon. Real sessions are well under 100 MB and individual lines
-// far smaller, so these ceilings are generous-but-finite and never trip on
-// normal transcripts; an oversized file is skipped wholesale and an oversized
-// line is dropped, both gracefully (matching the tolerant skip handling used
-// throughout the scan) so one pathological input cannot abort the scan.
+// the per-user daemon. Codex is source-special: long active sessions can exceed
+// the default file cap while still being safe to parse because its parser is
+// line-bounded and streaming. Keep the stricter cap for sources with heavier
+// artifact/session paths, and use the line cap as the real Codex OOM guard.
 pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_CODEX_JSONL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3676,7 +3676,7 @@ fn collect_recent_jsonl_files(
         // parser. metadata.len() is already read for fingerprinting, so this is
         // free; an oversized file is dropped from the candidate set rather than
         // opened, keeping the scan's memory bounded without aborting it.
-        if metadata.len() > MAX_JSONL_FILE_BYTES {
+        if metadata.len() > max_jsonl_file_bytes(source) {
             continue;
         }
         files.push(CandidateFile {
@@ -3713,6 +3713,13 @@ fn is_recent_enough_at(
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
+}
+
+fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
+        SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
+    }
 }
 
 fn unix_seconds(value: SystemTime) -> Option<u64> {
@@ -4239,20 +4246,8 @@ mod tests {
     }
 
     #[test]
-    fn scan_policy_skips_oversized_transcript_files() {
+    fn scan_policy_skips_oversized_non_codex_transcript_files() {
         let root = temp_dir("scan-policy-oversized");
-        // A normal session and an oversized one (forced just over the file cap)
-        // live in the same root. The oversized file must be skipped wholesale
-        // without aborting the scan or contributing a snapshot.
-        fs::write(
-            root.join("session-normal.jsonl"),
-            concat!(
-                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-ffffffffffff\"}}\n",
-                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
-            ),
-        )
-        .expect("write normal fixture");
-
         // Sparse file: logical length over the cap, negligible bytes on disk.
         let oversized_path = root.join("session-oversized.jsonl");
         let oversized = File::create(&oversized_path).expect("create oversized");
@@ -4266,7 +4261,7 @@ mod tests {
 
         let mut index = ScanIndex::default();
         let scan = scan_source_roots_with_limit(
-            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
             std::slice::from_ref(&root),
             &mut index,
             "2026-05-14T10:04:00Z",
@@ -4276,13 +4271,26 @@ mod tests {
         )
         .expect("scan must not abort on an oversized file");
 
-        // The oversized file is never a candidate, so only the normal session is
-        // discovered and scanned; the scan completes without panic.
-        assert_eq!(scan.discovered_file_count, 1);
-        assert_eq!(scan.scanned_file_count, 1);
-        assert!(!scan.snapshots.is_empty());
+        // The oversized file is never a candidate, so it is not discovered or
+        // scanned; the scan completes without panic.
+        assert_eq!(scan.discovered_file_count, 0);
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_allows_larger_streaming_transcripts_than_other_sources() {
+        assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_JSONL_FILE_BYTES);
+        assert_eq!(
+            max_jsonl_file_bytes(SnapshotSource::ClaudeCode),
+            MAX_JSONL_FILE_BYTES,
+        );
+        assert_eq!(
+            max_jsonl_file_bytes(SnapshotSource::Pi),
+            MAX_JSONL_FILE_BYTES,
+        );
     }
 
     #[test]
