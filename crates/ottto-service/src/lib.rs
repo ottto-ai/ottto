@@ -1712,10 +1712,9 @@ fn local_health_source_for_status(
             SourceState::Unsupported => LocalHealthSourceState::DisabledByPolicy,
         }
     };
-    let blocking_reason = source
-        .problems
-        .first()
-        .map(|problem| stable_problem_code_slug(&problem.code).to_string());
+    let first_problem = source.problems.first();
+    let blocking_reason =
+        first_problem.map(|problem| local_health_problem_code_slug(problem).to_string());
     LocalHealthSourceV1 {
         source_id: format!("src_{}", source_slug(&source.source)),
         app: source.source.clone(),
@@ -1728,10 +1727,10 @@ fn local_health_source_for_status(
             .or_else(|| source.connected_at.clone())
             .unwrap_or_else(current_rfc3339_timestamp),
         blocking_reason,
-        clear_condition: source
-            .problems
-            .first()
-            .map(|_| "run Verify after repairing local source configuration".to_string()),
+        clear_condition: first_problem
+            .map(|problem| problem.detail.trim())
+            .filter(|detail| !detail.is_empty())
+            .map(str::to_string),
         next_action: source
             .recommended_actions
             .first()
@@ -1783,6 +1782,24 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
         StableProblemCode::UnsupportedPlatform => "unsupported_platform",
         StableProblemCode::Unknown => "unknown",
     }
+}
+
+fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
+    if problem.code == StableProblemCode::TelemetryNotVerified
+        && problem_detail_is_usage_limited(&problem.detail)
+    {
+        return "smoke_quota_limited";
+    }
+    stable_problem_code_slug(&problem.code)
+}
+
+fn problem_detail_is_usage_limited(detail: &str) -> bool {
+    let lowered = detail.to_ascii_lowercase();
+    lowered.contains("usage limit")
+        || lowered.contains("weekly limit")
+        || lowered.contains("rate limit")
+        || lowered.contains("purchase more credits")
+        || lowered.contains("quota")
 }
 
 fn local_health_blockers_for_status(
@@ -4332,6 +4349,59 @@ mod tests {
         assert_eq!(
             source.blocking_reason.as_deref(),
             Some("telemetry_not_verified")
+        );
+    }
+
+    #[test]
+    fn quota_limited_verification_projects_specific_local_health_reason() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let detail = "Claude Code is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify.";
+        let result = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "smoke_quota_limited".to_string(),
+                text: detail.to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record quota-limited verification");
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status.canonical_health.expect("canonical health");
+        let source = health
+            .sources
+            .iter()
+            .find(|source| source.app == SourceKind::ClaudeCode)
+            .expect("Claude Code source");
+
+        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("smoke_quota_limited")
+        );
+        assert_eq!(source.clear_condition.as_deref(), Some(detail));
+        assert!(
+            health
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == "smoke_quota_limited"
+                    && blocker.clear_condition == detail),
+            "source blocker should preserve the display-safe quota guidance"
         );
     }
 
