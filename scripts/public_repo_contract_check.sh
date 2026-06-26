@@ -293,6 +293,44 @@ def check_cli_contracts() -> None:
     expect(setup_claim.get("client_kind") == "cli", "CLI setup claim request client_kind must be cli")
     expect(setup_claim.get("command") == "setup", "CLI setup claim request command must be setup")
 
+    setup_headless = require_dict(
+        load_json("fixtures/cli/setup-headless-request.json"),
+        "CLI setup headless request",
+    )
+    expect_protocol(setup_headless.get("protocol_version"), "CLI setup headless request")
+    expect(setup_headless.get("client_kind") == "cli", "CLI setup headless request client_kind must be cli")
+    expect(setup_headless.get("command") == "setup", "CLI setup headless request command must be setup")
+    expect(setup_headless.get("claim_code") is None, "CLI setup headless request claim_code must be null")
+
+    login_headless = require_dict(
+        load_json("fixtures/cli/login-headless-request.json"),
+        "CLI login headless request",
+    )
+    expect_protocol(login_headless.get("protocol_version"), "CLI login headless request")
+    expect(login_headless.get("client_kind") == "cli", "CLI login headless request client_kind must be cli")
+    expect(login_headless.get("command") == "setup", "CLI login headless request must use daemon setup command")
+    expect(login_headless.get("claim_code") is None, "CLI login headless request claim_code must be null")
+
+    account = require_dict(load_json("fixtures/cli/account-request.json"), "CLI account request")
+    expect_protocol(account.get("protocol_version"), "CLI account request")
+    expect(account.get("client_kind") == "cli", "CLI account request client_kind must be cli")
+    expect(account.get("command") == "account", "CLI account request command must be account")
+
+    logout = require_dict(load_json("fixtures/cli/logout-request.json"), "CLI logout request")
+    expect_protocol(logout.get("protocol_version"), "CLI logout request")
+    expect(logout.get("client_kind") == "cli", "CLI logout request client_kind must be cli")
+    expect(logout.get("command") == "auth_reset", "CLI logout request command must be auth_reset")
+    expect(logout.get("local_only") is False, "CLI logout request must be cloud-first by default")
+
+    logout_local = require_dict(
+        load_json("fixtures/cli/logout-local-request.json"),
+        "CLI logout local-only request",
+    )
+    expect_protocol(logout_local.get("protocol_version"), "CLI logout local-only request")
+    expect(logout_local.get("client_kind") == "cli", "CLI logout local-only request client_kind must be cli")
+    expect(logout_local.get("command") == "auth_reset", "CLI logout local-only request command must be auth_reset")
+    expect(logout_local.get("local_only") is True, "CLI logout local-only request local_only must be true")
+
     diagnostics_collect = require_dict(
         load_json("fixtures/cli/diagnostics-collect-request.json"),
         "CLI diagnostics collect request",
