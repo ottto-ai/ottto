@@ -83,7 +83,26 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "minLength": 1
+            "enum": [
+              "prompt",
+              "response",
+              "tool_output",
+              "command_output",
+              "local_path",
+              "credential",
+              "secret",
+              "password",
+              "api_key",
+              "access_token",
+              "id_token",
+              "refresh_token",
+              "tokens.access_token",
+              "tokens.id_token",
+              "tokens.refresh_token",
+              "cookie",
+              "email",
+              "org_id"
+            ]
           }
         }
       }

@@ -26,23 +26,50 @@ pub const REQUIRED_REDACTION_CLASSES: &[&str] = &[
     "credential",
 ];
 
+pub const ALLOWED_REDACTION_CLASSES: &[&str] = &[
+    "prompt",
+    "response",
+    "tool_output",
+    "command_output",
+    "local_path",
+    "credential",
+    "secret",
+    "password",
+    "api_key",
+    "access_token",
+    "id_token",
+    "refresh_token",
+    "tokens.access_token",
+    "tokens.id_token",
+    "tokens.refresh_token",
+    "cookie",
+    "email",
+    "org_id",
+];
+
 pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
+    "access_token",
     "api_key",
     "command_output",
     "cookie",
     "credential",
     "credentials",
+    "email",
+    "id_token",
     "local_path",
+    "org_id",
     "password",
     "prompt",
     "prompts",
     "raw_content",
     "raw_prompt",
     "raw_response",
+    "refresh_token",
     "response",
     "responses",
     "secret",
     "tool_output",
+    "tokens",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -301,6 +328,10 @@ pub fn is_required_redaction_class(value: &str) -> bool {
     REQUIRED_REDACTION_CLASSES.contains(&value)
 }
 
+pub fn is_allowed_redaction_class(value: &str) -> bool {
+    ALLOWED_REDACTION_CLASSES.contains(&value)
+}
+
 pub fn is_forbidden_sample_key(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     FORBIDDEN_SAMPLE_KEYS
@@ -426,8 +457,16 @@ mod tests {
     #[test]
     fn redaction_vocabularies_cover_raw_content_boundaries() {
         assert!(is_required_redaction_class("prompt"));
+        assert!(is_allowed_redaction_class("tokens.access_token"));
+        assert!(!is_allowed_redaction_class("free_form_secret_hint"));
+        for class in REQUIRED_REDACTION_CLASSES {
+            assert!(is_allowed_redaction_class(class));
+        }
         assert!(is_forbidden_sample_key("raw_prompt"));
         assert!(is_forbidden_sample_key("API_KEY"));
+        assert!(is_forbidden_sample_key("ACCESS_TOKEN"));
+        assert!(is_forbidden_sample_key("tokens"));
+        assert!(is_forbidden_sample_key("org_id"));
         assert!(!is_forbidden_sample_key("token_count"));
     }
 }

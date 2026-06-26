@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use ottto_connector_sdk::{
-    is_forbidden_sample_key, is_forbidden_v1_field, validate_emit_name, validate_manifest_id,
-    DataSourceKind, DefaultState, Maturity, Operation, ReviewTier, RiskClass,
+    is_allowed_redaction_class, is_forbidden_sample_key, is_forbidden_v1_field, validate_emit_name,
+    validate_manifest_id, DataSourceKind, DefaultState, Maturity, Operation, ReviewTier, RiskClass,
     REQUIRED_REDACTION_CLASSES,
 };
 
@@ -99,6 +99,9 @@ pub enum ConnectorTestkitError {
     MissingRequiredRedactionClass {
         class: String,
     },
+    UnsupportedRedactionClass {
+        class: String,
+    },
     RecordTypeMismatch {
         expected: Vec<String>,
         actual: Vec<String>,
@@ -156,6 +159,12 @@ impl fmt::Display for ConnectorTestkitError {
                 write!(
                     formatter,
                     "fixture upload policy is missing redaction class '{class}'"
+                )
+            }
+            Self::UnsupportedRedactionClass { class } => {
+                write!(
+                    formatter,
+                    "fixture upload policy uses unsupported redaction class '{class}'"
                 )
             }
             Self::RecordTypeMismatch { expected, actual } => write!(
@@ -478,10 +487,15 @@ fn parse_default_state(value: &str) -> Result<DefaultState, ConnectorTestkitErro
 }
 
 fn assert_required_redactions(values: &[&str]) -> Result<(), ConnectorTestkitError> {
-    let present: HashSet<String> = values
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect();
+    let mut present = HashSet::new();
+    for value in values {
+        if !is_allowed_redaction_class(value) {
+            return Err(ConnectorTestkitError::UnsupportedRedactionClass {
+                class: (*value).to_string(),
+            });
+        }
+        present.insert((*value).to_string());
+    }
     for class in REQUIRED_REDACTION_CLASSES {
         if !present.contains(*class) {
             return Err(ConnectorTestkitError::MissingRequiredRedactionClass {
@@ -725,5 +739,44 @@ mod tests {
             assert_sample_key_path_safe("payload.raw_prompt.text"),
             Err(ConnectorTestkitError::RawContentKey { .. })
         ));
+    }
+
+    #[test]
+    fn collector_fixture_contract_rejects_unknown_redaction_classes() {
+        let manifest = collector_contract();
+        let fixture = CollectorFixtureContract {
+            source_id: "codex",
+            collector_id: "local_sessions",
+            upload_policy: FixtureUploadPolicyContract {
+                uploads_raw_content: false,
+                redacts: &[
+                    "prompt",
+                    "response",
+                    "tool_output",
+                    "command_output",
+                    "local_path",
+                    "credential",
+                    "raw_secret_hint",
+                ],
+            },
+            emitted_records: &[
+                EmittedRecordContract {
+                    record_type: "local_usage_snapshots",
+                    sample_key_paths: &["usage.input_tokens"],
+                },
+                EmittedRecordContract {
+                    record_type: "local_usage_collector_statuses",
+                    sample_key_paths: &["collector.status"],
+                },
+            ],
+        };
+
+        let error = assert_collector_fixture_contract(&manifest, &fixture).unwrap_err();
+        assert_eq!(
+            error,
+            ConnectorTestkitError::UnsupportedRedactionClass {
+                class: "raw_secret_hint".to_string()
+            }
+        );
     }
 }
