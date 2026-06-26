@@ -459,6 +459,63 @@ def check_agent_adapter_contracts() -> None:
         if (PUBLIC_ROOT / relative_path).exists():
             fail(f"MCP adapter must remain deferred for public v1: {relative_path}")
 
+    skill_expectations = {
+        "agent-adapters/codex-skill/SKILL.md": {
+            "required": [
+                ("Always pass `--json`", "Codex skill must require JSON output for consumed CLI responses"),
+                ("`--json --watch` emits compact\nNDJSON", "Codex skill must document NDJSON watch semantics"),
+                ("Do not parse human output", "Codex skill must prohibit parsing human output"),
+                ("bypass browser/setup authority", "Codex skill must preserve browser/setup authority"),
+                ("do not hand-edit local app config", "Codex skill must prohibit direct config edits"),
+                ("Do not ask users to paste support claims into public issues or chat", "Codex skill must keep support claims out of chat"),
+                ("must not appear in returned JSON", "Codex skill must keep support claims out of returned JSON"),
+                ("uploaded bundle content", "Codex skill must document support-claim upload containment"),
+            ],
+            "forbidden": [
+                ("allowed-tools:", "Codex skill must not pregrant tools"),
+                ("hooks:", "Codex skill must not install hooks"),
+            ],
+        },
+        "agent-adapters/claude-code-skill/SKILL.md": {
+            "required": [
+                ("Always pass `--json`", "Claude Code skill must require JSON output for consumed CLI responses"),
+                ("`--json --watch` emits compact\nNDJSON", "Claude Code skill must document NDJSON watch semantics"),
+                ("Do not parse human output", "Claude Code skill must prohibit parsing human output"),
+                ("bypass browser/setup authority", "Claude Code skill must preserve browser/setup authority"),
+                ("do not write telemetry\nenvironment variables", "Claude Code skill must prohibit direct telemetry config edits"),
+                ("Do not ask users to paste support claims into public issues or chat", "Claude Code skill must keep support claims out of chat"),
+                ("must not appear in returned JSON", "Claude Code skill must keep support claims out of returned JSON"),
+                ("uploaded bundle content", "Claude Code skill must document support-claim upload containment"),
+            ],
+            "forbidden": [
+                ("allowed-tools:", "Claude Code skill must not pregrant tools"),
+                ("hooks:", "Claude Code skill must not define hooks metadata"),
+            ],
+        },
+        "agent-adapters/codex-skill/agents/openai.yaml": {
+            "required": [
+                ("Manage Ottto local setup", "Codex agent manifest must stay scoped to Ottto lifecycle"),
+            ],
+            "forbidden": [
+                ("allowed_tools:", "Codex agent manifest must not pregrant tools"),
+                ("tools:", "Codex agent manifest must not pregrant tools"),
+                ("mcp", "Codex agent manifest must not advertise MCP for public v1"),
+                ("hooks:", "Codex agent manifest must not define hooks"),
+            ],
+        },
+    }
+    for relative_path, expectations in skill_expectations.items():
+        path = require_file(relative_path)
+        if path is None:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle, message in expectations["required"]:
+            expect(needle in text, message)
+        lowered = text.lower()
+        for needle, message in expectations["forbidden"]:
+            if needle.lower() in lowered:
+                fail(message)
+
 
 def check_private_runtime_pin() -> int:
     if PRIVATE_REPO_ROOT is None:
