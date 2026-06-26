@@ -2632,6 +2632,36 @@ mod tests {
     }
 
     #[test]
+    fn setup_headless_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Setup(SetupArgs {
+                    claim_code: None,
+                    no_browser: true,
+                    no_wait: true,
+                    timeout: 30,
+                    setup_run_id: None,
+                    api_base_url: None,
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_setup_headless_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/setup-headless-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn setup_accepts_headless_browser_claim_flags() {
         let cli = Cli::parse_from([
             "ottto",
@@ -2672,12 +2702,63 @@ mod tests {
     }
 
     #[test]
+    fn login_headless_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Login(SetupArgs {
+                    claim_code: None,
+                    no_browser: true,
+                    no_wait: true,
+                    timeout: 45,
+                    setup_run_id: None,
+                    api_base_url: None,
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_login_headless_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/login-headless-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn account_builds_account_request() {
         let cli = Cli::parse_from(["ottto", "account", "--json"]);
         let invocation = invocation_from_cli(cli);
 
         assert_eq!(invocation.output_mode, OutputMode::Json);
         assert_eq!(invocation.request.command, LocalControlCommand::Account);
+    }
+
+    #[test]
+    fn account_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Account(JsonArgs { json: true }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_account_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/cli/account-request.json"))
+                .expect("fixture parses");
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2693,6 +2774,30 @@ mod tests {
     }
 
     #[test]
+    fn logout_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Logout(LogoutArgs {
+                    json: true,
+                    local_only: false,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_logout_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/cli/logout-request.json"))
+                .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn logout_local_only_is_explicit() {
         let cli = Cli::parse_from(["ottto", "logout", "--local-only", "--json"]);
         let invocation = invocation_from_cli(cli);
@@ -2702,6 +2807,31 @@ mod tests {
             invocation.request.command,
             LocalControlCommand::AuthReset { local_only: true }
         );
+    }
+
+    #[test]
+    fn logout_local_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Logout(LogoutArgs {
+                    json: true,
+                    local_only: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_logout_local_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/logout-local-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
     }
 
     #[test]

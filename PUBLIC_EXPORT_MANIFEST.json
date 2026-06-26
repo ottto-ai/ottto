@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 205,
-  "content_sha256": "19c654b9c898758f28f750a95ad9f15cacd8bc1ad87d39d8cd07227500ef873a",
+  "candidate_file_count": 210,
+  "content_sha256": "94fddca7c7b1eb109eab609c8dfab704aa38ba166d7b2cb1021dbe68d8e36e24",
   "files": [
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "72ccbe97de014798e28adccb25a6dab1d467dc491ade632d63962ff1b30f68be",
-      "size_bytes": 122942
+      "sha256": "b78e40d03faba1cc8f2d4d3d88072820c45b18fc5103ffc2d6a42f01fbf27ec8",
+      "size_bytes": 127850
     },
     {
       "executable": false,
@@ -810,6 +810,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/account-request.json",
+      "sha256": "bbfbeae6223a025e7201a5d736f5256cb6551837161fd05f32cd0eaca57a4f09",
+      "size_bytes": 145
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/apps-detect-request.json",
       "sha256": "f4fc489116b293783e86f192db5b584c261e94f35684234a63623fbf2048f43c",
       "size_bytes": 180
@@ -873,6 +880,27 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/login-headless-request.json",
+      "sha256": "9f4b6a76a99a97525e30abc5dfc844ba3495e524e387d0c721a49adf7307e1ea",
+      "size_bytes": 237
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/logout-local-request.json",
+      "sha256": "933fe8dee38b19f0e58cfaf6db837fca0cf5b087255d02e2486931e30156a513",
+      "size_bytes": 175
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/logout-request.json",
+      "sha256": "0da84f62a8a191ba45b7c28b54c7a860182da19ce8356fd25603874393d6cdf8",
+      "size_bytes": 170
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/setup-browser-claim-output.json",
       "sha256": "7e1f7994422e2f7badfd831aa3f8eb8827de5cff4295e5cbf3d1a17f7ff96399",
       "size_bytes": 650
@@ -883,6 +911,13 @@
       "path": "fixtures/cli/setup-claim-request.json",
       "sha256": "94b3c1b7580c93450e105074284d1ec7ddee631f4e260a858a1e019e2f09dc1c",
       "size_bytes": 241
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/setup-headless-request.json",
+      "sha256": "e6bc20fddf37def052a860cb807c10b4af8ad181c3b29256c4b5d701fb38e998",
+      "size_bytes": 237
     },
     {
       "executable": false,
@@ -1210,8 +1245,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "ccee21e1319f1cbef57b27337a9a642fcad807be409516512fd87adb61607ac0",
-      "size_bytes": 36146
+      "sha256": "a3360a00464e9151948d39098d9d6ed0ced73611028d498c2f822abab3d27eec",
+      "size_bytes": 38655
     },
     {
       "executable": true,
@@ -1440,7 +1475,7 @@
   ],
   "generated_at": "2026-06-26T09:17:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 206,
+  "output_file_count": 211,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
