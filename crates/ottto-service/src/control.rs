@@ -7718,6 +7718,10 @@ fn pi_route_aggregate_result(
 ) -> SourceVerificationResult {
     let total = route_results.len();
     let passed = route_results.iter().filter(|route| route.verified).count();
+    let smoke_succeeded = route_results
+        .iter()
+        .filter(|route| route.command_succeeded)
+        .count();
     // A route awaiting a provider re-sign-in is a soft, actionable Warning — not a
     // hard smoke failure — even though it isn't verified: Ottto deliberately did
     // not (and can't safely) live-probe a rotating-OAuth route, so "no fresh
@@ -7733,6 +7737,11 @@ fn pi_route_aggregate_result(
         SourceVerificationStatus::Verified
     } else if total > 0 && hard_failed == 0 {
         // Everything is verified and/or awaiting re-auth.
+        SourceVerificationStatus::Warning
+    } else if smoke_succeeded > 0 {
+        // At least one route can execute successfully. If backend telemetry has
+        // not matched yet, report a warning instead of the false "no route
+        // passed smoke" repair-level failure.
         SourceVerificationStatus::Warning
     } else if passed > 0 || reauth_pending > 0 {
         SourceVerificationStatus::Warning
@@ -7751,9 +7760,19 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Warning => (
             "pi_route_warnings",
-            format!(
-                "Verified {passed} of {total} Pi model routes; review the remaining routes (re-sign in if a provider asks)."
-            ),
+            if passed > 0 {
+                format!(
+                    "Verified {passed} of {total} Pi model routes; review the remaining routes (re-sign in if a provider asks)."
+                )
+            } else if smoke_succeeded > 0 {
+                format!(
+                    "Pi smoke worked for {smoke_succeeded} of {total} model routes, but Ottto has not matched fresh telemetry yet. Retry Verify after sync or review the remaining routes."
+                )
+            } else {
+                format!(
+                    "Pi has {total} model routes awaiting review; re-sign in if a provider asks."
+                )
+            },
         ),
         _ => (
             "pi_route_smoke_failed",
@@ -11070,6 +11089,87 @@ mod tests {
         assert!(result.verified);
         assert_eq!(result.records_seen, 1);
         assert_eq!(result.message.code, "pi_route_warnings");
+    }
+
+    #[test]
+    fn pi_route_aggregate_warns_when_smoke_succeeds_without_matched_telemetry() {
+        let route_results = vec![
+            SourceRouteVerificationResult {
+                provider: Some("gcp-glm".to_string()),
+                model: Some("zai-org/glm-5-maas".to_string()),
+                model_provider: None,
+                billing_provider: Some("gcp-glm".to_string()),
+                billing_channel: Some("direct_api".to_string()),
+                auth_mode: Some("api_key".to_string()),
+                gateway_provider: None,
+                subscription_product: None,
+                source_category: Some("unknown".to_string()),
+                account_identifier_hash: None,
+                organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: None,
+                billing_identity_confidence: ottto_protocol::AgentStatusConfidence::Unknown,
+                status: SourceVerificationStatus::NoFreshTelemetry,
+                verified: false,
+                records_seen: 0,
+                last_record_id: None,
+                last_received_at: None,
+                smoke_after: Some("2026-06-26T08:00:00Z".to_string()),
+                command_found: true,
+                command_succeeded: true,
+                exit_status: Some(0),
+                duration_ms: 20_000,
+                diagnostic: None,
+                error_code: Some("no_fresh_telemetry".to_string()),
+                local_session_observed: Some(true),
+                message: StableMessage {
+                    code: "no_fresh_telemetry".to_string(),
+                    text: "Pi route completed smoke, but Ottto did not receive matching telemetry."
+                        .to_string(),
+                },
+            },
+            SourceRouteVerificationResult {
+                provider: Some("google-vertex".to_string()),
+                model: Some("gemini-3.1-pro-preview".to_string()),
+                model_provider: Some("google".to_string()),
+                billing_provider: Some("google".to_string()),
+                billing_channel: Some("google_vertex".to_string()),
+                auth_mode: Some("service_account".to_string()),
+                gateway_provider: None,
+                subscription_product: None,
+                source_category: Some("google_cloud_vertex".to_string()),
+                account_identifier_hash: None,
+                organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: None,
+                billing_identity_confidence: ottto_protocol::AgentStatusConfidence::Unknown,
+                status: SourceVerificationStatus::Failed,
+                verified: false,
+                records_seen: 0,
+                last_record_id: None,
+                last_received_at: None,
+                smoke_after: Some("2026-06-26T08:01:00Z".to_string()),
+                command_found: true,
+                command_succeeded: false,
+                exit_status: Some(1),
+                duration_ms: 7_000,
+                diagnostic: Some("Vertex route rejected credentials.".to_string()),
+                error_code: Some("smoke_command_failed".to_string()),
+                local_session_observed: Some(false),
+                message: StableMessage {
+                    code: "smoke_command_failed".to_string(),
+                    text: "Pi route failed smoke.".to_string(),
+                },
+            },
+        ];
+
+        let result = pi_route_aggregate_result(route_results);
+
+        assert_eq!(result.status, SourceVerificationStatus::Warning);
+        assert!(!result.verified);
+        assert_eq!(result.message.code, "pi_route_warnings");
+        assert!(result.message.text.contains("Pi smoke worked for 1 of 2"));
+        assert!(!result.message.text.contains("No Pi model routes passed"));
     }
 
     #[test]
