@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "7c95f2c154b83fe69e3989c09802314119bc893b2dfcc5618e9ee7b32b4ba82e",
+  "content_sha256": "2fdde7f6d43b3d83de0b74a8d4cdb22448625ed06d4888d42ff1f6c46178c11e",
   "files": [
     {
       "executable": false,
@@ -1273,8 +1273,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_manifest_check.sh",
-      "sha256": "8e80ee6a5f33201af90a95dc32ea8f70bcd1edd51effab56d489c32ca5654521",
-      "size_bytes": 9967
+      "sha256": "09049cadf783f5dce258aa28f461e6a99692f3a928a848e277bc67ea32ead650",
+      "size_bytes": 10037
     },
     {
       "executable": true,
@@ -1448,8 +1448,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_manifest_check.sh",
-      "sha256": "c0725e1ee282647457b2768984bad2faac0e00c1bc8c2e5b613c87a555b38d19",
-      "size_bytes": 5116
+      "sha256": "2489b82ced7b4b9c1e4c4a682ba7091d1c55041c2492877091eb48dfba535d13",
+      "size_bytes": 5860
     },
     {
       "executable": true,

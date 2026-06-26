@@ -53,7 +53,7 @@ manifest = {
     "schema_version": 1,
     "generated_by": "public_repo_export_bundle.sh",
     "generated_at": _datetime.datetime.now(_datetime.timezone.utc).replace(microsecond=0).isoformat(),
-    "source_commit": "0123456789abcdef",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
     "candidate_file_count": 2,
     "output_file_count": len(records) + 1,
     "public_roots": ["README.md", "scripts/"],
@@ -117,6 +117,25 @@ if "$SCRIPT" --staged-output "$bad_digest" >/tmp/public-manifest-digest.out 2>&1
   exit 1
 fi
 grep -q "manifest content_sha256 mismatch" /tmp/public-manifest-digest.out
+
+bad_source_commit="$tmp_dir/bad-source-commit"
+cp -R "$base" "$bad_source_commit"
+python3 - "$bad_source_commit/PUBLIC_EXPORT_MANIFEST.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest["source_commit"] = "not-a-commit"
+path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if "$SCRIPT" --staged-output "$bad_source_commit" >/tmp/public-manifest-source-commit.out 2>&1; then
+  echo "Expected malformed source_commit to fail manifest check" >&2
+  exit 1
+fi
+grep -q "manifest source_commit must be a lowercase 40-character git commit SHA" \
+  /tmp/public-manifest-source-commit.out
 
 git_checkout="$tmp_dir/git-checkout"
 mkdir -p "$git_checkout/scripts"
