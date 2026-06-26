@@ -333,6 +333,41 @@ def check_cli_contracts() -> None:
     expect(verify_repair.get("source") == "codex", "CLI verify repair request source must be codex")
     expect(verify_repair.get("repair") is True, "CLI verify repair request repair must be true")
 
+    apps_root = require_dict(
+        load_json("fixtures/cli/apps-root-request.json"),
+        "CLI apps root request",
+    )
+    expect_protocol(apps_root.get("protocol_version"), "CLI apps root request")
+    expect(apps_root.get("client_kind") == "cli", "CLI apps root request client_kind must be cli")
+    expect(apps_root.get("command") == "status", "CLI apps root request command must be status")
+    expect(apps_root.get("refresh_agent_status") is False, "CLI apps root request must not refresh agent status")
+
+    apps_detect = require_dict(
+        load_json("fixtures/cli/apps-detect-request.json"),
+        "CLI apps detect request",
+    )
+    expect_protocol(apps_detect.get("protocol_version"), "CLI apps detect request")
+    expect(apps_detect.get("client_kind") == "cli", "CLI apps detect request client_kind must be cli")
+    expect(apps_detect.get("command") == "status", "CLI apps detect request command must be status")
+    expect(apps_detect.get("refresh_agent_status") is True, "CLI apps detect request must refresh agent status")
+
+    apps_status = require_dict(
+        load_json("fixtures/cli/apps-status-pi-request.json"),
+        "CLI apps status request",
+    )
+    expect_protocol(apps_status.get("protocol_version"), "CLI apps status request")
+    expect(apps_status.get("client_kind") == "cli", "CLI apps status request client_kind must be cli")
+    expect(apps_status.get("command") == "agent_status_refresh", "CLI apps status request command must be agent_status_refresh")
+    expect(apps_status.get("source") == "pi", "CLI apps status request source must be pi")
+
+    update_check = require_dict(
+        load_json("fixtures/cli/update-check-request.json"),
+        "CLI update check request",
+    )
+    expect_protocol(update_check.get("protocol_version"), "CLI update check request")
+    expect(update_check.get("client_kind") == "cli", "CLI update check request client_kind must be cli")
+    expect(update_check.get("command") == "update_check", "CLI update check request command must be update_check")
+
     browser_claim = require_dict(
         load_json("fixtures/cli/setup-browser-claim-output.json"),
         "CLI browser claim output",

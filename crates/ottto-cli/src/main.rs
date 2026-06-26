@@ -2815,6 +2815,83 @@ mod tests {
     }
 
     #[test]
+    fn apps_root_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Apps(AppsArgs {
+                    command: None,
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_apps_root_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/cli/apps-root-request.json"))
+                .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn apps_detect_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Apps(AppsArgs {
+                    command: Some(AppsCommand::Detect(JsonArgs { json: true })),
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_apps_detect_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/apps-detect-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn apps_status_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Apps(AppsArgs {
+                    command: Some(AppsCommand::Status(AppStatusArgs {
+                        app: SourceArg::Pi,
+                        json: true,
+                    })),
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_apps_status_pi_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/apps-status-pi-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn agent_status_builds_refresh_request() {
         let invocation = build_invocation(
             Cli {
@@ -3233,6 +3310,31 @@ mod tests {
 
         assert_eq!(invocation.output_mode, OutputMode::Json);
         assert_eq!(invocation.request.command, LocalControlCommand::UpdateCheck);
+    }
+
+    #[test]
+    fn update_check_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Update(UpdateArgs {
+                    command: Some(UpdateCommand::Check(JsonArgs { json: true })),
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_update_check_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/update-check-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
     }
 
     #[test]
