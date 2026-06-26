@@ -201,6 +201,52 @@ def require_list(value: Any, context: str) -> list[Any]:
     return value
 
 
+def iter_json_strings(value: Any, path: str) -> list[tuple[str, str]]:
+    if isinstance(value, str):
+        return [(path, value)]
+    if isinstance(value, dict):
+        strings: list[tuple[str, str]] = []
+        for key, item in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            strings.extend(iter_json_strings(item, child_path))
+        return strings
+    if isinstance(value, list):
+        strings = []
+        for index, item in enumerate(value):
+            strings.extend(iter_json_strings(item, f"{path}[{index}]"))
+        return strings
+    return []
+
+
+DIAGNOSTICS_ALLOWED_PLACEHOLDERS = {
+    "[REDACTED]",
+    "[account_id]",
+    "[machine_id]",
+    "[path]",
+    "[prompt]",
+}
+
+DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS = (
+    (re.compile(r"(?i)(^|[\s:=])Bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "bearer token"),
+    (re.compile(r"(?i)(^|[\s:=])x-api-key\s*[:=]\s*[A-Za-z0-9._-]{8,}"), "API key header"),
+    (re.compile(r"\b(?:ghp|github_pat|sk|xox[baprs])[-_A-Za-z0-9]{8,}\b"), "secret token"),
+    (re.compile(r"\b(?:org|usr|acct)_[A-Za-z0-9]{6,}\b"), "account identifier"),
+    (re.compile(r"\b(?:machine|otm|device)_[A-Za-z0-9]{6,}\b"), "machine identifier"),
+    (re.compile(r"(?:^|\s)(?:/Users|/private|/var|/tmp|/etc|/opt|/Applications)/[^\s]+"), "local path"),
+    (re.compile(r"(?:^|\s)~/[^\s]+"), "home-relative path"),
+    (re.compile(r"(?i)(?:raw_prompt|prompt_text|completion_text|command_output)\s*[:=]"), "raw prompt or command output"),
+)
+
+
+def check_diagnostics_values_are_redacted(value: Any, context: str) -> None:
+    for path, raw in iter_json_strings(value, context):
+        if raw in DIAGNOSTICS_ALLOWED_PLACEHOLDERS:
+            continue
+        for pattern, label in DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS:
+            if pattern.search(raw):
+                fail(f"{path} exposes unredacted {label}: {raw!r}")
+
+
 def check_schema_contracts() -> None:
     schema_expectations = {
         "schemas/connector-registry.schema.json": ("connector registry schema", "connector_registry.v1"),
@@ -497,6 +543,7 @@ def check_setup_and_redaction_contracts() -> None:
     expect(installation.get("launch_agent_path") == "[path]", "launch_agent_path must be path-redacted")
     security = require_dict(section_items.get("security"), "redacted security section")
     expect(security.get("auth_header") == "[REDACTED]", "auth_header must be redacted")
+    check_diagnostics_values_are_redacted(section_items, "diagnostics.sections")
 
     setup = require_dict(load_json("fixtures/setup/claim-run.json"), "setup claim run")
     expect(setup.get("status") == "waiting_for_approval", "setup claim run status must be waiting_for_approval")
