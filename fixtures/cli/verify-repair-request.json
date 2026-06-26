@@ -1,0 +1,9 @@
+{
+  "request_id": "req_cli_verify_repair_fixture",
+  "protocol_version": 15,
+  "token": "test-token",
+  "client_kind": "cli",
+  "command": "verify",
+  "source": "codex",
+  "repair": true
+}

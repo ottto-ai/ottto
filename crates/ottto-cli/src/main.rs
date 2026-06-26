@@ -2767,6 +2767,54 @@ mod tests {
     }
 
     #[test]
+    fn doctor_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Doctor(JsonArgs { json: true }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_doctor_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/cli/doctor-request.json"))
+                .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn verify_repair_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Verify(VerifyArgs {
+                    source: None,
+                    app: Some(SourceArg::Codex),
+                    repair: true,
+                    json: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_verify_repair_fixture".to_string();
+
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/verify-repair-request.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn agent_status_builds_refresh_request() {
         let invocation = build_invocation(
             Cli {
