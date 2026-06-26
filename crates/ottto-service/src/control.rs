@@ -10222,6 +10222,11 @@ mod tests {
             upload.get("upload_id").and_then(|value| value.as_str()),
             Some("diag_upload_123")
         );
+        let payload_json = serde_json::to_string(&payload).expect("payload serializes");
+        assert!(!payload_json.contains("support_123"));
+        assert!(!payload_json
+            .to_ascii_lowercase()
+            .contains("x-ottto-support-claim"));
 
         let request = captured
             .lock()

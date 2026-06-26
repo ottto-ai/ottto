@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 199,
-  "content_sha256": "ef65ae1e59ab329b14a6c1985c4b842f48409ed049d35fe64998c615616edc6e",
+  "content_sha256": "a9a4f9d6ec6cb74ddddeee725914a3a02bf39d8c882804e431a458cc004ac90e",
   "files": [
     {
       "executable": false,
@@ -622,8 +622,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "80ce89be5e75fc94acf12fc8004ea8e04cc5a7b7166ca17d2076e2d414c4d403",
-      "size_bytes": 537617
+      "sha256": "8e6fefda62ba9aaac9b9144feeb4fe0682a69c146843e5563dd811044e8190c2",
+      "size_bytes": 537875
     },
     {
       "executable": false,
@@ -748,8 +748,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "5af8adf383cf92e9e0b932204d1da68d1f737b7fdc5eb15ff5ee94ca4e47c945",
-      "size_bytes": 1240
+      "sha256": "a10ae2f337cdd631caca57cef4576b9565e74c1088c045f1d9e20562e442d7ef",
+      "size_bytes": 1469
     },
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/support.md",
-      "sha256": "85c8d6a92031f780367159d8179cd0f70610ac0fdf676c0bc74a5e0e0c54ba21",
-      "size_bytes": 4275
+      "sha256": "14c8d95dc478ded7a69d9fa8584af6d2d770e4be408371f2cf32295d64ba7fe8",
+      "size_bytes": 4445
     },
     {
       "executable": false,
