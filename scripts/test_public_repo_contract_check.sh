@@ -180,6 +180,20 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_mcp" >/tmp/public-contract-broken
 fi
 grep -q "MCP adapter must remain deferred for public v1" /tmp/public-contract-broken-mcp.out
 
+broken_adapter_path="$tmp_dir/broken-adapter-path"
+cp -R "$output_dir" "$broken_adapter_path"
+cat >> "$broken_adapter_path/agent-adapters/codex-skill/SKILL.md" <<'EOF'
+
+Private install path regression:
+tools/ottto-local-platform/scripts/macos_dev_install.sh
+EOF
+if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_path" >/tmp/public-contract-broken-adapter-path.out 2>&1; then
+  echo "Expected contract check to fail when an adapter skill references private install paths" >&2
+  exit 1
+fi
+grep -q "Codex skill must not reference private monorepo install paths" \
+  /tmp/public-contract-broken-adapter-path.out
+
 pin_private="$tmp_dir/pin-private"
 write_valid_private_consumers "$pin_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
 bad_pin="$tmp_dir/bad-pin.json"

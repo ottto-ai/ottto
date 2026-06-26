@@ -40,11 +40,12 @@ command -v ottto
 
 If `ottto` is missing, do not emulate local platform behavior. For trusted
 internal repo QA only, and only when the user has approved an internal dev
-package, install the dev runtime from the checked-in manifest:
+package with a generated release manifest in this public-shaped checkout,
+install the dev runtime through the public macOS dev installer script:
 
 ```bash
-tools/ottto-local-platform/scripts/macos_dev_install.sh \
-  --manifest tools/ottto-local-platform/dist/macos/release-manifest.json \
+scripts/macos_dev_install.sh \
+  --manifest dist/macos/release-manifest.json \
   --bootstrap-launch-agent
 ```
 

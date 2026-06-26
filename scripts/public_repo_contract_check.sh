@@ -610,6 +610,7 @@ def check_agent_adapter_contracts() -> None:
             "forbidden": [
                 ("allowed-tools:", "Codex skill must not pregrant tools"),
                 ("hooks:", "Codex skill must not install hooks"),
+                ("tools/ottto-local-platform", "Codex skill must not reference private monorepo install paths"),
             ],
         },
         "agent-adapters/claude-code-skill/SKILL.md": {
@@ -626,6 +627,7 @@ def check_agent_adapter_contracts() -> None:
             "forbidden": [
                 ("allowed-tools:", "Claude Code skill must not pregrant tools"),
                 ("hooks:", "Claude Code skill must not define hooks metadata"),
+                ("tools/ottto-local-platform", "Claude Code skill must not reference private monorepo install paths"),
             ],
         },
         "agent-adapters/codex-skill/agents/openai.yaml": {
