@@ -317,6 +317,22 @@ def check_cli_contracts() -> None:
         "CLI diagnostics upload retention disclosure must be accepted",
     )
 
+    doctor = require_dict(load_json("fixtures/cli/doctor-request.json"), "CLI doctor request")
+    expect_protocol(doctor.get("protocol_version"), "CLI doctor request")
+    expect(doctor.get("client_kind") == "cli", "CLI doctor request client_kind must be cli")
+    expect(doctor.get("command") == "status", "CLI doctor request command must be status")
+    expect(doctor.get("refresh_agent_status") is False, "CLI doctor request must not refresh agent status")
+
+    verify_repair = require_dict(
+        load_json("fixtures/cli/verify-repair-request.json"),
+        "CLI verify repair request",
+    )
+    expect_protocol(verify_repair.get("protocol_version"), "CLI verify repair request")
+    expect(verify_repair.get("client_kind") == "cli", "CLI verify repair request client_kind must be cli")
+    expect(verify_repair.get("command") == "verify", "CLI verify repair request command must be verify")
+    expect(verify_repair.get("source") == "codex", "CLI verify repair request source must be codex")
+    expect(verify_repair.get("repair") is True, "CLI verify repair request repair must be true")
+
     browser_claim = require_dict(
         load_json("fixtures/cli/setup-browser-claim-output.json"),
         "CLI browser claim output",

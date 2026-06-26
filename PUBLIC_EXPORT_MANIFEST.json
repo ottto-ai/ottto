@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 199,
-  "content_sha256": "12711791ec3a589865cddb80f432368b2ecdef47eb8f9be474cdcdf529c690d2",
+  "candidate_file_count": 201,
+  "content_sha256": "9a2556cdecd9fa9a0ef095eb820a32cda02bffb590164edd4d293657a4fbee25",
   "files": [
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "6e32ddb631672947c439fa6598b3c46fecebf993f50d30da4929526c619f6fe8",
-      "size_bytes": 117191
+      "sha256": "44d58bf23fc5db0470fdf480bdb3f318011119f723c6dee9309680b55248b6bc",
+      "size_bytes": 119032
     },
     {
       "executable": false,
@@ -838,6 +838,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/doctor-request.json",
+      "sha256": "106518b950628297ecfd8cfdfcb678bb97adea0606b551d6a12bb94159bd2587",
+      "size_bytes": 176
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
       "sha256": "ea054652fd786c0775d29e20748246f9a12d9f080c4b8abb708d13ca18e1c4ac",
       "size_bytes": 20107
@@ -883,6 +890,13 @@
       "path": "fixtures/cli/status-watch-output.ndjson",
       "sha256": "9bafae616f8e298643a4da851567339ced736166ca3405f3d7bf8ab099777d9b",
       "size_bytes": 243
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/verify-repair-request.json",
+      "sha256": "4fc47ba2a839797935b248998a8fb15f44d0948bb48573312883fb7a3595182e",
+      "size_bytes": 189
     },
     {
       "executable": false,
@@ -1168,8 +1182,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "6c0115c0e7f743dac8fa1c39c022f29e77df9b9a825acd1b0c6226f5180f74e3",
-      "size_bytes": 33006
+      "sha256": "5714da0dfadc48302407ac2e7b34ea42c5a49a749b051c2f64114d5570ac560a",
+      "size_bytes": 34106
     },
     {
       "executable": true,
@@ -1398,7 +1412,7 @@
   ],
   "generated_at": "2026-06-26T09:17:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 200,
+  "output_file_count": 202,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
