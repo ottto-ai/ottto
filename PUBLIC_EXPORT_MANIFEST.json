@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 199,
-  "content_sha256": "a9a4f9d6ec6cb74ddddeee725914a3a02bf39d8c882804e431a458cc004ac90e",
+  "content_sha256": "12711791ec3a589865cddb80f432368b2ecdef47eb8f9be474cdcdf529c690d2",
   "files": [
     {
       "executable": false,
@@ -97,15 +97,15 @@
       "executable": false,
       "mode": "0644",
       "path": "agent-adapters/claude-code-skill/SKILL.md",
-      "sha256": "4ab6cc044fe3567434a00acea9481b0340790beb0d899abd6e30c71d94330d5c",
-      "size_bytes": 6143
+      "sha256": "d7dfb9194de10f1c1dab2e8e04cf08d2287920eb3946ce1c312fa93f319194b9",
+      "size_bytes": 6377
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "agent-adapters/codex-skill/SKILL.md",
-      "sha256": "b57677d39d5962081f9ad75aa416f23a75a60d3c3be30d08d4e7babb631ee850",
-      "size_bytes": 6502
+      "sha256": "ad8570578b5015c03ad133a790ce13a05df6c8561c7b60fac9b6503d06aea778",
+      "size_bytes": 6735
     },
     {
       "executable": false,
@@ -1168,8 +1168,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "c4cb583021e266ec34ff5faab2d0790d02e7a5905dd2348499fec2ff57f11016",
-      "size_bytes": 29483
+      "sha256": "6c0115c0e7f743dac8fa1c39c022f29e77df9b9a825acd1b0c6226f5180f74e3",
+      "size_bytes": 33006
     },
     {
       "executable": true,

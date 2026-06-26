@@ -175,6 +175,10 @@ ottto diagnostics collect --upload \
   --json
 ```
 
+Do not ask users to paste support claims into public issues or chat. Support
+claims authorize diagnostics upload only and must not appear in returned JSON or
+uploaded bundle content; report only whether a support claim was provided.
+
 Check updates before applying:
 
 ```bash

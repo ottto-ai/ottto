@@ -198,6 +198,9 @@ ottto diagnostics collect --upload \
 
 Summarize diagnostics in final responses unless the user asks for exact JSON.
 Keep secrets, raw local paths, prompts, IDs, and command output out of chat.
+Do not ask users to paste support claims into public issues or chat. Support
+claims authorize diagnostics upload only and must not appear in returned JSON or
+uploaded bundle content; report only whether a support claim was provided.
 
 ## Update And Uninstall
 
