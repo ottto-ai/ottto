@@ -98,6 +98,11 @@ The fixture contract is `collector_fixture.v1` and must include:
 - `upload_policy.boundary`, written as a concise human-readable upload boundary;
 - `upload_policy.redacts`, including prompt, response, tool output, command
   output, local path, and credential classes when raw content is disallowed.
+  Values must come from the public fixture schema redaction vocabulary:
+  `prompt`, `response`, `tool_output`, `command_output`, `local_path`,
+  `credential`, `secret`, `password`, `api_key`, `access_token`, `id_token`,
+  `refresh_token`, `tokens.access_token`, `tokens.id_token`,
+  `tokens.refresh_token`, `cookie`, `email`, or `org_id`.
 
 The fixture test rejects samples that expose raw prompt/response fields, command
 or tool output, local paths, credentials, cookies, API keys, passwords, secrets,

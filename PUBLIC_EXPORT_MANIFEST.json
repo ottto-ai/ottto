@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "95e57de750ae7386b0c6ef5a9db82e4b7b7133ec26ff737887d7fd550d4ad9aa",
+  "content_sha256": "7c95f2c154b83fe69e3989c09802314119bc893b2dfcc5618e9ee7b32b4ba82e",
   "files": [
     {
       "executable": false,
@@ -118,8 +118,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "a8b8fdd0e29c93514ae8b00c8d941d8a4d9eb7449e2fee7d15a58e8afc15197c",
-      "size_bytes": 10557
+      "sha256": "af657f628884ba006bd3368aad081f3ce79d9f0fd91b6da2d2a6be5f1c4f98c4",
+      "size_bytes": 10896
     },
     {
       "executable": false,
@@ -433,8 +433,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-sdk/src/lib.rs",
-      "sha256": "ccd2eaa8964cab75ca377efd1916db2ad15db5fe4d9f42b37ea8643da1ae5a9d",
-      "size_bytes": 12497
+      "sha256": "40b073855b46ff7d223409caedde5805167c4017b3985b0eae03bff0fe815500",
+      "size_bytes": 13501
     },
     {
       "executable": false,
@@ -447,8 +447,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/src/lib.rs",
-      "sha256": "66ccbbbb6e799858b7d67b7cc87bd6a6d8062b2826df4217343457bfdb042576",
-      "size_bytes": 23989
+      "sha256": "2b4a021c7b161bf286e0617b4b2227e035bf08dc787d42ccc6ea18e470fe7754",
+      "size_bytes": 25855
     },
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "schemas/collector-fixture.schema.json",
-      "sha256": "83dd807c4bbfc3e2e5ff1c17b632e4dd6e831cad4d38e47400d8d01a3e5b0f96",
-      "size_bytes": 1982
+      "sha256": "b8036c96581c048630840b75b62eabf76cfe6c3b4460a9c6a4e93ff538071494",
+      "size_bytes": 2498
     },
     {
       "executable": false,
