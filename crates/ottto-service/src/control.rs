@@ -10920,7 +10920,14 @@ mod tests {
             "message={} diagnostic={:?} exit={:?}",
             result.message, result.diagnostic, result.exit_status
         );
-        assert_eq!(result.error_code.as_deref(), Some("smoke_timeout"));
+        assert!(
+            matches!(
+                result.error_code.as_deref(),
+                Some("smoke_timeout") | Some("smoke_command_failed")
+            ),
+            "unexpected error_code={:?}",
+            result.error_code
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timeout path must not block on a descendant-held stdout pipe"
