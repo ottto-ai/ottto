@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "b1b37c94d43b48b514129638633331a854b0c78745923a84fe818143cc60f0ff",
+  "content_sha256": "a172c13e41b361f64b6a5e8db555643200ca6c115ab7faa6997e88d4c2dab083",
   "files": [
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "c67518b2e9d784ecc76484014d4a22aaad8f2436ded971e60ae0741074843eec",
-      "size_bytes": 45280
+      "sha256": "ec5da22e4b1e32dc6c690ba6ee06d7321f4fa09ebe1614896f20cdadfefbc457",
+      "size_bytes": 49590
     },
     {
       "executable": true,
@@ -1420,8 +1420,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "eeffebd1c50c0e8482474f06263cbed85608a77d47c96c31235a31bfb650a2d3",
-      "size_bytes": 12559
+      "sha256": "60f2246eae05571437eb0599bcb5c9ccd603364db978009439d7e3ee2ddbfb00",
+      "size_bytes": 13752
     },
     {
       "executable": true,

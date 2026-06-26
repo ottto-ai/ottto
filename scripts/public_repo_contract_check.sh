@@ -224,6 +224,80 @@ def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict
     return [source for source in detected_sources if isinstance(source, dict)]
 
 
+def check_connector_fixture_contract(
+    fixture_path: Path,
+    source_id: str,
+    collector_id: str,
+    emits: list[str],
+    uploads_raw_content: bool,
+) -> None:
+    relative_path = fixture_path.relative_to(PUBLIC_ROOT).as_posix()
+    fixture = require_dict(load_json(relative_path), f"{relative_path} fixture")
+    expect(
+        fixture.get("schema_version") == "collector_fixture.v1",
+        f"{relative_path} schema_version must be collector_fixture.v1",
+    )
+    expect(fixture.get("source_id") == source_id, f"{relative_path} source_id must match registry")
+    expect(
+        fixture.get("collector_id") == collector_id,
+        f"{relative_path} collector_id must match registry",
+    )
+
+    input_fixture_paths = require_list(
+        fixture.get("input_fixture_paths"), f"{relative_path} input_fixture_paths"
+    )
+    fixture_root = fixture_path.parent.resolve()
+    for index, input_path_value in enumerate(input_fixture_paths):
+        expect(
+            isinstance(input_path_value, str) and bool(input_path_value),
+            f"{relative_path} input_fixture_paths[{index}] must be non-empty",
+        )
+        if not isinstance(input_path_value, str) or not input_path_value:
+            continue
+        resolved_input_path = (fixture_root / input_path_value).resolve()
+        expect(
+            resolved_input_path.is_file(),
+            f"{relative_path} input_fixture_paths[{index}] must point to a file",
+        )
+        expect(
+            resolved_input_path.is_relative_to(PUBLIC_ROOT),
+            f"{relative_path} input_fixture_paths[{index}] must stay inside public repo",
+        )
+
+    upload_policy = require_dict(fixture.get("upload_policy"), f"{relative_path} upload_policy")
+    expect(
+        upload_policy.get("uploads_raw_content") == uploads_raw_content,
+        f"{relative_path} upload_policy.uploads_raw_content must match registry",
+    )
+    expect(
+        upload_policy.get("uploads_raw_content") is False,
+        f"{relative_path} upload_policy.uploads_raw_content must be false for public v1",
+    )
+
+    emitted_records = require_list(
+        fixture.get("emitted_records"), f"{relative_path} emitted_records"
+    )
+    actual_record_types = []
+    for index, record_value in enumerate(emitted_records):
+        record = require_dict(record_value, f"{relative_path} emitted_records[{index}]")
+        record_type = record.get("record_type")
+        expect(
+            isinstance(record_type, str) and bool(record_type),
+            f"{relative_path} emitted_records[{index}].record_type must be non-empty",
+        )
+        if isinstance(record_type, str):
+            actual_record_types.append(record_type)
+        require_dict(record.get("sample"), f"{relative_path} emitted_records[{index}].sample")
+    expect(
+        sorted(actual_record_types) == sorted(emits),
+        f"{relative_path} emitted record types must match registry emits",
+    )
+    expect(
+        len(actual_record_types) == len(set(actual_record_types)),
+        f"{relative_path} emitted record types must be unique",
+    )
+
+
 def iter_json_strings(value: Any, path: str) -> list[tuple[str, str]]:
     if isinstance(value, str):
         return [(path, value)]
@@ -342,9 +416,31 @@ def check_registry_contract() -> None:
                 f"{collector_context} manifest_path must point to a collector manifest",
             )
             if isinstance(collector_manifest_path, str):
-                require_file(collector_manifest_path)
+                collector_manifest = require_file(collector_manifest_path)
             expect(isinstance(collector.get("uploads_raw_content"), bool), f"{collector_context} uploads_raw_content must be boolean")
-            require_list(collector.get("emits"), f"{collector_context} emits")
+            emits = [
+                emit
+                for emit in require_list(collector.get("emits"), f"{collector_context} emits")
+                if isinstance(emit, str)
+            ]
+            expect(emits, f"{collector_context} emits must not be empty")
+            if not isinstance(source_id, str) or not isinstance(collector.get("collector_id"), str):
+                continue
+            if not isinstance(collector.get("uploads_raw_content"), bool):
+                continue
+            if isinstance(collector_manifest_path, str) and collector_manifest is not None:
+                fixture_dir = collector_manifest.parent / "fixtures"
+                expect(fixture_dir.is_dir(), f"{collector_context} fixtures directory must exist")
+                fixture_paths = sorted(fixture_dir.glob("*.json")) if fixture_dir.is_dir() else []
+                expect(fixture_paths, f"{collector_context} must include at least one fixture")
+                for fixture_path in fixture_paths:
+                    check_connector_fixture_contract(
+                        fixture_path,
+                        source_id,
+                        collector.get("collector_id"),
+                        emits,
+                        collector.get("uploads_raw_content"),
+                    )
 
 
 def check_cli_contracts() -> None:

@@ -191,6 +191,28 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_registry" >/tmp/public-contract-b
 fi
 grep -q "registry is missing required source(s): codex" /tmp/public-contract-broken-registry.out
 
+broken_connector_fixture="$tmp_dir/broken-connector-fixture"
+cp -R "$output_dir" "$broken_connector_fixture"
+python3 - "$broken_connector_fixture/connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["emitted_records"][0]["record_type"] = "unexpected_fixture_record"
+payload["upload_policy"]["uploads_raw_content"] = True
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_fixture" >/tmp/public-contract-broken-connector-fixture.out 2>&1; then
+  echo "Expected contract check to fail when connector fixtures drift from registry" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.uploads_raw_content must match registry" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted record types must match registry emits" \
+  /tmp/public-contract-broken-connector-fixture.out
+
 broken_mcp="$tmp_dir/broken-mcp"
 cp -R "$output_dir" "$broken_mcp"
 mkdir -p "$broken_mcp/agent-adapters/mcp-server"
