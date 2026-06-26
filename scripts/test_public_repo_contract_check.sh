@@ -213,6 +213,33 @@ grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evi
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted record types must match registry emits" \
   /tmp/public-contract-broken-connector-fixture.out
 
+broken_diagnostics_redaction="$tmp_dir/broken-diagnostics-redaction"
+cp -R "$output_dir" "$broken_diagnostics_redaction"
+python3 - "$broken_diagnostics_redaction/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+for section in payload["sections"]:
+    if section["name"] == "installation":
+        section["items"]["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.plist"
+    if section["name"] == "security":
+        section["items"]["auth_header"] = "Bearer " + "ghp_" + "unredactedfixturetoken"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_redaction" >/tmp/public-contract-broken-diagnostics-redaction.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics expose unredacted values" >&2
+  exit 1
+fi
+grep -q "launch_agent_path must be path-redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "auth_header must be redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.sections.security.auth_header exposes unredacted bearer token" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+
 broken_mcp="$tmp_dir/broken-mcp"
 cp -R "$output_dir" "$broken_mcp"
 mkdir -p "$broken_mcp/agent-adapters/mcp-server"

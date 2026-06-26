@@ -660,9 +660,22 @@ def check_setup_and_redaction_contracts() -> None:
     )
     expect(bundle.get("bundle_id"), "redacted diagnostics bundle must include bundle_id")
     upload = require_dict(bundle.get("upload"), "redacted diagnostics upload")
+    expect(upload.get("requested") is False, "redacted diagnostics upload requested must be false")
+    expect(upload.get("status") == "local_only", "redacted diagnostics upload status must be local_only")
     expect(upload.get("approval_required") is True, "redacted diagnostics upload must require approval")
+    expect(upload.get("approved") is False, "redacted diagnostics upload approved must be false")
     expect(upload.get("authorization") == "not_requested", "redacted diagnostics authorization must be not_requested")
     redaction = require_dict(bundle.get("redaction"), "redacted diagnostics redaction")
+    expect(redaction.get("policy_version") == 1, "redacted diagnostics policy_version must be 1")
+    covered_surfaces = set(require_list(redaction.get("covered_surfaces"), "redaction covered surfaces"))
+    for surface in (
+        "diagnostics",
+        "support_output",
+        "agent_output",
+        "setup_error",
+        "command_output",
+    ):
+        expect(surface in covered_surfaces, f"redaction covered surfaces must include {surface}")
     categories = set(require_list(redaction.get("redacted_categories"), "redacted categories"))
     for category in (
         "local_path",
@@ -682,6 +695,7 @@ def check_setup_and_redaction_contracts() -> None:
         for section in sections
         if isinstance(section, dict) and isinstance(section.get("items"), dict)
     }
+    expect(len(section_items) == len(sections), "redacted diagnostics sections must have object items")
     installation = require_dict(section_items.get("installation"), "redacted installation section")
     expect(installation.get("launch_agent_path") == "[path]", "launch_agent_path must be path-redacted")
     security = require_dict(section_items.get("security"), "redacted security section")
