@@ -223,8 +223,9 @@ if manifest.get("schema_version") != 1:
     die("manifest schema_version must be 1")
 if manifest.get("generated_by") != "public_repo_export_bundle.sh":
     die("manifest generated_by must be public_repo_export_bundle.sh")
-if not isinstance(manifest.get("source_commit"), str) or not manifest["source_commit"]:
-    die("manifest source_commit must be a non-empty string")
+source_commit = manifest.get("source_commit")
+if not isinstance(source_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+    die("manifest source_commit must be a lowercase 40-character git commit SHA")
 if not isinstance(manifest.get("candidate_file_count"), int) or manifest["candidate_file_count"] < 1:
     die("manifest candidate_file_count must be a positive integer")
 if not isinstance(manifest.get("output_file_count"), int) or manifest["output_file_count"] < 1:
