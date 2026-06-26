@@ -201,6 +201,29 @@ def require_list(value: Any, context: str) -> list[Any]:
     return value
 
 
+def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
+    source_count = payload.get("source_count")
+    detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
+    actions = require_list(payload.get("actions"), f"{context} actions")
+    expect(isinstance(source_count, int) and source_count >= 0, f"{context} source_count must be a non-negative integer")
+    if isinstance(source_count, int):
+        expect(source_count == len(detected_sources), f"{context} source_count must match detected_sources length")
+    expect(not (payload.get("next_question") is not None and payload.get("next_action") is not None), f"{context} must not set both next_question and next_action")
+    for index, source_value in enumerate(detected_sources):
+        source = require_dict(source_value, f"{context} detected_sources[{index}]")
+        expect(isinstance(source.get("source"), str) and bool(source.get("source")), f"{context} detected_sources[{index}].source must be non-empty")
+        expect(isinstance(source.get("state"), str) and bool(source.get("state")), f"{context} detected_sources[{index}].state must be non-empty")
+        readiness = source.get("readiness_percent")
+        expect(isinstance(readiness, int) and 0 <= readiness <= 100, f"{context} detected_sources[{index}].readiness_percent must be 0-100")
+        missing_fields = require_list(source.get("missing_fields"), f"{context} detected_sources[{index}].missing_fields")
+        for field_index, field in enumerate(missing_fields):
+            expect(isinstance(field, str) and bool(field), f"{context} detected_sources[{index}].missing_fields[{field_index}] must be non-empty")
+    for index, action_value in enumerate(actions):
+        action = require_dict(action_value, f"{context} actions[{index}]")
+        expect(isinstance(action.get("type"), str) and bool(action.get("type")), f"{context} actions[{index}].type must be non-empty")
+    return [source for source in detected_sources if isinstance(source, dict)]
+
+
 def iter_json_strings(value: Any, path: str) -> list[tuple[str, str]]:
     if isinstance(value, str):
         return [(path, value)]
@@ -456,9 +479,14 @@ def check_cli_contracts() -> None:
         load_json("fixtures/cli/setup-browser-claim-output.json"),
         "CLI browser claim output",
     )
+    browser_claim_sources = check_setup_output_shape(browser_claim, "browser claim output")
     expect(browser_claim.get("status") == "waiting_for_browser", "browser claim status must be waiting_for_browser")
+    expect(browser_claim.get("setup_run_id") is None, "browser claim setup_run_id must be null before claim")
+    expect(browser_claim.get("claim_code_provided") is False, "browser claim output must not mark claim_code_provided")
     expect(browser_claim.get("claim_code"), "browser claim output must include claim_code")
     expect(browser_claim.get("claim_url"), "browser claim output must include claim_url")
+    expect(browser_claim.get("next_question") is None, "browser claim next_question must be null")
+    expect(browser_claim_sources == [], "browser claim detected_sources must be empty")
     next_action = require_dict(browser_claim.get("next_action"), "browser claim next_action")
     expect(next_action.get("type") == "browser_claim", "browser claim next_action type must be browser_claim")
     expect(next_action.get("claim_code") == browser_claim.get("claim_code"), "browser claim next_action must repeat claim_code")
@@ -468,15 +496,34 @@ def check_cli_contracts() -> None:
         load_json("fixtures/cli/setup-needs-user-action-output.json"),
         "CLI needs-user-action output",
     )
+    needs_user_sources = check_setup_output_shape(needs_user, "needs-user-action output")
     expect(needs_user.get("status") == "waiting_for_approval", "needs-user-action status must be waiting_for_approval")
+    expect(needs_user.get("claim_code_provided") is False, "needs-user-action output must not mark claim_code_provided")
+    expect(needs_user.get("next_action") is None, "needs-user-action next_action must be null while waiting for approval")
     question = require_dict(needs_user.get("next_question"), "needs-user-action next_question")
     expect(question.get("type") == "approval", "needs-user-action next_question type must be approval")
+    expect(question.get("source") == "codex", "needs-user-action next_question source must be codex")
+    expect(len(needs_user_sources) == 1, "needs-user-action output must expose one detected source")
+    if needs_user_sources:
+        source = needs_user_sources[0]
+        expect(source.get("source") == "codex", "needs-user-action detected source must be codex")
+        expect(source.get("state") == "ready_to_install", "needs-user-action detected source state must be ready_to_install")
+        expect("browser_approval" in require_list(source.get("missing_fields"), "needs-user-action missing_fields"), "needs-user-action missing_fields must include browser_approval")
 
     timed_out = require_dict(
         load_json("fixtures/cli/setup-timed-out-output.json"), "CLI setup timed-out output"
     )
+    timed_out_sources = check_setup_output_shape(timed_out, "setup timed-out output")
     expect(timed_out.get("status") == "timed_out", "setup timed-out status must be timed_out")
     expect(timed_out.get("claim_code_provided") is True, "setup timed-out output must preserve claim_code_provided")
+    expect(timed_out.get("next_question") is None, "setup timed-out next_question must be null")
+    expect(timed_out.get("next_action") is None, "setup timed-out next_action must be null")
+    expect(len(timed_out_sources) == 1, "setup timed-out output must expose one detected source")
+    if timed_out_sources:
+        source = timed_out_sources[0]
+        expect(source.get("source") == "codex", "setup timed-out detected source must be codex")
+        expect(source.get("state") == "waiting_for_telemetry", "setup timed-out detected source state must be waiting_for_telemetry")
+        expect("fresh_telemetry" in require_list(source.get("missing_fields"), "setup timed-out missing_fields"), "setup timed-out missing_fields must include fresh_telemetry")
 
     status_events = load_ndjson("fixtures/cli/status-watch-output.ndjson")
     if status_events:

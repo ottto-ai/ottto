@@ -150,6 +150,27 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-b
 fi
 grep -q "control status request protocol_version must be 15" /tmp/public-contract-broken-protocol.out
 
+broken_setup_state="$tmp_dir/broken-setup-state"
+cp -R "$output_dir" "$broken_setup_state"
+python3 - "$broken_setup_state/fixtures/cli/setup-needs-user-action-output.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["next_action"] = {"type": "browser_claim"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_state" >/tmp/public-contract-broken-setup-state.out 2>&1; then
+  echo "Expected contract check to fail when setup output has ambiguous next state" >&2
+  exit 1
+fi
+grep -q "needs-user-action output must not set both next_question and next_action" \
+  /tmp/public-contract-broken-setup-state.out
+grep -q "needs-user-action next_action must be null while waiting for approval" \
+  /tmp/public-contract-broken-setup-state.out
+
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
 python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'
