@@ -51,7 +51,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table};
@@ -81,6 +81,7 @@ const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
 const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
 #[cfg(target_os = "macos")]
@@ -5755,11 +5756,14 @@ fn run_bounded_command(
             };
         }
     };
+    let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+    let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let (diagnostic, usage_limited) = read_command_diagnostic_with_flags(&mut child);
+                let (diagnostic, usage_limited) =
+                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader);
                 return SmokeResult {
                     command_found: true,
                     succeeded: status.success(),
@@ -5790,7 +5794,8 @@ fn run_bounded_command(
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let (diagnostic, usage_limited) = read_command_diagnostic_with_flags(&mut child);
+                let (diagnostic, usage_limited) =
+                    read_command_diagnostic_with_flags(stdout_reader, stderr_reader);
                 return SmokeResult {
                     command_found: true,
                     succeeded: false,
@@ -6265,9 +6270,12 @@ fn verification_failure_message(
     no_fresh_telemetry_message(source, smoke)
 }
 
-fn read_command_diagnostic_with_flags(child: &mut std::process::Child) -> (Option<String>, bool) {
-    let stderr = read_pipe_raw(&mut child.stderr);
-    let stdout = read_pipe_raw(&mut child.stdout);
+fn read_command_diagnostic_with_flags(
+    stdout_reader: Option<mpsc::Receiver<String>>,
+    stderr_reader: Option<mpsc::Receiver<String>>,
+) -> (Option<String>, bool) {
+    let stderr = collect_pipe_raw(stderr_reader);
+    let stdout = collect_pipe_raw(stdout_reader);
     let raw = match (stderr, stdout) {
         (Some(stderr), Some(stdout)) => Some(format!("{stderr}; stdout: {stdout}")),
         (Some(stderr), None) => Some(stderr),
@@ -6279,11 +6287,23 @@ fn read_command_diagnostic_with_flags(child: &mut std::process::Child) -> (Optio
     (diagnostic, usage_limited)
 }
 
-fn read_pipe_raw<R: Read>(pipe: &mut Option<R>) -> Option<String> {
-    let mut output = String::new();
-    if let Some(mut pipe) = pipe.take() {
+fn spawn_pipe_reader<R>(mut pipe: R) -> mpsc::Receiver<String>
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = String::new();
         let _ = pipe.read_to_string(&mut output);
-    }
+        let _ = sender.send(output);
+    });
+    receiver
+}
+
+fn collect_pipe_raw(reader: Option<mpsc::Receiver<String>>) -> Option<String> {
+    let output = reader
+        .and_then(|receiver| receiver.recv_timeout(PIPE_DRAIN_TIMEOUT).ok())
+        .unwrap_or_default();
     (!output.trim().is_empty()).then_some(output)
 }
 
@@ -10870,6 +10890,40 @@ mod tests {
             result.succeeded,
             "message={} diagnostic={:?} exit={:?}",
             result.message, result.diagnostic, result.exit_status
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn pi_smoke_timeout_does_not_wait_on_inherited_pipe() {
+        let root = control_test_root("pi-smoke-held-pipe");
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(&fake_pi, "#!/bin/sh\n(sh -c 'sleep 2') &\nsleep 30\n").expect("write fake pi");
+        #[cfg(unix)]
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake pi executable");
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+
+        let started = Instant::now();
+        let result = run_bounded_command("pi", &[], Duration::from_millis(200), "Pi", None);
+
+        assert!(
+            !result.succeeded,
+            "message={} diagnostic={:?} exit={:?}",
+            result.message, result.diagnostic, result.exit_status
+        );
+        assert_eq!(result.error_code.as_deref(), Some("smoke_timeout"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path must not block on a descendant-held stdout pipe"
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -26,6 +26,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
@@ -3036,8 +3037,8 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = join_pipe_reader(stdout_reader);
-                let stderr = join_pipe_reader(stderr_reader);
+                let stdout = collect_pipe_reader(stdout_reader, PIPE_DRAIN_TIMEOUT);
+                let stderr = collect_pipe_reader(stderr_reader, PIPE_DRAIN_TIMEOUT);
                 return CommandOutput {
                     command_found: true,
                     success: status.success(),
@@ -3049,47 +3050,49 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
             Ok(None) if start.elapsed() >= timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = join_pipe_reader(stdout_reader);
-                let _ = join_pipe_reader(stderr_reader);
+                let stdout = collect_pipe_reader(stdout_reader, PIPE_DRAIN_TIMEOUT);
+                let stderr = collect_pipe_reader(stderr_reader, PIPE_DRAIN_TIMEOUT);
                 return CommandOutput {
                     command_found: true,
                     success: false,
                     status_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout,
+                    stderr,
                 };
             }
             Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(_) => {
                 let _ = child.kill();
-                let _ = join_pipe_reader(stdout_reader);
-                let _ = join_pipe_reader(stderr_reader);
+                let stdout = collect_pipe_reader(stdout_reader, PIPE_DRAIN_TIMEOUT);
+                let stderr = collect_pipe_reader(stderr_reader, PIPE_DRAIN_TIMEOUT);
                 return CommandOutput {
                     command_found: true,
                     success: false,
                     status_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout,
+                    stderr,
                 };
             }
         }
     }
 }
 
-fn spawn_pipe_reader<R>(mut pipe: R) -> thread::JoinHandle<String>
+fn spawn_pipe_reader<R>(mut pipe: R) -> mpsc::Receiver<String>
 where
     R: Read + Send + 'static,
 {
+    let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut output = String::new();
         let _ = pipe.read_to_string(&mut output);
-        output
-    })
+        let _ = sender.send(output);
+    });
+    receiver
 }
 
-fn join_pipe_reader(reader: Option<thread::JoinHandle<String>>) -> String {
+fn collect_pipe_reader(reader: Option<mpsc::Receiver<String>>, timeout: Duration) -> String {
     reader
-        .and_then(|handle| handle.join().ok())
+        .and_then(|receiver| receiver.recv_timeout(timeout).ok())
         .unwrap_or_default()
 }
 
@@ -3171,6 +3174,38 @@ mod tests {
 
         assert!(output.success, "{output:?}");
         assert_eq!(output.stdout.len(), 200000);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial]
+    fn run_command_capture_timeout_does_not_wait_on_inherited_pipe() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-command-capture-held-pipe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let executable = dir.join("held-pipe");
+        std::fs::write(&executable, "#!/bin/sh\n(sh -c 'sleep 2') &\nsleep 30\n")
+            .expect("write executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+
+        let _guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+        let started = Instant::now();
+        let output = run_command_capture("held-pipe", &[], Duration::from_millis(200));
+
+        assert!(!output.success, "{output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path must not block on a descendant-held stdout pipe"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
