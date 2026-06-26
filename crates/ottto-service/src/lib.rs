@@ -59,6 +59,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
+const USAGE_LIMITED_MESSAGE_CODE: &str = "usage_limited";
+const SMOKE_QUOTA_LIMITED_MESSAGE_CODE: &str = "smoke_quota_limited";
+const PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE: &str = "pi_route_smoke_failed";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendErrorKind {
     Unreachable,
@@ -2554,6 +2558,7 @@ fn source_health_from_verification(
             .iter()
             .any(|drift| drift.key.ends_with("config_file"));
     let patch_disabled = result.message.code == "patch_disabled";
+    let usage_limited = verification_result_is_usage_limited(result);
     let (source_state, grade, problems) = if config_has_drift {
         (
             SourceState::NeedsRepair,
@@ -2579,8 +2584,16 @@ fn source_health_from_verification(
                 retryable: true,
             }],
         )
-    } else if patch_disabled {
-        (SourceState::Healthy, HealthGrade::Ok, Vec::new())
+    } else if patch_disabled || usage_limited {
+        (
+            SourceState::Healthy,
+            if usage_limited {
+                HealthGrade::Warning
+            } else {
+                HealthGrade::Ok
+            },
+            Vec::new(),
+        )
     } else {
         match result.status {
             SourceVerificationStatus::Verified => {
@@ -2643,7 +2656,7 @@ fn source_health_from_verification(
                 result.config.fingerprint.clone(),
             )),
         }]
-    } else if result.verified || patch_disabled {
+    } else if result.verified || patch_disabled || usage_limited {
         Vec::new()
     } else {
         vec![RepairAction {
@@ -2761,6 +2774,70 @@ fn has_soft_no_fresh_telemetry_problem(health: &SourceHealth) -> bool {
         })
 }
 
+fn has_usage_limited_verification_problem(health: &SourceHealth) -> bool {
+    health.last_verified_at.is_some()
+        && !health.problems.is_empty()
+        && health.problems.iter().all(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && (problem_detail_is_usage_limited(&problem.title)
+                    || problem_detail_is_usage_limited(&problem.detail))
+        })
+}
+
+fn verification_result_is_usage_limited(result: &SourceVerificationResult) -> bool {
+    if verification_code_is_usage_limited(&result.message.code) {
+        return true;
+    }
+    let failed_routes = result
+        .route_results
+        .iter()
+        .filter(|route| !route.verified)
+        .collect::<Vec<_>>();
+    !failed_routes.is_empty()
+        && failed_routes.iter().all(|route| {
+            route
+                .error_code
+                .as_deref()
+                .is_some_and(verification_code_is_usage_limited)
+                || verification_code_is_usage_limited(&route.message.code)
+        })
+}
+
+fn verification_code_is_usage_limited(code: &str) -> bool {
+    matches!(
+        code,
+        USAGE_LIMITED_MESSAGE_CODE | SMOKE_QUOTA_LIMITED_MESSAGE_CODE
+    )
+}
+
+fn has_pi_route_smoke_failure_problem(health: &SourceHealth) -> bool {
+    health.source == SourceKind::Pi
+        && health.problems.iter().any(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && (problem
+                    .detail
+                    .contains("No Pi model routes passed smoke verification")
+                    || problem.detail.contains(PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE)
+                    || problem.title.contains("Pi route check failed"))
+        })
+}
+
+fn refreshed_pi_status_has_available_routes(refreshed: &SourceHealth) -> bool {
+    if refreshed.source != SourceKind::Pi || refreshed.state != SourceState::Healthy {
+        return false;
+    }
+    refreshed
+        .agent_status
+        .as_ref()
+        .and_then(|snapshot| snapshot.model.as_ref())
+        .is_some_and(|model| {
+            model.active_model.is_some()
+                || model.default_model.is_some()
+                || !model.available_models.is_empty()
+                || !model.available_model_details.is_empty()
+        })
+}
+
 fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
     let preserve_config_drift =
         refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
@@ -2769,7 +2846,10 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     }
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
-        && !has_soft_no_fresh_telemetry_problem(existing);
+        && !has_soft_no_fresh_telemetry_problem(existing)
+        && !has_usage_limited_verification_problem(existing)
+        && !(has_pi_route_smoke_failure_problem(existing)
+            && refreshed_pi_status_has_available_routes(refreshed));
     if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
     {
         refreshed.state = existing.state.clone();
@@ -4144,13 +4224,56 @@ mod tests {
     #[test]
     fn source_update_preserves_failed_verification_result() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
-        let mut healthy = codex_health();
-        healthy.source = SourceKind::Pi;
-        healthy.descriptor = source_descriptor(&SourceKind::Pi);
         daemon
-            .update_sources(TOKEN, vec![healthy.clone()])
+            .update_sources(TOKEN, vec![codex_health()])
             .expect("source health should update");
 
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "smoke_command_failed".to_string(),
+                text: "Codex smoke session failed before telemetry could be sent.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record failed verification");
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("fresh source scan should not clear failed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert_eq!(status.sources[0].state, SourceState::Failed);
+        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::TelemetryNotVerified
+        );
+        assert_eq!(
+            status.sources[0].recommended_actions[0].action,
+            RepairActionKind::VerifyTelemetry
+        );
+    }
+
+    #[test]
+    fn available_pi_route_status_clears_stale_aggregate_smoke_failure() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
             source: SourceKind::Pi,
             config: SourceConfigState {
@@ -4166,32 +4289,47 @@ mod tests {
             last_received_at: None,
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
-                code: "pi_route_smoke_failed".to_string(),
+                code: PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE.to_string(),
                 text: "No Pi model routes passed smoke verification.".to_string(),
             },
             route_results: Vec::new(),
         };
-
         daemon
             .record_verification_result(&result)
-            .expect("record failed verification");
-        daemon
-            .update_sources(TOKEN, vec![healthy])
-            .expect("fresh source scan should not clear failed verification");
+            .expect("record failed Pi verification");
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            let mut snapshot = available_agent_status(SourceKind::Pi, "2026-05-05T10:20:00Z");
+            snapshot.model = Some(ottto_protocol::AgentModelStatus {
+                active_model: None,
+                default_model: Some("zai-org/glm-5-maas".to_string()),
+                provider: Some("pi".to_string()),
+                available_models: vec!["zai-org/glm-5-maas".to_string()],
+                available_model_details: Vec::new(),
+                context_window_tokens: None,
+            });
+            upsert_agent_status_snapshot(&mut state, snapshot);
+        }
 
         let status = daemon.status(TOKEN).expect("status");
         assert_eq!(status.sources.len(), 1);
         assert_eq!(status.sources[0].source, SourceKind::Pi);
-        assert_eq!(status.sources[0].state, SourceState::Failed);
-        assert_eq!(status.sources[0].grade, HealthGrade::Critical);
-        assert_eq!(
-            status.sources[0].problems[0].code,
-            StableProblemCode::TelemetryNotVerified
-        );
-        assert_eq!(
-            status.sources[0].recommended_actions[0].action,
-            RepairActionKind::VerifyTelemetry
-        );
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].agent_status.is_some());
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
     }
 
     #[test]
@@ -4289,6 +4427,69 @@ mod tests {
     }
 
     #[test]
+    fn available_agent_status_clears_stale_quota_verification_problem() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut stale = codex_health();
+        stale.source = SourceKind::ClaudeCode;
+        stale.descriptor = source_descriptor(&SourceKind::ClaudeCode);
+        stale.state = SourceState::NeedsConfirmation;
+        stale.grade = HealthGrade::Warning;
+        stale.config = SourceConfigState {
+            discovered: true,
+            path_hint: None,
+            fingerprint: None,
+            drift: Vec::new(),
+        };
+        stale.last_seen_at = Some("2026-05-05T10:00:00Z".to_string());
+        stale.last_verified_at = Some("2026-05-05T10:01:00Z".to_string());
+        stale.problems = vec![HealthProblem {
+            code: StableProblemCode::TelemetryNotVerified,
+            title: "Telemetry not verified".to_string(),
+            detail: "Claude Code is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify.".to_string(),
+            retryable: true,
+        }];
+        stale.recommended_actions = Vec::new();
+        daemon
+            .update_sources(TOKEN, vec![stale])
+            .expect("seed stale quota state");
+
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(
+            before_scan.canonical_health.as_ref().unwrap().sources[0]
+                .blocking_reason
+                .as_deref(),
+            Some("smoke_quota_limited")
+        );
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].source, SourceKind::ClaudeCode);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::ClaudeCode)
+            .expect("Claude Code source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert!(source.blocking_reason.is_none());
+    }
+
+    #[test]
     fn warning_verification_without_success_never_projects_healthy() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -4353,7 +4554,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_limited_verification_projects_specific_local_health_reason() {
+    fn quota_limited_verification_projects_non_blocking_local_health() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let detail = "Claude Code is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify.";
         let result = SourceVerificationResult {
@@ -4381,6 +4582,11 @@ mod tests {
             .record_verification_result(&result)
             .expect("record quota-limited verification");
         let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+
         let health = status.canonical_health.expect("canonical health");
         let source = health
             .sources
@@ -4388,20 +4594,16 @@ mod tests {
             .find(|source| source.app == SourceKind::ClaudeCode)
             .expect("Claude Code source");
 
-        assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
         assert_eq!(source.authority, LocalHealthAuthority::Verify);
-        assert_eq!(
-            source.blocking_reason.as_deref(),
-            Some("smoke_quota_limited")
-        );
-        assert_eq!(source.clear_condition.as_deref(), Some(detail));
+        assert!(source.blocking_reason.is_none());
+        assert!(source.clear_condition.is_none());
         assert!(
             health
                 .blockers
                 .iter()
-                .any(|blocker| blocker.code == "smoke_quota_limited"
-                    && blocker.clear_condition == detail),
-            "source blocker should preserve the display-safe quota guidance"
+                .all(|blocker| blocker.code != "smoke_quota_limited"),
+            "quota-only verification should not produce a source blocker"
         );
     }
 
