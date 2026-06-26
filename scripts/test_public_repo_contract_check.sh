@@ -264,6 +264,38 @@ fi
 grep -q "Codex skill must not reference private monorepo install paths" \
   /tmp/public-contract-broken-adapter-path.out
 
+broken_adapter_metadata="$tmp_dir/broken-adapter-metadata"
+cp -R "$output_dir" "$broken_adapter_metadata"
+cat >> "$broken_adapter_metadata/agent-adapters/claude-code-skill/SKILL.md" <<'EOF'
+
+allowed-tools:
+  - Bash
+hooks:
+  PreToolUse: []
+statusLine:
+  command: ottto status --json
+EOF
+cat >> "$broken_adapter_metadata/agent-adapters/codex-skill/agents/openai.yaml" <<'EOF'
+tools:
+  - shell
+status-line:
+  command: ottto status --json
+EOF
+if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_metadata" >/tmp/public-contract-broken-adapter-metadata.out 2>&1; then
+  echo "Expected contract check to fail when adapter metadata pregrants tools or hooks" >&2
+  exit 1
+fi
+grep -q "Claude Code skill must not pregrant tools" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Claude Code skill must not define hooks metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Claude Code skill must not define status-line metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Codex agent manifest must not pregrant tools" \
+  /tmp/public-contract-broken-adapter-metadata.out
+grep -q "Codex agent manifest must not define status-line metadata" \
+  /tmp/public-contract-broken-adapter-metadata.out
+
 pin_private="$tmp_dir/pin-private"
 write_valid_private_consumers "$pin_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
 bad_pin="$tmp_dir/bad-pin.json"

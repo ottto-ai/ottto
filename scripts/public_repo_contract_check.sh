@@ -767,6 +767,8 @@ def check_agent_adapter_contracts() -> None:
             "forbidden": [
                 ("allowed-tools:", "Codex skill must not pregrant tools"),
                 ("hooks:", "Codex skill must not install hooks"),
+                ("statusline:", "Codex skill must not install status-line metadata"),
+                ("status-line:", "Codex skill must not install status-line metadata"),
                 ("tools/ottto-local-platform", "Codex skill must not reference private monorepo install paths"),
             ],
         },
@@ -784,6 +786,8 @@ def check_agent_adapter_contracts() -> None:
             "forbidden": [
                 ("allowed-tools:", "Claude Code skill must not pregrant tools"),
                 ("hooks:", "Claude Code skill must not define hooks metadata"),
+                ("statusline:", "Claude Code skill must not define status-line metadata"),
+                ("status-line:", "Claude Code skill must not define status-line metadata"),
                 ("tools/ottto-local-platform", "Claude Code skill must not reference private monorepo install paths"),
             ],
         },
@@ -796,6 +800,8 @@ def check_agent_adapter_contracts() -> None:
                 ("tools:", "Codex agent manifest must not pregrant tools"),
                 ("mcp", "Codex agent manifest must not advertise MCP for public v1"),
                 ("hooks:", "Codex agent manifest must not define hooks"),
+                ("statusline:", "Codex agent manifest must not define status-line metadata"),
+                ("status-line:", "Codex agent manifest must not define status-line metadata"),
             ],
         },
     }
