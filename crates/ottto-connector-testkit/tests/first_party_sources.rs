@@ -226,12 +226,6 @@ fn assert_collector_fixture(
         fixture.payload.collector_id,
         collector.manifest.collector_id
     );
-    assert!(
-        !fixture.payload.upload_policy.boundary.trim().is_empty(),
-        "{} upload boundary is empty",
-        fixture.path.display()
-    );
-
     for input_path in &fixture.payload.input_fixture_paths {
         let unresolved = fixture.path.parent().unwrap().join(input_path);
         let resolved = fs::canonicalize(&unresolved)
@@ -277,6 +271,7 @@ fn assert_collector_fixture(
         collector_id: &fixture.payload.collector_id,
         upload_policy: FixtureUploadPolicyContract {
             uploads_raw_content: fixture.payload.upload_policy.uploads_raw_content,
+            boundary: &fixture.payload.upload_policy.boundary,
             redacts: &redacts,
         },
         emitted_records: &emitted_records,

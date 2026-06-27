@@ -117,8 +117,9 @@ contributors:
   manifest id and emitted-record validators, and the shared redaction
   vocabulary for safe collector fixtures.
 - `ottto-connector-testkit` owns contract assertion helpers for source
-  manifests, collector manifests, fixture upload policy, emitted-record names,
-  duplicate ids, forbidden v1 fields, and raw-content sample keys.
+  manifests, collector manifests, fixture upload policy boundaries,
+  emitted-record names, duplicate ids, forbidden v1 fields, and raw-content
+  sample keys.
 - `ottto-connector-testkit/tests/first_party_sources.rs` exercises the
   checked-in Codex, Claude Code, and Pi packages with those public helper APIs,
   so the first-party packages stay usable as contributor examples.
@@ -128,7 +129,9 @@ logic:
 
 ```rust
 use ottto_connector_testkit::{
-    assert_collector_manifest_contract, CollectorManifestContract,
+    assert_collector_fixture_contract, assert_collector_manifest_contract,
+    CollectorFixtureContract, CollectorManifestContract, EmittedRecordContract,
+    FixtureUploadPolicyContract,
 };
 
 let manifest = CollectorManifestContract {
@@ -160,6 +163,29 @@ let manifest = CollectorManifestContract {
 };
 
 assert_collector_manifest_contract(&manifest).unwrap();
+
+let fixture = CollectorFixtureContract {
+    source_id: "codex",
+    collector_id: "local_sessions",
+    upload_policy: FixtureUploadPolicyContract {
+        uploads_raw_content: false,
+        boundary: "Aggregate usage and collector health only.",
+        redacts: &[
+            "prompt",
+            "response",
+            "tool_output",
+            "command_output",
+            "local_path",
+            "credential",
+        ],
+    },
+    emitted_records: &[EmittedRecordContract {
+        record_type: "local_usage_snapshots",
+        sample_key_paths: &["usage.input_tokens", "usage.output_tokens"],
+    }],
+};
+
+assert_collector_fixture_contract(&manifest, &fixture).unwrap();
 ```
 
 ## Review Tiers
