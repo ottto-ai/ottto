@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 217,
-  "content_sha256": "f7c7e8726b97867c5e5a54c7c9fece3717a65e222fd7abe6a5e1db3e354a5a66",
+  "candidate_file_count": 210,
+  "content_sha256": "297a1235843f2655a7b2d3886c0c241eabdacdd18e35e22bfd9fa6330818e7d1",
   "files": [
     {
       "executable": false,
@@ -118,8 +118,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "7d758554c52a1c356db2a516830e975a774084c2b3294b4aaaba40800f925c4f",
-      "size_bytes": 11734
+      "sha256": "a1a604c8c19a4576a2c86470ed93a742995a3480b4336c2a6668f1002dc801a7",
+      "size_bytes": 11718
     },
     {
       "executable": false,
@@ -321,8 +321,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/pi/README.md",
-      "sha256": "19103aa59e95e3277797b6f2e511a68215cdfc18b9242706c6ad8205e690d50a",
-      "size_bytes": 1314
+      "sha256": "fa83d64bf19c05ab620b1772cac98681fb697756d4d86121625d36efde002edf",
+      "size_bytes": 1183
     },
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "28f6b64ea9fc8af9561deaeb6332060cfdef29ab694551ff52b798e8c889e7c3",
-      "size_bytes": 140418
+      "sha256": "b78e40d03faba1cc8f2d4d3d88072820c45b18fc5103ffc2d6a42f01fbf27ec8",
+      "size_bytes": 127850
     },
     {
       "executable": false,
@@ -447,8 +447,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/src/lib.rs",
-      "sha256": "357f79eceeca0709517e9d3a2373805f881079323621a08cd1c120d720f04304",
-      "size_bytes": 33082
+      "sha256": "5d58c7d0a71a297a87e926ae323cc4f03607a35c2e073a90754cbbcecc807053",
+      "size_bytes": 26779
     },
     {
       "executable": false,
@@ -510,8 +510,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/redaction.rs",
-      "sha256": "7212d06d5d0714452f236ad5b24e81b9e95cc01e69ccad2d09b37a7c32aa31ad",
-      "size_bytes": 25578
+      "sha256": "88c116d325427e3abedb34f6b08895ccc5ce06ff4cbef5ea639c00d0459f054f",
+      "size_bytes": 23802
     },
     {
       "executable": false,
@@ -622,8 +622,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "4c99c0c8564d04cf656ef49aec6edd9264ca2e89b24649e161d11c65506855b7",
-      "size_bytes": 544063
+      "sha256": "8e6fefda62ba9aaac9b9144feeb4fe0682a69c146843e5563dd811044e8190c2",
+      "size_bytes": 537875
     },
     {
       "executable": false,
@@ -678,15 +678,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "1e972e85667a88d53a98010295d174dac74b1b83271eb0274d8ba10c034494e9",
-      "size_bytes": 30530
+      "sha256": "4688ce5414d588bf6fb35ba0369a8b94959e5eb89d7830a4dcb08ebd4e34f8a6",
+      "size_bytes": 24749
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "ffff72fe72323c52c8689f5f14acd5143e139e6a26e63f7d8bbabf153a88cf49",
-      "size_bytes": 66650
+      "sha256": "3adc84e931aa3538f75c5934abd5c5a845c38e9aff42520c50413104f82fab95",
+      "size_bytes": 65398
     },
     {
       "executable": false,
@@ -699,15 +699,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "18332da579ab92018a726ea2bfd1de112f7b07328887a73e5128c913d43950f6",
-      "size_bytes": 306609
+      "sha256": "47f05ec5457c9d0f63e7f15b36b77d75852b8049dbf5b410475f407ee1028e23",
+      "size_bytes": 317009
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/unix_socket.rs",
-      "sha256": "e933b429a65990d42682037d773626ad04aded31204f2e4ac6e7f744c07b9094",
-      "size_bytes": 19439
+      "sha256": "180e83798a9e0914b9eac615b6eced59e4fd80af4ff982a3d2d061c4332d7676",
+      "size_bytes": 15085
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/agent-adapters.md",
-      "sha256": "1bb9e53bcba706eaec61864f0999670336325bd628f81392425dd4fba0f5c799",
-      "size_bytes": 2499
+      "sha256": "838689e83e6fbc48d916a2ca4954750c29df597fe0244c5cd21b402e4a6a4c82",
+      "size_bytes": 2354
     },
     {
       "executable": false,
@@ -748,15 +748,15 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/diagnostics.md",
-      "sha256": "e491d6b1ac05d503f6734c48ec6638b5c131c697c5b7f16b8d53e3fffff7c74e",
-      "size_bytes": 1606
+      "sha256": "a10ae2f337cdd631caca57cef4576b9565e74c1088c045f1d9e20562e442d7ef",
+      "size_bytes": 1469
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "docs/examples.md",
-      "sha256": "1328e921faaf815e78ffa39b93452e8507ffe6461113014d4058457f85b5232a",
-      "size_bytes": 2597
+      "sha256": "240f66efb877ce54b35d3461b85d5508028c13106e1e8c3d3394cd6c6ac928b9",
+      "size_bytes": 2459
     },
     {
       "executable": false,
@@ -790,8 +790,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/setup.md",
-      "sha256": "84bf2f551baf58c11812bb50d0d22458ab6b7c66d448b948dcaf765a2de7e6f7",
-      "size_bytes": 3119
+      "sha256": "dd42039c8c8782ad038d0087b074163a69feda54950efa514159cdbfe2461f9d",
+      "size_bytes": 2278
     },
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/troubleshooting.md",
-      "sha256": "5e50489bce42d39ab0905c60b266a50cceb938b62f805cfcf4f868622a639d0c",
-      "size_bytes": 3645
+      "sha256": "8b22a033a2a8d02ab4badedd9e40c37f35c605a02bd691f9f4a13d0a90ab720b",
+      "size_bytes": 3290
     },
     {
       "executable": false,
@@ -834,20 +834,6 @@
       "path": "fixtures/cli/apps-status-pi-request.json",
       "sha256": "2db7d4c2761210c069e1b98c7f86b47206fa0bdf40568803575ab04a6982dabb",
       "size_bytes": 183
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "fixtures/cli/context-request.json",
-      "sha256": "488498074080316954870328a966bf8f530a0dc9f3c079776a22b86f34414fff",
-      "size_bytes": 475
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "fixtures/cli/costs-request.json",
-      "sha256": "4bccd8b9b7e8a9bd2759bf134f92a59944456397a4213eee71501b525b7eda50",
-      "size_bytes": 483
     },
     {
       "executable": false,
@@ -887,13 +873,6 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "fixtures/cli/fix-codex-request.json",
-      "sha256": "93fde2d218c4cc59eb1bc1f2518900cc309f0d199773c07a9fbf4fede90c8bfb",
-      "size_bytes": 187
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "fixtures/cli/help-contract.txt",
       "sha256": "ea054652fd786c0775d29e20748246f9a12d9f080c4b8abb708d13ca18e1c4ac",
       "size_bytes": 20107
@@ -922,30 +901,9 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "fixtures/cli/provider-impact-request.json",
-      "sha256": "288faa64d269a100922f8c42aa2466d403dd1e44d8ab8d026e862aa9534fc74a",
-      "size_bytes": 440
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "fixtures/cli/recommendations-request.json",
-      "sha256": "fd582e8c82729e0bf1ff7c1315446daae29a2fbdcbb3bf902c424b0698c32081",
-      "size_bytes": 182
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "fixtures/cli/sessions-request.json",
-      "sha256": "85e46d1b31ebba596dc7832009331f28f36068988c7bda4e1dcccaa42106fde5",
-      "size_bytes": 660
-    },
-    {
-      "executable": false,
-      "mode": "0644",
       "path": "fixtures/cli/setup-browser-claim-output.json",
-      "sha256": "8ae7a0bcdb988c78d57d67cdffeee27e343f05ab72c3a3f219cba874386e2401",
-      "size_bytes": 839
+      "sha256": "7e1f7994422e2f7badfd831aa3f8eb8827de5cff4295e5cbf3d1a17f7ff96399",
+      "size_bytes": 650
     },
     {
       "executable": false,
@@ -965,15 +923,15 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/setup-needs-user-action-output.json",
-      "sha256": "513baf47807b223188d51522a3769398ea54c5a21d856830d82ea91fd2e78026",
-      "size_bytes": 610
+      "sha256": "4b5e2e8f4f7af3342fbe615e79ffa016aacb0ae8ebab3a011047f1304a243e78",
+      "size_bytes": 417
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/cli/setup-timed-out-output.json",
-      "sha256": "eabda93e84f5a7394300ee964b6a5fdb68b0615ed56b732d801584df0cfbeed2",
-      "size_bytes": 563
+      "sha256": "74cec9552f8b6a582187df6df39bd8f7b668523da1e5b53ddd23cc809b75df8f",
+      "size_bytes": 365
     },
     {
       "executable": false,
@@ -988,13 +946,6 @@
       "path": "fixtures/cli/status-watch-output.ndjson",
       "sha256": "9bafae616f8e298643a4da851567339ced736166ca3405f3d7bf8ab099777d9b",
       "size_bytes": 243
-    },
-    {
-      "executable": false,
-      "mode": "0644",
-      "path": "fixtures/cli/uninstall-request.json",
-      "sha256": "17fc5c9dae323559406b57194fc658afcbcb06da6d559542ca520fc606c8488a",
-      "size_bytes": 176
     },
     {
       "executable": false,
@@ -1028,8 +979,8 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/diagnostics/redacted-bundle.json",
-      "sha256": "b60eb3012b6f652e7d796083b414efad0cfdb28859b3858e130fb6df06f84ece",
-      "size_bytes": 3074
+      "sha256": "36355e965b447131b75f5195de2072ab2589883cb872fc6079ad26b6a8d39e79",
+      "size_bytes": 3082
     },
     {
       "executable": false,
@@ -1294,8 +1245,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "aead06531d9b176841bfb051cba276ba3f3d849201581474496211047c9d2e61",
-      "size_bytes": 96212
+      "sha256": "02cc050cdef6fed1bb00da17de7f29fa3dd3c05566ca545d0657ea88a606bf64",
+      "size_bytes": 51062
     },
     {
       "executable": true,
@@ -1469,8 +1420,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "54352deaa71a2595c96361560f91237458ab8b15f6dcd975956243150176e90d",
-      "size_bytes": 70277
+      "sha256": "6dec1fb77b60140a0a440e9eeb7527ca735ce12cf9d44002fd502df7d3657728",
+      "size_bytes": 17835
     },
     {
       "executable": true,
@@ -1522,9 +1473,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-28T13:48:53+00:00",
+  "generated_at": "2026-06-27T17:53:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 218,
+  "output_file_count": 211,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1557,5 +1508,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e071ef1d400cad89da5d94ed6bf7036fc40548ad"
+  "source_commit": "f4ecd941c82e5bc6bdae97f85b9e02a31a7bd1cc"
 }
