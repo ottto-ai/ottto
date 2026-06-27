@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "c41e91d723be400e8228d0c742906c694cb70ce1a0fad1b58e564aba4a8a4aae",
+  "content_sha256": "8fe4386b91d1fb8600f1a020dd38a6e7cd80af780d1bac064a4bcb6cd75c7907",
   "files": [
     {
       "executable": false,
@@ -1427,8 +1427,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_cutover_closeout.sh",
-      "sha256": "5e5e356ff2c735580ac97bd0e900a56035eea02529ae7e6cef7a33ff54878463",
-      "size_bytes": 7888
+      "sha256": "6c612e172e253b2c6b02e8a2b637f08dcc23209bd7a241077d06fde674cfe790",
+      "size_bytes": 9579
     },
     {
       "executable": true,

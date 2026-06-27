@@ -105,6 +105,50 @@ if "$CLOSEOUT_SCRIPT" \
 fi
 grep -q "bootstrap report bundle digest does not match target manifest" /tmp/public-cutover-closeout-bad-report.out
 
+python3 - "$apply_report" "$tmp_dir/bad-bootstrap-output-count.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+report["bundle"]["output_file_count"] = report["bundle"]["output_file_count"] + 1
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(report, handle)
+PY
+if "$CLOSEOUT_SCRIPT" \
+  --target-dir "$target" \
+  --bootstrap-report "$tmp_dir/bad-bootstrap-output-count.json" \
+  --report "$tmp_dir/bad-bootstrap-output-count-closeout.json" \
+  --skip-surface-ci \
+  >/tmp/public-cutover-closeout-bad-bootstrap-output-count.out 2>&1; then
+  echo "Expected mismatched bootstrap output count to fail closeout" >&2
+  exit 1
+fi
+grep -q "bootstrap report output file count does not match target manifest" \
+  /tmp/public-cutover-closeout-bad-bootstrap-output-count.out
+
+python3 - "$apply_report" "$tmp_dir/bad-bootstrap-post-apply.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+report["post_apply_public_checks"]["contract"] = "skipped"
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(report, handle)
+PY
+if "$CLOSEOUT_SCRIPT" \
+  --target-dir "$target" \
+  --bootstrap-report "$tmp_dir/bad-bootstrap-post-apply.json" \
+  --report "$tmp_dir/bad-bootstrap-post-apply-closeout.json" \
+  --skip-surface-ci \
+  >/tmp/public-cutover-closeout-bad-bootstrap-post-apply.out 2>&1; then
+  echo "Expected missing post-apply public check evidence to fail closeout" >&2
+  exit 1
+fi
+grep -q "bootstrap report does not record passed post-apply public checks" \
+  /tmp/public-cutover-closeout-bad-bootstrap-post-apply.out
+
 python3 - "$apply_report" "$tmp_dir/bad-bootstrap-remote.json" <<'PY'
 import json
 import sys
