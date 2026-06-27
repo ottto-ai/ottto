@@ -5927,6 +5927,97 @@ mod tests {
     }
 
     #[test]
+    fn claude_attribution_capture_lifts_only_present_markers_mixed() {
+        // Real-world top-level (non-subagent) transcript shape: the line carries
+        // MCP-server/MCP-tool + skill attribution but NO `attributionAgent`
+        // (subagent attribution lives in the child `subagents/*.jsonl`
+        // transcripts, which the daemon walk already ingests as standalone
+        // sidechain sessions). Assert capture lifts exactly the present markers
+        // and invents nothing for the absent ones — complements the
+        // all-five-present and none-present cases above with the realistic
+        // partial shape.
+        let line: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"attr-top-level\",",
+            "\"attributionSkill\":\"design-sync\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":48}}}"
+        ))
+        .expect("parse line");
+
+        let mut selector = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut selector, true);
+
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_skill")
+                .map(String::as_str),
+            Some("design-sync")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_server")
+                .map(String::as_str),
+            Some("claude-in-chrome")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("tabs_context_mcp")
+        );
+        // No subagent / plugin markers on this line: they must be absent, not
+        // empty-string placeholders.
+        assert!(
+            !selector.context.contains_key("attribution_subagent"),
+            "absent attributionAgent must not synthesize an attribution_subagent key"
+        );
+        assert!(
+            !selector.context.contains_key("attribution_plugin"),
+            "absent attributionPlugin must not synthesize an attribution_plugin key"
+        );
+    }
+
+    #[test]
+    fn claude_attribution_capture_is_per_turn_isolated() {
+        // Core per-turn discipline: capture runs on the per-LINE selector, so an
+        // attribution marker on one turn's line must NOT bleed onto a later
+        // turn's line. Each line gets its own SelectorCapture; the second
+        // (unattributed) line must surface no attribution from the first.
+        let attributed: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
+        ))
+        .expect("parse attributed line");
+        let unattributed: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
+        ))
+        .expect("parse unattributed line");
+
+        let mut first = SelectorCapture::default();
+        capture_claude_attribution(&attributed, &mut first, true);
+        let mut second = SelectorCapture::default();
+        capture_claude_attribution(&unattributed, &mut second, true);
+
+        assert_eq!(
+            first
+                .context
+                .get("attribution_subagent")
+                .map(String::as_str),
+            Some("general-purpose"),
+            "the attributed turn must carry its own subagent"
+        );
+        assert!(
+            second.is_empty(),
+            "a later unattributed turn must not inherit the prior turn's subagent attribution"
+        );
+    }
+
+    #[test]
     fn codex_logs2_reader_collects_priority_turns_from_sqlite() {
         let codex_dir = temp_dir("codex-logs2-reader");
         let db_path = codex_dir.join("logs_2.sqlite");
