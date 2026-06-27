@@ -11,6 +11,7 @@ use crate::snapshot_client::{
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
+    UploadFailureDiagnostics,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, scan_source_roots_with_artifacts,
@@ -322,8 +323,9 @@ fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadF
 }
 
 fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> bool {
+    let safe = safe_error(error);
     matches!(
-        safe_error(error),
+        safe.as_str(),
         "relay device credentials are unavailable" | "machine identity is unavailable"
     ) || error
         .to_string()
@@ -958,43 +960,46 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
         .and_then(|value| value.format(&Rfc3339).ok())
 }
 
-pub(crate) fn safe_error(error: &anyhow::Error) -> &'static str {
+pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
+        return diagnostics.safe_message();
+    }
     let text = error.to_string();
     if text.contains("relay device") {
-        "relay device credentials are unavailable"
+        "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
-        "machine identity is unavailable"
+        "machine identity is unavailable".to_string()
     } else if text.contains("issue relay token failed") {
-        "relay token request failed"
+        "relay token request failed".to_string()
     } else if text.contains("backend rejected local health projection") {
-        "local health projection rejected"
+        "local health projection rejected".to_string()
     } else if text.contains("backend rejected local health authorization") {
-        "local health authorization rejected"
+        "local health authorization rejected".to_string()
     } else if text.contains("get activity hint failed") {
-        "activity hint request failed"
+        "activity hint request failed".to_string()
     } else if text.contains("upload agent status failed")
         || text.contains("agent status upload failed")
     {
-        "agent status upload failed"
+        "agent status upload failed".to_string()
     } else if text.contains("scan local snapshots") {
-        "local snapshot scan failed"
+        "local snapshot scan failed".to_string()
     } else if text.contains("daemon/backend contract preflight")
         || text.contains("backend rejected snapshot batch payload")
     {
-        "local snapshot payload validation failed"
+        "local snapshot payload validation failed".to_string()
     } else if text.contains("upload local snapshots")
         || text.contains("upload snapshot batch failed")
     {
-        "local snapshot upload failed"
+        "local snapshot upload failed".to_string()
     } else if text.contains("report snapshot status failed") {
-        "local collector status upload failed"
+        "local collector status upload failed".to_string()
     } else if text.contains("mcp inventory")
         || text.contains("mcp handshake")
         || text.contains("mcp server")
     {
-        "mcp inventory sync failed"
+        "mcp inventory sync failed".to_string()
     } else {
-        "sync failed"
+        "sync failed".to_string()
     }
 }
 
@@ -1157,6 +1162,31 @@ mod tests {
 
     #[test]
     fn safe_error_reports_sync_phase_without_raw_details() {
+        let snapshot_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            true,
+        ))
+        .context("upload local snapshots");
+        assert_eq!(
+            safe_error(&snapshot_error),
+            "local snapshot upload failed (endpoint=snapshot_batch, status_family=http_5xx, retryable=true, request_id=present)"
+        );
+
+        let agent_status_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "agent status upload",
+            "agent_status",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert_eq!(
+            safe_error(&agent_status_error),
+            "agent status upload failed (endpoint=agent_status, status_family=transport_timeout, retryable=true, request_id=absent)"
+        );
+
         assert_eq!(
             safe_error(&anyhow!("upload agent status failed: HTTP 500")),
             "agent status upload failed"

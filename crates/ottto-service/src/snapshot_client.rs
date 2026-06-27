@@ -120,6 +120,84 @@ impl std::fmt::Display for LocalHealthAuthorizationRejected {
 
 impl std::error::Error for LocalHealthAuthorizationRejected {}
 
+/// Redacted upload failure classification for field diagnostics. This never
+/// carries raw response bodies, request IDs, tokens, account IDs, or machine IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFailureDiagnostics {
+    operation: &'static str,
+    endpoint: &'static str,
+    status_family: &'static str,
+    retryable: bool,
+    request_id_present: bool,
+}
+
+impl UploadFailureDiagnostics {
+    fn http(
+        operation: &'static str,
+        endpoint: &'static str,
+        status: u16,
+        response: &ureq::Response,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: http_status_family(status),
+            retryable: http_status_retryable(status),
+            request_id_present: response_has_request_id(response),
+        }
+    }
+
+    fn transport(operation: &'static str, endpoint: &'static str, error: &ureq::Error) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: transport_status_family(error),
+            retryable: true,
+            request_id_present: false,
+        }
+    }
+
+    pub fn safe_message(&self) -> String {
+        format!(
+            "{} failed (endpoint={}, status_family={}, retryable={}, request_id={})",
+            self.operation,
+            self.endpoint,
+            self.status_family,
+            self.retryable,
+            if self.request_id_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation: &'static str,
+        endpoint: &'static str,
+        status_family: &'static str,
+        retryable: bool,
+        request_id_present: bool,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family,
+            retryable,
+            request_id_present,
+        }
+    }
+}
+
+impl std::fmt::Display for UploadFailureDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.safe_message())
+    }
+}
+
+impl std::error::Error for UploadFailureDiagnostics {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActivityHintResponse {
     pub source: String,
@@ -276,7 +354,19 @@ impl SnapshotApiClient {
                 ureq::Error::Status(status @ (401 | 403), _response) => {
                     anyhow::Error::new(RelayTokenAuthorizationRejected { status })
                 }
-                other => anyhow!("issue relay token failed: {other}"),
+                ureq::Error::Status(status, response) => {
+                    anyhow::Error::new(UploadFailureDiagnostics::http(
+                        "relay token request",
+                        "relay_token",
+                        status,
+                        &response,
+                    ))
+                }
+                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "relay token request",
+                    "relay_token",
+                    &other,
+                )),
             })?
             .into_json()
             .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
@@ -327,7 +417,19 @@ impl SnapshotApiClient {
                     body_excerpt: response_body_excerpt(response),
                 }))
             }
-            Err(error) => Err(anyhow!("upload snapshot batch failed: {error}")),
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "local snapshot upload",
+                    "snapshot_batch",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "local snapshot upload",
+                "snapshot_batch",
+                &error,
+            ))),
         }
     }
 
@@ -351,14 +453,30 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &AgentStatusSnapshotUploadRequest,
     ) -> Result<AgentStatusSnapshotUploadResponse> {
-        self.agent
+        match self
+            .agent
             .post(&self.api_url("/api/v1/agent-status/snapshots"))
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
-            .map_err(|error| anyhow!("upload agent status failed: {error}"))?
-            .into_json()
-            .map_err(|error| anyhow!("parse agent status response failed: {error}"))
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse agent status response failed: {error}")),
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "agent status upload",
+                    "agent_status",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "agent status upload",
+                "agent_status",
+                &error,
+            ))),
+        }
     }
 
     /// POST a configured-MCP inventory capture to the footprint ingest endpoint.
@@ -462,6 +580,56 @@ fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
         .build()
 }
 
+fn http_status_family(status: u16) -> &'static str {
+    match status {
+        400..=499 => {
+            if status == 429 {
+                "http_429"
+            } else {
+                "http_4xx"
+            }
+        }
+        500..=599 => "http_5xx",
+        300..=399 => "http_3xx",
+        _ => "http_other",
+    }
+}
+
+fn http_status_retryable(status: u16) -> bool {
+    status == 408
+        || status == 409
+        || status == 425
+        || status == 429
+        || (500..=599).contains(&status)
+}
+
+fn transport_status_family(error: &ureq::Error) -> &'static str {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("timeout") {
+        "transport_timeout"
+    } else if text.contains("dns") || text.contains("resolve") {
+        "transport_dns"
+    } else if text.contains("tls") || text.contains("certificate") {
+        "transport_tls"
+    } else if text.contains("connection") || text.contains("connect") {
+        "transport_connection"
+    } else {
+        "transport_error"
+    }
+}
+
+fn response_has_request_id(response: &ureq::Response) -> bool {
+    [
+        "x-request-id",
+        "x-correlation-id",
+        "x-amzn-requestid",
+        "x-amz-request-id",
+        "x-amz-cf-id",
+    ]
+    .iter()
+    .any(|header| response.header(header).is_some())
+}
+
 fn response_body_excerpt(response: ureq::Response) -> Option<String> {
     response
         .into_string()
@@ -545,6 +713,30 @@ mod tests {
         assert!(err.to_string().contains("401"));
         assert!(err.to_string().contains("authorization"));
         assert!(err.downcast_ref::<BatchRejected>().is_none());
+    }
+
+    #[test]
+    fn upload_failure_diagnostics_are_classified_and_redacted() {
+        assert_eq!(http_status_family(500), "http_5xx");
+        assert_eq!(http_status_family(429), "http_429");
+        assert_eq!(http_status_family(404), "http_4xx");
+        assert!(http_status_retryable(500));
+        assert!(http_status_retryable(429));
+        assert!(!http_status_retryable(404));
+
+        let diagnostics = UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            true,
+        );
+        assert_eq!(
+            diagnostics.safe_message(),
+            "local snapshot upload failed (endpoint=snapshot_batch, status_family=http_5xx, retryable=true, request_id=present)"
+        );
+        assert!(!diagnostics.safe_message().contains("req_"));
+        assert!(!diagnostics.safe_message().contains("Bearer"));
     }
 
     #[test]
