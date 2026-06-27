@@ -296,6 +296,38 @@ grep -q "Codex agent manifest must not pregrant tools" \
 grep -q "Codex agent manifest must not define status-line metadata" \
   /tmp/public-contract-broken-adapter-metadata.out
 
+broken_adapter_required="$tmp_dir/broken-adapter-required"
+cp -R "$output_dir" "$broken_adapter_required"
+python3 - "$broken_adapter_required" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+codex_skill = root / "agent-adapters/codex-skill/SKILL.md"
+codex_text = codex_skill.read_text(encoding="utf-8")
+codex_text = codex_text.replace(
+    "Always pass `--json`",
+    "Prefer structured output",
+)
+codex_skill.write_text(codex_text, encoding="utf-8")
+
+claude_skill = root / "agent-adapters/claude-code-skill/SKILL.md"
+claude_text = claude_skill.read_text(encoding="utf-8")
+claude_text = claude_text.replace(
+    "Do not ask users to paste support claims into public issues or chat",
+    "Support claims may be pasted into chat",
+)
+claude_skill.write_text(claude_text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_required" >/tmp/public-contract-broken-adapter-required.out 2>&1; then
+  echo "Expected contract check to fail when adapter skills lose required safety instructions" >&2
+  exit 1
+fi
+grep -q "Codex skill must require JSON output for consumed CLI responses" \
+  /tmp/public-contract-broken-adapter-required.out
+grep -q "Claude Code skill must keep support claims out of chat" \
+  /tmp/public-contract-broken-adapter-required.out
+
 pin_private="$tmp_dir/pin-private"
 write_valid_private_consumers "$pin_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
 bad_pin="$tmp_dir/bad-pin.json"
