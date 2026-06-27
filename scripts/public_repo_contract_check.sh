@@ -327,6 +327,7 @@ DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS = (
     (re.compile(r"(?i)(^|[\s:=])Bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "bearer token"),
     (re.compile(r"(?i)(^|[\s:=])x-api-key\s*[:=]\s*[A-Za-z0-9._-]{8,}"), "API key header"),
     (re.compile(r"\b(?:ghp|github_pat|sk|xox[baprs])[-_A-Za-z0-9]{8,}\b"), "secret token"),
+    (re.compile(r"\bsupport_[A-Za-z0-9]{6,}\b"), "support claim"),
     (re.compile(r"\b(?:org|usr|acct)_[A-Za-z0-9]{6,}\b"), "account identifier"),
     (re.compile(r"\b(?:machine|otm|device)_[A-Za-z0-9]{6,}\b"), "machine identifier"),
     (re.compile(r"(?:^|\s)(?:/Users|/private|/var|/tmp|/etc|/opt|/Applications)/[^\s]+"), "local path"),
