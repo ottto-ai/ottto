@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 214,
-  "content_sha256": "966dca5d59cd71184e61019278cedffb97410ac5694c800902fae74f0df10411",
+  "candidate_file_count": 215,
+  "content_sha256": "0e4584355eea6167662173568eed5ae0bb13cd06956c6d3078cdc5a24e2dcf03",
   "files": [
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "a3581c2fc46e907571da75602164fcec4ff82b43da614c5e311812d7071dea65",
-      "size_bytes": 133945
+      "sha256": "bf617920b2714b1d0c9d40ca8e476f50afa0e5de57ff53bba68c0f015fb86154",
+      "size_bytes": 134662
     },
     {
       "executable": false,
@@ -918,6 +918,13 @@
       "path": "fixtures/cli/provider-impact-request.json",
       "sha256": "288faa64d269a100922f8c42aa2466d403dd1e44d8ab8d026e862aa9534fc74a",
       "size_bytes": 440
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/recommendations-request.json",
+      "sha256": "fd582e8c82729e0bf1ff7c1315446daae29a2fbdcbb3bf902c424b0698c32081",
+      "size_bytes": 182
     },
     {
       "executable": false,
@@ -1501,9 +1508,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-27T23:26:04Z",
+  "generated_at": "2026-06-27T23:39:06Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 215,
+  "output_file_count": 216,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",

@@ -3388,6 +3388,26 @@ mod tests {
     }
 
     #[test]
+    fn recommendations_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Recommendations(RecommendationsArgs { json: true }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_recommendations_fixture".to_string();
+
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/recommendations-request.json"),
+        );
+    }
+
+    #[test]
     fn provider_impact_builds_agent_provider_impact_request() {
         let cli = Cli::parse_from([
             "ottto",
