@@ -49,6 +49,7 @@ pub struct CollectorFixtureContract<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct FixtureUploadPolicyContract<'a> {
     pub uploads_raw_content: bool,
+    pub boundary: &'a str,
     pub redacts: &'a [&'a str],
 }
 
@@ -332,6 +333,7 @@ pub fn assert_collector_fixture_contract(
             collector_id: fixture.collector_id.to_string(),
         });
     }
+    require_non_empty("upload_policy.boundary", fixture.upload_policy.boundary)?;
     assert_required_redactions(fixture.upload_policy.redacts)?;
     assert_unique_ids(
         "record_type",
@@ -682,6 +684,7 @@ mod tests {
             collector_id: "local_sessions",
             upload_policy: FixtureUploadPolicyContract {
                 uploads_raw_content: false,
+                boundary: "Aggregate usage and collector health only.",
                 redacts: &[
                     "prompt",
                     "response",
@@ -706,6 +709,25 @@ mod tests {
         assert!(assert_collector_fixture_contract(&manifest, &fixture).is_ok());
 
         let fixture = CollectorFixtureContract {
+            upload_policy: FixtureUploadPolicyContract {
+                boundary: " ",
+                ..fixture.upload_policy
+            },
+            ..fixture
+        };
+        let error = assert_collector_fixture_contract(&manifest, &fixture).unwrap_err();
+        assert_eq!(
+            error,
+            ConnectorTestkitError::EmptyField {
+                field: "upload_policy.boundary".to_string()
+            }
+        );
+
+        let fixture = CollectorFixtureContract {
+            upload_policy: FixtureUploadPolicyContract {
+                boundary: "Aggregate usage and collector health only.",
+                ..fixture.upload_policy
+            },
             emitted_records: &[EmittedRecordContract {
                 record_type: "local_usage_snapshots",
                 sample_key_paths: &["payload.raw_prompt"],
@@ -749,6 +771,7 @@ mod tests {
             collector_id: "local_sessions",
             upload_policy: FixtureUploadPolicyContract {
                 uploads_raw_content: false,
+                boundary: "Aggregate usage and collector health only.",
                 redacts: &[
                     "prompt",
                     "response",

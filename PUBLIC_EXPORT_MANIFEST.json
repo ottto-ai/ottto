@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "8fe4386b91d1fb8600f1a020dd38a6e7cd80af780d1bac064a4bcb6cd75c7907",
+  "content_sha256": "99e24934f5286b6dcd81f1a9ef6cce24f1fab2a337d62fa6b9db5c9e89c0c471",
   "files": [
     {
       "executable": false,
@@ -118,8 +118,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "af657f628884ba006bd3368aad081f3ce79d9f0fd91b6da2d2a6be5f1c4f98c4",
-      "size_bytes": 10896
+      "sha256": "a1a604c8c19a4576a2c86470ed93a742995a3480b4336c2a6668f1002dc801a7",
+      "size_bytes": 11718
     },
     {
       "executable": false,
@@ -447,15 +447,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/src/lib.rs",
-      "sha256": "2b4a021c7b161bf286e0617b4b2227e035bf08dc787d42ccc6ea18e470fe7754",
-      "size_bytes": 25855
+      "sha256": "5d58c7d0a71a297a87e926ae323cc4f03607a35c2e073a90754cbbcecc807053",
+      "size_bytes": 26779
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/tests/first_party_sources.rs",
-      "sha256": "ffd0cc8f04bed8009b1c073e00bd5a4e9437de1e13ed46449496732828e6baf9",
-      "size_bytes": 15370
+      "sha256": "13963aed5b7fcf2ff3fc8e70a18d426930c875d8bb36b9c988f785fc261e2aff",
+      "size_bytes": 15275
     },
     {
       "executable": false,
