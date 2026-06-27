@@ -9,8 +9,13 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
+
+type RequestHandler =
+    Arc<dyn Fn(LocalControlRequest, Option<LocalClientPeer>) -> LocalControlResponse + Send + Sync>;
 
 pub fn serve_unix_socket_once(path: &Path, daemon: LocalDaemon) -> Result<()> {
     serve_unix_socket_with_limit(path, daemon, Some(1))
@@ -24,6 +29,15 @@ pub fn serve_unix_socket_with_limit(
     path: &Path,
     daemon: LocalDaemon,
     max_requests: Option<usize>,
+) -> Result<()> {
+    let handler = Arc::new(move |request, peer| handle_request_with_peer(&daemon, request, peer));
+    serve_unix_socket_with_limit_and_handler(path, max_requests, handler)
+}
+
+fn serve_unix_socket_with_limit_and_handler(
+    path: &Path,
+    max_requests: Option<usize>,
+    handler: RequestHandler,
 ) -> Result<()> {
     if path.exists() {
         fs::remove_file(path).with_context(|| format!("remove stale socket {}", path.display()))?;
@@ -39,31 +53,49 @@ pub fn serve_unix_socket_with_limit(
         .with_context(|| format!("chmod socket {}", path.display()))?;
 
     let mut served = 0_usize;
+    let mut workers = Vec::new();
     for stream in listener.incoming() {
-        let mut stream = match stream {
+        let stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
                 eprintln!("socket listener {} accept failed: {error}", path.display());
                 continue;
             }
         };
-        let peer = local_client_peer(&stream);
-        let response = match read_request(&mut stream) {
-            Ok(request) => handle_request_with_peer(&daemon, request, peer),
-            Err(error) => invalid_request_response(&error.to_string()),
-        };
-        if let Err(error) = write_response(&mut stream, &response) {
-            eprintln!(
-                "socket listener {} response write failed: {error}",
-                path.display()
-            );
+        let path = path.to_path_buf();
+        let handler = Arc::clone(&handler);
+        let worker = thread::Builder::new()
+            .name("ottto-unix-control".to_string())
+            .spawn(move || handle_stream(path, stream, handler))
+            .context("spawn unix control worker")?;
+        if max_requests.is_some() {
+            workers.push(worker);
         }
         served += 1;
         if max_requests.is_some_and(|limit| served >= limit) {
             break;
         }
     }
+    for worker in workers {
+        if worker.join().is_err() {
+            eprintln!("socket listener {} worker panicked", path.display());
+        }
+    }
     Ok(())
+}
+
+fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
+    let peer = local_client_peer(&stream);
+    let response = match read_request(&mut stream) {
+        Ok(request) => handler(request, peer),
+        Err(error) => invalid_request_response(&error.to_string()),
+    };
+    if let Err(error) = write_response(&mut stream, &response) {
+        eprintln!(
+            "socket listener {} response write failed: {error}",
+            path.display()
+        );
+    }
 }
 
 fn invalid_request_response(message: &str) -> LocalControlResponse {
@@ -199,13 +231,14 @@ fn write_response(stream: &mut UnixStream, response: &LocalControlResponse) -> R
 mod tests {
     use super::*;
     use crate::{ControlToken, LocalDaemon};
-    use ottto_core::request_unix_socket;
+    use ottto_core::{request_unix_socket, request_unix_socket_with_timeout};
     use ottto_protocol::{
         LocalClientKind, LocalControlCommand, LocalControlRequest, MachineIdentity,
         OperatingSystem, LOCAL_CONTROL_PROTOCOL_VERSION,
     };
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -413,6 +446,89 @@ mod tests {
         .expect("socket request after disconnect should succeed");
 
         assert!(response.ok);
+        server.join().expect("server thread should join").unwrap();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[serial]
+    fn unix_socket_serves_fast_request_while_slow_request_is_in_flight() {
+        let path = std::env::temp_dir().join(format!(
+            "ottto-service-test-{}-{}.sock",
+            std::process::id(),
+            "concurrent"
+        ));
+        let _ = fs::remove_file(&path);
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let release_slow_rx = Arc::new(Mutex::new(release_slow_rx));
+
+        let handler: RequestHandler = Arc::new(move |request, _peer| {
+            if request.request_id == "req_slow" {
+                let _ = slow_started_tx.send(());
+                let _ = release_slow_rx
+                    .lock()
+                    .expect("release receiver lock")
+                    .recv_timeout(Duration::from_secs(2));
+            }
+            LocalControlResponse {
+                request_id: request.request_id,
+                ok: true,
+                payload: Some(serde_json::json!({"daemon": "running"})),
+                error: None,
+            }
+        });
+
+        let server_path = path.clone();
+        let server = thread::spawn(move || {
+            serve_unix_socket_with_limit_and_handler(&server_path, Some(2), handler)
+        });
+
+        wait_for_socket(&path);
+        let slow_path = path.clone();
+        let slow = thread::spawn(move || {
+            request_unix_socket_with_timeout(
+                &slow_path,
+                &LocalControlRequest {
+                    request_id: "req_slow".to_string(),
+                    protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                    token: Some("token".to_string()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Verify {
+                        source: ottto_protocol::SourceKind::Pi,
+                        repair: false,
+                    },
+                },
+                Duration::from_secs(3),
+            )
+        });
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("slow request reached handler");
+
+        let fast = request_unix_socket_with_timeout(
+            &path,
+            &LocalControlRequest {
+                request_id: "req_fast".to_string(),
+                protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+            Duration::from_millis(500),
+        )
+        .expect("fast request should not wait for slow request to complete");
+        assert_eq!(fast.request_id, "req_fast");
+        assert!(fast.ok);
+
+        release_slow_tx.send(()).expect("release slow handler");
+        slow.join()
+            .expect("slow client joins")
+            .expect("slow request completes");
         server.join().expect("server thread should join").unwrap();
         let _ = fs::remove_file(path);
     }
