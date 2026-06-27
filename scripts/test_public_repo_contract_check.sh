@@ -227,6 +227,8 @@ for section in payload["sections"]:
         section["items"]["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.plist"
     if section["name"] == "security":
         section["items"]["auth_header"] = "Bearer " + "ghp_" + "unredactedfixturetoken"
+    if section["name"] == "repair":
+        section["items"]["support_claim"] = "support_unredactedfixture"
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_redaction" >/tmp/public-contract-broken-diagnostics-redaction.out 2>&1; then
@@ -238,6 +240,8 @@ grep -q "launch_agent_path must be path-redacted" \
 grep -q "auth_header must be redacted" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 grep -q "diagnostics.sections.security.auth_header exposes unredacted bearer token" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.sections.repair.support_claim exposes unredacted support claim" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 
 broken_mcp="$tmp_dir/broken-mcp"
