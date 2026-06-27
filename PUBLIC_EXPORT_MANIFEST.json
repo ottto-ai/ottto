@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 210,
-  "content_sha256": "2a9dbb35e56d1101ab21164af1b3cad9d3f9775530b57005ef45e8fad09bfb78",
+  "content_sha256": "7bc496e5b754e075423230b4b60af1d985a674e0e7a3b26eff9963fa96439cc1",
   "files": [
     {
       "executable": false,
@@ -118,8 +118,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "a1a604c8c19a4576a2c86470ed93a742995a3480b4336c2a6668f1002dc801a7",
-      "size_bytes": 11718
+      "sha256": "7d758554c52a1c356db2a516830e975a774084c2b3294b4aaaba40800f925c4f",
+      "size_bytes": 11734
     },
     {
       "executable": false,
@@ -447,8 +447,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/src/lib.rs",
-      "sha256": "5d58c7d0a71a297a87e926ae323cc4f03607a35c2e073a90754cbbcecc807053",
-      "size_bytes": 26779
+      "sha256": "256f0ec61acbf385915b8b7f9e79fd4da81631ff9f0a657d88d4ad4255d9532c",
+      "size_bytes": 28307
     },
     {
       "executable": false,
@@ -1245,8 +1245,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "02cc050cdef6fed1bb00da17de7f29fa3dd3c05566ca545d0657ea88a606bf64",
-      "size_bytes": 51062
+      "sha256": "74ad0cd4be37e61382187c56090b642112c1554b3fc006fbfa4cd482a00e99e5",
+      "size_bytes": 51791
     },
     {
       "executable": true,
@@ -1420,8 +1420,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "6dec1fb77b60140a0a440e9eeb7527ca735ce12cf9d44002fd502df7d3657728",
-      "size_bytes": 17835
+      "sha256": "7e24d842c0bf095b4549baac5f92e34ccdfe18d5329a335731983293dfd00a77",
+      "size_bytes": 18340
     },
     {
       "executable": true,
@@ -1473,7 +1473,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-27T20:47:27+00:00",
+  "generated_at": "2026-06-27T22:25:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 211,
   "public_roots": [
@@ -1508,5 +1508,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cf99a0a6067f7242110fe041a835d8aa45961db3"
+  "source_commit": "38902ad96e5bd5e68020cdd66c434f3ced22093a"
 }
