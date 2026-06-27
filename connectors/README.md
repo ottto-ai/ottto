@@ -98,7 +98,8 @@ The fixture contract is `collector_fixture.v1` and must include:
 - `upload_policy.boundary`, written as a concise human-readable upload boundary;
 - `upload_policy.redacts`, including prompt, response, tool output, command
   output, local path, and credential classes when raw content is disallowed.
-  Values must come from the public fixture schema redaction vocabulary:
+  Values must be unique and come from the public fixture schema redaction
+  vocabulary:
   `prompt`, `response`, `tool_output`, `command_output`, `local_path`,
   `credential`, `secret`, `password`, `api_key`, `access_token`, `id_token`,
   `refresh_token`, `tokens.access_token`, `tokens.id_token`,

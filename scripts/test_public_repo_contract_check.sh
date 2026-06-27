@@ -202,6 +202,8 @@ path = Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
 payload["emitted_records"][0]["record_type"] = "unexpected_fixture_record"
 payload["upload_policy"]["uploads_raw_content"] = True
+payload["upload_policy"]["redacts"].remove("credential")
+payload["upload_policy"]["redacts"].append("prompt")
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_fixture" >/tmp/public-contract-broken-connector-fixture.out 2>&1; then
@@ -211,6 +213,10 @@ fi
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.uploads_raw_content must match registry" \
   /tmp/public-contract-broken-connector-fixture.out
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted record types must match registry emits" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.redacts values must be unique" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.redacts missing required classes: credential" \
   /tmp/public-contract-broken-connector-fixture.out
 
 broken_diagnostics_redaction="$tmp_dir/broken-diagnostics-redaction"

@@ -86,6 +86,14 @@ PUBLIC_ROOT = Path(sys.argv[1]).resolve()
 PRIVATE_REPO_ROOT = Path(sys.argv[2]).resolve() if sys.argv[2] else None
 PRIVATE_RUNTIME_PIN_ARG = sys.argv[3]
 REQUIRE_PUBLIC_AUTHORITY = sys.argv[4].lower() in {"1", "true", "yes"}
+REQUIRED_CONNECTOR_REDACTION_CLASSES = {
+    "prompt",
+    "response",
+    "tool_output",
+    "command_output",
+    "local_path",
+    "credential",
+}
 
 failures: list[str] = []
 
@@ -272,6 +280,22 @@ def check_connector_fixture_contract(
     expect(
         upload_policy.get("uploads_raw_content") is False,
         f"{relative_path} upload_policy.uploads_raw_content must be false for public v1",
+    )
+    redacts = [
+        value
+        for value in require_list(
+            upload_policy.get("redacts"), f"{relative_path} upload_policy.redacts"
+        )
+        if isinstance(value, str)
+    ]
+    expect(
+        len(redacts) == len(set(redacts)),
+        f"{relative_path} upload_policy.redacts values must be unique",
+    )
+    missing_redactions = sorted(REQUIRED_CONNECTOR_REDACTION_CLASSES.difference(redacts))
+    expect(
+        not missing_redactions,
+        f"{relative_path} upload_policy.redacts missing required classes: {', '.join(missing_redactions)}",
     )
 
     emitted_records = require_list(

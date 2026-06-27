@@ -489,6 +489,7 @@ fn parse_default_state(value: &str) -> Result<DefaultState, ConnectorTestkitErro
 }
 
 fn assert_required_redactions(values: &[&str]) -> Result<(), ConnectorTestkitError> {
+    assert_unique_ids("redaction_class", values.iter().copied())?;
     let mut present = HashSet::new();
     for value in values {
         if !is_allowed_redaction_class(value) {
@@ -799,6 +800,47 @@ mod tests {
             error,
             ConnectorTestkitError::UnsupportedRedactionClass {
                 class: "raw_secret_hint".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn collector_fixture_contract_rejects_duplicate_redaction_classes() {
+        let manifest = collector_contract();
+        let fixture = CollectorFixtureContract {
+            source_id: "codex",
+            collector_id: "local_sessions",
+            upload_policy: FixtureUploadPolicyContract {
+                uploads_raw_content: false,
+                boundary: "Aggregate usage and collector health only.",
+                redacts: &[
+                    "prompt",
+                    "response",
+                    "tool_output",
+                    "command_output",
+                    "local_path",
+                    "credential",
+                    "credential",
+                ],
+            },
+            emitted_records: &[
+                EmittedRecordContract {
+                    record_type: "local_usage_snapshots",
+                    sample_key_paths: &["usage.input_tokens"],
+                },
+                EmittedRecordContract {
+                    record_type: "local_usage_collector_statuses",
+                    sample_key_paths: &["collector.status"],
+                },
+            ],
+        };
+
+        let error = assert_collector_fixture_contract(&manifest, &fixture).unwrap_err();
+        assert_eq!(
+            error,
+            ConnectorTestkitError::DuplicateId {
+                kind: "redaction_class".to_string(),
+                id: "credential".to_string()
             }
         );
     }
