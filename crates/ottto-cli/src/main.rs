@@ -2009,6 +2009,12 @@ mod tests {
         build_invocation(cli, mode)
     }
 
+    fn assert_request_matches_fixture(invocation: &Invocation, fixture: &str) {
+        let actual = serde_json::to_value(&invocation.request).expect("request serializes");
+        let expected: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn long_running_commands_get_timeout_exceeding_server_worst_case() {
         // The daemon can refresh/verify across Codex, Claude Code, and Pi. Each
@@ -3098,6 +3104,39 @@ mod tests {
     }
 
     #[test]
+    fn context_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Context(ContextArgs {
+                    json: true,
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: None,
+                    app: Some(SourceArg::ClaudeCode),
+                    machine_id: Some("otm_fixture".to_string()),
+                    source_plan_profile_id: Some("profile_fixture".to_string()),
+                    max_tokens: Some(4000),
+                    all_machines: false,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_context_fixture".to_string();
+
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/context-request.json"),
+        );
+    }
+
+    #[test]
     fn context_watch_builds_ndjson_invocation() {
         let cli = Cli::parse_from(["ottto", "context", "--json", "--watch", "--all-machines"]);
         validate_cli(&cli).expect("context watch valid");
@@ -3186,6 +3225,40 @@ mod tests {
     }
 
     #[test]
+    fn costs_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Costs(CostsArgs {
+                    json: true,
+                    days: Some(14),
+                    range: Some("last_7_days".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: Some("vertex".to_string()),
+                    app: None,
+                    machine_id: Some("otm_fixture".to_string()),
+                    source_plan_profile_id: Some("profile_fixture".to_string()),
+                    bucket: Some("day".to_string()),
+                    mode: Some("full".to_string()),
+                    all_machines: false,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_costs_fixture".to_string();
+
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/costs-request.json"),
+        );
+    }
+
+    #[test]
     fn sessions_builds_agent_sessions_request() {
         let cli = Cli::parse_from([
             "ottto",
@@ -3259,6 +3332,47 @@ mod tests {
     }
 
     #[test]
+    fn sessions_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::Sessions(SessionsArgs {
+                    json: true,
+                    limit: Some(25),
+                    cursor: Some("next_fixture".to_string()),
+                    range: Some("today".to_string()),
+                    start_date: Some("2026-06-01".to_string()),
+                    end_date: Some("2026-06-05".to_string()),
+                    timezone: Some("America/Los_Angeles".to_string()),
+                    source: None,
+                    app: Some(SourceArg::Codex),
+                    model: Some("gpt-5.3-codex".to_string()),
+                    billing_provider: Some("openai".to_string()),
+                    billing_channel: Some("subscription".to_string()),
+                    machine_id: None,
+                    source_plan_profile_id: Some("profile_fixture".to_string()),
+                    min_cost: Some(1.25),
+                    max_cost: Some(7.5),
+                    sort_by: Some("cost".to_string()),
+                    sort_dir: Some("desc".to_string()),
+                    search: Some("roadmap".to_string()),
+                    all_machines: true,
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_sessions_fixture".to_string();
+
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/sessions-request.json"),
+        );
+    }
+
+    #[test]
     fn recommendations_builds_agent_recommendations_request() {
         let cli = Cli::parse_from(["ottto", "recommendations", "--json"]);
         validate_cli(&cli).expect("recommendations json valid");
@@ -3320,6 +3434,38 @@ mod tests {
                     limit: Some(25),
                 }
             }
+        );
+    }
+
+    #[test]
+    fn provider_impact_request_matches_baseline_fixture() {
+        let mut invocation = build_invocation(
+            Cli {
+                socket: Some(PathBuf::from("/tmp/ottto.sock")),
+                token: Some("test-token".to_string()),
+                no_autostart: false,
+                watch: false,
+                command: Command::ProviderImpact(ProviderImpactArgs {
+                    json: true,
+                    date_from: Some("2026-06-01".to_string()),
+                    date_to: Some("2026-06-08".to_string()),
+                    provider: Some("openai".to_string()),
+                    app: Some("codex".to_string()),
+                    kind: Some("quota".to_string()),
+                    confidence: Some("high".to_string()),
+                    impact_priority: Some("critical".to_string()),
+                    status: Some("verified".to_string()),
+                    q: Some("subscription".to_string()),
+                    limit: Some(25),
+                }),
+            },
+            OutputMode::Json,
+        );
+        invocation.request.request_id = "req_cli_provider_impact_fixture".to_string();
+
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/provider-impact-request.json"),
         );
     }
 

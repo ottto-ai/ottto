@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 210,
-  "content_sha256": "7bc496e5b754e075423230b4b60af1d985a674e0e7a3b26eff9963fa96439cc1",
+  "candidate_file_count": 214,
+  "content_sha256": "966dca5d59cd71184e61019278cedffb97410ac5694c800902fae74f0df10411",
   "files": [
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "b78e40d03faba1cc8f2d4d3d88072820c45b18fc5103ffc2d6a42f01fbf27ec8",
-      "size_bytes": 127850
+      "sha256": "a3581c2fc46e907571da75602164fcec4ff82b43da614c5e311812d7071dea65",
+      "size_bytes": 133945
     },
     {
       "executable": false,
@@ -838,6 +838,20 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/context-request.json",
+      "sha256": "488498074080316954870328a966bf8f530a0dc9f3c079776a22b86f34414fff",
+      "size_bytes": 475
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/costs-request.json",
+      "sha256": "4bccd8b9b7e8a9bd2759bf134f92a59944456397a4213eee71501b525b7eda50",
+      "size_bytes": 483
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/daemon-unavailable-error.json",
       "sha256": "6a453175bb524283b305a785b2bd7196ffa65722a50026c6dcc8cc8005930931",
       "size_bytes": 257
@@ -897,6 +911,20 @@
       "path": "fixtures/cli/logout-request.json",
       "sha256": "0da84f62a8a191ba45b7c28b54c7a860182da19ce8356fd25603874393d6cdf8",
       "size_bytes": 170
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/provider-impact-request.json",
+      "sha256": "288faa64d269a100922f8c42aa2466d403dd1e44d8ab8d026e862aa9534fc74a",
+      "size_bytes": 440
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/cli/sessions-request.json",
+      "sha256": "85e46d1b31ebba596dc7832009331f28f36068988c7bda4e1dcccaa42106fde5",
+      "size_bytes": 660
     },
     {
       "executable": false,
@@ -1473,9 +1501,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-27T22:25:04+00:00",
+  "generated_at": "2026-06-27T23:26:04Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 211,
+  "output_file_count": 215,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
