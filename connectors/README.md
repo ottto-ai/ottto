@@ -103,11 +103,12 @@ The fixture contract is `collector_fixture.v1` and must include:
   `prompt`, `response`, `tool_output`, `command_output`, `local_path`,
   `credential`, `secret`, `password`, `api_key`, `access_token`, `id_token`,
   `refresh_token`, `tokens.access_token`, `tokens.id_token`,
-  `tokens.refresh_token`, `cookie`, `email`, or `org_id`.
+  `tokens.refresh_token`, `cookie`, `email`, `account_id`, `user_id`,
+  `org_id`, `organization_id`, `machine_id`, or `installation_id`.
 
 The fixture test rejects samples that expose raw prompt/response fields, command
 or tool output, local paths, credentials, cookies, API keys, passwords, secrets,
-or raw content fields.
+raw account/user/org/machine/installation identifiers, or raw content fields.
 
 ## SDK And Testkit Helpers
 

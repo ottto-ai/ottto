@@ -44,11 +44,17 @@ pub const ALLOWED_REDACTION_CLASSES: &[&str] = &[
     "tokens.refresh_token",
     "cookie",
     "email",
+    "account_id",
+    "user_id",
     "org_id",
+    "organization_id",
+    "machine_id",
+    "installation_id",
 ];
 
 pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
     "access_token",
+    "account_id",
     "api_key",
     "command_output",
     "cookie",
@@ -56,8 +62,11 @@ pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
     "credentials",
     "email",
     "id_token",
+    "installation_id",
     "local_path",
+    "machine_id",
     "org_id",
+    "organization_id",
     "password",
     "prompt",
     "prompts",
@@ -70,6 +79,7 @@ pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
     "secret",
     "tool_output",
     "tokens",
+    "user_id",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -457,6 +467,8 @@ mod tests {
     #[test]
     fn redaction_vocabularies_cover_raw_content_boundaries() {
         assert!(is_required_redaction_class("prompt"));
+        assert!(is_allowed_redaction_class("account_id"));
+        assert!(is_allowed_redaction_class("machine_id"));
         assert!(is_allowed_redaction_class("tokens.access_token"));
         assert!(!is_allowed_redaction_class("free_form_secret_hint"));
         for class in REQUIRED_REDACTION_CLASSES {
@@ -465,8 +477,14 @@ mod tests {
         assert!(is_forbidden_sample_key("raw_prompt"));
         assert!(is_forbidden_sample_key("API_KEY"));
         assert!(is_forbidden_sample_key("ACCESS_TOKEN"));
+        assert!(is_forbidden_sample_key("account_id"));
+        assert!(is_forbidden_sample_key("machine_id"));
+        assert!(is_forbidden_sample_key("installation_id"));
+        assert!(is_forbidden_sample_key("user_id"));
         assert!(is_forbidden_sample_key("tokens"));
         assert!(is_forbidden_sample_key("org_id"));
+        assert!(is_forbidden_sample_key("organization_id"));
+        assert!(!is_forbidden_sample_key("account_identifier_hash"));
         assert!(!is_forbidden_sample_key("token_count"));
     }
 }

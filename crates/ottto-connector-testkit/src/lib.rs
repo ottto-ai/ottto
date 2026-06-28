@@ -758,8 +758,21 @@ mod tests {
         assert!(matches!(error, ConnectorTestkitError::RawContentKey { .. }));
 
         assert!(assert_sample_key_path_safe("payload.token_count").is_ok());
+        assert!(assert_sample_key_path_safe("payload.account_identifier_hash").is_ok());
         assert!(matches!(
             assert_sample_key_path_safe("payload.raw_prompt.text"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
+            assert_sample_key_path_safe("payload.account_id"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
+            assert_sample_key_path_safe("payload.machine_id"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
+            assert_sample_key_path_safe("payload.installation_id"),
             Err(ConnectorTestkitError::RawContentKey { .. })
         ));
     }
