@@ -610,6 +610,78 @@ grep -q "release verification docs must prohibit silent app/Homebrew owner takeo
 grep -q "release verification docs must keep stable evidence redacted and owner-scoped" \
   /tmp/public-contract-broken-install-docs.out
 
+broken_connector_docs="$tmp_dir/broken-connector-docs"
+cp -R "$output_dir" "$broken_connector_docs"
+python3 - \
+  "$broken_connector_docs/docs/connectors.md" \
+  "$broken_connector_docs/connectors/README.md" <<'PY'
+import sys
+from pathlib import Path
+
+docs_path = Path(sys.argv[1])
+readme_path = Path(sys.argv[2])
+
+docs = docs_path.read_text(encoding="utf-8")
+docs = docs.replace(
+    "Use the public Rust testkit helpers in source-package tests instead of copying\n"
+    "backend generator logic",
+    "Copy the backend generator checks into source-package tests",
+)
+docs = docs.replace("assert_collector_manifest_contract", "assert_manifest")
+docs = docs.replace("CollectorManifestContract", "ManifestContract")
+docs = docs.replace(
+    "uv run python scripts/generate_connector_registry.py --check",
+    "uv run python scripts/generate_connector_registry.py",
+)
+docs = docs.replace(
+    "Official first-party fixtures must not expose raw prompts, responses, tool\n"
+    "  output, command output, local paths, credentials, cookies, API keys,\n"
+    "  passwords, or secrets.",
+    "Official fixtures may include local examples for support.",
+)
+docs_path.write_text(docs, encoding="utf-8")
+
+readme = readme_path.read_text(encoding="utf-8")
+readme = readme.replace("## SDK And Testkit Helpers", "## Helpers")
+readme = readme.replace("`ottto-connector-sdk` owns schema-version constants", "The SDK helps with manifests")
+readme = readme.replace("`ottto-connector-testkit` owns contract assertion helpers", "The test helper runs contracts")
+readme = readme.replace("ottto-connector-testkit/tests/first_party_sources.rs", "first party tests")
+readme = readme.replace(
+    "Use the testkit in source package tests instead of copying backend generator\n"
+    "logic",
+    "Copy backend generator logic into source package tests",
+)
+readme = readme.replace(
+    "-p ottto-connector-testkit \\\n"
+    "    --test first_party_sources",
+    "-p ottto-connector-testkit",
+)
+readme = readme.replace(
+    "Changing manifests without updating the\n"
+    "generated registry is incomplete",
+    "Changing manifests can be reviewed later",
+)
+readme_path.write_text(readme, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_docs" >/tmp/public-contract-broken-connector-docs.out 2>&1; then
+  echo "Expected contract check to fail when connector docs lose SDK/testkit guidance" >&2
+  exit 1
+fi
+grep -q "connector docs must route source-package tests through the public Rust testkit" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector docs must preserve registry generator check command" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector docs must preserve fixture raw-content prohibition" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must include SDK/testkit helper section" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must name first-party source contract tests" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must preserve first-party source test command" \
+  /tmp/public-contract-broken-connector-docs.out
+grep -q "connector README must require registry refresh with manifest changes" \
+  /tmp/public-contract-broken-connector-docs.out
+
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
 python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'

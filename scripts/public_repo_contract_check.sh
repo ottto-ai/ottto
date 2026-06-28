@@ -326,6 +326,72 @@ def check_source_docs_contract(
     )
 
 
+def check_connector_docs_contracts() -> None:
+    docs_path = require_file("docs/connectors.md")
+    if docs_path is not None:
+        text = docs_path.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "Use the public Rust testkit helpers in source-package tests instead of copying\nbackend generator logic",
+                "connector docs must route source-package tests through the public Rust testkit",
+            ),
+            (
+                "assert_collector_manifest_contract",
+                "connector docs must document collector manifest testkit assertions",
+            ),
+            (
+                "CollectorManifestContract",
+                "connector docs must document the collector manifest contract helper",
+            ),
+            (
+                "uv run python scripts/generate_connector_registry.py --check",
+                "connector docs must preserve registry generator check command",
+            ),
+            (
+                "Official first-party fixtures must not expose raw prompts, responses, tool\n  output, command output, local paths, credentials, cookies, API keys,\n  passwords, or secrets.",
+                "connector docs must preserve fixture raw-content prohibition",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+    readme_path = require_file("connectors/README.md")
+    if readme_path is not None:
+        text = readme_path.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "## SDK And Testkit Helpers",
+                "connector README must include SDK/testkit helper section",
+            ),
+            (
+                "`ottto-connector-sdk` owns schema-version constants",
+                "connector README must document SDK ownership",
+            ),
+            (
+                "`ottto-connector-testkit` owns contract assertion helpers",
+                "connector README must document testkit ownership",
+            ),
+            (
+                "ottto-connector-testkit/tests/first_party_sources.rs",
+                "connector README must name first-party source contract tests",
+            ),
+            (
+                "Use the testkit in source package tests instead of copying backend generator\nlogic",
+                "connector README must prohibit copying backend generator logic into source tests",
+            ),
+            (
+                "-p ottto-connector-testkit \\\n    --test first_party_sources",
+                "connector README must preserve first-party source test command",
+            ),
+            (
+                "Changing manifests without updating the\ngenerated registry is incomplete",
+                "connector README must require registry refresh with manifest changes",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
@@ -1693,6 +1759,7 @@ check_cli_contracts()
 check_control_contracts()
 check_setup_and_redaction_contracts()
 check_local_health_diagnostics_contract()
+check_connector_docs_contracts()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()
 check_install_docs_contracts()
