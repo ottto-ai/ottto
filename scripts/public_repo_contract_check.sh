@@ -886,6 +886,49 @@ def check_agent_adapter_contracts() -> None:
                 fail(message)
 
 
+def check_setup_docs_contracts() -> None:
+    setup_docs = require_file("docs/setup.md")
+    if setup_docs is None:
+        return
+
+    text = setup_docs.read_text(encoding="utf-8")
+    expectations = [
+        (
+            "branch on `agent_action.kind` before inspecting human text",
+            "setup docs must require branching on agent_action.kind before human text",
+        ),
+        (
+            "not treat the nonzero exit as corrupt JSON",
+            "setup docs must treat setup exit 60/61 payloads as parseable JSON",
+        ),
+        ("`open_browser_claim`", "setup docs must document open_browser_claim"),
+        (
+            "Show the structured `claim_url` or `claim_code`",
+            "setup docs must tell agents to surface structured claim URL/code",
+        ),
+        ("`answer_setup_question`", "setup docs must document answer_setup_question"),
+        (
+            "Ask the user for the structured `next_question`",
+            "setup docs must tell agents to use structured next_question",
+        ),
+        ("`run_next_action`", "setup docs must document run_next_action"),
+        (
+            "Follow the structured `next_action` object",
+            "setup docs must tell agents to use structured next_action",
+        ),
+        ("`retry_setup`", "setup docs must document retry_setup"),
+        ("`wait_or_check_status`", "setup docs must document wait_or_check_status"),
+        ("`inspect_failure`", "setup docs must document inspect_failure"),
+        ("`check_status`", "setup docs must document check_status"),
+        (
+            "Agents must consume the structured setup JSON and `agent_action` values rather\nthan parsing human output.",
+            "setup docs must prohibit parsing human output for setup state",
+        ),
+    ]
+    for needle, message in expectations:
+        expect(needle in text, message)
+
+
 def check_private_runtime_pin() -> int:
     if PRIVATE_REPO_ROOT is None:
         return 0
@@ -1063,6 +1106,7 @@ check_cli_contracts()
 check_control_contracts()
 check_setup_and_redaction_contracts()
 check_agent_adapter_contracts()
+check_setup_docs_contracts()
 private_check_count = check_private_consumers()
 
 if failures:

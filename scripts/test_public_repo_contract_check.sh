@@ -171,6 +171,79 @@ grep -q "needs-user-action output must not set both next_question and next_actio
 grep -q "needs-user-action next_action must be null while waiting for approval" \
   /tmp/public-contract-broken-setup-state.out
 
+broken_setup_docs="$tmp_dir/broken-setup-docs"
+cp -R "$output_dir" "$broken_setup_docs"
+python3 - "$broken_setup_docs/docs/setup.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "branch on `agent_action.kind` before inspecting human text",
+    "read setup summaries before deciding what to do",
+)
+text = text.replace(
+    "not treat the nonzero exit as corrupt JSON",
+    "treat nonzero setup exits as failed text output",
+)
+text = text.replace("`open_browser_claim`", "`browser`")
+text = text.replace(
+    "Show the structured `claim_url` or `claim_code`",
+    "Copy any setup URL from stdout",
+)
+text = text.replace("`answer_setup_question`", "`question`")
+text = text.replace(
+    "Ask the user for the structured `next_question`",
+    "Ask the user what to do next",
+)
+text = text.replace("`run_next_action`", "`action`")
+text = text.replace(
+    "Follow the structured `next_action` object",
+    "Run a convenient follow-up command",
+)
+text = text.replace("`retry_setup`", "`retry`")
+text = text.replace("`wait_or_check_status`", "`wait`")
+text = text.replace("`inspect_failure`", "`failure`")
+text = text.replace("`check_status`", "`status`")
+text = text.replace(
+    "Agents must consume the structured setup JSON and `agent_action` values rather\n"
+    "than parsing human output.",
+    "Agents may parse human setup output.",
+)
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_docs" >/tmp/public-contract-broken-setup-docs.out 2>&1; then
+  echo "Expected contract check to fail when setup docs lose agent-action semantics" >&2
+  exit 1
+fi
+grep -q "setup docs must require branching on agent_action.kind before human text" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must treat setup exit 60/61 payloads as parseable JSON" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document open_browser_claim" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to surface structured claim URL/code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document answer_setup_question" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to use structured next_question" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document run_next_action" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must tell agents to use structured next_action" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document retry_setup" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document wait_or_check_status" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document inspect_failure" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document check_status" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must prohibit parsing human output for setup state" \
+  /tmp/public-contract-broken-setup-docs.out
+
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
 python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'
