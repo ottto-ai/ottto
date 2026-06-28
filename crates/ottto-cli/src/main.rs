@@ -2655,10 +2655,10 @@ mod tests {
 
     #[test]
     fn fix_builds_repair_request() {
-        let invocation = build_invocation(
+        let mut invocation = build_invocation(
             Cli {
                 socket: Some(PathBuf::from("/tmp/ottto.sock")),
-                token: Some("token".to_string()),
+                token: Some("test-token".to_string()),
                 no_autostart: false,
                 watch: false,
                 command: Command::Fix(SourceArgs {
@@ -2669,16 +2669,21 @@ mod tests {
             },
             OutputMode::Json,
         );
+        invocation.request.request_id = "req_cli_fix_codex_fixture".to_string();
 
         assert_eq!(invocation.socket, PathBuf::from("/tmp/ottto.sock"));
         assert_eq!(invocation.output_mode, OutputMode::Json);
-        assert_eq!(invocation.request.token.as_deref(), Some("token"));
+        assert_eq!(invocation.request.token.as_deref(), Some("test-token"));
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Repair {
                 source: SourceKind::Codex,
                 dry_run: false
             }
+        );
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/fix-codex-request.json"),
         );
         assert!(!invocation.auto_start);
     }
