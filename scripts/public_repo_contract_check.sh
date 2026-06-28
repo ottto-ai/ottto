@@ -1116,9 +1116,17 @@ def check_setup_and_redaction_contracts() -> None:
         expect(category in categories, f"redaction categories must include {category}")
     fields = set(require_list(redaction.get("redacted_fields"), "redacted fields"))
     expect(bundle.get("machine_id") == "[machine_id]", "diagnostics machine_id must be redacted")
-    expect("machine_id" in fields, "redaction fields must include machine_id")
-    expect("installation.launch_agent_path" in fields, "redaction fields must include launch_agent_path")
-    expect("security.auth_header" in fields, "redaction fields must include auth_header")
+    for field in (
+        "account_id",
+        "device_id",
+        "installation_id",
+        "machine_id",
+        "org_id",
+        "user_id",
+        "installation.launch_agent_path",
+        "security.auth_header",
+    ):
+        expect(field in fields, f"redaction fields must include {field}")
     preserved_fields = set(require_list(redaction.get("preserved_fields"), "redaction preserved fields"))
     expect(
         "machine_id" not in preserved_fields,

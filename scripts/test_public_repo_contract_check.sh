@@ -1140,7 +1140,7 @@ payload["machine_id"] = "machine_unredactedfixture"
 payload["redaction"]["redacted_fields"] = [
     field
     for field in payload["redaction"]["redacted_fields"]
-    if field != "machine_id"
+    if field not in {"account_id", "machine_id"}
 ]
 payload["redaction"]["preserved_fields"].append("machine_id")
 for section in payload["sections"]:
@@ -1159,6 +1159,8 @@ fi
 grep -q "diagnostics machine_id must be redacted" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 grep -q "redaction fields must include machine_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction fields must include account_id" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 grep -q "redaction preserved_fields must not include machine_id" \
   /tmp/public-contract-broken-diagnostics-redaction.out
