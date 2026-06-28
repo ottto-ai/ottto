@@ -784,6 +784,30 @@ def check_agent_adapter_contracts() -> None:
             "agent-adapters/claude-code-skill/" in text,
             "agent adapter docs must name the exported Claude Code skill",
         )
+        docs_expectations = [
+            (
+                "Pi is supported through the same public CLI app value, `--app pi`",
+                "agent adapter docs must route Pi through the public CLI app value",
+            ),
+            (
+                "consume machine-readable `ottto --json` output",
+                "agent adapter docs must require machine-readable JSON output",
+            ),
+            (
+                "avoid direct edits to agent config, credentials, cookies, hooks, status-line\n  monitors, or local source files",
+                "agent adapter docs must prohibit direct config/credential/hook/source edits",
+            ),
+            (
+                "summarize redacted status facts instead of pasting raw diagnostics payloads",
+                "agent adapter docs must require redacted summaries instead of raw diagnostics",
+            ),
+            (
+                "keep support claims out of public issues, chat, returned JSON, and uploaded\n  bundle content",
+                "agent adapter docs must keep support claims out of public issues/chat/JSON/bundles",
+            ),
+        ]
+        for needle, message in docs_expectations:
+            expect(needle in text, message)
 
     require_file("agent-adapters/codex-skill/SKILL.md")
     require_file("agent-adapters/claude-code-skill/SKILL.md")

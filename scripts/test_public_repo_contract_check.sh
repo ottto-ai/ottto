@@ -306,6 +306,53 @@ grep -q "Codex agent manifest must not pregrant tools" \
 grep -q "Codex agent manifest must not define status-line metadata" \
   /tmp/public-contract-broken-adapter-metadata.out
 
+broken_adapter_docs="$tmp_dir/broken-adapter-docs"
+cp -R "$output_dir" "$broken_adapter_docs"
+python3 - "$broken_adapter_docs/docs/agent-adapters.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "Pi is supported through the same public CLI app value, `--app pi`",
+    "Pi uses a separate adapter package",
+)
+text = text.replace(
+    "consume machine-readable `ottto --json` output",
+    "parse convenient human output",
+)
+text = text.replace(
+    "avoid direct edits to agent config, credentials, cookies, hooks, status-line\n"
+    "  monitors, or local source files",
+    "edit agent config, credentials, cookies, hooks, status-line monitors, and local source files",
+)
+text = text.replace(
+    "summarize redacted status facts instead of pasting raw diagnostics payloads",
+    "paste raw diagnostics payloads when debugging",
+)
+text = text.replace(
+    "keep support claims out of public issues, chat, returned JSON, and uploaded\n"
+    "  bundle content",
+    "paste support claims into public issues, chat, returned JSON, and uploaded bundle content",
+)
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_adapter_docs" >/tmp/public-contract-broken-adapter-docs.out 2>&1; then
+  echo "Expected contract check to fail when adapter docs lose safety boundaries" >&2
+  exit 1
+fi
+grep -q "agent adapter docs must route Pi through the public CLI app value" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must require machine-readable JSON output" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must prohibit direct config/credential/hook/source edits" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must require redacted summaries instead of raw diagnostics" \
+  /tmp/public-contract-broken-adapter-docs.out
+grep -q "agent adapter docs must keep support claims out of public issues/chat/JSON/bundles" \
+  /tmp/public-contract-broken-adapter-docs.out
+
 broken_adapter_required="$tmp_dir/broken-adapter-required"
 cp -R "$output_dir" "$broken_adapter_required"
 python3 - "$broken_adapter_required" <<'PY'
