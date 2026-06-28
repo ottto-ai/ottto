@@ -605,6 +605,23 @@ write_public_commit_pin \
   --require-public-authority \
   >/tmp/public-contract-public-authority.out
 
+short_public_authority_private="$tmp_dir/short-public-authority-private"
+write_valid_private_consumers "$short_public_authority_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_public_commit_pin \
+  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$short_public_authority_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$(git -C "$public_git" rev-parse --short=12 HEAD)"
+if "$CONTRACT_SCRIPT" \
+  --staged-output "$public_git" \
+  --private-repo-root "$short_public_authority_private" \
+  --require-public-authority \
+  >/tmp/public-contract-short-public-authority.out 2>&1; then
+  echo "Expected contract check to fail when public authority pin uses a short commit SHA" >&2
+  exit 1
+fi
+grep -q "private runtime pin public_repo_commit.commit must be a full 40-character git SHA" \
+  /tmp/public-contract-short-public-authority.out
+
 bad_public_authority_private="$tmp_dir/bad-public-authority-private"
 write_valid_private_consumers "$bad_public_authority_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
 write_public_commit_pin \

@@ -1066,8 +1066,8 @@ def check_private_runtime_pin() -> int:
         commit = public_commit.get("commit")
         expect(
             isinstance(commit, str)
-            and re.fullmatch(r"[0-9a-f]{7,40}", commit) is not None,
-            "private runtime pin public_repo_commit.commit must be a git SHA prefix",
+            and re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
+            "private runtime pin public_repo_commit.commit must be a full 40-character git SHA",
         )
         expect(
             public_commit.get("manifest_path") == "PUBLIC_EXPORT_MANIFEST.json",
