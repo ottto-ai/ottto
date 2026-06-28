@@ -40,7 +40,9 @@ ottto setup --json --no-browser --no-wait
 ```
 
 If the command exits `60`, show the returned `claim_url` or `claim_code` to the
-user. Do not treat the nonzero exit as a corrupt response.
+user when `agent_action.kind` is `open_browser_claim`. If the kind is
+`answer_setup_question`, ask the user for the structured `next_question`. Do not
+treat the nonzero exit as a corrupt response.
 
 ## Verify Claude Code
 

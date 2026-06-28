@@ -19,5 +19,11 @@
     "claim_code": "claim_01HXBROWSER",
     "claim_url": "https://ottto.net/setup/claim?code=claim_01HXBROWSER&nonce=nonce_123"
   },
+  "agent_action": {
+    "kind": "open_browser_claim",
+    "requires_user": true,
+    "retryable": true,
+    "description": "Open or share the browser claim URL or code with the user."
+  },
   "actions": []
 }

@@ -13,5 +13,11 @@
   ],
   "next_question": null,
   "next_action": null,
+  "agent_action": {
+    "kind": "retry_setup",
+    "requires_user": false,
+    "retryable": true,
+    "description": "Setup timed out. Retry setup or check status before taking manual action."
+  },
   "actions": []
 }

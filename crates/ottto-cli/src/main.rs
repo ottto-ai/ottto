@@ -1254,6 +1254,7 @@ fn print_setup_payload(
     payload: serde_json::Value,
     output_mode: OutputMode,
 ) -> i32 {
+    let payload = setup_payload_with_agent_action(payload);
     let exit_code = setup_payload_exit_code(&payload);
     match output_mode {
         OutputMode::Human => println!("{}", human_summary(&payload)),
@@ -1275,7 +1276,7 @@ fn setup_waiting_for_browser_payload(
     wait_enabled: bool,
     timeout_seconds: u64,
 ) -> serde_json::Value {
-    serde_json::json!({
+    setup_payload_with_agent_action(serde_json::json!({
         "status": "waiting_for_browser",
         "setup_run_id": null,
         "claim_code_provided": false,
@@ -1297,7 +1298,7 @@ fn setup_waiting_for_browser_payload(
             "claim_url": claim.claim_url,
         },
         "actions": [],
-    })
+    }))
 }
 
 fn browser_claim_progress_event(
@@ -1354,6 +1355,7 @@ fn setup_timeout_payload(
             "timeout_seconds".to_string(),
             serde_json::Value::Number(timeout_seconds.into()),
         );
+        object.remove("agent_action");
         if let Some(claim) = claim {
             object.insert(
                 "claim_code".to_string(),
@@ -1376,7 +1378,100 @@ fn setup_timeout_payload(
             );
         }
     }
+    setup_payload_with_agent_action(payload)
+}
+
+fn setup_payload_with_agent_action(mut payload: serde_json::Value) -> serde_json::Value {
+    let action = setup_agent_action(&payload);
+    if let Some(object) = payload.as_object_mut() {
+        object.entry("agent_action".to_string()).or_insert(action);
+    }
     payload
+}
+
+fn setup_agent_action(payload: &serde_json::Value) -> serde_json::Value {
+    let status = payload
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("succeeded");
+    let next_action = payload.get("next_action").filter(|value| !value.is_null());
+    let next_action_type = next_action
+        .and_then(|value| value.get("type"))
+        .and_then(|value| value.as_str());
+    let next_question = payload
+        .get("next_question")
+        .filter(|value| !value.is_null());
+
+    let (kind, requires_user, retryable, description) =
+        if matches!(status, "succeeded" | "success" | "completed" | "complete") {
+            ("none", false, false, "Setup is complete.")
+        } else if matches!(status, "timed_out" | "timeout") {
+            (
+                "retry_setup",
+                false,
+                true,
+                "Setup timed out. Retry setup or check status before taking manual action.",
+            )
+        } else if matches!(next_action_type, Some("browser_claim"))
+            || status == "waiting_for_browser"
+        {
+            (
+                "open_browser_claim",
+                true,
+                true,
+                "Open or share the browser claim URL or code with the user.",
+            )
+        } else if next_action.is_some() {
+            (
+                "run_next_action",
+                true,
+                true,
+                "Follow the structured next_action object.",
+            )
+        } else if next_question.is_some()
+            || matches!(
+                status,
+                "waiting_for_approval" | "waiting_for_user" | "needs_action" | "action_required"
+            )
+        {
+            (
+                "answer_setup_question",
+                true,
+                true,
+                "Ask the user to answer the structured next_question prompt.",
+            )
+        } else if matches!(
+            status,
+            "pending" | "running" | "waiting" | "waiting_for_companion"
+        ) {
+            (
+                "wait_or_check_status",
+                false,
+                true,
+                "Setup is still running. Wait, poll setup again, or check status.",
+            )
+        } else if matches!(status, "failed" | "canceled" | "cancelled") {
+            (
+                "inspect_failure",
+                false,
+                true,
+                "Inspect setup failure details and run doctor before repair.",
+            )
+        } else {
+            (
+                "check_status",
+                false,
+                true,
+                "Check status or doctor for the current setup state.",
+            )
+        };
+
+    serde_json::json!({
+        "kind": kind,
+        "requires_user": requires_user,
+        "retryable": retryable,
+        "description": description,
+    })
 }
 
 /// Returns true only for URLs we trust to hand to the OS browser opener.
@@ -2333,6 +2428,13 @@ mod tests {
             setup_payload_requires_user_decision(&payload),
             "watch mode should surface user decisions instead of polling to timeout"
         );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("answer_setup_question")
+        );
     }
 
     #[test]
@@ -2356,6 +2458,13 @@ mod tests {
             setup_payload_exit_code(&payload),
             CliErrorCode::TimedOut.exit_code()
         );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("retry_setup")
+        );
     }
 
     #[test]
@@ -2369,6 +2478,13 @@ mod tests {
         assert_eq!(
             setup_payload_exit_code(&payload),
             CliErrorCode::NeedsUserAction.exit_code()
+        );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("open_browser_claim")
         );
     }
 
@@ -2405,6 +2521,46 @@ mod tests {
         assert_eq!(
             setup_payload_exit_code(&payload),
             CliErrorCode::TimedOut.exit_code()
+        );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("retry_setup")
+        );
+    }
+
+    #[test]
+    fn setup_payload_agent_action_is_added_for_daemon_payloads() {
+        let payload = serde_json::json!({
+            "status": "running",
+            "setup_run_id": "setup_running",
+            "next_question": null,
+            "next_action": null,
+        });
+        let payload = setup_payload_with_agent_action(payload);
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("wait_or_check_status")
+        );
+
+        let payload = serde_json::json!({
+            "status": "succeeded",
+            "agent_action": {
+                "kind": "custom_daemon_action"
+            },
+        });
+        let payload = setup_payload_with_agent_action(payload);
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("custom_daemon_action")
         );
     }
 

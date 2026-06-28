@@ -8,7 +8,9 @@ ottto doctor --json
 ```
 
 Do not parse human summaries. Use JSON status, error codes, and next-action
-fields.
+fields. For setup-specific JSON, prefer `agent_action.kind` as the stable
+machine branch: `open_browser_claim`, `answer_setup_question`, `retry_setup`,
+`wait_or_check_status`, or `inspect_failure`.
 
 ## Common Exit Codes
 
