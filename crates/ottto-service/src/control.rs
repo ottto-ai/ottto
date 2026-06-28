@@ -69,6 +69,7 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -6168,7 +6169,7 @@ fn upload_pi_import_run(
             "Content-Type",
             &format!("multipart/form-data; boundary={boundary}"),
         )
-        .timeout(BACKEND_REQUEST_TIMEOUT)
+        .timeout(PI_IMPORT_RUN_HTTP_TIMEOUT)
         .send_bytes(&body)
         .map_err(|error| backend_error_from_ureq(&url, error))?;
     response
@@ -13320,12 +13321,17 @@ log_user_prompt = true
     #[test]
     fn pi_verify_budgets_fit_interactive_cli_bounds() {
         assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
+        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
+        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
         assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
         assert!(
-            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
-                < Duration::from_secs(40)
+            PI_SMOKE_COMMAND_TIMEOUT
+                + PI_IMPORT_RUN_HTTP_TIMEOUT
+                + PI_VERIFICATION_HTTP_TIMEOUT
+                + PIPE_DRAIN_TIMEOUT
+                < Duration::from_secs(70)
         );
     }
 
@@ -13362,6 +13368,31 @@ log_user_prompt = true
     fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn upload_pi_import_accepts_response_slower_than_generic_timeout() {
+        let api_base_url =
+            delayed_pi_import_run_server(BACKEND_REQUEST_TIMEOUT + Duration::from_secs(1));
+        let root = control_test_root("pi-import-slow-response");
+        let session_file = root.join("session.jsonl");
+        fs::write(
+            &session_file,
+            r#"{"type":"session","id":"pi-slow-import","cwd":"/tmp/pi","version":1}"#,
+        )
+        .expect("write pi session file");
+
+        let started = Instant::now();
+        let result = upload_pi_import_run(
+            &api_base_url,
+            "relay_test",
+            &subscription_oauth_route(),
+            &[session_file],
+        )
+        .expect("Pi import POST should use Pi-specific timeout");
+
+        assert!(started.elapsed() > BACKEND_REQUEST_TIMEOUT);
+        assert_eq!(result["status"], "ok");
     }
 
     #[test]
@@ -13981,6 +14012,21 @@ log_user_prompt = true
                 r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
             );
             write_json_response(&mut stream, 200, "OK", &body);
+        });
+        format!("http://{address}")
+    }
+
+    fn delayed_pi_import_run_server(delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pi import backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Pi import");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.contains("/api/v1/pi/import-runs"));
+            assert!(request.contains("Authorization: Bearer relay_test"));
+            assert!(request.contains("name=\"files\""));
+            thread::sleep(delay);
+            write_json_response(&mut stream, 200, "OK", r#"{"status":"ok"}"#);
         });
         format!("http://{address}")
     }
