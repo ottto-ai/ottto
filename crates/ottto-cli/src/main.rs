@@ -3839,20 +3839,25 @@ mod tests {
 
     #[test]
     fn uninstall_builds_confirmed_execute_request_for_daemon_clients() {
-        let invocation = build_invocation(
+        let mut invocation = build_invocation(
             Cli {
                 socket: Some(PathBuf::from("/tmp/ottto.sock")),
-                token: Some("token".to_string()),
+                token: Some("test-token".to_string()),
                 no_autostart: false,
                 watch: false,
                 command: Command::Uninstall(JsonArgs { json: true }),
             },
             OutputMode::Json,
         );
+        invocation.request.request_id = "req_cli_uninstall_fixture".to_string();
 
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::UninstallExecute { confirm: true }
+        );
+        assert_request_matches_fixture(
+            &invocation,
+            include_str!("../../../fixtures/cli/uninstall-request.json"),
         );
     }
 

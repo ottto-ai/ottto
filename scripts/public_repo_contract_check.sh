@@ -734,6 +734,12 @@ def check_cli_contracts() -> None:
     expect(update_check.get("client_kind") == "cli", "CLI update check request client_kind must be cli")
     expect(update_check.get("command") == "update_check", "CLI update check request command must be update_check")
 
+    uninstall = require_dict(load_json("fixtures/cli/uninstall-request.json"), "CLI uninstall request")
+    expect_protocol(uninstall.get("protocol_version"), "CLI uninstall request")
+    expect(uninstall.get("client_kind") == "cli", "CLI uninstall request client_kind must be cli")
+    expect(uninstall.get("command") == "uninstall_execute", "CLI uninstall request command must be uninstall_execute")
+    expect(uninstall.get("confirm") is True, "CLI uninstall request confirm must be true")
+
     browser_claim = require_dict(
         load_json("fixtures/cli/setup-browser-claim-output.json"),
         "CLI browser claim output",

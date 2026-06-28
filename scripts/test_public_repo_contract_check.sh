@@ -150,6 +150,28 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-b
 fi
 grep -q "control status request protocol_version must be 15" /tmp/public-contract-broken-protocol.out
 
+broken_uninstall="$tmp_dir/broken-uninstall"
+cp -R "$output_dir" "$broken_uninstall"
+python3 - "$broken_uninstall/fixtures/cli/uninstall-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["command"] = "uninstall"
+payload["confirm"] = False
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_uninstall" >/tmp/public-contract-broken-uninstall.out 2>&1; then
+  echo "Expected contract check to fail when uninstall is not a confirmed execute request" >&2
+  exit 1
+fi
+grep -q "CLI uninstall request command must be uninstall_execute" \
+  /tmp/public-contract-broken-uninstall.out
+grep -q "CLI uninstall request confirm must be true" \
+  /tmp/public-contract-broken-uninstall.out
+
 broken_setup_state="$tmp_dir/broken-setup-state"
 cp -R "$output_dir" "$broken_setup_state"
 python3 - "$broken_setup_state/fixtures/cli/setup-needs-user-action-output.json" <<'PY'
