@@ -993,6 +993,100 @@ def check_diagnostics_docs_contracts() -> None:
             expect(needle in text, message)
 
 
+def check_install_docs_contracts() -> None:
+    install_docs = require_file("docs/install.md")
+    if install_docs is not None:
+        text = install_docs.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "Do not install by copying binaries from a mutable directory. Use the install\nowner named by the release channel.",
+                "install docs must prohibit mutable binary-copy installs",
+            ),
+            (
+                "`net.ottto.service` is a single-owner user LaunchAgent",
+                "install docs must document single-owner LaunchAgent authority",
+            ),
+            (
+                "Homebrew-owned LaunchAgent stays managed by `brew services`",
+                "install docs must keep Homebrew-owned services under brew services",
+            ),
+            (
+                "Do not install both the\napp bundle and Homebrew as independent service owners.",
+                "install docs must prohibit independent Homebrew/app-bundle owners",
+            ),
+            (
+                "The formula must pin immutable artifact URLs and SHA-256 hashes from the stable\nrelease manifest.",
+                "install docs must require immutable Homebrew artifacts from the stable manifest",
+            ),
+            (
+                "Do not self-overwrite a Homebrew-managed install",
+                "install docs must prohibit self-overwriting Homebrew-managed installs",
+            ),
+            (
+                "The helper verifies and opens the signed native DMG or PKG. It must not install\nmutable shell payloads, clear quarantine, or bootstrap launchd itself.",
+                "install docs must keep verified native helper non-mutating before the signed package",
+            ),
+            (
+                "the runtime install owner is `app_bundle`",
+                "install docs must bind verified native installs to app_bundle",
+            ),
+            (
+                "Do not use development install scripts unless the user explicitly asks for\ninternal QA on a trusted machine.",
+                "install docs must keep development install scripts out of customer flows",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+    support_docs = require_file("docs/support.md")
+    if support_docs is not None:
+        text = support_docs.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "Use the detected install owner from JSON status and the release manifest:",
+                "support docs must route update/rollback by detected install owner and manifest",
+            ),
+            (
+                "Do not self-overwrite owner-managed files.",
+                "support docs must prohibit self-overwriting owner-managed files",
+            ),
+            (
+                "verify checksums, signing/notarization state,\nGatekeeper assessment, and `ottto status --json`",
+                "support docs must require checksum/signing/Gatekeeper/status rollback verification",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+    release_docs = require_file("docs/release-verification.md")
+    if release_docs is not None:
+        text = release_docs.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "requires clean-machine evidence for every install owner advertised by the\nmanifest",
+                "release verification docs must require clean-machine evidence per advertised owner",
+            ),
+            (
+                "The verified native\ninstaller helper is not a runtime owner",
+                "release verification docs must keep verified native helper out of runtime owners",
+            ),
+            (
+                "Homebrew\nmust remain absent from `supported_install_owners` until its clean-machine\nlifecycle evidence passes.",
+                "release verification docs must gate Homebrew owner support on clean-machine evidence",
+            ),
+            (
+                "App-bundle\nevidence has to prove a second Homebrew install/start attempt is either a safe\nrefusal with instructions or an explicit migration, not silent owner takeover.",
+                "release verification docs must prohibit silent app/Homebrew owner takeover",
+            ),
+            (
+                "must not contain\nextra required install owners, unknown per-owner check names, local user paths,\nprivate repo paths, raw claim codes, account IDs, machine IDs, passwords, or\ntokens.",
+                "release verification docs must keep stable evidence redacted and owner-scoped",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+
 def check_private_runtime_pin() -> int:
     if PRIVATE_REPO_ROOT is None:
         return 0
@@ -1171,6 +1265,7 @@ check_control_contracts()
 check_setup_and_redaction_contracts()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()
+check_install_docs_contracts()
 check_setup_docs_contracts()
 private_check_count = check_private_consumers()
 
