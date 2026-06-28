@@ -266,6 +266,66 @@ def expect_same_string_list(
     expect(sorted(values) == sorted(right_values), f"{message} {field} must match registry")
 
 
+def check_source_docs_contract(
+    source_dir: Path,
+    display_name: str,
+    collector_ids: list[str],
+) -> None:
+    relative_source_dir = source_dir.relative_to(PUBLIC_ROOT).as_posix()
+    readme_path = source_dir / "README.md"
+    policy_path = source_dir / "POLICY.md"
+    if not readme_path.is_file():
+        fail(f"{relative_source_dir}/README.md is required for public source package docs")
+        return
+    if not policy_path.is_file():
+        fail(f"{relative_source_dir}/POLICY.md is required for public source package policy")
+        return
+
+    readme_text = readme_path.read_text(encoding="utf-8")
+    policy_text = policy_path.read_text(encoding="utf-8")
+    expect(
+        display_name in readme_text,
+        f"{relative_source_dir}/README.md must name source display_name {display_name}",
+    )
+    expect(
+        "Collectors:" in readme_text,
+        f"{relative_source_dir}/README.md must include a Collectors section",
+    )
+    for collector_id in collector_ids:
+        expect(
+            f"`{collector_id}`" in readme_text,
+            f"{relative_source_dir}/README.md must document collector {collector_id}",
+        )
+    expect(
+        "Raw prompts" in readme_text or "raw prompts" in readme_text,
+        f"{relative_source_dir}/README.md must document raw prompt/content upload boundary",
+    )
+
+    expect(
+        f"# {display_name} Source Policy" in policy_text,
+        f"{relative_source_dir}/POLICY.md must be titled for {display_name}",
+    )
+    for heading in (
+        "## Default Posture",
+        "## Documented Surfaces",
+        "## Undocumented Surfaces",
+        "## Local-Only Behavior",
+        "## Upload Boundaries",
+    ):
+        expect(
+            heading in policy_text,
+            f"{relative_source_dir}/POLICY.md must include {heading}",
+        )
+    expect(
+        "Review tier: `official`" in policy_text,
+        f"{relative_source_dir}/POLICY.md must preserve official review tier",
+    )
+    expect(
+        "Do not upload" in policy_text,
+        f"{relative_source_dir}/POLICY.md must document upload prohibitions",
+    )
+
+
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
@@ -552,6 +612,13 @@ def check_registry_contract() -> None:
         collector_id_values = [collector_id for collector_id in collector_ids if isinstance(collector_id, str)]
         if isinstance(manifest_path, str):
             expect_same_string_list(source_manifest, collector_id_values, "collectors", f"{manifest_path}")
+            display_name = source.get("display_name")
+            if isinstance(display_name, str):
+                check_source_docs_contract(
+                    (PUBLIC_ROOT / manifest_path).parent,
+                    display_name,
+                    collector_id_values,
+                )
         for collector_value in collectors:
             collector = require_dict(collector_value, f"{context} collector")
             collector_context = f"{context} collector {collector.get('collector_id') or '<unknown>'}"
