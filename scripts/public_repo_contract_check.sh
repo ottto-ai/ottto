@@ -213,6 +213,11 @@ def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
     actions = require_list(payload.get("actions"), f"{context} actions")
+    agent_action = require_dict(payload.get("agent_action"), f"{context} agent_action")
+    expect(isinstance(agent_action.get("kind"), str) and bool(agent_action.get("kind")), f"{context} agent_action.kind must be non-empty")
+    expect(isinstance(agent_action.get("requires_user"), bool), f"{context} agent_action.requires_user must be boolean")
+    expect(isinstance(agent_action.get("retryable"), bool), f"{context} agent_action.retryable must be boolean")
+    expect(isinstance(agent_action.get("description"), str) and bool(agent_action.get("description")), f"{context} agent_action.description must be non-empty")
     expect(isinstance(source_count, int) and source_count >= 0, f"{context} source_count must be a non-negative integer")
     if isinstance(source_count, int):
         expect(source_count == len(detected_sources), f"{context} source_count must match detected_sources length")
@@ -614,6 +619,10 @@ def check_cli_contracts() -> None:
     expect(next_action.get("type") == "browser_claim", "browser claim next_action type must be browser_claim")
     expect(next_action.get("claim_code") == browser_claim.get("claim_code"), "browser claim next_action must repeat claim_code")
     expect(next_action.get("claim_url") == browser_claim.get("claim_url"), "browser claim next_action must repeat claim_url")
+    agent_action = require_dict(browser_claim.get("agent_action"), "browser claim agent_action")
+    expect(agent_action.get("kind") == "open_browser_claim", "browser claim agent_action kind must be open_browser_claim")
+    expect(agent_action.get("requires_user") is True, "browser claim agent_action requires_user must be true")
+    expect(agent_action.get("retryable") is True, "browser claim agent_action retryable must be true")
 
     needs_user = require_dict(
         load_json("fixtures/cli/setup-needs-user-action-output.json"),
@@ -626,6 +635,10 @@ def check_cli_contracts() -> None:
     question = require_dict(needs_user.get("next_question"), "needs-user-action next_question")
     expect(question.get("type") == "approval", "needs-user-action next_question type must be approval")
     expect(question.get("source") == "codex", "needs-user-action next_question source must be codex")
+    agent_action = require_dict(needs_user.get("agent_action"), "needs-user-action agent_action")
+    expect(agent_action.get("kind") == "answer_setup_question", "needs-user-action agent_action kind must be answer_setup_question")
+    expect(agent_action.get("requires_user") is True, "needs-user-action agent_action requires_user must be true")
+    expect(agent_action.get("retryable") is True, "needs-user-action agent_action retryable must be true")
     expect(len(needs_user_sources) == 1, "needs-user-action output must expose one detected source")
     if needs_user_sources:
         source = needs_user_sources[0]
@@ -641,6 +654,10 @@ def check_cli_contracts() -> None:
     expect(timed_out.get("claim_code_provided") is True, "setup timed-out output must preserve claim_code_provided")
     expect(timed_out.get("next_question") is None, "setup timed-out next_question must be null")
     expect(timed_out.get("next_action") is None, "setup timed-out next_action must be null")
+    agent_action = require_dict(timed_out.get("agent_action"), "setup timed-out agent_action")
+    expect(agent_action.get("kind") == "retry_setup", "setup timed-out agent_action kind must be retry_setup")
+    expect(agent_action.get("requires_user") is False, "setup timed-out agent_action requires_user must be false")
+    expect(agent_action.get("retryable") is True, "setup timed-out agent_action retryable must be true")
     expect(len(timed_out_sources) == 1, "setup timed-out output must expose one detected source")
     if timed_out_sources:
         source = timed_out_sources[0]

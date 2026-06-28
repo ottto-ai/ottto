@@ -16,5 +16,11 @@
     "source": "codex"
   },
   "next_action": null,
+  "agent_action": {
+    "kind": "answer_setup_question",
+    "requires_user": true,
+    "retryable": true,
+    "description": "Ask the user to answer the structured next_question prompt."
+  },
   "actions": []
 }

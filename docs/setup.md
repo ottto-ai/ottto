@@ -26,6 +26,10 @@ ottto setup --json --no-browser --no-wait
 
 Show the returned `claim_url` or `claim_code` to the user. Exit code `60` means
 browser or user action is required. Exit code `61` means a wait timed out.
+For setup JSON, branch on `agent_action.kind` before inspecting human text:
+`open_browser_claim` means show the claim URL/code, `answer_setup_question`
+means ask the user for the structured `next_question`, and `retry_setup` means
+retry setup or check status before taking manual action.
 
 If the Apps page gives a claim code:
 
