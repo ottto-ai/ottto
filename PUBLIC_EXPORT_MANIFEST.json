@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 217,
-  "content_sha256": "3e58fe0e64918fc689538551518c55ed24ed3108b1c849ef1aa08729a99934af",
+  "content_sha256": "8325f52c9ac479a464234c9be42c4d41f2379a13907790cd49bb9bf3205b89d2",
   "files": [
     {
       "executable": false,
@@ -118,8 +118,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/README.md",
-      "sha256": "7d758554c52a1c356db2a516830e975a774084c2b3294b4aaaba40800f925c4f",
-      "size_bytes": 11734
+      "sha256": "a26d9cf2bb669255561065abc471ae031bdff8b317b3d635ed17d685306281de",
+      "size_bytes": 11868
     },
     {
       "executable": false,
@@ -433,8 +433,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-sdk/src/lib.rs",
-      "sha256": "40b073855b46ff7d223409caedde5805167c4017b3985b0eae03bff0fe815500",
-      "size_bytes": 13501
+      "sha256": "bcefe840f6e2777c0862d8e7aaa3d55b36868f6f378f846601b7fda2a0c86f0b",
+      "size_bytes": 14170
     },
     {
       "executable": false,
@@ -447,8 +447,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/src/lib.rs",
-      "sha256": "357f79eceeca0709517e9d3a2373805f881079323621a08cd1c120d720f04304",
-      "size_bytes": 33082
+      "sha256": "8e442c49fdf13a36b684095bdc7d9d79063e98132f318f7664f1109f5d310a68",
+      "size_bytes": 33662
     },
     {
       "executable": false,
@@ -741,8 +741,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/connectors.md",
-      "sha256": "3b71ebda6b1cfd333a384bb4894251b6c3097290e3d6cbed24db83d108329798",
-      "size_bytes": 1866
+      "sha256": "296177f70537e93cd8fef23b3980ea7114449179c67c5202c825fb2796b4ddd5",
+      "size_bytes": 1982
     },
     {
       "executable": false,
@@ -1522,7 +1522,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-28T17:26:14+00:00",
+  "generated_at": "2026-06-28T21:21:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 218,
   "public_roots": [
@@ -1557,5 +1557,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "579a038aaefc381e97ddb66fe013c668abbb15e7"
+  "source_commit": "bdfdf76be88290948a5f91d65872c167eef983cd"
 }

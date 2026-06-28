@@ -28,6 +28,8 @@ The generated registry lives at `connectors/registry.generated.json`.
 - Official first-party fixtures must not expose raw prompts, responses, tool
   output, command output, local paths, credentials, cookies, API keys,
   passwords, or secrets.
+- Fixture sample keys also must not expose raw account, user, organization,
+  machine, or installation identifiers.
 - Connector manifests do not grant Advisor action permissions and do not replace
   pricing selector or attribution contracts.
 
