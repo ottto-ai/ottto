@@ -844,4 +844,137 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn collector_fixture_contract_reports_identity_and_policy_mismatches() {
+        let manifest = collector_contract();
+        let fixture = valid_fixture_contract();
+
+        let mismatched_source = CollectorFixtureContract {
+            source_id: "claude_code",
+            ..fixture
+        };
+        assert_eq!(
+            assert_collector_fixture_contract(&manifest, &mismatched_source).unwrap_err(),
+            ConnectorTestkitError::SourceMismatch {
+                expected: "codex".to_string(),
+                actual: "claude_code".to_string()
+            }
+        );
+
+        let mismatched_collector = CollectorFixtureContract {
+            collector_id: "quota",
+            ..fixture
+        };
+        assert_eq!(
+            assert_collector_fixture_contract(&manifest, &mismatched_collector).unwrap_err(),
+            ConnectorTestkitError::CollectorMismatch {
+                expected: "local_sessions".to_string(),
+                actual: "quota".to_string()
+            }
+        );
+
+        let raw_upload_fixture = CollectorFixtureContract {
+            upload_policy: FixtureUploadPolicyContract {
+                uploads_raw_content: true,
+                ..fixture.upload_policy
+            },
+            ..fixture
+        };
+        assert_eq!(
+            assert_collector_fixture_contract(&manifest, &raw_upload_fixture).unwrap_err(),
+            ConnectorTestkitError::UploadPolicyMismatch {
+                expected: false,
+                actual: true
+            }
+        );
+    }
+
+    #[test]
+    fn collector_fixture_contract_reports_missing_redaction_classes() {
+        let manifest = collector_contract();
+        let fixture = CollectorFixtureContract {
+            upload_policy: FixtureUploadPolicyContract {
+                uploads_raw_content: false,
+                boundary: "Aggregate usage and collector health only.",
+                redacts: &[
+                    "prompt",
+                    "response",
+                    "tool_output",
+                    "command_output",
+                    "local_path",
+                ],
+            },
+            ..valid_fixture_contract()
+        };
+
+        assert_eq!(
+            assert_collector_fixture_contract(&manifest, &fixture).unwrap_err(),
+            ConnectorTestkitError::MissingRequiredRedactionClass {
+                class: "credential".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn connector_testkit_errors_keep_actionable_display_text() {
+        assert_eq!(
+            ConnectorTestkitError::RecordTypeMismatch {
+                expected: vec!["local_usage_snapshots".to_string()],
+                actual: vec!["collector_status".to_string()]
+            }
+            .to_string(),
+            "fixture emitted record types mismatch: expected [\"local_usage_snapshots\"], got [\"collector_status\"]"
+        );
+        assert_eq!(
+            ConnectorTestkitError::RawContentKey {
+                path: "payload.raw_prompt.text".to_string()
+            }
+            .to_string(),
+            "fixture sample exposes raw content key 'payload.raw_prompt.text'"
+        );
+        assert_eq!(
+            ConnectorTestkitError::MissingRequiredRedactionClass {
+                class: "credential".to_string()
+            }
+            .to_string(),
+            "fixture upload policy is missing redaction class 'credential'"
+        );
+        assert_eq!(
+            ConnectorTestkitError::UnsupportedRedactionClass {
+                class: "raw_secret_hint".to_string()
+            }
+            .to_string(),
+            "fixture upload policy uses unsupported redaction class 'raw_secret_hint'"
+        );
+    }
+
+    fn valid_fixture_contract() -> CollectorFixtureContract<'static> {
+        CollectorFixtureContract {
+            source_id: "codex",
+            collector_id: "local_sessions",
+            upload_policy: FixtureUploadPolicyContract {
+                uploads_raw_content: false,
+                boundary: "Aggregate usage and collector health only.",
+                redacts: &[
+                    "prompt",
+                    "response",
+                    "tool_output",
+                    "command_output",
+                    "local_path",
+                    "credential",
+                ],
+            },
+            emitted_records: &[
+                EmittedRecordContract {
+                    record_type: "local_usage_snapshots",
+                    sample_key_paths: &["usage.input_tokens", "usage.output_tokens"],
+                },
+                EmittedRecordContract {
+                    record_type: "local_usage_collector_statuses",
+                    sample_key_paths: &["collector.status", "collector.parser_version"],
+                },
+            ],
+        }
+    }
 }
