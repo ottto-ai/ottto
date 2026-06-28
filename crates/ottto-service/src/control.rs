@@ -69,7 +69,7 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -13322,7 +13322,8 @@ log_user_prompt = true
     fn pi_verify_budgets_fit_interactive_cli_bounds() {
         assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
         assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
-        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
+        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > Duration::from_secs(30));
+        assert!(PI_IMPORT_RUN_HTTP_TIMEOUT <= SMOKE_COMMAND_TIMEOUT);
         assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
         assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
@@ -13331,7 +13332,7 @@ log_user_prompt = true
                 + PI_IMPORT_RUN_HTTP_TIMEOUT
                 + PI_VERIFICATION_HTTP_TIMEOUT
                 + PIPE_DRAIN_TIMEOUT
-                < Duration::from_secs(70)
+                < Duration::from_secs(90)
         );
     }
 
@@ -13371,9 +13372,8 @@ log_user_prompt = true
     }
 
     #[test]
-    fn upload_pi_import_accepts_response_slower_than_generic_timeout() {
-        let api_base_url =
-            delayed_pi_import_run_server(BACKEND_REQUEST_TIMEOUT + Duration::from_secs(1));
+    fn upload_pi_import_accepts_response_slower_than_previous_pi_timeout() {
+        let api_base_url = delayed_pi_import_run_server(Duration::from_secs(31));
         let root = control_test_root("pi-import-slow-response");
         let session_file = root.join("session.jsonl");
         fs::write(
