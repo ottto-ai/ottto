@@ -78,6 +78,7 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,17 @@ def load_json(relative_path: str) -> Any | None:
         return None
 
 
+def load_toml(relative_path: str) -> Any | None:
+    path = require_file(relative_path)
+    if path is None:
+        return None
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as error:
+        fail(f"{relative_path}: invalid TOML: {error}")
+        return None
+
+
 def load_ndjson(relative_path: str) -> list[dict[str, Any]]:
     path = require_file(relative_path)
     if path is None:
@@ -207,6 +219,33 @@ def require_list(value: Any, context: str) -> list[Any]:
         fail(f"{context} must be a JSON array")
         return []
     return value
+
+
+def string_list(value: Any, context: str) -> list[str]:
+    return [
+        item
+        for item in require_list(value, context)
+        if isinstance(item, str)
+    ]
+
+
+def expect_same_string_field(left: dict[str, Any], right: dict[str, Any], field: str, message: str) -> None:
+    expect(isinstance(left.get(field), str) and bool(left.get(field)), f"{message} {field} must be non-empty")
+    expect(left.get(field) == right.get(field), f"{message} {field} must match registry")
+
+
+def expect_same_string_list(
+    left: dict[str, Any],
+    right_values: list[str],
+    field: str,
+    message: str,
+    *,
+    allow_empty: bool = False,
+) -> None:
+    values = string_list(left.get(field), f"{message} {field}")
+    if not allow_empty:
+        expect(values, f"{message} {field} must not be empty")
+    expect(sorted(values) == sorted(right_values), f"{message} {field} must match registry")
 
 
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
@@ -423,11 +462,21 @@ def check_registry_contract() -> None:
         context = f"registry source {source_id or '<unknown>'}"
         manifest_path = source.get("manifest_path")
         expect(isinstance(manifest_path, str) and manifest_path.startswith("connectors/sources/"), f"{context} manifest_path must point under connectors/sources")
+        source_manifest: dict[str, Any] = {}
         if isinstance(manifest_path, str):
-            require_file(manifest_path)
+            source_manifest = require_dict(load_toml(manifest_path), f"{manifest_path} manifest")
+            expect(
+                source_manifest.get("schema_version") == "source_manifest.v1",
+                f"{manifest_path} schema_version must be source_manifest.v1",
+            )
+            for field in ("source_id", "app_slug", "display_name", "publisher", "review_tier", "maturity"):
+                expect_same_string_field(source_manifest, source, field, f"{manifest_path}")
         operations = require_list(source.get("operations"), f"{context} operations")
         for operation in ("detect", "verify", "repair", "collect_usage", "monitor_quota", "upload_snapshot", "diagnostics"):
             expect(operation in operations, f"{context} operations must include {operation}")
+        operation_values = [operation for operation in operations if isinstance(operation, str)]
+        if isinstance(manifest_path, str):
+            expect_same_string_list(source_manifest, operation_values, "operations", f"{manifest_path}")
         collectors = require_list(source.get("collectors"), f"{context} collectors")
         collector_ids = [
             collector.get("collector_id") for collector in collectors if isinstance(collector, dict)
@@ -437,10 +486,15 @@ def check_registry_contract() -> None:
             len(collector_ids) == len(set(collector_ids)),
             f"{context} collector_id values must be unique",
         )
+        collector_id_values = [collector_id for collector_id in collector_ids if isinstance(collector_id, str)]
+        if isinstance(manifest_path, str):
+            expect_same_string_list(source_manifest, collector_id_values, "collectors", f"{manifest_path}")
         for collector_value in collectors:
             collector = require_dict(collector_value, f"{context} collector")
             collector_context = f"{context} collector {collector.get('collector_id') or '<unknown>'}"
             collector_manifest_path = collector.get("manifest_path")
+            collector_manifest: Path | None = None
+            collector_manifest_payload: dict[str, Any] = {}
             expect(
                 isinstance(collector_manifest_path, str)
                 and collector_manifest_path.startswith("connectors/sources/")
@@ -449,6 +503,31 @@ def check_registry_contract() -> None:
             )
             if isinstance(collector_manifest_path, str):
                 collector_manifest = require_file(collector_manifest_path)
+                collector_manifest_payload = require_dict(
+                    load_toml(collector_manifest_path), f"{collector_manifest_path} manifest"
+                )
+                expect(
+                    collector_manifest_payload.get("schema_version") == "collector_manifest.v1",
+                    f"{collector_manifest_path} schema_version must be collector_manifest.v1",
+                )
+                expect(
+                    collector_manifest_payload.get("source_id") == source_id,
+                    f"{collector_manifest_path} source_id must match registry source",
+                )
+                for field in (
+                    "collector_id",
+                    "display_name",
+                    "data_source_kind",
+                    "default_state",
+                    "review_tier",
+                    "maturity",
+                ):
+                    expect_same_string_field(
+                        collector_manifest_payload,
+                        collector,
+                        field,
+                        f"{collector_manifest_path}",
+                    )
             expect(isinstance(collector.get("uploads_raw_content"), bool), f"{collector_context} uploads_raw_content must be boolean")
             emits = [
                 emit
@@ -456,6 +535,29 @@ def check_registry_contract() -> None:
                 if isinstance(emit, str)
             ]
             expect(emits, f"{collector_context} emits must not be empty")
+            if isinstance(collector_manifest_path, str):
+                expect_same_string_list(
+                    collector_manifest_payload,
+                    [operation for operation in require_list(collector.get("operations"), f"{collector_context} operations") if isinstance(operation, str)],
+                    "operations",
+                    f"{collector_manifest_path}",
+                )
+                expect_same_string_list(
+                    collector_manifest_payload,
+                    [risk for risk in require_list(collector.get("risk_classes"), f"{collector_context} risk_classes") if isinstance(risk, str)],
+                    "risk_classes",
+                    f"{collector_manifest_path}",
+                    allow_empty=True,
+                )
+                expect(
+                    collector_manifest_payload.get("uploads_raw_content") == collector.get("uploads_raw_content"),
+                    f"{collector_manifest_path} uploads_raw_content must match registry",
+                )
+                expect(
+                    collector_manifest_payload.get("uploads_raw_content") is False,
+                    f"{collector_manifest_path} uploads_raw_content must be false for public v1",
+                )
+                expect_same_string_list(collector_manifest_payload, emits, "emits", f"{collector_manifest_path}")
             if not isinstance(source_id, str) or not isinstance(collector.get("collector_id"), str):
                 continue
             if not isinstance(collector.get("uploads_raw_content"), bool):

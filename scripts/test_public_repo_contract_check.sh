@@ -483,6 +483,48 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_registry" >/tmp/public-contract-b
 fi
 grep -q "registry is missing required source(s): codex" /tmp/public-contract-broken-registry.out
 
+broken_connector_manifest="$tmp_dir/broken-connector-manifest"
+cp -R "$output_dir" "$broken_connector_manifest"
+python3 - \
+  "$broken_connector_manifest/connectors/sources/codex/source.toml" \
+  "$broken_connector_manifest/connectors/sources/codex/collectors/local_sessions/collector.toml" <<'PY'
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+collector_path = Path(sys.argv[2])
+
+source_text = source_path.read_text(encoding="utf-8")
+source_text = source_text.replace('source_id = "codex"', 'source_id = "codex_drift"', 1)
+source_text = source_text.replace('"local_sessions"', '"local_sessions_drift"', 1)
+source_path.write_text(source_text, encoding="utf-8")
+
+collector_text = collector_path.read_text(encoding="utf-8")
+collector_text = collector_text.replace('collector_id = "local_sessions"', 'collector_id = "local_sessions_drift"', 1)
+collector_text = collector_text.replace('risk_classes = []', 'risk_classes = ["unexpected_risk"]', 1)
+collector_text = collector_text.replace('uploads_raw_content = false', 'uploads_raw_content = true', 1)
+collector_text = collector_text.replace('"local_usage_snapshots"', '"local_usage_snapshots_drift"', 1)
+collector_path.write_text(collector_text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_connector_manifest" >/tmp/public-contract-broken-connector-manifest.out 2>&1; then
+  echo "Expected contract check to fail when connector manifests drift from registry" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/source.toml source_id must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/source.toml collectors must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml collector_id must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml risk_classes must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml uploads_raw_content must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml uploads_raw_content must be false for public v1" \
+  /tmp/public-contract-broken-connector-manifest.out
+grep -q "connectors/sources/codex/collectors/local_sessions/collector.toml emits must match registry" \
+  /tmp/public-contract-broken-connector-manifest.out
+
 broken_connector_fixture="$tmp_dir/broken-connector-fixture"
 cp -R "$output_dir" "$broken_connector_fixture"
 python3 - "$broken_connector_fixture/connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json" <<'PY'
