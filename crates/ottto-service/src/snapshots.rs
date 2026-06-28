@@ -58,8 +58,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // `local_transcript_title`. The bump re-walks existing project JSONL files so
 // sessions that previously only had first-prompt/fallback names can be
 // superseded by Claude's generated title.
+// claude_code v11: captured Claude Code work-attribution keys now ride inside
+// selector_context so already-scanned sessions re-emit with subagent, skill,
+// plugin, and MCP server selector rows. `attribution_mcp_tool` stays stripped
+// because it is too high-cardinality for the first contract.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v10";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v11";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -773,14 +777,10 @@ fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
 /// attribution (`attributionAgent`) is the priority dimension.
 ///
 /// Defaults OFF: only `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` set to one of
-/// `on`/`1`/`true`/`yes`/`enabled` turns capture on. This is the
-/// safe-non-contract slice — even with capture ON, the attribution keys are NOT
-/// on `SELECTOR_CONTEXT_ALLOWED`, so `build_row_identity` strips them before
-/// they reach `reduced_context`/`selector_hash`. Nothing new crosses the wire
-/// until the daemon allowlist AND the mirrored backend selector contract land
-/// together (Codex-owned Public Runtime coordination). Capture-without-emit is
-/// intentional: it lets the parser + unit coverage land first with zero
-/// contract impact.
+/// `on`/`1`/`true`/`yes`/`enabled` turns capture on. Approved attribution keys
+/// on `SELECTOR_CONTEXT_ALLOWED` reach `reduced_context`/`selector_hash` and
+/// cross the wire; `attribution_mcp_tool` intentionally stays off the allowlist
+/// for this first contract because of cardinality risk.
 fn claude_attribution_capture_enabled() -> bool {
     claude_attribution_capture_enabled_from(
         std::env::var("OTTTO_CLAUDE_ATTRIBUTION_CAPTURE")
@@ -1447,6 +1447,10 @@ const SELECTOR_CONTEXT_ALLOWED: &[&str] = &[
     "auth_mode",
     "gateway_provider",
     "subscription_product",
+    "attribution_subagent",
+    "attribution_skill",
+    "attribution_plugin",
+    "attribution_mcp_server",
 ];
 
 pub fn scan_source_roots(
@@ -2309,18 +2313,14 @@ fn claude_code_selector_from_line(value: &Value) -> SelectorCapture {
 /// leak onto later turns, mirroring the per-turn `context_bucket` stamp in
 /// `apply_claude_code_line` and the Codex per-turn `service_tier` discipline.
 ///
-/// SAFE-SLICE BOUNDARY: gated OFF by default via
-/// `claude_attribution_capture_enabled`. The canonical snake_case keys below are
-/// deliberately NOT added to `SELECTOR_CONTEXT_ALLOWED`, so `build_row_identity`
-/// strips them before `reduced_context`/`selector_hash` — they never cross the
-/// wire. Allowlisting these keys + the mirrored backend `SELECTOR_FIELDS`/
-/// `SELECTOR_SOURCE_KEYS` + the golden v6 contract test is a separate,
-/// Codex-coordinated Public Runtime change.
+/// CONTRACT BOUNDARY: gated OFF by default via
+/// `claude_attribution_capture_enabled`. When enabled, the approved canonical
+/// snake_case keys below ride inside selector_context after the mirrored
+/// backend `SELECTOR_FIELDS`/`SELECTOR_SOURCE_KEYS` contract is in place.
 ///
 /// `attribution_mcp_tool` is captured last and is the highest-cardinality
-/// marker; once allowlisted it would explode `selector_hash` row counts, so it
-/// is expected to ship behind a finer guard (or be omitted) when the contract
-/// lands. Capturing it here is harmless while stripped.
+/// marker; allowlisting it would explode `selector_hash` row counts, so it stays
+/// stripped in this first contract.
 ///
 /// `enabled` is threaded in (read from `claude_attribution_capture_enabled` at
 /// the call site) so the capture logic is unit-testable without process-global
@@ -5872,24 +5872,25 @@ mod tests {
     }
 
     #[test]
-    fn claude_attribution_is_stripped_from_emitted_rows_safe_slice() {
-        // SAFE-SLICE INVARIANT: even with capture forced on for the duration of
-        // this test, the attribution keys are NOT on SELECTOR_CONTEXT_ALLOWED,
-        // so build_row_identity strips them before reduced_context/selector_hash.
-        // Nothing attribution-shaped reaches the emitted model_usage row — zero
-        // wire impact until the daemon + backend selector contract land together.
+    fn claude_attribution_contract_allows_four_keys_and_strips_tool() {
+        // First attribution contract: four approved attribution keys cross the
+        // wire inside selector_context. The tool-level marker remains stripped
+        // because it is too high-cardinality for the initial selector split.
         for key in [
             "attribution_subagent",
             "attribution_skill",
             "attribution_plugin",
             "attribution_mcp_server",
-            "attribution_mcp_tool",
         ] {
             assert!(
-                !SELECTOR_CONTEXT_ALLOWED.contains(&key),
-                "{key} must stay off SELECTOR_CONTEXT_ALLOWED in the safe slice"
+                SELECTOR_CONTEXT_ALLOWED.contains(&key),
+                "{key} must be on SELECTOR_CONTEXT_ALLOWED for daemon v11"
             );
         }
+        assert!(
+            !SELECTOR_CONTEXT_ALLOWED.contains(&"attribution_mcp_tool"),
+            "attribution_mcp_tool must stay off SELECTOR_CONTEXT_ALLOWED"
+        );
 
         let mut merged = SelectorCapture::default();
         merged.insert("context_bucket", "long".to_string(), "test");
@@ -5903,27 +5904,54 @@ mod tests {
             "claude-in-chrome".to_string(),
             "claude_code_attribution_field",
         );
+        merged.insert(
+            "attribution_skill",
+            "design-sync".to_string(),
+            "claude_code_attribution_field",
+        );
+        merged.insert(
+            "attribution_plugin",
+            "anthropic-skills".to_string(),
+            "claude_code_attribution_field",
+        );
+        merged.insert(
+            "attribution_mcp_tool",
+            "tabs_context_mcp".to_string(),
+            "claude_code_attribution_field",
+        );
 
         let (_, reduced_context, _) = build_row_identity("claude-opus-4-8", &merged);
 
-        // The already-allowlisted dimension survives...
         assert_eq!(
             reduced_context.get("context_bucket").map(String::as_str),
             Some("long")
         );
-        // ...but every attribution key is stripped.
-        for key in [
-            "attribution_subagent",
-            "attribution_mcp_server",
-            "attribution_skill",
-            "attribution_plugin",
-            "attribution_mcp_tool",
-        ] {
-            assert!(
-                !reduced_context.contains_key(key),
-                "{key} must be stripped from the emitted selector_context in the safe slice"
-            );
-        }
+        assert_eq!(
+            reduced_context
+                .get("attribution_subagent")
+                .map(String::as_str),
+            Some("general-purpose")
+        );
+        assert_eq!(
+            reduced_context
+                .get("attribution_mcp_server")
+                .map(String::as_str),
+            Some("claude-in-chrome")
+        );
+        assert_eq!(
+            reduced_context.get("attribution_skill").map(String::as_str),
+            Some("design-sync")
+        );
+        assert_eq!(
+            reduced_context
+                .get("attribution_plugin")
+                .map(String::as_str),
+            Some("anthropic-skills")
+        );
+        assert!(
+            !reduced_context.contains_key("attribution_mcp_tool"),
+            "attribution_mcp_tool must be stripped from emitted selector_context"
+        );
     }
 
     #[test]
@@ -7680,6 +7708,19 @@ mod tests {
                 // backend's normalize_selector_context recognizes it
                 // (SELECTOR_FIELDS / source key `context_bucket`).
                 ("context_bucket".to_string(), "long".to_string()),
+                (
+                    "attribution_subagent".to_string(),
+                    "general-purpose".to_string(),
+                ),
+                ("attribution_skill".to_string(), "design-sync".to_string()),
+                (
+                    "attribution_plugin".to_string(),
+                    "anthropic-skills".to_string(),
+                ),
+                (
+                    "attribution_mcp_server".to_string(),
+                    "claude-in-chrome".to_string(),
+                ),
             ]),
             selector_sources: BTreeMap::from([
                 (
@@ -7689,6 +7730,22 @@ mod tests {
                 (
                     "context_bucket".to_string(),
                     "derived_from_effective_input_volume".to_string(),
+                ),
+                (
+                    "attribution_subagent".to_string(),
+                    "claude_code_attribution_field".to_string(),
+                ),
+                (
+                    "attribution_skill".to_string(),
+                    "claude_code_attribution_field".to_string(),
+                ),
+                (
+                    "attribution_plugin".to_string(),
+                    "claude_code_attribution_field".to_string(),
+                ),
+                (
+                    "attribution_mcp_server".to_string(),
+                    "claude_code_attribution_field".to_string(),
                 ),
             ]),
             auth_mode: Some("service_account_oauth".to_string()),
@@ -7824,6 +7881,26 @@ mod tests {
             item_value["model_usage"][0]["selector_context"]["context_bucket"],
             json!("long"),
             "context_bucket must be carried inside the row's selector_context"
+        );
+        for (key, expected) in [
+            ("attribution_subagent", "general-purpose"),
+            ("attribution_skill", "design-sync"),
+            ("attribution_plugin", "anthropic-skills"),
+            ("attribution_mcp_server", "claude-in-chrome"),
+        ] {
+            assert!(
+                !first_row.contains_key(key),
+                "{key} must live inside selector_context, not as a top-level row key"
+            );
+            assert_eq!(
+                item_value["model_usage"][0]["selector_context"][key],
+                json!(expected),
+                "{key} must be carried inside the row's selector_context"
+            );
+        }
+        assert!(
+            item_value["model_usage"][0]["selector_context"]["attribution_mcp_tool"].is_null(),
+            "attribution_mcp_tool must stay out of the first selector_context contract"
         );
     }
 
