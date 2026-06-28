@@ -731,8 +731,15 @@ def check_setup_and_redaction_contracts() -> None:
     ):
         expect(category in categories, f"redaction categories must include {category}")
     fields = set(require_list(redaction.get("redacted_fields"), "redacted fields"))
+    expect(bundle.get("machine_id") == "[machine_id]", "diagnostics machine_id must be redacted")
+    expect("machine_id" in fields, "redaction fields must include machine_id")
     expect("installation.launch_agent_path" in fields, "redaction fields must include launch_agent_path")
     expect("security.auth_header" in fields, "redaction fields must include auth_header")
+    preserved_fields = set(require_list(redaction.get("preserved_fields"), "redaction preserved fields"))
+    expect(
+        "machine_id" not in preserved_fields,
+        "redaction preserved_fields must not include machine_id",
+    )
     sections = require_list(bundle.get("sections"), "redacted diagnostics sections")
     section_items = {
         section.get("name"): section.get("items")
@@ -744,7 +751,10 @@ def check_setup_and_redaction_contracts() -> None:
     expect(installation.get("launch_agent_path") == "[path]", "launch_agent_path must be path-redacted")
     security = require_dict(section_items.get("security"), "redacted security section")
     expect(security.get("auth_header") == "[REDACTED]", "auth_header must be redacted")
-    check_diagnostics_values_are_redacted(section_items, "diagnostics.sections")
+    check_diagnostics_values_are_redacted(
+        {"machine_id": bundle.get("machine_id"), "sections": sections},
+        "diagnostics",
+    )
 
     setup = require_dict(load_json("fixtures/setup/claim-run.json"), "setup claim run")
     expect(setup.get("status") == "waiting_for_approval", "setup claim run status must be waiting_for_approval")
@@ -929,6 +939,60 @@ def check_setup_docs_contracts() -> None:
         expect(needle in text, message)
 
 
+def check_diagnostics_docs_contracts() -> None:
+    diagnostics_docs = require_file("docs/diagnostics.md")
+    if diagnostics_docs is not None:
+        text = diagnostics_docs.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "Upload only when the user approves the upload and accepts the retention\ndisclosure.",
+                "diagnostics docs must require explicit upload approval and retention acceptance",
+            ),
+            (
+                "An active login or support claim is required",
+                "diagnostics docs must require active login or support claim",
+            ),
+            (
+                "Support claims are authorization material",
+                "diagnostics docs must classify support claims as authorization material",
+            ),
+            (
+                "must not appear in the returned JSON payload or uploaded bundle\ncontent",
+                "diagnostics docs must keep support claims out of payloads and bundles",
+            ),
+            (
+                "machine ids, must appear only as redacted\nplaceholders such as `[machine_id]`",
+                "diagnostics docs must require machine-id placeholders",
+            ),
+            (
+                "Do not share raw local paths, prompts, account ids, machine ids, credential\nmaterial, cookies, or command output.",
+                "diagnostics docs must prohibit sharing raw private diagnostics values",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+    troubleshooting_docs = require_file("docs/troubleshooting.md")
+    if troubleshooting_docs is not None:
+        text = troubleshooting_docs.read_text(encoding="utf-8")
+        expectations = [
+            (
+                "Upload only with explicit approval, retention disclosure acceptance, and an\nactive login or support claim.",
+                "troubleshooting docs must require approval, retention acceptance, and authorization before upload",
+            ),
+            (
+                "Support claims are authorization material",
+                "troubleshooting docs must classify support claims as authorization material",
+            ),
+            (
+                "do\nnot paste them into issues, chat, diagnostics summaries, or support bundle\ncontent.",
+                "troubleshooting docs must prohibit pasting support claims",
+            ),
+        ]
+        for needle, message in expectations:
+            expect(needle in text, message)
+
+
 def check_private_runtime_pin() -> int:
     if PRIVATE_REPO_ROOT is None:
         return 0
@@ -1106,6 +1170,7 @@ check_cli_contracts()
 check_control_contracts()
 check_setup_and_redaction_contracts()
 check_agent_adapter_contracts()
+check_diagnostics_docs_contracts()
 check_setup_docs_contracts()
 private_check_count = check_private_consumers()
 

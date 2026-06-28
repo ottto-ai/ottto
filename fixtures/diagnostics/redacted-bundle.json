@@ -1,6 +1,6 @@
 {
   "bundle_id": "diag_01HXREDACTED",
-  "machine_id": "machine_01HXLOCALMAC",
+  "machine_id": "[machine_id]",
   "created_at": "2026-05-05T09:05:00Z",
   "upload": {
     "requested": false,
@@ -32,12 +32,12 @@
       "command_output"
     ],
     "redacted_fields": [
+      "machine_id",
       "installation.launch_agent_path",
       "security.auth_header"
     ],
     "preserved_fields": [
       "bundle_id",
-      "machine_id",
       "created_at",
       "runtime.daemon_state",
       "runtime.daemon_running",
