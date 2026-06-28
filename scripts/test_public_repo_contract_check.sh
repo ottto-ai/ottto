@@ -322,6 +322,147 @@ grep -q "troubleshooting docs must classify support claims as authorization mate
 grep -q "troubleshooting docs must prohibit pasting support claims" \
   /tmp/public-contract-broken-diagnostics-docs.out
 
+broken_install_docs="$tmp_dir/broken-install-docs"
+cp -R "$output_dir" "$broken_install_docs"
+python3 - \
+  "$broken_install_docs/docs/install.md" \
+  "$broken_install_docs/docs/support.md" \
+  "$broken_install_docs/docs/release-verification.md" <<'PY'
+import sys
+from pathlib import Path
+
+install_path = Path(sys.argv[1])
+support_path = Path(sys.argv[2])
+release_path = Path(sys.argv[3])
+
+install = install_path.read_text(encoding="utf-8")
+install = install.replace(
+    "Do not install by copying binaries from a mutable directory. Use the install\n"
+    "owner named by the release channel.",
+    "Copy binaries from a build output when convenient.",
+)
+install = install.replace(
+    "`net.ottto.service` is a single-owner user LaunchAgent",
+    "`net.ottto.service` can be rewritten by whichever installer runs last",
+)
+install = install.replace(
+    "Homebrew-owned LaunchAgent stays managed by `brew services`",
+    "Homebrew-owned LaunchAgent can be refreshed by the app",
+)
+install = install.replace(
+    "Do not install both the\napp bundle and Homebrew as independent service owners.",
+    "Install both the app bundle and Homebrew whenever useful.",
+)
+install = install.replace(
+    "The formula must pin immutable artifact URLs and SHA-256 hashes from the stable\n"
+    "release manifest.",
+    "The formula can follow the latest artifact URL.",
+)
+install = install.replace(
+    "Do not self-overwrite a Homebrew-managed install",
+    "Self-overwrite Homebrew-managed installs",
+)
+install = install.replace(
+    "The helper verifies and opens the signed native DMG or PKG. It must not install\n"
+    "mutable shell payloads, clear quarantine, or bootstrap launchd itself.",
+    "The helper may install shell payloads and bootstrap launchd directly.",
+)
+install = install.replace(
+    "the runtime install owner is `app_bundle`",
+    "the runtime install owner can be selected later",
+)
+install = install.replace(
+    "Do not use development install scripts unless the user explicitly asks for\n"
+    "internal QA on a trusted machine.",
+    "Use development install scripts for customer setup when faster.",
+)
+install_path.write_text(install, encoding="utf-8")
+
+support = support_path.read_text(encoding="utf-8")
+support = support.replace(
+    "Use the detected install owner from JSON status and the release manifest:",
+    "Use whichever installer is easiest:",
+)
+support = support.replace(
+    "Do not self-overwrite owner-managed files.",
+    "Overwrite owner-managed files during rollback.",
+)
+support = support.replace(
+    "verify checksums, signing/notarization state,\n"
+    "Gatekeeper assessment, and `ottto status --json`",
+    "verify that the command seems to work",
+)
+support_path.write_text(support, encoding="utf-8")
+
+release = release_path.read_text(encoding="utf-8")
+release = release.replace(
+    "requires clean-machine evidence for every install owner advertised by the\n"
+    "manifest",
+    "can advertise install owners before clean-machine evidence",
+)
+release = release.replace(
+    "The verified native\ninstaller helper is not a runtime owner",
+    "The verified native installer helper is a runtime owner",
+)
+release = release.replace(
+    "Homebrew\nmust remain absent from `supported_install_owners` until its clean-machine\n"
+    "lifecycle evidence passes.",
+    "Homebrew can be listed before lifecycle evidence.",
+)
+release = release.replace(
+    "App-bundle\n"
+    "evidence has to prove a second Homebrew install/start attempt is either a safe\n"
+    "refusal with instructions or an explicit migration, not silent owner takeover.",
+    "App-bundle evidence need not cover Homebrew takeover.",
+)
+release = release.replace(
+    "must not contain\n"
+    "extra required install owners, unknown per-owner check names, local user paths,\n"
+    "private repo paths, raw claim codes, account IDs, machine IDs, passwords, or\n"
+    "tokens.",
+    "may contain raw owner evidence.",
+)
+release_path.write_text(release, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_install_docs" >/tmp/public-contract-broken-install-docs.out 2>&1; then
+  echo "Expected contract check to fail when install docs lose owner and installer boundaries" >&2
+  exit 1
+fi
+grep -q "install docs must prohibit mutable binary-copy installs" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must document single-owner LaunchAgent authority" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep Homebrew-owned services under brew services" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must prohibit independent Homebrew/app-bundle owners" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must require immutable Homebrew artifacts from the stable manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must prohibit self-overwriting Homebrew-managed installs" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep verified native helper non-mutating before the signed package" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must bind verified native installs to app_bundle" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "install docs must keep development install scripts out of customer flows" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must route update/rollback by detected install owner and manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must prohibit self-overwriting owner-managed files" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "support docs must require checksum/signing/Gatekeeper/status rollback verification" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require clean-machine evidence per advertised owner" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep verified native helper out of runtime owners" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must gate Homebrew owner support on clean-machine evidence" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must prohibit silent app/Homebrew owner takeover" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep stable evidence redacted and owner-scoped" \
+  /tmp/public-contract-broken-install-docs.out
+
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
 python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'
