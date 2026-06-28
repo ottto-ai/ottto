@@ -1667,6 +1667,92 @@ def check_install_docs_contracts() -> None:
         text = support_docs.read_text(encoding="utf-8")
         expectations = [
             (
+                "This runbook is public-safe. Do not add private infrastructure details",
+                "support docs must preserve public-safe boundary",
+            ),
+            (
+                "account\nidentifiers, machine identifiers, raw command output, screenshots with local\npaths",
+                "support docs must prohibit raw identifiers, command output, and local-path screenshots",
+            ),
+            (
+                "claim codes, setup-run tokens, setup keys",
+                "support docs must prohibit claim/setup secrets",
+            ),
+            (
+                "raw prompts, raw model output, or private repository links",
+                "support docs must prohibit raw model content and private repo links",
+            ),
+            (
+                "Identify the installed surface without parsing human text",
+                "support docs must require JSON status instead of human parsing",
+            ),
+            ("ottto status --json", "support docs must include status JSON command"),
+            (
+                "ottto update check --json",
+                "support docs must include update check JSON command",
+            ),
+            (
+                "ottto setup --json --no-browser --no-wait",
+                "support docs must include headless setup JSON command",
+            ),
+            ("ottto account --json", "support docs must include account JSON command"),
+            (
+                "Share the claim URL or code with the user when JSON returns\n   `needs_user_action`",
+                "support docs must route claim handoff through structured JSON",
+            ),
+            (
+                "The CLI must not collect an Ottto password in the\n   terminal",
+                "support docs must prohibit terminal password collection",
+            ),
+            (
+                "Check app/source status with public app nouns",
+                "support docs must preserve app-language triage",
+            ),
+            (
+                "ottto apps detect --json",
+                "support docs must include apps detect command",
+            ),
+            (
+                "ottto apps status --app codex --json",
+                "support docs must include app status command",
+            ),
+            (
+                "ottto verify --repair --app codex --json",
+                "support docs must include bounded verify repair command",
+            ),
+            (
+                "respect repair authority metadata",
+                "support docs must require repair authority metadata",
+            ),
+            (
+                "If JSON requires browser approval, do not edit local config directly",
+                "support docs must prohibit local config edits when browser approval is required",
+            ),
+            (
+                "`verify --repair` may repair only WriteConfig config drift",
+                "support docs must keep verify repair bounded to WriteConfig drift",
+            ),
+            (
+                "Share only the command family, exit code, high-level status, support bundle\nstate, redaction summary, and next user action",
+                "support docs must restrict diagnostics sharing to summary fields",
+            ),
+            (
+                "Do not paste raw diagnostics\nJSON into public issues or chat",
+                "support docs must prohibit raw diagnostics JSON in issues/chat",
+            ),
+            (
+                "Upload diagnostics only after explicit user approval and retention disclosure\nacceptance",
+                "support docs must require explicit approval and retention acceptance before upload",
+            ),
+            (
+                "Do not ask users to paste\nclaims into public issues",
+                "support docs must prohibit support claims in public issues",
+            ),
+            (
+                "diagnostics JSON and uploaded bundle content should expose only that a support\nclaim was provided, not the claim value",
+                "support docs must keep support claim values out of JSON and bundles",
+            ),
+            (
                 "Use the detected install owner from JSON status and the release manifest:",
                 "support docs must route update/rollback by detected install owner and manifest",
             ),
@@ -1677,6 +1763,30 @@ def check_install_docs_contracts() -> None:
             (
                 "verify checksums, signing/notarization state,\nGatekeeper assessment, and `ottto status --json`",
                 "support docs must require checksum/signing/Gatekeeper/status rollback verification",
+            ),
+            (
+                "Security-sensitive reports go to `security@ottto.net`, not public issues",
+                "support docs must route security reports away from public issues",
+            ),
+            (
+                "Public issues are appropriate only for redacted, reproducible CLI",
+                "support docs must scope public issues to redacted reproducible public-runtime bugs",
+            ),
+            (
+                "Passwords, cookies, API keys, bearer tokens, setup-run tokens, setup keys,\n  claim codes, support claims, or raw credentials",
+                "support docs must prohibit credential and claim collection",
+            ),
+            (
+                "Raw prompts, raw model output, transcripts, customer data",
+                "support docs must prohibit raw prompt/output/transcript/customer data collection",
+            ),
+            (
+                "Absolute local filesystem paths, account identifiers, machine identifiers",
+                "support docs must prohibit absolute paths and raw identifiers",
+            ),
+            (
+                "evidence records contain only redacted pass/fail facts and stable artifact\n  references",
+                "support docs must keep closeout evidence redacted and artifact-scoped",
             ),
         ]
         for needle, message in expectations:
