@@ -368,6 +368,37 @@ grep -q "troubleshooting docs must classify support claims as authorization mate
 grep -q "troubleshooting docs must prohibit pasting support claims" \
   /tmp/public-contract-broken-diagnostics-docs.out
 
+broken_diagnostics_upload="$tmp_dir/broken-diagnostics-upload"
+cp -R "$output_dir" "$broken_diagnostics_upload"
+python3 - "$broken_diagnostics_upload/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+upload = payload["upload"]
+upload["retention"]["accepted"] = True
+upload["retention"]["text"] = "Diagnostics may be retained."
+upload["support_claim_provided"] = True
+upload["support_claim"] = "support_unredactedfixture"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_upload" >/tmp/public-contract-broken-diagnostics-upload.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics upload state exposes support authorization" >&2
+  exit 1
+fi
+grep -q "redacted diagnostics retention must not be accepted for local-only bundles" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics retention text must disclose 30-day support retention" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics support_claim_provided must be false for local-only bundles" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "redacted diagnostics upload must not expose support_claim" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+grep -q "diagnostics.upload.support_claim exposes unredacted support claim" \
+  /tmp/public-contract-broken-diagnostics-upload.out
+
 broken_install_docs="$tmp_dir/broken-install-docs"
 cp -R "$output_dir" "$broken_install_docs"
 python3 - \

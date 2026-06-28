@@ -852,6 +852,18 @@ def check_setup_and_redaction_contracts() -> None:
     expect(upload.get("approval_required") is True, "redacted diagnostics upload must require approval")
     expect(upload.get("approved") is False, "redacted diagnostics upload approved must be false")
     expect(upload.get("authorization") == "not_requested", "redacted diagnostics authorization must be not_requested")
+    retention = require_dict(upload.get("retention"), "redacted diagnostics upload retention")
+    expect(retention.get("accepted") is False, "redacted diagnostics retention must not be accepted for local-only bundles")
+    retention_text = retention.get("text")
+    expect(
+        isinstance(retention_text, str) and "30 days" in retention_text and "support request" in retention_text,
+        "redacted diagnostics retention text must disclose 30-day support retention",
+    )
+    expect(
+        upload.get("support_claim_provided") is False,
+        "redacted diagnostics support_claim_provided must be false for local-only bundles",
+    )
+    expect("support_claim" not in upload, "redacted diagnostics upload must not expose support_claim")
     redaction = require_dict(bundle.get("redaction"), "redacted diagnostics redaction")
     expect(redaction.get("policy_version") == 1, "redacted diagnostics policy_version must be 1")
     covered_surfaces = set(require_list(redaction.get("covered_surfaces"), "redaction covered surfaces"))
@@ -895,7 +907,7 @@ def check_setup_and_redaction_contracts() -> None:
     security = require_dict(section_items.get("security"), "redacted security section")
     expect(security.get("auth_header") == "[REDACTED]", "auth_header must be redacted")
     check_diagnostics_values_are_redacted(
-        {"machine_id": bundle.get("machine_id"), "sections": sections},
+        {"machine_id": bundle.get("machine_id"), "upload": upload, "sections": sections},
         "diagnostics",
     )
 
