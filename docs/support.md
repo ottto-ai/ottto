@@ -75,7 +75,9 @@ ottto diagnostics collect --upload \
 Support claims come from the product support channel. Do not ask users to paste
 claims into public issues. Support claims are upload authorization material:
 diagnostics JSON and uploaded bundle content should expose only that a support
-claim was provided, not the claim value.
+claim was provided, not the claim value. Raw account, user, organization,
+machine, device, and installation ids must stay redacted in diagnostics
+evidence.
 
 ## Update And Rollback
 
