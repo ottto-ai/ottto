@@ -976,6 +976,159 @@ def check_setup_and_redaction_contracts() -> None:
     expect(request_approval.get("source") == "codex", "request_approval setup event source must be codex")
 
 
+def check_local_health_diagnostics_contract() -> None:
+    cases = require_list(
+        load_json("fixtures/local-health/contract-matrix.v1.json"),
+        "local health contract matrix",
+    )
+    diagnostics_cases = [
+        case
+        for case in cases
+        if isinstance(case, dict) and case.get("case_id") == "diagnostics_redaction"
+    ]
+    expect(
+        len(diagnostics_cases) == 1,
+        "local health contract matrix must include exactly one diagnostics_redaction case",
+    )
+    if len(diagnostics_cases) != 1:
+        return
+
+    case = require_dict(diagnostics_cases[0], "local health diagnostics_redaction case")
+    expect(
+        case.get("fixture_schema_version") == "local_health_contract_fixture.v1",
+        "local health diagnostics_redaction fixture_schema_version must be local_health_contract_fixture.v1",
+    )
+    expect(
+        case.get("contract_version") == "local_machine_health.v1",
+        "local health diagnostics_redaction contract_version must be local_machine_health.v1",
+    )
+    tags = set(string_list(case.get("tags"), "local health diagnostics_redaction tags"))
+    for tag in ("diagnostics", "redaction"):
+        expect(tag in tags, f"local health diagnostics_redaction tags must include {tag}")
+
+    health = require_dict(case.get("health"), "local health diagnostics_redaction health")
+    expect(
+        health.get("schema_version_name") == "local_machine_health.v1",
+        "local health diagnostics_redaction schema_version_name must be local_machine_health.v1",
+    )
+    capabilities = set(string_list(health.get("capabilities"), "local health diagnostics_redaction capabilities"))
+    expect(
+        "diagnostics.collect" in capabilities,
+        "local health diagnostics_redaction capabilities must include diagnostics.collect",
+    )
+    overall = require_dict(health.get("overall"), "local health diagnostics_redaction overall")
+    expect(
+        overall.get("primary_blocker") == "diagnostics_collected",
+        "local health diagnostics_redaction primary_blocker must be diagnostics_collected",
+    )
+    expect(
+        overall.get("next_action") == "share_redacted_bundle",
+        "local health diagnostics_redaction next_action must be share_redacted_bundle",
+    )
+
+    sources = require_list(health.get("sources"), "local health diagnostics_redaction sources")
+    diagnostics_sources = [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("authority") == "diagnostics"
+    ]
+    expect(
+        diagnostics_sources,
+        "local health diagnostics_redaction must include a diagnostics-authority source",
+    )
+    for source_value in diagnostics_sources:
+        source = require_dict(source_value, "local health diagnostics_redaction source")
+        expect(
+            source.get("next_action") == "share_redacted_bundle",
+            "local health diagnostics_redaction source next_action must be share_redacted_bundle",
+        )
+
+    blockers = require_list(health.get("blockers"), "local health diagnostics_redaction blockers")
+    diagnostics_blockers = [
+        blocker
+        for blocker in blockers
+        if isinstance(blocker, dict) and blocker.get("code") == "diagnostics_collected"
+    ]
+    expect(
+        diagnostics_blockers,
+        "local health diagnostics_redaction must include diagnostics_collected blocker",
+    )
+    for blocker_value in diagnostics_blockers:
+        blocker = require_dict(blocker_value, "local health diagnostics_redaction blocker")
+        expect(
+            blocker.get("owner") == "support",
+            "local health diagnostics_redaction blocker owner must be support",
+        )
+        expect(
+            blocker.get("source") == "diagnostics",
+            "local health diagnostics_redaction blocker source must be diagnostics",
+        )
+
+    events = require_list(case.get("events"), "local health diagnostics_redaction events")
+    diagnostics_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("event_type") == "DiagnosticsCollected"
+    ]
+    expect(
+        len(diagnostics_events) == 1,
+        "local health diagnostics_redaction must include exactly one DiagnosticsCollected event",
+    )
+    if len(diagnostics_events) != 1:
+        return
+
+    event = require_dict(diagnostics_events[0], "local health diagnostics_redaction event")
+    expect(
+        event.get("authority") == "diagnostics",
+        "local health diagnostics_redaction event authority must be diagnostics",
+    )
+    payload = require_dict(event.get("payload"), "local health diagnostics_redaction event payload")
+    redacted_identifiers = set(
+        string_list(
+            payload.get("redacted_identifiers"),
+            "local health diagnostics_redaction redacted_identifiers",
+        )
+    )
+    for identifier in ("machine_id", "device_id", "account_id"):
+        expect(
+            identifier in redacted_identifiers,
+            f"local health diagnostics_redaction redacted_identifiers must include {identifier}",
+        )
+    excluded_secret_classes = set(
+        string_list(
+            payload.get("excluded_secret_classes"),
+            "local health diagnostics_redaction excluded_secret_classes",
+        )
+    )
+    for secret_class in (
+        "cookies",
+        "passwords",
+        "setup_secrets",
+        "private_keys",
+        "hardware_serials",
+        "raw_credentials",
+    ):
+        expect(
+            secret_class in excluded_secret_classes,
+            f"local health diagnostics_redaction excluded_secret_classes must include {secret_class}",
+        )
+    included_sections = set(
+        string_list(
+            payload.get("included_sections"),
+            "local health diagnostics_redaction included_sections",
+        )
+    )
+    for section in ("runtime", "versions", "installation", "command_ledger"):
+        expect(
+            section in included_sections,
+            f"local health diagnostics_redaction included_sections must include {section}",
+        )
+    check_diagnostics_values_are_redacted(
+        {"event_payload": payload},
+        "local-health.diagnostics_redaction",
+    )
+
+
 def check_agent_adapter_contracts() -> None:
     docs_path = require_file("docs/agent-adapters.md")
     if docs_path is not None:
@@ -1465,6 +1618,7 @@ check_registry_contract()
 check_cli_contracts()
 check_control_contracts()
 check_setup_and_redaction_contracts()
+check_local_health_diagnostics_contract()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()
 check_install_docs_contracts()

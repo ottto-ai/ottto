@@ -723,6 +723,54 @@ grep -q "diagnostics.sections\\[4\\].items.auth_header exposes unredacted bearer
 grep -q "diagnostics.sections\\[3\\].items.support_claim exposes unredacted support claim" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 
+broken_local_health_diagnostics="$tmp_dir/broken-local-health-diagnostics"
+cp -R "$output_dir" "$broken_local_health_diagnostics"
+python3 - "$broken_local_health_diagnostics/fixtures/local-health/contract-matrix.v1.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+for case in payload:
+    if case.get("case_id") != "diagnostics_redaction":
+        continue
+    case["tags"].remove("redaction")
+    case["health"]["capabilities"].remove("diagnostics.collect")
+    case["health"]["overall"]["next_action"] = "share_raw_bundle"
+    case["health"]["sources"][0]["next_action"] = "share_raw_bundle"
+    case["health"]["blockers"][0]["owner"] = "runtime"
+    event_payload = case["events"][0]["payload"]
+    event_payload["redacted_identifiers"].remove("device_id")
+    event_payload["excluded_secret_classes"].remove("hardware_serials")
+    event_payload["included_sections"].remove("command_ledger")
+    event_payload["support_claim"] = "support_unredactedfixture"
+    break
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_local_health_diagnostics" >/tmp/public-contract-broken-local-health-diagnostics.out 2>&1; then
+  echo "Expected contract check to fail when local-health diagnostics redaction contract drifts" >&2
+  exit 1
+fi
+grep -q "local health diagnostics_redaction tags must include redaction" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction capabilities must include diagnostics.collect" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction next_action must be share_redacted_bundle" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction source next_action must be share_redacted_bundle" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction blocker owner must be support" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction redacted_identifiers must include device_id" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction excluded_secret_classes must include hardware_serials" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local health diagnostics_redaction included_sections must include command_ledger" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+grep -q "local-health.diagnostics_redaction.event_payload.support_claim exposes unredacted support claim" \
+  /tmp/public-contract-broken-local-health-diagnostics.out
+
 broken_mcp="$tmp_dir/broken-mcp"
 cp -R "$output_dir" "$broken_mcp"
 mkdir -p "$broken_mcp/agent-adapters/mcp-server"
