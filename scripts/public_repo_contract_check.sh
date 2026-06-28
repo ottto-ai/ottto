@@ -689,6 +689,13 @@ def check_cli_contracts() -> None:
     expect(doctor.get("command") == "status", "CLI doctor request command must be status")
     expect(doctor.get("refresh_agent_status") is False, "CLI doctor request must not refresh agent status")
 
+    fix_codex = require_dict(load_json("fixtures/cli/fix-codex-request.json"), "CLI fix Codex request")
+    expect_protocol(fix_codex.get("protocol_version"), "CLI fix Codex request")
+    expect(fix_codex.get("client_kind") == "cli", "CLI fix Codex request client_kind must be cli")
+    expect(fix_codex.get("command") == "repair", "CLI fix Codex request command must be repair")
+    expect(fix_codex.get("source") == "codex", "CLI fix Codex request source must be codex")
+    expect(fix_codex.get("dry_run") is False, "CLI fix Codex request dry_run must be false")
+
     verify_repair = require_dict(
         load_json("fixtures/cli/verify-repair-request.json"),
         "CLI verify repair request",

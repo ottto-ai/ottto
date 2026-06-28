@@ -172,6 +172,28 @@ grep -q "CLI uninstall request command must be uninstall_execute" \
 grep -q "CLI uninstall request confirm must be true" \
   /tmp/public-contract-broken-uninstall.out
 
+broken_fix="$tmp_dir/broken-fix"
+cp -R "$output_dir" "$broken_fix"
+python3 - "$broken_fix/fixtures/cli/fix-codex-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["source"] = "claude_code"
+payload["dry_run"] = True
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_fix" >/tmp/public-contract-broken-fix.out 2>&1; then
+  echo "Expected contract check to fail when fix request source or dry_run drifts" >&2
+  exit 1
+fi
+grep -q "CLI fix Codex request source must be codex" \
+  /tmp/public-contract-broken-fix.out
+grep -q "CLI fix Codex request dry_run must be false" \
+  /tmp/public-contract-broken-fix.out
+
 broken_setup_state="$tmp_dir/broken-setup-state"
 cp -R "$output_dir" "$broken_setup_state"
 python3 - "$broken_setup_state/fixtures/cli/setup-needs-user-action-output.json" <<'PY'
