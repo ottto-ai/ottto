@@ -276,6 +276,35 @@ def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict
     return [source for source in detected_sources if isinstance(source, dict)]
 
 
+def check_setup_agent_action(
+    payload: dict[str, Any],
+    context: str,
+    expected_kind: str,
+    *,
+    requires_user: bool,
+    retryable: bool,
+    description: str,
+) -> dict[str, Any]:
+    agent_action = require_dict(payload.get("agent_action"), f"{context} agent_action")
+    expect(
+        agent_action.get("kind") == expected_kind,
+        f"{context} agent_action.kind must be {expected_kind}",
+    )
+    expect(
+        agent_action.get("requires_user") is requires_user,
+        f"{context} agent_action.requires_user must be {str(requires_user).lower()}",
+    )
+    expect(
+        agent_action.get("retryable") is retryable,
+        f"{context} agent_action.retryable must be {str(retryable).lower()}",
+    )
+    expect(
+        agent_action.get("description") == description,
+        f"{context} agent_action.description must be stable",
+    )
+    return agent_action
+
+
 def check_connector_fixture_contract(
     fixture_path: Path,
     source_id: str,
@@ -721,10 +750,14 @@ def check_cli_contracts() -> None:
     expect(next_action.get("type") == "browser_claim", "browser claim next_action type must be browser_claim")
     expect(next_action.get("claim_code") == browser_claim.get("claim_code"), "browser claim next_action must repeat claim_code")
     expect(next_action.get("claim_url") == browser_claim.get("claim_url"), "browser claim next_action must repeat claim_url")
-    agent_action = require_dict(browser_claim.get("agent_action"), "browser claim agent_action")
-    expect(agent_action.get("kind") == "open_browser_claim", "browser claim agent_action kind must be open_browser_claim")
-    expect(agent_action.get("requires_user") is True, "browser claim agent_action requires_user must be true")
-    expect(agent_action.get("retryable") is True, "browser claim agent_action retryable must be true")
+    check_setup_agent_action(
+        browser_claim,
+        "browser claim",
+        "open_browser_claim",
+        requires_user=True,
+        retryable=True,
+        description="Open or share the browser claim URL or code with the user.",
+    )
 
     needs_user = require_dict(
         load_json("fixtures/cli/setup-needs-user-action-output.json"),
@@ -737,10 +770,14 @@ def check_cli_contracts() -> None:
     question = require_dict(needs_user.get("next_question"), "needs-user-action next_question")
     expect(question.get("type") == "approval", "needs-user-action next_question type must be approval")
     expect(question.get("source") == "codex", "needs-user-action next_question source must be codex")
-    agent_action = require_dict(needs_user.get("agent_action"), "needs-user-action agent_action")
-    expect(agent_action.get("kind") == "answer_setup_question", "needs-user-action agent_action kind must be answer_setup_question")
-    expect(agent_action.get("requires_user") is True, "needs-user-action agent_action requires_user must be true")
-    expect(agent_action.get("retryable") is True, "needs-user-action agent_action retryable must be true")
+    check_setup_agent_action(
+        needs_user,
+        "needs-user-action",
+        "answer_setup_question",
+        requires_user=True,
+        retryable=True,
+        description="Ask the user to answer the structured next_question prompt.",
+    )
     expect(len(needs_user_sources) == 1, "needs-user-action output must expose one detected source")
     if needs_user_sources:
         source = needs_user_sources[0]
@@ -756,10 +793,14 @@ def check_cli_contracts() -> None:
     expect(timed_out.get("claim_code_provided") is True, "setup timed-out output must preserve claim_code_provided")
     expect(timed_out.get("next_question") is None, "setup timed-out next_question must be null")
     expect(timed_out.get("next_action") is None, "setup timed-out next_action must be null")
-    agent_action = require_dict(timed_out.get("agent_action"), "setup timed-out agent_action")
-    expect(agent_action.get("kind") == "retry_setup", "setup timed-out agent_action kind must be retry_setup")
-    expect(agent_action.get("requires_user") is False, "setup timed-out agent_action requires_user must be false")
-    expect(agent_action.get("retryable") is True, "setup timed-out agent_action retryable must be true")
+    check_setup_agent_action(
+        timed_out,
+        "setup timed-out",
+        "retry_setup",
+        requires_user=False,
+        retryable=True,
+        description="Setup timed out. Retry setup or check status before taking manual action.",
+    )
     expect(len(timed_out_sources) == 1, "setup timed-out output must expose one detected source")
     if timed_out_sources:
         source = timed_out_sources[0]
