@@ -1,0 +1,23 @@
+{
+  "status": "failed",
+  "setup_run_id": "setup_01HXFAILED",
+  "claim_code_provided": true,
+  "source_count": 1,
+  "detected_sources": [
+    {
+      "source": "codex",
+      "state": "failed",
+      "readiness_percent": 40,
+      "missing_fields": ["setup_run_failed"]
+    }
+  ],
+  "next_question": null,
+  "next_action": null,
+  "agent_action": {
+    "kind": "inspect_failure",
+    "requires_user": false,
+    "retryable": true,
+    "description": "Inspect setup failure details and run doctor before repair."
+  },
+  "actions": []
+}

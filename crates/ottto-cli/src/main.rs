@@ -2468,6 +2468,54 @@ mod tests {
     }
 
     #[test]
+    fn setup_failed_output_uses_stable_internal_exit_code() {
+        let payload = parse_json_output(include_str!(
+            "../../../fixtures/cli/setup-failed-output.json"
+        ));
+        assert_eq!(
+            payload_exit_code(
+                Some(&LocalControlCommand::Setup {
+                    sources: Vec::new(),
+                    claim_code: None,
+                    setup_run_id: None,
+                    api_base_url: None,
+                }),
+                &payload,
+            ),
+            CliErrorCode::Internal.exit_code()
+        );
+        assert_eq!(
+            setup_payload_exit_code(&payload),
+            CliErrorCode::Internal.exit_code()
+        );
+        assert!(
+            !setup_payload_requires_user_decision(&payload),
+            "failed setup should surface inspect_failure without asking the user a question"
+        );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("inspect_failure")
+        );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("requires_user"))
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            payload
+                .get("agent_action")
+                .and_then(|value| value.get("retryable"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn setup_browser_claim_output_uses_stable_needs_action_exit_code() {
         let payload = setup_waiting_for_browser_payload(&fake_browser_claim(), false, 300);
         let expected: serde_json::Value = serde_json::from_str(include_str!(

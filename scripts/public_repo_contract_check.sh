@@ -1037,6 +1037,29 @@ def check_cli_contracts() -> None:
         expect(source.get("state") == "waiting_for_telemetry", "setup timed-out detected source state must be waiting_for_telemetry")
         expect("fresh_telemetry" in require_list(source.get("missing_fields"), "setup timed-out missing_fields"), "setup timed-out missing_fields must include fresh_telemetry")
 
+    failed = require_dict(
+        load_json("fixtures/cli/setup-failed-output.json"), "CLI setup failed output"
+    )
+    failed_sources = check_setup_output_shape(failed, "setup failed output")
+    expect(failed.get("status") == "failed", "setup failed status must be failed")
+    expect(failed.get("claim_code_provided") is True, "setup failed output must preserve claim_code_provided")
+    expect(failed.get("next_question") is None, "setup failed next_question must be null")
+    expect(failed.get("next_action") is None, "setup failed next_action must be null")
+    check_setup_agent_action(
+        failed,
+        "setup failed",
+        "inspect_failure",
+        requires_user=False,
+        retryable=True,
+        description="Inspect setup failure details and run doctor before repair.",
+    )
+    expect(len(failed_sources) == 1, "setup failed output must expose one detected source")
+    if failed_sources:
+        source = failed_sources[0]
+        expect(source.get("source") == "codex", "setup failed detected source must be codex")
+        expect(source.get("state") == "failed", "setup failed detected source state must be failed")
+        expect("setup_run_failed" in require_list(source.get("missing_fields"), "setup failed missing_fields"), "setup failed missing_fields must include setup_run_failed")
+
     status_events = load_ndjson("fixtures/cli/status-watch-output.ndjson")
     if status_events:
         final = status_events[-1]
