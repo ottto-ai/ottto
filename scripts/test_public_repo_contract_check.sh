@@ -171,6 +171,52 @@ grep -q "needs-user-action output must not set both next_question and next_actio
 grep -q "needs-user-action next_action must be null while waiting for approval" \
   /tmp/public-contract-broken-setup-state.out
 
+broken_setup_agent_action="$tmp_dir/broken-setup-agent-action"
+cp -R "$output_dir" "$broken_setup_agent_action"
+python3 - \
+  "$broken_setup_agent_action/fixtures/cli/setup-browser-claim-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-needs-user-action-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-timed-out-output.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+browser_path = Path(sys.argv[1])
+needs_path = Path(sys.argv[2])
+timeout_path = Path(sys.argv[3])
+
+browser = json.loads(browser_path.read_text(encoding="utf-8"))
+browser["agent_action"]["kind"] = "answer_setup_question"
+browser["agent_action"]["description"] = "Read the human setup output."
+browser_path.write_text(json.dumps(browser, indent=2) + "\n", encoding="utf-8")
+
+needs = json.loads(needs_path.read_text(encoding="utf-8"))
+needs["agent_action"]["requires_user"] = False
+needs["agent_action"]["description"] = "Ask the user what to do."
+needs_path.write_text(json.dumps(needs, indent=2) + "\n", encoding="utf-8")
+
+timeout = json.loads(timeout_path.read_text(encoding="utf-8"))
+timeout["agent_action"]["retryable"] = False
+timeout["agent_action"]["description"] = "Give up on setup."
+timeout_path.write_text(json.dumps(timeout, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_agent_action" >/tmp/public-contract-broken-setup-agent-action.out 2>&1; then
+  echo "Expected contract check to fail when setup agent_action semantics drift" >&2
+  exit 1
+fi
+grep -q "browser claim agent_action.kind must be open_browser_claim" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "browser claim agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "needs-user-action agent_action.requires_user must be true" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "needs-user-action agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup timed-out agent_action.retryable must be true" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup timed-out agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+
 broken_setup_docs="$tmp_dir/broken-setup-docs"
 cp -R "$output_dir" "$broken_setup_docs"
 python3 - "$broken_setup_docs/docs/setup.md" <<'PY'
