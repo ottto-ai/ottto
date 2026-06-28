@@ -220,7 +220,8 @@ cp -R "$output_dir" "$broken_setup_agent_action"
 python3 - \
   "$broken_setup_agent_action/fixtures/cli/setup-browser-claim-output.json" \
   "$broken_setup_agent_action/fixtures/cli/setup-needs-user-action-output.json" \
-  "$broken_setup_agent_action/fixtures/cli/setup-timed-out-output.json" <<'PY'
+  "$broken_setup_agent_action/fixtures/cli/setup-timed-out-output.json" \
+  "$broken_setup_agent_action/fixtures/cli/setup-failed-output.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -228,6 +229,7 @@ from pathlib import Path
 browser_path = Path(sys.argv[1])
 needs_path = Path(sys.argv[2])
 timeout_path = Path(sys.argv[3])
+failed_path = Path(sys.argv[4])
 
 browser = json.loads(browser_path.read_text(encoding="utf-8"))
 browser["agent_action"]["kind"] = "answer_setup_question"
@@ -243,6 +245,12 @@ timeout = json.loads(timeout_path.read_text(encoding="utf-8"))
 timeout["agent_action"]["retryable"] = False
 timeout["agent_action"]["description"] = "Give up on setup."
 timeout_path.write_text(json.dumps(timeout, indent=2) + "\n", encoding="utf-8")
+
+failed = json.loads(failed_path.read_text(encoding="utf-8"))
+failed["agent_action"]["kind"] = "retry_setup"
+failed["agent_action"]["requires_user"] = True
+failed["agent_action"]["description"] = "Ask the user to decide how to repair setup."
+failed_path.write_text(json.dumps(failed, indent=2) + "\n", encoding="utf-8")
 PY
 if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_agent_action" >/tmp/public-contract-broken-setup-agent-action.out 2>&1; then
   echo "Expected contract check to fail when setup agent_action semantics drift" >&2
@@ -259,6 +267,12 @@ grep -q "needs-user-action agent_action.description must be stable" \
 grep -q "setup timed-out agent_action.retryable must be true" \
   /tmp/public-contract-broken-setup-agent-action.out
 grep -q "setup timed-out agent_action.description must be stable" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.kind must be inspect_failure" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.requires_user must be false" \
+  /tmp/public-contract-broken-setup-agent-action.out
+grep -q "setup failed agent_action.description must be stable" \
   /tmp/public-contract-broken-setup-agent-action.out
 
 broken_setup_docs="$tmp_dir/broken-setup-docs"

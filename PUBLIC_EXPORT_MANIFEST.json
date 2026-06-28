@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 217,
-  "content_sha256": "8c4be8874b750cc80636e18d7806a2bb39350f044b61720810c99f9da050eda8",
+  "candidate_file_count": 218,
+  "content_sha256": "f4f9191ed7d89ea7106b42e80d99e970c8be688c0b48f86dc3573f9d191c228b",
   "files": [
     {
       "executable": false,
@@ -419,8 +419,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "28f6b64ea9fc8af9561deaeb6332060cfdef29ab694551ff52b798e8c889e7c3",
-      "size_bytes": 140418
+      "sha256": "f59d105049e7ae3a39792ba97bae090af089895935ad7a9bb6d052d6c7da7afc",
+      "size_bytes": 141988
     },
     {
       "executable": false,
@@ -957,6 +957,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/cli/setup-failed-output.json",
+      "sha256": "f7a09a22731eb34bead3c12e30b65c296cb678367b581089d1355adfca510fe2",
+      "size_bytes": 535
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/cli/setup-headless-request.json",
       "sha256": "e6bc20fddf37def052a860cb807c10b4af8ad181c3b29256c4b5d701fb38e998",
       "size_bytes": 237
@@ -1294,8 +1301,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "fedc9fd81e0c9cedee271fc6669ceeef2f3a676cfbc3ed08b4d8bc23fc3caf41",
-      "size_bytes": 96240
+      "sha256": "3fa9a396ae3d02254edb3377bbd8b62d47ba24fb15bc88e39d44122062e4df54",
+      "size_bytes": 97566
     },
     {
       "executable": true,
@@ -1469,8 +1476,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "02c053b029b5f2bede39c43afbc454d40e946e637d7e5859975cfb08e603d79f",
-      "size_bytes": 70406
+      "sha256": "6d122179c388e9e18656884f6bba1a26990ad9dd04739713bc73ff3568028214",
+      "size_bytes": 71186
     },
     {
       "executable": true,
@@ -1522,9 +1529,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-28T22:51:39+00:00",
+  "generated_at": "2026-06-28T23:24:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 218,
+  "output_file_count": 219,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1557,5 +1564,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b971d04c28a36facd06947612b3f204cf430b0e7"
+  "source_commit": "df48bdbf8cecedeee180dad07d50aaa71fdb3e65"
 }
