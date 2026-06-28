@@ -604,6 +604,51 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_registry" >/tmp/public-contract-b
 fi
 grep -q "registry is missing required source(s): codex" /tmp/public-contract-broken-registry.out
 
+broken_source_docs="$tmp_dir/broken-source-docs"
+cp -R "$output_dir" "$broken_source_docs"
+python3 - \
+  "$broken_source_docs/connectors/sources/codex/README.md" \
+  "$broken_source_docs/connectors/sources/codex/POLICY.md" <<'PY'
+import sys
+from pathlib import Path
+
+readme_path = Path(sys.argv[1])
+policy_path = Path(sys.argv[2])
+
+readme = readme_path.read_text(encoding="utf-8")
+readme = readme.replace("# Codex Source Package", "# Source Package")
+readme = readme.replace("Codex remains an official Ottto app", "This package")
+readme = readme.replace("Collectors:", "Capabilities:")
+readme = readme.replace("- `logs2_trace`:", "- logs2 trace:")
+readme = readme.replace("Raw prompts", "Content")
+readme_path.write_text(readme, encoding="utf-8")
+
+policy = policy_path.read_text(encoding="utf-8")
+policy = policy.replace("# Codex Source Policy", "# Codex Policy")
+policy = policy.replace("Review tier: `official`", "Review tier: unofficial")
+policy = policy.replace("## Upload Boundaries", "## Upload Notes")
+policy = policy.replace("Do not upload", "Avoid uploading")
+policy_path.write_text(policy, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_source_docs" >/tmp/public-contract-broken-source-docs.out 2>&1; then
+  echo "Expected contract check to fail when source package docs lose governance content" >&2
+  exit 1
+fi
+grep -q "connectors/sources/codex/README.md must include a Collectors section" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/README.md must document collector logs2_trace" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/README.md must document raw prompt/content upload boundary" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must be titled for Codex" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must include ## Upload Boundaries" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must preserve official review tier" \
+  /tmp/public-contract-broken-source-docs.out
+grep -q "connectors/sources/codex/POLICY.md must document upload prohibitions" \
+  /tmp/public-contract-broken-source-docs.out
+
 broken_connector_manifest="$tmp_dir/broken-connector-manifest"
 cp -R "$output_dir" "$broken_connector_manifest"
 python3 - \
