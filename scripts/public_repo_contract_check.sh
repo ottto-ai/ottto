@@ -518,6 +518,7 @@ DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS = (
     (re.compile(r"(?i)(^|[\s:=])Bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "bearer token"),
     (re.compile(r"(?i)(^|[\s:=])x-api-key\s*[:=]\s*[A-Za-z0-9._-]{8,}"), "API key header"),
     (re.compile(r"\b(?:ghp|github_pat|sk|xox[baprs])[-_A-Za-z0-9]{8,}\b"), "secret token"),
+    (re.compile(r"\bclaim_(?!machine\b|claimed\b)[A-Za-z0-9]{6,}\b"), "setup claim"),
     (re.compile(r"\bsupport_[A-Za-z0-9]{6,}\b"), "support claim"),
     (re.compile(r"\b(?:org|usr|acct)_[A-Za-z0-9]{6,}\b"), "account identifier"),
     (re.compile(r"\b(?:machine|otm|device)_[A-Za-z0-9]{6,}\b"), "machine identifier"),
@@ -1041,6 +1042,12 @@ def check_setup_and_redaction_contracts() -> None:
     )
     expect(request_approval.get("status") == "waiting", "request_approval setup event must be waiting")
     expect(request_approval.get("source") == "codex", "request_approval setup event source must be codex")
+    event_metadata = [
+        {"metadata": require_dict(event.get("metadata"), f"setup event {index} metadata")}
+        for index, event in enumerate(events)
+        if isinstance(event, dict)
+    ]
+    check_diagnostics_values_are_redacted({"events": event_metadata}, "setup")
 
 
 def check_local_health_diagnostics_contract() -> None:

@@ -443,6 +443,32 @@ grep -q "redacted diagnostics upload must not expose support_claim" \
 grep -q "diagnostics.upload.support_claim exposes unredacted support claim" \
   /tmp/public-contract-broken-diagnostics-upload.out
 
+broken_setup_redaction="$tmp_dir/broken-setup-redaction"
+cp -R "$output_dir" "$broken_setup_redaction"
+python3 - "$broken_setup_redaction/fixtures/setup/claim-run.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+metadata = payload["events"][0]["metadata"]
+metadata["claim_code"] = "claim_unredactedfixture"
+metadata["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.service.plist"
+metadata["auth_header"] = "Be" + "arer setupfixturetoken123"
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_redaction" >/tmp/public-contract-broken-setup-redaction.out 2>&1; then
+  echo "Expected contract check to fail when setup events expose raw private values" >&2
+  exit 1
+fi
+grep -q "setup.events\\[0\\].metadata.claim_code exposes unredacted setup claim" \
+  /tmp/public-contract-broken-setup-redaction.out
+grep -q "setup.events\\[0\\].metadata.launch_agent_path exposes unredacted local path" \
+  /tmp/public-contract-broken-setup-redaction.out
+grep -q "setup.events\\[0\\].metadata.auth_header exposes unredacted bearer token" \
+  /tmp/public-contract-broken-setup-redaction.out
+
 broken_install_docs="$tmp_dir/broken-install-docs"
 cp -R "$output_dir" "$broken_install_docs"
 python3 - \
