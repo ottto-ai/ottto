@@ -70,6 +70,9 @@ const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
+const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 // Poll long enough for slow-arriving agent telemetry (codex batches + flushes
 // its token records, then the relay forwards them) to reach the backend before
 // we give up — claude/pi still return early on success. Kept under
@@ -3489,14 +3492,36 @@ fn wait_for_setup_run_verification_with_refresh_mut(
     smoke_after: &str,
     filters: Option<&SetupRunVerificationFilters>,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
+    wait_for_setup_run_verification_with_refresh_mut_timeout(
+        api_base_url,
+        credentials,
+        source,
+        smoke_after,
+        filters,
+        SetupVerificationTimeouts {
+            wait: VERIFICATION_WAIT_TIMEOUT,
+            request: SETUP_VERIFICATION_HTTP_TIMEOUT,
+        },
+    )
+}
+
+fn wait_for_setup_run_verification_with_refresh_mut_timeout(
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    source: &SourceKind,
+    smoke_after: &str,
+    filters: Option<&SetupRunVerificationFilters>,
+    timeouts: SetupVerificationTimeouts,
+) -> Result<SetupRunVerificationResponse, LocalApiError> {
     setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
-        wait_for_setup_run_verification_with_base(
+        wait_for_setup_run_verification_with_base_timeout(
             api_base_url,
             active,
             token,
             source,
             smoke_after,
             filters,
+            timeouts,
         )
     })
 }
@@ -7336,12 +7361,16 @@ fn run_one_pi_route_verification(
             billing_provider: route.classification.billing_provider.clone(),
         })
     };
-    match wait_for_setup_run_verification_with_refresh_mut(
+    match wait_for_setup_run_verification_with_refresh_mut_timeout(
         api_base_url,
         credentials,
         &SourceKind::Pi,
         &smoke_after,
         filters.as_ref(),
+        SetupVerificationTimeouts {
+            wait: PI_VERIFICATION_WAIT_TIMEOUT,
+            request: PI_VERIFICATION_HTTP_TIMEOUT,
+        },
     ) {
         Ok(verification) => pi_route_result_from_verification(route, &smoke, verification),
         Err(error) => pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error),
@@ -7537,7 +7566,7 @@ fn run_pi_route_smoke_prompt(
     run_bounded_command(
         command.program,
         &command.args,
-        SMOKE_COMMAND_TIMEOUT,
+        PI_SMOKE_COMMAND_TIMEOUT,
         "Pi",
         before_session_count,
     )
@@ -7979,6 +8008,12 @@ struct SetupRunVerificationFilters {
     billing_provider: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct SetupVerificationTimeouts {
+    wait: Duration,
+    request: Duration,
+}
+
 fn get_setup_run_verification_with_base(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
@@ -7986,6 +8021,26 @@ fn get_setup_run_verification_with_base(
     source: &SourceKind,
     smoke_after: &str,
     filters: Option<&SetupRunVerificationFilters>,
+) -> Result<SetupRunVerificationResponse, LocalApiError> {
+    get_setup_run_verification_with_base_timeout(
+        api_base_url,
+        connection,
+        setup_run_token,
+        source,
+        smoke_after,
+        filters,
+        SETUP_VERIFICATION_HTTP_TIMEOUT,
+    )
+}
+
+fn get_setup_run_verification_with_base_timeout(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    source: &SourceKind,
+    smoke_after: &str,
+    filters: Option<&SetupRunVerificationFilters>,
+    request_timeout: Duration,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
     let url = api_url_with_base(
         api_base_url,
@@ -8018,7 +8073,7 @@ fn get_setup_run_verification_with_base(
     backend_get_json_with_timeout(
         &url,
         &[("X-Ottto-Setup-Run-Token", setup_run_token)],
-        SETUP_VERIFICATION_HTTP_TIMEOUT,
+        request_timeout,
     )
 }
 
@@ -8405,25 +8460,27 @@ fn safe_backend_body_excerpt(body: &str) -> Option<String> {
     Some(truncate_diagnostic(&redact_inline(&compact)))
 }
 
-fn wait_for_setup_run_verification_with_base(
+fn wait_for_setup_run_verification_with_base_timeout(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
     source: &SourceKind,
     smoke_after: &str,
     filters: Option<&SetupRunVerificationFilters>,
+    timeouts: SetupVerificationTimeouts,
 ) -> Result<SetupRunVerificationResponse, LocalApiError> {
     let start = Instant::now();
     loop {
-        let response = get_setup_run_verification_with_base(
+        let response = get_setup_run_verification_with_base_timeout(
             api_base_url,
             connection,
             setup_run_token,
             source,
             smoke_after,
             filters,
+            timeouts.request,
         )?;
-        if response.verified || start.elapsed() >= VERIFICATION_WAIT_TIMEOUT {
+        if response.verified || start.elapsed() >= timeouts.wait {
             return Ok(response);
         }
         thread::sleep(VERIFICATION_POLL_INTERVAL);
@@ -13261,6 +13318,47 @@ log_user_prompt = true
     }
 
     #[test]
+    fn pi_verify_budgets_fit_interactive_cli_bounds() {
+        assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
+        assert!(PI_VERIFICATION_WAIT_TIMEOUT < VERIFICATION_WAIT_TIMEOUT);
+        assert!(PI_VERIFICATION_HTTP_TIMEOUT < SETUP_VERIFICATION_HTTP_TIMEOUT);
+        assert!(PI_VERIFICATION_HTTP_TIMEOUT > PI_VERIFICATION_WAIT_TIMEOUT);
+        assert!(
+            PI_SMOKE_COMMAND_TIMEOUT + PI_VERIFICATION_HTTP_TIMEOUT + PIPE_DRAIN_TIMEOUT
+                < Duration::from_secs(40)
+        );
+    }
+
+    #[test]
+    fn setup_verification_request_honors_custom_timeout() {
+        let api_base_url = delayed_setup_verification_server(
+            "setup_slow_verification",
+            Duration::from_millis(250),
+        );
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_slow_verification".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base_url.clone(),
+        };
+
+        let started = Instant::now();
+        let result = get_setup_run_verification_with_base_timeout(
+            &api_base_url,
+            &connection,
+            "token_test",
+            &SourceKind::Pi,
+            "2026-05-05T10:00:00Z",
+            None,
+            Duration::from_millis(50),
+        );
+
+        assert!(matches!(result, Err(LocalApiError::TimedOut(_))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn setup_scan_result_http_timeout_covers_synchronous_backend_work() {
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT >= Duration::from_secs(120));
         assert!(SETUP_SCAN_RESULT_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
@@ -13883,6 +13981,22 @@ log_user_prompt = true
                 r#"{{"run":{{"id":"{setup_run_id}","status":"waiting_for_user","machine_id":"machine_test"}},"sources":[],"next_action":null,"next_question":null}}"#
             );
             write_json_response(&mut stream, 200, "OK", &body);
+        });
+        format!("http://{address}")
+    }
+
+    fn delayed_setup_verification_server(setup_run_id: &'static str, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind setup backend");
+        let address = listener.local_addr().expect("local address");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept setup verification");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.contains(&format!(
+                "/api/v1/setup-runs/{setup_run_id}/local-client/verification"
+            )));
+            thread::sleep(delay);
+            let body = r#"{"verified":false,"records_seen":0,"last_record_id":null,"last_received_at":null,"smoke_after":"2026-05-05T10:00:00Z"}"#;
+            write_json_response(&mut stream, 200, "OK", body);
         });
         format!("http://{address}")
     }
