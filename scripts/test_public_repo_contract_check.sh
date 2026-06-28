@@ -270,6 +270,69 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
 text = text.replace(
+    "Default setup opens a browser claim and waits for approval",
+    "Default setup can run locally without browser approval",
+)
+text = text.replace("ottto setup --json", "ottto setup", 1)
+text = text.replace(
+    "parseable JSON payload with a\nnonzero exit code",
+    "human-readable payload with a failure",
+)
+text = text.replace(
+    "ottto setup --json --no-browser --no-wait",
+    "ottto setup --no-browser",
+)
+text = text.replace(
+    "Show the returned `claim_url` or `claim_code` to the user",
+    "Continue setup without showing claim details",
+)
+text = text.replace(
+    "Exit code `60` means\nbrowser or user action is required",
+    "Exit code `60` means retry later",
+)
+text = text.replace(
+    "Exit code `61` means a wait timed out",
+    "Exit code `61` means setup failed permanently",
+)
+text = text.replace(
+    "ottto setup --claim-code <code> --json",
+    "ottto setup --claim-code <code>",
+)
+text = text.replace("ottto login --json", "ottto login", 1)
+text = text.replace(
+    "ottto login --json --no-browser --no-wait",
+    "ottto login --no-browser",
+)
+text = text.replace("ottto account --json", "ottto account")
+text = text.replace("ottto logout --json", "ottto logout", 1)
+text = text.replace(
+    "Use local-only logout only as an explicit emergency cleanup path",
+    "Use local-only logout whenever cleanup is easier",
+)
+text = text.replace("ottto logout --local-only --json", "ottto logout --local-only")
+text = text.replace("ottto apps detect --json", "ottto sources detect --json")
+text = text.replace("ottto apps status --app codex --json", "ottto source status codex")
+text = text.replace("ottto verify --app claude-code --json", "ottto verify claude-code")
+text = text.replace("ottto verify --repair --app codex --json", "ottto verify --repair codex")
+text = text.replace("Plain verify is read-only", "Plain verify may repair config")
+text = text.replace(
+    "`verify --repair` is limited to daemon-owned\nWriteConfig repair",
+    "`verify --repair` may edit any local config",
+)
+text = text.replace(
+    "Pi keeps its existing verification\nflow and has no config patching",
+    "Pi config patching is supported",
+)
+text = text.replace(
+    "Do not hand-edit local Codex, Claude Code, or\nPi config as a setup shortcut",
+    "Hand-edit local configs when setup is stuck",
+)
+text = text.replace("| `0` | Success or setup complete |", "| `0` | Success |")
+text = text.replace("| `10` | `ottto-service` unavailable |", "| `10` | Service issue |")
+text = text.replace("| `60` | Setup needs user or browser action |", "| `60` | Retry later |")
+text = text.replace("| `61` | Setup timed out |", "| `61` | Failed |")
+text = text.replace("| `70` | Internal error |", "| `70` | Unknown |")
+text = text.replace(
     "branch on `agent_action.kind` before inspecting human text",
     "read setup summaries before deciding what to do",
 )
@@ -307,6 +370,60 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_setup_docs" >/tmp/public-contract
   echo "Expected contract check to fail when setup docs lose agent-action semantics" >&2
   exit 1
 fi
+grep -q "setup docs must preserve browser-claim-first setup guidance" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include JSON setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document nonzero JSON setup payloads" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include headless no-browser/no-wait setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve headless claim handoff guidance" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document needs-user-action exit code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must document setup timeout exit code" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include claim-code setup command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include login JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include headless login command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include account JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include cloud-first logout command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must keep local-only logout as emergency-only" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include explicit local-only logout command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include apps detect JSON command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include app status command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include app verify command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must include bounded repair verify command" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve read-only verify boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve daemon-owned repair boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must preserve Pi no-config-patching boundary" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must prohibit hand-edit setup shortcuts" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 0" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 10" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 60" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 61" \
+  /tmp/public-contract-broken-setup-docs.out
+grep -q "setup docs must list exit code 70" \
+  /tmp/public-contract-broken-setup-docs.out
 grep -q "setup docs must require branching on agent_action.kind before human text" \
   /tmp/public-contract-broken-setup-docs.out
 grep -q "setup docs must treat setup exit 60/61 payloads as parseable JSON" \
