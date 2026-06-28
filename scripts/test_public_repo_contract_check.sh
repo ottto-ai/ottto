@@ -610,6 +610,81 @@ grep -q "release verification docs must prohibit silent app/Homebrew owner takeo
 grep -q "release verification docs must keep stable evidence redacted and owner-scoped" \
   /tmp/public-contract-broken-install-docs.out
 
+broken_docs_index="$tmp_dir/broken-docs-index"
+cp -R "$output_dir" "$broken_docs_index"
+python3 - "$broken_docs_index/docs/README.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+text = text.replace(
+    "CLI and `ottto-service` daemon, not private development scripts.",
+    "CLI, daemon, and useful development scripts.",
+)
+text = text.replace("[Install](install.md)", "[Install](setup.md)")
+text = text.replace("[Privacy](privacy.md)", "Privacy")
+text = text.replace("[Diagnostics](diagnostics.md)", "Diagnostics")
+text = text.replace("[Support Runbook](support.md)", "Support Runbook")
+text = text.replace("[Connector Contribution](connectors.md)", "Connector Contribution")
+text = text.replace("[Agent Adapters](agent-adapters.md)", "Agent Adapters")
+text = text.replace("[Release Verification](release-verification.md)", "Release Verification")
+text = text.replace("[Troubleshooting](troubleshooting.md)", "Troubleshooting")
+text = text.replace("[Examples](examples.md)", "Examples")
+text = text.replace(
+    "Automation should consume only `ottto --json` output.",
+    "Automation may parse concise human summaries.",
+)
+text = text.replace(
+    "`--json --watch` emits newline-delimited JSON progress events and a final event",
+    "`--json --watch` prints progress",
+)
+text = text.replace("Customer-facing commands use app language", "Customer-facing commands may use source language")
+text = text.replace("ottto apps --json", "ottto sources --json")
+text = text.replace("ottto setup --json", "ottto setup")
+text = text.replace("ottto diagnostics collect --json", "ottto diagnostics collect")
+text = text.replace("public docs should prefer `apps` and `--app`", "public docs may prefer sources")
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_docs_index" >/tmp/public-contract-broken-docs-index.out 2>&1; then
+  echo "Expected contract check to fail when docs index loses public entrypoint guidance" >&2
+  exit 1
+fi
+grep -q "docs index must keep private development scripts out of public setup" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link install docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link privacy docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link diagnostics docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link support runbook" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link connector contribution docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link agent adapter docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link release verification docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link troubleshooting docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must link examples docs" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must require automation to consume JSON output" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must document NDJSON watch semantics" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must preserve public app-language command guidance" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include apps JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include setup JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must include diagnostics JSON command" \
+  /tmp/public-contract-broken-docs-index.out
+grep -q "docs index must prefer apps and --app over lower-level source nouns" \
+  /tmp/public-contract-broken-docs-index.out
+
 broken_connector_docs="$tmp_dir/broken-connector-docs"
 cp -R "$output_dir" "$broken_connector_docs"
 python3 - \

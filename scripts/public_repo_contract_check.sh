@@ -392,6 +392,54 @@ def check_connector_docs_contracts() -> None:
             expect(needle in text, message)
 
 
+def check_docs_index_contracts() -> None:
+    docs_index = require_file("docs/README.md")
+    if docs_index is None:
+        return
+
+    text = docs_index.read_text(encoding="utf-8")
+    expectations = [
+        (
+            "not private development scripts",
+            "docs index must keep private development scripts out of public setup",
+        ),
+        ("[Install](install.md)", "docs index must link install docs"),
+        ("[Setup](setup.md)", "docs index must link setup docs"),
+        ("[Privacy](privacy.md)", "docs index must link privacy docs"),
+        ("[Diagnostics](diagnostics.md)", "docs index must link diagnostics docs"),
+        ("[Support Runbook](support.md)", "docs index must link support runbook"),
+        ("[Connector Contribution](connectors.md)", "docs index must link connector contribution docs"),
+        ("[Agent Adapters](agent-adapters.md)", "docs index must link agent adapter docs"),
+        ("[Release Verification](release-verification.md)", "docs index must link release verification docs"),
+        ("[Troubleshooting](troubleshooting.md)", "docs index must link troubleshooting docs"),
+        ("[Examples](examples.md)", "docs index must link examples docs"),
+        (
+            "Automation should consume only `ottto --json` output",
+            "docs index must require automation to consume JSON output",
+        ),
+        (
+            "`--json --watch` emits newline-delimited JSON progress events and a final event",
+            "docs index must document NDJSON watch semantics",
+        ),
+        (
+            "Customer-facing commands use app language",
+            "docs index must preserve public app-language command guidance",
+        ),
+        ("ottto apps --json", "docs index must include apps JSON command"),
+        ("ottto setup --json", "docs index must include setup JSON command"),
+        (
+            "ottto diagnostics collect --json",
+            "docs index must include diagnostics JSON command",
+        ),
+        (
+            "public docs should prefer `apps` and `--app`",
+            "docs index must prefer apps and --app over lower-level source nouns",
+        ),
+    ]
+    for needle, message in expectations:
+        expect(needle in text, message)
+
+
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
@@ -1759,6 +1807,7 @@ check_cli_contracts()
 check_control_contracts()
 check_setup_and_redaction_contracts()
 check_local_health_diagnostics_contract()
+check_docs_index_contracts()
 check_connector_docs_contracts()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()
