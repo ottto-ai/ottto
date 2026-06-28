@@ -244,6 +244,84 @@ grep -q "setup docs must document check_status" \
 grep -q "setup docs must prohibit parsing human output for setup state" \
   /tmp/public-contract-broken-setup-docs.out
 
+broken_diagnostics_docs="$tmp_dir/broken-diagnostics-docs"
+cp -R "$output_dir" "$broken_diagnostics_docs"
+python3 - "$broken_diagnostics_docs/docs/diagnostics.md" "$broken_diagnostics_docs/docs/troubleshooting.md" <<'PY'
+import sys
+from pathlib import Path
+
+diagnostics_path = Path(sys.argv[1])
+troubleshooting_path = Path(sys.argv[2])
+
+diagnostics = diagnostics_path.read_text(encoding="utf-8")
+diagnostics = diagnostics.replace(
+    "Upload only when the user approves the upload and accepts the retention\n"
+    "disclosure.",
+    "Upload diagnostics when support asks for them.",
+)
+diagnostics = diagnostics.replace(
+    "An active login or support claim is required",
+    "A claim can be pasted into the report when available",
+)
+diagnostics = diagnostics.replace(
+    "Support claims are authorization material",
+    "Support claims are useful identifiers",
+)
+diagnostics = diagnostics.replace(
+    "must not appear in the returned JSON payload or uploaded bundle\ncontent",
+    "may appear in the JSON payload for support",
+)
+diagnostics = diagnostics.replace(
+    "machine ids, must appear only as redacted\nplaceholders such as `[machine_id]`",
+    "machine ids can stay visible for support",
+)
+diagnostics = diagnostics.replace(
+    "Do not share raw local paths, prompts, account ids, machine ids, credential\n"
+    "material, cookies, or command output.",
+    "Share full diagnostics payloads.",
+)
+diagnostics_path.write_text(diagnostics, encoding="utf-8")
+
+troubleshooting = troubleshooting_path.read_text(encoding="utf-8")
+troubleshooting = troubleshooting.replace(
+    "Upload only with explicit approval, retention disclosure acceptance, and an\n"
+    "active login or support claim.",
+    "Upload when support asks.",
+)
+troubleshooting = troubleshooting.replace(
+    "Support claims are authorization material",
+    "Support claims can be copied",
+)
+troubleshooting = troubleshooting.replace(
+    "do\nnot paste them into issues, chat, diagnostics summaries, or support bundle\n"
+    "content.",
+    "paste them into reports.",
+)
+troubleshooting_path.write_text(troubleshooting, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_docs" >/tmp/public-contract-broken-diagnostics-docs.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics docs lose upload/redaction constraints" >&2
+  exit 1
+fi
+grep -q "diagnostics docs must require explicit upload approval and retention acceptance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must require active login or support claim" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must classify support claims as authorization material" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must keep support claims out of payloads and bundles" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must require machine-id placeholders" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "diagnostics docs must prohibit sharing raw private diagnostics values" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must require approval, retention acceptance, and authorization before upload" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must classify support claims as authorization material" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit pasting support claims" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+
 broken_registry="$tmp_dir/broken-registry"
 cp -R "$output_dir" "$broken_registry"
 python3 - "$broken_registry/connectors/registry.generated.json" <<'PY'
@@ -301,6 +379,13 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
+payload["machine_id"] = "machine_unredactedfixture"
+payload["redaction"]["redacted_fields"] = [
+    field
+    for field in payload["redaction"]["redacted_fields"]
+    if field != "machine_id"
+]
+payload["redaction"]["preserved_fields"].append("machine_id")
 for section in payload["sections"]:
     if section["name"] == "installation":
         section["items"]["launch_agent_path"] = "/Users/example/Library/LaunchAgents/net.ottto.plist"
@@ -314,13 +399,21 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_redaction" >/tmp/publ
   echo "Expected contract check to fail when diagnostics expose unredacted values" >&2
   exit 1
 fi
+grep -q "diagnostics machine_id must be redacted" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction fields must include machine_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "redaction preserved_fields must not include machine_id" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
+grep -q "diagnostics.machine_id exposes unredacted machine identifier" \
+  /tmp/public-contract-broken-diagnostics-redaction.out
 grep -q "launch_agent_path must be path-redacted" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 grep -q "auth_header must be redacted" \
   /tmp/public-contract-broken-diagnostics-redaction.out
-grep -q "diagnostics.sections.security.auth_header exposes unredacted bearer token" \
+grep -q "diagnostics.sections\\[4\\].items.auth_header exposes unredacted bearer token" \
   /tmp/public-contract-broken-diagnostics-redaction.out
-grep -q "diagnostics.sections.repair.support_claim exposes unredacted support claim" \
+grep -q "diagnostics.sections\\[3\\].items.support_claim exposes unredacted support claim" \
   /tmp/public-contract-broken-diagnostics-redaction.out
 
 broken_mcp="$tmp_dir/broken-mcp"

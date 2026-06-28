@@ -33,6 +33,8 @@ JSON `upload_report` and next-action fields.
 Support claims are authorization material. They are sent only on the upload
 request and must not appear in the returned JSON payload or uploaded bundle
 content; the JSON report exposes only whether a support claim was provided.
+Stable local identifiers, including machine ids, must appear only as redacted
+placeholders such as `[machine_id]` in diagnostics output.
 
 ## What To Share
 

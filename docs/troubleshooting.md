@@ -111,4 +111,7 @@ complete.
 ottto diagnostics collect --json
 ```
 
-Upload only with explicit approval and retention disclosure acceptance.
+Upload only with explicit approval, retention disclosure acceptance, and an
+active login or support claim. Support claims are authorization material; do
+not paste them into issues, chat, diagnostics summaries, or support bundle
+content.
