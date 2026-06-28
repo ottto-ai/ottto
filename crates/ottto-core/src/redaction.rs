@@ -129,7 +129,16 @@ fn is_account_identifier_key(key: &str) -> bool {
 
 fn is_machine_identifier_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
-    normalized == "machine_id" || normalized == "installation_id"
+    normalized == "machine_id"
+        || normalized == "installation_id"
+        || normalized == "device_id"
+        || normalized == "hardware_uuid"
+        || normalized == "serial"
+        || normalized == "serial_number"
+        || normalized == "hardware_serial"
+        || normalized.ends_with("_uuid")
+        || normalized.ends_with("_serial")
+        || normalized.ends_with("_serial_number")
 }
 
 fn is_raw_prompt_key(key: &str) -> bool {
@@ -381,12 +390,25 @@ fn looks_like_account_identifier(token: &str) -> bool {
 
 fn looks_like_machine_identifier(token: &str) -> bool {
     let normalized = trimmed_token(token);
+    if let Some((key, value)) = normalized.split_once('=') {
+        return !value.is_empty() && is_machine_identifier_key(key);
+    }
     let lower = token_value(normalized).to_ascii_lowercase();
-    let prefixes = ["machine_", "install_"];
-    prefixes.iter().any(|prefix| {
-        lower
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(id_char))
+    is_canonical_uuid(&lower)
+        || ["machine_", "install_", "device_"].iter().any(|prefix| {
+            lower
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(id_char))
+        })
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    value.char_indices().all(|(index, ch)| {
+        matches!(index, 8 | 13 | 18 | 23) && ch == '-'
+            || !matches!(index, 8 | 13 | 18 | 23) && ch.is_ascii_hexdigit()
     })
 }
 
@@ -461,6 +483,14 @@ mod tests {
     fn redacts_sensitive_key_families() {
         assert_eq!(
             redact_key_value("machine_id", "machine_123"),
+            RedactedValue::String("[machine_id]".to_string())
+        );
+        assert_eq!(
+            redact_key_value("hardware_uuid", "A1B2C3D4-E5F6-7890-ABCD-1234567890AB"),
+            RedactedValue::String("[machine_id]".to_string())
+        );
+        assert_eq!(
+            redact_key_value("serial_number", "C02ABC123XYZ"),
             RedactedValue::String("[machine_id]".to_string())
         );
         assert_eq!(
@@ -650,6 +680,24 @@ mod tests {
         // High-entropy fallback must not steal tokens owned by other classes.
         let redacted = redact_inline("acct org_abc123def456ghi789jkl0 path ~/repo/secrets.txt");
         assert_eq!(redacted, "acct [account_id] path [path]");
+    }
+
+    #[test]
+    fn redacts_hardware_uuid_and_serial_inline() {
+        let redacted = redact_inline(
+            "machine hardware_uuid=A1B2C3D4-E5F6-7890-ABCD-1234567890AB serial_number=C02ABC123XYZ ok",
+        );
+        assert_eq!(redacted, "machine [machine_id] [machine_id] ok");
+        assert!(!redacted.contains("A1B2C3D4"));
+        assert!(!redacted.contains("C02ABC"));
+
+        let redacted = redact_inline(
+            "observed A1B2C3D4-E5F6-7890-ABCD-1234567890AB while collecting diagnostics",
+        );
+        assert_eq!(
+            redacted,
+            "observed [machine_id] while collecting diagnostics"
+        );
     }
 
     #[test]

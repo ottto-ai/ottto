@@ -354,6 +354,8 @@ DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS = (
     (re.compile(r"\bsupport_[A-Za-z0-9]{6,}\b"), "support claim"),
     (re.compile(r"\b(?:org|usr|acct)_[A-Za-z0-9]{6,}\b"), "account identifier"),
     (re.compile(r"\b(?:machine|otm|device)_[A-Za-z0-9]{6,}\b"), "machine identifier"),
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "UUID identifier"),
+    (re.compile(r"(?i)\b(?:serial|serial_number|hardware_serial)\s*[:=]\s*[A-Z0-9]{8,}\b"), "hardware serial"),
     (re.compile(r"(?:^|\s)(?:/Users|/private|/var|/tmp|/etc|/opt|/Applications)/[^\s]+"), "local path"),
     (re.compile(r"(?:^|\s)~/[^\s]+"), "home-relative path"),
     (re.compile(r"(?i)(?:raw_prompt|prompt_text|completion_text|command_output)\s*[:=]"), "raw prompt or command output"),
