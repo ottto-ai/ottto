@@ -20,6 +20,8 @@ Every adapter must:
 - avoid direct edits to agent config, credentials, cookies, hooks, status-line
   monitors, or local source files
 - summarize redacted status facts instead of pasting raw diagnostics payloads
+- keep support claims out of public issues, chat, returned JSON, and uploaded
+  bundle content; report only whether a support claim was provided
 
 Agents that need product context should call `ottto context --json`, `ottto
 costs --json`, `ottto sessions --json`, `ottto recommendations --json`, or

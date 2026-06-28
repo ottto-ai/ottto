@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 215,
-  "content_sha256": "f191ede766925b8e02f2b96150cb1881f12047e8a45344cbf49ed4330a4312b1",
+  "content_sha256": "ec029166cb7fd204647a7698f952595ee778ef4eec56b60d92d4561170cfea59",
   "files": [
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/agent-adapters.md",
-      "sha256": "838689e83e6fbc48d916a2ca4954750c29df597fe0244c5cd21b402e4a6a4c82",
-      "size_bytes": 2354
+      "sha256": "1bb9e53bcba706eaec61864f0999670336325bd628f81392425dd4fba0f5c799",
+      "size_bytes": 2499
     },
     {
       "executable": false,
@@ -1280,8 +1280,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_contract_check.sh",
-      "sha256": "d407343deb5d0ca60480854f0b80c069d760850152ddbf0f1222164e9ce13015",
-      "size_bytes": 53958
+      "sha256": "fe78a9b05c310b7b0c2b716883d7c3c145eaac8fbe9f0d0c5ed2165519e5d4bf",
+      "size_bytes": 55186
     },
     {
       "executable": true,
@@ -1455,8 +1455,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "7e24d842c0bf095b4549baac5f92e34ccdfe18d5329a335731983293dfd00a77",
-      "size_bytes": 18340
+      "sha256": "452dfa8eb1d5300923c5048caf66070195cb8dace378088d85789145961635ef",
+      "size_bytes": 20406
     },
     {
       "executable": true,
@@ -1508,7 +1508,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-28T02:47:50+00:00",
+  "generated_at": "2026-06-28T04:00:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 216,
   "public_roots": [
@@ -1543,5 +1543,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "32355a6b44d1ef7e35515105b5c8f637ec6b8a9a"
+  "source_commit": "89909c9c3daea6f07a2a8dd11fd52aac30f9c416"
 }
