@@ -656,6 +656,7 @@ from pathlib import Path
 path = Path(sys.argv[1])
 payload = json.loads(path.read_text(encoding="utf-8"))
 payload["emitted_records"][0]["record_type"] = "unexpected_fixture_record"
+payload["emitted_records"][0]["sample"]["raw_prompt"] = "unredacted fixture prompt"
 payload["upload_policy"]["uploads_raw_content"] = True
 payload["upload_policy"]["redacts"].remove("credential")
 payload["upload_policy"]["redacts"].append("prompt")
@@ -668,6 +669,8 @@ fi
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.uploads_raw_content must match registry" \
   /tmp/public-contract-broken-connector-fixture.out
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted record types must match registry emits" \
+  /tmp/public-contract-broken-connector-fixture.out
+grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json emitted_records\\[0\\].sample.raw_prompt exposes raw-content sample key" \
   /tmp/public-contract-broken-connector-fixture.out
 grep -q "connectors/sources/codex/collectors/local_sessions/fixtures/minimal-evidence.json upload_policy.redacts values must be unique" \
   /tmp/public-contract-broken-connector-fixture.out

@@ -95,6 +95,24 @@ REQUIRED_CONNECTOR_REDACTION_CLASSES = {
     "local_path",
     "credential",
 }
+FORBIDDEN_CONNECTOR_SAMPLE_KEYS = {
+    "api_key",
+    "command_output",
+    "cookie",
+    "credential",
+    "credentials",
+    "local_path",
+    "password",
+    "prompt",
+    "prompts",
+    "raw_content",
+    "raw_prompt",
+    "raw_response",
+    "response",
+    "responses",
+    "secret",
+    "tool_output",
+}
 
 failures: list[str] = []
 
@@ -384,7 +402,11 @@ def check_connector_fixture_contract(
         )
         if isinstance(record_type, str):
             actual_record_types.append(record_type)
-        require_dict(record.get("sample"), f"{relative_path} emitted_records[{index}].sample")
+        sample = require_dict(record.get("sample"), f"{relative_path} emitted_records[{index}].sample")
+        check_connector_fixture_sample_keys(
+            sample,
+            f"{relative_path} emitted_records[{index}].sample",
+        )
     expect(
         sorted(actual_record_types) == sorted(emits),
         f"{relative_path} emitted record types must match registry emits",
@@ -393,6 +415,18 @@ def check_connector_fixture_contract(
         len(actual_record_types) == len(set(actual_record_types)),
         f"{relative_path} emitted record types must be unique",
     )
+
+
+def check_connector_fixture_sample_keys(value: Any, context: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child_context = f"{context}.{key}" if context else str(key)
+            if key.lower() in FORBIDDEN_CONNECTOR_SAMPLE_KEYS:
+                fail(f"{child_context} exposes raw-content sample key")
+            check_connector_fixture_sample_keys(item, child_context)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            check_connector_fixture_sample_keys(item, f"{context}[{index}]")
 
 
 def iter_json_strings(value: Any, path: str) -> list[tuple[str, str]]:
