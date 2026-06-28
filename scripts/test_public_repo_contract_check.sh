@@ -529,6 +529,121 @@ grep -q "troubleshooting docs must classify support claims as authorization mate
 grep -q "troubleshooting docs must prohibit pasting support claims" \
   /tmp/public-contract-broken-diagnostics-docs.out
 
+broken_support_docs="$tmp_dir/broken-support-docs"
+cp -R "$output_dir" "$broken_support_docs"
+python3 - "$broken_support_docs/docs/support.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "This runbook is public-safe. Do not add private infrastructure details": "This runbook may include internal details when useful",
+    "account\nidentifiers, machine identifiers, raw command output, screenshots with local\npaths": "account identifiers and raw command output",
+    "claim codes, setup-run tokens, setup keys": "setup tokens",
+    "raw prompts, raw model output, or private repository links": "model examples",
+    "Identify the installed surface without parsing human text": "Identify the installed surface from the human summary",
+    "ottto status --json": "ottto status",
+    "ottto update check --json": "ottto update check",
+    "ottto setup --json --no-browser --no-wait": "ottto setup --no-browser",
+    "ottto account --json": "ottto account",
+    "Share the claim URL or code with the user when JSON returns\n   `needs_user_action`": "Continue setup without sharing claim details",
+    "The CLI must not collect an Ottto password in the\n   terminal": "The CLI may collect credentials in the terminal",
+    "Check app/source status with public app nouns": "Check source status with source nouns",
+    "ottto apps detect --json": "ottto sources detect",
+    "ottto apps status --app codex --json": "ottto source status codex",
+    "ottto verify --repair --app codex --json": "ottto verify --repair codex",
+    "respect repair authority metadata": "repair when convenient",
+    "If JSON requires browser approval, do not edit local config directly": "Edit local config when browser approval is slow",
+    "`verify --repair` may repair only WriteConfig config drift": "`verify --repair` may edit any config",
+    "Share only the command family, exit code, high-level status, support bundle\nstate, redaction summary, and next user action": "Share the full diagnostics payload",
+    "Do not paste raw diagnostics\nJSON into public issues or chat": "Paste raw diagnostics JSON into issues",
+    "Upload diagnostics only after explicit user approval and retention disclosure\nacceptance": "Upload diagnostics when support asks",
+    "Do not ask users to paste\nclaims into public issues": "Ask users to paste claims into issues",
+    "diagnostics JSON and uploaded bundle content should expose only that a support\nclaim was provided, not the claim value": "diagnostics JSON may include the support claim value",
+    "Use the detected install owner from JSON status and the release manifest:": "Use whichever install owner is convenient:",
+    "Do not self-overwrite owner-managed files.": "Self-overwrite owner-managed files when repair is faster.",
+    "verify checksums, signing/notarization state,\nGatekeeper assessment, and `ottto status --json`": "verify the app opens",
+    "Security-sensitive reports go to `security@ottto.net`, not public issues": "Security-sensitive reports can use public issues",
+    "Public issues are appropriate only for redacted, reproducible CLI": "Public issues can include full local payloads",
+    "Passwords, cookies, API keys, bearer tokens, setup-run tokens, setup keys,\n  claim codes, support claims, or raw credentials": "credentials",
+    "Raw prompts, raw model output, transcripts, customer data": "model output",
+    "Absolute local filesystem paths, account identifiers, machine identifiers": "local paths",
+    "evidence records contain only redacted pass/fail facts and stable artifact\n  references": "evidence records may include raw output",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_support_docs" >/tmp/public-contract-broken-support-docs.out 2>&1; then
+  echo "Expected contract check to fail when support docs lose public-safe triage boundaries" >&2
+  exit 1
+fi
+grep -q "support docs must preserve public-safe boundary" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw identifiers, command output, and local-path screenshots" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit claim/setup secrets" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw model content and private repo links" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require JSON status instead of human parsing" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include status JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include update check JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include headless setup JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include account JSON command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route claim handoff through structured JSON" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit terminal password collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must preserve app-language triage" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include apps detect command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include app status command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must include bounded verify repair command" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require repair authority metadata" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit local config edits when browser approval is required" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep verify repair bounded to WriteConfig drift" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must restrict diagnostics sharing to summary fields" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw diagnostics JSON in issues/chat" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require explicit approval and retention acceptance before upload" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit support claims in public issues" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep support claim values out of JSON and bundles" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route update/rollback by detected install owner and manifest" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit self-overwriting owner-managed files" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must require checksum/signing/Gatekeeper/status rollback verification" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must route security reports away from public issues" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must scope public issues to redacted reproducible public-runtime bugs" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit credential and claim collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit raw prompt/output/transcript/customer data collection" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must prohibit absolute paths and raw identifiers" \
+  /tmp/public-contract-broken-support-docs.out
+grep -q "support docs must keep closeout evidence redacted and artifact-scoped" \
+  /tmp/public-contract-broken-support-docs.out
+
 broken_diagnostics_upload="$tmp_dir/broken-diagnostics-upload"
 cp -R "$output_dir" "$broken_diagnostics_upload"
 python3 - "$broken_diagnostics_upload/fixtures/diagnostics/redacted-bundle.json" <<'PY'
