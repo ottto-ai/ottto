@@ -34,7 +34,9 @@ Support claims are authorization material. They are sent only on the upload
 request and must not appear in the returned JSON payload or uploaded bundle
 content; the JSON report exposes only whether a support claim was provided.
 Stable local identifiers, including machine ids, must appear only as redacted
-placeholders such as `[machine_id]` in diagnostics output.
+placeholders such as `[machine_id]` in diagnostics output. Account, user,
+organization, device, and installation identifiers must follow the same
+redacted-placeholder rule.
 
 ## What To Share
 
@@ -47,7 +49,8 @@ Share:
 - next user action.
 
 Do not share raw local paths, prompts, account ids, machine ids, credential
-material, cookies, or command output.
+material, cookies, or command output. Also keep raw user, organization, device,
+and installation ids out of diagnostics summaries and support handoffs.
 
 ## Common Diagnostics Flow
 

@@ -32,7 +32,12 @@
       "command_output"
     ],
     "redacted_fields": [
+      "account_id",
+      "device_id",
+      "installation_id",
       "machine_id",
+      "org_id",
+      "user_id",
       "installation.launch_agent_path",
       "security.auth_header"
     ],

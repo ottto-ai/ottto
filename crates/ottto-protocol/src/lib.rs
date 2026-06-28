@@ -3416,6 +3416,50 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_bundle_fixture_declares_identifier_redactions() {
+        let bundle = serde_json::from_str::<DiagnosticsBundle>(include_str!(
+            "../../../fixtures/diagnostics/redacted-bundle.json"
+        ))
+        .expect("diagnostics fixture should deserialize");
+        assert_eq!(bundle.machine_id, "[machine_id]");
+
+        let redacted_fields: std::collections::BTreeSet<_> = bundle
+            .redaction
+            .redacted_fields
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for field in [
+            "account_id",
+            "device_id",
+            "installation_id",
+            "machine_id",
+            "org_id",
+            "user_id",
+        ] {
+            assert!(
+                redacted_fields.contains(field),
+                "diagnostics fixture redaction report must cover {field}"
+            );
+        }
+
+        let encoded = serde_json::to_string(&bundle).expect("diagnostics fixture should serialize");
+        for forbidden in [
+            "acct_private",
+            "dev_private",
+            "install_private",
+            "mach_private",
+            "org_private",
+            "usr_private",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "diagnostics fixture leaked raw identifier marker {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "Phase 1+ reducer work: fixtures are present, runtime reducer is not implemented yet"]
     fn local_health_reducer_replays_contract_matrix() {
         let fixtures = local_health_contract_fixtures();
