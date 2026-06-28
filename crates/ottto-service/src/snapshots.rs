@@ -767,6 +767,38 @@ fn claude_workflow_detect_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
+/// Local opt-IN for capturing Claude Code per-turn work-attribution
+/// (`attributionAgent`/`Skill`/`Plugin`/`McpServer`/`McpTool`) off each
+/// assistant+usage line into the per-turn `SelectorCapture`. Subagent
+/// attribution (`attributionAgent`) is the priority dimension.
+///
+/// Defaults OFF: only `OTTTO_CLAUDE_ATTRIBUTION_CAPTURE` set to one of
+/// `on`/`1`/`true`/`yes`/`enabled` turns capture on. This is the
+/// safe-non-contract slice — even with capture ON, the attribution keys are NOT
+/// on `SELECTOR_CONTEXT_ALLOWED`, so `build_row_identity` strips them before
+/// they reach `reduced_context`/`selector_hash`. Nothing new crosses the wire
+/// until the daemon allowlist AND the mirrored backend selector contract land
+/// together (Codex-owned Public Runtime coordination). Capture-without-emit is
+/// intentional: it lets the parser + unit coverage land first with zero
+/// contract impact.
+fn claude_attribution_capture_enabled() -> bool {
+    claude_attribution_capture_enabled_from(
+        std::env::var("OTTTO_CLAUDE_ATTRIBUTION_CAPTURE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn claude_attribution_capture_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes" | "enabled"
+        ),
+        None => false,
+    }
+}
+
 /// True when `dir` (a Claude Code session's `workflows/` sibling directory)
 /// contains at least one `wf_*.json` orchestration manifest. The Workflow tool
 /// writes one manifest per run; manifest filenames are truncated
@@ -2262,7 +2294,54 @@ fn claude_code_selector_from_line(value: &Value) -> SelectorCapture {
             &Value::String("anthropic".to_string()),
         );
     }
+    capture_claude_attribution(value, &mut selector, claude_attribution_capture_enabled());
     selector
+}
+
+/// Lift Claude Code's per-turn work-attribution off this assistant+usage line
+/// into the per-turn `SelectorCapture`. Claude Code writes the five attribution
+/// markers as TOP-LEVEL string siblings of `message` on each `type=assistant`
+/// line that also carries `message.usage` — i.e. exactly the line the usage
+/// selector is already built from — so this attributes the same turn's usage.
+///
+/// Done in `claude_code_selector_from_line` (the per-LINE selector, not the
+/// accumulator-merged `current_selector`) so one turn's subagent/skill cannot
+/// leak onto later turns, mirroring the per-turn `context_bucket` stamp in
+/// `apply_claude_code_line` and the Codex per-turn `service_tier` discipline.
+///
+/// SAFE-SLICE BOUNDARY: gated OFF by default via
+/// `claude_attribution_capture_enabled`. The canonical snake_case keys below are
+/// deliberately NOT added to `SELECTOR_CONTEXT_ALLOWED`, so `build_row_identity`
+/// strips them before `reduced_context`/`selector_hash` — they never cross the
+/// wire. Allowlisting these keys + the mirrored backend `SELECTOR_FIELDS`/
+/// `SELECTOR_SOURCE_KEYS` + the golden v6 contract test is a separate,
+/// Codex-coordinated Public Runtime change.
+///
+/// `attribution_mcp_tool` is captured last and is the highest-cardinality
+/// marker; once allowlisted it would explode `selector_hash` row counts, so it
+/// is expected to ship behind a finer guard (or be omitted) when the contract
+/// lands. Capturing it here is harmless while stripped.
+///
+/// `enabled` is threaded in (read from `claude_attribution_capture_enabled` at
+/// the call site) so the capture logic is unit-testable without process-global
+/// env mutation.
+fn capture_claude_attribution(value: &Value, selector: &mut SelectorCapture, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    // (raw CC key, canonical selector key). Subagent first (priority dimension).
+    const ATTRIBUTION_FIELDS: &[(&str, &str)] = &[
+        ("attributionAgent", "attribution_subagent"),
+        ("attributionSkill", "attribution_skill"),
+        ("attributionPlugin", "attribution_plugin"),
+        ("attributionMcpServer", "attribution_mcp_server"),
+        ("attributionMcpTool", "attribution_mcp_tool"),
+    ];
+    for (raw_key, canonical_key) in ATTRIBUTION_FIELDS {
+        if let Some(attribution) = string_at(value, &[raw_key]) {
+            selector.insert(canonical_key, attribution, "claude_code_attribution_field");
+        }
+    }
 }
 
 fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
@@ -5671,6 +5750,271 @@ mod tests {
                 "expected {off:?} to disable the trace"
             );
         }
+    }
+
+    #[test]
+    fn claude_attribution_capture_opt_in_defaults_off() {
+        // Default OFF: absent env, and any unrecognized/explicit-off value.
+        assert!(!claude_attribution_capture_enabled_from(None));
+        for off in ["", "off", "0", "false", "no", "disabled", "nonsense"] {
+            assert!(
+                !claude_attribution_capture_enabled_from(Some(off)),
+                "expected {off:?} to leave attribution capture off"
+            );
+        }
+        // Explicit opt-in tokens (case/whitespace tolerant).
+        for on in ["on", "1", "true", "yes", "enabled", "ON", " True ", "Yes"] {
+            assert!(
+                claude_attribution_capture_enabled_from(Some(on)),
+                "expected {on:?} to enable attribution capture"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_attribution_capture_lifts_all_five_markers_when_enabled() {
+        let line: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"attr-session\",",
+            "\"attributionAgent\":\"general-purpose\",",
+            "\"attributionSkill\":\"design-sync\",",
+            "\"attributionPlugin\":\"anthropic-skills\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":30}}}"
+        ))
+        .expect("parse line");
+
+        let mut selector = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut selector, true);
+
+        // Subagent is the priority dimension.
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_subagent")
+                .map(String::as_str),
+            Some("general-purpose")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_skill")
+                .map(String::as_str),
+            Some("design-sync")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_plugin")
+                .map(String::as_str),
+            Some("anthropic-skills")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_server")
+                .map(String::as_str),
+            Some("claude-in-chrome")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("tabs_context_mcp")
+        );
+        // Source tag is uniform for all captured attribution keys.
+        assert_eq!(
+            selector
+                .sources
+                .get("attribution_subagent")
+                .map(String::as_str),
+            Some("claude_code_attribution_field")
+        );
+    }
+
+    #[test]
+    fn claude_attribution_capture_is_noop_when_disabled() {
+        let line: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
+        ))
+        .expect("parse line");
+
+        let mut selector = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut selector, false);
+
+        assert!(
+            selector.is_empty(),
+            "attribution must not be captured while the opt-in flag is off"
+        );
+    }
+
+    #[test]
+    fn claude_attribution_capture_skips_absent_or_blank_markers() {
+        // Enabled, but the line carries no usable attribution: blank string and
+        // a non-string value are both ignored (string_at trims + rejects empty).
+        let line: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"   \",",
+            "\"attributionSkill\":42,",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}"
+        ))
+        .expect("parse line");
+
+        let mut selector = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut selector, true);
+
+        assert!(
+            selector.is_empty(),
+            "blank/non-string attribution markers must be skipped"
+        );
+    }
+
+    #[test]
+    fn claude_attribution_is_stripped_from_emitted_rows_safe_slice() {
+        // SAFE-SLICE INVARIANT: even with capture forced on for the duration of
+        // this test, the attribution keys are NOT on SELECTOR_CONTEXT_ALLOWED,
+        // so build_row_identity strips them before reduced_context/selector_hash.
+        // Nothing attribution-shaped reaches the emitted model_usage row — zero
+        // wire impact until the daemon + backend selector contract land together.
+        for key in [
+            "attribution_subagent",
+            "attribution_skill",
+            "attribution_plugin",
+            "attribution_mcp_server",
+            "attribution_mcp_tool",
+        ] {
+            assert!(
+                !SELECTOR_CONTEXT_ALLOWED.contains(&key),
+                "{key} must stay off SELECTOR_CONTEXT_ALLOWED in the safe slice"
+            );
+        }
+
+        let mut merged = SelectorCapture::default();
+        merged.insert("context_bucket", "long".to_string(), "test");
+        merged.insert(
+            "attribution_subagent",
+            "general-purpose".to_string(),
+            "claude_code_attribution_field",
+        );
+        merged.insert(
+            "attribution_mcp_server",
+            "claude-in-chrome".to_string(),
+            "claude_code_attribution_field",
+        );
+
+        let (_, reduced_context, _) = build_row_identity("claude-opus-4-8", &merged);
+
+        // The already-allowlisted dimension survives...
+        assert_eq!(
+            reduced_context.get("context_bucket").map(String::as_str),
+            Some("long")
+        );
+        // ...but every attribution key is stripped.
+        for key in [
+            "attribution_subagent",
+            "attribution_mcp_server",
+            "attribution_skill",
+            "attribution_plugin",
+            "attribution_mcp_tool",
+        ] {
+            assert!(
+                !reduced_context.contains_key(key),
+                "{key} must be stripped from the emitted selector_context in the safe slice"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_attribution_capture_lifts_only_present_markers_mixed() {
+        // Real-world top-level (non-subagent) transcript shape: the line carries
+        // MCP-server/MCP-tool + skill attribution but NO `attributionAgent`
+        // (subagent attribution lives in the child `subagents/*.jsonl`
+        // transcripts, which the daemon walk already ingests as standalone
+        // sidechain sessions). Assert capture lifts exactly the present markers
+        // and invents nothing for the absent ones — complements the
+        // all-five-present and none-present cases above with the realistic
+        // partial shape.
+        let line: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"attr-top-level\",",
+            "\"attributionSkill\":\"design-sync\",",
+            "\"attributionMcpServer\":\"claude-in-chrome\",",
+            "\"attributionMcpTool\":\"tabs_context_mcp\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":48}}}"
+        ))
+        .expect("parse line");
+
+        let mut selector = SelectorCapture::default();
+        capture_claude_attribution(&line, &mut selector, true);
+
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_skill")
+                .map(String::as_str),
+            Some("design-sync")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_server")
+                .map(String::as_str),
+            Some("claude-in-chrome")
+        );
+        assert_eq!(
+            selector
+                .context
+                .get("attribution_mcp_tool")
+                .map(String::as_str),
+            Some("tabs_context_mcp")
+        );
+        // No subagent / plugin markers on this line: they must be absent, not
+        // empty-string placeholders.
+        assert!(
+            !selector.context.contains_key("attribution_subagent"),
+            "absent attributionAgent must not synthesize an attribution_subagent key"
+        );
+        assert!(
+            !selector.context.contains_key("attribution_plugin"),
+            "absent attributionPlugin must not synthesize an attribution_plugin key"
+        );
+    }
+
+    #[test]
+    fn claude_attribution_capture_is_per_turn_isolated() {
+        // Core per-turn discipline: capture runs on the per-LINE selector, so an
+        // attribution marker on one turn's line must NOT bleed onto a later
+        // turn's line. Each line gets its own SelectorCapture; the second
+        // (unattributed) line must surface no attribution from the first.
+        let attributed: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",\"attributionAgent\":\"general-purpose\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
+        ))
+        .expect("parse attributed line");
+        let unattributed: Value = serde_json::from_str(concat!(
+            "{\"type\":\"assistant\",",
+            "\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":80,\"output_tokens\":20}}}"
+        ))
+        .expect("parse unattributed line");
+
+        let mut first = SelectorCapture::default();
+        capture_claude_attribution(&attributed, &mut first, true);
+        let mut second = SelectorCapture::default();
+        capture_claude_attribution(&unattributed, &mut second, true);
+
+        assert_eq!(
+            first
+                .context
+                .get("attribution_subagent")
+                .map(String::as_str),
+            Some("general-purpose"),
+            "the attributed turn must carry its own subagent"
+        );
+        assert!(
+            second.is_empty(),
+            "a later unattributed turn must not inherit the prior turn's subagent attribution"
+        );
     }
 
     #[test]
