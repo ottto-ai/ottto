@@ -1447,6 +1447,87 @@ def check_setup_docs_contracts() -> None:
     text = setup_docs.read_text(encoding="utf-8")
     expectations = [
         (
+            "Default setup opens a browser claim and waits for approval",
+            "setup docs must preserve browser-claim-first setup guidance",
+        ),
+        ("ottto setup --json", "setup docs must include JSON setup command"),
+        (
+            "parseable JSON payload with a\nnonzero exit code",
+            "setup docs must document nonzero JSON setup payloads",
+        ),
+        (
+            "ottto setup --json --no-browser --no-wait",
+            "setup docs must include headless no-browser/no-wait setup command",
+        ),
+        (
+            "Show the returned `claim_url` or `claim_code` to the user",
+            "setup docs must preserve headless claim handoff guidance",
+        ),
+        (
+            "Exit code `60` means\nbrowser or user action is required",
+            "setup docs must document needs-user-action exit code",
+        ),
+        (
+            "Exit code `61` means a wait timed out",
+            "setup docs must document setup timeout exit code",
+        ),
+        (
+            "ottto setup --claim-code <code> --json",
+            "setup docs must include claim-code setup command",
+        ),
+        ("ottto login --json", "setup docs must include login JSON command"),
+        (
+            "ottto login --json --no-browser --no-wait",
+            "setup docs must include headless login command",
+        ),
+        ("ottto account --json", "setup docs must include account JSON command"),
+        ("ottto logout --json", "setup docs must include cloud-first logout command"),
+        (
+            "Use local-only logout only as an explicit emergency cleanup path",
+            "setup docs must keep local-only logout as emergency-only",
+        ),
+        (
+            "ottto logout --local-only --json",
+            "setup docs must include explicit local-only logout command",
+        ),
+        (
+            "ottto apps detect --json",
+            "setup docs must include apps detect JSON command",
+        ),
+        (
+            "ottto apps status --app codex --json",
+            "setup docs must include app status command",
+        ),
+        (
+            "ottto verify --app claude-code --json",
+            "setup docs must include app verify command",
+        ),
+        (
+            "ottto verify --repair --app codex --json",
+            "setup docs must include bounded repair verify command",
+        ),
+        (
+            "Plain verify is read-only",
+            "setup docs must preserve read-only verify boundary",
+        ),
+        (
+            "`verify --repair` is limited to daemon-owned\nWriteConfig repair",
+            "setup docs must preserve daemon-owned repair boundary",
+        ),
+        (
+            "Pi keeps its existing verification\nflow and has no config patching",
+            "setup docs must preserve Pi no-config-patching boundary",
+        ),
+        (
+            "Do not hand-edit local Codex, Claude Code, or\nPi config as a setup shortcut",
+            "setup docs must prohibit hand-edit setup shortcuts",
+        ),
+        ("| `0` | Success or setup complete |", "setup docs must list exit code 0"),
+        ("| `10` | `ottto-service` unavailable |", "setup docs must list exit code 10"),
+        ("| `60` | Setup needs user or browser action |", "setup docs must list exit code 60"),
+        ("| `61` | Setup timed out |", "setup docs must list exit code 61"),
+        ("| `70` | Internal error |", "setup docs must list exit code 70"),
+        (
             "branch on `agent_action.kind` before inspecting human text",
             "setup docs must require branching on agent_action.kind before human text",
         ),
