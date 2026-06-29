@@ -12,6 +12,7 @@ use ottto_protocol::{
     AgentStatusDiagnostic, AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState,
     SourceKind,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -33,6 +34,11 @@ const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
 const CLAUDE_OAUTH_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const CLAUDE_OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
+const CLAUDE_OAUTH_USAGE_CACHE_FILE: &str = "claude-code-oauth-usage-cache.json";
+const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
+const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
+const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -63,6 +69,14 @@ struct CodexAuthCredentials {
 struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeOAuthUsageCache {
+    schema_version: u16,
+    observed_at_epoch_seconds: u64,
+    next_refresh_after_epoch_seconds: u64,
+    windows: Vec<AgentQuotaWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,22 +462,78 @@ fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, St
 fn collect_claude_oauth_quota_windows(
     version: &CommandOutput,
 ) -> Result<Vec<AgentQuotaWindow>, String> {
+    let now = current_unix_seconds();
+    if let Some(cache) = read_claude_oauth_usage_cache() {
+        let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+        if !cache.windows.is_empty()
+            && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+            && (cache_age <= CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS
+                || now < cache.next_refresh_after_epoch_seconds)
+        {
+            return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+        }
+        if now < cache.next_refresh_after_epoch_seconds {
+            return Err("Claude OAuth usage endpoint is rate limited.".to_string());
+        }
+    }
+
     let token = read_claude_oauth_access_token()
         .ok_or_else(|| "Claude OAuth credentials were not available locally.".to_string())?;
     let authorization = format!("Bearer {token}");
     let user_agent = claude_code_user_agent(version);
-    let value: Value = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
+    let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
         .set("Accept", "application/json")
         .set("Content-Type", "application/json")
         .set("Authorization", &authorization)
         .set("anthropic-beta", CLAUDE_OAUTH_BETA_HEADER)
         .set("User-Agent", &user_agent)
         .timeout(COMMAND_TIMEOUT)
-        .call()
-        .map_err(claude_oauth_usage_error)?
+        .call();
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(429, response)) => {
+            let retry_after = claude_oauth_retry_after_epoch_seconds(&response, now);
+            let mut cache = read_claude_oauth_usage_cache().unwrap_or(ClaudeOAuthUsageCache {
+                schema_version: 1,
+                observed_at_epoch_seconds: now,
+                next_refresh_after_epoch_seconds: retry_after,
+                windows: Vec::new(),
+            });
+            cache.next_refresh_after_epoch_seconds = retry_after;
+            let _ = write_claude_oauth_usage_cache(&cache);
+            if !cache.windows.is_empty()
+                && now.saturating_sub(cache.observed_at_epoch_seconds)
+                    <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+            {
+                return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+            }
+            return Err("Claude OAuth usage endpoint is rate limited.".to_string());
+        }
+        Err(error) => {
+            if let Some(cache) = read_claude_oauth_usage_cache() {
+                if !cache.windows.is_empty()
+                    && now.saturating_sub(cache.observed_at_epoch_seconds)
+                        <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+                {
+                    return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+                }
+            }
+            return Err(claude_oauth_usage_error(error));
+        }
+    };
+    let value: Value = response
         .into_json()
         .map_err(|_| "Claude OAuth usage endpoint returned an unreadable response.".to_string())?;
-    Ok(claude_oauth_quota_windows(&value))
+    let windows = claude_oauth_quota_windows(&value);
+    if !windows.is_empty() {
+        let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: now,
+            next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+            windows: windows.clone(),
+        });
+    }
+    Ok(windows)
 }
 
 fn read_claude_oauth_access_token() -> Option<String> {
@@ -516,6 +586,37 @@ fn claude_oauth_usage_error(error: ureq::Error) -> String {
         }
         ureq::Error::Transport(_) => "Claude OAuth usage endpoint was unreachable.".to_string(),
     }
+}
+
+fn claude_oauth_usage_cache_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_OAUTH_USAGE_CACHE_FILE)
+}
+
+fn read_claude_oauth_usage_cache() -> Option<ClaudeOAuthUsageCache> {
+    let path = claude_oauth_usage_cache_path();
+    let body = fs::read_to_string(path).ok()?;
+    let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
+    if cache.schema_version != 1 {
+        return None;
+    }
+    Some(cache)
+}
+
+fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
+    let path = claude_oauth_usage_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
+    fs::write(path, body)
+}
+
+fn claude_oauth_retry_after_epoch_seconds(response: &ureq::Response, now: u64) -> u64 {
+    response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS)
+        .saturating_add(now)
 }
 
 fn claude_code_user_agent(version: &CommandOutput) -> String {
@@ -579,6 +680,27 @@ fn claude_oauth_quota_window(
         used_percent,
         left_percent,
     })
+}
+
+fn claude_oauth_quota_windows_from_cache(
+    cache: ClaudeOAuthUsageCache,
+    now: u64,
+) -> Vec<AgentQuotaWindow> {
+    let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+    let cache_is_stale = cache_age > CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS;
+    cache
+        .windows
+        .into_iter()
+        .map(|mut window| {
+            if cache_is_stale {
+                window.status = AgentQuotaWindowStatus::Unknown;
+                window.freshness = AgentQuotaWindowFreshness::Stale;
+            } else {
+                window.freshness = AgentQuotaWindowFreshness::Fresh;
+            }
+            window
+        })
+        .collect()
 }
 
 fn claude_statusline_quota_windows_from_cache(
@@ -3890,6 +4012,71 @@ for line in sys.stdin:
             windows[1].resets_at.as_deref(),
             Some("2026-07-04T05:00:00.937587Z")
         );
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_keeps_fresh_windows() {
+        let cache = ClaudeOAuthUsageCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 400,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: None,
+                account_label: None,
+                window_seconds: Some(5 * 60 * 60),
+                started_at: None,
+                resets_at: Some("2026-06-29T18:10:00Z".to_string()),
+                quota: None,
+                remaining: None,
+                used_percent: Some(25),
+                left_percent: Some(75),
+            }],
+        };
+
+        let windows = claude_oauth_quota_windows_from_cache(cache, 200);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Ok);
+        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+        assert_eq!(windows[0].used_percent, Some(25));
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_marks_old_windows_stale() {
+        let cache = ClaudeOAuthUsageCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 400,
+            windows: vec![AgentQuotaWindow {
+                name: "weekly".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: None,
+                account_label: None,
+                window_seconds: Some(7 * 24 * 60 * 60),
+                started_at: None,
+                resets_at: Some("2026-07-04T05:00:00Z".to_string()),
+                quota: None,
+                remaining: None,
+                used_percent: Some(72),
+                left_percent: Some(28),
+            }],
+        };
+
+        let windows = claude_oauth_quota_windows_from_cache(
+            cache,
+            100 + CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS + 1,
+        );
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Unknown);
+        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(windows[0].used_percent, Some(72));
     }
 
     #[test]
