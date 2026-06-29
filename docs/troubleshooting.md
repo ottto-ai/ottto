@@ -66,6 +66,11 @@ the config is clean. If repair JSON requires browser approval, or if verify
 returns `patch_disabled`, do not edit config files directly. Present the
 browser/setup next action or the patch-disabled fact.
 
+Claude Code quota windows also depend on the daemon-owned statusLine wrapper.
+If plan/account detection works but 5-hour or weekly quota windows are missing,
+use the same `verify --repair` / `fix` flow; repair recreates a missing or stale
+`claude-code-statusline.sh` wrapper before re-verifying.
+
 ## Local Relay Port Conflict
 
 The default local OTLP relay listens on `127.0.0.1:43119`. If another macOS
