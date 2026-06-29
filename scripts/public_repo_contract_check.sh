@@ -1046,6 +1046,41 @@ def check_cli_contracts() -> None:
         "watch without JSON error details must stay empty",
     )
 
+    for fixture_name, message in (
+        ("context-without-json-error.json", "ottto context is agent JSON only; pass --json"),
+        ("costs-without-json-error.json", "ottto costs is agent JSON only; pass --json"),
+        ("sessions-without-json-error.json", "ottto sessions is agent JSON only; pass --json"),
+        (
+            "recommendations-without-json-error.json",
+            "ottto recommendations is agent JSON only; pass --json",
+        ),
+        (
+            "provider-impact-without-json-error.json",
+            "ottto provider-impact is agent JSON only; pass --json",
+        ),
+    ):
+        agent_error_output = require_dict(
+            load_json(f"fixtures/cli/{fixture_name}"),
+            f"CLI {fixture_name}",
+        )
+        agent_error = require_dict(agent_error_output.get("error"), f"CLI {fixture_name} payload")
+        expect(
+            agent_error.get("code") == "invalid_request",
+            f"{fixture_name} error code must be invalid_request",
+        )
+        expect(
+            agent_error.get("message") == message,
+            f"{fixture_name} error message must match agent JSON contract",
+        )
+        expect(
+            agent_error.get("retryable") is False,
+            f"{fixture_name} error must not be retryable",
+        )
+        expect(
+            require_dict(agent_error.get("details"), f"CLI {fixture_name} details") == {},
+            f"{fixture_name} error details must stay empty",
+        )
+
     setup_claim = require_dict(load_json("fixtures/cli/setup-claim-request.json"), "CLI setup claim request")
     expect_protocol(setup_claim.get("protocol_version"), "CLI setup claim request")
     expect(setup_claim.get("client_kind") == "cli", "CLI setup claim request client_kind must be cli")

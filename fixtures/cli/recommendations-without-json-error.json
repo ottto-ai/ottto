@@ -1,0 +1,8 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "ottto recommendations is agent JSON only; pass --json",
+    "retryable": false,
+    "details": {}
+  }
+}
