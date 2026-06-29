@@ -764,6 +764,18 @@ mod tests {
             Err(ConnectorTestkitError::RawContentKey { .. })
         ));
         assert!(matches!(
+            assert_sample_key_path_safe("payload.auth_token"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
+            assert_sample_key_path_safe("payload.bearer_token"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
+            assert_sample_key_path_safe("payload.session_token"),
+            Err(ConnectorTestkitError::RawContentKey { .. })
+        ));
+        assert!(matches!(
             assert_sample_key_path_safe("payload.account_id"),
             Err(ConnectorTestkitError::RawContentKey { .. })
         ));
