@@ -1006,6 +1006,86 @@ grep -q "docs index must include diagnostics JSON command" \
 grep -q "docs index must prefer apps and --app over lower-level source nouns" \
   /tmp/public-contract-broken-docs-index.out
 
+broken_examples_docs="$tmp_dir/broken-examples-docs"
+cp -R "$output_dir" "$broken_examples_docs"
+python3 - "$broken_examples_docs/docs/examples.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "consume only JSON\noutput": "can parse concise human output",
+    "ottto status --json": "ottto status",
+    "ottto account --json": "ottto account",
+    "ottto apps --json": "ottto apps",
+    "ottto context --json": "ottto context",
+    "ottto costs --json": "ottto costs",
+    "ottto sessions --json": "ottto sessions",
+    "machine-readable agent surfaces": "human-readable agent surfaces",
+    "require this Mac to be connected": "can run without this Mac connected",
+    "`--app": "`--source",
+    "codex|claude-code|pi": "provider slugs",
+    "`--source`": "`--provider`",
+    "backend source slugs": "provider names",
+    "ottto setup --json --no-browser --no-wait": "ottto setup --no-browser",
+    "exits `60`": "fails",
+    "`claim_url`": "`setup_url`",
+    "`claim_code`": "`setup_code`",
+    "treat the nonzero exit as a corrupt response": "treat nonzero exit as failed text output",
+    "ottto apps status --app claude-code --json": "ottto apps status claude-code",
+    "ottto verify --app claude-code --json": "ottto verify claude-code",
+    "ottto verify --repair --app claude-code --json": "ottto verify --repair claude-code",
+    "Plain verify is read-only": "Plain verify can repair config",
+    "Use `--repair` only when the JSON reports config drift": "Use `--repair` whenever setup is stuck",
+    "daemon-owned WriteConfig": "any local config",
+    "ottto doctor --json": "ottto doctor",
+    "ottto verify --repair --app codex --json": "ottto verify --repair codex",
+    "ottto fix --app codex --json": "ottto fix codex",
+    "ottto verify --app codex --json": "ottto verify codex",
+    "Apply repair only through `ottto fix`": "Patch local config when repair is faster",
+    "Do not patch `~/.codex/config.toml`\ndirectly": "Patch `~/.codex/config.toml` directly",
+    "ottto diagnostics collect --json": "ottto diagnostics collect",
+    "Summarize the redaction report": "Paste the full diagnostics payload",
+    "ottto diagnostics collect --upload": "ottto diagnostics upload",
+    "--approve-upload": "--yes",
+    "--accept-retention-disclosure": "--accept",
+    "--support-claim <claim>": "--claim <claim>",
+    "Use this only after the user approves upload and retention disclosure": "Upload whenever support asks",
+    "ottto update check --json": "ottto update check",
+    "install owner": "installer",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_examples_docs" >/tmp/public-contract-broken-examples-docs.out 2>&1; then
+  echo "Expected contract check to fail when examples docs lose JSON/setup/diagnostics boundaries" >&2
+  exit 1
+fi
+grep -q "examples docs must keep examples JSON-only" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include status JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve machine-readable agent guidance" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include headless setup JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must document setup exit 60" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve nonzero JSON setup boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve read-only verify boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must route Codex repair through ottto fix" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must prohibit direct Codex config patching" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must preserve diagnostics upload approval boundary" \
+  /tmp/public-contract-broken-examples-docs.out
+grep -q "examples docs must include update check JSON command" \
+  /tmp/public-contract-broken-examples-docs.out
+
 broken_connector_docs="$tmp_dir/broken-connector-docs"
 cp -R "$output_dir" "$broken_connector_docs"
 python3 - \
