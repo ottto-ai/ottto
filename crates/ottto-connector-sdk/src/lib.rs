@@ -56,6 +56,8 @@ pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
     "access_token",
     "account_id",
     "api_key",
+    "auth_token",
+    "bearer_token",
     "command_output",
     "cookie",
     "credential",
@@ -77,6 +79,7 @@ pub const FORBIDDEN_SAMPLE_KEYS: &[&str] = &[
     "response",
     "responses",
     "secret",
+    "session_token",
     "tool_output",
     "tokens",
     "user_id",
@@ -477,6 +480,9 @@ mod tests {
         assert!(is_forbidden_sample_key("raw_prompt"));
         assert!(is_forbidden_sample_key("API_KEY"));
         assert!(is_forbidden_sample_key("ACCESS_TOKEN"));
+        assert!(is_forbidden_sample_key("auth_token"));
+        assert!(is_forbidden_sample_key("BEARER_TOKEN"));
+        assert!(is_forbidden_sample_key("session_token"));
         assert!(is_forbidden_sample_key("account_id"));
         assert!(is_forbidden_sample_key("machine_id"));
         assert!(is_forbidden_sample_key("installation_id"));
