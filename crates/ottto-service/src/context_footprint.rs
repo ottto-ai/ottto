@@ -634,7 +634,7 @@ fn safe_text(raw: &str, max_len: usize) -> Option<String> {
 fn discover_recent_claude_workspaces(home: &Path, now: SystemTime) -> Vec<WorkspaceCandidate> {
     let mut files = Vec::new();
     collect_recent_jsonl_files(&home.join(".claude").join("projects"), now, &mut files);
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|item| std::cmp::Reverse(item.1));
     let mut by_path: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
     for (file, mtime) in files {
         for cwd in cwd_values_from_jsonl(&file) {
@@ -657,7 +657,7 @@ fn discover_recent_claude_workspaces(home: &Path, now: SystemTime) -> Vec<Worksp
         }
     }
     let mut candidates: Vec<_> = by_path.into_values().collect();
-    candidates.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
     candidates
 }
 
