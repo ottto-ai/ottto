@@ -1817,6 +1817,56 @@ def check_diagnostics_docs_contracts() -> None:
         text = troubleshooting_docs.read_text(encoding="utf-8")
         expectations = [
             (
+                "Do not parse human summaries. Use JSON status, error codes, and next-action\n"
+                "fields.",
+                "troubleshooting docs must prohibit parsing human summaries",
+            ),
+            (
+                "prefer `agent_action.kind` as the stable\nmachine branch",
+                "troubleshooting docs must preserve setup agent_action branch guidance",
+            ),
+            (
+                "`60` | Browser/user action needed | Open or share the claim URL/code.",
+                "troubleshooting docs must preserve browser/user-action exit code",
+            ),
+            (
+                "`61` | Setup timed out | Rerun setup or use headless setup with claim URL/code.",
+                "troubleshooting docs must preserve setup-timeout exit code",
+            ),
+            (
+                "Plain verify is read-only. `verify --repair` repairs only daemon-owned\n"
+                "WriteConfig config drift",
+                "troubleshooting docs must keep verify repair daemon-owned and narrow",
+            ),
+            (
+                "runs telemetry smoke only after\nthe config is clean",
+                "troubleshooting docs must keep telemetry smoke after clean config",
+            ),
+            (
+                "If repair JSON requires browser approval, or if verify\n"
+                "returns `patch_disabled`, do not edit config files directly.",
+                "troubleshooting docs must prohibit direct config edits on browser approval or patch_disabled",
+            ),
+            (
+                "binds a deterministic per-user fallback port and reports the active endpoint in\n"
+                "`ottto status --json`",
+                "troubleshooting docs must preserve relay fallback endpoint contract",
+            ),
+            (
+                "Do not kill another user's process unless you own that test\n"
+                "account and have confirmed it is not the active customer install.",
+                "troubleshooting docs must prohibit killing another user's active service",
+            ),
+            (
+                "Use cloud-first logout:",
+                "troubleshooting docs must preserve cloud-first logout guidance",
+            ),
+            (
+                "Use local-only cleanup only after the user accepts that cloud disconnect did not\n"
+                "complete.",
+                "troubleshooting docs must keep local-only logout user-accepted",
+            ),
+            (
                 "Upload only with explicit approval, retention disclosure acceptance, and an\nactive login or support claim.",
                 "troubleshooting docs must require approval, retention acceptance, and authorization before upload",
             ),
