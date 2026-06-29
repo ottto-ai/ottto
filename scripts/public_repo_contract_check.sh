@@ -1263,6 +1263,27 @@ def check_cli_contracts() -> None:
         watch_error = require_dict(final.get("error"), "daemon error watch final error")
         expect(watch_error.get("code") == "daemon_unavailable", "daemon error watch code must be daemon_unavailable")
 
+    uninstall_events = load_ndjson("fixtures/cli/uninstall-incomplete-output.ndjson")
+    expect(len(uninstall_events) == 2, "uninstall incomplete output must include progress and final events")
+    if uninstall_events:
+        progress = uninstall_events[0]
+        expect(progress.get("event") == "progress", "uninstall incomplete first event must be progress")
+        expect(progress.get("command") == "uninstall", "uninstall incomplete progress command must be uninstall")
+        expect_protocol(progress.get("protocol_version"), "uninstall incomplete progress event")
+        final = uninstall_events[-1]
+        expect(final.get("event") == "final", "uninstall incomplete final event must be final")
+        expect(final.get("ok") is False, "uninstall incomplete final event must not be ok")
+        expect(final.get("exit_code") == 70, "uninstall incomplete final exit_code must be 70")
+        uninstall_error = require_dict(final.get("error"), "uninstall incomplete final error")
+        expect(uninstall_error.get("code") == "internal", "uninstall incomplete error code must be internal")
+        expect(uninstall_error.get("retryable") is True, "uninstall incomplete error must be retryable")
+        details = require_dict(uninstall_error.get("details"), "uninstall incomplete error details")
+        expect(details.get("status") == "incomplete", "uninstall incomplete details status must be incomplete")
+        expect(
+            len(require_list(details.get("failed_operations"), "uninstall incomplete failed operations")) >= 1,
+            "uninstall incomplete must include failed operations",
+        )
+
 
 def check_control_contracts() -> None:
     request = require_dict(load_json("fixtures/control/status-request.json"), "control status request")
