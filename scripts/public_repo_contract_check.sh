@@ -2063,6 +2063,51 @@ def check_install_docs_contracts() -> None:
         text = release_docs.read_text(encoding="utf-8")
         expectations = [
             (
+                "Stable local-platform releases must be verifiable without trusting mutable\ninstaller state.",
+                "release verification docs must distrust mutable installer state",
+            ),
+            (
+                "Do not trust a release where the manifest omits required public-v1 metadata.",
+                "release verification docs must treat manifest metadata as required",
+            ),
+            (
+                "The computed digest must exactly match the manifest.",
+                "release verification docs must require checksum equality with manifest",
+            ),
+            (
+                "Verify `release-manifest.json.sig` with\n`macos_manifest_signature.sh verify --manifest release-manifest.json --identity \"$OTTTO_MACOS_CODESIGN_IDENTITY\"`",
+                "release verification docs must require manifest signature verification",
+            ),
+            (
+                "bound to the expected Ottto Developer ID identity",
+                "release verification docs must bind signatures to Ottto Developer ID identity",
+            ),
+            (
+                "The macOS stable release workflow can optionally publish a public GitHub Release\nas a **verification mirror only**.",
+                "release verification docs must keep GitHub releases verification-only",
+            ),
+            (
+                "The CDN at\n`install.ottto.net` remains the install and update source of truth",
+                "release verification docs must keep CDN as install/update source of truth",
+            ),
+            (
+                "stable-candidate RC QA",
+                "release verification docs must require stable-candidate RC QA",
+            ),
+            (
+                "The evidence must\nnot include private repo paths, local user paths, raw claim/setup tokens,\naccount or machine identifiers, passwords, API keys, or bearer credentials.",
+                "release verification docs must keep stable-candidate evidence redacted",
+            ),
+            ("ottto status --json", "release verification docs must include status JSON check"),
+            (
+                "ottto update check --json",
+                "release verification docs must include update-check JSON check",
+            ),
+            (
+                "The JSON should report the expected version, install owner, update state, and\ndaemon reachability.",
+                "release verification docs must require installed-runtime JSON fields",
+            ),
+            (
                 "requires clean-machine evidence for every install owner advertised by the\nmanifest",
                 "release verification docs must require clean-machine evidence per advertised owner",
             ),
