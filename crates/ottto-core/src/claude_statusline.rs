@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub const CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION: u16 = 1;
 pub const CLAUDE_STATUSLINE_CACHE_FILE_NAME: &str = "claude-code-rate-limits.json";
+pub const CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME: &str = "claude-code-context-window.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeStatusLineRateLimitCache {
@@ -21,6 +22,16 @@ pub struct ClaudeStatusLineRateLimitWindow {
     pub resets_at_epoch_seconds: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStatusLineContextWindowCache {
+    pub schema_version: u16,
+    pub observed_at_epoch_seconds: u64,
+    pub active_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub remaining_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeStatusLineIngestResult {
     pub stored: bool,
@@ -32,12 +43,27 @@ pub fn claude_statusline_cache_path(support_dir: &Path) -> PathBuf {
     support_dir.join(CLAUDE_STATUSLINE_CACHE_FILE_NAME)
 }
 
+pub fn claude_statusline_context_cache_path(support_dir: &Path) -> PathBuf {
+    support_dir.join(CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME)
+}
+
 pub fn ingest_claude_statusline_payload(
     support_dir: &Path,
     payload: &str,
     observed_at_epoch_seconds: u64,
 ) -> Result<ClaudeStatusLineIngestResult> {
-    let Some(cache) = parse_claude_statusline_payload(payload, observed_at_epoch_seconds)? else {
+    let rate_cache = parse_claude_statusline_payload(payload, observed_at_epoch_seconds)?;
+    let context_cache =
+        parse_claude_statusline_context_window_payload(payload, observed_at_epoch_seconds)?;
+    let Some(cache) = rate_cache.as_ref() else {
+        if let Some(context_cache) = context_cache.as_ref() {
+            write_claude_statusline_context_cache(support_dir, context_cache)?;
+            return Ok(ClaudeStatusLineIngestResult {
+                stored: true,
+                window_count: 0,
+                reason: None,
+            });
+        }
         return Ok(ClaudeStatusLineIngestResult {
             stored: false,
             window_count: 0,
@@ -45,7 +71,10 @@ pub fn ingest_claude_statusline_payload(
         });
     };
     let window_count = cache.windows.len();
-    write_claude_statusline_cache(support_dir, &cache)?;
+    write_claude_statusline_cache(support_dir, cache)?;
+    if let Some(context_cache) = context_cache.as_ref() {
+        write_claude_statusline_context_cache(support_dir, context_cache)?;
+    }
     Ok(ClaudeStatusLineIngestResult {
         stored: true,
         window_count,
@@ -84,6 +113,74 @@ pub fn parse_claude_statusline_payload(
     }))
 }
 
+pub fn parse_claude_statusline_context_window_payload(
+    payload: &str,
+    observed_at_epoch_seconds: u64,
+) -> Result<Option<ClaudeStatusLineContextWindowCache>> {
+    let value: Value =
+        serde_json::from_str(payload).context("parse Claude Code statusLine JSON")?;
+    let Some(context_window) = value.get("context_window").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+
+    let max_tokens = u64_at(
+        &Value::Object(context_window.clone()),
+        &[
+            "context_window_size",
+            "max_tokens",
+            "context_window_tokens",
+            "window_tokens",
+        ],
+    );
+    let used_percent = f64_at(
+        &Value::Object(context_window.clone()),
+        &["used_percentage", "used_percent", "pct_context"],
+    )
+    .and_then(percent_to_u8);
+    let active_tokens = active_tokens_from_context_window(&Value::Object(context_window.clone()))
+        .or_else(|| {
+            max_tokens.and_then(|max| {
+                used_percent.map(|percent| ((max as f64) * (percent as f64 / 100.0)).round() as u64)
+            })
+        });
+    let remaining_tokens = u64_at(
+        &Value::Object(context_window.clone()),
+        &[
+            "remaining_tokens",
+            "available_tokens",
+            "free_space_tokens",
+            "free_tokens",
+        ],
+    )
+    .or_else(|| {
+        let remaining_percent = f64_at(
+            &Value::Object(context_window.clone()),
+            &["remaining_percentage", "remaining_percent"],
+        );
+        max_tokens.and_then(|max| {
+            remaining_percent
+                .map(|percent| ((max as f64) * (percent.clamp(0.0, 100.0) / 100.0)).round() as u64)
+        })
+    })
+    .or_else(|| match (max_tokens, active_tokens) {
+        (Some(max), Some(active)) => Some(max.saturating_sub(active)),
+        _ => None,
+    });
+
+    if max_tokens.is_none() && active_tokens.is_none() && used_percent.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(ClaudeStatusLineContextWindowCache {
+        schema_version: CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
+        observed_at_epoch_seconds,
+        active_tokens,
+        max_tokens,
+        used_percent,
+        remaining_tokens,
+    }))
+}
+
 pub fn read_claude_statusline_cache(
     support_dir: &Path,
 ) -> Result<Option<ClaudeStatusLineRateLimitCache>> {
@@ -94,6 +191,22 @@ pub fn read_claude_statusline_cache(
     let body = fs::read_to_string(&path).context("read Claude Code statusLine cache")?;
     let cache: ClaudeStatusLineRateLimitCache =
         serde_json::from_str(&body).context("parse Claude Code statusLine cache")?;
+    if cache.schema_version != CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+pub fn read_claude_statusline_context_cache(
+    support_dir: &Path,
+) -> Result<Option<ClaudeStatusLineContextWindowCache>> {
+    let path = claude_statusline_context_cache_path(support_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(&path).context("read Claude Code statusLine context cache")?;
+    let cache: ClaudeStatusLineContextWindowCache =
+        serde_json::from_str(&body).context("parse Claude Code statusLine context cache")?;
     if cache.schema_version != CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION {
         return Ok(None);
     }
@@ -114,6 +227,20 @@ pub fn write_claude_statusline_cache(
     Ok(())
 }
 
+pub fn write_claude_statusline_context_cache(
+    support_dir: &Path,
+    cache: &ClaudeStatusLineContextWindowCache,
+) -> Result<()> {
+    fs::create_dir_all(support_dir).context("create Ottto support directory")?;
+    let path = claude_statusline_context_cache_path(support_dir);
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let body = serde_json::to_vec_pretty(cache)
+        .context("serialize Claude Code statusLine context cache")?;
+    fs::write(&tmp_path, body).context("write Claude Code statusLine context cache temp file")?;
+    fs::rename(&tmp_path, &path).context("replace Claude Code statusLine context cache")?;
+    Ok(())
+}
+
 fn parse_rate_limit_window(name: &str, value: &Value) -> Option<ClaudeStatusLineRateLimitWindow> {
     let used_percent = value
         .get("used_percentage")
@@ -125,6 +252,65 @@ fn parse_rate_limit_window(name: &str, value: &Value) -> Option<ClaudeStatusLine
         used_percent,
         resets_at_epoch_seconds,
     })
+}
+
+fn active_tokens_from_context_window(value: &Value) -> Option<u64> {
+    u64_at(
+        value,
+        &[
+            "active_tokens",
+            "used_tokens",
+            "current_tokens",
+            "total_tokens",
+            "total_context_tokens",
+        ],
+    )
+    .or_else(|| {
+        value.get("current_usage").and_then(|usage| {
+            u64_at(
+                usage,
+                &[
+                    "total_tokens",
+                    "total_context_tokens",
+                    "total",
+                    "context_tokens",
+                    "tokens",
+                ],
+            )
+            .or_else(|| {
+                let input = u64_at(usage, &["input_tokens", "total_input_tokens"]);
+                let output = u64_at(usage, &["output_tokens", "total_output_tokens"]);
+                match (input, output) {
+                    (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                    (Some(input), None) => Some(input),
+                    (None, Some(output)) => Some(output),
+                    _ => None,
+                }
+            })
+        })
+    })
+}
+
+fn u64_at(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(json_number_to_u64))
+}
+
+fn f64_at(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_f64))
+}
+
+fn json_number_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|v| (v >= 0).then_some(v as u64)))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.round() as u64)
+        })
 }
 
 fn percent_to_u8(value: f64) -> Option<u8> {
@@ -155,6 +341,12 @@ mod tests {
           "cwd": "/Users/example/private/project",
           "transcript_path": "/Users/example/.claude/projects/session.jsonl",
           "model": { "display_name": "Opus" },
+          "context_window": {
+            "context_window_size": 1000000,
+            "current_usage": { "input_tokens": 42194, "output_tokens": 8 },
+            "used_percentage": 4.2,
+            "remaining_percentage": 95.8
+          },
           "rate_limits": {
             "five_hour": { "used_percentage": 23.5, "resets_at": 1738425600 },
             "seven_day": { "used_percentage": 41.2, "resets_at": 1738857600 }
@@ -173,6 +365,19 @@ mod tests {
         assert!(!serialized.contains("/Users/example"));
         assert!(!serialized.contains("transcript_path"));
         assert!(!serialized.contains("Opus"));
+
+        let context_cache = parse_claude_statusline_context_window_payload(payload, 1738422000)
+            .expect("parse context")
+            .expect("context cache");
+
+        assert_eq!(context_cache.max_tokens, Some(1_000_000));
+        assert_eq!(context_cache.active_tokens, Some(42_202));
+        assert_eq!(context_cache.used_percent, Some(4));
+        assert_eq!(context_cache.remaining_tokens, Some(958_000));
+        let serialized = serde_json::to_string(&context_cache).expect("serialize");
+        assert!(!serialized.contains("/Users/example"));
+        assert!(!serialized.contains("transcript_path"));
+        assert!(!serialized.contains("Opus"));
     }
 
     #[test]
@@ -185,6 +390,29 @@ mod tests {
         assert!(!result.stored);
         assert_eq!(result.reason.as_deref(), Some("rate_limits_missing"));
         assert!(!claude_statusline_cache_path(&dir).exists());
+    }
+
+    #[test]
+    fn context_window_without_rate_limits_is_stored() {
+        let dir = support_dir("context-only");
+        let result = ingest_claude_statusline_payload(
+            &dir,
+            r#"{"context_window":{"context_window_size":1000000,"used_tokens":42000,"used_percentage":4.2}}"#,
+            10,
+        )
+        .expect("ingest");
+
+        assert!(result.stored);
+        assert_eq!(result.window_count, 0);
+        assert!(result.reason.is_none());
+        assert!(!claude_statusline_cache_path(&dir).exists());
+        let cache = read_claude_statusline_context_cache(&dir)
+            .expect("read context")
+            .expect("context cache");
+        assert_eq!(cache.active_tokens, Some(42_000));
+        assert_eq!(cache.max_tokens, Some(1_000_000));
+        assert_eq!(cache.used_percent, Some(4));
+        assert_eq!(cache.remaining_tokens, Some(958_000));
     }
 
     #[test]
@@ -203,6 +431,25 @@ mod tests {
         write_claude_statusline_cache(&dir, &cache).expect("write");
         assert_eq!(
             read_claude_statusline_cache(&dir).expect("read"),
+            Some(cache)
+        );
+    }
+
+    #[test]
+    fn writes_and_reads_context_cache_atomically() {
+        let dir = support_dir("context-roundtrip");
+        let cache = ClaudeStatusLineContextWindowCache {
+            schema_version: CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
+            observed_at_epoch_seconds: 10,
+            active_tokens: Some(42),
+            max_tokens: Some(100),
+            used_percent: Some(42),
+            remaining_tokens: Some(58),
+        };
+
+        write_claude_statusline_context_cache(&dir, &cache).expect("write");
+        assert_eq!(
+            read_claude_statusline_context_cache(&dir).expect("read"),
             Some(cache)
         );
     }

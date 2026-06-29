@@ -319,6 +319,10 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving mcp inventory harvest"),
         Err(error) => eprintln!("mcp inventory harvest unavailable: {error}"),
     }
+    match ottto_service::context_footprint::spawn_context_footprint_sync() {
+        Ok(()) => eprintln!("serving context footprint harvest"),
+        Err(error) => eprintln!("context footprint harvest unavailable: {error}"),
+    }
     match ottto_service::snapshot_sync::spawn_local_health_projection_sync(daemon.clone()) {
         Ok(()) => eprintln!("serving local health projection sync"),
         Err(error) => eprintln!("local health projection sync unavailable: {error}"),

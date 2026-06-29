@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
     compiled_release_version, default_support_dir, read_claude_statusline_cache,
+    read_claude_statusline_context_cache, ClaudeStatusLineContextWindowCache,
     ClaudeStatusLineRateLimitCache,
 };
 use ottto_protocol::{
@@ -412,24 +413,52 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
             }
         },
     }
-    snapshot.context = Some(AgentContextStatus {
-        status: AgentContextState::Unsupported,
-        active_tokens: None,
-        max_tokens: None,
-        used_percent: None,
-        remaining_tokens: None,
-        source: Some("claude_cli_v1".to_string()),
-    });
+    let mut context_capability = unsupported_capability(
+        "active_context",
+        "Claude Code active context has not been observed from statusLine yet.",
+    );
+    match collect_claude_statusline_context_status() {
+        Ok(Some(context)) => {
+            snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+            snapshot.context = Some(context);
+            context_capability = supported_capability(
+                "active_context",
+                "Collected from Claude Code's local statusLine context_window payload.",
+            );
+        }
+        Ok(None) => {
+            snapshot.context = Some(AgentContextStatus {
+                status: AgentContextState::Unsupported,
+                active_tokens: None,
+                max_tokens: None,
+                used_percent: None,
+                remaining_tokens: None,
+                source: Some("claude_statusline_context_window".to_string()),
+            });
+        }
+        Err(message) => {
+            snapshot.context = Some(AgentContextStatus {
+                status: AgentContextState::Unknown,
+                active_tokens: None,
+                max_tokens: None,
+                used_percent: None,
+                remaining_tokens: None,
+                source: Some("claude_statusline_context_window".to_string()),
+            });
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "claude_statusline_context_cache_unavailable",
+                AgentDiagnosticSeverity::Warning,
+                message,
+            ));
+        }
+    }
     snapshot.capabilities = vec![
         supported_capability(
             "account_status",
             "Read from claude auth status --json when available.",
         ),
         quota_capability,
-        unsupported_capability(
-            "active_context",
-            "Claude Code CLI does not expose active context metadata in v1.",
-        ),
+        context_capability,
     ];
     if version.command_found && version.success {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
@@ -457,6 +486,24 @@ fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, St
     }
 
     Ok(claude_statusline_quota_windows_from_cache(cache, now))
+}
+
+fn collect_claude_statusline_context_status() -> Result<Option<AgentContextStatus>, String> {
+    let cache = read_claude_statusline_context_cache(&default_support_dir()).map_err(|_| {
+        "Claude Code statusLine context cache could not be read safely.".to_string()
+    })?;
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    let now = current_unix_seconds();
+    if cache.observed_at_epoch_seconds > now.saturating_add(60)
+        || now.saturating_sub(cache.observed_at_epoch_seconds)
+            > CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(claude_statusline_context_from_cache(cache)))
 }
 
 fn collect_claude_oauth_quota_windows(
@@ -747,6 +794,19 @@ fn claude_statusline_quota_windows_from_cache(
         });
     }
     windows
+}
+
+fn claude_statusline_context_from_cache(
+    cache: ClaudeStatusLineContextWindowCache,
+) -> AgentContextStatus {
+    AgentContextStatus {
+        status: AgentContextState::Available,
+        active_tokens: cache.active_tokens,
+        max_tokens: cache.max_tokens,
+        used_percent: cache.used_percent,
+        remaining_tokens: cache.remaining_tokens,
+        source: Some("claude_statusline_context_window".to_string()),
+    }
 }
 
 fn current_unix_seconds() -> u64 {
@@ -4167,6 +4227,30 @@ for line in sys.stdin:
         assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Stale);
         assert_eq!(windows[0].used_percent, Some(24));
         assert_eq!(windows[0].left_percent, Some(76));
+    }
+
+    #[test]
+    fn claude_statusline_context_cache_maps_live_context() {
+        let cache = ClaudeStatusLineContextWindowCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: 100,
+            active_tokens: Some(42_000),
+            max_tokens: Some(1_000_000),
+            used_percent: Some(4),
+            remaining_tokens: Some(958_000),
+        };
+
+        let context = claude_statusline_context_from_cache(cache);
+
+        assert_eq!(context.status, AgentContextState::Available);
+        assert_eq!(context.active_tokens, Some(42_000));
+        assert_eq!(context.max_tokens, Some(1_000_000));
+        assert_eq!(context.used_percent, Some(4));
+        assert_eq!(context.remaining_tokens, Some(958_000));
+        assert_eq!(
+            context.source.as_deref(),
+            Some("claude_statusline_context_window")
+        );
     }
 
     #[test]

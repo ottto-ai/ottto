@@ -218,6 +218,8 @@ pub struct ActivityHintResponse {
     // Defaults true so an older backend that omits the field keeps harvesting.
     #[serde(default = "default_true")]
     pub mcp_inventory_harvest_enabled: bool,
+    #[serde(default = "default_true")]
+    pub context_footprint_harvest_enabled: bool,
     pub recommended_scan_after: String,
 }
 
@@ -506,6 +508,29 @@ impl SnapshotApiClient {
                 Err(anyhow!("backend rejected mcp inventory: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload mcp inventory failed: {error}")),
+        }
+    }
+
+    pub fn upload_context_footprint(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-footprint/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context footprint response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context footprint: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context footprint failed: {error}")),
         }
     }
 
