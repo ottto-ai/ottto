@@ -755,6 +755,47 @@ impl LocalDaemon {
         Ok(snapshots)
     }
 
+    /// Reconfirm any sources still in the seeded post-restart `verifying` state
+    /// (see [`Self::with_registered_device_sources`]) by running the same
+    /// agent-status scan an on-demand refresh runs, promoting each to its real
+    /// health. Trusted, internal call (no control token) used by the startup
+    /// re-verify burst, mirroring how the snapshot-sync loop updates daemon
+    /// state without a token.
+    ///
+    /// Deliberately conservative: a seeded row is only replaced when the scan
+    /// finds the source `Available` (-> healthy). A weaker scan result right
+    /// after boot is far more likely a cold-CLI transient than a real
+    /// regression, so the neutral `verifying` row is left in place rather than
+    /// flash a spurious attention state — a later scan, an explicit Verify, or a
+    /// fresh session resolves a genuine problem. The write also re-checks that
+    /// each source is still `verifying`, so a concurrent Verify/refresh result
+    /// is never clobbered. Returns the number of sources still `verifying`
+    /// afterward so the startup burst can stop once everything has reconfirmed.
+    pub fn reconfirm_verifying_sources_for_trusted_client(
+        &self,
+        captured_at: String,
+        expires_at: String,
+    ) -> Result<usize, LocalApiError> {
+        let verifying = {
+            let state = self.state()?;
+            if state.account.state != LocalAccountState::Connected {
+                return Ok(0);
+            }
+            verifying_source_kinds(&state)
+        };
+        if verifying.is_empty() {
+            return Ok(0);
+        }
+        let snapshots = verifying
+            .iter()
+            .map(|source| {
+                agent_status::collect_agent_status(source, captured_at.clone(), expires_at.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut state = self.state()?;
+        Ok(apply_verifying_reconfirm(&mut state, snapshots))
+    }
+
     pub fn set_relay_state(&self, token: &str, relay: RelayState) -> Result<(), LocalApiError> {
         self.control_token.authorize(token)?;
         self.set_relay_state_authorized(relay)
@@ -2747,6 +2788,41 @@ fn upsert_agent_status_snapshot(state: &mut DaemonState, snapshot: AgentStatusSn
     }
     let health = source_health_from_agent_status(state, snapshot);
     state.sources.push(health);
+}
+
+/// Source kinds whose health is still in the seeded post-restart `verifying`
+/// state.
+fn verifying_source_kinds(state: &DaemonState) -> Vec<SourceKind> {
+    state
+        .sources
+        .iter()
+        .filter(|health| health.state == SourceState::Verifying)
+        .map(|health| health.source.clone())
+        .collect()
+}
+
+/// Apply a startup re-verify scan: replace each source that is *still*
+/// `verifying` with authoritative health, but only when the scan found it
+/// `Available`. Skipping non-`Available` results keeps a cold-CLI boot read from
+/// flashing a seeded `verifying` row into a spurious attention state; the
+/// still-verifying recheck keeps a concurrent Verify/refresh result from being
+/// clobbered. Returns the count of sources still `verifying` afterward.
+fn apply_verifying_reconfirm(
+    state: &mut DaemonState,
+    snapshots: Vec<AgentStatusSnapshot>,
+) -> usize {
+    for snapshot in snapshots {
+        if snapshot.status != AgentStatusState::Available {
+            continue;
+        }
+        let still_verifying = state.sources.iter().any(|health| {
+            health.source == snapshot.source && health.state == SourceState::Verifying
+        });
+        if still_verifying {
+            upsert_agent_status_snapshot(state, snapshot);
+        }
+    }
+    verifying_source_kinds(state).len()
 }
 
 fn has_config_drift_problem(health: &SourceHealth) -> bool {
@@ -5234,6 +5310,80 @@ mod tests {
         assert!(status.sources[0].agent_status.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_reverify_promotes_available_seeded_source() {
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+
+        let mut state = restarted.inner.lock().expect("state");
+        assert_eq!(state.sources[0].state, SourceState::Verifying);
+
+        let remaining = apply_verifying_reconfirm(
+            &mut state,
+            vec![available_agent_status(
+                SourceKind::Codex,
+                "2026-05-05T10:20:00Z",
+            )],
+        );
+
+        assert_eq!(remaining, 0);
+        assert_eq!(state.sources[0].state, SourceState::Healthy);
+        assert_eq!(state.sources[0].grade, HealthGrade::Ok);
+    }
+
+    #[test]
+    fn startup_reverify_leaves_cold_cli_source_verifying() {
+        // A non-`Available` scan right after boot is far more likely a cold CLI
+        // than a real regression, so the seeded `verifying` row is preserved
+        // (no spurious attention flash). The burst retries on a later tick.
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_registered_device_sources(Some(LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }));
+
+        let mut state = restarted.inner.lock().expect("state");
+        let mut cold = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
+        cold.status = AgentStatusState::AuthRequired;
+
+        let remaining = apply_verifying_reconfirm(&mut state, vec![cold]);
+
+        assert_eq!(remaining, 1);
+        assert_eq!(state.sources[0].state, SourceState::Verifying);
+        assert!(state.sources[0].agent_status.is_none());
+    }
+
+    #[test]
+    fn startup_reverify_does_not_clobber_explicit_verify_result() {
+        // A source that an explicit Verify already moved out of `verifying`
+        // (e.g. needs_confirmation after a no-fresh-telemetry smoke) must not be
+        // promoted back to healthy by a racing startup scan.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut state = daemon.inner.lock().expect("state");
+        let mut confirmed = codex_health();
+        confirmed.state = SourceState::NeedsConfirmation;
+        confirmed.grade = HealthGrade::Warning;
+        state.sources = vec![confirmed];
+
+        let remaining = apply_verifying_reconfirm(
+            &mut state,
+            vec![available_agent_status(
+                SourceKind::Codex,
+                "2026-05-05T10:20:00Z",
+            )],
+        );
+
+        assert_eq!(remaining, 0);
+        assert_eq!(state.sources[0].state, SourceState::NeedsConfirmation);
     }
 
     #[test]

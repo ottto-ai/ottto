@@ -123,6 +123,53 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
     Ok(())
 }
 
+/// A freshly restarted daemon seeds registered sources as `verifying` (see
+/// [`LocalDaemon::with_registered_device_sources`]) so a connected account never
+/// momentarily shows zero sources while the first agent scan is pending. Nothing
+/// else proactively runs that scan, so without this burst the seeded rows can
+/// dwell in `verifying` for tens of seconds until a client polls with refresh or
+/// the next session emits telemetry — a transient that can read as "not working"
+/// to a customer right after a daemon restart. Reconfirm them shortly after
+/// boot, retrying a few times so a cold CLI that is not yet ready on the first
+/// pass still settles quickly. Honest by construction: this runs the same
+/// agent-status scan a GUI/CLI refresh runs and only promotes `Available`
+/// sources (see `LocalDaemon::reconfirm_verifying_sources_for_trusted_client`),
+/// so it never reports `healthy` before the scan actually finds the source ready.
+const STARTUP_REVERIFY_SCHEDULE: &[Duration] = &[
+    Duration::from_secs(2),
+    Duration::from_secs(6),
+    Duration::from_secs(15),
+];
+
+pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
+    let spawn_result = std::thread::Builder::new()
+        .name("ottto-startup-reverify".to_string())
+        .spawn(move || {
+            for delay in STARTUP_REVERIFY_SCHEDULE {
+                std::thread::sleep(*delay);
+                let captured_at = current_rfc3339();
+                let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+                    .unwrap_or_else(|| captured_at.clone());
+                match daemon.reconfirm_verifying_sources_for_trusted_client(captured_at, expires_at)
+                {
+                    // All seeded rows reconfirmed (or none seeded / not
+                    // connected) — nothing left to do.
+                    Ok(0) => break,
+                    // Some sources were not `Available` yet (cold CLI); retry on
+                    // the next, longer tick once they have had time to warm up.
+                    Ok(_) => continue,
+                    Err(error) => {
+                        eprintln!("startup source re-verify skipped: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("startup source re-verify unavailable: {error}");
+    }
+}
+
 pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
