@@ -440,6 +440,112 @@ def check_docs_index_contracts() -> None:
         expect(needle in text, message)
 
 
+def check_examples_docs_contracts() -> None:
+    examples_docs = require_file("docs/examples.md")
+    if examples_docs is None:
+        return
+
+    text = examples_docs.read_text(encoding="utf-8")
+    expectations = [
+        ("consume only JSON\noutput", "examples docs must keep examples JSON-only"),
+        ("ottto status --json", "examples docs must include status JSON command"),
+        ("ottto account --json", "examples docs must include account JSON command"),
+        ("ottto apps --json", "examples docs must include apps JSON command"),
+        ("ottto context --json", "examples docs must include context JSON command"),
+        (
+            "ottto context --json --range today --source codex",
+            "examples docs must include source-scoped context JSON command",
+        ),
+        (
+            "ottto context --json --all-machines --max-tokens 4000",
+            "examples docs must include bounded all-machines context JSON command",
+        ),
+        (
+            "ottto costs --json --range today --source codex",
+            "examples docs must include source-scoped costs JSON command",
+        ),
+        (
+            "ottto costs --json --all-machines --bucket day",
+            "examples docs must include all-machines cost bucket JSON command",
+        ),
+        (
+            "ottto sessions --json --limit 20 --source codex",
+            "examples docs must include bounded source-scoped sessions JSON command",
+        ),
+        (
+            "ottto sessions --json --all-machines --sort-by cost --sort-dir desc",
+            "examples docs must include bounded all-machines sessions JSON command",
+        ),
+        ("machine-readable agent surfaces", "examples docs must preserve machine-readable agent guidance"),
+        ("require this Mac to be connected", "examples docs must document connected-Mac requirement"),
+        ("`--app", "examples docs must document app alias flag"),
+        ("codex|claude-code|pi", "examples docs must list public app aliases"),
+        ("`--source`", "examples docs must document source slug flag"),
+        ("backend source slugs", "examples docs must explain source slugs as backend values"),
+        (
+            "ottto setup --json --no-browser --no-wait",
+            "examples docs must include headless setup JSON command",
+        ),
+        ("exits `60`", "examples docs must document setup exit 60"),
+        ("`claim_url`", "examples docs must preserve claim_url handoff"),
+        ("`claim_code`", "examples docs must preserve claim_code handoff"),
+        (
+            "treat the nonzero exit as a corrupt response",
+            "examples docs must preserve nonzero JSON setup boundary",
+        ),
+        (
+            "ottto apps status --app claude-code --json",
+            "examples docs must include Claude Code app status command",
+        ),
+        (
+            "ottto verify --app claude-code --json",
+            "examples docs must include Claude Code read-only verify command",
+        ),
+        (
+            "ottto verify --repair --app claude-code --json",
+            "examples docs must include Claude Code bounded repair command",
+        ),
+        ("Plain verify is read-only", "examples docs must preserve read-only verify boundary"),
+        (
+            "Use `--repair` only when the JSON reports config drift",
+            "examples docs must keep repair conditional on JSON config drift",
+        ),
+        (
+            "daemon-owned WriteConfig",
+            "examples docs must preserve daemon-owned WriteConfig repair boundary",
+        ),
+        ("ottto doctor --json", "examples docs must include doctor JSON command"),
+        (
+            "ottto verify --repair --app codex --json",
+            "examples docs must include Codex bounded repair command",
+        ),
+        ("ottto fix --app codex --json", "examples docs must include Codex fix JSON command"),
+        ("ottto verify --app codex --json", "examples docs must include Codex post-fix verify command"),
+        ("Apply repair only through `ottto fix`", "examples docs must route Codex repair through ottto fix"),
+        (
+            "Do not patch `~/.codex/config.toml`\ndirectly",
+            "examples docs must prohibit direct Codex config patching",
+        ),
+        ("ottto diagnostics collect --json", "examples docs must include diagnostics JSON command"),
+        (
+            "Summarize the redaction report",
+            "examples docs must preserve diagnostics redaction summary guidance",
+        ),
+        ("ottto diagnostics collect --upload", "examples docs must include diagnostics upload command"),
+        ("--approve-upload", "examples docs must require upload approval flag"),
+        ("--accept-retention-disclosure", "examples docs must require retention disclosure flag"),
+        ("--support-claim <claim>", "examples docs must require support claim argument shape"),
+        (
+            "Use this only after the user approves upload and retention disclosure",
+            "examples docs must preserve diagnostics upload approval boundary",
+        ),
+        ("ottto update check --json", "examples docs must include update check JSON command"),
+        ("install owner", "examples docs must preserve install-owner update guidance"),
+    ]
+    for needle, message in expectations:
+        expect(needle in text, message)
+
+
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
@@ -2030,6 +2136,7 @@ check_control_contracts()
 check_setup_and_redaction_contracts()
 check_local_health_diagnostics_contract()
 check_docs_index_contracts()
+check_examples_docs_contracts()
 check_connector_docs_contracts()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()
