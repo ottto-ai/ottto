@@ -631,10 +631,11 @@ impl LocalDaemon {
         let machine_id = state.machine.machine_id.clone();
         let source_slug = source_slug(&result.source);
         let action_id = format!("verify_{source_slug}");
+        let records_success = verification_result_records_success(result);
         state.local_health_events.push(LocalHealthEventV1 {
             event_id: format!("evt_verify_{source_slug}_{sequence}"),
             event_schema_version: "local_health_event.v1".to_string(),
-            event_type: if result.status == SourceVerificationStatus::Verified {
+            event_type: if records_success {
                 "VerifyPassed".to_string()
             } else {
                 "VerifyFailed".to_string()
@@ -655,7 +656,7 @@ impl LocalDaemon {
             action_id,
             idempotency_key: format!("verify:{machine_id}:{source_slug}"),
             command_schema_version: "local_command.v1".to_string(),
-            status: if result.status == SourceVerificationStatus::Verified {
+            status: if records_success {
                 LocalHealthCommandStatus::Succeeded
             } else {
                 LocalHealthCommandStatus::Failed
@@ -664,7 +665,7 @@ impl LocalDaemon {
             started_projection_revision: sequence.saturating_sub(1),
             completed_projection_revision: sequence,
             observed_at,
-            error_code: if result.status == SourceVerificationStatus::Verified {
+            error_code: if records_success {
                 None
             } else {
                 Some(result.message.code.clone())
@@ -2852,6 +2853,15 @@ fn has_soft_no_fresh_telemetry_problem(health: &SourceHealth) -> bool {
         })
 }
 
+fn has_soft_smoke_timeout_problem(health: &SourceHealth) -> bool {
+    health.state == SourceState::Failed
+        && health.grade == HealthGrade::Critical
+        && health.problems.iter().any(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && problem.detail.contains("smoke session timed out")
+        })
+}
+
 fn has_usage_limited_verification_problem(health: &SourceHealth) -> bool {
     health.last_verified_at.is_some()
         && !health.problems.is_empty()
@@ -2879,6 +2889,12 @@ fn verification_result_is_usage_limited(result: &SourceVerificationResult) -> bo
                 .is_some_and(verification_code_is_usage_limited)
                 || verification_code_is_usage_limited(&route.message.code)
         })
+}
+
+fn verification_result_records_success(result: &SourceVerificationResult) -> bool {
+    matches!(result.status, SourceVerificationStatus::Verified)
+        || (matches!(result.status, SourceVerificationStatus::Warning)
+            && (result.verified || verification_result_is_usage_limited(result)))
 }
 
 fn verification_code_is_usage_limited(code: &str) -> bool {
@@ -2922,12 +2938,14 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     if preserve_config_drift {
         refreshed.config.drift = existing.config.drift.clone();
     }
+    let clear_failed_verification = has_soft_no_fresh_telemetry_problem(existing)
+        || has_soft_smoke_timeout_problem(existing)
+        || has_usage_limited_verification_problem(existing)
+        || (has_pi_route_smoke_failure_problem(existing)
+            && refreshed_pi_status_has_available_routes(refreshed));
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
-        && !has_soft_no_fresh_telemetry_problem(existing)
-        && !has_usage_limited_verification_problem(existing)
-        && !(has_pi_route_smoke_failure_problem(existing)
-            && refreshed_pi_status_has_available_routes(refreshed));
+        && !clear_failed_verification;
     if (preserve_config_drift && has_config_drift_problem(existing)) || preserve_failed_verification
     {
         refreshed.state = existing.state.clone();
@@ -4505,6 +4523,71 @@ mod tests {
     }
 
     #[test]
+    fn available_agent_status_clears_smoke_timeout_verification() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.codex/config.toml".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "smoke_timeout".to_string(),
+                text: "Codex smoke session timed out before telemetry could be sent.".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record smoke timeout verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("failed verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::Failed);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::Codex, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status
+            .command_ledger
+            .iter()
+            .any(|entry| entry.observed_at == attempt_at
+                && entry.status == LocalHealthCommandStatus::Failed
+                && entry.error_code.as_deref() == Some("smoke_timeout")));
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert_eq!(source.authority_at, "2026-05-05T10:40:00Z");
+    }
+
+    #[test]
     fn available_agent_status_clears_stale_quota_verification_problem() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut stale = codex_health();
@@ -4665,6 +4748,17 @@ mod tests {
         assert_eq!(status.sources[0].grade, HealthGrade::Warning);
         assert!(status.sources[0].problems.is_empty());
         assert!(status.sources[0].recommended_actions.is_empty());
+        let command = status
+            .command_ledger
+            .iter()
+            .find(|entry| entry.action_id == "verify_pi")
+            .expect("verify command ledger entry");
+        assert_eq!(command.status, LocalHealthCommandStatus::Succeeded);
+        assert!(command.error_code.is_none());
+        assert!(status
+            .local_health_events
+            .iter()
+            .any(|event| event.event_type == "VerifyPassed"));
         let source = status
             .canonical_health
             .expect("canonical health")
@@ -4710,6 +4804,13 @@ mod tests {
         assert_eq!(status.sources[0].grade, HealthGrade::Warning);
         assert!(status.sources[0].problems.is_empty());
         assert!(status.sources[0].recommended_actions.is_empty());
+        let command = status
+            .command_ledger
+            .iter()
+            .find(|entry| entry.action_id == "verify_claude_code")
+            .expect("verify command ledger entry");
+        assert_eq!(command.status, LocalHealthCommandStatus::Succeeded);
+        assert!(command.error_code.is_none());
 
         let health = status.canonical_health.expect("canonical health");
         let source = health
