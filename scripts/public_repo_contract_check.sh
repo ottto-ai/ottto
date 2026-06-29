@@ -811,14 +811,27 @@ DIAGNOSTICS_ALLOWED_PLACEHOLDERS = {
     "[machine_id]",
     "[path]",
     "[prompt]",
+    "[response]",
+    "[tool_output]",
 }
+
+DIAGNOSTICS_FORBIDDEN_PATH_PATTERNS = (
+    (re.compile(r"(?i)(?:^|\.)(?:raw_prompt|prompt_text)(?:$|\.)"), "raw prompt field"),
+    (re.compile(r"(?i)(?:^|\.)(?:raw_response|response_text|completion_text)(?:$|\.)"), "raw response field"),
+    (re.compile(r"(?i)(?:^|\.)(?:tool_output|command_output|transcript)(?:$|\.)"), "raw output field"),
+    (re.compile(r"(?i)(?:^|\.)(?:cookie|password|api_key|setup_run_token|setup_key|local_control_token|support_claim)(?:$|\.)"), "credential field"),
+)
 
 DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS = (
     (re.compile(r"(?i)(^|[\s:=])Bearer\s+[A-Za-z0-9._~+/=-]{8,}"), "bearer token"),
     (re.compile(r"(?i)(^|[\s:=])x-api-key\s*[:=]\s*[A-Za-z0-9._-]{8,}"), "API key header"),
+    (re.compile(r"(?i)\bpassword\s*[:=]\s*['\"]?[^,'\"\s}]{6,}"), "password"),
+    (re.compile(r"(?i)\bcookie\s*[:=]\s*['\"]?[^,'\"\s}]{6,}"), "cookie"),
     (re.compile(r"\b(?:ghp|github_pat|sk|xox[baprs])[-_A-Za-z0-9]{8,}\b"), "secret token"),
+    (re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"), "JWT token"),
     (re.compile(r"\bclaim_(?!machine\b|claimed\b)[A-Za-z0-9]{6,}\b"), "setup claim"),
     (re.compile(r"\bsupport_[A-Za-z0-9]{6,}\b"), "support claim"),
+    (re.compile(r"\b(?:setup_run_token|setup_key|local_control_token)_[A-Za-z0-9_-]{6,}\b"), "setup/control token"),
     (re.compile(r"\b(?:org|usr|acct)_[A-Za-z0-9]{6,}\b"), "account identifier"),
     (re.compile(r"\b(?:machine|otm|device)_[A-Za-z0-9]{6,}\b"), "machine identifier"),
     (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "UUID identifier"),
@@ -833,6 +846,9 @@ def check_diagnostics_values_are_redacted(value: Any, context: str) -> None:
     for path, raw in iter_json_strings(value, context):
         if raw in DIAGNOSTICS_ALLOWED_PLACEHOLDERS:
             continue
+        for pattern, label in DIAGNOSTICS_FORBIDDEN_PATH_PATTERNS:
+            if pattern.search(path):
+                fail(f"{path} exposes unredacted {label}: {raw!r}")
         for pattern, label in DIAGNOSTICS_FORBIDDEN_VALUE_PATTERNS:
             if pattern.search(raw):
                 fail(f"{path} exposes unredacted {label}: {raw!r}")
