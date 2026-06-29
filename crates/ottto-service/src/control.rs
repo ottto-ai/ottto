@@ -7479,6 +7479,11 @@ fn run_one_pi_route_verification(
 /// recovery is a provider re-sign-in (`ottto fix --app pi` yields the steps).
 const PI_OAUTH_REAUTH_CODE: &str = "pi_oauth_reauth_required";
 
+/// Pi is accepted through local session/route evidence for now. Live telemetry
+/// matching is intentionally not a hard acceptance gate until the Pi live
+/// ingestion path is productized again.
+const PI_LOCAL_ONLY_CODE: &str = "pi_local_only";
+
 /// How far back to look for already-uploaded telemetry when verifying a
 /// subscription-OAuth Pi route passively (we don't run a live smoke, so we treat
 /// recent observed usage as the verification signal).
@@ -7733,13 +7738,18 @@ fn pi_route_result_from_verification(
     verification: SetupRunVerificationResponse,
 ) -> SourceRouteVerificationResult {
     let identity = pi_route_billing_identity_hints(route);
+    let local_only_verified = !verification.verified && smoke.local_session_observed == Some(true);
     let status = if verification.verified {
         SourceVerificationStatus::Verified
+    } else if local_only_verified {
+        SourceVerificationStatus::Warning
     } else {
         SourceVerificationStatus::NoFreshTelemetry
     };
     let code = if verification.verified {
         "verified".to_string()
+    } else if local_only_verified {
+        PI_LOCAL_ONLY_CODE.to_string()
     } else {
         no_fresh_telemetry_code(&SourceKind::Pi, smoke).to_string()
     };
@@ -7747,6 +7757,11 @@ fn pi_route_result_from_verification(
         format!(
             "Saw {} recent Pi telemetry records for {}.",
             verification.records_seen,
+            pi_route_label(route)
+        )
+    } else if local_only_verified {
+        format!(
+            "Pi route {} created a local session. Ottto is treating Pi as local-only; live telemetry is not required for this route.",
             pi_route_label(route)
         )
     } else {
@@ -7771,7 +7786,7 @@ fn pi_route_result_from_verification(
         billing_identity_evidence: identity.billing_identity_evidence,
         billing_identity_confidence: identity.billing_identity_confidence,
         status,
-        verified: verification.verified,
+        verified: verification.verified || local_only_verified,
         records_seen: verification.records_seen,
         last_record_id: verification.last_record_id,
         last_received_at: verification.last_received_at,
@@ -7843,10 +7858,17 @@ fn pi_route_aggregate_result(
     route_results: Vec<SourceRouteVerificationResult>,
 ) -> SourceVerificationResult {
     let total = route_results.len();
-    let passed = route_results.iter().filter(|route| route.verified).count();
-    let smoke_succeeded = route_results
+    let live_passed = route_results
         .iter()
-        .filter(|route| route.command_succeeded)
+        .filter(|route| route.verified && route.status == SourceVerificationStatus::Verified)
+        .count();
+    let local_only_passed = route_results
+        .iter()
+        .filter(|route| {
+            route.verified
+                && route.status == SourceVerificationStatus::Warning
+                && route.error_code.as_deref() == Some(PI_LOCAL_ONLY_CODE)
+        })
         .count();
     // A route awaiting a provider re-sign-in is a soft, actionable Warning — not a
     // hard smoke failure — even though it isn't verified: Ottto deliberately did
@@ -7858,27 +7880,34 @@ fn pi_route_aggregate_result(
             !route.verified && route.error_code.as_deref() == Some(PI_OAUTH_REAUTH_CODE)
         })
         .count();
-    let hard_failed = total.saturating_sub(passed).saturating_sub(reauth_pending);
-    let status = if total > 0 && passed == total {
+    let hard_failed = total
+        .saturating_sub(live_passed)
+        .saturating_sub(local_only_passed)
+        .saturating_sub(reauth_pending);
+    let status = if total > 0 && live_passed == total {
         SourceVerificationStatus::Verified
     } else if total > 0 && hard_failed == 0 {
-        // Everything is verified and/or awaiting re-auth.
+        // Everything is live-verified, local-only verified, and/or awaiting re-auth.
         SourceVerificationStatus::Warning
-    } else if smoke_succeeded > 0 {
-        // At least one route can execute successfully. If backend telemetry has
-        // not matched yet, report a warning instead of the false "no route
-        // passed smoke" repair-level failure.
-        SourceVerificationStatus::Warning
-    } else if passed > 0 || reauth_pending > 0 {
+    } else if live_passed > 0 || local_only_passed > 0 || reauth_pending > 0 {
         SourceVerificationStatus::Warning
     } else {
         SourceVerificationStatus::Failed
     };
-    let all_reauth_pending = passed == 0 && hard_failed == 0 && reauth_pending > 0;
+    let all_reauth_pending =
+        live_passed == 0 && local_only_passed == 0 && hard_failed == 0 && reauth_pending > 0;
+    let all_local_only =
+        live_passed == 0 && local_only_passed > 0 && hard_failed == 0 && reauth_pending == 0;
     let (code, text): (&str, String) = match status {
         SourceVerificationStatus::Verified => {
             ("verified", format!("Verified {total} Pi model routes."))
         }
+        SourceVerificationStatus::Warning if all_local_only => (
+            PI_LOCAL_ONLY_CODE,
+            format!(
+                "Verified {local_only_passed} Pi model route(s) from local session evidence. Pi is local-only; live telemetry is not required."
+            ),
+        ),
         SourceVerificationStatus::Warning if all_reauth_pending => (
             PI_OAUTH_REAUTH_CODE,
             "Re-sign in to the Pi provider, then re-run Verify — Ottto can't re-mint a rotating provider OAuth token."
@@ -7886,13 +7915,9 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Warning => (
             "pi_route_warnings",
-            if passed > 0 {
+            if live_passed > 0 || local_only_passed > 0 {
                 format!(
-                    "Verified {passed} of {total} Pi model routes; review the remaining routes (re-sign in if a provider asks)."
-                )
-            } else if smoke_succeeded > 0 {
-                format!(
-                    "Pi smoke worked for {smoke_succeeded} of {total} model routes, but Ottto has not matched fresh telemetry yet. Retry Verify after sync or review the remaining routes."
+                    "Verified {live_passed} live and {local_only_passed} local-only of {total} Pi model routes; review the remaining routes."
                 )
             } else {
                 format!(
@@ -7913,7 +7938,7 @@ fn pi_route_aggregate_result(
         source: SourceKind::Pi,
         config: empty_source_config(&SourceKind::Pi),
         status,
-        verified: passed > 0,
+        verified: live_passed > 0 || local_only_passed > 0,
         records_seen: route_results.iter().map(|route| route.records_seen).sum(),
         last_record_id: last_route.and_then(|route| route.last_record_id.clone()),
         last_received_at: last_route.and_then(|route| route.last_received_at.clone()),
@@ -11251,7 +11276,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_route_aggregate_warns_when_smoke_succeeds_without_matched_telemetry() {
+    fn pi_route_aggregate_accepts_local_only_session_evidence() {
         let route_results = vec![
             SourceRouteVerificationResult {
                 provider: Some("gcp-glm".to_string()),
@@ -11268,8 +11293,8 @@ mod tests {
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: None,
                 billing_identity_confidence: ottto_protocol::AgentStatusConfidence::Unknown,
-                status: SourceVerificationStatus::NoFreshTelemetry,
-                verified: false,
+                status: SourceVerificationStatus::Warning,
+                verified: true,
                 records_seen: 0,
                 last_record_id: None,
                 last_received_at: None,
@@ -11279,12 +11304,11 @@ mod tests {
                 exit_status: Some(0),
                 duration_ms: 20_000,
                 diagnostic: None,
-                error_code: Some("no_fresh_telemetry".to_string()),
+                error_code: Some(PI_LOCAL_ONLY_CODE.to_string()),
                 local_session_observed: Some(true),
                 message: StableMessage {
-                    code: "no_fresh_telemetry".to_string(),
-                    text: "Pi route completed smoke, but Ottto did not receive matching telemetry."
-                        .to_string(),
+                    code: PI_LOCAL_ONLY_CODE.to_string(),
+                    text: "Pi route created a local session. Pi is local-only.".to_string(),
                 },
             },
             SourceRouteVerificationResult {
@@ -11325,9 +11349,9 @@ mod tests {
         let result = pi_route_aggregate_result(route_results);
 
         assert_eq!(result.status, SourceVerificationStatus::Warning);
-        assert!(!result.verified);
+        assert!(result.verified);
         assert_eq!(result.message.code, "pi_route_warnings");
-        assert!(result.message.text.contains("Pi smoke worked for 1 of 2"));
+        assert!(result.message.text.contains("0 live and 1 local-only"));
         assert!(!result.message.text.contains("No Pi model routes passed"));
     }
 
