@@ -580,6 +580,56 @@ diagnostics_path.write_text(diagnostics, encoding="utf-8")
 
 troubleshooting = troubleshooting_path.read_text(encoding="utf-8")
 troubleshooting = troubleshooting.replace(
+    "Do not parse human summaries. Use JSON status, error codes, and next-action\n"
+    "fields.",
+    "Parse the human summary when it is easier.",
+)
+troubleshooting = troubleshooting.replace(
+    "prefer `agent_action.kind` as the stable\nmachine branch",
+    "infer setup state from summary text",
+)
+troubleshooting = troubleshooting.replace(
+    "`60` | Browser/user action needed | Open or share the claim URL/code.",
+    "`60` | Browser/user action needed | Try terminal repair.",
+)
+troubleshooting = troubleshooting.replace(
+    "`61` | Setup timed out | Rerun setup or use headless setup with claim URL/code.",
+    "`61` | Setup timed out | Clear local state.",
+)
+troubleshooting = troubleshooting.replace(
+    "Plain verify is read-only. `verify --repair` repairs only daemon-owned\n"
+    "WriteConfig config drift",
+    "Verify may rewrite any local config",
+)
+troubleshooting = troubleshooting.replace(
+    "runs telemetry smoke only after\nthe config is clean",
+    "runs telemetry smoke before config checks",
+)
+troubleshooting = troubleshooting.replace(
+    "If repair JSON requires browser approval, or if verify\n"
+    "returns `patch_disabled`, do not edit config files directly.",
+    "Edit config files directly when repair is blocked.",
+)
+troubleshooting = troubleshooting.replace(
+    "binds a deterministic per-user fallback port and reports the active endpoint in\n"
+    "`ottto status --json`",
+    "binds any open port and logs it in human output",
+)
+troubleshooting = troubleshooting.replace(
+    "Do not kill another user's process unless you own that test\n"
+    "account and have confirmed it is not the active customer install.",
+    "Kill stale services when they block the relay port.",
+)
+troubleshooting = troubleshooting.replace(
+    "Use cloud-first logout:",
+    "Start with local-only logout:",
+)
+troubleshooting = troubleshooting.replace(
+    "Use local-only cleanup only after the user accepts that cloud disconnect did not\n"
+    "complete.",
+    "Use local-only cleanup whenever logout is slow.",
+)
+troubleshooting = troubleshooting.replace(
     "Upload only with explicit approval, retention disclosure acceptance, and an\n"
     "active login or support claim.",
     "Upload when support asks.",
@@ -610,6 +660,28 @@ grep -q "diagnostics docs must keep support claims out of payloads and bundles" 
 grep -q "diagnostics docs must require machine-id placeholders" \
   /tmp/public-contract-broken-diagnostics-docs.out
 grep -q "diagnostics docs must prohibit sharing raw private diagnostics values" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit parsing human summaries" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve setup agent_action branch guidance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve browser/user-action exit code" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve setup-timeout exit code" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep verify repair daemon-owned and narrow" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep telemetry smoke after clean config" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit direct config edits on browser approval or patch_disabled" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve relay fallback endpoint contract" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must prohibit killing another user's active service" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must preserve cloud-first logout guidance" \
+  /tmp/public-contract-broken-diagnostics-docs.out
+grep -q "troubleshooting docs must keep local-only logout user-accepted" \
   /tmp/public-contract-broken-diagnostics-docs.out
 grep -q "troubleshooting docs must require approval, retention acceptance, and authorization before upload" \
   /tmp/public-contract-broken-diagnostics-docs.out
