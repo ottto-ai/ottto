@@ -2302,6 +2302,19 @@ mod tests {
     }
 
     #[test]
+    fn watch_without_json_error_matches_baseline_fixture() {
+        let cli = Cli::parse_from(["ottto", "status", "--watch"]);
+        let error = output_mode(command_json(&cli.command), cli.watch).expect_err("watch invalid");
+        let actual =
+            serde_json::to_value(&CliErrorResponse { error }).expect("error response serializes");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/cli/watch-without-json-error.json"
+        ))
+        .expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn context_requires_json_mode() {
         let cli = Cli::parse_from(["ottto", "context"]);
         let error = validate_cli(&cli).expect_err("context requires json");
