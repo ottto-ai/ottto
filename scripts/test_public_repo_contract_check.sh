@@ -175,6 +175,28 @@ grep -q "watch without JSON error must not be retryable" \
 grep -q "watch without JSON error details must stay empty" \
   /tmp/public-contract-broken-watch-without-json.out
 
+broken_collector_safety_schema="$tmp_dir/broken-collector-safety-schema"
+cp -R "$output_dir" "$broken_collector_safety_schema"
+python3 - "$broken_collector_safety_schema/schemas/collector-manifest.schema.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["properties"]["uploads_raw_content"] = {"type": "boolean"}
+payload.pop("allOf", None)
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_collector_safety_schema" >/tmp/public-contract-broken-collector-safety-schema.out 2>&1; then
+  echo "Expected contract check to fail when collector safety schema loosens" >&2
+  exit 1
+fi
+grep -q "collector manifest schema must reject raw content upload" \
+  /tmp/public-contract-broken-collector-safety-schema.out
+grep -q "collector manifest schema safety rules must be a JSON array" \
+  /tmp/public-contract-broken-collector-safety-schema.out
+
 broken_agent_only_json="$tmp_dir/broken-agent-only-json"
 cp -R "$output_dir" "$broken_agent_only_json"
 python3 - "$broken_agent_only_json/fixtures/cli/context-without-json-error.json" <<'PY'

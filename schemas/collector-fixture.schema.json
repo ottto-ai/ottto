@@ -71,7 +71,7 @@
       ],
       "properties": {
         "uploads_raw_content": {
-          "type": "boolean"
+          "const": false
         },
         "boundary": {
           "type": "string",

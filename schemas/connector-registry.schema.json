@@ -116,7 +116,7 @@
           "$ref": "#/$defs/maturity"
         },
         "uploads_raw_content": {
-          "type": "boolean"
+          "const": false
         },
         "risk_classes": {
           "type": "array",
@@ -137,7 +137,117 @@
           "type": "string",
           "pattern": "^connectors/sources/.+/collectors/.+/collector\\.toml$"
         }
-      }
+      },
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "risk_classes": {
+                "contains": {
+                  "const": "hidden_credential_read"
+                }
+              }
+            },
+            "required": [
+              "default_state",
+              "risk_classes"
+            ]
+          }
+        },
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "risk_classes": {
+                "contains": {
+                  "const": "raw_prompt_or_output"
+                }
+              }
+            },
+            "required": [
+              "default_state",
+              "risk_classes"
+            ]
+          }
+        },
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "risk_classes": {
+                "contains": {
+                  "const": "network_calls"
+                }
+              }
+            },
+            "required": [
+              "default_state",
+              "risk_classes"
+            ]
+          }
+        },
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "data_source_kind": {
+                "const": "live_telemetry"
+              }
+            },
+            "required": [
+              "default_state",
+              "data_source_kind"
+            ]
+          }
+        },
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "maturity": {
+                "const": "writes_config"
+              }
+            },
+            "required": [
+              "default_state",
+              "maturity"
+            ]
+          }
+        },
+        {
+          "not": {
+            "properties": {
+              "default_state": {
+                "const": "enabled"
+              },
+              "maturity": {
+                "const": "undocumented_surface"
+              },
+              "risk_classes": {
+                "contains": {
+                  "const": "auth_adjacent"
+                }
+              }
+            },
+            "required": [
+              "default_state",
+              "maturity",
+              "risk_classes"
+            ]
+          }
+        }
+      ]
     },
     "operations": {
       "type": "array",
