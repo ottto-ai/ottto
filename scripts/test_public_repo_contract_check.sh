@@ -175,6 +175,31 @@ grep -q "watch without JSON error must not be retryable" \
 grep -q "watch without JSON error details must stay empty" \
   /tmp/public-contract-broken-watch-without-json.out
 
+broken_agent_only_json="$tmp_dir/broken-agent-only-json"
+cp -R "$output_dir" "$broken_agent_only_json"
+python3 - "$broken_agent_only_json/fixtures/cli/context-without-json-error.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["error"]["message"] = "context requires json"
+payload["error"]["retryable"] = True
+payload["error"]["details"] = {"command": "context"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_agent_only_json" >/tmp/public-contract-broken-agent-only-json.out 2>&1; then
+  echo "Expected contract check to fail when agent-only JSON error semantics drift" >&2
+  exit 1
+fi
+grep -q "context-without-json-error.json error message must match agent JSON contract" \
+  /tmp/public-contract-broken-agent-only-json.out
+grep -q "context-without-json-error.json error must not be retryable" \
+  /tmp/public-contract-broken-agent-only-json.out
+grep -q "context-without-json-error.json error details must stay empty" \
+  /tmp/public-contract-broken-agent-only-json.out
+
 broken_uninstall="$tmp_dir/broken-uninstall"
 cp -R "$output_dir" "$broken_uninstall"
 python3 - "$broken_uninstall/fixtures/cli/uninstall-request.json" <<'PY'

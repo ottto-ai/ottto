@@ -2314,6 +2314,38 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    fn assert_agent_json_error_fixture(cli: Cli, fixture: &str) {
+        let error = validate_cli(&cli).expect_err("agent-only command requires json");
+        let actual =
+            serde_json::to_value(&CliErrorResponse { error }).expect("error response serializes");
+        let expected: serde_json::Value = serde_json::from_str(fixture).expect("fixture parses");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn agent_only_json_errors_match_baseline_fixtures() {
+        assert_agent_json_error_fixture(
+            Cli::parse_from(["ottto", "context"]),
+            include_str!("../../../fixtures/cli/context-without-json-error.json"),
+        );
+        assert_agent_json_error_fixture(
+            Cli::parse_from(["ottto", "costs"]),
+            include_str!("../../../fixtures/cli/costs-without-json-error.json"),
+        );
+        assert_agent_json_error_fixture(
+            Cli::parse_from(["ottto", "sessions"]),
+            include_str!("../../../fixtures/cli/sessions-without-json-error.json"),
+        );
+        assert_agent_json_error_fixture(
+            Cli::parse_from(["ottto", "recommendations"]),
+            include_str!("../../../fixtures/cli/recommendations-without-json-error.json"),
+        );
+        assert_agent_json_error_fixture(
+            Cli::parse_from(["ottto", "provider-impact"]),
+            include_str!("../../../fixtures/cli/provider-impact-without-json-error.json"),
+        );
+    }
+
     #[test]
     fn context_requires_json_mode() {
         let cli = Cli::parse_from(["ottto", "context"]);
