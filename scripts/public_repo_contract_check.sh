@@ -869,6 +869,83 @@ def check_schema_contracts() -> None:
             version = require_dict(properties.get("schema_version"), f"{path} schema_version")
             expect(version.get("const") == schema_version, f"{path} must pin {schema_version}")
 
+    collector_schema = require_dict(load_json("schemas/collector-manifest.schema.json"), "collector manifest schema")
+    collector_properties = require_dict(
+        collector_schema.get("properties"), "collector manifest schema properties"
+    )
+    collector_uploads = require_dict(
+        collector_properties.get("uploads_raw_content"),
+        "collector manifest uploads_raw_content schema",
+    )
+    expect(
+        collector_uploads.get("const") is False,
+        "collector manifest schema must reject raw content upload",
+    )
+    collector_rules = json.dumps(
+        require_list(collector_schema.get("allOf"), "collector manifest schema safety rules"),
+        sort_keys=True,
+    )
+    for expected in (
+        "hidden_credential_read",
+        "raw_prompt_or_output",
+        "network_calls",
+        "live_telemetry",
+        "writes_config",
+        "undocumented_surface",
+        "auth_adjacent",
+    ):
+        expect(
+            expected in collector_rules,
+            f"collector manifest schema must guard {expected} from default-enabled collection",
+        )
+
+    registry_schema = require_dict(load_json("schemas/connector-registry.schema.json"), "connector registry schema")
+    registry_defs = require_dict(registry_schema.get("$defs"), "connector registry schema definitions")
+    registry_collector = require_dict(registry_defs.get("collector"), "connector registry collector schema")
+    registry_collector_properties = require_dict(
+        registry_collector.get("properties"), "connector registry collector properties"
+    )
+    registry_uploads = require_dict(
+        registry_collector_properties.get("uploads_raw_content"),
+        "connector registry uploads_raw_content schema",
+    )
+    expect(
+        registry_uploads.get("const") is False,
+        "connector registry schema must reject raw content upload",
+    )
+    registry_rules = json.dumps(
+        require_list(registry_collector.get("allOf"), "connector registry collector safety rules"),
+        sort_keys=True,
+    )
+    for expected in (
+        "hidden_credential_read",
+        "raw_prompt_or_output",
+        "network_calls",
+        "live_telemetry",
+        "writes_config",
+        "undocumented_surface",
+        "auth_adjacent",
+    ):
+        expect(
+            expected in registry_rules,
+            f"connector registry schema must guard {expected} from default-enabled collection",
+        )
+
+    fixture_schema = require_dict(load_json("schemas/collector-fixture.schema.json"), "collector fixture schema")
+    fixture_defs = require_dict(fixture_schema.get("$defs"), "collector fixture schema definitions")
+    upload_policy = require_dict(fixture_defs.get("upload_policy"), "collector fixture upload policy schema")
+    upload_policy_properties = require_dict(
+        upload_policy.get("properties"), "collector fixture upload policy properties"
+    )
+    fixture_uploads = require_dict(
+        upload_policy_properties.get("uploads_raw_content"),
+        "collector fixture uploads_raw_content schema",
+    )
+    expect(
+        fixture_uploads.get("const") is False,
+        "collector fixture schema must reject raw content upload",
+    )
+
     release_schema = require_dict(
         load_json("release/manifest.schema.json"), "release manifest schema"
     )
