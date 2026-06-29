@@ -243,7 +243,7 @@
       "display_name": "Pi",
       "publisher": "ottto",
       "review_tier": "official",
-      "maturity": "beta",
+      "maturity": "local_only",
       "operations": [
         "detect",
         "verify",
@@ -283,9 +283,9 @@
             "diagnostics"
           ],
           "data_source_kind": "live_telemetry",
-          "default_state": "requires_setup",
+          "default_state": "disabled",
           "review_tier": "official",
-          "maturity": "beta",
+          "maturity": "experimental",
           "risk_classes": [
             "network_calls"
           ],

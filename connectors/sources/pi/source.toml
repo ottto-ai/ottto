@@ -4,7 +4,7 @@ app_slug = "pi"
 display_name = "Pi"
 publisher = "ottto"
 review_tier = "official"
-maturity = "beta"
+maturity = "local_only"
 
 operations = [
   "detect",

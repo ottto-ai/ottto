@@ -5,7 +5,7 @@ Review tier: `official`
 ## Default Posture
 
 - `local_sessions` defaults on for official pilot installs because it uploads aggregate usage and metadata only.
-- `live_batches` requires an authenticated Pi/Ottto live path and keeps normalized assistant-message usage bounded to the existing ingestion contract.
+- `live_batches` is disabled by default. It remains documented as a future live path, but Pi acceptance must use local session and route evidence until live ingestion is explicitly re-enabled.
 - `route_status` defaults on when local non-secret route metadata is available.
 - `identity_probe` defaults on as a parity stub: it runs no subprocess, reads no files, and never accesses Keychain. It emits `not_applicable` heartbeats so the resolver can distinguish intentional absence from collector failure.
 
@@ -26,6 +26,7 @@ Review tier: `official`
 
 - Local Pi session reads stay on the user's machine until transformed into aggregate usage, source-plan, or collector-health records.
 - Local route observations must omit provider credentials and raw endpoint secrets.
+- A Pi smoke that creates a local session is sufficient for local-only source acceptance. Missing fresh live telemetry must be reported as `pi_local_only`, not as a repair-required telemetry failure.
 
 ## Upload Boundaries
 

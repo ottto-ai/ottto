@@ -301,10 +301,12 @@ fn assert_safe_default_posture(collector: &LoadedCollector) {
             .iter()
             .any(|risk| risk == "network_calls")
     {
-        assert_eq!(
-            collector.manifest.default_state,
-            "requires_setup",
-            "{} live/config/network collectors must require setup",
+        assert!(
+            matches!(
+                collector.manifest.default_state.as_str(),
+                "requires_setup" | "disabled"
+            ),
+            "{} live/config/network collectors must require setup or be disabled",
             collector.manifest_path.display()
         );
     }

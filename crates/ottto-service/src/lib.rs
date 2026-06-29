@@ -2559,6 +2559,7 @@ fn source_health_from_verification(
             .any(|drift| drift.key.ends_with("config_file"));
     let patch_disabled = result.message.code == "patch_disabled";
     let usage_limited = verification_result_is_usage_limited(result);
+    let pi_local_only = result.source == SourceKind::Pi && result.message.code == "pi_local_only";
     let (source_state, grade, problems) = if config_has_drift {
         (
             SourceState::NeedsRepair,
@@ -2584,10 +2585,10 @@ fn source_health_from_verification(
                 retryable: true,
             }],
         )
-    } else if patch_disabled || usage_limited {
+    } else if patch_disabled || usage_limited || pi_local_only {
         (
             SourceState::Healthy,
-            if usage_limited {
+            if usage_limited || pi_local_only {
                 HealthGrade::Warning
             } else {
                 HealthGrade::Ok
@@ -3349,7 +3350,7 @@ mod tests {
             assert!(descriptor_operation.supported);
             assert_eq!(descriptor_operation.state, SourceOperationState::Available);
         }
-        assert_eq!(descriptor.maturity, ConnectorMaturity::Beta);
+        assert_eq!(descriptor.maturity, ConnectorMaturity::LocalOnly);
     }
 
     #[test]
@@ -4551,6 +4552,52 @@ mod tests {
             source.blocking_reason.as_deref(),
             Some("telemetry_not_verified")
         );
+    }
+
+    #[test]
+    fn pi_local_only_verification_projects_non_blocking_health() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: true,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_local_only".to_string(),
+                text: "Verified Pi from local session evidence. Live telemetry is not required."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record local-only verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status.sources[0].recommended_actions.is_empty());
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Verify);
+        assert!(source.blocking_reason.is_none());
     }
 
     #[test]
