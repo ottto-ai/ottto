@@ -546,6 +546,85 @@ def check_examples_docs_contracts() -> None:
         expect(needle in text, message)
 
 
+def check_privacy_docs_contracts() -> None:
+    privacy_docs = require_file("docs/privacy.md")
+    if privacy_docs is None:
+        return
+
+    text = privacy_docs.read_text(encoding="utf-8")
+    expectations = [
+        (
+            "local state and secret material on the Mac unless a user-approved setup or\n"
+            "diagnostics flow sends a redacted payload",
+            "privacy docs must preserve local-first redacted-upload boundary",
+        ),
+        ("`ottto-service` owns:", "privacy docs must name ottto-service as local owner"),
+        ("local control token storage", "privacy docs must keep control token storage daemon-owned"),
+        ("diagnostics redaction", "privacy docs must keep diagnostics redaction daemon-owned"),
+        (
+            "Agents, the CLI, the macOS app, and the web app are clients",
+            "privacy docs must keep agents and apps as clients",
+        ),
+        (
+            "should not\nduplicate local setup or repair logic",
+            "privacy docs must prohibit duplicate setup/repair logic",
+        ),
+        (
+            "must not upload raw prompts, raw responses, tool output,\n"
+            "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
+            "absolute local paths, or raw provider account ids",
+            "privacy docs must prohibit uploading raw private local data",
+        ),
+        ("derived and redacted fields", "privacy docs must require derived/redacted snapshot fields"),
+        ("hashed workspace identity", "privacy docs must preserve hashed workspace identity wording"),
+        ("display-safe account or plan evidence", "privacy docs must preserve display-safe account evidence"),
+        ("Live telemetry is source-level opt-in", "privacy docs must keep live telemetry source-level opt-in"),
+        (
+            "Opt-out must remove fenced\nlocal config or Keychain state before backend setup-key revocation completes",
+            "privacy docs must preserve opt-out local cleanup ordering",
+        ),
+        ("`ottto fix --json` returns repair authority metadata", "privacy docs must preserve fix authority metadata"),
+        (
+            "Terminal repair is allowed\nonly for setup-safe actions tied to an active setup-run binding",
+            "privacy docs must keep terminal repair setup-run bound",
+        ),
+        (
+            "Credential,\nauth-adjacent, stale-account, or disconnected cases require browser approval",
+            "privacy docs must require browser approval for auth-adjacent repair",
+        ),
+        ("`ottto verify --repair --json` is narrower", "privacy docs must keep verify repair narrower than fix"),
+        (
+            "can repair only Codex or Claude\nCode WriteConfig drift",
+            "privacy docs must bound verify repair to Codex/Claude WriteConfig drift",
+        ),
+        (
+            "`OTTTO_PATCH_CODEX_DISABLED` and\n"
+            "`OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return\n"
+            "`patch_disabled`",
+            "privacy docs must preserve patch-disabled repair block",
+        ),
+        (
+            "Uploads require explicit\napproval, retention disclosure acceptance, and either an active login or a\nsupport claim",
+            "privacy docs must require diagnostics upload approval, retention, and authorization",
+        ),
+        (
+            "Redaction covers local paths, secret tokens, account identifiers,\n"
+            "machine identifiers, raw prompts, and command output before display or upload",
+            "privacy docs must list diagnostics redaction categories before display/upload",
+        ),
+        (
+            "Do not paste full\ndiagnostics payloads or raw JSON containing local identifiers",
+            "privacy docs must prohibit pasting full diagnostics payloads",
+        ),
+        (
+            "reviewed for redaction",
+            "privacy docs must require redaction review before sharing diagnostics JSON",
+        ),
+    ]
+    for needle, message in expectations:
+        expect(needle in text, message)
+
+
 def check_setup_output_shape(payload: dict[str, Any], context: str) -> list[dict[str, Any]]:
     source_count = payload.get("source_count")
     detected_sources = require_list(payload.get("detected_sources"), f"{context} detected_sources")
@@ -2137,6 +2216,7 @@ check_setup_and_redaction_contracts()
 check_local_health_diagnostics_contract()
 check_docs_index_contracts()
 check_examples_docs_contracts()
+check_privacy_docs_contracts()
 check_connector_docs_contracts()
 check_agent_adapter_contracts()
 check_diagnostics_docs_contracts()

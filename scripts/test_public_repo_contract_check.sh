@@ -1086,6 +1086,77 @@ grep -q "examples docs must preserve diagnostics upload approval boundary" \
 grep -q "examples docs must include update check JSON command" \
   /tmp/public-contract-broken-examples-docs.out
 
+broken_privacy_docs="$tmp_dir/broken-privacy-docs"
+cp -R "$output_dir" "$broken_privacy_docs"
+python3 - "$broken_privacy_docs/docs/privacy.md" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacements = {
+    "local state and secret material on the Mac unless a user-approved setup or\n"
+    "diagnostics flow sends a redacted payload": "local state may be uploaded when useful for support",
+    "`ottto-service` owns:": "Agents may own:",
+    "local control token storage": "local control token inspection",
+    "diagnostics redaction": "diagnostics collection",
+    "Agents, the CLI, the macOS app, and the web app are clients": "Agents, the CLI, the macOS app, and the web app may each own setup",
+    "should not\nduplicate local setup or repair logic": "may duplicate local setup and repair logic",
+    "must not upload raw prompts, raw responses, tool output,\n"
+    "command output, browser cookies, OAuth credentials, API keys, passwords,\n"
+    "absolute local paths, or raw provider account ids": "may upload raw local content when support needs details",
+    "derived and redacted fields": "raw fields",
+    "hashed workspace identity": "workspace path",
+    "display-safe account or plan evidence": "raw account evidence",
+    "Live telemetry is source-level opt-in": "Live telemetry is enabled by default",
+    "Opt-out must remove fenced\nlocal config or Keychain state before backend setup-key revocation completes": "Opt-out can revoke backend setup keys before local cleanup",
+    "`ottto fix --json` returns repair authority metadata": "`ottto fix --json` returns repair text",
+    "Terminal repair is allowed\nonly for setup-safe actions tied to an active setup-run binding": "Terminal repair may run whenever setup is stuck",
+    "Credential,\nauth-adjacent, stale-account, or disconnected cases require browser approval": "Credential and auth-adjacent cases may use terminal repair",
+    "`ottto verify --repair --json` is narrower": "`ottto verify --repair --json` can repair broadly",
+    "can repair only Codex or Claude\nCode WriteConfig drift": "can repair any app config",
+    "`OTTTO_PATCH_CODEX_DISABLED` and\n"
+    "`OTTTO_PATCH_CLAUDE_CODE_DISABLED` block repair writes and return\n"
+    "`patch_disabled`": "patch-disable flags may be ignored during repair",
+    "Uploads require explicit\napproval, retention disclosure acceptance, and either an active login or a\nsupport claim": "Uploads can happen when support asks",
+    "Redaction covers local paths, secret tokens, account identifiers,\n"
+    "machine identifiers, raw prompts, and command output before display or upload": "Redaction is best-effort after upload",
+    "Do not paste full\ndiagnostics payloads or raw JSON containing local identifiers": "Paste full diagnostics payloads into support channels",
+    "reviewed for redaction": "reviewed for relevance",
+}
+for old, new in replacements.items():
+    text = text.replace(old, new)
+path.write_text(text, encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_privacy_docs" >/tmp/public-contract-broken-privacy-docs.out 2>&1; then
+  echo "Expected contract check to fail when privacy docs lose local ownership and redaction boundaries" >&2
+  exit 1
+fi
+grep -q "privacy docs must preserve local-first redacted-upload boundary" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must name ottto-service as local owner" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit duplicate setup/repair logic" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit uploading raw private local data" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep live telemetry source-level opt-in" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must preserve opt-out local cleanup ordering" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must keep terminal repair setup-run bound" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must require browser approval for auth-adjacent repair" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must bound verify repair to Codex/Claude WriteConfig drift" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must require diagnostics upload approval, retention, and authorization" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must list diagnostics redaction categories before display/upload" \
+  /tmp/public-contract-broken-privacy-docs.out
+grep -q "privacy docs must prohibit pasting full diagnostics payloads" \
+  /tmp/public-contract-broken-privacy-docs.out
+
 broken_connector_docs="$tmp_dir/broken-connector-docs"
 cp -R "$output_dir" "$broken_connector_docs"
 python3 - \
