@@ -1017,6 +1017,35 @@ def check_cli_contracts() -> None:
     expect(error.get("code") == "daemon_unavailable", "daemon error code must be daemon_unavailable")
     expect(error.get("retryable") is True, "daemon error must be retryable")
 
+    watch_without_json_output = require_dict(
+        load_json("fixtures/cli/watch-without-json-error.json"),
+        "CLI watch without JSON error",
+    )
+    watch_without_json_error = require_dict(
+        watch_without_json_output.get("error"),
+        "CLI watch without JSON error payload",
+    )
+    expect(
+        watch_without_json_error.get("code") == "invalid_request",
+        "watch without JSON error code must be invalid_request",
+    )
+    expect(
+        watch_without_json_error.get("message") == "--watch requires --json",
+        "watch without JSON error message must explain --json requirement",
+    )
+    expect(
+        watch_without_json_error.get("retryable") is False,
+        "watch without JSON error must not be retryable",
+    )
+    expect(
+        require_dict(
+            watch_without_json_error.get("details"),
+            "CLI watch without JSON error details",
+        )
+        == {},
+        "watch without JSON error details must stay empty",
+    )
+
     setup_claim = require_dict(load_json("fixtures/cli/setup-claim-request.json"), "CLI setup claim request")
     expect_protocol(setup_claim.get("protocol_version"), "CLI setup claim request")
     expect(setup_claim.get("client_kind") == "cli", "CLI setup claim request client_kind must be cli")

@@ -150,6 +150,31 @@ if "$CONTRACT_SCRIPT" --staged-output "$broken_protocol" >/tmp/public-contract-b
 fi
 grep -q "control status request protocol_version must be 15" /tmp/public-contract-broken-protocol.out
 
+broken_watch_without_json="$tmp_dir/broken-watch-without-json"
+cp -R "$output_dir" "$broken_watch_without_json"
+python3 - "$broken_watch_without_json/fixtures/cli/watch-without-json-error.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["error"]["code"] = "daemon_unavailable"
+payload["error"]["retryable"] = True
+payload["error"]["details"] = {"socket": "/tmp/ottto.sock"}
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_watch_without_json" >/tmp/public-contract-broken-watch-without-json.out 2>&1; then
+  echo "Expected contract check to fail when watch-without-json error semantics drift" >&2
+  exit 1
+fi
+grep -q "watch without JSON error code must be invalid_request" \
+  /tmp/public-contract-broken-watch-without-json.out
+grep -q "watch without JSON error must not be retryable" \
+  /tmp/public-contract-broken-watch-without-json.out
+grep -q "watch without JSON error details must stay empty" \
+  /tmp/public-contract-broken-watch-without-json.out
+
 broken_uninstall="$tmp_dir/broken-uninstall"
 cp -R "$output_dir" "$broken_uninstall"
 python3 - "$broken_uninstall/fixtures/cli/uninstall-request.json" <<'PY'
