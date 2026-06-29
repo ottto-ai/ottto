@@ -3915,6 +3915,62 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_incomplete_ndjson_matches_baseline_fixture() {
+        let report = ottto_protocol::UninstallExecutionResult {
+            status: "incomplete".to_string(),
+            plan: ottto_protocol::UninstallPlan {
+                plan_id: "uninstall_local_platform".to_string(),
+                service_label: "com.ottto.locald".to_string(),
+                launchd_target: "gui/501/com.ottto.locald".to_string(),
+                actions: vec![ottto_protocol::UninstallAction {
+                    action: "remove".to_string(),
+                    target: "/tmp/ottto-home/Library/Application Support/Ottto/account.json"
+                        .to_string(),
+                    kind: "file".to_string(),
+                    requires_confirmation: true,
+                    destructive: true,
+                }],
+                warnings: Vec::new(),
+                requires_confirmation: true,
+                cloud_credentials_untouched: true,
+            },
+            credential_status: "untouched".to_string(),
+            removed_paths: Vec::new(),
+            missing_paths: Vec::new(),
+            warnings: Vec::new(),
+            failed_operations: vec![
+                "remove /tmp/ottto-home/Library/Application Support/Ottto/account.json".to_string(),
+                "unload gui/501/com.ottto.locald".to_string(),
+            ],
+            cloud_credentials_untouched: true,
+        };
+        let request_id = "req_cli_uninstall_incomplete_fixture";
+        let output = format!(
+            "{}\n{}\n",
+            compact_json(&progress_event(request_id, "uninstall")),
+            compact_json(&final_error_event(
+                request_id,
+                CliErrorCode::Internal.exit_code(),
+                uninstall_incomplete_error(&report),
+            )),
+        );
+
+        let actual = parse_ndjson_output(&output);
+        let expected = parse_ndjson_output(include_str!(
+            "../../../fixtures/cli/uninstall-incomplete-output.ndjson"
+        ));
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual[1].get("ok").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            actual[1].get("exit_code").and_then(|value| value.as_i64()),
+            Some(i64::from(CliErrorCode::Internal.exit_code()))
+        );
+    }
+
+    #[test]
     fn is_safe_external_url_accepts_trusted_targets() {
         assert!(is_safe_external_url("https://ottto.net/x"));
         assert!(is_safe_external_url("http://localhost:8765/x"));

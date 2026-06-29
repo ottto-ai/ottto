@@ -172,6 +172,34 @@ grep -q "CLI uninstall request command must be uninstall_execute" \
 grep -q "CLI uninstall request confirm must be true" \
   /tmp/public-contract-broken-uninstall.out
 
+broken_uninstall_output="$tmp_dir/broken-uninstall-output"
+cp -R "$output_dir" "$broken_uninstall_output"
+python3 - "$broken_uninstall_output/fixtures/cli/uninstall-incomplete-output.ndjson" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+events[-1]["ok"] = True
+events[-1]["exit_code"] = 0
+events[-1]["error"]["code"] = "none"
+path.write_text(
+    "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n",
+    encoding="utf-8",
+)
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_uninstall_output" >/tmp/public-contract-broken-uninstall-output.out 2>&1; then
+  echo "Expected contract check to fail when uninstall incomplete output stops being an error" >&2
+  exit 1
+fi
+grep -q "uninstall incomplete final event must not be ok" \
+  /tmp/public-contract-broken-uninstall-output.out
+grep -q "uninstall incomplete final exit_code must be 70" \
+  /tmp/public-contract-broken-uninstall-output.out
+grep -q "uninstall incomplete error code must be internal" \
+  /tmp/public-contract-broken-uninstall-output.out
+
 broken_fix="$tmp_dir/broken-fix"
 cp -R "$output_dir" "$broken_fix"
 python3 - "$broken_fix/fixtures/cli/fix-codex-request.json" <<'PY'
