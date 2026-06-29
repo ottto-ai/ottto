@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 225,
-  "content_sha256": "64c1aad61ecc6726991511fd7a99ef5d326d3f5a0b668066b97db7f6e5387620",
+  "content_sha256": "9053b765cc6a29ac3b77aa6fb30810f0a237f61abb05256288051ab9cf257f1c",
   "files": [
     {
       "executable": false,
@@ -41,7 +41,7 @@
       "executable": false,
       "mode": "0644",
       "path": "Cargo.lock",
-      "sha256": "07b71df0375d9c322688a811576e8cd0156da7bf491e49a17244a6e71878d2c6",
+      "sha256": "7f03a879580f7f7ec3b59bfc251527d98995bd2491b2e46b923d60bc522ecd30",
       "size_bytes": 41628
     },
     {
@@ -601,8 +601,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8a8215dc69b045ceb61d10f9f5c71eb9ba953b3b400ce18be8c9c3b376e6cdd1",
-      "size_bytes": 146153
+      "sha256": "69a2bbdc85c9453b6f104ab33ea00d05632c8840c219dcf01172bbbb6c8da89c",
+      "size_bytes": 154451
     },
     {
       "executable": false,
@@ -1578,7 +1578,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-06-29T13:38:50+00:00",
+  "generated_at": "2026-06-29T16:52:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 226,
   "public_roots": [
@@ -1613,5 +1613,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2cf2fc3caf564e71bae4bb663dc627eec52fc53b"
+  "source_commit": "d23ef8ec12b6f1f919c3cb8422be42b1852e4222"
 }

@@ -30,6 +30,9 @@ const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
+const CLAUDE_OAUTH_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const CLAUDE_OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -344,28 +347,56 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     });
     let mut quota_capability = unsupported_capability(
         "quota_windows",
-        "Claude Code rate-limit windows have not been observed from statusLine yet.",
+        "Claude Code rate-limit windows have not been observed from local OAuth usage or statusLine yet.",
     );
-    match collect_claude_statusline_quota_windows() {
+    match collect_claude_oauth_quota_windows(&version) {
         Ok(windows) if !windows.is_empty() => {
-            snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+            snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = windows;
             quota_capability = supported_capability(
                 "quota_windows",
-                "Collected from Claude Code's local statusLine rate_limits payload.",
+                "Collected from Claude Code's local OAuth usage endpoint.",
             );
         }
-        Ok(_) => {
-            snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-        }
-        Err(message) => {
-            snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                "claude_statusline_cache_unavailable",
-                AgentDiagnosticSeverity::Warning,
-                message,
-            ));
-        }
+        Ok(_) => match collect_claude_statusline_quota_windows() {
+            Ok(windows) if !windows.is_empty() => {
+                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                snapshot.quota_windows = windows;
+                quota_capability = supported_capability(
+                    "quota_windows",
+                    "Collected from Claude Code's local statusLine rate_limits payload.",
+                );
+            }
+            Ok(_) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+            }
+            Err(message) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    "claude_statusline_cache_unavailable",
+                    AgentDiagnosticSeverity::Warning,
+                    message,
+                ));
+            }
+        },
+        Err(message) => match collect_claude_statusline_quota_windows() {
+            Ok(windows) if !windows.is_empty() => {
+                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                snapshot.quota_windows = windows;
+                quota_capability = supported_capability(
+                    "quota_windows",
+                    "Collected from Claude Code's local statusLine rate_limits payload.",
+                );
+            }
+            Ok(_) | Err(_) => {
+                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    "claude_oauth_usage_unavailable",
+                    AgentDiagnosticSeverity::Warning,
+                    message,
+                ));
+            }
+        },
     }
     snapshot.context = Some(AgentContextStatus {
         status: AgentContextState::Unsupported,
@@ -412,6 +443,142 @@ fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, St
     }
 
     Ok(claude_statusline_quota_windows_from_cache(cache, now))
+}
+
+fn collect_claude_oauth_quota_windows(
+    version: &CommandOutput,
+) -> Result<Vec<AgentQuotaWindow>, String> {
+    let token = read_claude_oauth_access_token()
+        .ok_or_else(|| "Claude OAuth credentials were not available locally.".to_string())?;
+    let authorization = format!("Bearer {token}");
+    let user_agent = claude_code_user_agent(version);
+    let value: Value = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/json")
+        .set("Authorization", &authorization)
+        .set("anthropic-beta", CLAUDE_OAUTH_BETA_HEADER)
+        .set("User-Agent", &user_agent)
+        .timeout(COMMAND_TIMEOUT)
+        .call()
+        .map_err(claude_oauth_usage_error)?
+        .into_json()
+        .map_err(|_| "Claude OAuth usage endpoint returned an unreadable response.".to_string())?;
+    Ok(claude_oauth_quota_windows(&value))
+}
+
+fn read_claude_oauth_access_token() -> Option<String> {
+    read_claude_oauth_access_token_from_keychain()
+        .or_else(read_claude_oauth_access_token_from_credentials_file)
+}
+
+fn read_claude_oauth_access_token_from_keychain() -> Option<String> {
+    let output = run_command_capture(
+        "security",
+        &[
+            "find-generic-password",
+            "-s",
+            CLAUDE_OAUTH_KEYCHAIN_SERVICE,
+            "-w",
+        ],
+        COMMAND_TIMEOUT,
+    );
+    if !output.command_found || !output.success {
+        return None;
+    }
+    parse_claude_oauth_access_token(&output.stdout)
+}
+
+fn read_claude_oauth_access_token_from_credentials_file() -> Option<String> {
+    let path = home_path(".claude").join(".credentials.json");
+    let body = fs::read_to_string(path).ok()?;
+    parse_claude_oauth_access_token(&body)
+}
+
+fn parse_claude_oauth_access_token(payload: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("accessToken"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+}
+
+fn claude_oauth_usage_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(401 | 403, _) => {
+            "Claude OAuth usage endpoint rejected the local Claude Code session.".to_string()
+        }
+        ureq::Error::Status(429, _) => "Claude OAuth usage endpoint is rate limited.".to_string(),
+        ureq::Error::Status(status, _) => {
+            format!("Claude OAuth usage endpoint returned HTTP {status}.")
+        }
+        ureq::Error::Transport(_) => "Claude OAuth usage endpoint was unreachable.".to_string(),
+    }
+}
+
+fn claude_code_user_agent(version: &CommandOutput) -> String {
+    let version = if version.command_found && version.success {
+        version
+            .stdout
+            .split_whitespace()
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("2.1.0")
+    } else {
+        "2.1.0"
+    };
+    format!("claude-code/{version}")
+}
+
+fn claude_oauth_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
+    let mut windows = Vec::new();
+    if let Some(window) = claude_oauth_quota_window("session", value.get("five_hour"), 5 * 60 * 60)
+    {
+        windows.push(window);
+    }
+    if let Some(window) =
+        claude_oauth_quota_window("weekly", value.get("seven_day"), 7 * 24 * 60 * 60)
+    {
+        windows.push(window);
+    }
+    windows
+}
+
+fn claude_oauth_quota_window(
+    name: &str,
+    value: Option<&Value>,
+    window_seconds: u64,
+) -> Option<AgentQuotaWindow> {
+    let value = value?;
+    let used_percent = json_u8(value, &["utilization", "used_percentage", "used_percent"]);
+    let resets_at = json_timestamp_rfc3339(value, &["resets_at", "reset_at"]);
+    if used_percent.is_none() && resets_at.is_none() {
+        return None;
+    }
+    let left_percent = used_percent.map(|used| 100_u8.saturating_sub(used));
+    let started_at = resets_at
+        .as_deref()
+        .and_then(|reset| rfc3339_minus_seconds(reset, window_seconds));
+    Some(AgentQuotaWindow {
+        name: name.to_string(),
+        scope: AgentQuotaWindowScope::Account,
+        status: used_percent
+            .map(percent_quota_status)
+            .unwrap_or(AgentQuotaWindowStatus::Unknown),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        model: None,
+        account_label: None,
+        window_seconds: Some(window_seconds),
+        started_at,
+        resets_at,
+        quota: None,
+        remaining: None,
+        used_percent,
+        left_percent,
+    })
 }
 
 fn claude_statusline_quota_windows_from_cache(
@@ -3665,6 +3832,64 @@ for line in sys.stdin:
         assert_eq!(account.plan_type.as_deref(), Some("max"));
         assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
         assert_eq!(account.billing_channel.as_deref(), Some("subscription"));
+    }
+
+    #[test]
+    fn claude_oauth_token_parser_extracts_only_access_token() {
+        let payload = r#"{
+          "claudeAiOauth": {
+            "accessToken": " access-token ",
+            "refreshToken": "refresh-token",
+            "expiresAt": 1782750000000
+          }
+        }"#;
+
+        assert_eq!(
+            parse_claude_oauth_access_token(payload).as_deref(),
+            Some("access-token")
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_maps_five_hour_and_weekly_windows() {
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 24.0,
+                "resets_at": "2026-06-29T18:10:00.937562+00:00"
+            },
+            "seven_day": {
+                "utilization": 72.0,
+                "resets_at": "2026-07-04T05:00:00.937587+00:00"
+            },
+            "seven_day_sonnet": {
+                "utilization": 7.0,
+                "resets_at": "2026-07-04T05:00:00.937594+00:00"
+            }
+        });
+
+        let windows = claude_oauth_quota_windows(&json);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].name, "session");
+        assert_eq!(windows[0].scope, AgentQuotaWindowScope::Account);
+        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Ok);
+        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+        assert_eq!(windows[0].used_percent, Some(24));
+        assert_eq!(windows[0].left_percent, Some(76));
+        assert_eq!(windows[0].window_seconds, Some(5 * 60 * 60));
+        assert_eq!(
+            windows[0].resets_at.as_deref(),
+            Some("2026-06-29T18:10:00.937562Z")
+        );
+        assert_eq!(windows[1].name, "weekly");
+        assert_eq!(windows[1].status, AgentQuotaWindowStatus::Ok);
+        assert_eq!(windows[1].used_percent, Some(72));
+        assert_eq!(windows[1].left_percent, Some(28));
+        assert_eq!(windows[1].window_seconds, Some(7 * 24 * 60 * 60));
+        assert_eq!(
+            windows[1].resets_at.as_deref(),
+            Some("2026-07-04T05:00:00.937587Z")
+        );
     }
 
     #[test]
