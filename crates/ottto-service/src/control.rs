@@ -530,6 +530,16 @@ fn handle_command(
         }
         LocalControlCommand::Verify { source, repair } => {
             let result = verify_source(daemon, &authorization, source, repair)?;
+            if verification_result_should_refresh_agent_status(&result) {
+                if let Err(error) =
+                    refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
+                {
+                    eprintln!(
+                        "post-verify agent status refresh skipped: {}",
+                        cli_error_message(&error)
+                    );
+                }
+            }
             let mut value = to_value(result)?;
             let mut status = status_for(daemon, &authorization)?;
             status.update.install_owner = detect_install_owner();
@@ -641,6 +651,12 @@ fn status_for(
         RequestAuthorization::TrustedCompanionApp => daemon.status_for_trusted_client(),
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
+}
+
+fn verification_result_should_refresh_agent_status(result: &SourceVerificationResult) -> bool {
+    matches!(result.status, SourceVerificationStatus::NoFreshTelemetry)
+        || (matches!(result.status, SourceVerificationStatus::Failed)
+            && result.message.code == "smoke_timeout")
 }
 
 fn account_for(
@@ -12709,6 +12725,51 @@ log_user_prompt = true
             result.message.text,
             "Codex is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify."
         );
+    }
+
+    #[test]
+    fn soft_verify_timing_results_refresh_agent_status() {
+        let no_fresh = verification_result(
+            SourceKind::ClaudeCode,
+            SourceVerificationStatus::NoFreshTelemetry,
+            false,
+            0,
+            None,
+            None,
+            Some("2026-06-20T02:00:00Z".to_string()),
+            "no_fresh_telemetry",
+            "No Claude Code telemetry arrived after the smoke session.",
+        );
+        let smoke_timeout = verification_result(
+            SourceKind::Codex,
+            SourceVerificationStatus::Failed,
+            false,
+            0,
+            None,
+            None,
+            Some("2026-06-20T02:00:00Z".to_string()),
+            "smoke_timeout",
+            "Codex smoke session timed out before telemetry could be sent.",
+        );
+        let command_failed = verification_result(
+            SourceKind::Codex,
+            SourceVerificationStatus::Failed,
+            false,
+            0,
+            None,
+            None,
+            Some("2026-06-20T02:00:00Z".to_string()),
+            "smoke_command_failed",
+            "Codex smoke session failed before telemetry could be sent.",
+        );
+
+        assert!(verification_result_should_refresh_agent_status(&no_fresh));
+        assert!(verification_result_should_refresh_agent_status(
+            &smoke_timeout
+        ));
+        assert!(!verification_result_should_refresh_agent_status(
+            &command_failed
+        ));
     }
 
     #[test]
