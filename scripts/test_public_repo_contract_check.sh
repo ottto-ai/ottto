@@ -250,6 +250,48 @@ grep -q "uninstall incomplete final exit_code must be 70" \
 grep -q "uninstall incomplete error code must be internal" \
   /tmp/public-contract-broken-uninstall-output.out
 
+broken_diagnostics_bundle="$tmp_dir/broken-diagnostics-bundle"
+cp -R "$output_dir" "$broken_diagnostics_bundle"
+python3 - "$broken_diagnostics_bundle/fixtures/diagnostics/redacted-bundle.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+private_project_path = "/" + "Users/" + "ronshub/private/project"
+operator_log_path = "/" + "Users/" + "ronshub/Library/Logs/Ottto/local.log"
+payload["upload"]["support_claim"] = "support_123456"
+payload["sections"].append({
+    "name": "unsafe_support_context",
+    "status": "succeeded",
+    "items": {
+        "raw_response": "The user's private model response text",
+        "command_output": f"Raw shell output from {private_project_path}",
+        "cookie": "session=abcdefghijklmnopqrstuvwxyz",
+        "setup_run_token": "setup_run_token_123456",
+        "operator_path": operator_log_path,
+    },
+})
+path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_diagnostics_bundle" >/tmp/public-contract-broken-diagnostics-bundle.out 2>&1; then
+  echo "Expected contract check to fail when diagnostics bundle exposes raw support data" >&2
+  exit 1
+fi
+grep -q "diagnostics.upload.support_claim exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.raw_response exposes unredacted raw response field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.command_output exposes unredacted raw output field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.cookie exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.setup_run_token exposes unredacted credential field" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+grep -q "diagnostics.sections\\[5\\].items.operator_path exposes unredacted local path" \
+  /tmp/public-contract-broken-diagnostics-bundle.out
+
 broken_fix="$tmp_dir/broken-fix"
 cp -R "$output_dir" "$broken_fix"
 python3 - "$broken_fix/fixtures/cli/fix-codex-request.json" <<'PY'
