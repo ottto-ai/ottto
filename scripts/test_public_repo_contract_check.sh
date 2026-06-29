@@ -194,6 +194,81 @@ grep -q "CLI fix Codex request source must be codex" \
 grep -q "CLI fix Codex request dry_run must be false" \
   /tmp/public-contract-broken-fix.out
 
+broken_cli_requests="$tmp_dir/broken-cli-requests"
+cp -R "$output_dir" "$broken_cli_requests"
+python3 - \
+  "$broken_cli_requests/fixtures/cli/apps-root-request.json" \
+  "$broken_cli_requests/fixtures/cli/apps-detect-request.json" \
+  "$broken_cli_requests/fixtures/cli/apps-status-pi-request.json" \
+  "$broken_cli_requests/fixtures/cli/login-headless-request.json" \
+  "$broken_cli_requests/fixtures/cli/logout-request.json" \
+  "$broken_cli_requests/fixtures/cli/logout-local-request.json" \
+  "$broken_cli_requests/fixtures/cli/update-check-request.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+apps_root_path = Path(sys.argv[1])
+apps_detect_path = Path(sys.argv[2])
+apps_status_path = Path(sys.argv[3])
+login_path = Path(sys.argv[4])
+logout_path = Path(sys.argv[5])
+logout_local_path = Path(sys.argv[6])
+update_path = Path(sys.argv[7])
+
+apps_root = json.loads(apps_root_path.read_text(encoding="utf-8"))
+apps_root["refresh_agent_status"] = True
+apps_root_path.write_text(json.dumps(apps_root, indent=2) + "\n", encoding="utf-8")
+
+apps_detect = json.loads(apps_detect_path.read_text(encoding="utf-8"))
+apps_detect["refresh_agent_status"] = False
+apps_detect_path.write_text(json.dumps(apps_detect, indent=2) + "\n", encoding="utf-8")
+
+apps_status = json.loads(apps_status_path.read_text(encoding="utf-8"))
+apps_status["command"] = "status"
+apps_status["source"] = "codex"
+apps_status_path.write_text(json.dumps(apps_status, indent=2) + "\n", encoding="utf-8")
+
+login = json.loads(login_path.read_text(encoding="utf-8"))
+login["command"] = "login"
+login["claim_code"] = "claim_leaky_fixture"
+login_path.write_text(json.dumps(login, indent=2) + "\n", encoding="utf-8")
+
+logout = json.loads(logout_path.read_text(encoding="utf-8"))
+logout["local_only"] = True
+logout_path.write_text(json.dumps(logout, indent=2) + "\n", encoding="utf-8")
+
+logout_local = json.loads(logout_local_path.read_text(encoding="utf-8"))
+logout_local["local_only"] = False
+logout_local_path.write_text(json.dumps(logout_local, indent=2) + "\n", encoding="utf-8")
+
+update = json.loads(update_path.read_text(encoding="utf-8"))
+update["command"] = "update"
+update_path.write_text(json.dumps(update, indent=2) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" --staged-output "$broken_cli_requests" >/tmp/public-contract-broken-cli-requests.out 2>&1; then
+  echo "Expected contract check to fail when CLI request fixture semantics drift" >&2
+  exit 1
+fi
+grep -q "CLI apps root request must not refresh agent status" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps detect request must refresh agent status" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps status request command must be agent_status_refresh" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI apps status request source must be pi" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI login headless request must use daemon setup command" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI login headless request claim_code must be null" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI logout request must be cloud-first by default" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI logout local-only request local_only must be true" \
+  /tmp/public-contract-broken-cli-requests.out
+grep -q "CLI update check request command must be update_check" \
+  /tmp/public-contract-broken-cli-requests.out
+
 broken_setup_state="$tmp_dir/broken-setup-state"
 cp -R "$output_dir" "$broken_setup_state"
 python3 - "$broken_setup_state/fixtures/cli/setup-needs-user-action-output.json" <<'PY'
