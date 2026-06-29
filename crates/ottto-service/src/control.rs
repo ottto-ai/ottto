@@ -4326,11 +4326,13 @@ fn source_config_state_for_daemon(
         ),
         SourceKind::ClaudeCode => {
             let machine = daemon.status_for_trusted_client()?.machine;
+            let support_dir = default_support_dir();
             claude_code_settings_config_state_at(
                 &home_path(".claude/settings.json"),
                 "~/.claude/settings.json",
                 &machine,
                 &relay_base_url,
+                &support_dir,
                 patch_disabled,
             )
         }
@@ -4528,6 +4530,7 @@ fn claude_code_settings_config_state_at(
     path_hint: &str,
     machine: &MachineIdentity,
     relay_base_url: &str,
+    support_dir: &Path,
     patch_disabled: bool,
 ) -> SourceConfigState {
     let bytes = match fs::read(path) {
@@ -4622,12 +4625,10 @@ fn claude_code_settings_config_state_at(
         .and_then(|value| value.as_object())
         .and_then(|statusline| statusline.get("command"))
         .and_then(|value| value.as_str());
-    if !statusline_command.is_some_and(is_ottto_statusline_command) {
-        drift.push(config_drift(
-            "statusLine.command",
-            "ottto claude-code-statusline wrapper",
-            statusline_command.unwrap_or("missing"),
-        ));
+    if let Some(command_drift) = claude_statusline_command_drift(statusline_command, support_dir) {
+        drift.push(command_drift);
+    } else if let Some(wrapper_drift) = claude_statusline_wrapper_drift(support_dir) {
+        drift.push(wrapper_drift);
     }
     SourceConfigState {
         discovered: true,
@@ -5212,6 +5213,100 @@ fn is_ottto_statusline_command(command: &str) -> bool {
 
 fn claude_statusline_wrapper_path(support_dir: &Path) -> PathBuf {
     support_dir.join("claude-code-statusline.sh")
+}
+
+fn expected_claude_statusline_command(support_dir: &Path) -> String {
+    shell_quote_path(&claude_statusline_wrapper_path(support_dir))
+}
+
+fn claude_statusline_command_drift(
+    command: Option<&str>,
+    support_dir: &Path,
+) -> Option<ConfigDrift> {
+    let expected = expected_claude_statusline_command(support_dir);
+    let observed = command.map(str::trim).filter(|value| !value.is_empty());
+    match observed {
+        Some(command) if command == expected => None,
+        Some(command) if is_ottto_statusline_command(command) => {
+            Some(config_drift("statusLine.command", expected, command))
+        }
+        Some(command) => Some(config_drift(
+            "statusLine.command",
+            "ottto claude-code-statusline wrapper",
+            command,
+        )),
+        None => Some(config_drift(
+            "statusLine.command",
+            "ottto claude-code-statusline wrapper",
+            "missing",
+        )),
+    }
+}
+
+fn claude_statusline_wrapper_drift(support_dir: &Path) -> Option<ConfigDrift> {
+    let path = claude_statusline_wrapper_path(support_dir);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Some(config_drift(
+                "statusLine.wrapper",
+                "executable current ottto statusLine wrapper",
+                "missing",
+            ));
+        }
+        Err(_) => {
+            return Some(config_drift(
+                "statusLine.wrapper",
+                "executable current ottto statusLine wrapper",
+                "unreadable",
+            ));
+        }
+    };
+    if !metadata.is_file() {
+        return Some(config_drift(
+            "statusLine.wrapper",
+            "executable current ottto statusLine wrapper",
+            "not_file",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Some(config_drift(
+            "statusLine.wrapper",
+            "executable current ottto statusLine wrapper",
+            "not_executable",
+        ));
+    }
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => {
+            return Some(config_drift(
+                "statusLine.wrapper",
+                "executable current ottto statusLine wrapper",
+                "unreadable",
+            ));
+        }
+    };
+    let delegated_command = body
+        .lines()
+        .find_map(|line| line.strip_prefix("ORIGINAL_STATUSLINE="))
+        .and_then(parse_shell_single_quoted_assignment)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let expected =
+        render_claude_statusline_wrapper(&preferred_ottto_cli_path(), delegated_command.as_deref());
+    if body != expected {
+        return Some(config_drift(
+            "statusLine.wrapper",
+            "current ottto statusLine wrapper",
+            "stale",
+        ));
+    }
+    None
+}
+
+fn claude_statusline_wrapper_ready(support_dir: &Path) -> bool {
+    claude_statusline_wrapper_drift(support_dir).is_none()
 }
 
 fn existing_claude_statusline_wrapper_delegated_command(
@@ -6713,6 +6808,7 @@ fn claude_code_telemetry_config_installed(body: &str) -> bool {
     let relay_port = claude_code_settings_relay_port(body);
     claude_code_settings_has_relay_env(body)
         && claude_code_settings_has_statusline_helper(body)
+        && claude_statusline_wrapper_ready(&default_support_dir())
         && relay_port.is_some_and(loopback_listener_available)
         && snapshot_device_credentials_include_source(crate::otlp_relay::CLAUDE_CODE_RELAY_SOURCE)
 }
@@ -11831,12 +11927,14 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         fs::create_dir_all(&root).expect("create root");
         let missing = root.join("settings-missing.json");
         let default_base = crate::otlp_relay::default_local_relay_base_url();
+        let support_dir = root.join("backups");
 
         let missing_state = claude_code_settings_config_state_at(
             &missing,
             "~/.claude/settings.json",
             &test_machine(),
             &default_base,
+            &support_dir,
             false,
         );
         assert!(!missing_state.discovered);
@@ -11849,7 +11947,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         patch_claude_code_settings_at_with_relay_base(
             &clean,
             &test_machine(),
-            &root.join("backups"),
+            &support_dir,
             &default_base,
         )
         .expect("seed clean settings");
@@ -11859,6 +11957,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             "~/.claude/settings.json",
             &test_machine(),
             &default_base,
+            &support_dir,
             false,
         );
         assert!(clean_state.discovered);
@@ -11870,12 +11969,35 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             clean_body
         );
 
+        fs::remove_file(claude_statusline_wrapper_path(&support_dir))
+            .expect("remove statusLine wrapper");
+        let missing_wrapper_state = claude_code_settings_config_state_at(
+            &clean,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &default_base,
+            &support_dir,
+            false,
+        );
+        assert!(missing_wrapper_state
+            .drift
+            .iter()
+            .any(|drift| drift.key == "statusLine.wrapper"));
+        patch_claude_code_settings_at_with_relay_base(
+            &clean,
+            &test_machine(),
+            &support_dir,
+            &default_base,
+        )
+        .expect("restore clean wrapper");
+
         let fallback_base = "http://127.0.0.1:44621";
         let wrong_relay_state = claude_code_settings_config_state_at(
             &clean,
             "~/.claude/settings.json",
             &test_machine(),
             fallback_base,
+            &support_dir,
             false,
         );
         assert!(wrong_relay_state
@@ -11892,6 +12014,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             "~/.claude/settings.json",
             &test_machine(),
             &default_base,
+            &support_dir,
             false,
         );
         assert!(missing_statusline
@@ -11905,6 +12028,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             "~/.claude/settings.json",
             &test_machine(),
             &default_base,
+            &support_dir,
             false,
         );
         assert!(invalid_state
@@ -11931,6 +12055,7 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
             "~/.claude/settings.json",
             &test_machine(),
             &default_base,
+            &root.join("support"),
             true,
         );
 
@@ -11984,6 +12109,47 @@ log_user_prompt = true
         assert!(body.contains("http://127.0.0.1:43119/v1/logs"));
         assert!(body.contains("protocol = \"binary\""));
         assert!(body.contains("otel.log_user_prompt = false"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn verify_repair_restores_claude_statusline_wrapper_before_account_check() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("verify-repair-claude-wrapper");
+        create_control_test_dir(&root.join(".claude"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let support_dir = root.join("support");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let settings_path = root.join(".claude/settings.json");
+        patch_claude_code_settings_at(&settings_path, &test_machine(), &support_dir)
+            .expect("seed settings");
+        fs::remove_file(claude_statusline_wrapper_path(&support_dir))
+            .expect("remove statusLine wrapper");
+
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_verify_repair_claude_wrapper".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Verify {
+                    source: SourceKind::ClaudeCode,
+                    repair: true,
+                },
+            },
+        );
+
+        assert!(response.ok, "{response:?}");
+        let result: SourceVerificationResult =
+            serde_json::from_value(response.payload.expect("payload"))
+                .expect("verification result");
+        assert_eq!(result.message.code, "account_not_connected");
+        assert!(result.config.drift.is_empty());
+        assert!(claude_statusline_wrapper_path(&support_dir).is_file());
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -12133,6 +12299,38 @@ log_user_prompt = true
             "~/.claude/settings.json",
             &test_machine(),
             &crate::otlp_relay::default_local_relay_base_url(),
+            &root.join("support"),
+            false,
+        );
+        assert!(state.drift.is_empty());
+
+        fs::remove_file(claude_statusline_wrapper_path(&root.join("support")))
+            .expect("remove statusLine wrapper");
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_fix_claude_missing_wrapper".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Repair {
+                    source: SourceKind::ClaudeCode,
+                    dry_run: false,
+                },
+            },
+        );
+        assert!(response.ok);
+        let plan: RepairPlan =
+            serde_json::from_value(response.payload.expect("payload")).expect("repair plan");
+        assert_eq!(plan.status, RepairPlanStatus::Succeeded);
+        assert!(claude_statusline_wrapper_path(&root.join("support")).is_file());
+        let state = claude_code_settings_config_state_at(
+            &settings_path,
+            "~/.claude/settings.json",
+            &test_machine(),
+            &crate::otlp_relay::default_local_relay_base_url(),
+            &root.join("support"),
             false,
         );
         assert!(state.drift.is_empty());
