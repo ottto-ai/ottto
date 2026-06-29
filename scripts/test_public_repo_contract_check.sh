@@ -936,6 +936,61 @@ support_path.write_text(support, encoding="utf-8")
 
 release = release_path.read_text(encoding="utf-8")
 release = release.replace(
+    "Stable local-platform releases must be verifiable without trusting mutable\n"
+    "installer state.",
+    "Stable local-platform releases may trust current installer state.",
+)
+release = release.replace(
+    "Do not trust a release where the manifest omits required public-v1 metadata.",
+    "Trust releases even when the manifest omits metadata.",
+)
+release = release.replace(
+    "The computed digest must exactly match the manifest.",
+    "The computed digest only needs to look plausible.",
+)
+release = release.replace(
+    "Verify `release-manifest.json.sig` with\n"
+    "`macos_manifest_signature.sh verify --manifest release-manifest.json --identity \"$OTTTO_MACOS_CODESIGN_IDENTITY\"`",
+    "Skip manifest signature verification when checksums exist.",
+)
+release = release.replace(
+    "bound to the expected Ottto Developer ID identity",
+    "bound to any local signing identity",
+)
+release = release.replace(
+    "The macOS stable release workflow can optionally publish a public GitHub Release\n"
+    "as a **verification mirror only**.",
+    "The macOS stable release workflow can publish GitHub Releases as an install source.",
+)
+release = release.replace(
+    "The CDN at\n"
+    "`install.ottto.net` remains the install and update source of truth",
+    "GitHub Releases can become the install and update source of truth",
+)
+release = release.replace(
+    "stable-candidate RC QA",
+    "optional candidate QA",
+)
+release = release.replace(
+    "The evidence must\n"
+    "not include private repo paths, local user paths, raw claim/setup tokens,\n"
+    "account or machine identifiers, passwords, API keys, or bearer credentials.",
+    "The evidence may include local identifiers and bearer credentials.",
+)
+release = release.replace(
+    "ottto status --json",
+    "ottto status",
+)
+release = release.replace(
+    "ottto update check --json",
+    "ottto update check",
+)
+release = release.replace(
+    "The JSON should report the expected version, install owner, update state, and\n"
+    "daemon reachability.",
+    "Human output should look healthy.",
+)
+release = release.replace(
     "requires clean-machine evidence for every install owner advertised by the\n"
     "manifest",
     "can advertise install owners before clean-machine evidence",
@@ -991,6 +1046,30 @@ grep -q "support docs must route update/rollback by detected install owner and m
 grep -q "support docs must prohibit self-overwriting owner-managed files" \
   /tmp/public-contract-broken-install-docs.out
 grep -q "support docs must require checksum/signing/Gatekeeper/status rollback verification" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must distrust mutable installer state" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must treat manifest metadata as required" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require checksum equality with manifest" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require manifest signature verification" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must bind signatures to Ottto Developer ID identity" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep GitHub releases verification-only" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep CDN as install/update source of truth" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require stable-candidate RC QA" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must keep stable-candidate evidence redacted" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must include status JSON check" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must include update-check JSON check" \
+  /tmp/public-contract-broken-install-docs.out
+grep -q "release verification docs must require installed-runtime JSON fields" \
   /tmp/public-contract-broken-install-docs.out
 grep -q "release verification docs must require clean-machine evidence per advertised owner" \
   /tmp/public-contract-broken-install-docs.out
