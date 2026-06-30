@@ -656,7 +656,10 @@ fn status_for(
 fn verification_result_should_refresh_agent_status(result: &SourceVerificationResult) -> bool {
     matches!(result.status, SourceVerificationStatus::NoFreshTelemetry)
         || (matches!(result.status, SourceVerificationStatus::Failed)
-            && result.message.code == "smoke_timeout")
+            && matches!(
+                result.message.code.as_str(),
+                "smoke_timeout" | "verification_service_unavailable"
+            ))
 }
 
 fn account_for(
@@ -12762,10 +12765,24 @@ log_user_prompt = true
             "smoke_command_failed",
             "Codex smoke session failed before telemetry could be sent.",
         );
+        let verification_unavailable = verification_result(
+            SourceKind::ClaudeCode,
+            SourceVerificationStatus::Failed,
+            false,
+            0,
+            None,
+            None,
+            Some("2026-06-20T02:00:00Z".to_string()),
+            "verification_service_unavailable",
+            "Could not reach Ottto verification. Check your network and retry.",
+        );
 
         assert!(verification_result_should_refresh_agent_status(&no_fresh));
         assert!(verification_result_should_refresh_agent_status(
             &smoke_timeout
+        ));
+        assert!(verification_result_should_refresh_agent_status(
+            &verification_unavailable
         ));
         assert!(!verification_result_should_refresh_agent_status(
             &command_failed
