@@ -2862,6 +2862,17 @@ fn has_soft_smoke_timeout_problem(health: &SourceHealth) -> bool {
         })
 }
 
+fn has_soft_verification_service_unavailable_problem(health: &SourceHealth) -> bool {
+    health.state == SourceState::Failed
+        && health.grade == HealthGrade::Critical
+        && health.problems.iter().any(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && problem
+                    .detail
+                    .contains("Could not reach Ottto verification")
+        })
+}
+
 fn has_usage_limited_verification_problem(health: &SourceHealth) -> bool {
     health.last_verified_at.is_some()
         && !health.problems.is_empty()
@@ -2940,6 +2951,7 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     }
     let clear_failed_verification = has_soft_no_fresh_telemetry_problem(existing)
         || has_soft_smoke_timeout_problem(existing)
+        || has_soft_verification_service_unavailable_problem(existing)
         || has_usage_limited_verification_problem(existing)
         || (has_pi_route_smoke_failure_problem(existing)
             && refreshed_pi_status_has_available_routes(refreshed));
@@ -4582,6 +4594,72 @@ mod tests {
             .into_iter()
             .find(|source| source.app == SourceKind::Codex)
             .expect("Codex source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert_eq!(source.authority_at, "2026-05-05T10:40:00Z");
+    }
+
+    #[test]
+    fn available_agent_status_clears_verification_service_unavailable() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: Some("~/.claude/settings.json".to_string()),
+                fingerprint: Some("sha256:test".to_string()),
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "verification_service_unavailable".to_string(),
+                text: "Could not reach Ottto verification. Check your network and retry."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record verification backend timeout");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        let attempt_at = before_scan.sources[0]
+            .last_verified_at
+            .clone()
+            .expect("failed verify attempt timestamp");
+        assert_eq!(before_scan.sources[0].state, SourceState::Failed);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].last_verified_at.is_none());
+        assert!(status.sources[0].problems.is_empty());
+        assert!(status
+            .command_ledger
+            .iter()
+            .any(|entry| entry.observed_at == attempt_at
+                && entry.status == LocalHealthCommandStatus::Failed
+                && entry.error_code.as_deref() == Some("verification_service_unavailable")));
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::ClaudeCode)
+            .expect("Claude Code source");
         assert_eq!(source.state, LocalHealthSourceState::Healthy);
         assert_eq!(source.authority, LocalHealthAuthority::Runtime);
         assert_eq!(source.authority_at, "2026-05-05T10:40:00Z");
