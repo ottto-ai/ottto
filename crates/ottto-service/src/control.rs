@@ -14352,7 +14352,7 @@ log_user_prompt = true
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
             let mut next_action_calls = 0_u8;
-            for _ in 0..8 {
+            for _ in 0..10 {
                 let (mut stream, _) = listener.accept().expect("accept setup action request");
                 let request = read_complete_http_request(&mut stream);
                 if request.contains("/local-client/heartbeat") {
