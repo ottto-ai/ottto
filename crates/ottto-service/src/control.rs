@@ -1401,7 +1401,7 @@ fn build_pi_reauth_repair_plan(mut plan: RepairPlan) -> RepairPlan {
         RepairAction {
             action: RepairActionKind::VerifyTelemetry,
             title: "Re-run Pi verification".to_string(),
-            detail: "After re-signing in, run Verify again to confirm Pi telemetry is flowing.".to_string(),
+            detail: "After re-signing in, run Verify again to confirm Pi is connected.".to_string(),
             requires_approval: false,
             destructive: false,
             approval,
@@ -4223,7 +4223,7 @@ fn run_install_source_action(
                     InstallSessionEvent {
                         event_type: "verification.succeeded",
                         status: "succeeded",
-                        message: "Sent synthetic telemetry verification marker",
+                        message: "Recorded setup verification signal",
                         metadata: Some(json!({
                             "source": source,
                             "marker_id": marker_id,
@@ -4241,7 +4241,7 @@ fn run_install_source_action(
                     InstallSessionEvent {
                         event_type: "verification.failed",
                         status: "failed",
-                        message: "Synthetic telemetry verification marker failed",
+                        message: "Setup verification signal failed",
                         metadata: Some(json!({
                             "source": source,
                             "error_code": "verification_marker_failed",
@@ -4253,7 +4253,7 @@ fn run_install_source_action(
                 return Ok((
                     "failed".to_string(),
                     format!(
-                        "{} telemetry config was written, but verification marker failed",
+                        "{} setup was installed, but verification did not finish",
                         source_display_name(&source_kind)
                     ),
                     json!({
@@ -4266,7 +4266,7 @@ fn run_install_source_action(
                         "relay_port": relay_port,
                         "relay_source": source,
                         "error_code": "verification_marker_failed",
-                        "error_message": "Synthetic telemetry verification marker failed",
+                        "error_message": "Setup verification signal failed",
                     }),
                 ));
             }
@@ -5650,11 +5650,7 @@ fn run_verify_source_action(
         wait_for_verification_with_refresh_mut(api_base_url, credentials, &source, &smoke_after)?;
     let failure_code = verification_failure_code(&source, &smoke, &verification);
     let verification_message = if verification.verified {
-        format!(
-            "Saw {} recent {} telemetry records.",
-            verification.records_seen,
-            source_display_name(&source)
-        )
+        format!("{} verification passed.", source_display_name(&source))
     } else {
         verification_failure_message(
             &source,
@@ -5946,10 +5942,10 @@ fn run_bounded_command(
                         usage_limited_smoke_message(display_name)
                     } else if let Some(diagnostic) = diagnostic.as_deref() {
                         format!(
-                            "{display_name} smoke session failed before telemetry could be sent: {diagnostic}"
+                            "{display_name} smoke session failed before verification could complete: {diagnostic}"
                         )
                     } else {
-                        format!("{display_name} smoke session failed before telemetry could be sent. Check the local {display_name} auth and provider configuration, then retry Verify.")
+                        format!("{display_name} smoke session failed before verification could complete. Check the local {display_name} auth and provider configuration, then retry Verify.")
                     },
                     diagnostic,
                     error_code: if status.success() {
@@ -5976,7 +5972,7 @@ fn run_bounded_command(
                         usage_limited_smoke_message(display_name)
                     } else {
                         format!(
-                        "{display_name} smoke session timed out before telemetry could be sent."
+                        "{display_name} smoke session timed out before verification could complete."
                     )
                     },
                     diagnostic,
@@ -7370,16 +7366,7 @@ fn verify_source(
                 response.last_received_at,
                 Some(response.smoke_after),
                 "verified",
-                &format!(
-                    "Saw {} recent {} telemetry {}.",
-                    response.records_seen,
-                    source_display_name(&source),
-                    if response.records_seen == 1 {
-                        "record"
-                    } else {
-                        "records"
-                    }
-                ),
+                &format!("{} verification passed.", source_display_name(&source)),
             ),
             Ok(response) => {
                 let failure_code = verification_failure_code(&source, &smoke, &response);
@@ -7563,8 +7550,8 @@ fn rfc3339_hours_ago(hours: u32) -> String {
 }
 
 /// Verify a subscription-OAuth Pi route without a live smoke: query the backend
-/// for recently-observed telemetry for this route (model/provider filtered) over
-/// a passive lookback window. Fresh telemetry -> Verified; none -> an actionable
+/// for recently-observed usage for this route (model/provider filtered) over
+/// a passive lookback window. Fresh usage -> Verified; none -> an actionable
 /// re-auth Warning (never a hard smoke failure); backend error -> error result.
 fn verify_pi_subscription_oauth_route_passively(
     api_base_url: &str,
@@ -7618,8 +7605,7 @@ fn verify_pi_subscription_oauth_route_passively(
             Some(lookback),
             None,
             format!(
-                "Saw {} recent Pi telemetry record(s) for {} (verified from observed usage; no live smoke for this rotating-OAuth route).",
-                verification.records_seen,
+                "Pi route {} verification passed from recent usage.",
                 pi_route_label(route)
             ),
             local_session_observed,
@@ -7634,7 +7620,7 @@ fn verify_pi_subscription_oauth_route_passively(
             Some(lookback),
             Some(PI_OAUTH_REAUTH_CODE.to_string()),
             format!(
-                "Pi route {} needs a provider re-sign-in: no recent telemetry, and Ottto can't live-probe a rotating-OAuth route. Run `ottto fix --app pi` for recovery steps.",
+                "Pi route {} needs a provider re-sign-in: no recent matching usage, and Ottto can't live-probe this route. Run `ottto fix --app pi` for recovery steps.",
                 pi_route_label(route)
             ),
             local_session_observed,
@@ -7656,7 +7642,8 @@ fn pi_passive_placeholder_smoke(local_session_observed: Option<bool>) -> SmokeRe
         succeeded: false,
         exit_status: None,
         duration_ms: 0,
-        message: "Verified passively from observed telemetry; no live smoke was run for this rotating-OAuth route.".to_string(),
+        message: "Checked recent Pi usage; no live smoke was run for this rotating-OAuth route."
+            .to_string(),
         diagnostic: None,
         error_code: Some(PI_OAUTH_REAUTH_CODE.to_string()),
         local_session_observed,
@@ -7805,11 +7792,7 @@ fn pi_route_result_from_verification(
         no_fresh_telemetry_code(&SourceKind::Pi, smoke).to_string()
     };
     let text = if verification.verified {
-        format!(
-            "Saw {} recent Pi telemetry records for {}.",
-            verification.records_seen,
-            pi_route_label(route)
-        )
+        format!("Pi route {} verification passed.", pi_route_label(route))
     } else if local_only_verified {
         format!(
             "Pi route {} created a local session. Ottto is treating Pi as local-only; live telemetry is not required for this route.",
@@ -7817,7 +7800,7 @@ fn pi_route_result_from_verification(
         )
     } else {
         format!(
-            "Pi route {} completed smoke, but Ottto did not receive matching telemetry.",
+            "Pi route {} completed smoke, but Ottto did not receive matching usage.",
             pi_route_label(route)
         )
     };
@@ -8149,13 +8132,13 @@ fn verification_result_for_backend_error_with_config(
 
 fn no_fresh_telemetry_message(source: &SourceKind, smoke: &SmokeResult) -> String {
     if source == &SourceKind::Pi && smoke.local_session_observed == Some(true) {
-        return "Pi created a local session, but Ottto did not receive matching telemetry for this setup run. Check the backend binding and local upload path, then retry Verify.".to_string();
+        return "Pi created a local session, but Ottto did not receive a matching verification signal for this setup run. Check the backend binding and local upload path, then retry Verify.".to_string();
     }
     if source == &SourceKind::Pi {
-        return "Pi smoke completed, but no new local Pi session file was observed and Ottto did not receive telemetry. Check the configured Pi provider route, then retry Verify.".to_string();
+        return "Pi smoke completed, but no new local Pi session file was observed and Ottto did not receive matching usage. Check the configured Pi provider route, then retry Verify.".to_string();
     }
     format!(
-        "No {} telemetry arrived after the smoke session. Check that {} telemetry export is enabled, then retry Verify.",
+        "Ottto did not receive a fresh {} verification signal after the smoke session. Check that {} setup is connected, then retry Verify.",
         source_display_name(source),
         source_display_name(source),
     )
@@ -8874,7 +8857,7 @@ mod tests {
             None,
             Some("2026-06-04T00:00:00Z".to_string()),
             None,
-            "saw recent telemetry".to_string(),
+            "Pi route default route verification passed from recent usage.".to_string(),
             Some(true),
         );
 
@@ -12709,7 +12692,7 @@ log_user_prompt = true
             succeeded: false,
             exit_status: Some(1),
             duration_ms: 12,
-            message: "Pi smoke session failed before telemetry could be sent.".to_string(),
+            message: "Pi smoke session failed before verification could complete.".to_string(),
             diagnostic: Some("Token is expired.".to_string()),
             error_code: Some("smoke_command_failed".to_string()),
             local_session_observed: Some(false),
@@ -12780,7 +12763,7 @@ log_user_prompt = true
             None,
             Some("2026-06-20T02:00:00Z".to_string()),
             "no_fresh_telemetry",
-            "No Claude Code telemetry arrived after the smoke session.",
+            "Ottto did not receive a fresh Claude Code verification signal after the smoke session.",
         );
         let smoke_timeout = verification_result(
             SourceKind::Codex,
@@ -12791,7 +12774,7 @@ log_user_prompt = true
             None,
             Some("2026-06-20T02:00:00Z".to_string()),
             "smoke_timeout",
-            "Codex smoke session timed out before telemetry could be sent.",
+            "Codex smoke session timed out before verification could complete.",
         );
         let command_failed = verification_result(
             SourceKind::Codex,
@@ -12802,7 +12785,7 @@ log_user_prompt = true
             None,
             Some("2026-06-20T02:00:00Z".to_string()),
             "smoke_command_failed",
-            "Codex smoke session failed before telemetry could be sent.",
+            "Codex smoke session failed before verification could complete.",
         );
         let verification_unavailable = verification_result(
             SourceKind::ClaudeCode,
@@ -12860,7 +12843,7 @@ log_user_prompt = true
 
         assert_eq!(code, "telemetry_disabled_by_admin");
         assert!(message.contains("turned off in this workspace"));
-        assert!(!message.contains("No Codex telemetry arrived"));
+        assert!(!message.contains("fresh Codex verification signal"));
     }
 
     #[test]

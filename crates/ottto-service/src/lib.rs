@@ -964,7 +964,7 @@ impl LocalDaemon {
                 },
                 RepairAction {
                     action: RepairActionKind::VerifyTelemetry,
-                    title: "Verify fresh telemetry".to_string(),
+                    title: "Verify setup".to_string(),
                     detail: "Run source verification after local config is written.".to_string(),
                     requires_approval: false,
                     destructive: false,
@@ -2662,7 +2662,7 @@ fn source_health_from_verification(
                 HealthGrade::Warning,
                 vec![HealthProblem {
                     code: StableProblemCode::TelemetryNotVerified,
-                    title: "No recent telemetry found".to_string(),
+                    title: "Verification needs attention".to_string(),
                     detail: result.message.text.clone(),
                     retryable: true,
                 }],
@@ -2849,7 +2849,10 @@ fn has_soft_no_fresh_telemetry_problem(health: &SourceHealth) -> bool {
         && health.grade == HealthGrade::Warning
         && health.problems.iter().any(|problem| {
             problem.code == StableProblemCode::TelemetryNotVerified
-                && problem.title == "No recent telemetry found"
+                && matches!(
+                    problem.title.as_str(),
+                    "Verification needs attention" | "No recent telemetry found"
+                )
         })
 }
 
@@ -3930,7 +3933,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "verified".to_string(),
-                text: "Saw 2 recent Codex telemetry records.".to_string(),
+                text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
         };
@@ -4352,7 +4355,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "smoke_command_failed".to_string(),
-                text: "Codex smoke session failed before telemetry could be sent.".to_string(),
+                text: "Codex smoke session failed before verification could complete.".to_string(),
             },
             route_results: Vec::new(),
         };
@@ -4487,7 +4490,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "no_fresh_telemetry".to_string(),
-                text: "No fresh Codex telemetry was processed after the smoke prompt.".to_string(),
+                text: "Ottto did not receive a fresh Codex verification signal after the smoke prompt.".to_string(),
             },
             route_results: Vec::new(),
         };
@@ -4553,7 +4556,8 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "smoke_timeout".to_string(),
-                text: "Codex smoke session timed out before telemetry could be sent.".to_string(),
+                text: "Codex smoke session timed out before verification could complete."
+                    .to_string(),
             },
             route_results: Vec::new(),
         };
@@ -4747,7 +4751,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "pi_oauth_reauth_required".to_string(),
-                text: "Pi provider OAuth re-auth is required before telemetry can be trusted."
+                text: "Pi provider OAuth re-auth is required before verification can complete."
                     .to_string(),
             },
             route_results: Vec::new(),
@@ -6014,7 +6018,7 @@ mod tests {
             smoke_after: None,
             message: StableMessage {
                 code: "verified".to_string(),
-                text: "Saw recent Codex telemetry.".to_string(),
+                text: "Codex verification passed.".to_string(),
             },
             route_results: Vec::new(),
         }
