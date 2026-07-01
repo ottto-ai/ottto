@@ -69,6 +69,7 @@ const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const PI_IMPORT_RUN_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
@@ -3476,20 +3477,6 @@ fn disconnect_setup_run_local_client(
 /// Call `wait_for_setup_run_verification_with_base` with one transparent
 /// retry on 401: refresh the companion token via device-secret auth, then
 /// re-issue the verify call with the new token. Other errors pass through.
-fn wait_for_verification_with_refresh(
-    api_base_url: &str,
-    connection: &LocalConnectionBinding,
-    setup_run_token: &str,
-    source: &SourceKind,
-    smoke_after: &str,
-) -> Result<SetupRunVerificationResponse, LocalApiError> {
-    let mut credentials = SetupRunCredentials {
-        setup_run_token: setup_run_token.to_string(),
-        connection: connection.clone(),
-    };
-    wait_for_verification_with_refresh_mut(api_base_url, &mut credentials, source, smoke_after)
-}
-
 fn wait_for_verification_with_refresh_mut(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
@@ -3543,6 +3530,39 @@ fn wait_for_setup_run_verification_with_refresh_mut_timeout(
             filters,
             timeouts,
         )
+    })
+}
+
+fn emit_setup_run_fast_verification_marker_with_refresh_mut(
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    source: &SourceKind,
+    flow: &str,
+) -> Result<String, LocalApiError> {
+    let marker_id = format!("m3-{}-{}", source_slug(source), current_millis());
+    let body = json!({
+        "source": source_slug(source),
+        "marker_id": marker_id,
+        "details": {
+            "flow": flow,
+            "client": OTTTO_CLIENT_NAME,
+        },
+    });
+    setup_run_request_with_refresh_mut(api_base_url, credentials, |active, token| {
+        let url = api_url_with_base(
+            api_base_url,
+            &format!(
+                "/api/v1/setup-runs/{}/local-client/verification-marker",
+                active.setup_run_id
+            ),
+        );
+        let _: serde_json::Value = backend_post_json_with_timeout(
+            &url,
+            &body,
+            &[("X-Ottto-Setup-Run-Token", token)],
+            SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT,
+        )?;
+        Ok(marker_id.clone())
     })
 }
 
@@ -5620,6 +5640,12 @@ fn run_verify_source_action(
             }),
         ));
     }
+    let _ = emit_setup_run_fast_verification_marker_with_refresh_mut(
+        api_base_url,
+        credentials,
+        &source,
+        "setup_action_verify",
+    );
     let verification =
         wait_for_verification_with_refresh_mut(api_base_url, credentials, &source, &smoke_after)?;
     let failure_code = verification_failure_code(&source, &smoke, &verification);
@@ -7209,7 +7235,7 @@ fn verify_source(
         return Ok(result);
     };
 
-    let setup_credentials = match setup_run_token_for_connection(
+    let mut setup_credentials = match setup_run_token_for_connection(
         &connection.api_base_url,
         &connection,
     ) {
@@ -7236,48 +7262,44 @@ fn verify_source(
             return Ok(result);
         }
     };
-    let connection = setup_credentials.connection;
-    let setup_run_token = setup_credentials.setup_run_token;
+    let api_base_url = setup_credentials.connection.api_base_url.clone();
 
     if source == SourceKind::Pi {
-        let pi_token = setup_run_token.clone();
-        let result =
-            match run_pi_route_verification(&connection.api_base_url, &connection, &pi_token) {
-                Ok(result) => result,
-                Err(LocalApiError::Backend(details)) if details.status == Some(401) => {
-                    // Token expired mid-Pi-verify. Try a single refresh + retry.
-                    match refresh_setup_run_token_via_device_secret(
-                        &connection.api_base_url,
-                        &connection,
+        let connection = setup_credentials.connection.clone();
+        let pi_token = setup_credentials.setup_run_token.clone();
+        let result = match run_pi_route_verification(&api_base_url, &connection, &pi_token) {
+            Ok(result) => result,
+            Err(LocalApiError::Backend(details)) if details.status == Some(401) => {
+                // Token expired mid-Pi-verify. Try a single refresh + retry.
+                match refresh_setup_run_token_via_device_secret(&api_base_url, &connection) {
+                    Ok(refreshed) => match run_pi_route_verification(
+                        &api_base_url,
+                        &refreshed.connection,
+                        &refreshed.setup_run_token,
                     ) {
-                        Ok(refreshed) => match run_pi_route_verification(
-                            &connection.api_base_url,
-                            &refreshed.connection,
-                            &refreshed.setup_run_token,
-                        ) {
-                            Ok(retry) => retry,
-                            Err(err) => verification_result_for_backend_error_with_config(
-                                source.clone(),
-                                empty_source_config(&source),
-                                None,
-                                &err,
-                            ),
-                        },
+                        Ok(retry) => retry,
                         Err(err) => verification_result_for_backend_error_with_config(
                             source.clone(),
                             empty_source_config(&source),
                             None,
                             &err,
                         ),
-                    }
+                    },
+                    Err(err) => verification_result_for_backend_error_with_config(
+                        source.clone(),
+                        empty_source_config(&source),
+                        None,
+                        &err,
+                    ),
                 }
-                Err(other) => verification_result_for_backend_error_with_config(
-                    source.clone(),
-                    empty_source_config(&source),
-                    None,
-                    &other,
-                ),
-            };
+            }
+            Err(other) => verification_result_for_backend_error_with_config(
+                source.clone(),
+                empty_source_config(&source),
+                None,
+                &other,
+            ),
+        };
         daemon.record_verification_result(&result)?;
         return Ok(result);
     }
@@ -7321,10 +7343,15 @@ fn verify_source(
             Some(smoke_after),
         )
     } else {
-        match wait_for_verification_with_refresh(
-            &connection.api_base_url,
-            &connection,
-            &setup_run_token,
+        let _ = emit_setup_run_fast_verification_marker_with_refresh_mut(
+            &api_base_url,
+            &mut setup_credentials,
+            &source,
+            "manual_verify",
+        );
+        match wait_for_verification_with_refresh_mut(
+            &api_base_url,
+            &mut setup_credentials,
             &source,
             &smoke_after,
         ) {
@@ -13619,6 +13646,11 @@ log_user_prompt = true
     }
 
     #[test]
+    fn setup_verification_marker_timeout_stays_interactive() {
+        assert!(SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT < BACKEND_REQUEST_TIMEOUT);
+    }
+
+    #[test]
     fn pi_verify_budgets_fit_interactive_cli_bounds() {
         assert!(PI_SMOKE_COMMAND_TIMEOUT < SMOKE_COMMAND_TIMEOUT);
         assert!(PI_IMPORT_RUN_HTTP_TIMEOUT > BACKEND_REQUEST_TIMEOUT);
@@ -13938,7 +13970,7 @@ log_user_prompt = true
             let mut heartbeat_calls = 0_u8;
             let mut next_action_calls = 0_u8;
             let mut event_calls = 0_u8;
-            let mut verification_calls = 0_u8;
+            let mut marker_calls = 0_u8;
             let mut refresh_calls = 0_u8;
             let mut complete_calls = 0_u8;
             for _ in 0..20 {
@@ -14026,9 +14058,9 @@ log_user_prompt = true
                             r#"{"detail":"event used stale setup token"}"#,
                         );
                     }
-                } else if request.contains("/local-client/verification") {
-                    if verification_calls == 0 {
-                        verification_calls += 1;
+                } else if request.contains("/local-client/verification-marker") {
+                    if marker_calls == 0 {
+                        marker_calls += 1;
                         write_json_response(
                             &mut stream,
                             401,
@@ -14036,7 +14068,25 @@ log_user_prompt = true
                             r#"{"detail":"Setup run companion token expired"}"#,
                         );
                     } else if request.contains("X-Ottto-Setup-Run-Token: otsr_fresh_verify") {
-                        verification_calls += 1;
+                        marker_calls += 1;
+                        write_json_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                        );
+                    } else {
+                        write_json_response(
+                            &mut stream,
+                            400,
+                            "Bad Request",
+                            r#"{"detail":"marker used stale setup token"}"#,
+                        );
+                    }
+                } else if request.contains("/local-client/verification") {
+                    if request.contains("X-Ottto-Setup-Run-Token: otsr_fresh_verify")
+                        && marker_calls > 1
+                    {
                         write_json_response(
                             &mut stream,
                             200,
@@ -14110,6 +14160,7 @@ log_user_prompt = true
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind verify refresh backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
+            let mut marker_seen = false;
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept verify request");
                 let request = read_complete_http_request(&mut stream);
@@ -14120,8 +14171,19 @@ log_user_prompt = true
                         "OK",
                         r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
                     );
+                } else if request.contains("/local-client/verification-marker")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    marker_seen = true;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                    );
                 } else if request.contains("/local-client/verification")
                     && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                    && marker_seen
                 {
                     write_json_response(
                         &mut stream,
@@ -14148,6 +14210,7 @@ log_user_prompt = true
             TcpListener::bind("127.0.0.1:0").expect("bind invalid verify refresh backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
+            let mut marker_seen = false;
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept verify request");
                 let request = read_complete_http_request(&mut stream);
@@ -14158,8 +14221,28 @@ log_user_prompt = true
                         "OK",
                         r#"{"setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
                     );
+                } else if request.contains("/local-client/verification-marker")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    marker_seen = true;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                    );
+                } else if request.contains("/local-client/verification-marker")
+                    && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
                 } else if request.contains("/local-client/verification")
                     && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                    && marker_seen
                 {
                     write_json_response(
                         &mut stream,
@@ -14195,6 +14278,7 @@ log_user_prompt = true
             TcpListener::bind("127.0.0.1:0").expect("bind rebound verify refresh backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
+            let mut marker_seen = false;
             for _ in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept verify request");
                 let request = read_complete_http_request(&mut stream);
@@ -14205,9 +14289,31 @@ log_user_prompt = true
                         "OK",
                         r#"{"setup_run_id":"setup_verify_rebound","setup_run_token":"otsr_verify_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
                     );
+                } else if request.contains(
+                    "/api/v1/setup-runs/setup_verify_rebound/local-client/verification-marker",
+                ) && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                {
+                    marker_seen = true;
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/setup-runs/setup_verify_stale/local-client/verification-marker",
+                ) && request.contains("X-Ottto-Setup-Run-Token: otsr_stale_verify")
+                {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        r#"{"detail":"Setup run companion token is invalid"}"#,
+                    );
                 } else if request
                     .contains("/api/v1/setup-runs/setup_verify_rebound/local-client/verification")
                     && request.contains("X-Ottto-Setup-Run-Token: otsr_verify_fresh")
+                    && marker_seen
                 {
                     write_json_response(
                         &mut stream,
@@ -14264,6 +14370,13 @@ log_user_prompt = true
                     }
                 } else if request.contains("/actions/action_verify_codex/events") {
                     write_json_response(&mut stream, 200, "OK", "{}");
+                } else if request.contains("/local-client/verification-marker") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"source":"codex","marker_id":"marker_test","received_at":"2026-06-11T18:00:00Z","last_record_id":"verification_marker:1"}"#,
+                    );
                 } else if request.contains("/local-client/verification") {
                     write_json_response(
                         &mut stream,
