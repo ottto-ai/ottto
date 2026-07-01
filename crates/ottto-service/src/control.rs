@@ -5804,10 +5804,15 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
             program: "codex",
             args: vec![
                 "exec",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
                 "--json",
                 "--sandbox",
                 "read-only",
                 "--skip-git-repo-check",
+                "-c",
+                "model_reasoning_effort=low",
                 SMOKE_PROMPT,
             ]
             .into_iter()
@@ -11067,11 +11072,18 @@ mod tests {
 
         assert_eq!(command.program, "codex");
         assert!(command.args.iter().any(|arg| arg == "exec"));
+        assert!(command.args.iter().any(|arg| arg == "--ignore-user-config"));
+        assert!(command.args.iter().any(|arg| arg == "--ignore-rules"));
+        assert!(command.args.iter().any(|arg| arg == "--ephemeral"));
         assert!(command.args.iter().any(|arg| arg == "--json"));
         assert!(command
             .args
             .iter()
             .any(|arg| arg == "--skip-git-repo-check"));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|args| args == ["-c", "model_reasoning_effort=low"]));
         assert!(command.args.iter().any(|arg| arg == SMOKE_PROMPT));
     }
 
