@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 226,
-  "content_sha256": "9d25c0c6592fc5bf5216c5c1731ddd669e501769bd56ae27e7c8c61402bab51c",
+  "content_sha256": "3d684c0e0eb507cc9c8a7f62477418dcbe2825f380e17eb09322d23c3eb6729f",
   "files": [
     {
       "executable": false,
@@ -69,8 +69,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "569d52412f511b5c2126b0dca01ff94418292b194a72e7eb662d2ab5dbc448a4",
-      "size_bytes": 41716
+      "sha256": "26d56d3c1ac666d149cd782d3b20b8b329dc18b0ab40cea9bb1d0b18afd3b5cb",
+      "size_bytes": 41728
     },
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "4dc4ca3c72ad459bc45e77a0059eab698234b494b17a9402d9216222b2ab0cec",
-      "size_bytes": 560841
+      "sha256": "bc570ed53b28242278eea1b734f9fdc0b4c6651dc94f9798327eaa1d877f7a20",
+      "size_bytes": 560338
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "149dd6b2a4783e42ac1d357c4c8dad928bb2edf47a9d4933c66ae9e007719a84",
-      "size_bytes": 235654
+      "sha256": "161ff281638734cb657fbf4168c2838802a18330c3f504a4497ff0f3f867c3da",
+      "size_bytes": 235790
     },
     {
       "executable": false,

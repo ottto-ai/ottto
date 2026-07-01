@@ -463,9 +463,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   setup/verify/repair/skip actions, and disclosure details all render from the
   typed local-control status/setup/verify payloads instead of shelling out or
   scanning local files in SwiftUI.
-- source verification that runs a bounded local smoke prompt, waits for delayed
-  backend telemetry, uses the daemon-owned setup-run token to call the backend
-  local-client verification endpoint, updates local source health, and reports
+- source verification that runs a bounded local smoke prompt, waits for fresh
+  backend verification evidence, uses the daemon-owned setup-run token to call
+  the backend local-client verification endpoint, updates local source health,
+  and reports
   verified/no-fresh-telemetry/reconnect-required/local-smoke-failure states
   instead of a placeholder pending result. Pi verification runs a real
   non-interactive `pi --print` prompt for every configured provider/model route
