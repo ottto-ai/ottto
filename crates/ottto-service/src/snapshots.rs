@@ -62,8 +62,16 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // selector_context so already-scanned sessions re-emit with subagent, skill,
 // plugin, and MCP server selector rows. `attribution_mcp_tool` stays stripped
 // because it is too high-cardinality for the first contract.
+// claude_code v12: each Claude Code session now carries session-level latency
+// aggregates (`avg_duration_ms` / `max_duration_ms`) derived from per-turn
+// wall-clock durations — each assistant API response's first content-block
+// timestamp minus the preceding `type=user` record (prompt or tool_result).
+// Claude Code transcripts carry ms-precision RFC3339 timestamps on every record
+// but no first-token marker, so TTFT stays absent (unlike Codex `task_complete`,
+// which supplies both). The bump re-walks existing Claude sessions once so
+// already-scanned sessions re-emit with the duration aggregates populated.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v11";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v12";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -925,6 +933,14 @@ struct SnapshotAccumulator {
     // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
     // the set's lifetime matches one scan of one session file exactly.
     seen_claude_usage_keys: BTreeSet<String>,
+    // Timestamp of the most recent Claude Code `type=user` record (a real user
+    // prompt OR a tool_result — both are "model input available" moments). Each
+    // assistant API response's first content-block record subtracts this to
+    // derive that turn's wall-clock duration, feeding the shared
+    // `latency_duration_ms_*` accumulators. Claude Code stamps every record with
+    // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
+    // turn duration is derivable this way, never TTFT.
+    claude_last_user_ts: Option<String>,
 }
 
 impl SnapshotAccumulator {
@@ -958,6 +974,7 @@ impl SnapshotAccumulator {
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
+            claude_last_user_ts: None,
         }
     }
 
@@ -1002,6 +1019,38 @@ impl SnapshotAccumulator {
         {
             self.last_activity_at = Some(timestamp);
         }
+    }
+
+    /// Fold one Claude Code turn's wall-clock duration into the session latency
+    /// accumulators: the gap from the most recent `type=user` record (real
+    /// prompt or tool_result) to this API response's first content-block record.
+    /// Called once per API response (gated by the same usage dedup as token
+    /// counting), so each turn contributes exactly one duration sample — the
+    /// Claude Code analogue of the Codex `task_complete` latency path. Only whole
+    /// turn duration is derivable from Claude transcripts (no first-token
+    /// marker), so this never touches the TTFT accumulators. Records with no
+    /// preceding user timestamp, unparseable timestamps, or a negative delta
+    /// (out-of-order/clock skew) contribute nothing.
+    fn note_claude_turn_duration(&mut self, assistant_ts: Option<&str>) {
+        let (Some(user_ts), Some(assistant_ts)) =
+            (self.claude_last_user_ts.as_deref(), assistant_ts)
+        else {
+            return;
+        };
+        let (Ok(user), Ok(assistant)) = (
+            OffsetDateTime::parse(user_ts, &Rfc3339),
+            OffsetDateTime::parse(assistant_ts, &Rfc3339),
+        ) else {
+            return;
+        };
+        let millis = (assistant - user).whole_milliseconds();
+        if millis < 0 {
+            return;
+        }
+        let duration_ms = millis as u64;
+        self.latency_duration_ms_sum = self.latency_duration_ms_sum.saturating_add(duration_ms);
+        self.latency_duration_ms_count += 1;
+        self.latency_duration_ms_max = self.latency_duration_ms_max.max(duration_ms);
     }
 
     fn fallback_bucket_timestamp(&self, collected_at: Option<&str>) -> Option<String> {
@@ -2658,6 +2707,15 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
     accumulator.note_time(timestamp.clone());
+    // Remember the latest user-input moment so the next assistant response can
+    // derive its turn duration. A `type=user` record is either a real prompt or
+    // a tool_result; both are "model input available" instants and neither
+    // carries `message.usage`, so this never collides with the usage path below.
+    if string_eq_at(value, &["type"], "user") {
+        if let Some(user_ts) = timestamp.clone() {
+            accumulator.claude_last_user_ts = Some(user_ts);
+        }
+    }
     accumulator.set_title(string_at(value, &["aiTitle"]), "ai_title");
     accumulator.set_title_if_absent(
         string_at(value, &["summary"])
@@ -2689,6 +2747,12 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         _ => true,
     };
     if let Some(usage) = usage.filter(|_| usage_first_seen) {
+        // First content-block record of this API response: derive the turn's
+        // wall-clock duration (this record's timestamp minus the preceding user
+        // record) once, aligned with the once-per-response usage count above.
+        // Later duplicate content-block records of the same response are gated
+        // out here too, so each turn contributes exactly one latency sample.
+        accumulator.note_claude_turn_duration(timestamp.as_deref());
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -4663,6 +4727,101 @@ mod tests {
         // Max (slowest turn): duration max(2000, 4000) = 4000; ttft max(100, 300) = 300.
         assert_eq!(item.max_duration_ms, Some(4000));
         assert_eq!(item.max_time_to_first_token_ms, Some(300));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_derives_turn_duration_latency_per_session() {
+        // Claude Code has no `task_complete` latency event, but every record
+        // carries an ms-precision RFC3339 timestamp. A turn's wall-clock
+        // duration is the gap from the preceding `type=user` record (real prompt
+        // OR tool_result) to the assistant response's first content-block record.
+        // The duration is measured once per API response, deduped exactly like
+        // token usage, so the several content-block records of one response
+        // contribute a single sample.
+        let path = temp_file("claude-turn-duration");
+        fs::write(
+            &path,
+            concat!(
+                // Real user prompt at T+0.
+                "{\"timestamp\":\"2026-06-30T12:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"claude-latency-1\",\"message\":{\"role\":\"user\",\"content\":\"do the thing\"}}\n",
+                // Response 1 spans two content-block records (thinking + text),
+                // both repeating msg_A/req_A + usage. First record lands at
+                // T+2.000s -> turn 1 duration = 2000ms; the duplicate is deduped.
+                "{\"timestamp\":\"2026-06-30T12:00:02.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-1\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}}\n",
+                "{\"timestamp\":\"2026-06-30T12:00:02.750Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-1\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}}\n",
+                // Tool result comes back as a `type=user` record at T+3.000s; it
+                // becomes the input moment for the next response.
+                "{\"timestamp\":\"2026-06-30T12:00:03.000Z\",\"type\":\"user\",\"sessionId\":\"claude-latency-1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}]}}\n",
+                // Response 2 lands at T+9.000s -> turn 2 duration measured from
+                // the tool_result (not the original prompt) = 6000ms.
+                "{\"timestamp\":\"2026-06-30T12:00:09.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-1\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":10}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T12:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        // Session-level average across the two turns: (2000 + 6000) / 2 = 4000.
+        assert_eq!(item.avg_duration_ms, Some(4000));
+        // Slowest turn (the tail): max(2000, 6000) = 6000.
+        assert_eq!(item.max_duration_ms, Some(6000));
+        // TTFT is NOT derivable from Claude Code transcripts (no first-token
+        // marker), so both TTFT aggregates stay absent.
+        assert_eq!(item.avg_time_to_first_token_ms, None);
+        assert_eq!(item.max_time_to_first_token_ms, None);
+        // Latency measurement rides the same once-per-response gate as usage, so
+        // the deduped tokens/request_count are unaffected: response 1 counts
+        // once despite its two content-block records.
+        assert_eq!(item.input_tokens, 150);
+        assert_eq!(item.output_tokens, 30);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_turn_duration_skips_responses_without_preceding_user() {
+        // A response with no preceding `type=user` record (e.g. the transcript
+        // opens mid-stream after a compaction/resume) has no input moment to
+        // measure against and must contribute no latency sample. Only the
+        // response that follows a real user record is measured.
+        let path = temp_file("claude-turn-duration-noprompt");
+        fs::write(
+            &path,
+            concat!(
+                // Leading assistant response with nothing before it -> skipped.
+                "{\"timestamp\":\"2026-06-30T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-2\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-06-30T13:00:01.000Z\",\"type\":\"user\",\"sessionId\":\"claude-latency-2\",\"message\":{\"role\":\"user\",\"content\":\"continue\"}}\n",
+                // Only this response has a preceding user record: 4000ms.
+                "{\"timestamp\":\"2026-06-30T13:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"claude-latency-2\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T13:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        // Exactly one turn measured, so avg == max == that single sample.
+        assert_eq!(item.avg_duration_ms, Some(4000));
+        assert_eq!(item.max_duration_ms, Some(4000));
+        assert_eq!(item.avg_time_to_first_token_ms, None);
 
         let _ = fs::remove_file(path);
     }
