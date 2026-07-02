@@ -1,7 +1,14 @@
 {
-  "candidate_file_count": 226,
-  "content_sha256": "5a1827c9fa4850630dc73bc6df5307b7038ab8b189a01c77a89d1454b18bce42",
+  "candidate_file_count": 227,
+  "content_sha256": "7befc44de2c59be0620bda1520b5d92ef334361c41932433599f4b7117607af4",
   "files": [
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": ".cargo/audit.toml",
+      "sha256": "e470226f33fb2d904233ced08ce1a320b774a8aa7eda3d539ab10e561add4872",
+      "size_bytes": 791
+    },
     {
       "executable": false,
       "mode": "0644",
@@ -1585,9 +1592,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-02T19:56:46+00:00",
+  "generated_at": "2026-07-02T19:58:58+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 227,
+  "output_file_count": 228,
   "public_roots": [
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
@@ -1620,5 +1627,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f8700660f331faa33fe335a231690f21e1316434"
+  "source_commit": "3f7421a4471f6b25d5e804c84511741cea2cb3b0"
 }
