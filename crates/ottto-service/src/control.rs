@@ -6066,23 +6066,26 @@ fn import_new_pi_route_sessions(
 /// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
 /// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
 /// verify from re-uploading the user's entire session history.
-fn import_recent_pi_route_sessions(
+fn recent_pi_session_files(since: SystemTime) -> Vec<PathBuf> {
+    pi_session_files_modified_since(pi_session_files(), since)
+}
+
+fn import_pi_route_session_files(
     api_base_url: &str,
     route: &PiModelRoute,
-    since: SystemTime,
+    session_files: &[PathBuf],
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    let session_files = pi_session_files_modified_since(pi_session_files(), since);
     if session_files.is_empty() {
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+    upload_pi_import_run(api_base_url, &relay_token, route, session_files).map(Some)
 }
 
 /// Keep only session files whose on-disk mtime is at or after `since`. Files
 /// whose metadata can't be read are dropped (treated as not-recent), matching
 /// the conservative behavior of the live-import path. Pure helper so the mtime
-/// bound used by `import_recent_pi_route_sessions` is unit-testable without the
+/// bound used by the passive Pi route verifier is unit-testable without the
 /// relay-token / upload network calls.
 fn pi_session_files_modified_since(
     files: impl IntoIterator<Item = PathBuf>,
@@ -7551,8 +7554,9 @@ fn rfc3339_hours_ago(hours: u32) -> String {
 
 /// Verify a subscription-OAuth Pi route without a live smoke: query the backend
 /// for recently-observed usage for this route (model/provider filtered) over
-/// a passive lookback window. Fresh usage -> Verified; none -> an actionable
-/// re-auth Warning (never a hard smoke failure); backend error -> error result.
+/// a passive lookback window. Fresh usage -> Verified; fresh local route/account
+/// evidence -> local-only verified Warning; none -> an actionable re-auth
+/// Warning (never a hard smoke failure); backend error -> error result.
 fn verify_pi_subscription_oauth_route_passively(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
@@ -7570,10 +7574,16 @@ fn verify_pi_subscription_oauth_route_passively(
             u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
         ))
         .unwrap_or(UNIX_EPOCH);
-    if let Err(error) = import_recent_pi_route_sessions(api_base_url, route, import_since) {
+    let recent_session_files = recent_pi_session_files(import_since);
+    if let Err(error) = import_pi_route_session_files(api_base_url, route, &recent_session_files) {
         eprintln!("Pi passive route session import failed (non-fatal): {error}");
     }
-    let local_session_observed = Some(!pi_session_files().is_empty());
+    let recent_local_session_observed = !recent_session_files.is_empty();
+    let local_session_observed = Some(recent_local_session_observed);
+    let local_evidence_observed = pi_route_has_local_verification_evidence(
+        &pi_route_billing_identity_hints(route),
+        recent_local_session_observed,
+    );
     let filters = if pi_route_is_unscoped(route) {
         None
     } else {
@@ -7606,6 +7616,21 @@ fn verify_pi_subscription_oauth_route_passively(
             None,
             format!(
                 "Pi route {} verification passed from recent usage.",
+                pi_route_label(route)
+            ),
+            local_session_observed,
+        ),
+        Ok(_) if local_evidence_observed => pi_route_passive_result(
+            route,
+            SourceVerificationStatus::Warning,
+            true,
+            0,
+            None,
+            None,
+            Some(lookback),
+            Some(PI_LOCAL_ONLY_CODE.to_string()),
+            format!(
+                "Verified Pi route {} from local route/account evidence. Pi is local-only for this rotating-OAuth route; live telemetry matching is not required.",
                 pi_route_label(route)
             ),
             local_session_observed,
@@ -7715,6 +7740,17 @@ fn run_pi_route_smoke_prompt(
 fn pi_route_billing_identity_hints(route: &PiModelRoute) -> BillingIdentityHints {
     let auth = read_pi_agent_auth();
     pi_identity_hints_for_route(auth.as_ref(), route)
+}
+
+fn pi_route_has_local_verification_evidence(
+    identity: &BillingIdentityHints,
+    recent_local_session_observed: bool,
+) -> bool {
+    recent_local_session_observed
+        || identity.billing_identity_evidence.is_some()
+        || identity.account_identifier_hash.is_some()
+        || identity.organization_identifier_hash.is_some()
+        || identity.credential_fingerprint_hash.is_some()
 }
 
 fn pi_route_result_from_smoke(
@@ -8818,6 +8854,25 @@ mod tests {
         gateway.classification.auth_mode = Some("oauth".to_string());
         gateway.classification.billing_channel = Some("usage".to_string());
         assert!(!route_is_subscription_oauth(&gateway));
+    }
+
+    #[test]
+    fn subscription_oauth_local_evidence_accepts_recent_session_or_identity() {
+        let empty_identity = BillingIdentityHints::default();
+        assert!(!pi_route_has_local_verification_evidence(
+            &empty_identity,
+            false
+        ));
+        assert!(pi_route_has_local_verification_evidence(
+            &empty_identity,
+            true
+        ));
+
+        let identity = BillingIdentityHints {
+            account_identifier_hash: Some("acct_hash".to_string()),
+            ..BillingIdentityHints::default()
+        };
+        assert!(pi_route_has_local_verification_evidence(&identity, false));
     }
 
     #[test]

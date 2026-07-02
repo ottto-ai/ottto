@@ -63,6 +63,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 const USAGE_LIMITED_MESSAGE_CODE: &str = "usage_limited";
 const SMOKE_QUOTA_LIMITED_MESSAGE_CODE: &str = "smoke_quota_limited";
 const PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE: &str = "pi_route_smoke_failed";
+const PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE: &str = "pi_oauth_reauth_required";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendErrorKind {
@@ -2930,6 +2931,19 @@ fn has_pi_route_smoke_failure_problem(health: &SourceHealth) -> bool {
         })
 }
 
+fn has_pi_oauth_reauth_problem(health: &SourceHealth) -> bool {
+    health.source == SourceKind::Pi
+        && health.problems.iter().any(|problem| {
+            problem.code == StableProblemCode::TelemetryNotVerified
+                && (problem
+                    .detail
+                    .contains(PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE)
+                    || problem.detail.contains("provider OAuth re-auth")
+                    || problem.detail.contains("rotating provider OAuth token")
+                    || problem.detail.contains("Re-sign in to the Pi provider"))
+        })
+}
+
 fn refreshed_pi_status_has_available_routes(refreshed: &SourceHealth) -> bool {
     if refreshed.source != SourceKind::Pi || refreshed.state != SourceState::Healthy {
         return false;
@@ -2946,6 +2960,56 @@ fn refreshed_pi_status_has_available_routes(refreshed: &SourceHealth) -> bool {
         })
 }
 
+fn refreshed_pi_status_has_subscription_oauth_identity_evidence(refreshed: &SourceHealth) -> bool {
+    if refreshed.source != SourceKind::Pi || refreshed.state != SourceState::Healthy {
+        return false;
+    }
+    let Some(snapshot) = refreshed.agent_status.as_ref() else {
+        return false;
+    };
+    snapshot.model.as_ref().is_some_and(|model| {
+        model.available_model_details.iter().any(|detail| {
+            has_subscription_oauth_identity_evidence(
+                detail.auth_mode.as_deref(),
+                detail.billing_channel.as_deref(),
+                detail.account_identifier_hash.as_deref(),
+                detail.organization_identifier_hash.as_deref(),
+                detail.credential_fingerprint_hash.as_deref(),
+                detail.billing_identity_evidence.as_deref(),
+            )
+        })
+    }) || snapshot.plan_observations.iter().any(|observation| {
+        has_subscription_oauth_identity_evidence(
+            observation.auth_mode.as_deref(),
+            observation.billing_channel.as_deref(),
+            observation.account_identifier_hash.as_deref(),
+            observation.organization_identifier_hash.as_deref(),
+            observation.credential_fingerprint_hash.as_deref(),
+            observation.billing_identity_evidence.as_deref(),
+        )
+    })
+}
+
+fn has_subscription_oauth_identity_evidence(
+    auth_mode: Option<&str>,
+    billing_channel: Option<&str>,
+    account_identifier_hash: Option<&str>,
+    organization_identifier_hash: Option<&str>,
+    credential_fingerprint_hash: Option<&str>,
+    billing_identity_evidence: Option<&str>,
+) -> bool {
+    auth_mode == Some("oauth")
+        && billing_channel == Some("subscription")
+        && [
+            account_identifier_hash,
+            organization_identifier_hash,
+            credential_fingerprint_hash,
+            billing_identity_evidence,
+        ]
+        .into_iter()
+        .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
+}
+
 fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: &SourceHealth) {
     let preserve_config_drift =
         refreshed.config.drift.is_empty() && !existing.config.drift.is_empty();
@@ -2957,7 +3021,9 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
         || has_soft_verification_service_unavailable_problem(existing)
         || has_usage_limited_verification_problem(existing)
         || (has_pi_route_smoke_failure_problem(existing)
-            && refreshed_pi_status_has_available_routes(refreshed));
+            && refreshed_pi_status_has_available_routes(refreshed))
+        || (has_pi_oauth_reauth_problem(existing)
+            && refreshed_pi_status_has_subscription_oauth_identity_evidence(refreshed));
     let preserve_failed_verification = existing.last_verified_at.is_some()
         && has_verification_failure_problem(existing)
         && !clear_failed_verification;
@@ -4797,6 +4863,67 @@ mod tests {
     }
 
     #[test]
+    fn pi_oauth_reauth_warning_clears_after_runtime_identity_refresh() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::Pi,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "pi_oauth_reauth_required".to_string(),
+                text: "Re-sign in to the Pi provider, then re-run Verify -- Ottto can't re-mint a rotating provider OAuth token."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record warning verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        assert_eq!(before_scan.sources[0].state, SourceState::NeedsConfirmation);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                pi_subscription_oauth_agent_status("2026-05-05T10:40:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        let pi = status
+            .sources
+            .iter()
+            .find(|source| source.source == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(pi.state, SourceState::Healthy);
+        assert_eq!(pi.grade, HealthGrade::Ok);
+        assert!(pi.last_verified_at.is_none());
+        assert!(pi.problems.is_empty());
+        let source = status
+            .canonical_health
+            .expect("canonical health")
+            .sources
+            .into_iter()
+            .find(|source| source.app == SourceKind::Pi)
+            .expect("Pi source");
+        assert_eq!(source.state, LocalHealthSourceState::Healthy);
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert!(source.blocking_reason.is_none());
+    }
+
+    #[test]
     fn pi_local_only_verification_projects_non_blocking_health() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
@@ -5999,6 +6126,38 @@ mod tests {
             diagnostics: Vec::new(),
             runtime_defaults: None,
         }
+    }
+
+    fn pi_subscription_oauth_agent_status(captured_at: &str) -> AgentStatusSnapshot {
+        let mut snapshot = available_agent_status(SourceKind::Pi, captured_at);
+        snapshot.model = Some(ottto_protocol::AgentModelStatus {
+            active_model: Some("gpt-5.5".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            provider: Some("openai-codex".to_string()),
+            available_models: vec!["gpt-5.5".to_string()],
+            available_model_details: vec![ottto_protocol::AgentAvailableModelStatus {
+                id: "gpt-5.5".to_string(),
+                provider: Some("openai-codex".to_string()),
+                model_provider: Some("openai".to_string()),
+                billing_provider: Some("openai".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                auth_mode: Some("oauth".to_string()),
+                gateway_provider: None,
+                subscription_product: Some("chatgpt".to_string()),
+                source_category: Some("chatgpt_openai_subscription".to_string()),
+                account_identifier_hash: Some("acct_hash".to_string()),
+                organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: Some("provider_account_id".to_string()),
+                billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
+                context_window_tokens: None,
+                max_output_tokens: None,
+                supports_thinking: Some(true),
+                supports_images: None,
+            }],
+            context_window_tokens: None,
+        });
+        snapshot
     }
 
     fn verified_codex(last_received_at: &str) -> SourceVerificationResult {
