@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 227,
-  "content_sha256": "7befc44de2c59be0620bda1520b5d92ef334361c41932433599f4b7117607af4",
+  "content_sha256": "a7291d03454cfbe15a5e955c554a0ee2c4f82864ed76ea08b755bbd2264cc35b",
   "files": [
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "bc570ed53b28242278eea1b734f9fdc0b4c6651dc94f9798327eaa1d877f7a20",
-      "size_bytes": 560338
+      "sha256": "2075ab81aa26f807a0ea2c9ef1cea856d8500ef10697e7f879bc7527b5acb4a4",
+      "size_bytes": 562387
     },
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "161ff281638734cb657fbf4168c2838802a18330c3f504a4497ff0f3f867c3da",
-      "size_bytes": 235790
+      "sha256": "b6c5ceb98e530b295420e843d0313a0399f4587cd4553754b3759c74e81e3435",
+      "size_bytes": 242672
     },
     {
       "executable": false,
@@ -1161,8 +1161,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/path-map.tsv",
-      "sha256": "c3ca074933c4a59be1aa5852d22bb09f89907902dd79c168f494a12c719f752c",
-      "size_bytes": 2289
+      "sha256": "e9bd3ca628e9d5310a56582ec3f1f1644a1a0267e7b05dc95ae0800c241cf588",
+      "size_bytes": 2370
     },
     {
       "executable": false,
@@ -1175,8 +1175,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/roots.txt",
-      "sha256": "155c9a9cadb5b7b86eb6ca3792549cb8ebcf93027890659213793ab5d0842adf",
-      "size_bytes": 498
+      "sha256": "206019b1ad3b3ca867ae5ee5d75eda5eff798f1d37872c861d15892beb6d6580",
+      "size_bytes": 516
     },
     {
       "executable": false,
@@ -1592,10 +1592,11 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-02T19:58:58+00:00",
+  "generated_at": "2026-07-02T20:28:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 228,
   "public_roots": [
+    ".cargo/audit.toml",
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/macos-stable-release.yml",
@@ -1627,5 +1628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3f7421a4471f6b25d5e804c84511741cea2cb3b0"
+  "source_commit": "da25cd099350c88158b4f04d2d6ee37e8cb5d8c5"
 }

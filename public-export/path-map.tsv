@@ -1,4 +1,5 @@
 # source_prefix	destination_prefix	reason
+.cargo/audit.toml	.cargo	Public repository root file is already in export shape.
 .github/dependabot.yml	.github	Public repository root file is already in export shape.
 .github/workflows/ci.yml	.github/workflows	Public repository root file is already in export shape.
 .github/workflows/macos-stable-release.yml	.github/workflows	Public repository root file is already in export shape.
