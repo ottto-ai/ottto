@@ -467,9 +467,16 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
 /// agent-status sync response, so the status command can surface it on
 /// `status.machine.icon_url`. Never fails sync on a write error.
 fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
+    let Some(icon_url) = response
+        .machine_icon_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return;
+    };
     let payload = serde_json::json!({
         "machine_id": response.machine_id,
-        "icon_url": response.machine_icon_url,
+        "icon_url": icon_url,
         "icon_version": response.machine_icon_version,
     });
     if let Ok(serialized) = serde_json::to_string(&payload) {
@@ -1357,6 +1364,65 @@ mod tests {
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
         assert!(requests[1].contains("\"source\":\"codex\""));
         assert!(!requests[1].contains("claude_code"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn machine_icon_cache_preserves_existing_icon_when_backend_echo_is_null() {
+        let root = test_dir("machine-icon-cache-preserve-null");
+        let support_dir = root.join("support");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let cache_path = support_dir.join("machine_icon.json");
+        std::fs::write(
+            &cache_path,
+            r#"{"machine_id":"otm_test","icon_url":"https://cdn.ottto.net/icon.png","icon_version":7}"#,
+        )
+        .expect("write existing icon cache");
+
+        persist_machine_icon(&AgentStatusSnapshotUploadResponse {
+            accepted: 1,
+            machine_id: "otm_test".to_string(),
+            sources: vec!["codex".to_string()],
+            machine_icon_url: None,
+            machine_icon_version: None,
+        });
+
+        let cached: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).expect("read icon cache"))
+                .expect("parse icon cache");
+        assert_eq!(cached["machine_id"], "otm_test");
+        assert_eq!(cached["icon_url"], "https://cdn.ottto.net/icon.png");
+        assert_eq!(cached["icon_version"], 7);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn machine_icon_cache_updates_when_backend_echo_has_url() {
+        let root = test_dir("machine-icon-cache-update-url");
+        let support_dir = root.join("support");
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+        let cache_path = support_dir.join("machine_icon.json");
+
+        persist_machine_icon(&AgentStatusSnapshotUploadResponse {
+            accepted: 1,
+            machine_id: "otm_test".to_string(),
+            sources: vec!["codex".to_string()],
+            machine_icon_url: Some("https://cdn.ottto.net/fresh.png".to_string()),
+            machine_icon_version: Some(8),
+        });
+
+        let cached: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cache_path).expect("read icon cache"))
+                .expect("parse icon cache");
+        assert_eq!(cached["machine_id"], "otm_test");
+        assert_eq!(cached["icon_url"], "https://cdn.ottto.net/fresh.png");
+        assert_eq!(cached["icon_version"], 8);
 
         let _ = std::fs::remove_dir_all(root);
     }
