@@ -86,6 +86,12 @@ const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
 const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
+/// Verification message/error code for a source whose CLI is genuinely not
+/// installed on this machine. Reported instead of running a doomed smoke that
+/// would surface "not installed or not executable" as a blocking telemetry
+/// failure. Maps to a non-blocking `not_found` source state. Shared with the
+/// crate-root health projection via [`crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE`].
+const SOURCE_NOT_INSTALLED_CODE: &str = crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
@@ -5593,6 +5599,26 @@ fn run_verify_source_action(
     if source == SourceKind::Pi {
         return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
+    if !source_binary_present(&source) {
+        let result =
+            not_installed_verification_result(source.clone(), empty_source_config(&source));
+        daemon.record_verification_result(&result)?;
+        let message = result.message.text.clone();
+        return Ok((
+            "succeeded".to_string(),
+            message.clone(),
+            json!({
+                "status": verification_status_slug(&result.status),
+                "verified": false,
+                "records_seen": 0,
+                "last_record_id": serde_json::Value::Null,
+                "last_received_at": serde_json::Value::Null,
+                "smoke_after": serde_json::Value::Null,
+                "error_code": SOURCE_NOT_INSTALLED_CODE,
+                "error_message": message,
+            }),
+        ));
+    }
     let smoke_after = current_rfc3339();
     let smoke = run_smoke_prompt(&source);
     record_setup_action_event(
@@ -6578,6 +6604,42 @@ fn smoke_failure_verification_result_with_config(
     )
 }
 
+/// Whether the source's CLI binary is genuinely present on this machine, using
+/// the canonical presence contract (binary found, or — for Codex/Pi — a genuine
+/// user config directory). Claude requires the binary: a lone
+/// `~/.claude/settings.json` that Ottto's own patch writes does not count. Used
+/// to short-circuit verification before running a doomed smoke.
+fn source_binary_present(source: &SourceKind) -> bool {
+    crate::agent_configs::detection::source_present_locally(source)
+}
+
+/// A clean, non-blocking verification result for a source that is not installed
+/// on this machine. Uses a dedicated `source_not_installed` code so the health
+/// projection renders it as informational `not_found` (finish setup) rather than
+/// a blocking `verify_failed`/`repair_required` telemetry problem.
+fn not_installed_verification_result(
+    source: SourceKind,
+    config: SourceConfigState,
+) -> SourceVerificationResult {
+    let text = format!(
+        "{} is not installed on this Mac, so there is nothing to verify. Install {} on this Mac to start sending telemetry, or leave it off here.",
+        source_display_name(&source),
+        source_display_name(&source),
+    );
+    verification_result_with_config(
+        source,
+        config,
+        SourceVerificationStatus::Warning,
+        false,
+        0,
+        None,
+        None,
+        None,
+        SOURCE_NOT_INSTALLED_CODE,
+        &text,
+    )
+}
+
 fn smoke_result_metadata(smoke: &SmokeResult) -> serde_json::Value {
     json!({
         "command_found": smoke.command_found,
@@ -7320,6 +7382,18 @@ fn verify_source(
     // install fail to verify Codex even though the smoke ran and `fix` reported
     // success. Detect the missing provisioning up front and return an accurate,
     // actionable status instead of running a doomed smoke.
+    //
+    // Before any of that: if the source CLI is genuinely not installed on this
+    // Mac, there is nothing to smoke. Running the smoke anyway returns
+    // "not installed or not executable", which the health projection renders as
+    // a BLOCKING telemetry failure and stalls onboarding on a machine that never
+    // had the app. Report a clean, non-blocking not-installed result instead.
+    if !source_binary_present(&source) {
+        let result = not_installed_verification_result(source.clone(), config);
+        daemon.record_verification_result(&result)?;
+        return Ok(result);
+    }
+
     if !relay_device_is_provisioned() {
         let result = verification_result_with_config(
             source.clone(),

@@ -28,6 +28,43 @@ pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetect
     detect_agent_installation_with_paths(source, spec, binary_path, version)
 }
 
+/// Whether a source is genuinely present on THIS machine, using the same
+/// contract as [`detect_agent_installation`] but without spawning `--version`.
+///
+/// This is the single source of truth for "does this Mac actually have the
+/// app". It must NOT be satisfied by config that Ottto itself writes during
+/// onboarding: Claude Code is `installed_when_config_parent_exists: false`, so a
+/// lone `~/.claude/settings.json` (which the relay-base patch creates) does not
+/// count — the `claude` binary must be found. Codex/Pi treat a genuine
+/// user-owned config directory as presence, matching their detection specs.
+pub fn source_present_locally(source: &SourceKind) -> bool {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    source_present_with_home(source, &home)
+}
+
+fn source_present_with_home(source: &SourceKind, home: &Path) -> bool {
+    let spec = detection_spec(source, home);
+    let binary_found = crate::command_env::executable_path(spec.binary_name).is_some();
+    source_present_with_paths(spec, binary_found)
+}
+
+/// Pure presence decision so tests can drive the binary-found flag
+/// deterministically without depending on what is installed on the dev machine.
+fn source_present_with_paths(spec: DetectionSpec, binary_found: bool) -> bool {
+    if binary_found {
+        return true;
+    }
+    if !spec.installed_when_config_parent_exists {
+        return false;
+    }
+    spec.config_path
+        .as_ref()
+        .map(|path| path.exists() || path.parent().is_some_and(Path::exists))
+        .unwrap_or(false)
+}
+
 fn detect_agent_installation_with_paths(
     source: &SourceKind,
     spec: DetectionSpec,
@@ -217,5 +254,65 @@ mod tests {
         assert!(detected.installed);
         assert_eq!(detected.binary_path, Some(binary.display().to_string()));
         assert_eq!(detected.version.as_deref(), Some("codex 0.124.0"));
+    }
+
+    #[test]
+    fn presence_claude_requires_binary_not_ottto_written_settings() {
+        let home = test_home("presence-claude-settings");
+        let path = home.join(".claude").join("settings.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("claude dir");
+        // Ottto's own relay-base patch writes this file during onboarding; it
+        // must not make an uninstalled Claude read as present.
+        fs::write(&path, "{}").expect("settings");
+
+        // Binary absent -> not present even though settings.json (and its parent
+        // dir) exist.
+        assert!(!source_present_with_paths(
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            false,
+        ));
+        // Binary present -> present.
+        assert!(source_present_with_paths(
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            true,
+        ));
+    }
+
+    #[test]
+    fn presence_claude_absent_with_no_config_is_not_present() {
+        let home = test_home("presence-claude-empty");
+        assert!(!source_present_with_paths(
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            false,
+        ));
+    }
+
+    #[test]
+    fn presence_codex_config_dir_counts_when_binary_absent() {
+        let home = test_home("presence-codex-config");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        // Codex treats a genuine user config directory as presence.
+        assert!(source_present_with_paths(
+            detection_spec(&SourceKind::Codex, &home),
+            false,
+        ));
+    }
+
+    #[test]
+    fn presence_codex_absent_with_no_config_is_not_present() {
+        let home = test_home("presence-codex-empty");
+        assert!(!source_present_with_paths(
+            detection_spec(&SourceKind::Codex, &home),
+            false,
+        ));
+    }
+
+    #[test]
+    fn presence_pi_absent_with_no_data_is_not_present() {
+        let home = test_home("presence-pi-empty");
+        assert!(!source_present_with_paths(
+            detection_spec(&SourceKind::Pi, &home),
+            false,
+        ));
     }
 }
