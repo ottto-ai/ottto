@@ -917,6 +917,14 @@ struct SnapshotAccumulator {
     // Max (slowest single turn) alongside the avg — the tail the average hides.
     latency_duration_ms_max: u64,
     latency_ttft_ms_max: u64,
+    // Claude Code writes one JSONL record per assistant CONTENT BLOCK, and
+    // every record of the same API response repeats the same `message.id` +
+    // `requestId` with byte-identical `message.usage`. Counting each record
+    // overstates tokens and request_count ~3-6x. This set remembers which
+    // API responses already contributed usage so each response counts once.
+    // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
+    // the set's lifetime matches one scan of one session file exactly.
+    seen_claude_usage_keys: BTreeSet<String>,
 }
 
 impl SnapshotAccumulator {
@@ -949,6 +957,7 @@ impl SnapshotAccumulator {
             latency_ttft_ms_count: 0,
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
+            seen_claude_usage_keys: BTreeSet::new(),
         }
     }
 
@@ -2666,7 +2675,20 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["projectPath"]))
             .or_else(|| string_at(value, &["workspace"])),
     );
-    if let Some(usage) = claude_code_delta_usage(value) {
+    // One API response can span several JSONL records (one per assistant
+    // content block), each repeating the same `message.id` + `requestId` with
+    // identical usage. Count usage once per response; duplicate records still
+    // contribute every NON-usage signal above (timestamps, model, title,
+    // sidechain, workspace) and the artifact scrape below.
+    let usage = claude_code_delta_usage(value);
+    let usage_first_seen = match (usage.is_some(), claude_code_usage_dedup_key(value)) {
+        // Only usage-bearing lines consume the key: a keyed line without
+        // usage must not shadow the later record that carries the tokens.
+        (true, Some(key)) => accumulator.seen_claude_usage_keys.insert(key),
+        // No message.id and no requestId: nothing to dedup on, count the line.
+        _ => true,
+    };
+    if let Some(usage) = usage.filter(|_| usage_first_seen) {
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -3117,6 +3139,25 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
         .or_else(|| u64_at(usage, &["cache_write"]))
         .unwrap_or_default();
     (flat, 0)
+}
+
+/// Identity of the API response behind one Claude Code JSONL record, used to
+/// count `message.usage` once per response instead of once per content-block
+/// record. Keyed on the (`message.id`, `requestId`) PAIR when both exist —
+/// conservative: if either differs, the line is treated as a distinct
+/// response — falling back to whichever is present alone. `None` (neither id)
+/// means no dedup is possible and the caller counts the line.
+fn claude_code_usage_dedup_key(value: &Value) -> Option<String> {
+    let message_id = string_at(value, &["message", "id"]);
+    let request_id = string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
+    match (message_id, request_id) {
+        (Some(message_id), Some(request_id)) => {
+            Some(format!("p\u{1f}{message_id}\u{1f}{request_id}"))
+        }
+        (Some(message_id), None) => Some(format!("m\u{1f}{message_id}")),
+        (None, Some(request_id)) => Some(format!("r\u{1f}{request_id}")),
+        (None, None) => None,
+    }
 }
 
 fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
@@ -6684,6 +6725,138 @@ mod tests {
             item.provenance.input_token_scope.as_deref(),
             Some("uncached")
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_duplicate_content_block_records_count_usage_once() {
+        // Claude Code writes one JSONL record per assistant content block; all
+        // records of one API response share message.id + requestId and repeat
+        // byte-identical usage. Only the first may count.
+        let path = temp_file("claude-dedup-same-response");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-30T10:01:00Z\",\"sessionId\":\"claude-dedup-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":3}}}\n",
+                "{\"timestamp\":\"2026-06-30T10:01:01Z\",\"sessionId\":\"claude-dedup-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":3}}}\n",
+                "{\"timestamp\":\"2026-06-30T10:01:02Z\",\"sessionId\":\"claude-dedup-1\",\"requestId\":\"req_011AAA\",\"isSidechain\":true,\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 10);
+        assert_eq!(item.output_tokens, 5);
+        assert_eq!(item.cache_read_tokens, 3);
+        // Dedup fixes request_count implicitly: one counted usage = one request.
+        assert_eq!(item.request_count, 1);
+        // Duplicate records still contribute NON-usage signals: the sidechain
+        // flag rode in on the third (skipped-usage) record.
+        assert_eq!(
+            item.origin.expect("origin forwarded").is_sidechain,
+            Some(true)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_distinct_response_ids_count_separately() {
+        let path = temp_file("claude-dedup-distinct-ids");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-30T11:01:00Z\",\"sessionId\":\"claude-dedup-2\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-06-30T11:02:00Z\",\"sessionId\":\"claude-dedup-2\",\"requestId\":\"req_011BBB\",\"message\":{\"id\":\"msg_011BBB\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T11:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 17);
+        assert_eq!(item.output_tokens, 14);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_usage_without_ids_counts_each_line() {
+        // No message.id and no requestId: nothing to dedup on, so identical
+        // usage on consecutive lines still counts per line (legacy behavior).
+        let path = temp_file("claude-dedup-no-ids");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-30T12:01:00Z\",\"sessionId\":\"claude-dedup-3\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-06-30T12:02:00Z\",\"sessionId\":\"claude-dedup-3\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T12:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 20);
+        assert_eq!(item.output_tokens, 10);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_same_message_id_different_request_id_counts_separately() {
+        // Conservative pair-keying: identical message.id under different
+        // requestIds is treated as two distinct API responses (e.g. a retry).
+        let path = temp_file("claude-dedup-pair-key");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-30T13:01:00Z\",\"sessionId\":\"claude-dedup-4\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-06-30T13:02:00Z\",\"sessionId\":\"claude-dedup-4\",\"requestId\":\"req_011BBB\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-06-30T13:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 20);
+        assert_eq!(item.output_tokens, 10);
+        assert_eq!(item.request_count, 2);
 
         let _ = fs::remove_file(path);
     }
