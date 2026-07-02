@@ -324,7 +324,12 @@ fn build_codex_runtime_defaults(captured_at: &str) -> Option<AgentRuntimeDefault
 }
 
 fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("claude") && !claude_settings_path().exists() {
+    // Presence is decided by the canonical detector, which requires the `claude`
+    // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
+    // patch writes during onboarding — must NOT read as "installed", or a Mac
+    // that never had Claude reports it as present and then fails verification
+    // with "claude is not installed or not executable".
+    if !crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode) {
         return not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(
@@ -3455,10 +3460,6 @@ fn codex_config_path() -> PathBuf {
 
 fn codex_auth_path() -> PathBuf {
     home_path(".codex/auth.json")
-}
-
-fn claude_settings_path() -> PathBuf {
-    home_path(".claude/settings.json")
 }
 
 fn home_path(relative: &str) -> PathBuf {

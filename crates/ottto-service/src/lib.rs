@@ -64,6 +64,11 @@ const USAGE_LIMITED_MESSAGE_CODE: &str = "usage_limited";
 const SMOKE_QUOTA_LIMITED_MESSAGE_CODE: &str = "smoke_quota_limited";
 const PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE: &str = "pi_route_smoke_failed";
 const PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE: &str = "pi_oauth_reauth_required";
+/// Verification message code (also used as the API error code) for a source
+/// whose CLI is genuinely not installed on this machine. Shared with
+/// [`control`] so the health projection can map it to a non-blocking
+/// `not_found` state instead of a blocking telemetry-verification failure.
+pub(crate) const SOURCE_NOT_INSTALLED_VERIFICATION_CODE: &str = "source_not_installed";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendErrorKind {
@@ -300,12 +305,31 @@ impl LocalDaemon {
 
     /// Seed known registered sources from the persisted relay-device binding so
     /// a freshly restarted daemon never reports a connected account with zero
-    /// sources while the slower agent scan is still pending. These rows are
-    /// intentionally `verifying` and carry no agent snapshot; a real scan or
-    /// verification result replaces them with authoritative health.
+    /// sources while the slower agent scan is still pending. Only sources that
+    /// are genuinely present on THIS machine are seeded — `device.sources` is the
+    /// account-wide registered set, and seeding an app that this Mac never had
+    /// would show a phantom "needs attention" row. Seeded rows are intentionally
+    /// `verifying` and carry no agent snapshot; a real scan or verification
+    /// result replaces them with authoritative health.
     pub fn with_registered_device_sources(self, device: Option<LocalDeviceBinding>) -> Self {
         if let Ok(mut state) = self.inner.lock() {
             seed_registered_sources(&mut state, device.as_ref());
+        }
+        self
+    }
+
+    /// Test-only variant of [`Self::with_registered_device_sources`] that injects
+    /// the local-presence probe so each state (present / not-present) is
+    /// deterministic regardless of what is installed on the machine running the
+    /// tests.
+    #[cfg(test)]
+    fn with_registered_device_sources_presence(
+        self,
+        device: Option<LocalDeviceBinding>,
+        present: impl Fn(&SourceKind) -> bool,
+    ) -> Self {
+        if let Ok(mut state) = self.inner.lock() {
+            seed_registered_sources_with_presence(&mut state, device.as_ref(), present);
         }
         self
     }
@@ -2378,6 +2402,23 @@ fn source_from_slug(slug: &str) -> Option<SourceKind> {
 }
 
 fn seed_registered_sources(state: &mut DaemonState, device: Option<&LocalDeviceBinding>) {
+    seed_registered_sources_with_presence(state, device, source_present_locally)
+}
+
+/// Seed `verifying` placeholder rows for account-registered sources, but ONLY
+/// for sources that are genuinely present on THIS machine. `device.sources` is
+/// the account-wide registered set (sources set up on ANY of the user's Macs),
+/// so seeding it blindly makes a Mac that never had an app show a phantom
+/// "1 account / needs attention" row that then fails verification. The
+/// presence probe (binary found or genuine user config) is the gate; absent
+/// sources are simply omitted and can still be discovered later by a real scan
+/// if the app is installed. `present` is injected so tests can drive each state
+/// deterministically.
+fn seed_registered_sources_with_presence(
+    state: &mut DaemonState,
+    device: Option<&LocalDeviceBinding>,
+    present: impl Fn(&SourceKind) -> bool,
+) {
     if state.account.state != LocalAccountState::Connected {
         return;
     }
@@ -2389,10 +2430,18 @@ fn seed_registered_sources(state: &mut DaemonState, device: Option<&LocalDeviceB
         .iter()
         .filter_map(|slug| source_from_slug(slug))
         .filter(|source| !state.sources.iter().any(|health| health.source == *source))
+        .filter(|source| present(source))
         .collect::<Vec<_>>();
     for source in sources {
         state.sources.push(cached_source_health(state, source));
     }
+}
+
+/// Local-presence probe used by seeding. Delegates to the canonical detector so
+/// "is this app really here" has one definition across seeding, status
+/// collection, and verification.
+fn source_present_locally(source: &SourceKind) -> bool {
+    agent_configs::detection::source_present_locally(source)
 }
 
 fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth {
@@ -2604,7 +2653,23 @@ fn source_health_from_verification(
     let patch_disabled = result.message.code == "patch_disabled";
     let usage_limited = verification_result_is_usage_limited(result);
     let pi_local_only = result.source == SourceKind::Pi && result.message.code == "pi_local_only";
-    let (source_state, grade, problems) = if config_has_drift {
+    let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
+    let (source_state, grade, problems) = if source_not_installed {
+        // The CLI is genuinely absent on this Mac. Report it as an informational
+        // `not_found` (finish setup) with a `SourceNotInstalled` problem — never
+        // a `TelemetryNotVerified` one, which would project as a blocking
+        // verify-failed and stall onboarding on a machine that never had the app.
+        (
+            SourceState::NotFound,
+            HealthGrade::Unknown,
+            vec![HealthProblem {
+                code: StableProblemCode::SourceNotInstalled,
+                title: format!("{} is not installed", source_display_name(&result.source)),
+                detail: result.message.text.clone(),
+                retryable: false,
+            }],
+        )
+    } else if config_has_drift {
         (
             SourceState::NeedsRepair,
             HealthGrade::Warning,
@@ -4155,6 +4220,76 @@ mod tests {
     }
 
     #[test]
+    fn not_installed_verification_projects_non_blocking_not_found() {
+        // A verify against a source whose CLI is genuinely absent must land as an
+        // informational not-found (finish setup), NOT a blocking verify-failed —
+        // otherwise onboarding stalls on a Mac that never had the app.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        let result = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: false,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: None,
+            message: StableMessage {
+                code: SOURCE_NOT_INSTALLED_VERIFICATION_CODE.to_string(),
+                text: "Claude Code is not installed on this Mac, so there is nothing to verify."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record not-installed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources.len(), 1);
+        assert_eq!(status.sources[0].source, SourceKind::ClaudeCode);
+        assert_eq!(
+            status.sources[0].state,
+            SourceState::NotFound,
+            "not-installed verify must map to not_found, not Failed"
+        );
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::SourceNotInstalled,
+            "problem must be source_not_installed, never a blocking telemetry_not_verified"
+        );
+
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        assert_ne!(
+            health.overall.state,
+            LocalHealthOverallState::Blocked,
+            "a not-installed source must not block onboarding"
+        );
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::PendingSetup,
+            "renders as finish-setup, not repair/verify-failed"
+        );
+        assert!(
+            health
+                .blockers
+                .iter()
+                .all(|blocker| blocker.owner != "source"),
+            "no blocking source problem for a not-installed app"
+        );
+    }
+
+    #[test]
     fn canonical_health_marks_protocol_mismatch_upgrade_required() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let mut status = daemon.status(TOKEN).expect("status");
@@ -5436,11 +5571,14 @@ mod tests {
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
             .with_source_state_dir(dir.clone())
-            .with_registered_device_sources(Some(LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            }));
+            .with_registered_device_sources_presence(
+                Some(LocalDeviceBinding {
+                    device_id: "device_test".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    sources: vec!["codex".to_string()],
+                }),
+                |_| true,
+            );
         restarted
             .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
             .expect("record upload failure");
@@ -5503,11 +5641,14 @@ mod tests {
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
             .with_source_state_dir(dir.clone())
-            .with_registered_device_sources(Some(LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            }));
+            .with_registered_device_sources_presence(
+                Some(LocalDeviceBinding {
+                    device_id: "device_test".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    sources: vec!["codex".to_string()],
+                }),
+                |_| true,
+            );
         let status = restarted.status(TOKEN).expect("status");
         assert_eq!(status.sources.len(), 1);
         assert_eq!(status.sources[0].source, SourceKind::Codex);
@@ -5549,10 +5690,11 @@ mod tests {
                 "unknown_source".to_string(),
             ],
         };
+        // Both apps present on this Mac -> both seed as `verifying`.
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
             .with_source_state_dir(dir.clone())
-            .with_registered_device_sources(Some(device));
+            .with_registered_device_sources_presence(Some(device), |_| true);
 
         let status = restarted.status(TOKEN).expect("status");
         assert_eq!(status.sources.len(), 2);
@@ -5566,6 +5708,86 @@ mod tests {
         assert!(status.sources[0].agent_status.is_none());
         assert_eq!(status.sources[1].source, SourceKind::ClaudeCode);
         assert_eq!(status.sources[1].state, SourceState::Verifying);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registered_device_source_absent_on_this_machine_is_not_seeded() {
+        // The account has Claude Code registered (from another Mac), but this
+        // machine never installed it. Seeding must skip it entirely so the app
+        // does not show a phantom "Claude Code - needs attention" row that then
+        // fails verification with "claude is not installed". Codex IS present
+        // here, so it still seeds.
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-absent-claude",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string(), "claude_code".to_string()],
+        };
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources_presence(Some(device), |source| {
+                *source == SourceKind::Codex
+            });
+
+        let status = restarted.status(TOKEN).expect("status");
+        assert_eq!(
+            status.sources.len(),
+            1,
+            "only the locally-present source seeds"
+        );
+        assert_eq!(status.sources[0].source, SourceKind::Codex);
+        assert!(
+            status
+                .sources
+                .iter()
+                .all(|source| source.source != SourceKind::ClaudeCode),
+            "an app that this Mac never installed must not appear as a source"
+        );
+
+        // The absent source contributes no blocker: onboarding is not stalled.
+        let health = status.canonical_health.expect("canonical health");
+        assert!(
+            health
+                .blockers
+                .iter()
+                .all(|blocker| blocker.owner != "source"),
+            "a not-present source must not produce a blocking source problem"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_registered_sources_present_seeds_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-source-state-test-{}-none-present",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string(), "claude_code".to_string()],
+        };
+        let restarted = daemon()
+            .with_account(account("user_1", "ron@example.com"))
+            .with_source_state_dir(dir.clone())
+            .with_registered_device_sources_presence(Some(device), |_| false);
+
+        let status = restarted.status(TOKEN).expect("status");
+        assert!(
+            status.sources.is_empty(),
+            "no locally-present sources -> no seeded rows"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5587,11 +5809,14 @@ mod tests {
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
             .with_source_state_dir(dir.clone())
-            .with_registered_device_sources(Some(LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            }));
+            .with_registered_device_sources_presence(
+                Some(LocalDeviceBinding {
+                    device_id: "device_test".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    sources: vec!["codex".to_string()],
+                }),
+                |_| true,
+            );
         let status = restarted.status(TOKEN).expect("status");
         assert_eq!(status.sources[0].state, SourceState::Verifying);
         assert_eq!(status.sources[0].grade, HealthGrade::Unknown);
@@ -5627,11 +5852,14 @@ mod tests {
     fn startup_reverify_promotes_available_seeded_source() {
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
-            .with_registered_device_sources(Some(LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            }));
+            .with_registered_device_sources_presence(
+                Some(LocalDeviceBinding {
+                    device_id: "device_test".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    sources: vec!["codex".to_string()],
+                }),
+                |_| true,
+            );
 
         let mut state = restarted.inner.lock().expect("state");
         assert_eq!(state.sources[0].state, SourceState::Verifying);
@@ -5656,11 +5884,14 @@ mod tests {
         // (no spurious attention flash). The burst retries on a later tick.
         let restarted = daemon()
             .with_account(account("user_1", "ron@example.com"))
-            .with_registered_device_sources(Some(LocalDeviceBinding {
-                device_id: "device_test".to_string(),
-                machine_id: Some("machine_test".to_string()),
-                sources: vec!["codex".to_string()],
-            }));
+            .with_registered_device_sources_presence(
+                Some(LocalDeviceBinding {
+                    device_id: "device_test".to_string(),
+                    machine_id: Some("machine_test".to_string()),
+                    sources: vec!["codex".to_string()],
+                }),
+                |_| true,
+            );
 
         let mut state = restarted.inner.lock().expect("state");
         let mut cold = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
