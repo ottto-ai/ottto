@@ -70,8 +70,15 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // but no first-token marker, so TTFT stays absent (unlike Codex `task_complete`,
 // which supplies both). The bump re-walks existing Claude sessions once so
 // already-scanned sessions re-emit with the duration aggregates populated.
+// claude_code v13: Task-tool subagent transcripts (`<sessionId>/subagents/
+// agent-<agentId>.jsonl`) carry the parent's `sessionId` on every line, so they
+// used to collapse onto the human parent session. They now re-key to a distinct
+// `<parentSessionId>_<agentFileStem>` id (see `claude_subagent_source_session_id`)
+// and stand up as their own `isSidechain=true` -> ai_agent sessions. The bump
+// re-walks existing project JSONL once so already-scanned subagent files re-emit
+// under the new id instead of remaining folded into their parent.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v12";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v13";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -1277,6 +1284,15 @@ impl SnapshotAccumulator {
             })
         else {
             return Vec::new();
+        };
+        // A Claude Code Task-tool subagent transcript shares its parent's
+        // `sessionId`; re-key it to a distinct id so it ingests as its own
+        // `isSidechain=true` (ai_agent) session instead of collapsing into the
+        // human parent. Top-level transcripts are unchanged.
+        let source_session_id = if self.source == SnapshotSource::ClaudeCode {
+            claude_subagent_source_session_id(path, &source_session_id).unwrap_or(source_session_id)
+        } else {
+            source_session_id
         };
         // Claude Code dynamic workflow orchestration (the Workflow tool, e.g.
         // `ultracode`) leaves a local manifest at
@@ -4196,6 +4212,30 @@ fn codex_session_id_from_path(path: &Path) -> Option<String> {
     None
 }
 
+/// Claude Code Task-tool subagents write their transcript to
+/// `<projectDir>/<parentSessionId>/subagents/agent-<agentId>.jsonl`, and every
+/// line inside is stamped with the *parent's* `sessionId`. Left alone, the
+/// subagent's `source_session_id` therefore equals the parent's and it collapses
+/// into the human-started parent session -- so its `isSidechain=true` origin
+/// never stands up as its own (ai_agent) session on the backend.
+///
+/// Detect the subagent transcript by its enclosing `subagents` directory and
+/// mint a distinct session id `<parentSessionId>_<agentFileStem>`. The id must
+/// stay URL-path-safe: the backend uses `source_session_id` verbatim as its
+/// `Session.session_id`, which rides in `/sessions/{session_id}/...` routes, so
+/// the join uses `_` (never `/`) and every component is already lowercase.
+/// Ordinary top-level transcripts return `None` and keep their raw `sessionId`.
+fn claude_subagent_source_session_id(path: &Path, parent_session_id: &str) -> Option<String> {
+    if path.parent()?.file_name()?.to_str()? != "subagents" {
+        return None;
+    }
+    let agent_file_stem = path.file_stem()?.to_str()?;
+    if agent_file_stem.is_empty() {
+        return None;
+    }
+    Some(format!("{parent_session_id}_{agent_file_stem}"))
+}
+
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for key in path {
@@ -6788,6 +6828,102 @@ mod tests {
         assert_eq!(origin.used_workflow_orchestration, Some(false));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_subagent_transcript_ingests_as_its_own_sidechain_session() {
+        // Claude Code writes Task-tool subagents to
+        // `<projectDir>/<parentSessionId>/subagents/agent-<agentId>.jsonl`, and
+        // every line is stamped with the PARENT `sessionId`. The parser must
+        // re-key the snapshot to a distinct `<parent>_agent-<agentId>` id so it
+        // stands up as its own `isSidechain=true` (ai_agent) session instead of
+        // collapsing into the human parent session.
+        let root = temp_dir("claude-subagent");
+        let parent_session = "52c34dcb-44e4-428f-8def-979dd43b7259";
+        let subagents_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        let path = subagents_dir.join("agent-a35bc3648272bc00c.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-29T01:16:00.000Z\",\"type\":\"user\",\"sessionId\":\"52c34dcb-44e4-428f-8def-979dd43b7259\",\"agentId\":\"a35bc3648272bc00c\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"map the recipe\"}}\n",
+                "{\"timestamp\":\"2026-06-29T01:16:04.000Z\",\"type\":\"assistant\",\"sessionId\":\"52c34dcb-44e4-428f-8def-979dd43b7259\",\"agentId\":\"a35bc3648272bc00c\",\"isSidechain\":true,\"requestId\":\"req_S\",\"message\":{\"id\":\"msg_S\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":40,\"output_tokens\":12}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-06-29T01:20:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        // Distinct from the parent, and URL-path-safe (no `/`): the backend uses
+        // `source_session_id` verbatim as its `Session.session_id`, which rides
+        // in `/sessions/{session_id}/...` routes.
+        assert_eq!(
+            item.source_session_id,
+            "52c34dcb-44e4-428f-8def-979dd43b7259_agent-a35bc3648272bc00c"
+        );
+        assert_ne!(item.source_session_id, parent_session);
+        assert!(!item.source_session_id.contains('/'));
+        // isSidechain=true rides through -> backend classifies this as ai_agent.
+        assert_eq!(
+            item.origin.expect("origin forwarded").is_sidechain,
+            Some(true)
+        );
+        // The subagent's own tokens, counted once under this new session (they do
+        // not appear in the parent transcript, so nothing is double-counted).
+        assert_eq!(item.input_tokens, 40);
+        assert_eq!(item.output_tokens, 12);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_top_level_transcript_keeps_raw_session_id() {
+        // The human-started top-level transcript lives at `<sessionId>.jsonl`,
+        // NOT under a `subagents/` directory. Even when it carries an inline
+        // sidechain line (older Claude versions inlined them), its
+        // `source_session_id` must stay the raw `sessionId` so the parent session
+        // is never re-keyed away from where its prior snapshots landed.
+        let root = temp_dir("claude-top-level");
+        let path = root.join("claude-top-1.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-29T01:00:00Z\",\"type\":\"user\",\"sessionId\":\"claude-top-1\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+                "{\"timestamp\":\"2026-06-29T01:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"claude-top-1\",\"isSidechain\":true,\"requestId\":\"req_T\",\"message\":{\"id\":\"msg_T\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-06-29T01:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.source_session_id, "claude-top-1");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_subagent_source_session_id_discriminates_by_subagents_dir() {
+        // Helper contract: only transcripts whose immediate parent directory is
+        // `subagents` are re-keyed; everything else returns None (raw id kept).
+        let sub = Path::new("/p/proj/PARENT/subagents/agent-abc123.jsonl");
+        assert_eq!(
+            claude_subagent_source_session_id(sub, "PARENT").as_deref(),
+            Some("PARENT_agent-abc123")
+        );
+        // Top-level transcript -> None.
+        let top = Path::new("/p/proj/PARENT.jsonl");
+        assert_eq!(claude_subagent_source_session_id(top, "PARENT"), None);
+        // A nested but non-`subagents` sibling dir -> None.
+        let other = Path::new("/p/proj/PARENT/workflows/wf.jsonl");
+        assert_eq!(claude_subagent_source_session_id(other, "PARENT"), None);
     }
 
     #[test]
