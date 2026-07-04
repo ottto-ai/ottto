@@ -3,6 +3,33 @@
 Stable local-platform releases must be verifiable without trusting mutable
 installer state.
 
+## Current Release Version
+
+The current published version is served from the CDN, not from GitHub. The
+source of truth is the per-channel release manifest — the same record the
+daemon's own update check reads:
+
+```bash
+curl -fsS \
+  https://install.ottto.net/ottto-local-platform/releases/stable/latest/release-manifest.json \
+  | jq '{version, channel, commit}'
+```
+
+Swap `stable` for `stable-candidate`, `preview`, or `dev` to read another
+channel (the URL shape is `default_release_manifest_url` in
+`crates/ottto-service/src/control.rs`). The Sparkle appcast beside it at
+`.../releases/stable/latest/appcast.xml` carries the same version, and it is the
+app's `SUFeedURL`. On a machine with Ottto installed, the daemon reports both
+sides of the comparison:
+
+```bash
+ottto update --json   # {current_version, latest_version, update_available, channel}
+```
+
+Do **not** read the current version from GitHub Releases: that is an optional,
+`stable`-only verification mirror (see below) that is opt-in per run and
+regularly lags the CDN by many releases.
+
 ## Release Manifest
 
 A stable release manifest must include:
@@ -84,7 +111,10 @@ as a **verification mirror only**. The mirror is opt-in per run via the
 refuses to overwrite an existing `v<version>` release. The CDN at
 `install.ottto.net` remains the install and update source of truth; the GitHub
 Release never promotes a channel pointer and the workflow never writes to the
-CDN.
+CDN. Because the mirror is opt-in per run, the newest GitHub Release (and its
+`v<version>` tag) can trail the live CDN by many releases — never use it to
+determine the current version; read the channel release manifest instead (see
+[Current Release Version](#current-release-version)).
 
 A stable verification mirror is expected to carry exactly these assets:
 
