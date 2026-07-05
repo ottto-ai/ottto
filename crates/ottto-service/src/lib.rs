@@ -2002,6 +2002,31 @@ fn blocker(
     }
 }
 
+/// Whether a source should count toward the overall degraded
+/// `finish_source_setup` state.
+///
+/// Sources whose blocking reason is `source_not_installed` are excluded: a
+/// machine that simply does not have an agent installed (for example, no
+/// Claude Code on this Mac) is a legitimate, healthy configuration, not a
+/// setup task waiting to be finished. The source stays listed in `sources`
+/// so serving layers can still present it; only the overall state must not
+/// degrade because of it.
+fn source_counts_toward_finish_setup(source: &LocalHealthSourceV1) -> bool {
+    if source.blocking_reason.as_deref()
+        == Some(stable_problem_code_slug(
+            &StableProblemCode::SourceNotInstalled,
+        ))
+    {
+        return false;
+    }
+    matches!(
+        source.state,
+        LocalHealthSourceState::PendingSetup
+            | LocalHealthSourceState::DisabledByPolicy
+            | LocalHealthSourceState::Unknown
+    )
+}
+
 fn local_health_overall(
     blockers: &[LocalHealthBlockerV1],
     runtime: &RuntimeIdentityV1,
@@ -2035,14 +2060,7 @@ fn local_health_overall(
             next_action: Some("repair_or_verify".to_string()),
         };
     }
-    if sources.iter().any(|source| {
-        matches!(
-            source.state,
-            LocalHealthSourceState::PendingSetup
-                | LocalHealthSourceState::DisabledByPolicy
-                | LocalHealthSourceState::Unknown
-        )
-    }) {
+    if sources.iter().any(source_counts_toward_finish_setup) {
         return LocalHealthOverall {
             state: LocalHealthOverallState::Degraded,
             primary_blocker: None,
@@ -4286,6 +4304,125 @@ mod tests {
                 .iter()
                 .all(|blocker| blocker.owner != "source"),
             "no blocking source problem for a not-installed app"
+        );
+    }
+
+    #[test]
+    fn not_installed_source_does_not_degrade_overall_health() {
+        // A Mac that simply does not have an agent installed is a legitimate,
+        // healthy configuration: healthy verified sources plus one
+        // not-installed source must project overall Healthy, not a perpetual
+        // Degraded / finish_source_setup machine banner.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        for source in [SourceKind::Codex, SourceKind::Pi] {
+            let verified = SourceVerificationResult {
+                source: source.clone(),
+                config: SourceConfigState {
+                    discovered: true,
+                    path_hint: None,
+                    fingerprint: Some("sha256:test".to_string()),
+                    drift: Vec::new(),
+                },
+                status: SourceVerificationStatus::Verified,
+                verified: true,
+                records_seen: 2,
+                last_record_id: Some("record_2".to_string()),
+                last_received_at: Some("2026-05-05T10:15:00Z".to_string()),
+                smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+                message: StableMessage {
+                    code: "verified".to_string(),
+                    text: "Verification passed.".to_string(),
+                },
+                route_results: Vec::new(),
+            };
+            daemon
+                .record_verification_result(&verified)
+                .expect("record verified result");
+        }
+
+        let not_installed = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: false,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: None,
+            message: StableMessage {
+                code: SOURCE_NOT_INSTALLED_VERIFICATION_CODE.to_string(),
+                text: "Claude Code is not installed on this Mac, so there is nothing to verify."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+        daemon
+            .record_verification_result(&not_installed)
+            .expect("record not-installed verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        let claude = health
+            .sources
+            .iter()
+            .find(|source| source.app == SourceKind::ClaudeCode)
+            .expect("not-installed source stays listed in sources");
+        assert_eq!(
+            claude.state,
+            LocalHealthSourceState::PendingSetup,
+            "presentation state is unchanged; serving layers decide rendering"
+        );
+        assert_eq!(
+            claude.blocking_reason.as_deref(),
+            Some("source_not_installed")
+        );
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::Healthy,
+            "a not-installed source must not degrade the machine"
+        );
+        assert_eq!(health.overall.next_action, None);
+    }
+
+    #[test]
+    fn genuinely_pending_source_still_degrades_overall_health() {
+        // Regression guard for the not-installed exclusion: a source that is
+        // actually waiting on setup (needs confirmation, no
+        // source_not_installed problem) must keep degrading the machine with
+        // finish_source_setup.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        let mut pending = codex_health();
+        pending.state = SourceState::NeedsConfirmation;
+        pending.grade = HealthGrade::Unknown;
+        pending.last_verified_at = None;
+        daemon
+            .update_sources(TOKEN, vec![pending])
+            .expect("source health should update");
+
+        let status = daemon.status(TOKEN).expect("status");
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        assert_eq!(
+            health.sources[0].state,
+            LocalHealthSourceState::PendingSetup
+        );
+        assert_eq!(health.sources[0].blocking_reason, None);
+        assert_eq!(health.overall.state, LocalHealthOverallState::Degraded);
+        assert_eq!(
+            health.overall.next_action.as_deref(),
+            Some("finish_source_setup")
         );
     }
 
