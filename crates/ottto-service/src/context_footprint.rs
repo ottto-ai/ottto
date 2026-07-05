@@ -25,6 +25,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 const CONTEXT_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(5 * 60);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTEXT_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
@@ -60,6 +61,16 @@ struct ContextFootprintIngestRequest {
     workspace_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_label_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_label_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository_identity_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_kind: Option<String>,
     config_hash: String,
     captured_at: String,
     collector_version: String,
@@ -93,6 +104,15 @@ struct ParsedContextFootprint {
 struct WorkspaceCandidate {
     path: PathBuf,
     last_seen: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepositoryIdentity {
+    repository_hash: Option<String>,
+    repository_label: Option<String>,
+    repository_label_source: Option<String>,
+    repository_identity_source: Option<String>,
+    workspace_kind: Option<String>,
 }
 
 #[derive(Clone)]
@@ -184,16 +204,47 @@ fn harvest_source(
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
         Ok(hint) => {
+            let workspace_labels_enabled = hint.workspace_labels_enabled;
             if !hint.context_footprint_harvest_enabled {
                 write_marker(&marker, &identity);
                 return Ok(());
             }
             let _ = fs::remove_file(&marker);
+            harvest_recent_workspaces(
+                client,
+                &relay_token,
+                support_dir,
+                &identity,
+                home,
+                machine_id,
+                workspace_labels_enabled,
+            )?;
+            return Ok(());
         }
         Err(_) if read_marker(&marker).as_deref() == Some(identity.as_str()) => return Ok(()),
         Err(_) => {}
     }
 
+    harvest_recent_workspaces(
+        client,
+        &relay_token,
+        support_dir,
+        &identity,
+        home,
+        machine_id,
+        true,
+    )
+}
+
+fn harvest_recent_workspaces(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+    support_dir: &Path,
+    identity: &str,
+    home: &Path,
+    machine_id: &str,
+    workspace_labels_enabled: bool,
+) -> Result<()> {
     let now = SystemTime::now();
     let mut workspaces = discover_recent_claude_workspaces(home, now);
     workspaces.truncate(MAX_WORKSPACES_PER_CYCLE);
@@ -210,9 +261,14 @@ fn harvest_source(
         if Instant::now() >= deadline {
             break;
         }
-        match build_request_for_workspace(&workspace.path, machine_id, &env) {
+        match build_request_for_workspace(
+            &workspace.path,
+            machine_id,
+            &env,
+            workspace_labels_enabled,
+        ) {
             Ok(request) => {
-                match upload_if_changed(client, &relay_token, support_dir, &identity, &request) {
+                match upload_if_changed(client, relay_token, support_dir, identity, &request) {
                     Ok(true) => uploaded += 1,
                     Ok(false) => skipped += 1,
                     Err(error) => {
@@ -253,6 +309,7 @@ fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
     env: &SpawnEnv,
+    workspace_labels_enabled: bool,
 ) -> Result<ContextFootprintIngestRequest> {
     let stdout = run_claude_context(workspace, env)?;
     let value: Value = serde_json::from_str(&stdout)
@@ -275,13 +332,21 @@ fn build_request_for_workspace(
     }
     let workspace_text = workspace.to_string_lossy();
     let workspace_hash = sha256_hex(&[workspace_text.as_ref()]);
+    let repository_identity = resolve_repository_identity(workspace, workspace_labels_enabled);
     let config_hash = request_content_hash(&parsed)?;
     Ok(ContextFootprintIngestRequest {
         agent_source: "claude-code".to_string(),
         machine_id: machine_id.to_string(),
         workspace_hash,
-        workspace_label: workspace_label(workspace),
-        workspace_label_source: Some("directory_name".to_string()),
+        workspace_label: workspace_labels_enabled
+            .then(|| workspace_label(workspace))
+            .flatten(),
+        workspace_label_source: workspace_labels_enabled.then(|| "directory_name".to_string()),
+        repository_hash: repository_identity.repository_hash,
+        repository_label: repository_identity.repository_label,
+        repository_label_source: repository_identity.repository_label_source,
+        repository_identity_source: repository_identity.repository_identity_source,
+        workspace_kind: repository_identity.workspace_kind,
         config_hash,
         captured_at: OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -338,6 +403,116 @@ fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
             Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
         }
     }
+}
+
+fn resolve_repository_identity(workspace: &Path, labels_enabled: bool) -> RepositoryIdentity {
+    let Some(toplevel_raw) = git_stdout(workspace, &["rev-parse", "--show-toplevel"]) else {
+        return RepositoryIdentity {
+            repository_hash: None,
+            repository_label: None,
+            repository_label_source: None,
+            repository_identity_source: None,
+            workspace_kind: Some("non_git".to_string()),
+        };
+    };
+    let toplevel = absolutize_git_path(workspace, &toplevel_raw);
+    let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
+        return RepositoryIdentity {
+            repository_hash: None,
+            repository_label: labels_enabled
+                .then(|| toplevel.file_name()?.to_str())
+                .flatten()
+                .and_then(|name| safe_text(name, 255)),
+            repository_label_source: labels_enabled.then(|| "git_root".to_string()),
+            repository_identity_source: None,
+            workspace_kind: Some("unknown".to_string()),
+        };
+    };
+    let common_dir = absolutize_git_path(workspace, &common_dir_raw);
+    let git_dir = git_stdout(workspace, &["rev-parse", "--git-dir"])
+        .map(|raw| absolutize_git_path(workspace, &raw));
+    let common_text = common_dir.to_string_lossy();
+    let linked_worktree = git_dir
+        .as_ref()
+        .map(|git_dir| canonical_or_self(git_dir) != canonical_or_self(&common_dir))
+        .unwrap_or(false);
+    let workspace_kind = if linked_worktree {
+        "linked_worktree"
+    } else if same_path(workspace, &toplevel) {
+        "repository_root"
+    } else {
+        "repository_subdir"
+    };
+    RepositoryIdentity {
+        repository_hash: Some(sha256_hex(&[common_text.as_ref()])),
+        repository_label: labels_enabled
+            .then(|| toplevel.file_name()?.to_str())
+            .flatten()
+            .and_then(|name| safe_text(name, 255)),
+        repository_label_source: labels_enabled.then(|| "git_root".to_string()),
+        repository_identity_source: Some(
+            if linked_worktree {
+                "git_worktree"
+            } else {
+                "git_common_dir"
+            }
+            .to_string(),
+        ),
+        workspace_kind: Some(workspace_kind.to_string()),
+    }
+}
+
+fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
+                if !status.success() {
+                    return None;
+                }
+                let text = String::from_utf8(output.stdout).ok()?;
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                return Some(trimmed.chars().take(4096).collect());
+            }
+            Ok(None) if started.elapsed() >= GIT_COMMAND_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn absolutize_git_path(workspace: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    };
+    canonical_or_self(&absolute)
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    canonical_or_self(left) == canonical_or_self(right)
 }
 
 fn parse_context_markdown(markdown: &str) -> Result<ParsedContextFootprint> {
@@ -658,7 +833,31 @@ fn discover_recent_claude_workspaces(home: &Path, now: SystemTime) -> Vec<Worksp
     }
     let mut candidates: Vec<_> = by_path.into_values().collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
-    candidates
+    dedupe_workspace_candidates_by_repository(candidates)
+}
+
+fn dedupe_workspace_candidates_by_repository(
+    candidates: Vec<WorkspaceCandidate>,
+) -> Vec<WorkspaceCandidate> {
+    let mut by_scope: BTreeMap<String, WorkspaceCandidate> = BTreeMap::new();
+    for candidate in candidates {
+        let repository_identity = resolve_repository_identity(&candidate.path, false);
+        let fallback_text = candidate.path.to_string_lossy();
+        let scope = repository_identity
+            .repository_hash
+            .unwrap_or_else(|| sha256_hex(&[fallback_text.as_ref()]));
+        by_scope
+            .entry(scope)
+            .and_modify(|existing| {
+                if existing.last_seen < candidate.last_seen {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut out: Vec<_> = by_scope.into_values().collect();
+    out.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_seen));
+    out
 }
 
 fn collect_recent_jsonl_files(dir: &Path, now: SystemTime, out: &mut Vec<(PathBuf, SystemTime)>) {
@@ -906,6 +1105,27 @@ mod tests {
         path
     }
 
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_git_repo(name: &str) -> PathBuf {
+        let repo = temp_dir(name);
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "test\n").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        repo
+    }
+
     #[test]
     fn parses_claude_context_markdown_tables() {
         let parsed = parse_context_markdown(
@@ -986,6 +1206,130 @@ mod tests {
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].path, workspace);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn repository_identity_groups_root_and_subdir_without_raw_paths() {
+        let repo = init_git_repo("repo-identity-root");
+        let subdir = repo.join("backend");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let root_identity = resolve_repository_identity(&repo, true);
+        let subdir_identity = resolve_repository_identity(&subdir, true);
+
+        assert_eq!(
+            root_identity.repository_hash,
+            subdir_identity.repository_hash
+        );
+        assert_eq!(root_identity.repository_hash.as_ref().unwrap().len(), 64);
+        assert_eq!(
+            root_identity.repository_label.as_deref(),
+            repo.file_name().and_then(|name| name.to_str())
+        );
+        assert_eq!(
+            root_identity.repository_label_source.as_deref(),
+            Some("git_root")
+        );
+        assert_eq!(
+            root_identity.repository_identity_source.as_deref(),
+            Some("git_common_dir")
+        );
+        assert_eq!(
+            root_identity.workspace_kind.as_deref(),
+            Some("repository_root")
+        );
+        assert_eq!(
+            subdir_identity.workspace_kind.as_deref(),
+            Some("repository_subdir")
+        );
+        let encoded = serde_json::to_string(&root_identity.repository_label).unwrap();
+        assert!(!encoded.contains("/Users/"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn repository_identity_respects_label_privacy() {
+        let repo = init_git_repo("repo-identity-private-labels");
+
+        let identity = resolve_repository_identity(&repo, false);
+
+        assert!(identity.repository_hash.is_some());
+        assert!(identity.repository_label.is_none());
+        assert!(identity.repository_label_source.is_none());
+        assert_eq!(identity.workspace_kind.as_deref(), Some("repository_root"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn repository_identity_marks_non_git_without_repository_hash() {
+        let dir = temp_dir("repo-identity-non-git");
+
+        let identity = resolve_repository_identity(&dir, true);
+
+        assert!(identity.repository_hash.is_none());
+        assert!(identity.repository_label.is_none());
+        assert!(identity.repository_label_source.is_none());
+        assert!(identity.repository_identity_source.is_none());
+        assert_eq!(identity.workspace_kind.as_deref(), Some("non_git"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repository_identity_groups_linked_worktree_to_common_repo() {
+        let repo = init_git_repo("repo-identity-worktree");
+        let worktree = temp_dir("repo-identity-worktree-linked");
+        fs::remove_dir_all(&worktree).unwrap();
+        let worktree_text = worktree.to_string_lossy().to_string();
+        run_git(
+            &repo,
+            &["worktree", "add", "-b", "context-test", &worktree_text],
+        );
+
+        let root_identity = resolve_repository_identity(&repo, true);
+        let worktree_identity = resolve_repository_identity(&worktree, true);
+
+        assert_eq!(
+            root_identity.repository_hash,
+            worktree_identity.repository_hash
+        );
+        assert_eq!(
+            worktree_identity.repository_identity_source.as_deref(),
+            Some("git_worktree")
+        );
+        assert_eq!(
+            worktree_identity.workspace_kind.as_deref(),
+            Some("linked_worktree")
+        );
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "remove", "--force", &worktree_text])
+            .status();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dedupes_recent_candidates_by_repository_hash() {
+        let repo = init_git_repo("repo-identity-dedupe");
+        let subdir = repo.join("frontend");
+        fs::create_dir_all(&subdir).unwrap();
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(200);
+
+        let out = dedupe_workspace_candidates_by_repository(vec![
+            WorkspaceCandidate {
+                path: repo.clone(),
+                last_seen: older,
+            },
+            WorkspaceCandidate {
+                path: subdir.clone(),
+                last_seen: newer,
+            },
+        ]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, subdir);
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
