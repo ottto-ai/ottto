@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 227,
-  "content_sha256": "f85768967f997084c6e5686f8a66afadc499169c5b4f7cbd1559953002e920a8",
+  "content_sha256": "3d1fcb0a823346670db0c848e4332660636edf48b3c0af4fdb55daf0a153fed4",
   "files": [
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "b59b2743c59e60bde4a04c72fee6c7b3c376f91416214bb992d985e4edb7f2f6",
-      "size_bytes": 33453
+      "sha256": "63477bae0d2f20980a7a981b5dda4035ff6eeb56e5c511a97d5e74cdd3e32c17",
+      "size_bytes": 45688
     },
     {
       "executable": false,
@@ -1592,7 +1592,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-05T08:29:02+00:00",
+  "generated_at": "2026-07-05T11:20:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 228,
   "public_roots": [
@@ -1628,5 +1628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "88b92a334478deaf8aaae5d3cfdf7295398c6c11"
+  "source_commit": "f95b68e4c0763084b7e7c13f00431a927e3b30bb"
 }
