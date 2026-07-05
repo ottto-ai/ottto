@@ -970,6 +970,20 @@ fn request_content_hash(parsed: &ParsedContextFootprint) -> Result<String> {
 
 fn request_content_hash_for_request(request: &ContextFootprintIngestRequest) -> Result<String> {
     let canonical = serde_json::to_vec(&json!({
+        "cache_schema": "context_footprint_request_v2",
+        "agent_source": &request.agent_source,
+        "machine_id": &request.machine_id,
+        "workspace_hash": &request.workspace_hash,
+        "workspace_label": &request.workspace_label,
+        "workspace_label_source": &request.workspace_label_source,
+        "repository_hash": &request.repository_hash,
+        "repository_label": &request.repository_label,
+        "repository_label_source": &request.repository_label_source,
+        "repository_identity_source": &request.repository_identity_source,
+        "workspace_kind": &request.workspace_kind,
+        "config_hash": &request.config_hash,
+        "collector_version": &request.collector_version,
+        "counter_source": &request.counter_source,
         "model": &request.model,
         "used_tokens": request.used_tokens,
         "context_window_tokens": request.context_window_tokens,
@@ -1366,5 +1380,65 @@ mod tests {
         let hash = request_content_hash(&parsed).unwrap();
         assert_eq!(hash.len(), 64);
         assert_eq!(hash, request_content_hash(&parsed).unwrap());
+    }
+
+    fn sample_request() -> ContextFootprintIngestRequest {
+        ContextFootprintIngestRequest {
+            agent_source: "claude-code".to_string(),
+            machine_id: "machine-a".to_string(),
+            workspace_hash: "workspace-a".to_string(),
+            workspace_label: Some("coding-agents-observability".to_string()),
+            workspace_label_source: Some("directory_name".to_string()),
+            repository_hash: Some("repo-a".to_string()),
+            repository_label: Some("coding-agents-observability".to_string()),
+            repository_label_source: Some("git_root".to_string()),
+            repository_identity_source: Some("git_common_dir".to_string()),
+            workspace_kind: Some("repository_root".to_string()),
+            config_hash: "config-a".to_string(),
+            captured_at: "2026-07-05T00:00:00Z".to_string(),
+            collector_version: "0.1.69".to_string(),
+            counter_source: "claude_code_context_v1".to_string(),
+            model: "claude".to_string(),
+            used_tokens: 10,
+            context_window_tokens: 100,
+            pct_context: 10.0,
+            free_space_tokens: Some(90),
+            categories: vec![ContextFootprintCategoryInput {
+                name: "Free space".to_string(),
+                tokens: 90,
+                pct: 90.0,
+                loading_mode: "unknown".to_string(),
+            }],
+            memory_files: Vec::new(),
+            skills: Vec::new(),
+            custom_agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn request_upload_cache_hash_tracks_repository_identity_and_label_policy() {
+        let base = sample_request();
+        let mut legacy_shape = base.clone();
+        legacy_shape.repository_hash = None;
+        legacy_shape.repository_label = None;
+        legacy_shape.repository_label_source = None;
+        legacy_shape.repository_identity_source = None;
+        legacy_shape.workspace_kind = None;
+        let mut labels_disabled = base.clone();
+        labels_disabled.workspace_label = None;
+        labels_disabled.workspace_label_source = None;
+        labels_disabled.repository_label = None;
+        labels_disabled.repository_label_source = None;
+
+        let base_hash = request_content_hash_for_request(&base).unwrap();
+        assert_eq!(base_hash.len(), 64);
+        assert_ne!(
+            base_hash,
+            request_content_hash_for_request(&legacy_shape).unwrap()
+        );
+        assert_ne!(
+            base_hash,
+            request_content_hash_for_request(&labels_disabled).unwrap()
+        );
     }
 }
