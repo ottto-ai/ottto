@@ -102,6 +102,21 @@ pub enum LocalApiError {
         "this Mac is connected to a different Ottto account; reset local account binding first"
     )]
     AccountResetRequired,
+    /// A sign-in claim completed for a different user than the one this Mac is
+    /// bound to, and the completion is staged for an explicit
+    /// `auth_switch_account` confirmation. Carries display-safe identity so the
+    /// client can render a confirm dialog. Maps to the same wire error code as
+    /// [`Self::AccountResetRequired`] (`account_reset_required`) so pre-switch
+    /// clients keep their existing reset flow; switch-aware clients read the
+    /// `switch_candidate` details instead.
+    #[error(
+        "this Mac is connected to a different Ottto account; reset local account binding first"
+    )]
+    AccountSwitchCandidate {
+        current_user_email: String,
+        new_user_email: String,
+        claim_code: String,
+    },
     #[error("no pending Ottto sign-in claim")]
     NoPendingAuthClaim,
     #[error("Ottto sign-in claim does not match this local session")]
@@ -181,6 +196,12 @@ struct DaemonState {
     account: LocalAccountBinding,
     connection: Option<LocalConnectionBinding>,
     pending_auth: Option<PendingAuthClaim>,
+    /// A claim completion for a DIFFERENT user than the current binding,
+    /// held in memory until the client confirms the switch via
+    /// `auth_switch_account` (or it is superseded by a new claim / reset).
+    /// Never persisted: a daemon restart drops it and the user re-runs
+    /// sign-in.
+    pending_switch: Option<StagedAccountSwitch>,
     repair_locked: bool,
     running: bool,
     now: String,
@@ -257,6 +278,68 @@ pub struct PendingAuthClaim {
     pub expires_at: String,
 }
 
+/// Stable message code set on the account binding when the backend reports
+/// that the bound account no longer exists (deleted server-side). A binding in
+/// this state is treated as unbound for claim purposes: the next sign-in by
+/// ANY user proceeds as a fresh first claim instead of demanding a reset.
+pub const ACCOUNT_NOT_FOUND_MESSAGE_CODE: &str = "account_not_found";
+
+/// A fully backend-completed sign-in claim for a different user, staged in
+/// memory pending an explicit `auth_switch_account` confirmation. Nothing is
+/// persisted (files, keychain) until the switch is confirmed, so cancelling
+/// leaves the old binding's credentials intact.
+#[derive(Clone)]
+pub struct StagedAccountSwitch {
+    pub claim_code: String,
+    pub new_account: LocalAccountBinding,
+    pub setup_run_id: String,
+    /// Secret. In-memory only; redacted from `Debug`.
+    pub setup_run_token: String,
+    pub setup_run_token_expires_at: String,
+    pub machine_id: Option<String>,
+    pub relay_device: Option<LocalDeviceBinding>,
+    /// Secret. In-memory only; redacted from `Debug`.
+    pub relay_device_secret: Option<String>,
+}
+
+impl std::fmt::Debug for StagedAccountSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedAccountSwitch")
+            .field("claim_code", &self.claim_code)
+            .field("new_account", &self.new_account)
+            .field("setup_run_id", &self.setup_run_id)
+            .field("setup_run_token", &"[redacted]")
+            .field(
+                "setup_run_token_expires_at",
+                &self.setup_run_token_expires_at,
+            )
+            .field("machine_id", &self.machine_id)
+            .field("relay_device", &self.relay_device)
+            .field(
+                "relay_device_secret",
+                &self.relay_device_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+/// Display-safe summary of a staged switch, surfaced to the client in the
+/// `account_reset_required` error details so it can render a confirm dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSwitchCandidateInfo {
+    pub current_user_email: String,
+    pub new_user_email: String,
+    pub claim_code: String,
+}
+
+fn account_binding_is_account_not_found(account: &LocalAccountBinding) -> bool {
+    account.state == LocalAccountState::Error
+        && account
+            .message
+            .as_ref()
+            .is_some_and(|message| message.code == ACCOUNT_NOT_FOUND_MESSAGE_CODE)
+}
+
 impl LocalDaemon {
     pub fn new(
         machine: MachineIdentity,
@@ -281,6 +364,7 @@ impl LocalDaemon {
                 account: LocalAccountBinding::not_connected(),
                 connection: None,
                 pending_auth: None,
+                pending_switch: None,
                 repair_locked: false,
                 running: true,
                 now: now.into(),
@@ -390,12 +474,34 @@ impl LocalDaemon {
         Ok(status_from_state(&state))
     }
 
+    /// Snapshot of the current pending claim plus the account binding, used by
+    /// `auth_start` to make repeated Sign-in presses idempotent: an unexpired
+    /// in-flight claim is returned as-is instead of minting a parallel one.
+    pub fn pending_auth_claim_snapshot(
+        &self,
+    ) -> Result<Option<(PendingAuthClaim, LocalAccountBinding)>, LocalApiError> {
+        let state = self.state()?;
+        Ok(state
+            .pending_auth
+            .as_ref()
+            .map(|claim| (claim.clone(), state.account.clone())))
+    }
+
     pub fn begin_auth_with_claim(
         &self,
         claim: PendingAuthClaim,
     ) -> Result<AuthStartResponse, LocalApiError> {
         let mut state = self.state()?;
-        let previous_account = state.account.clone();
+        let mut previous_account = state.account.clone();
+        // A binding whose account was deleted server-side is unbound for claim
+        // purposes: drop the dead identity so the fresh claim proceeds as a
+        // first claim for ANY user (and the UI doesn't show a ghost account).
+        if account_binding_is_account_not_found(&previous_account) {
+            previous_account = LocalAccountBinding::not_connected();
+        }
+        // A fresh claim supersedes any staged switch from an earlier claim —
+        // the staged claim's backend completion is single-use anyway.
+        state.pending_switch = None;
         state.pending_auth = Some(claim.clone());
         state.account = LocalAccountBinding {
             state: LocalAccountState::ClaimPending,
@@ -462,19 +568,25 @@ impl LocalDaemon {
         if claim.claim_code != claim_code || claim.nonce != nonce {
             return Err(LocalApiError::AuthClaimMismatch);
         }
-        if let Some(existing_user) = bound_user(&state.account) {
-            if let Some(new_user) = bound_user(&account) {
-                if existing_user.id != new_user.id {
-                    state.account.state = LocalAccountState::ResetRequired;
-                    state.account.message = Some(StableMessage {
-                        code: "account_reset_required".to_string(),
-                        text: "This Mac is connected to a different Ottto account.".to_string(),
-                    });
-                    return Err(LocalApiError::AccountResetRequired);
+        // A binding whose account was deleted server-side (`account_not_found`)
+        // is unbound for claim purposes: any user may claim fresh without the
+        // reset ceremony.
+        if !account_binding_is_account_not_found(&state.account) {
+            if let Some(existing_user) = bound_user(&state.account) {
+                if let Some(new_user) = bound_user(&account) {
+                    if existing_user.id != new_user.id {
+                        state.account.state = LocalAccountState::ResetRequired;
+                        state.account.message = Some(StableMessage {
+                            code: "account_reset_required".to_string(),
+                            text: "This Mac is connected to a different Ottto account.".to_string(),
+                        });
+                        return Err(LocalApiError::AccountResetRequired);
+                    }
                 }
             }
         }
         state.pending_auth = None;
+        state.pending_switch = None;
         state.connection = Some(LocalConnectionBinding {
             setup_run_id: setup_run_id.clone(),
             setup_run_token_expires_at: setup_run_token_expires_at.clone(),
@@ -489,6 +601,134 @@ impl LocalDaemon {
             setup_run_token_expires_at,
             machine_id,
         })
+    }
+
+    /// If the completed claim belongs to a different user than the current
+    /// binding, stage it for an explicit `auth_switch_account` confirmation and
+    /// return the display-safe candidate info. Returns `Ok(None)` when the
+    /// claim may proceed as a normal completion (same user, no bound user, or
+    /// the previous account no longer exists server-side).
+    ///
+    /// On staging, the account transitions to `ResetRequired` with the
+    /// long-standing `account_reset_required` message so pre-switch clients
+    /// keep their existing reset flow; the pending claim is consumed (the
+    /// backend completion is single-use).
+    pub fn stage_account_switch_if_user_mismatch(
+        &self,
+        staged: StagedAccountSwitch,
+    ) -> Result<Option<AccountSwitchCandidateInfo>, LocalApiError> {
+        let mut state = self.state()?;
+        if account_binding_is_account_not_found(&state.account) {
+            return Ok(None);
+        }
+        let Some(existing_user) = bound_user(&state.account) else {
+            return Ok(None);
+        };
+        let Some(new_user) = bound_user(&staged.new_account) else {
+            return Ok(None);
+        };
+        if existing_user.id == new_user.id {
+            return Ok(None);
+        }
+        let info = AccountSwitchCandidateInfo {
+            current_user_email: existing_user.email.clone(),
+            new_user_email: new_user.email.clone(),
+            claim_code: staged.claim_code.clone(),
+        };
+        state.pending_auth = None;
+        state.pending_switch = Some(staged);
+        state.account.state = LocalAccountState::ResetRequired;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = Some(StableMessage {
+            code: "account_reset_required".to_string(),
+            text: "This Mac is connected to a different Ottto account.".to_string(),
+        });
+        Ok(Some(info))
+    }
+
+    /// Consume the staged account switch for `claim_code`. Errors when nothing
+    /// is staged (or a different claim is staged) so a stray confirm cannot
+    /// install stale credentials.
+    pub fn take_staged_account_switch(
+        &self,
+        claim_code: &str,
+    ) -> Result<StagedAccountSwitch, LocalApiError> {
+        let mut state = self.state()?;
+        match state.pending_switch.as_ref() {
+            Some(staged) if staged.claim_code == claim_code => {
+                Ok(state.pending_switch.take().expect("checked above"))
+            }
+            Some(_) | None => Err(LocalApiError::InvalidRequest(
+                "no staged account switch for this sign-in claim; start Sign in again".to_string(),
+            )),
+        }
+    }
+
+    /// Re-stage a switch that failed mid-install so the client can retry the
+    /// confirmation instead of restarting the whole browser claim.
+    pub fn restore_staged_account_switch(
+        &self,
+        staged: StagedAccountSwitch,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if state.pending_switch.is_none() {
+            state.pending_switch = Some(staged);
+        }
+        Ok(())
+    }
+
+    /// Install a confirmed account switch as the new binding in one state
+    /// transition (no intermediate `ResetRequired`/`NotConnected` exposure to
+    /// status readers between the reset and the install).
+    pub fn install_switched_account(
+        &self,
+        account: LocalAccountBinding,
+        setup_run_id: String,
+        setup_run_token_expires_at: String,
+        machine_id: Option<String>,
+        claim_code: &str,
+    ) -> Result<AuthCompleteResponse, LocalApiError> {
+        let mut state = self.state()?;
+        state.pending_auth = None;
+        state.pending_switch = None;
+        state.sources.clear();
+        state.clear_source_state();
+        state.connection = Some(LocalConnectionBinding {
+            setup_run_id: setup_run_id.clone(),
+            setup_run_token_expires_at: setup_run_token_expires_at.clone(),
+            machine_id: machine_id.clone(),
+            claim_code: Some(claim_code.to_string()),
+            api_base_url: default_connection_api_base_url(),
+        });
+        state.account = account.clone();
+        Ok(AuthCompleteResponse {
+            account,
+            setup_run_id,
+            setup_run_token_expires_at,
+            machine_id,
+        })
+    }
+
+    /// Transition the binding to the unbound-equivalent `account_not_found`
+    /// state after the backend reports the bound account no longer exists.
+    /// Keeps the last-known user for display ("previous account no longer
+    /// exists") while freeing the Mac for a fresh first claim by any user.
+    /// Idempotent; no-op when nothing is bound.
+    pub fn mark_account_not_found(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        if state.account.state == LocalAccountState::NotConnected {
+            return Ok(());
+        }
+        if account_binding_is_account_not_found(&state.account) {
+            return Ok(());
+        }
+        state.account.state = LocalAccountState::Error;
+        state.account.last_refreshed_at = Some(state.now.clone());
+        state.account.message = Some(StableMessage {
+            code: ACCOUNT_NOT_FOUND_MESSAGE_CODE.to_string(),
+            text: "The Ottto account this Mac was connected to no longer exists. Sign in to connect it to an account.".to_string(),
+        });
+        Ok(())
     }
 
     pub fn completed_auth_claim_for_resume(
@@ -544,6 +784,7 @@ impl LocalDaemon {
         state.account = LocalAccountBinding::not_connected();
         state.connection = None;
         state.pending_auth = None;
+        state.pending_switch = None;
         state.sources.clear();
         state.clear_source_state();
         Ok(AuthResetResponse {
@@ -5423,6 +5664,313 @@ mod tests {
             daemon.status(TOKEN).expect("status").account.state,
             LocalAccountState::ResetRequired
         );
+    }
+
+    fn staged_switch(claim_code: &str, user_id: &str, email: &str) -> StagedAccountSwitch {
+        StagedAccountSwitch {
+            claim_code: claim_code.to_string(),
+            new_account: account(user_id, email),
+            setup_run_id: format!("setup_{claim_code}"),
+            setup_run_token: "token_secret".to_string(),
+            setup_run_token_expires_at: "2026-05-05T11:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            relay_device: None,
+            relay_device_secret: None,
+        }
+    }
+
+    #[test]
+    fn claim_for_different_user_stages_switch_candidate() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_two", "nonce_two"))
+            .expect("start second auth");
+        let candidate = daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage")
+            .expect("mismatch stages a candidate");
+        assert_eq!(candidate.current_user_email, "ron@example.com");
+        assert_eq!(candidate.new_user_email, "other@example.com");
+        assert_eq!(candidate.claim_code, "claim_two");
+
+        // Old-client compatibility: the binding shows the long-standing
+        // reset-required state + message code.
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.account.state, LocalAccountState::ResetRequired);
+        assert_eq!(
+            status.account.message.as_ref().map(|m| m.code.as_str()),
+            Some("account_reset_required")
+        );
+        // The pending claim is consumed (the backend completion is single-use).
+        assert_eq!(
+            daemon
+                .pending_auth_claim_for_resume("claim_two")
+                .expect_err("claim consumed"),
+            LocalApiError::NoPendingAuthClaim
+        );
+    }
+
+    #[test]
+    fn confirmed_switch_installs_new_account_in_one_transition() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+        daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage")
+            .expect("candidate");
+
+        // Wrong claim code cannot consume the staged switch.
+        assert!(daemon.take_staged_account_switch("claim_other").is_err());
+
+        let staged = daemon
+            .take_staged_account_switch("claim_two")
+            .expect("take staged switch");
+        let response = daemon
+            .install_switched_account(
+                staged.new_account.clone(),
+                staged.setup_run_id.clone(),
+                staged.setup_run_token_expires_at.clone(),
+                staged.machine_id.clone(),
+                &staged.claim_code,
+            )
+            .expect("install switched account");
+        assert_eq!(
+            response.account.user.as_ref().map(|u| u.email.as_str()),
+            Some("other@example.com")
+        );
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.account.state, LocalAccountState::Connected);
+        assert_eq!(
+            status.account.user.as_ref().map(|u| u.id.as_str()),
+            Some("user_2")
+        );
+        // Consumed: a second confirm is rejected.
+        assert!(daemon.take_staged_account_switch("claim_two").is_err());
+    }
+
+    #[test]
+    fn same_user_claim_does_not_stage_switch() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+        let candidate = daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_1",
+                "ron@example.com",
+            ))
+            .expect("stage");
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn unbound_daemon_does_not_stage_switch() {
+        let daemon = daemon();
+        let candidate = daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_one",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage");
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn account_not_found_binding_accepts_fresh_claim_by_any_user() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+
+        daemon.mark_account_not_found().expect("mark not found");
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.account.state, LocalAccountState::Error);
+        assert_eq!(
+            status.account.message.as_ref().map(|m| m.code.as_str()),
+            Some(ACCOUNT_NOT_FOUND_MESSAGE_CODE)
+        );
+        // Last-known user retained for display.
+        assert_eq!(
+            status.account.user.as_ref().map(|u| u.email.as_str()),
+            Some("ron@example.com")
+        );
+
+        // No switch staging: the mismatch is waived because the old account is
+        // gone…
+        let candidate = daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage");
+        assert!(candidate.is_none());
+
+        // …and a full completion by a DIFFERENT user proceeds as a fresh
+        // first claim (no reset ceremony).
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_two", "nonce_two"))
+            .expect("start second auth");
+        let response = daemon
+            .complete_auth_with_account(
+                "claim_two",
+                "nonce_two",
+                account("user_2", "other@example.com"),
+                "setup_2".to_string(),
+                "2026-05-05T10:20:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("fresh claim after account deletion");
+        assert_eq!(
+            response.account.user.as_ref().map(|u| u.id.as_str()),
+            Some("user_2")
+        );
+        assert_eq!(
+            daemon.status(TOKEN).expect("status").account.state,
+            LocalAccountState::Connected
+        );
+    }
+
+    #[test]
+    fn mark_account_not_found_is_a_noop_when_not_connected() {
+        let daemon = daemon();
+        daemon.mark_account_not_found().expect("mark");
+        assert_eq!(
+            daemon.status(TOKEN).expect("status").account.state,
+            LocalAccountState::NotConnected
+        );
+    }
+
+    #[test]
+    fn fresh_claim_supersedes_staged_switch() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+        daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage")
+            .expect("candidate");
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_three", "nonce_three"))
+            .expect("fresh claim");
+        assert!(daemon.take_staged_account_switch("claim_two").is_err());
+    }
+
+    #[test]
+    fn reset_clears_staged_switch() {
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        daemon
+            .complete_auth_with_account(
+                "claim_one",
+                "nonce_one",
+                account("user_1", "ron@example.com"),
+                "setup_1".to_string(),
+                "2026-05-05T10:10:00Z".to_string(),
+                Some("machine_test".to_string()),
+            )
+            .expect("complete first auth");
+        daemon
+            .stage_account_switch_if_user_mismatch(staged_switch(
+                "claim_two",
+                "user_2",
+                "other@example.com",
+            ))
+            .expect("stage")
+            .expect("candidate");
+        daemon.reset_account_for_authorized_client().expect("reset");
+        assert!(daemon.take_staged_account_switch("claim_two").is_err());
+    }
+
+    #[test]
+    fn pending_auth_claim_snapshot_reflects_in_flight_claim() {
+        let daemon = daemon();
+        assert!(daemon
+            .pending_auth_claim_snapshot()
+            .expect("snapshot")
+            .is_none());
+        daemon
+            .begin_auth_with_claim(pending_claim("claim_one", "nonce_one"))
+            .expect("start auth");
+        let (claim, account) = daemon
+            .pending_auth_claim_snapshot()
+            .expect("snapshot")
+            .expect("claim in flight");
+        assert_eq!(claim.claim_code, "claim_one");
+        assert_eq!(account.state, LocalAccountState::ClaimPending);
     }
 
     fn daemon() -> LocalDaemon {

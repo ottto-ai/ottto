@@ -1910,6 +1910,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
+        LocalControlCommand::AuthSwitchAccount { .. } => "auth_switch_account",
         LocalControlCommand::AuthReset { .. } => "auth_reset",
         LocalControlCommand::Account => "account",
         LocalControlCommand::Detect { .. } => "detect",

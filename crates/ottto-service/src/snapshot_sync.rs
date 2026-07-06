@@ -313,6 +313,14 @@ fn upload_local_health_projection_reporting(
             if let Err(refresh_error) =
                 crate::control::refresh_setup_run_token_for_persisted_connection()
             {
+                // Terminal refresh failure indicating the bound account was
+                // deleted server-side: transition the binding to the
+                // unbound-equivalent `account_not_found` state so the next
+                // sign-in (by any user) is a fresh first claim instead of a
+                // reset-required dead end.
+                if crate::control::backend_error_indicates_account_gone(&refresh_error) {
+                    let _ = daemon.mark_account_not_found();
+                }
                 let _ = daemon
                     .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected);
                 return Err(error.context(format!(
