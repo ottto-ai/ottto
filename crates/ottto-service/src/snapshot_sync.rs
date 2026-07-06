@@ -1,7 +1,7 @@
 use crate::agent_status::collect_agent_status;
 use crate::backfill::{
-    current_parser_version as backfill_current_parser_version, load_backfill_state,
-    pending_backfill_sources, run_backfill, save_backfill_state,
+    apply_backfill_cutoff, current_parser_version as backfill_current_parser_version,
+    load_backfill_state, pending_backfill_sources, run_backfill, save_backfill_state,
 };
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
@@ -584,7 +584,7 @@ fn sync_source(
     // backend UPSERTs by snapshot_fingerprint so re-runs on partial failure
     // are idempotent. State is persisted only after this iteration's upload
     // succeeds (see `save_backfill_state` below).
-    let mut backfill_state = load_backfill_state(support_dir);
+    let backfill_state = load_backfill_state(support_dir);
     let backfill_ran = pending_backfill_sources(&backfill_state).contains(&source);
     if backfill_ran {
         match run_backfill(
@@ -605,6 +605,21 @@ fn sync_source(
                 );
             }
         }
+    }
+
+    // Account-switch backfill cutoff (server-issued at claim completion): a
+    // machine claimed by a different same-org user must not re-attribute the
+    // previous owner's already-ingested history. Applies to everything headed
+    // upstream this cycle — sessions whose activity ended strictly before the
+    // cutoff are historical by definition, whichever scan produced them; live
+    // sessions always have activity at/after the cutoff and pass untouched.
+    let skipped_before_cutoff = apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state);
+    if skipped_before_cutoff > 0 {
+        eprintln!(
+            "ottto-service: skipped {} historical {} snapshot(s) that ended before the account-switch backfill cutoff",
+            skipped_before_cutoff,
+            source.api_slug(),
+        );
     }
 
     let mut accepted = 0;
@@ -758,6 +773,10 @@ fn sync_source(
     }
 
     if backfill_ran {
+        // Reload before mutating: a claim completion can persist an
+        // account-switch backfill cutoff while this (potentially minutes-long)
+        // sync is running, and saving the stale pre-scan copy would clobber it.
+        let mut backfill_state = load_backfill_state(support_dir);
         backfill_state.completed_parser_versions.insert(
             source.api_slug().to_string(),
             backfill_current_parser_version(source).to_string(),

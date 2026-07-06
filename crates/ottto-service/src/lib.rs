@@ -300,6 +300,12 @@ pub struct StagedAccountSwitch {
     pub relay_device: Option<LocalDeviceBinding>,
     /// Secret. In-memory only; redacted from `Debug`.
     pub relay_device_secret: Option<String>,
+    /// Additive backend backfill policy from the claim completion ("full" |
+    /// "from"); `None` when the backend predates the field. Applied to the
+    /// snapshot backfill state when the switch is confirmed and installed.
+    pub backfill_policy: Option<String>,
+    /// Server-UTC cutoff accompanying `backfill_policy: "from"`.
+    pub backfill_cutoff_at: Option<String>,
 }
 
 impl std::fmt::Debug for StagedAccountSwitch {
@@ -319,6 +325,8 @@ impl std::fmt::Debug for StagedAccountSwitch {
                 "relay_device_secret",
                 &self.relay_device_secret.as_ref().map(|_| "[redacted]"),
             )
+            .field("backfill_policy", &self.backfill_policy)
+            .field("backfill_cutoff_at", &self.backfill_cutoff_at)
             .finish()
     }
 }
@@ -5676,6 +5684,8 @@ mod tests {
             machine_id: Some("machine_test".to_string()),
             relay_device: None,
             relay_device_secret: None,
+            backfill_policy: None,
+            backfill_cutoff_at: None,
         }
     }
 
