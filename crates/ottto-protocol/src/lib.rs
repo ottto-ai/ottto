@@ -2230,6 +2230,16 @@ pub enum LocalControlCommand {
     AuthCompletePending {
         claim_code: String,
     },
+    /// Confirmed account switch: atomically clear the old local binding
+    /// (best-effort cloud disconnect of the previous account) and install the
+    /// staged claim completion for the new account. Only valid after an
+    /// `auth_complete`/`auth_complete_pending` returned an
+    /// `account_reset_required` error carrying `switch_candidate` details for
+    /// this `claim_code`. Additive command: older daemons reject it as an
+    /// unknown command, and older clients never send it.
+    AuthSwitchAccount {
+        claim_code: String,
+    },
     AuthReset {
         #[serde(default)]
         local_only: bool,
@@ -2787,6 +2797,25 @@ mod tests {
         assert_eq!(
             request.command,
             LocalControlCommand::AuthCompletePending {
+                claim_code: "claim_123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn auth_switch_account_command_round_trips() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_auth_switch_account",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "auth_switch_account",
+            "claim_code": "claim_123"
+        }))
+        .expect("auth switch account request");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::AuthSwitchAccount {
                 claim_code: "claim_123".to_string()
             }
         );

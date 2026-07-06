@@ -10,6 +10,7 @@ use crate::{
     keychain::TelemetryKeyStore,
     snapshot_client::relay_token_request_payload,
     BackendErrorDetails, BackendErrorKind, LocalApiError, LocalDaemon, PendingAuthClaim,
+    StagedAccountSwitch,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
@@ -474,6 +475,9 @@ fn handle_command(
         }
         LocalControlCommand::AuthCompletePending { claim_code } => {
             to_value(auth_complete_pending(daemon, &authorization, &claim_code)?)
+        }
+        LocalControlCommand::AuthSwitchAccount { claim_code } => {
+            to_value(auth_switch_account(daemon, &authorization, &claim_code)?)
         }
         LocalControlCommand::AuthReset { local_only } => {
             to_value(auth_reset(daemon, &authorization, local_only)?)
@@ -1641,6 +1645,24 @@ fn auth_start(
     authorization: &RequestAuthorization,
 ) -> Result<AuthStartResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
+    // Idempotent re-trigger: while a claim is in flight and unexpired,
+    // repeated Sign-in presses return the SAME claim instead of minting a
+    // parallel one. Racing claims were one writer behind the observed
+    // ClaimPending/ResetRequired status flip-flop (a completion for claim A
+    // landing while claim B had already replaced the pending state).
+    if let Some((pending, account)) = daemon.pending_auth_claim_snapshot()? {
+        if account.state == LocalAccountState::ClaimPending
+            && !auth_claim_is_expired(&pending.expires_at)
+        {
+            return Ok(AuthStartResponse {
+                account,
+                claim_code: pending.claim_code,
+                claim_url: pending.claim_url,
+                nonce: pending.nonce,
+                expires_at: pending.expires_at,
+            });
+        }
+    }
     let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
@@ -1651,6 +1673,17 @@ fn auth_start(
         claim_url,
         expires_at: claim.expires_at,
     })
+}
+
+/// Whether a pending claim's `expires_at` is in the past (with a 30s safety
+/// margin so a claim that is about to lapse mid-browser-open is not reused).
+/// Unparseable timestamps count as expired so a fresh claim is minted.
+fn auth_claim_is_expired(expires_at: &str) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    let Ok(expires) = time::OffsetDateTime::parse(expires_at, &Rfc3339) else {
+        return true;
+    };
+    expires - time::Duration::seconds(30) <= time::OffsetDateTime::now_utc()
 }
 
 fn auth_complete(
@@ -1691,21 +1724,19 @@ fn complete_pending_auth_claim(
             return Err(error);
         }
     };
-    let _binding_lock = lock_setup_run_binding();
-    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-        .save(&completed.setup_run_token)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    let relay_credentials_persisted = persist_claim_relay_device_credentials(&completed)?;
+    // Validate the relay-device payload up front so a malformed completion is
+    // rejected before any staging or persistence.
+    let relay_credentials = relay_device_credentials_from_claim_completion(&completed)?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
-            id: completed.user.id,
-            email: completed.user.email,
-            display_name: completed.user.display_name,
+            id: completed.user.id.clone(),
+            email: completed.user.email.clone(),
+            display_name: completed.user.display_name.clone(),
         }),
         organization: Some(LocalAccountOrganization {
-            id: completed.organization.id,
-            name: completed.organization.name,
+            id: completed.organization.id.clone(),
+            name: completed.organization.name.clone(),
         }),
         connected_at: Some(completed.connected_at.clone()),
         last_refreshed_at: Some(completed.connected_at.clone()),
@@ -1713,6 +1744,40 @@ fn complete_pending_auth_claim(
             code: "connected".to_string(),
             text: "This Mac is connected to Ottto.".to_string(),
         }),
+    };
+    // Claim-collision check BEFORE any persistence. Previously the new
+    // setup-run token and relay-device credentials were written to the
+    // keychain before the user-mismatch check fired, leaving a half-installed
+    // credential set for the wrong user alongside the old account files. On a
+    // mismatch the fully-completed claim is staged in memory and surfaced as a
+    // switch candidate; nothing on disk or in the keychain changes until the
+    // switch is confirmed via `auth_switch_account`.
+    if let Some(candidate) = daemon.stage_account_switch_if_user_mismatch(StagedAccountSwitch {
+        claim_code: pending.claim_code.clone(),
+        new_account: account.clone(),
+        setup_run_id: completed.setup_run_id.clone(),
+        setup_run_token: completed.setup_run_token.clone(),
+        setup_run_token_expires_at: completed.setup_run_token_expires_at.clone(),
+        machine_id: completed.machine_id.clone(),
+        relay_device: relay_credentials.as_ref().map(|(device, _)| device.clone()),
+        relay_device_secret: relay_credentials.as_ref().map(|(_, secret)| secret.clone()),
+    })? {
+        return Err(LocalApiError::AccountSwitchCandidate {
+            current_user_email: candidate.current_user_email,
+            new_user_email: candidate.new_user_email,
+            claim_code: candidate.claim_code,
+        });
+    }
+    let _binding_lock = lock_setup_run_binding();
+    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .save(&completed.setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let relay_credentials_persisted = match &relay_credentials {
+        Some((device, secret)) => {
+            persist_relay_device_credentials(device, secret)?;
+            true
+        }
+        None => false,
     };
     let response = daemon.complete_auth_with_account(
         &pending.claim_code,
@@ -1738,6 +1803,131 @@ fn complete_pending_auth_claim(
         request_snapshot_sync_after_device_registration(daemon);
     }
     Ok(response)
+}
+
+/// Confirmed account switch (`auth_switch_account`): consume the staged claim
+/// completion for `claim_code`, best-effort disconnect the OLD cloud binding
+/// (tolerating auth failures and an already-deleted account), clear the old
+/// local artifacts, and install the new binding in one in-memory state
+/// transition. Status readers never observe an intermediate
+/// `ResetRequired`→`NotConnected` hop — the binding goes straight to the new
+/// `Connected` account.
+fn auth_switch_account(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    claim_code: &str,
+) -> Result<AuthCompleteResponse, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
+    let staged = daemon.take_staged_account_switch(claim_code)?;
+    disconnect_previous_binding_best_effort(daemon);
+    match install_staged_account_switch(daemon, &staged) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            // Keep the staged completion so the user can retry the confirm
+            // (e.g. after a transient keychain/file failure) without redoing
+            // the whole browser claim.
+            let _ = daemon.restore_staged_account_switch(staged);
+            Err(error)
+        }
+    }
+}
+
+/// Best-effort cloud disconnect of the binding being replaced. Failures are
+/// tolerated by design: the old account may already be deleted server-side
+/// (401/404), the token may be unrefreshable, or the network may be down. The
+/// switch proceeds either way; the backend reconciles a dangling setup run on
+/// its side.
+fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
+    let connection = match daemon.connection_for_authorized_client() {
+        Ok(Some(connection)) => connection,
+        Ok(None) | Err(_) => return,
+    };
+    let Ok(setup_run_token) = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() else {
+        return;
+    };
+    let Ok(api_base_url) = validated_api_base_url(Some(connection.api_base_url.as_str())) else {
+        return;
+    };
+    if let Err(error) =
+        disconnect_setup_run_with_refresh(&api_base_url, &connection, &setup_run_token)
+    {
+        eprintln!(
+            "ottto-service: account switch: cloud disconnect of previous binding skipped: {error}"
+        );
+    }
+}
+
+fn install_staged_account_switch(
+    daemon: &LocalDaemon,
+    staged: &StagedAccountSwitch,
+) -> Result<AuthCompleteResponse, LocalApiError> {
+    reset_local_account_files()?;
+    let _binding_lock = lock_setup_run_binding();
+    let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
+    let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .save(&staged.setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let relay_credentials_persisted = match (&staged.relay_device, &staged.relay_device_secret) {
+        (Some(device), Some(secret)) => {
+            persist_relay_device_credentials(device, secret)?;
+            true
+        }
+        _ => false,
+    };
+    let response = daemon.install_switched_account(
+        staged.new_account.clone(),
+        staged.setup_run_id.clone(),
+        staged.setup_run_token_expires_at.clone(),
+        staged.machine_id.clone(),
+        &staged.claim_code,
+    )?;
+    FileAccountStore::default()
+        .save(&staged.new_account)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileConnectionStore::default()
+        .save(&LocalConnectionBinding {
+            setup_run_id: staged.setup_run_id.clone(),
+            setup_run_token_expires_at: staged.setup_run_token_expires_at.clone(),
+            machine_id: staged.machine_id.clone(),
+            claim_code: Some(staged.claim_code.clone()),
+            api_base_url: validated_api_base_url(None)?,
+        })
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if relay_credentials_persisted {
+        request_snapshot_sync_after_device_registration(daemon);
+    }
+    Ok(response)
+}
+
+/// Whether a terminal backend auth failure indicates the bound account (or its
+/// setup run/device row) no longer exists server-side — as opposed to an
+/// expired/invalid token, which is recoverable via refresh. Used to transition
+/// the binding to the unbound-equivalent `account_not_found` state so the next
+/// sign-in by ANY user proceeds as a fresh first claim.
+pub(crate) fn backend_error_indicates_account_gone(error: &LocalApiError) -> bool {
+    let LocalApiError::Backend(details) = error else {
+        return false;
+    };
+    if details.status == Some(404)
+        && (details.endpoint.contains("/setup-runs/")
+            || details.endpoint.contains("/local-client/"))
+    {
+        return true;
+    }
+    if !matches!(details.status, Some(401) | Some(403)) {
+        return false;
+    }
+    let Some(body) = details.body_excerpt.as_deref() else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    body.contains("account_not_found")
+        || body.contains("user_not_found")
+        || body.contains("workspace_not_found")
+        || body.contains("account no longer exists")
+        || body.contains("user no longer exists")
+        || body.contains("workspace no longer exists")
 }
 
 fn log_auth_complete_backend_failure(error: &LocalApiError) {
@@ -1786,36 +1976,49 @@ fn auth_complete_log_endpoint(endpoint: &str) -> String {
     )
 }
 
-fn persist_claim_relay_device_credentials(
+/// Validate and materialize the relay-device credentials from a claim
+/// completion without persisting anything. `Ok(None)` means the completion
+/// legitimately carried no relay device.
+fn relay_device_credentials_from_claim_completion(
     completed: &SetupClaimCompleteResponse,
-) -> Result<bool, LocalApiError> {
+) -> Result<Option<(LocalDeviceBinding, String)>, LocalApiError> {
     match (&completed.relay_device, &completed.relay_device_secret) {
-        (None, None) => Ok(false),
+        (None, None) => Ok(None),
         (Some(device), Some(device_secret)) => {
             if device.sources.is_empty() || device_secret.trim().is_empty() {
                 return Err(claim_completion_response_unexpected(
                     "claim completion returned incomplete relay-device credentials",
                 ));
             }
-            FileDeviceStore::default()
-                .save(&LocalDeviceBinding {
+            Ok(Some((
+                LocalDeviceBinding {
                     device_id: device.id.clone(),
                     machine_id: device
                         .machine_id
                         .clone()
                         .or_else(|| completed.machine_id.clone()),
                     sources: device.sources.clone(),
-                })
-                .map_err(|_| LocalApiError::StatePoisoned)?;
-            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-                .save(device_secret)
-                .map_err(|_| LocalApiError::StatePoisoned)?;
-            Ok(true)
+                },
+                device_secret.clone(),
+            )))
         }
         _ => Err(claim_completion_response_unexpected(
             "claim completion returned partial relay-device credentials",
         )),
     }
+}
+
+fn persist_relay_device_credentials(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+) -> Result<(), LocalApiError> {
+    FileDeviceStore::default()
+        .save(device)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+        .save(device_secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    Ok(())
 }
 
 fn claim_completion_response_unexpected(detail: &str) -> LocalApiError {
@@ -2622,6 +2825,30 @@ fn cli_error(error: LocalApiError) -> CliError {
         LocalApiError::Unauthorized => CliErrorCode::LocalAuthFailed,
         LocalApiError::LocalClientNotTrusted => CliErrorCode::LocalClientNotTrusted,
         LocalApiError::AccountResetRequired => CliErrorCode::AccountResetRequired,
+        LocalApiError::AccountSwitchCandidate {
+            current_user_email,
+            new_user_email,
+            claim_code,
+        } => {
+            // Same wire code as AccountResetRequired so pre-switch clients keep
+            // their existing reset flow; switch-aware clients read these
+            // additive details to render a confirm dialog and call
+            // `auth_switch_account` with the claim code.
+            details.insert("switch_candidate".to_string(), RedactedValue::Bool(true));
+            details.insert(
+                "current_user_email".to_string(),
+                RedactedValue::String(current_user_email.clone()),
+            );
+            details.insert(
+                "new_user_email".to_string(),
+                RedactedValue::String(new_user_email.clone()),
+            );
+            details.insert(
+                "claim_code".to_string(),
+                RedactedValue::String(claim_code.clone()),
+            );
+            CliErrorCode::AccountResetRequired
+        }
         LocalApiError::RepairLocked => CliErrorCode::RepairLocked,
         LocalApiError::StatePoisoned => CliErrorCode::Internal,
         LocalApiError::EmptyControlToken => CliErrorCode::InvalidRequest,
@@ -3832,6 +4059,7 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
         LocalApiError::Unauthorized
         | LocalApiError::LocalClientNotTrusted
         | LocalApiError::AccountResetRequired
+        | LocalApiError::AccountSwitchCandidate { .. }
         | LocalApiError::EmptyControlToken
         | LocalApiError::NoPendingAuthClaim
         | LocalApiError::AuthClaimMismatch => (
@@ -7311,7 +7539,13 @@ fn verify_source(
             }
             credentials
         }
-        Err(_) => {
+        Err(error) => {
+            // A refresh failure proving the bound account was deleted
+            // server-side frees the binding for a fresh first claim by any
+            // user instead of dead-ending on reconnect/reset ceremony.
+            if backend_error_indicates_account_gone(&error) {
+                let _ = daemon.mark_account_not_found();
+            }
             let result = verification_result_with_config(
                     source,
                     config,
@@ -9265,6 +9499,156 @@ mod tests {
     }
 
     #[test]
+    fn auth_switch_account_rejects_bad_token() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_switch_bad_token".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("bad-token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthSwitchAccount {
+                    claim_code: "claim_test".to_string(),
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.expect("error").code,
+            CliErrorCode::LocalAuthFailed
+        );
+    }
+
+    #[test]
+    fn auth_switch_account_without_staged_switch_is_invalid_request() {
+        let response = handle_request(
+            &daemon().with_account(connected_account()),
+            LocalControlRequest {
+                request_id: "req_switch_unstaged".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthSwitchAccount {
+                    claim_code: "claim_never_staged".to_string(),
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error.message.contains("staged account switch"));
+    }
+
+    #[test]
+    fn switch_candidate_error_keeps_reset_required_code_with_additive_details() {
+        let error = cli_error(LocalApiError::AccountSwitchCandidate {
+            current_user_email: "old@example.com".to_string(),
+            new_user_email: "new@example.com".to_string(),
+            claim_code: "claim_123".to_string(),
+        });
+
+        // Old clients: unchanged code + message shape.
+        assert_eq!(error.code, CliErrorCode::AccountResetRequired);
+        assert!(!error.retryable);
+        // New clients: additive structured details.
+        assert_eq!(
+            error.details.get("switch_candidate"),
+            Some(&RedactedValue::Bool(true))
+        );
+        assert_eq!(
+            error.details.get("current_user_email"),
+            Some(&RedactedValue::String("old@example.com".to_string()))
+        );
+        assert_eq!(
+            error.details.get("new_user_email"),
+            Some(&RedactedValue::String("new@example.com".to_string()))
+        );
+        assert_eq!(
+            error.details.get("claim_code"),
+            Some(&RedactedValue::String("claim_123".to_string()))
+        );
+    }
+
+    #[test]
+    fn auth_claim_expiry_check_handles_past_future_and_garbage() {
+        assert!(auth_claim_is_expired("2000-01-01T00:00:00Z"));
+        assert!(!auth_claim_is_expired("2100-01-01T00:00:00Z"));
+        assert!(auth_claim_is_expired("not-a-timestamp"));
+        assert!(auth_claim_is_expired(""));
+    }
+
+    #[test]
+    fn repeated_auth_start_reuses_unexpired_pending_claim() {
+        // Daemon with an in-flight, far-future claim: auth_start must return
+        // the SAME claim (idempotent re-trigger) without minting a new one —
+        // no backend call happens because the reuse path short-circuits.
+        let daemon = daemon();
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reuse".to_string(),
+                claim_token: "token_reuse".to_string(),
+                nonce: "nonce_reuse".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reuse".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+
+        let response = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
+            .expect("auth start reuses pending claim");
+        assert_eq!(response.claim_code, "claim_reuse");
+        assert_eq!(response.nonce, "nonce_reuse");
+        assert_eq!(
+            response.account.state,
+            ottto_protocol::LocalAccountState::ClaimPending
+        );
+    }
+
+    #[test]
+    fn account_gone_detection_matches_terminal_backend_failures() {
+        let gone_404 = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
+            status: Some(404),
+            body_excerpt: None,
+        });
+        assert!(backend_error_indicates_account_gone(&gone_404));
+
+        let gone_401 = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
+            status: Some(401),
+            body_excerpt: Some(r#"{"detail":"account_not_found"}"#.to_string()),
+        });
+        assert!(backend_error_indicates_account_gone(&gone_401));
+
+        // A plain expired-token 401 must NOT count as account-gone.
+        let expired_401 = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/setup-runs/run_1/local-client/refresh".to_string(),
+            status: Some(401),
+            body_excerpt: Some(r#"{"detail":"setup run companion token expired"}"#.to_string()),
+        });
+        assert!(!backend_error_indicates_account_gone(&expired_401));
+
+        // Unrelated 404s (not a setup-run/local-client endpoint) don't count.
+        let unrelated_404 = LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/releases/latest".to_string(),
+            status: Some(404),
+            body_excerpt: None,
+        });
+        assert!(!backend_error_indicates_account_gone(&unrelated_404));
+
+        assert!(!backend_error_indicates_account_gone(
+            &LocalApiError::NetworkUnavailable
+        ));
+    }
+
+    #[test]
     #[serial]
     fn logout_without_cloud_connection_points_to_local_only_escape_hatch() {
         let support_root = telemetry_key_store_root("logout-missing-connection");
@@ -9347,35 +9731,36 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let persisted = persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
-            setup_run_id: "setup_claim".to_string(),
-            setup_run_token: "otsr_claim".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_claim".to_string()),
-            relay_device: Some(SetupClaimCompleteRelayDevice {
-                id: "device_claim".to_string(),
-                machine_id: None,
-                sources: vec![
-                    "claude_code".to_string(),
-                    "codex".to_string(),
-                    "pi".to_string(),
-                ],
-            }),
-            relay_device_secret: Some("otdev_rotated_claim".to_string()),
-            connected_at: "2026-05-05T09:20:00Z".to_string(),
-            user: SetupClaimCompleteUser {
-                id: "user_claim".to_string(),
-                email: "claim@example.com".to_string(),
-                display_name: None,
-            },
-            organization: SetupClaimCompleteOrganization {
-                id: "org_claim".to_string(),
-                name: "Claim Org".to_string(),
-            },
-        })
-        .expect("persist claim relay device");
-
-        assert!(persisted);
+        let (device, secret) =
+            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+                setup_run_id: "setup_claim".to_string(),
+                setup_run_token: "otsr_claim".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("machine_claim".to_string()),
+                relay_device: Some(SetupClaimCompleteRelayDevice {
+                    id: "device_claim".to_string(),
+                    machine_id: None,
+                    sources: vec![
+                        "claude_code".to_string(),
+                        "codex".to_string(),
+                        "pi".to_string(),
+                    ],
+                }),
+                relay_device_secret: Some("otdev_rotated_claim".to_string()),
+                connected_at: "2026-05-05T09:20:00Z".to_string(),
+                user: SetupClaimCompleteUser {
+                    id: "user_claim".to_string(),
+                    email: "claim@example.com".to_string(),
+                    display_name: None,
+                },
+                organization: SetupClaimCompleteOrganization {
+                    id: "org_claim".to_string(),
+                    name: "Claim Org".to_string(),
+                },
+            })
+            .expect("materialize claim relay device")
+            .expect("relay device credentials present");
+        persist_relay_device_credentials(&device, &secret).expect("persist claim relay device");
         assert_eq!(
             FileDeviceStore::default()
                 .load()
@@ -9409,27 +9794,28 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let persisted = persist_claim_relay_device_credentials(&SetupClaimCompleteResponse {
-            setup_run_id: "setup_claim".to_string(),
-            setup_run_token: "otsr_claim".to_string(),
-            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
-            machine_id: Some("machine_claim".to_string()),
-            relay_device: None,
-            relay_device_secret: None,
-            connected_at: "2026-05-05T09:20:00Z".to_string(),
-            user: SetupClaimCompleteUser {
-                id: "user_claim".to_string(),
-                email: "claim@example.com".to_string(),
-                display_name: None,
-            },
-            organization: SetupClaimCompleteOrganization {
-                id: "org_claim".to_string(),
-                name: "Claim Org".to_string(),
-            },
-        })
-        .expect("persist no claim relay device");
+        let credentials =
+            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+                setup_run_id: "setup_claim".to_string(),
+                setup_run_token: "otsr_claim".to_string(),
+                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                machine_id: Some("machine_claim".to_string()),
+                relay_device: None,
+                relay_device_secret: None,
+                connected_at: "2026-05-05T09:20:00Z".to_string(),
+                user: SetupClaimCompleteUser {
+                    id: "user_claim".to_string(),
+                    email: "claim@example.com".to_string(),
+                    display_name: None,
+                },
+                organization: SetupClaimCompleteOrganization {
+                    id: "org_claim".to_string(),
+                    name: "Claim Org".to_string(),
+                },
+            })
+            .expect("materialize no claim relay device");
 
-        assert!(!persisted);
+        assert!(credentials.is_none());
         assert_eq!(
             FileDeviceStore::default().load().expect("load device"),
             None
