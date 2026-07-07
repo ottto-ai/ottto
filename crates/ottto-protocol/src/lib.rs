@@ -1374,12 +1374,23 @@ pub struct AgentContextStatus {
     pub used_percent: Option<u8>,
     pub remaining_tokens: Option<u64>,
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_samples: Vec<AgentContextPressureSample>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completeness: Option<AgentContextCompleteness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextPressureSample {
+    pub at: Rfc3339Timestamp,
+    pub active_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub remaining_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

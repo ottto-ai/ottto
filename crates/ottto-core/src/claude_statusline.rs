@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 pub const CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION: u16 = 1;
 pub const CLAUDE_STATUSLINE_CACHE_FILE_NAME: &str = "claude-code-rate-limits.json";
 pub const CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME: &str = "claude-code-context-window.json";
+pub const CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME: &str =
+    "claude-code-context-window-history.json";
+pub const CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeStatusLineRateLimitCache {
@@ -32,6 +35,21 @@ pub struct ClaudeStatusLineContextWindowCache {
     pub remaining_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStatusLineContextWindowHistory {
+    pub schema_version: u16,
+    pub samples: Vec<ClaudeStatusLineContextWindowSample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeStatusLineContextWindowSample {
+    pub observed_at_epoch_seconds: u64,
+    pub active_tokens: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub used_percent: Option<u8>,
+    pub remaining_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeStatusLineIngestResult {
     pub stored: bool,
@@ -47,6 +65,10 @@ pub fn claude_statusline_context_cache_path(support_dir: &Path) -> PathBuf {
     support_dir.join(CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME)
 }
 
+pub fn claude_statusline_context_history_path(support_dir: &Path) -> PathBuf {
+    support_dir.join(CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME)
+}
+
 pub fn ingest_claude_statusline_payload(
     support_dir: &Path,
     payload: &str,
@@ -58,6 +80,7 @@ pub fn ingest_claude_statusline_payload(
     let Some(cache) = rate_cache.as_ref() else {
         if let Some(context_cache) = context_cache.as_ref() {
             write_claude_statusline_context_cache(support_dir, context_cache)?;
+            append_claude_statusline_context_history(support_dir, context_cache)?;
             return Ok(ClaudeStatusLineIngestResult {
                 stored: true,
                 window_count: 0,
@@ -74,6 +97,7 @@ pub fn ingest_claude_statusline_payload(
     write_claude_statusline_cache(support_dir, cache)?;
     if let Some(context_cache) = context_cache.as_ref() {
         write_claude_statusline_context_cache(support_dir, context_cache)?;
+        append_claude_statusline_context_history(support_dir, context_cache)?;
     }
     Ok(ClaudeStatusLineIngestResult {
         stored: true,
@@ -213,6 +237,22 @@ pub fn read_claude_statusline_context_cache(
     Ok(Some(cache))
 }
 
+pub fn read_claude_statusline_context_history(
+    support_dir: &Path,
+) -> Result<Option<ClaudeStatusLineContextWindowHistory>> {
+    let path = claude_statusline_context_history_path(support_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(&path).context("read Claude Code statusLine context history")?;
+    let history: ClaudeStatusLineContextWindowHistory =
+        serde_json::from_str(&body).context("parse Claude Code statusLine context history")?;
+    if history.schema_version != CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(history))
+}
+
 pub fn write_claude_statusline_cache(
     support_dir: &Path,
     cache: &ClaudeStatusLineRateLimitCache,
@@ -238,6 +278,57 @@ pub fn write_claude_statusline_context_cache(
         .context("serialize Claude Code statusLine context cache")?;
     fs::write(&tmp_path, body).context("write Claude Code statusLine context cache temp file")?;
     fs::rename(&tmp_path, &path).context("replace Claude Code statusLine context cache")?;
+    Ok(())
+}
+
+pub fn append_claude_statusline_context_history(
+    support_dir: &Path,
+    cache: &ClaudeStatusLineContextWindowCache,
+) -> Result<()> {
+    fs::create_dir_all(support_dir).context("create Ottto support directory")?;
+    let mut samples = read_claude_statusline_context_history(support_dir)?
+        .map(|history| history.samples)
+        .unwrap_or_default();
+    let sample = ClaudeStatusLineContextWindowSample {
+        observed_at_epoch_seconds: cache.observed_at_epoch_seconds,
+        active_tokens: cache.active_tokens,
+        max_tokens: cache.max_tokens,
+        used_percent: cache.used_percent,
+        remaining_tokens: cache.remaining_tokens,
+    };
+    if let Some(existing) = samples
+        .iter_mut()
+        .find(|existing| existing.observed_at_epoch_seconds == sample.observed_at_epoch_seconds)
+    {
+        *existing = sample;
+    } else {
+        samples.push(sample);
+    }
+    samples.sort_by_key(|sample| sample.observed_at_epoch_seconds);
+    if samples.len() > CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES {
+        let remove_count = samples.len() - CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES;
+        samples.drain(0..remove_count);
+    }
+    write_claude_statusline_context_history(
+        support_dir,
+        &ClaudeStatusLineContextWindowHistory {
+            schema_version: CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
+            samples,
+        },
+    )
+}
+
+pub fn write_claude_statusline_context_history(
+    support_dir: &Path,
+    history: &ClaudeStatusLineContextWindowHistory,
+) -> Result<()> {
+    fs::create_dir_all(support_dir).context("create Ottto support directory")?;
+    let path = claude_statusline_context_history_path(support_dir);
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let body = serde_json::to_vec_pretty(history)
+        .context("serialize Claude Code statusLine context history")?;
+    fs::write(&tmp_path, body).context("write Claude Code statusLine context history temp file")?;
+    fs::rename(&tmp_path, &path).context("replace Claude Code statusLine context history")?;
     Ok(())
 }
 
@@ -437,6 +528,12 @@ mod tests {
         assert_eq!(cache.max_tokens, Some(1_000_000));
         assert_eq!(cache.used_percent, Some(4));
         assert_eq!(cache.remaining_tokens, Some(958_000));
+        let history = read_claude_statusline_context_history(&dir)
+            .expect("read context history")
+            .expect("context history");
+        assert_eq!(history.samples.len(), 1);
+        assert_eq!(history.samples[0].observed_at_epoch_seconds, 10);
+        assert_eq!(history.samples[0].active_tokens, Some(42_000));
     }
 
     #[test]
@@ -476,5 +573,56 @@ mod tests {
             read_claude_statusline_context_cache(&dir).expect("read"),
             Some(cache)
         );
+    }
+
+    #[test]
+    fn context_history_is_deduplicated_sorted_and_capped() {
+        let dir = support_dir("context-history");
+        for observed_at in 0..(CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES as u64 + 5) {
+            append_claude_statusline_context_history(
+                &dir,
+                &ClaudeStatusLineContextWindowCache {
+                    schema_version: CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
+                    observed_at_epoch_seconds: observed_at,
+                    active_tokens: Some(observed_at * 100),
+                    max_tokens: Some(1_000_000),
+                    used_percent: Some((observed_at % 100) as u8),
+                    remaining_tokens: Some(1_000_000u64.saturating_sub(observed_at * 100)),
+                },
+            )
+            .expect("append");
+        }
+        append_claude_statusline_context_history(
+            &dir,
+            &ClaudeStatusLineContextWindowCache {
+                schema_version: CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
+                observed_at_epoch_seconds: 119,
+                active_tokens: Some(99_999),
+                max_tokens: Some(1_000_000),
+                used_percent: Some(10),
+                remaining_tokens: Some(900_001),
+            },
+        )
+        .expect("replace duplicate");
+
+        let history = read_claude_statusline_context_history(&dir)
+            .expect("read")
+            .expect("history");
+
+        assert_eq!(
+            history.samples.len(),
+            CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES
+        );
+        assert_eq!(history.samples[0].observed_at_epoch_seconds, 5);
+        assert_eq!(
+            history.samples.last().unwrap().observed_at_epoch_seconds,
+            124
+        );
+        let replaced = history
+            .samples
+            .iter()
+            .find(|sample| sample.observed_at_epoch_seconds == 119)
+            .expect("duplicate timestamp remains");
+        assert_eq!(replaced.active_tokens, Some(99_999));
     }
 }
