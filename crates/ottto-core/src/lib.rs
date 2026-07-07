@@ -15,14 +15,18 @@ pub use account_store::{
     LocalConnectionBinding, LocalDeviceBinding, LocalMachineBinding, LocalSourceState,
 };
 pub use claude_statusline::{
-    claude_statusline_cache_path, claude_statusline_context_cache_path,
+    append_claude_statusline_context_history, claude_statusline_cache_path,
+    claude_statusline_context_cache_path, claude_statusline_context_history_path,
     ingest_claude_statusline_payload, parse_claude_statusline_context_window_payload,
     parse_claude_statusline_payload, read_claude_statusline_cache,
-    read_claude_statusline_context_cache, write_claude_statusline_cache,
-    write_claude_statusline_context_cache, ClaudeStatusLineContextWindowCache,
+    read_claude_statusline_context_cache, read_claude_statusline_context_history,
+    write_claude_statusline_cache, write_claude_statusline_context_cache,
+    write_claude_statusline_context_history, ClaudeStatusLineContextWindowCache,
+    ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
     ClaudeStatusLineIngestResult, ClaudeStatusLineRateLimitCache, ClaudeStatusLineRateLimitWindow,
     CLAUDE_STATUSLINE_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
-    CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME,
+    CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME,
+    CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES,
 };
 pub use lifecycle::{
     execute_local_uninstall, launch_agent_path, launchd_target, local_lifecycle_home_dir,

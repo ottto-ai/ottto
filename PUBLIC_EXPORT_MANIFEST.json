@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 227,
-  "content_sha256": "4676da4c75d9e11dc4d0ff1057a31115e0e1e2ba93379844cc1f20ed9dcc9292",
+  "content_sha256": "17f2d1db1a37ff3abf392b6fe5e9ef4711deba8f0e02963f656252a667978193",
   "files": [
     {
       "executable": false,
@@ -482,15 +482,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_statusline.rs",
-      "sha256": "eb5af65edac1fc71d87070802ee759e56c923290bf3e3bc1b63deff118f6e652",
-      "size_bytes": 16706
+      "sha256": "9f61e70b01c0033e41b0ae0b8e6720a0cdf40a2907df7a6fb557ad727db661fc",
+      "size_bytes": 22765
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lib.rs",
-      "sha256": "60028fcc84dfd1fce32d5b0c69cb42b6d3f8a530f3953bbbfbf546bef926c7c7",
-      "size_bytes": 2645
+      "sha256": "826f120e97a6c06410dacdce456d748073b4c7640fdb263a32c69322b1337c40",
+      "size_bytes": 2991
     },
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "9e61bb1c881a96fd665c054bb65c164b5f3c5a85ae86c2b922765393d9c0caa9",
-      "size_bytes": 137112
+      "sha256": "ab6ba4ff07c62c2bd0b4e80cb0c064f024d9de8c8b6f1cf02e61fc773b07fceb",
+      "size_bytes": 137508
     },
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8316190210768aa64433bfb6ce7813b41f5d46d0b9d9675877792877608d59bb",
-      "size_bytes": 169168
+      "sha256": "11344d5676c222777890afbc45d734fc3d5c27cce00a35f27ae1a858e23da014",
+      "size_bytes": 173305
     },
     {
       "executable": false,
@@ -1592,7 +1592,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-07T17:36:28+00:00",
+  "generated_at": "2026-07-07T18:46:56+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 228,
   "public_roots": [
@@ -1628,5 +1628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c7cfeb96bd7fc67f42f5a1282217387543609f6c"
+  "source_commit": "203c88aed4be7b595ead26d0641c07df76b82914"
 }
