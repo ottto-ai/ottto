@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 227,
-  "content_sha256": "442279612728cc66660aecdae824c00f22d229a59a4bf32e9c6ad39ebdc17e5b",
+  "content_sha256": "205d6680d08898a0e27da4f3a61dd1d11f113054c7731f0b3ef104c7e0175efd",
   "files": [
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "0eb1f13b3ba31c15522ba9240e5eb82c66d1f9a7ace7d02b691d2624df9aca9a",
-      "size_bytes": 13565
+      "sha256": "789932f35bfaf69affce9a00aa8ea72dc267fa26dd57468c041dc538337ee6fe",
+      "size_bytes": 26711
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "d90090ec16c22a3ed109d65550f5362cf246c238d82ce077624909985dcbdeb8",
-      "size_bytes": 582579
+      "sha256": "4621739de7fb42fed17fcc4f47631bba5d47d23aeba02f5316d79ebfd3ddb50e",
+      "size_bytes": 587173
     },
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "a55b89f8287c824b91687697b803ab79d5b0556465df09fff8fb6783a84509c6",
-      "size_bytes": 279366
+      "sha256": "5366d1c0e11791fa1d0c379908a9a0c9ba724576c00e6d6d79ccfeb30f0b38a8",
+      "size_bytes": 279947
     },
     {
       "executable": false,
@@ -699,8 +699,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "8874c6bcc6c6d5a774c36401476abd7813310824b90f3c5bda4a9e0e6a387686",
-      "size_bytes": 69564
+      "sha256": "3cbe1feee025bed860b7340912ffd1e30f25868af8b724d014662bcea09c1476",
+      "size_bytes": 70709
     },
     {
       "executable": false,
@@ -1592,7 +1592,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-06T08:10:11+00:00",
+  "generated_at": "2026-07-07T07:01:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 228,
   "public_roots": [
@@ -1628,5 +1628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "549a01be329a8ca35032b292f792e91239376ddf"
+  "source_commit": "ca01eb52d681c47dc75ebbcbe45de33fa9d8cb29"
 }

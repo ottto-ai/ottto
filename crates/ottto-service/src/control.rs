@@ -1761,6 +1761,8 @@ fn complete_pending_auth_claim(
         machine_id: completed.machine_id.clone(),
         relay_device: relay_credentials.as_ref().map(|(device, _)| device.clone()),
         relay_device_secret: relay_credentials.as_ref().map(|(_, secret)| secret.clone()),
+        backfill_policy: completed.backfill_policy.clone(),
+        backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
     })? {
         return Err(LocalApiError::AccountSwitchCandidate {
             current_user_email: candidate.current_user_email,
@@ -1769,6 +1771,18 @@ fn complete_pending_auth_claim(
         });
     }
     let _binding_lock = lock_setup_run_binding();
+    // Persist the server-issued backfill policy BEFORE committing any of the
+    // new binding (token, relay credentials, account/connection files): if
+    // this write failed after the binding were already durable, the daemon
+    // would come up connected without the cutoff and the next snapshot sync
+    // would re-attribute the previous owner's pre-cutoff history to the new
+    // account. A stray cutoff for a never-installed binding is harmless; a
+    // binding without its cutoff is not.
+    persist_claim_backfill_policy(
+        completed.backfill_policy.as_deref(),
+        completed.backfill_cutoff_at.as_deref(),
+        &completed.user.id,
+    )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -1803,6 +1817,24 @@ fn complete_pending_auth_claim(
         request_snapshot_sync_after_device_registration(daemon);
     }
     Ok(response)
+}
+
+/// Persist the additive claim-completion backfill policy into the snapshot
+/// backfill state (`snapshot_backfill_state.json`). An unwritable state file is
+/// a poisoned-state error for `"from"` decisions — proceeding without the
+/// cutoff would double-count the previous owner's history at org level.
+fn persist_claim_backfill_policy(
+    policy: Option<&str>,
+    cutoff_at: Option<&str>,
+    user_id: &str,
+) -> Result<(), LocalApiError> {
+    let support_dir = default_support_dir();
+    crate::backfill::apply_claim_backfill_policy(&support_dir, policy, cutoff_at, user_id).map_err(
+        |error| {
+            eprintln!("ottto-service: persisting claim backfill policy failed: {error}");
+            LocalApiError::StatePoisoned
+        },
+    )
 }
 
 /// Confirmed account switch (`auth_switch_account`): consume the staged claim
@@ -1865,6 +1897,20 @@ fn install_staged_account_switch(
     let _binding_lock = lock_setup_run_binding();
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    // Persist the server-issued backfill policy BEFORE committing the new
+    // binding (see auth claim completion for the failure-ordering rationale):
+    // a same-org takeover must not re-attribute the previous owner's
+    // already-ingested history to the new account.
+    persist_claim_backfill_policy(
+        staged.backfill_policy.as_deref(),
+        staged.backfill_cutoff_at.as_deref(),
+        staged
+            .new_account
+            .user
+            .as_ref()
+            .map(|user| user.id.as_str())
+            .unwrap_or_default(),
+    )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -2120,6 +2166,13 @@ struct SetupClaimCompleteResponse {
     connected_at: String,
     user: SetupClaimCompleteUser,
     organization: SetupClaimCompleteOrganization,
+    /// Additive local-history backfill policy ("full" | "from"); absent on old
+    /// backends, which means full-backfill behavior (same as "full").
+    #[serde(default)]
+    backfill_policy: Option<String>,
+    /// Server-UTC takeover moment accompanying `backfill_policy: "from"`.
+    #[serde(default)]
+    backfill_cutoff_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9522,6 +9575,49 @@ mod tests {
     }
 
     #[test]
+    fn setup_claim_completion_parses_without_backfill_policy_fields() {
+        // Old backend: the additive fields are absent and default to None,
+        // which downstream means today's full-backfill behavior.
+        let completed: SetupClaimCompleteResponse = serde_json::from_value(serde_json::json!({
+            "setup_run_id": "setup_1",
+            "setup_run_token": "otsr_test",
+            "setup_run_token_expires_at": "2026-07-06T11:00:00Z",
+            "machine_id": "machine_test",
+            "relay_device": null,
+            "relay_device_secret": null,
+            "connected_at": "2026-07-06T10:00:00Z",
+            "user": {"id": "user_1", "email": "ron@example.com", "display_name": null},
+            "organization": {"id": "org_1", "name": "Org"}
+        }))
+        .expect("old-backend completion parses");
+        assert_eq!(completed.backfill_policy, None);
+        assert_eq!(completed.backfill_cutoff_at, None);
+    }
+
+    #[test]
+    fn setup_claim_completion_parses_backfill_policy_fields() {
+        let completed: SetupClaimCompleteResponse = serde_json::from_value(serde_json::json!({
+            "setup_run_id": "setup_1",
+            "setup_run_token": "otsr_test",
+            "setup_run_token_expires_at": "2026-07-06T11:00:00Z",
+            "machine_id": "machine_test",
+            "relay_device": null,
+            "relay_device_secret": null,
+            "connected_at": "2026-07-06T10:00:00Z",
+            "user": {"id": "user_2", "email": "other@example.com", "display_name": null},
+            "organization": {"id": "org_1", "name": "Org"},
+            "backfill_policy": "from",
+            "backfill_cutoff_at": "2026-07-06T10:00:00Z"
+        }))
+        .expect("new-backend completion parses");
+        assert_eq!(completed.backfill_policy.as_deref(), Some("from"));
+        assert_eq!(
+            completed.backfill_cutoff_at.as_deref(),
+            Some("2026-07-06T10:00:00Z")
+        );
+    }
+
+    #[test]
     fn auth_switch_account_without_staged_switch_is_invalid_request() {
         let response = handle_request(
             &daemon().with_account(connected_account()),
@@ -9757,6 +9853,8 @@ mod tests {
                     id: "org_claim".to_string(),
                     name: "Claim Org".to_string(),
                 },
+                backfill_policy: None,
+                backfill_cutoff_at: None,
             })
             .expect("materialize claim relay device")
             .expect("relay device credentials present");
@@ -9812,6 +9910,8 @@ mod tests {
                     id: "org_claim".to_string(),
                     name: "Claim Org".to_string(),
                 },
+                backfill_policy: None,
+                backfill_cutoff_at: None,
             })
             .expect("materialize no claim relay device");
 
