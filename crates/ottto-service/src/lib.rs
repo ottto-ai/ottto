@@ -6133,6 +6133,7 @@ mod tests {
                     remaining: None,
                     used_percent: Some(16),
                     left_percent: Some(84),
+                    ..Default::default()
                 },
                 AgentQuotaWindow {
                     name: "primary".to_string(),
@@ -6148,6 +6149,7 @@ mod tests {
                     remaining: None,
                     used_percent: Some(92),
                     left_percent: Some(8),
+                    ..Default::default()
                 },
             ],
             credit_balances: Vec::new(),
@@ -6910,6 +6912,7 @@ mod tests {
             remaining: Some(42),
             used_percent: Some(58),
             left_percent: Some(42),
+            ..Default::default()
         }];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
