@@ -1608,6 +1608,7 @@ fn refresh_agent_status_for(
     authorization: &RequestAuthorization,
     source: Option<SourceKind>,
 ) -> Result<Vec<ottto_protocol::AgentStatusSnapshot>, LocalApiError> {
+    reconcile_agent_status_config_for_refresh(daemon, source.as_ref())?;
     let captured_at = current_rfc3339();
     let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
         .unwrap_or_else(|| captured_at.clone());
@@ -1622,6 +1623,37 @@ fn refresh_agent_status_for(
     }?;
     upload_agent_status_snapshots_in_background(snapshots.clone());
     Ok(snapshots)
+}
+
+fn reconcile_agent_status_config_for_refresh(
+    daemon: &LocalDaemon,
+    source: Option<&SourceKind>,
+) -> Result<(), LocalApiError> {
+    if source.is_some_and(|source| source != &SourceKind::ClaudeCode) {
+        return Ok(());
+    }
+    reconcile_claude_statusline_for_agent_status_refresh(daemon)
+}
+
+fn reconcile_claude_statusline_for_agent_status_refresh(
+    daemon: &LocalDaemon,
+) -> Result<(), LocalApiError> {
+    if source_patch_disabled(&SourceKind::ClaudeCode)
+        || !crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode)
+    {
+        return Ok(());
+    }
+    let machine = daemon.status_for_trusted_client()?.machine;
+    let relay_base_url = local_relay_base_url_for_daemon(daemon);
+    let support_dir = default_support_dir();
+    let settings_path = home_path(".claude/settings.json");
+    let _ = repair_claude_statusline_for_refresh_at(
+        &settings_path,
+        &machine,
+        &support_dir,
+        &relay_base_url,
+    )?;
+    Ok(())
 }
 
 fn upload_agent_status_snapshots_in_background(snapshots: Vec<AgentStatusSnapshot>) {
@@ -5309,6 +5341,59 @@ fn patch_claude_code_settings_with_relay_base(
         &backup_root,
         relay_base_url,
     )
+}
+
+fn repair_claude_statusline_for_refresh_at(
+    path: &Path,
+    machine: &MachineIdentity,
+    support_dir: &Path,
+    relay_base_url: &str,
+) -> Result<ConfigPatchResult, LocalApiError> {
+    if !claude_statusline_refresh_repair_needed(path, support_dir) {
+        return Ok(ConfigPatchResult {
+            changed: false,
+            created: false,
+            backup_created: false,
+        });
+    }
+    patch_claude_code_settings_at_with_relay_base(path, machine, support_dir, relay_base_url)
+}
+
+fn claude_statusline_refresh_repair_needed(path: &Path, support_dir: &Path) -> bool {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let settings = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) if value.is_object() => value,
+        _ => return false,
+    };
+    let statusline = settings
+        .get("statusLine")
+        .and_then(|value| value.as_object());
+    if statusline
+        .and_then(|statusline| statusline.get("type"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value != "command")
+    {
+        return false;
+    }
+    let command = statusline
+        .and_then(|statusline| statusline.get("command"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match command {
+        None => true,
+        Some(command) if is_ottto_statusline_command(command) => {
+            command != expected_claude_statusline_command(support_dir).as_str()
+                || claude_statusline_wrapper_drift(support_dir).is_some()
+        }
+        Some(_) => false,
+    }
 }
 
 fn patch_claude_code_env_with_relay_base(
@@ -12415,6 +12500,106 @@ metrics_exporter = { otlp-http = { endpoint = "http://127.0.0.1:43119/v1/metrics
         );
         assert_eq!(count_backup_files(&backup_dir), 1);
         assert!(wrapper.contains("ORIGINAL_STATUSLINE=''"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_repair_installs_missing_claude_statusline_settings() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-refresh-install-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let path = root.join("settings.json");
+        let support_dir = root.join("support");
+
+        let repaired = repair_claude_statusline_for_refresh_at(
+            &path,
+            &test_machine(),
+            &support_dir,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("refresh repair");
+        let body = fs::read_to_string(&path).expect("read repaired settings");
+        let wrapper = fs::read_to_string(claude_statusline_wrapper_path(&support_dir))
+            .expect("read statusLine wrapper");
+
+        assert!(repaired.changed);
+        assert!(repaired.created);
+        assert!(!repaired.backup_created);
+        assert!(claude_code_settings_has_statusline_helper(&body));
+        assert!(wrapper.contains("claude-code-statusline"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_repair_restores_missing_claude_statusline_wrapper() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-refresh-wrapper-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let path = root.join("settings.json");
+        let support_dir = root.join("support");
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        patch_claude_code_settings_at(&path, &test_machine(), &support_dir).expect("seed settings");
+        let body = fs::read_to_string(&path).expect("read seeded settings");
+        fs::remove_file(claude_statusline_wrapper_path(&support_dir))
+            .expect("remove statusLine wrapper");
+
+        let repaired = repair_claude_statusline_for_refresh_at(
+            &path,
+            &test_machine(),
+            &support_dir,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("refresh repair");
+
+        assert!(repaired.changed);
+        assert!(!repaired.created);
+        assert!(!repaired.backup_created);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read settings again"),
+            body
+        );
+        assert!(claude_statusline_wrapper_path(&support_dir).is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_repair_preserves_user_claude_statusline_command() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-refresh-user-statusline-test-{}-{}",
+            std::process::id(),
+            current_millis()
+        ));
+        let path = root.join("settings.json");
+        let support_dir = root.join("support");
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(
+            &path,
+            r#"{"statusLine":{"type":"command","command":"jq -r '.model.display_name'"}}"#,
+        )
+        .expect("write user settings");
+        let body = fs::read_to_string(&path).expect("read user settings");
+
+        let repaired = repair_claude_statusline_for_refresh_at(
+            &path,
+            &test_machine(),
+            &support_dir,
+            &crate::otlp_relay::default_local_relay_base_url(),
+        )
+        .expect("refresh repair");
+
+        assert!(!repaired.changed);
+        assert!(!repaired.created);
+        assert!(!repaired.backup_created);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read settings again"),
+            body
+        );
+        assert!(!claude_statusline_wrapper_path(&support_dir).exists());
         let _ = fs::remove_dir_all(&root);
     }
 

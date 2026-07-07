@@ -6,12 +6,12 @@ use ottto_core::{
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
-    AgentContextState, AgentContextStatus, AgentCreditBalance, AgentCreditBalanceStatus,
-    AgentCreditBalanceUnit, AgentDiagnosticSeverity, AgentLoginState, AgentModelStatus,
-    AgentQuotaWindow, AgentQuotaWindowFreshness, AgentQuotaWindowScope, AgentQuotaWindowStatus,
-    AgentRuntimeDefaults, AgentStatusCollectionMethod, AgentStatusConfidence,
-    AgentStatusDiagnostic, AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState,
-    SourceKind,
+    AgentContextCompleteness, AgentContextState, AgentContextStatus, AgentCreditBalance,
+    AgentCreditBalanceStatus, AgentCreditBalanceUnit, AgentDiagnosticSeverity, AgentLoginState,
+    AgentModelStatus, AgentQuotaWindow, AgentQuotaWindowFreshness, AgentQuotaWindowScope,
+    AgentQuotaWindowStatus, AgentRuntimeDefaults, AgentStatusCollectionMethod,
+    AgentStatusConfidence, AgentStatusDiagnostic, AgentStatusPlanObservation, AgentStatusSnapshot,
+    AgentStatusState, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -264,6 +264,9 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         used_percent: None,
         remaining_tokens: None,
         source: Some("codex_cli_v1".to_string()),
+        observed_at: None,
+        completeness: Some(AgentContextCompleteness::Unavailable),
+        reason: Some("codex_active_context_not_collected".to_string()),
     });
     snapshot.capabilities = vec![
         supported_capability("account_status", "Detected with Codex CLI/config probes."),
@@ -423,23 +426,25 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         "Claude Code active context has not been observed from statusLine yet.",
     );
     match collect_claude_statusline_context_status() {
-        Ok(Some(context)) => {
-            snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+        Ok(context) => {
+            if context.status == AgentContextState::Available {
+                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                context_capability = match context.completeness {
+                    Some(AgentContextCompleteness::FullPressure) => supported_capability(
+                        "active_context",
+                        "Collected live context pressure from Claude Code's local statusLine context_window payload.",
+                    ),
+                    Some(AgentContextCompleteness::WindowSizeOnly) => supported_capability(
+                        "active_context",
+                        "Collected Claude Code context-window size from statusLine; live pressure fields have not been reported yet.",
+                    ),
+                    _ => supported_capability(
+                        "active_context",
+                        "Collected Claude Code's local statusLine context_window payload.",
+                    ),
+                };
+            }
             snapshot.context = Some(context);
-            context_capability = supported_capability(
-                "active_context",
-                "Collected from Claude Code's local statusLine context_window payload.",
-            );
-        }
-        Ok(None) => {
-            snapshot.context = Some(AgentContextStatus {
-                status: AgentContextState::Unsupported,
-                active_tokens: None,
-                max_tokens: None,
-                used_percent: None,
-                remaining_tokens: None,
-                source: Some("claude_statusline_context_window".to_string()),
-            });
         }
         Err(message) => {
             snapshot.context = Some(AgentContextStatus {
@@ -449,6 +454,9 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 used_percent: None,
                 remaining_tokens: None,
                 source: Some("claude_statusline_context_window".to_string()),
+                observed_at: None,
+                completeness: Some(AgentContextCompleteness::Unknown),
+                reason: Some("statusline_context_cache_unreadable".to_string()),
             });
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                 "claude_statusline_context_cache_unavailable",
@@ -493,22 +501,29 @@ fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, St
     Ok(claude_statusline_quota_windows_from_cache(cache, now))
 }
 
-fn collect_claude_statusline_context_status() -> Result<Option<AgentContextStatus>, String> {
+fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, String> {
     let cache = read_claude_statusline_context_cache(&default_support_dir()).map_err(|_| {
         "Claude Code statusLine context cache could not be read safely.".to_string()
     })?;
     let Some(cache) = cache else {
-        return Ok(None);
+        return Ok(claude_statusline_context_unavailable(
+            "statusline_context_not_observed",
+            None,
+        ));
     };
     let now = current_unix_seconds();
+    let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     if cache.observed_at_epoch_seconds > now.saturating_add(60)
         || now.saturating_sub(cache.observed_at_epoch_seconds)
             > CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS
     {
-        return Ok(None);
+        return Ok(claude_statusline_context_unavailable(
+            "statusline_context_cache_stale",
+            observed_at,
+        ));
     }
 
-    Ok(Some(claude_statusline_context_from_cache(cache)))
+    Ok(claude_statusline_context_from_cache(cache))
 }
 
 fn collect_claude_oauth_quota_windows(
@@ -804,13 +819,55 @@ fn claude_statusline_quota_windows_from_cache(
 fn claude_statusline_context_from_cache(
     cache: ClaudeStatusLineContextWindowCache,
 ) -> AgentContextStatus {
+    let has_pressure = cache.active_tokens.is_some()
+        || cache.used_percent.is_some()
+        || cache.remaining_tokens.is_some();
+    let (status, completeness, reason) = if has_pressure {
+        (
+            AgentContextState::Available,
+            AgentContextCompleteness::FullPressure,
+            "full_pressure_observed",
+        )
+    } else if cache.max_tokens.is_some() {
+        (
+            AgentContextState::Available,
+            AgentContextCompleteness::WindowSizeOnly,
+            "context_window_size_only",
+        )
+    } else {
+        (
+            AgentContextState::Unsupported,
+            AgentContextCompleteness::Unavailable,
+            "statusline_context_empty",
+        )
+    };
     AgentContextStatus {
-        status: AgentContextState::Available,
+        status,
         active_tokens: cache.active_tokens,
         max_tokens: cache.max_tokens,
         used_percent: cache.used_percent,
         remaining_tokens: cache.remaining_tokens,
         source: Some("claude_statusline_context_window".to_string()),
+        observed_at: rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds),
+        completeness: Some(completeness),
+        reason: Some(reason.to_string()),
+    }
+}
+
+fn claude_statusline_context_unavailable(
+    reason: &str,
+    observed_at: Option<String>,
+) -> AgentContextStatus {
+    AgentContextStatus {
+        status: AgentContextState::Unsupported,
+        active_tokens: None,
+        max_tokens: None,
+        used_percent: None,
+        remaining_tokens: None,
+        source: Some("claude_statusline_context_window".to_string()),
+        observed_at,
+        completeness: Some(AgentContextCompleteness::Unavailable),
+        reason: Some(reason.to_string()),
     }
 }
 
@@ -898,6 +955,9 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         used_percent: None,
         remaining_tokens: None,
         source: Some("pi_cli_v1".to_string()),
+        observed_at: None,
+        completeness: Some(AgentContextCompleteness::Unavailable),
+        reason: Some("pi_active_context_not_collected".to_string()),
     });
     snapshot.capabilities = vec![
         supported_capability(
@@ -2093,6 +2153,9 @@ fn parse_codex_text_context(text: &str) -> Option<AgentContextStatus> {
         used_percent,
         remaining_tokens: None,
         source: Some("codex_status_text".to_string()),
+        observed_at: None,
+        completeness: Some(AgentContextCompleteness::FullPressure),
+        reason: Some("codex_status_text_observed".to_string()),
     })
 }
 
@@ -4249,9 +4312,39 @@ for line in sys.stdin:
         assert_eq!(context.used_percent, Some(4));
         assert_eq!(context.remaining_tokens, Some(958_000));
         assert_eq!(
+            context.completeness,
+            Some(AgentContextCompleteness::FullPressure)
+        );
+        assert_eq!(context.reason.as_deref(), Some("full_pressure_observed"));
+        assert_eq!(
             context.source.as_deref(),
             Some("claude_statusline_context_window")
         );
+    }
+
+    #[test]
+    fn claude_statusline_context_cache_maps_window_size_only() {
+        let cache = ClaudeStatusLineContextWindowCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: 100,
+            active_tokens: None,
+            max_tokens: Some(1_000_000),
+            used_percent: None,
+            remaining_tokens: None,
+        };
+
+        let context = claude_statusline_context_from_cache(cache);
+
+        assert_eq!(context.status, AgentContextState::Available);
+        assert_eq!(context.active_tokens, None);
+        assert_eq!(context.max_tokens, Some(1_000_000));
+        assert_eq!(context.used_percent, None);
+        assert_eq!(context.remaining_tokens, None);
+        assert_eq!(
+            context.completeness,
+            Some(AgentContextCompleteness::WindowSizeOnly)
+        );
+        assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
     }
 
     #[test]

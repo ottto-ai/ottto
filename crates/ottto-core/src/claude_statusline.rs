@@ -260,6 +260,8 @@ fn active_tokens_from_context_window(value: &Value) -> Option<u64> {
         &[
             "active_tokens",
             "used_tokens",
+            "total_input_tokens",
+            "input_tokens",
             "current_tokens",
             "total_tokens",
             "total_context_tokens",
@@ -390,6 +392,28 @@ mod tests {
         assert!(!result.stored);
         assert_eq!(result.reason.as_deref(), Some("rate_limits_missing"));
         assert!(!claude_statusline_cache_path(&dir).exists());
+    }
+
+    #[test]
+    fn parses_official_context_window_token_fields() {
+        let payload = r#"{
+          "context_window": {
+            "context_window_size": 1000000,
+            "total_input_tokens": 42000,
+            "total_output_tokens": 12,
+            "used_percentage": 4.2,
+            "remaining_percentage": 95.8
+          }
+        }"#;
+
+        let cache = parse_claude_statusline_context_window_payload(payload, 1738422000)
+            .expect("parse context")
+            .expect("context cache");
+
+        assert_eq!(cache.max_tokens, Some(1_000_000));
+        assert_eq!(cache.active_tokens, Some(42_000));
+        assert_eq!(cache.used_percent, Some(4));
+        assert_eq!(cache.remaining_tokens, Some(958_000));
     }
 
     #[test]
