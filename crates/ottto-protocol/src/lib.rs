@@ -1374,6 +1374,12 @@ pub struct AgentContextStatus {
     pub used_percent: Option<u8>,
     pub remaining_tokens: Option<u64>,
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<AgentContextCompleteness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1381,6 +1387,15 @@ pub struct AgentContextStatus {
 pub enum AgentContextState {
     Available,
     Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextCompleteness {
+    FullPressure,
+    WindowSizeOnly,
+    Unavailable,
     Unknown,
 }
 
