@@ -1268,7 +1268,7 @@ pub struct AgentAvailableModelStatus {
     pub supports_images: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentQuotaWindow {
     pub name: String,
     pub scope: AgentQuotaWindowScope,
@@ -1286,19 +1286,42 @@ pub struct AgentQuotaWindow {
     pub remaining: Option<u64>,
     pub used_percent: Option<u8>,
     pub left_percent: Option<u8>,
+    /// Window dollar budget in integer minor units (cents), when the provider
+    /// reports one (Claude `five_hour`/`seven_day` `limit_dollars`). Additive;
+    /// old backends tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_cents: Option<u64>,
+    /// Window dollars spent so far in integer minor units (cents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_cents: Option<u64>,
+    /// Window dollars remaining in integer minor units (cents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_cents: Option<u64>,
+    /// Provider grouping key for scoped limits (e.g. `weekly`, `session`).
+    /// Free-form string, not an enum, so upstream drift never bricks parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Provider-reported severity (e.g. `normal`, `warning`, `critical`).
+    /// Free-form string, not an enum, for the same drift-safety reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Whether the provider marks this limit currently active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentQuotaWindowScope {
     Source,
     Account,
     Organization,
     Model,
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentQuotaWindowStatus {
     Ok,
@@ -1308,20 +1331,22 @@ pub enum AgentQuotaWindowStatus {
     Unsupported,
     Stale,
     Error,
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentQuotaWindowFreshness {
     Fresh,
     Stale,
     Unsupported,
     Error,
+    #[default]
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentCreditBalance {
     pub name: String,
     pub status: AgentCreditBalanceStatus,
@@ -1340,9 +1365,22 @@ pub struct AgentCreditBalance {
     pub unlimited: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<Rfc3339Timestamp>,
+    /// ISO 4217 currency code for money-denominated balances (e.g. `USD`).
+    /// Free-form string; additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// When the balance's budget window resets, if the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<Rfc3339Timestamp>,
+    /// Provider-reported utilization percentage (0..=100), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u8>,
+    /// Whether the provider marks usage credits as enabled for the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCreditBalanceStatus {
     Ok,
@@ -1352,6 +1390,7 @@ pub enum AgentCreditBalanceStatus {
     Unsupported,
     Stale,
     Error,
+    #[default]
     Unknown,
 }
 
@@ -3012,6 +3051,7 @@ mod tests {
                 quota: None,
                 unlimited: Some(false),
                 updated_at: Some("2026-05-07T00:00:00Z".to_string()),
+                ..Default::default()
             }],
             context: None,
             capabilities: Vec::new(),
