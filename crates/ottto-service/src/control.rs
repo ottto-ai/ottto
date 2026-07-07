@@ -1771,6 +1771,18 @@ fn complete_pending_auth_claim(
         });
     }
     let _binding_lock = lock_setup_run_binding();
+    // Persist the server-issued backfill policy BEFORE committing any of the
+    // new binding (token, relay credentials, account/connection files): if
+    // this write failed after the binding were already durable, the daemon
+    // would come up connected without the cutoff and the next snapshot sync
+    // would re-attribute the previous owner's pre-cutoff history to the new
+    // account. A stray cutoff for a never-installed binding is harmless; a
+    // binding without its cutoff is not.
+    persist_claim_backfill_policy(
+        completed.backfill_policy.as_deref(),
+        completed.backfill_cutoff_at.as_deref(),
+        &completed.user.id,
+    )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -1801,13 +1813,6 @@ fn complete_pending_auth_claim(
             api_base_url: validated_api_base_url(None)?,
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    // Persist the server-issued backfill policy BEFORE waking the snapshot
-    // sync, so the first post-claim scan already enforces the cutoff.
-    persist_claim_backfill_policy(
-        completed.backfill_policy.as_deref(),
-        completed.backfill_cutoff_at.as_deref(),
-        &completed.user.id,
-    )?;
     if relay_credentials_persisted {
         request_snapshot_sync_after_device_registration(daemon);
     }
@@ -1892,6 +1897,20 @@ fn install_staged_account_switch(
     let _binding_lock = lock_setup_run_binding();
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    // Persist the server-issued backfill policy BEFORE committing the new
+    // binding (see auth claim completion for the failure-ordering rationale):
+    // a same-org takeover must not re-attribute the previous owner's
+    // already-ingested history to the new account.
+    persist_claim_backfill_policy(
+        staged.backfill_policy.as_deref(),
+        staged.backfill_cutoff_at.as_deref(),
+        staged
+            .new_account
+            .user
+            .as_ref()
+            .map(|user| user.id.as_str())
+            .unwrap_or_default(),
+    )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -1921,19 +1940,6 @@ fn install_staged_account_switch(
             api_base_url: validated_api_base_url(None)?,
         })
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    // Persist the server-issued backfill policy BEFORE waking the snapshot
-    // sync: a same-org takeover must not re-attribute the previous owner's
-    // already-ingested history to the new account.
-    persist_claim_backfill_policy(
-        staged.backfill_policy.as_deref(),
-        staged.backfill_cutoff_at.as_deref(),
-        staged
-            .new_account
-            .user
-            .as_ref()
-            .map(|user| user.id.as_str())
-            .unwrap_or_default(),
-    )?;
     if relay_credentials_persisted {
         request_snapshot_sync_after_device_registration(daemon);
     }
