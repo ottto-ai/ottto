@@ -17,10 +17,10 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -42,6 +42,8 @@ const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
+const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
+const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -80,6 +82,79 @@ struct ClaudeOAuthUsageCache {
     observed_at_epoch_seconds: u64,
     next_refresh_after_epoch_seconds: u64,
     windows: Vec<AgentQuotaWindow>,
+    /// Usage-credit balances parsed from the same OAuth usage response.
+    /// `serde(default)` keeps schema-version-2 caches readable if the field is
+    /// absent; version-1 caches are discarded wholesale on read.
+    #[serde(default)]
+    credit_balances: Vec<AgentCreditBalance>,
+}
+
+const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 2;
+
+/// Everything the Claude OAuth usage endpoint yields in one fetch.
+#[derive(Debug, Clone, Default)]
+struct ClaudeOAuthUsage {
+    windows: Vec<AgentQuotaWindow>,
+    credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopConfig {
+    #[serde(rename = "lastKnownAccountUuid")]
+    last_known_account_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopCodeSessionMetadata {
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
+    #[serde(rename = "lastActivityAt")]
+    last_activity_at: Option<Value>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopAgentModeSessionMetadata {
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
+    #[serde(rename = "lastActivityAt")]
+    last_activity_at: Option<Value>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<Value>,
+    #[serde(rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(rename = "accountEmail")]
+    account_email: Option<String>,
+    email: Option<String>,
+    #[serde(rename = "accountName")]
+    account_name: Option<String>,
+    #[serde(rename = "organizationName")]
+    organization_name: Option<String>,
+    #[serde(rename = "workspaceName")]
+    workspace_name: Option<String>,
+    #[serde(rename = "teamName")]
+    team_name: Option<String>,
+    #[serde(rename = "subscriptionType")]
+    subscription_type: Option<String>,
+    #[serde(rename = "planType")]
+    plan_type: Option<String>,
+    plan: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopProfileBuilder {
+    account_uuid: String,
+    account_label: Option<String>,
+    account_name: Option<String>,
+    organization_label: Option<String>,
+    plan_type: Option<String>,
+    organization_uuids: BTreeSet<String>,
+    current_organization_uuid: Option<String>,
+    latest_activity_epoch_seconds: Option<i64>,
+    latest_session_id: Option<String>,
+    code_session_count: usize,
+    agent_mode_session_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,7 +410,10 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     // patch writes during onboarding — must NOT read as "installed", or a Mac
     // that never had Claude reports it as present and then fails verification
     // with "claude is not installed or not executable".
-    if !crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode) {
+    let claude_desktop_root = claude_desktop_support_dir();
+    let claude_cli_present =
+        crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode);
+    if !claude_cli_present && !claude_desktop_metadata_present(&claude_desktop_root) {
         return not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(
@@ -375,10 +453,11 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         "quota_windows",
         "Claude Code rate-limit windows have not been observed from local OAuth usage or statusLine yet.",
     );
-    match collect_claude_oauth_quota_windows(&version) {
-        Ok(windows) if !windows.is_empty() => {
+    match collect_claude_oauth_usage(&version) {
+        Ok(usage) if !usage.windows.is_empty() => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
-            snapshot.quota_windows = windows;
+            snapshot.quota_windows = usage.windows;
+            snapshot.credit_balances = usage.credit_balances;
             quota_capability = supported_capability(
                 "quota_windows",
                 "Collected from Claude Code's local OAuth usage endpoint.",
@@ -485,7 +564,437 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         ));
     }
     append_current_plan_observation(&mut snapshot);
+    let desktop_observation_count =
+        append_claude_desktop_plan_observations(&mut snapshot, &claude_desktop_root);
+    if desktop_observation_count > 0 {
+        if snapshot.status == AgentStatusState::Degraded {
+            snapshot.status = AgentStatusState::Available;
+        }
+        snapshot.capabilities.push(supported_capability(
+            "desktop_identity",
+            "Read display-safe Claude Desktop account and session-bucket metadata.",
+        ));
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_desktop_profile_detected",
+            AgentDiagnosticSeverity::Info,
+            "Claude Desktop Code account/session bucket metadata was detected.",
+        ));
+    }
     snapshot
+}
+
+fn append_claude_desktop_plan_observations(
+    snapshot: &mut AgentStatusSnapshot,
+    desktop_root: &Path,
+) -> usize {
+    let observations =
+        claude_desktop_plan_observations_from_root(desktop_root, &snapshot.captured_at);
+    let count = observations.len();
+    snapshot.plan_observations.extend(observations);
+    count
+}
+
+fn claude_desktop_support_dir() -> PathBuf {
+    home_path("Library/Application Support/Claude")
+}
+
+fn claude_desktop_metadata_present(root: &Path) -> bool {
+    root.join("config.json").is_file()
+        || root.join("claude-code-sessions").is_dir()
+        || root.join("local-agent-mode-sessions").is_dir()
+}
+
+fn claude_desktop_plan_observations_from_root(
+    root: &Path,
+    observed_at: &str,
+) -> Vec<AgentStatusPlanObservation> {
+    let config = read_claude_desktop_config(root);
+    let last_known_account_uuid = config
+        .last_known_account_uuid
+        .as_deref()
+        .and_then(safe_local_identifier)
+        .map(ToString::to_string);
+    let mut builders: BTreeMap<String, ClaudeDesktopProfileBuilder> = BTreeMap::new();
+
+    collect_claude_desktop_code_sessions(
+        &root.join("claude-code-sessions"),
+        last_known_account_uuid.as_deref(),
+        &mut builders,
+    );
+    collect_claude_desktop_agent_mode_sessions(
+        &root.join("local-agent-mode-sessions"),
+        &mut builders,
+    );
+
+    builders
+        .into_values()
+        .filter(|builder| {
+            builder.code_session_count > 0
+                || last_known_account_uuid.as_deref() == Some(builder.account_uuid.as_str())
+        })
+        .filter_map(|builder| {
+            claude_desktop_builder_plan_observation(
+                builder,
+                observed_at,
+                last_known_account_uuid.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn read_claude_desktop_config(root: &Path) -> ClaudeDesktopConfig {
+    let path = root.join("config.json");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ClaudeDesktopConfig>(&body).ok())
+        .unwrap_or_default()
+}
+
+fn collect_claude_desktop_code_sessions(
+    root: &Path,
+    last_known_account_uuid: Option<&str>,
+    builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+) {
+    let Ok(accounts) = fs::read_dir(root) else {
+        return;
+    };
+    for account in accounts.flatten() {
+        let Ok(file_type) = account.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(account_uuid) = account
+            .file_name()
+            .to_str()
+            .and_then(safe_local_identifier)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let Ok(orgs) = fs::read_dir(account.path()) else {
+            continue;
+        };
+        for org in orgs.flatten() {
+            let Ok(file_type) = org.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(org_uuid) = org
+                .file_name()
+                .to_str()
+                .and_then(safe_local_identifier)
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let builder = builders.entry(account_uuid.clone()).or_insert_with(|| {
+                ClaudeDesktopProfileBuilder {
+                    account_uuid: account_uuid.clone(),
+                    ..Default::default()
+                }
+            });
+            builder.organization_uuids.insert(org_uuid.clone());
+            let Ok(files) = fs::read_dir(org.path()) else {
+                continue;
+            };
+            for file in files
+                .flatten()
+                .filter(|entry| looks_like_local_json_file(entry.path().as_path()))
+                .take(CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG)
+            {
+                let metadata = read_json_file::<ClaudeDesktopCodeSessionMetadata>(&file.path());
+                let activity = metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                            .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                    })
+                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let session_id = metadata
+                    .and_then(|metadata| metadata.cli_session_id)
+                    .and_then(|value| safe_local_identifier(&value).map(ToString::to_string));
+                let builder = builders.get_mut(&account_uuid).expect("builder exists");
+                builder.code_session_count += 1;
+                if builder.record_activity(activity, session_id)
+                    && last_known_account_uuid == Some(account_uuid.as_str())
+                {
+                    builder.current_organization_uuid = Some(org_uuid.clone());
+                }
+            }
+        }
+    }
+}
+
+fn collect_claude_desktop_agent_mode_sessions(
+    root: &Path,
+    builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+) {
+    let Ok(accounts) = fs::read_dir(root) else {
+        return;
+    };
+    for account in accounts.flatten() {
+        let Ok(file_type) = account.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(account_uuid) = account
+            .file_name()
+            .to_str()
+            .and_then(safe_local_identifier)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let Ok(orgs) = fs::read_dir(account.path()) else {
+            continue;
+        };
+        for org in orgs.flatten() {
+            let Ok(file_type) = org.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(org_uuid) = org
+                .file_name()
+                .to_str()
+                .and_then(safe_local_identifier)
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let builder = builders.entry(account_uuid.clone()).or_insert_with(|| {
+                ClaudeDesktopProfileBuilder {
+                    account_uuid: account_uuid.clone(),
+                    ..Default::default()
+                }
+            });
+            builder.organization_uuids.insert(org_uuid);
+            let Ok(files) = fs::read_dir(org.path()) else {
+                continue;
+            };
+            for file in files
+                .flatten()
+                .filter(|entry| looks_like_local_json_file(entry.path().as_path()))
+                .take(CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG)
+            {
+                let Some(metadata) =
+                    read_json_file::<ClaudeDesktopAgentModeSessionMetadata>(&file.path())
+                else {
+                    continue;
+                };
+                let activity = timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                    .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let session_id = metadata
+                    .cli_session_id
+                    .as_deref()
+                    .and_then(safe_local_identifier)
+                    .map(ToString::to_string);
+                let builder = builders.get_mut(&account_uuid).expect("builder exists");
+                builder.agent_mode_session_count += 1;
+                builder.record_activity(activity, session_id);
+                builder.account_label = builder.account_label.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.email_address.as_deref(),
+                        metadata.account_email.as_deref(),
+                        metadata.email.as_deref(),
+                    ])
+                    .map(ToString::to_string)
+                });
+                builder.account_name = builder
+                    .account_name
+                    .clone()
+                    .or_else(|| safe_display_label(metadata.account_name.as_deref()));
+                builder.organization_label = builder.organization_label.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.organization_name.as_deref(),
+                        metadata.workspace_name.as_deref(),
+                        metadata.team_name.as_deref(),
+                    ])
+                    .and_then(|value| safe_display_label(Some(value)))
+                });
+                builder.plan_type = builder.plan_type.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.subscription_type.as_deref(),
+                        metadata.plan_type.as_deref(),
+                        metadata.plan.as_deref(),
+                    ])
+                    .map(|value| normalize_plan_type(value.to_string()))
+                });
+            }
+        }
+    }
+}
+
+fn claude_desktop_builder_plan_observation(
+    builder: ClaudeDesktopProfileBuilder,
+    observed_at: &str,
+    last_known_account_uuid: Option<&str>,
+) -> Option<AgentStatusPlanObservation> {
+    let account_identifier_hash =
+        billing_identity_hash("anthropic", "account", &builder.account_uuid);
+    let organization_id = builder
+        .current_organization_uuid
+        .or_else(|| builder.organization_uuids.iter().next().cloned());
+    let organization_identifier_hash = organization_id
+        .as_deref()
+        .and_then(|value| billing_identity_hash("anthropic", "organization", value));
+    let billing_identity_evidence = billing_identity_evidence_for(
+        &account_identifier_hash,
+        &organization_identifier_hash,
+        &None,
+    );
+    if account_identifier_hash.is_none() && organization_identifier_hash.is_none() {
+        return None;
+    }
+    let plan_type = builder.plan_type;
+    let subscription_product = plan_type.clone().map(|plan| {
+        if plan.starts_with("claude_") {
+            plan
+        } else {
+            format!("claude_{plan}")
+        }
+    });
+    let is_current = last_known_account_uuid == Some(builder.account_uuid.as_str());
+    Some(AgentStatusPlanObservation {
+        observed_at: Some(observed_at.to_string()),
+        evidence_method: Some("claude_desktop_session_bucket".to_string()),
+        source_session_id: builder.latest_session_id,
+        provider: Some("anthropic".to_string()),
+        billing_provider: Some("anthropic".to_string()),
+        model_provider: Some("anthropic".to_string()),
+        billing_channel: Some("subscription".to_string()),
+        auth_mode: Some("claude_desktop".to_string()),
+        gateway_provider: None,
+        subscription_product,
+        plan_type,
+        account_label: builder.account_label.or(builder.account_name),
+        account_id: Some(builder.account_uuid),
+        organization_label: builder.organization_label,
+        organization_id,
+        account_identifier_hash,
+        organization_identifier_hash,
+        credential_fingerprint_hash: None,
+        billing_identity_evidence,
+        billing_identity_confidence: AgentStatusConfidence::High,
+        confidence: if is_current {
+            AgentStatusConfidence::High
+        } else {
+            AgentStatusConfidence::Medium
+        },
+        is_current: Some(is_current),
+    })
+}
+
+impl ClaudeDesktopProfileBuilder {
+    fn record_activity(&mut self, activity: Option<i64>, session_id: Option<String>) -> bool {
+        let should_replace = match (activity, self.latest_activity_epoch_seconds) {
+            (Some(next), Some(current)) => next >= current,
+            (Some(_), None) => true,
+            (None, _) => self.latest_session_id.is_none(),
+        };
+        if should_replace {
+            self.latest_activity_epoch_seconds = activity.or(self.latest_activity_epoch_seconds);
+            if session_id.is_some() {
+                self.latest_session_id = session_id;
+            }
+        }
+        should_replace
+    }
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let body = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+fn looks_like_local_json_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("local_") && name.ends_with(".json")
+}
+
+fn safe_local_identifier(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn safe_display_label(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 255
+        || value.contains('/')
+        || value.contains('\\')
+        || value.to_ascii_lowercase().contains("token")
+        || value.to_ascii_lowercase().contains("secret")
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn timestamp_value_epoch_seconds(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds);
+    }
+    if let Some(seconds) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return Some(seconds);
+    }
+    if let Some(seconds) = value.as_f64() {
+        if seconds.is_finite() {
+            return Some(seconds.round() as i64);
+        }
+    }
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = text.parse::<i64>() {
+        return Some(seconds);
+    }
+    if let Ok(seconds) = text.parse::<f64>() {
+        if seconds.is_finite() {
+            return Some(seconds.round() as i64);
+        }
+    }
+    OffsetDateTime::parse(text, &Rfc3339)
+        .ok()
+        .map(|value| value.unix_timestamp())
+}
+
+fn file_modified_epoch_seconds(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(duration.as_secs()).ok()
 }
 
 fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, String> {
@@ -534,9 +1043,7 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
     Ok(claude_statusline_context_from_cache(cache, history))
 }
 
-fn collect_claude_oauth_quota_windows(
-    version: &CommandOutput,
-) -> Result<Vec<AgentQuotaWindow>, String> {
+fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsage, String> {
     let now = current_unix_seconds();
     if let Some(cache) = read_claude_oauth_usage_cache() {
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
@@ -545,7 +1052,7 @@ fn collect_claude_oauth_quota_windows(
             && (cache_age <= CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS
                 || now < cache.next_refresh_after_epoch_seconds)
         {
-            return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+            return Ok(claude_oauth_usage_from_cache(cache, now));
         }
         if now < cache.next_refresh_after_epoch_seconds {
             return Err("Claude OAuth usage endpoint is rate limited.".to_string());
@@ -569,10 +1076,11 @@ fn collect_claude_oauth_quota_windows(
         Err(ureq::Error::Status(429, response)) => {
             let retry_after = claude_oauth_retry_after_epoch_seconds(&response, now);
             let mut cache = read_claude_oauth_usage_cache().unwrap_or(ClaudeOAuthUsageCache {
-                schema_version: 1,
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
                 observed_at_epoch_seconds: now,
                 next_refresh_after_epoch_seconds: retry_after,
                 windows: Vec::new(),
+                credit_balances: Vec::new(),
             });
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
@@ -580,7 +1088,7 @@ fn collect_claude_oauth_quota_windows(
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
             {
-                return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+                return Ok(claude_oauth_usage_from_cache(cache, now));
             }
             return Err("Claude OAuth usage endpoint is rate limited.".to_string());
         }
@@ -590,7 +1098,7 @@ fn collect_claude_oauth_quota_windows(
                     && now.saturating_sub(cache.observed_at_epoch_seconds)
                         <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
                 {
-                    return Ok(claude_oauth_quota_windows_from_cache(cache, now));
+                    return Ok(claude_oauth_usage_from_cache(cache, now));
                 }
             }
             return Err(claude_oauth_usage_error(error));
@@ -599,16 +1107,20 @@ fn collect_claude_oauth_quota_windows(
     let value: Value = response
         .into_json()
         .map_err(|_| "Claude OAuth usage endpoint returned an unreadable response.".to_string())?;
-    let windows = claude_oauth_quota_windows(&value);
-    if !windows.is_empty() {
+    let usage = ClaudeOAuthUsage {
+        windows: claude_oauth_quota_windows(&value),
+        credit_balances: claude_oauth_credit_balances(&value),
+    };
+    if !usage.windows.is_empty() {
         let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
-            schema_version: 1,
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             observed_at_epoch_seconds: now,
             next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
-            windows: windows.clone(),
+            windows: usage.windows.clone(),
+            credit_balances: usage.credit_balances.clone(),
         });
     }
-    Ok(windows)
+    Ok(usage)
 }
 
 fn read_claude_oauth_access_token() -> Option<String> {
@@ -671,7 +1183,9 @@ fn read_claude_oauth_usage_cache() -> Option<ClaudeOAuthUsageCache> {
     let path = claude_oauth_usage_cache_path();
     let body = fs::read_to_string(path).ok()?;
     let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
-    if cache.schema_version != 1 {
+    if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
+        // Older cache layouts (v1: windows only) are discarded so the next
+        // tick refetches and repopulates the credit balances.
         return None;
     }
     Some(cache)
@@ -720,7 +1234,224 @@ fn claude_oauth_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
     {
         windows.push(window);
     }
+    windows.extend(claude_oauth_scoped_limit_windows(value));
     windows
+}
+
+/// Per-model scoped limits from the `limits[]` array (e.g. `weekly_scoped`
+/// for one model at 98% while the account-level `seven_day` shows 82%).
+/// Entries without a model scope duplicate `five_hour`/`seven_day` account
+/// windows (`session`, `weekly_all`) and are skipped.
+fn claude_oauth_scoped_limit_windows(value: &Value) -> Vec<AgentQuotaWindow> {
+    let Some(limits) = value.get("limits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    limits
+        .iter()
+        .filter_map(|entry| {
+            let model = entry
+                .get("scope")
+                .and_then(|scope| scope.get("model"))
+                .and_then(|model| {
+                    model
+                        .get("display_name")
+                        .or_else(|| model.get("id"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|name| !name.is_empty())?;
+            let used_percent = json_u8(entry, &["percent"]);
+            let resets_at = json_timestamp_rfc3339(entry, &["resets_at", "reset_at"]);
+            if used_percent.is_none() && resets_at.is_none() {
+                return None;
+            }
+            let name = entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .unwrap_or("scoped")
+                .to_string();
+            Some(AgentQuotaWindow {
+                name,
+                scope: AgentQuotaWindowScope::Model,
+                status: used_percent
+                    .map(percent_quota_status)
+                    .unwrap_or(AgentQuotaWindowStatus::Unknown),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: Some(model.to_string()),
+                resets_at,
+                used_percent,
+                left_percent: used_percent.map(|used| 100_u8.saturating_sub(used)),
+                group: json_trimmed_string(entry, "group"),
+                severity: json_trimmed_string(entry, "severity"),
+                is_active: entry.get("is_active").and_then(Value::as_bool),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Usage-credit balances from the OAuth usage response. The newer `spend`
+/// object is authoritative; the older `extra_usage` shape is the fallback.
+/// Disabled accounts emit nothing (no credit chrome downstream), and a missing
+/// or unrecognized shape fails soft to an empty list so quota windows are
+/// never hidden by credit parsing.
+fn claude_oauth_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
+    claude_oauth_spend_credit_balance(value.get("spend"))
+        .or_else(|| claude_oauth_extra_usage_credit_balance(value.get("extra_usage")))
+        .into_iter()
+        .collect()
+}
+
+fn claude_oauth_spend_credit_balance(spend: Option<&Value>) -> Option<AgentCreditBalance> {
+    let spend = spend?;
+    if spend.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let used = claude_oauth_money_cents(spend.get("used"));
+    let quota = claude_oauth_money_cents(spend.get("cap"))
+        .or_else(|| claude_oauth_money_cents(spend.get("limit")));
+    let remaining =
+        claude_oauth_money_cents(spend.get("balance")).or_else(|| match (quota, used) {
+            (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
+            _ => None,
+        });
+    if used.is_none() && quota.is_none() && remaining.is_none() {
+        return None;
+    }
+    let used_percent = json_u8(spend, &["percent"]).or_else(|| match (used, quota) {
+        (Some(used), Some(quota)) if quota > 0 => {
+            Some(((used.saturating_mul(100)) / quota).min(100) as u8)
+        }
+        _ => None,
+    });
+    let severity = spend.get("severity").and_then(Value::as_str).unwrap_or("");
+    Some(AgentCreditBalance {
+        name: "Usage credits".to_string(),
+        status: claude_oauth_credit_status(severity, used, quota, remaining),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        remaining,
+        used,
+        quota,
+        currency: claude_oauth_money_currency(spend.get("used"))
+            .or_else(|| json_trimmed_string(spend, "currency")),
+        resets_at: json_timestamp_rfc3339(spend, &["resets_at", "reset_at"]),
+        used_percent,
+        enabled: Some(true),
+        ..Default::default()
+    })
+}
+
+fn claude_oauth_extra_usage_credit_balance(extra: Option<&Value>) -> Option<AgentCreditBalance> {
+    let extra = extra?;
+    if extra.get("is_enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let quota = claude_oauth_money_cents(extra.get("monthly_limit"));
+    let used = claude_oauth_money_cents(extra.get("used_credits"));
+    let remaining = match (quota, used) {
+        (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
+        _ => None,
+    };
+    if used.is_none() && quota.is_none() {
+        return None;
+    }
+    let used_percent = json_u8(extra, &["utilization"]);
+    Some(AgentCreditBalance {
+        name: "Usage credits".to_string(),
+        status: claude_oauth_credit_status("", used, quota, remaining),
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Usd,
+        remaining,
+        used,
+        quota,
+        currency: json_trimmed_string(extra, "currency"),
+        resets_at: None,
+        used_percent,
+        enabled: Some(true),
+        ..Default::default()
+    })
+}
+
+fn claude_oauth_credit_status(
+    severity: &str,
+    used: Option<u64>,
+    quota: Option<u64>,
+    remaining: Option<u64>,
+) -> AgentCreditBalanceStatus {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        "critical" => return AgentCreditBalanceStatus::Exhausted,
+        "warning" => return AgentCreditBalanceStatus::Low,
+        "normal" => return AgentCreditBalanceStatus::Ok,
+        _ => {}
+    }
+    match (used, quota, remaining) {
+        (_, _, Some(0)) => AgentCreditBalanceStatus::Exhausted,
+        (Some(used), Some(quota), _) if quota > 0 && used >= quota => {
+            AgentCreditBalanceStatus::Exhausted
+        }
+        (Some(used), Some(quota), _) if quota > 0 && used.saturating_mul(10) >= quota * 9 => {
+            AgentCreditBalanceStatus::Low
+        }
+        (Some(_), _, _) | (_, Some(_), _) => AgentCreditBalanceStatus::Ok,
+        _ => AgentCreditBalanceStatus::Unknown,
+    }
+}
+
+/// Normalize a provider money value to integer minor units (cents).
+///
+/// Accepts either the structured shape `{"amount_minor": 321, "currency":
+/// "USD", "exponent": 2}` (exponent 0..=6, scaled to 2 with round-half-up on
+/// downscale) or a bare non-negative number interpreted as whole dollars.
+fn claude_oauth_money_cents(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(object) = value.as_object() {
+        let amount_minor = object.get("amount_minor").and_then(Value::as_i64)?;
+        if amount_minor < 0 {
+            return None;
+        }
+        let amount_minor = amount_minor as u64;
+        let exponent = object.get("exponent").and_then(Value::as_u64).unwrap_or(2);
+        if exponent > 6 {
+            return None;
+        }
+        return Some(match exponent.cmp(&2) {
+            std::cmp::Ordering::Equal => amount_minor,
+            std::cmp::Ordering::Less => {
+                amount_minor.saturating_mul(10_u64.pow((2 - exponent) as u32))
+            }
+            std::cmp::Ordering::Greater => {
+                let divisor = 10_u64.pow((exponent - 2) as u32);
+                (amount_minor + divisor / 2) / divisor
+            }
+        });
+    }
+    let dollars = value.as_f64()?;
+    if !dollars.is_finite() || dollars < 0.0 {
+        return None;
+    }
+    Some((dollars * 100.0).round() as u64)
+}
+
+fn claude_oauth_money_currency(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("currency"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|currency| !currency.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_trimmed_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
 }
 
 fn claude_oauth_quota_window(
@@ -754,28 +1485,43 @@ fn claude_oauth_quota_window(
         remaining: None,
         used_percent,
         left_percent,
+        limit_cents: claude_oauth_money_cents(value.get("limit_dollars")),
+        used_cents: claude_oauth_money_cents(value.get("used_dollars")),
+        remaining_cents: claude_oauth_money_cents(value.get("remaining_dollars")),
+        ..Default::default()
     })
 }
 
-fn claude_oauth_quota_windows_from_cache(
-    cache: ClaudeOAuthUsageCache,
-    now: u64,
-) -> Vec<AgentQuotaWindow> {
+fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> ClaudeOAuthUsage {
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
     let cache_is_stale = cache_age > CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS;
-    cache
-        .windows
-        .into_iter()
-        .map(|mut window| {
-            if cache_is_stale {
-                window.status = AgentQuotaWindowStatus::Unknown;
-                window.freshness = AgentQuotaWindowFreshness::Stale;
-            } else {
-                window.freshness = AgentQuotaWindowFreshness::Fresh;
-            }
-            window
-        })
-        .collect()
+    ClaudeOAuthUsage {
+        windows: cache
+            .windows
+            .into_iter()
+            .map(|mut window| {
+                if cache_is_stale {
+                    window.status = AgentQuotaWindowStatus::Unknown;
+                    window.freshness = AgentQuotaWindowFreshness::Stale;
+                } else {
+                    window.freshness = AgentQuotaWindowFreshness::Fresh;
+                }
+                window
+            })
+            .collect(),
+        credit_balances: cache
+            .credit_balances
+            .into_iter()
+            .map(|mut credit| {
+                credit.freshness = if cache_is_stale {
+                    AgentQuotaWindowFreshness::Stale
+                } else {
+                    AgentQuotaWindowFreshness::Fresh
+                };
+                credit
+            })
+            .collect(),
+    }
 }
 
 fn claude_statusline_quota_windows_from_cache(
@@ -819,6 +1565,7 @@ fn claude_statusline_quota_windows_from_cache(
             remaining: None,
             used_percent: Some(window.used_percent),
             left_percent: Some(100u8.saturating_sub(window.used_percent)),
+            ..Default::default()
         });
     }
     windows
@@ -1610,6 +2357,7 @@ fn codex_app_server_quota_window(name: &str, value: &Value) -> Option<AgentQuota
         remaining: None,
         used_percent,
         left_percent,
+        ..Default::default()
     })
 }
 
@@ -1639,6 +2387,7 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
                 quota: None,
                 unlimited: Some(false),
                 updated_at: None,
+                ..Default::default()
             });
         }
     }
@@ -1663,6 +2412,7 @@ fn codex_credit_balance_from_credits_snapshot(credits: &Value) -> Option<AgentCr
         quota: None,
         unlimited,
         updated_at: None,
+        ..Default::default()
     })
 }
 
@@ -1776,6 +2526,7 @@ fn codex_usage_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindo
         remaining: None,
         used_percent,
         left_percent,
+        ..Default::default()
     })
 }
 
@@ -1804,6 +2555,7 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         quota: None,
         unlimited,
         updated_at: None,
+        ..Default::default()
     }]
 }
 
@@ -2187,6 +2939,7 @@ fn parse_codex_text_quota_windows(text: &str) -> Vec<AgentQuotaWindow> {
                 remaining: None,
                 used_percent,
                 left_percent: left,
+                ..Default::default()
             });
         }
     }
@@ -3384,6 +4137,7 @@ fn unsupported_quota_window(name: &str) -> AgentQuotaWindow {
         remaining: None,
         used_percent: None,
         left_percent: None,
+        ..Default::default()
     }
 }
 
@@ -4135,6 +4889,124 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn claude_desktop_metadata_observations_split_current_desktop_account() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-profile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"lastKnownAccountUuid":"desktop-account-current"}"#,
+        )
+        .expect("write config");
+
+        let current_code = root
+            .join("claude-code-sessions")
+            .join("desktop-account-current")
+            .join("singular-org-bucket");
+        std::fs::create_dir_all(&current_code).expect("create current code bucket");
+        std::fs::write(
+            current_code.join("local_current.json"),
+            r#"{
+              "cliSessionId": "current-cli-session",
+              "lastActivityAt": "2026-07-08T10:00:00Z",
+              "cwd": "/Users/example/private",
+              "title": "ignored"
+            }"#,
+        )
+        .expect("write current code metadata");
+        let current_identity = root
+            .join("local-agent-mode-sessions")
+            .join("desktop-account-current")
+            .join("different-agent-mode-bucket");
+        std::fs::create_dir_all(&current_identity).expect("create current identity bucket");
+        std::fs::write(
+            current_identity.join("local_identity.json"),
+            r#"{
+              "cliSessionId": "identity-cli-session",
+              "emailAddress": "ron.s@singular.net",
+              "accountName": "Ron",
+              "organizationName": "Singular",
+              "subscriptionType": "team",
+              "initialMessage": "must not be persisted"
+            }"#,
+        )
+        .expect("write current identity metadata");
+
+        let old_code = root
+            .join("claude-code-sessions")
+            .join("desktop-account-old")
+            .join("gmail-org-bucket");
+        std::fs::create_dir_all(&old_code).expect("create old code bucket");
+        std::fs::write(
+            old_code.join("local_old.json"),
+            r#"{"cliSessionId":"old-cli-session","lastActivityAt":"2026-07-07T10:00:00Z"}"#,
+        )
+        .expect("write old code metadata");
+        let old_identity = root
+            .join("local-agent-mode-sessions")
+            .join("desktop-account-old")
+            .join("gmail-org-bucket");
+        std::fs::create_dir_all(&old_identity).expect("create old identity bucket");
+        std::fs::write(
+            old_identity.join("local_identity.json"),
+            r#"{"emailAddress":"ronshub88@gmail.com"}"#,
+        )
+        .expect("write old identity metadata");
+
+        let observations =
+            claude_desktop_plan_observations_from_root(&root, "2026-07-08T10:01:00Z");
+
+        assert_eq!(observations.len(), 2);
+        let current = observations
+            .iter()
+            .find(|observation| observation.is_current == Some(true))
+            .expect("current desktop observation");
+        assert_eq!(
+            current.evidence_method.as_deref(),
+            Some("claude_desktop_session_bucket")
+        );
+        assert_eq!(current.auth_mode.as_deref(), Some("claude_desktop"));
+        assert_eq!(current.billing_channel.as_deref(), Some("subscription"));
+        assert_eq!(current.account_label.as_deref(), Some("ron.s@singular.net"));
+        assert_eq!(current.organization_label.as_deref(), Some("Singular"));
+        assert_eq!(current.plan_type.as_deref(), Some("team"));
+        assert_eq!(current.subscription_product.as_deref(), Some("claude_team"));
+        assert_eq!(
+            current.account_id.as_deref(),
+            Some("desktop-account-current")
+        );
+        assert_eq!(
+            current.organization_id.as_deref(),
+            Some("singular-org-bucket")
+        );
+        assert_eq!(
+            current.source_session_id.as_deref(),
+            Some("current-cli-session")
+        );
+        assert!(current.account_identifier_hash.is_some());
+        assert!(current.organization_identifier_hash.is_some());
+        assert_eq!(
+            current.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+        assert_eq!(
+            current.billing_identity_confidence,
+            AgentStatusConfidence::High
+        );
+
+        let old = observations
+            .iter()
+            .find(|observation| observation.account_label.as_deref() == Some("ronshub88@gmail.com"))
+            .expect("old desktop observation");
+        assert_eq!(old.is_current, Some(false));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn claude_oauth_token_parser_extracts_only_access_token() {
         let payload = r#"{
           "claudeAiOauth": {
@@ -4195,7 +5067,7 @@ for line in sys.stdin:
     #[test]
     fn claude_oauth_usage_cache_keeps_fresh_windows() {
         let cache = ClaudeOAuthUsageCache {
-            schema_version: 1,
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -4203,30 +5075,43 @@ for line in sys.stdin:
                 scope: AgentQuotaWindowScope::Account,
                 status: AgentQuotaWindowStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                model: None,
-                account_label: None,
                 window_seconds: Some(5 * 60 * 60),
-                started_at: None,
                 resets_at: Some("2026-06-29T18:10:00Z".to_string()),
-                quota: None,
-                remaining: None,
                 used_percent: Some(25),
                 left_percent: Some(75),
+                ..Default::default()
+            }],
+            credit_balances: vec![AgentCreditBalance {
+                name: "Usage credits".to_string(),
+                status: AgentCreditBalanceStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                unit: AgentCreditBalanceUnit::Usd,
+                used: Some(321),
+                quota: Some(500),
+                remaining: Some(179),
+                enabled: Some(true),
+                ..Default::default()
             }],
         };
 
-        let windows = claude_oauth_quota_windows_from_cache(cache, 200);
+        let usage = claude_oauth_usage_from_cache(cache, 200);
 
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Ok);
-        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
-        assert_eq!(windows[0].used_percent, Some(25));
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].status, AgentQuotaWindowStatus::Ok);
+        assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
+        assert_eq!(usage.windows[0].used_percent, Some(25));
+        assert_eq!(usage.credit_balances.len(), 1);
+        assert_eq!(
+            usage.credit_balances[0].freshness,
+            AgentQuotaWindowFreshness::Fresh
+        );
+        assert_eq!(usage.credit_balances[0].used, Some(321));
     }
 
     #[test]
     fn claude_oauth_usage_cache_marks_old_windows_stale() {
         let cache = ClaudeOAuthUsageCache {
-            schema_version: 1,
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -4234,27 +5119,190 @@ for line in sys.stdin:
                 scope: AgentQuotaWindowScope::Account,
                 status: AgentQuotaWindowStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
-                model: None,
-                account_label: None,
                 window_seconds: Some(7 * 24 * 60 * 60),
-                started_at: None,
                 resets_at: Some("2026-07-04T05:00:00Z".to_string()),
-                quota: None,
-                remaining: None,
                 used_percent: Some(72),
                 left_percent: Some(28),
+                ..Default::default()
+            }],
+            credit_balances: vec![AgentCreditBalance {
+                name: "Usage credits".to_string(),
+                status: AgentCreditBalanceStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                unit: AgentCreditBalanceUnit::Usd,
+                used: Some(321),
+                quota: Some(500),
+                enabled: Some(true),
+                ..Default::default()
             }],
         };
 
-        let windows = claude_oauth_quota_windows_from_cache(
+        let usage = claude_oauth_usage_from_cache(
             cache,
             100 + CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS + 1,
         );
 
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].status, AgentQuotaWindowStatus::Unknown);
+        assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Stale);
+        assert_eq!(usage.windows[0].used_percent, Some(72));
+        assert_eq!(
+            usage.credit_balances[0].freshness,
+            AgentQuotaWindowFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_discards_v1_schema() {
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "observed_at_epoch_seconds": 100,
+            "next_refresh_after_epoch_seconds": 400,
+            "windows": []
+        });
+        let cache: ClaudeOAuthUsageCache = serde_json::from_value(v1).unwrap();
+        assert_ne!(
+            cache.schema_version,
+            CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn claude_oauth_spend_disabled_emits_no_credit_balance() {
+        // Live disabled-state sample observed 2026-07-06 (Max account).
+        let json = serde_json::json!({
+            "spend": {
+                "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+                "limit": null, "cap": null, "balance": null,
+                "percent": 0, "severity": "normal", "enabled": false,
+                "can_purchase_credits": false, "can_toggle": false
+            },
+            "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null}
+        });
+        assert!(claude_oauth_credit_balances(&json).is_empty());
+    }
+
+    #[test]
+    fn claude_oauth_spend_enabled_maps_usage_credit_balance() {
+        let json = serde_json::json!({
+            "spend": {
+                "used": {"amount_minor": 321, "currency": "USD", "exponent": 2},
+                "cap": {"amount_minor": 500, "currency": "USD", "exponent": 2},
+                "balance": {"amount_minor": 179, "currency": "USD", "exponent": 2},
+                "percent": 64, "severity": "warning", "enabled": true
+            }
+        });
+        let balances = claude_oauth_credit_balances(&json);
+        assert_eq!(balances.len(), 1);
+        let credit = &balances[0];
+        assert_eq!(credit.name, "Usage credits");
+        assert_eq!(credit.unit, AgentCreditBalanceUnit::Usd);
+        assert_eq!(credit.status, AgentCreditBalanceStatus::Low);
+        assert_eq!(credit.used, Some(321));
+        assert_eq!(credit.quota, Some(500));
+        assert_eq!(credit.remaining, Some(179));
+        assert_eq!(credit.used_percent, Some(64));
+        assert_eq!(credit.currency.as_deref(), Some("USD"));
+        assert_eq!(credit.enabled, Some(true));
+    }
+
+    #[test]
+    fn claude_oauth_spend_falls_back_to_limit_and_derives_remaining() {
+        let json = serde_json::json!({
+            "spend": {
+                "used": {"amount_minor": 500, "currency": "USD", "exponent": 2},
+                "limit": 5.0,
+                "severity": "critical",
+                "enabled": true
+            }
+        });
+        let balances = claude_oauth_credit_balances(&json);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(balances[0].used, Some(500));
+        assert_eq!(balances[0].quota, Some(500));
+        assert_eq!(balances[0].remaining, Some(0));
+    }
+
+    #[test]
+    fn claude_oauth_money_cents_normalizes_exponents_and_bare_numbers() {
+        let object = serde_json::json!({"amount_minor": 3215, "exponent": 3});
+        assert_eq!(claude_oauth_money_cents(Some(&object)), Some(322));
+        let zero_exp = serde_json::json!({"amount_minor": 5, "exponent": 0});
+        assert_eq!(claude_oauth_money_cents(Some(&zero_exp)), Some(500));
+        let bare = serde_json::json!(5.0);
+        assert_eq!(claude_oauth_money_cents(Some(&bare)), Some(500));
+        let negative = serde_json::json!({"amount_minor": -1, "exponent": 2});
+        assert_eq!(claude_oauth_money_cents(Some(&negative)), None);
+        assert_eq!(claude_oauth_money_cents(None), None);
+    }
+
+    #[test]
+    fn claude_oauth_extra_usage_fallback_maps_credit_balance() {
+        let json = serde_json::json!({
+            "extra_usage": {
+                "is_enabled": true,
+                "monthly_limit": 5.0,
+                "used_credits": 3.21,
+                "utilization": 64,
+                "currency": "USD"
+            }
+        });
+        let balances = claude_oauth_credit_balances(&json);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].used, Some(321));
+        assert_eq!(balances[0].quota, Some(500));
+        assert_eq!(balances[0].remaining, Some(179));
+        assert_eq!(balances[0].used_percent, Some(64));
+    }
+
+    #[test]
+    fn claude_oauth_scoped_limits_map_model_windows_and_skip_account_kinds() {
+        let json = serde_json::json!({
+            "five_hour": {"utilization": 0.0, "resets_at": "2026-07-06T22:40:00+00:00"},
+            "seven_day": {"utilization": 82.0, "resets_at": "2026-07-11T05:00:00+00:00"},
+            "limits": [
+                {"kind": "session", "group": "session", "percent": 0,
+                 "severity": "normal", "resets_at": "2026-07-06T22:40:00+00:00",
+                 "scope": null, "is_active": false},
+                {"kind": "weekly_all", "group": "weekly", "percent": 82,
+                 "severity": "warning", "resets_at": "2026-07-11T05:00:00+00:00",
+                 "scope": null, "is_active": false},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 98,
+                 "severity": "critical", "resets_at": "2026-07-11T05:00:00+00:00",
+                 "scope": {"model": {"id": null, "display_name": "Fable"}},
+                 "is_active": true}
+            ]
+        });
+        let windows = claude_oauth_quota_windows(&json);
+        // session + weekly account windows, plus exactly one scoped model window
+        assert_eq!(windows.len(), 3);
+        let scoped = &windows[2];
+        assert_eq!(scoped.name, "weekly_scoped");
+        assert_eq!(scoped.scope, AgentQuotaWindowScope::Model);
+        assert_eq!(scoped.model.as_deref(), Some("Fable"));
+        assert_eq!(scoped.used_percent, Some(98));
+        assert_eq!(scoped.group.as_deref(), Some("weekly"));
+        assert_eq!(scoped.severity.as_deref(), Some("critical"));
+        assert_eq!(scoped.is_active, Some(true));
+    }
+
+    #[test]
+    fn claude_oauth_window_dollar_fields_map_to_cents() {
+        let json = serde_json::json!({
+            "five_hour": {
+                "utilization": 24.0,
+                "resets_at": "2026-06-29T18:10:00+00:00",
+                "limit_dollars": 25.0,
+                "used_dollars": 6.0,
+                "remaining_dollars": 19.0
+            }
+        });
+        let windows = claude_oauth_quota_windows(&json);
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Unknown);
-        assert_eq!(windows[0].freshness, AgentQuotaWindowFreshness::Stale);
-        assert_eq!(windows[0].used_percent, Some(72));
+        assert_eq!(windows[0].limit_cents, Some(2500));
+        assert_eq!(windows[0].used_cents, Some(600));
+        assert_eq!(windows[0].remaining_cents, Some(1900));
     }
 
     #[test]

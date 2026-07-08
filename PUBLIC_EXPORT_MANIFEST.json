@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 227,
-  "content_sha256": "17f2d1db1a37ff3abf392b6fe5e9ef4711deba8f0e02963f656252a667978193",
+  "content_sha256": "98a5332da2dcab542655d7369caa251ef1aefd70c6485e4c7fcf2dce42d3e7ee",
   "files": [
     {
       "executable": false,
@@ -139,15 +139,15 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/POLICY.md",
-      "sha256": "1a8565431dff0c2d219d924176e4a86f76cb0f3d2411d6070a22e74ce6efa13a",
-      "size_bytes": 2498
+      "sha256": "bee015738c5e3089da8fc355e83e6ee2aa15514a486c725e6920db028837b678",
+      "size_bytes": 3357
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/README.md",
-      "sha256": "9d2f1e5f7330683cad49cf6f1869bc32b0b35fdddb9e3978e60977df0d8b6d46",
-      "size_bytes": 1032
+      "sha256": "595db600e4fa35b5d954c9fa00a5cd1663a1d151836faeb1499c741d9d333542",
+      "size_bytes": 1192
     },
     {
       "executable": false,
@@ -160,8 +160,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/claude-code/collectors/identity_probe/fixtures/minimal-evidence.json",
-      "sha256": "9bdbe966320bfd0415f5d34bc4045dd1e3a868051e613e5e98fb401d93b2ef7c",
-      "size_bytes": 1246
+      "sha256": "b3ebe6328be6c7653c50b7504cb4d6d27da785388b3b96984880ee50562debbb",
+      "size_bytes": 1438
     },
     {
       "executable": false,
@@ -545,8 +545,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "ab6ba4ff07c62c2bd0b4e80cb0c064f024d9de8c8b6f1cf02e61fc773b07fceb",
-      "size_bytes": 137508
+      "sha256": "82cee390d2cf71c58faa3db6153b80df81f8d56b3ef6d5c75a3687b32a02125d",
+      "size_bytes": 139996
     },
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "11344d5676c222777890afbc45d734fc3d5c27cce00a35f27ae1a858e23da014",
-      "size_bytes": 173305
+      "sha256": "1f33df753920496cc6650c7a00db347adaac46bb0c5030a95c63c0720ba71076",
+      "size_bytes": 213855
     },
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "5366d1c0e11791fa1d0c379908a9a0c9ba724576c00e6d6d79ccfeb30f0b38a8",
-      "size_bytes": 279947
+      "sha256": "5ae5ec3b712cd689e01052b648a0ac98f5ee181e00ff4b057834b714e38b516c",
+      "size_bytes": 280062
     },
     {
       "executable": false,
@@ -1592,7 +1592,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-07T18:46:56+00:00",
+  "generated_at": "2026-07-08T07:56:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 228,
   "public_roots": [
@@ -1628,5 +1628,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "203c88aed4be7b595ead26d0641c07df76b82914"
+  "source_commit": "758dcf995777d00de7c55debb8b6c5a9af17fb54"
 }
