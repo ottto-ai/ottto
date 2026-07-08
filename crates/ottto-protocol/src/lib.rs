@@ -2568,9 +2568,9 @@ fn redact_plan_observation_for_backend(
     observation.gateway_provider = safe_optional_text(observation.gateway_provider.take());
     observation.subscription_product = safe_optional_text(observation.subscription_product.take());
     observation.plan_type = safe_optional_text(observation.plan_type.take());
-    observation.account_label = None;
+    observation.account_label = safe_optional_text(observation.account_label.take());
     observation.account_id = None;
-    observation.organization_label = None;
+    observation.organization_label = safe_optional_text(observation.organization_label.take());
     observation.organization_id = None;
     observation.account_identifier_hash =
         safe_optional_text(observation.account_identifier_hash.take());
@@ -3140,7 +3140,14 @@ mod tests {
                 .as_deref(),
             Some("ChatGPT Pro")
         );
-        assert_eq!(snapshot.plan_observations[0].account_label, None);
+        assert_eq!(
+            snapshot.plan_observations[0].account_label.as_deref(),
+            Some("ron@example.com")
+        );
+        assert_eq!(
+            snapshot.plan_observations[0].organization_label.as_deref(),
+            Some("Private Org")
+        );
         assert_eq!(
             snapshot.plan_observations[0]
                 .account_identifier_hash

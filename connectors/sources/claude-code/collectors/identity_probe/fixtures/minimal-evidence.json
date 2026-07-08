@@ -20,7 +20,7 @@
   ],
   "upload_policy": {
     "uploads_raw_content": false,
-    "boundary": "Documented claude auth status JSON fields, hashed account identifier, subscription label, observed timestamp, and probe trigger only. No token bytes. No Keychain access. Vertex/Bedrock novelty triggers may additionally read ~/.claude/settings.json env values (ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION) without exposing credentials.",
+    "boundary": "Documented claude auth status JSON fields plus narrow Claude Desktop app-managed metadata: lastKnownAccountUuid, claude-code-sessions/local_*.json recency/session ids, and local-agent-mode-sessions/local_*.json display-safe account/org labels. Raw provider ids are hashed; token bytes, Keychain items, browser state, prompts, responses, cwd, and audit logs are never uploaded. Vertex/Bedrock novelty triggers may additionally read ~/.claude/settings.json env values (ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION) without exposing credentials.",
     "redacts": [
       "prompt",
       "response",
@@ -32,7 +32,6 @@
       "cookie",
       "password",
       "secret",
-      "email",
       "org_id"
     ]
   }

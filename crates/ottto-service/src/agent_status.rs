@@ -17,10 +17,10 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -42,6 +42,8 @@ const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
+const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
+const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -94,6 +96,65 @@ const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 2;
 struct ClaudeOAuthUsage {
     windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopConfig {
+    #[serde(rename = "lastKnownAccountUuid")]
+    last_known_account_uuid: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopCodeSessionMetadata {
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
+    #[serde(rename = "lastActivityAt")]
+    last_activity_at: Option<Value>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeDesktopAgentModeSessionMetadata {
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
+    #[serde(rename = "lastActivityAt")]
+    last_activity_at: Option<Value>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<Value>,
+    #[serde(rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(rename = "accountEmail")]
+    account_email: Option<String>,
+    email: Option<String>,
+    #[serde(rename = "accountName")]
+    account_name: Option<String>,
+    #[serde(rename = "organizationName")]
+    organization_name: Option<String>,
+    #[serde(rename = "workspaceName")]
+    workspace_name: Option<String>,
+    #[serde(rename = "teamName")]
+    team_name: Option<String>,
+    #[serde(rename = "subscriptionType")]
+    subscription_type: Option<String>,
+    #[serde(rename = "planType")]
+    plan_type: Option<String>,
+    plan: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeDesktopProfileBuilder {
+    account_uuid: String,
+    account_label: Option<String>,
+    account_name: Option<String>,
+    organization_label: Option<String>,
+    plan_type: Option<String>,
+    organization_uuids: BTreeSet<String>,
+    current_organization_uuid: Option<String>,
+    latest_activity_epoch_seconds: Option<i64>,
+    latest_session_id: Option<String>,
+    code_session_count: usize,
+    agent_mode_session_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +410,10 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     // patch writes during onboarding — must NOT read as "installed", or a Mac
     // that never had Claude reports it as present and then fails verification
     // with "claude is not installed or not executable".
-    if !crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode) {
+    let claude_desktop_root = claude_desktop_support_dir();
+    let claude_cli_present =
+        crate::agent_configs::detection::source_present_locally(&SourceKind::ClaudeCode);
+    if !claude_cli_present && !claude_desktop_metadata_present(&claude_desktop_root) {
         return not_installed_snapshot(SourceKind::ClaudeCode, "claude", captured_at, expires_at);
     }
     let mut snapshot = base_snapshot(
@@ -500,7 +564,437 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         ));
     }
     append_current_plan_observation(&mut snapshot);
+    let desktop_observation_count =
+        append_claude_desktop_plan_observations(&mut snapshot, &claude_desktop_root);
+    if desktop_observation_count > 0 {
+        if snapshot.status == AgentStatusState::Degraded {
+            snapshot.status = AgentStatusState::Available;
+        }
+        snapshot.capabilities.push(supported_capability(
+            "desktop_identity",
+            "Read display-safe Claude Desktop account and session-bucket metadata.",
+        ));
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_desktop_profile_detected",
+            AgentDiagnosticSeverity::Info,
+            "Claude Desktop Code account/session bucket metadata was detected.",
+        ));
+    }
     snapshot
+}
+
+fn append_claude_desktop_plan_observations(
+    snapshot: &mut AgentStatusSnapshot,
+    desktop_root: &Path,
+) -> usize {
+    let observations =
+        claude_desktop_plan_observations_from_root(desktop_root, &snapshot.captured_at);
+    let count = observations.len();
+    snapshot.plan_observations.extend(observations);
+    count
+}
+
+fn claude_desktop_support_dir() -> PathBuf {
+    home_path("Library/Application Support/Claude")
+}
+
+fn claude_desktop_metadata_present(root: &Path) -> bool {
+    root.join("config.json").is_file()
+        || root.join("claude-code-sessions").is_dir()
+        || root.join("local-agent-mode-sessions").is_dir()
+}
+
+fn claude_desktop_plan_observations_from_root(
+    root: &Path,
+    observed_at: &str,
+) -> Vec<AgentStatusPlanObservation> {
+    let config = read_claude_desktop_config(root);
+    let last_known_account_uuid = config
+        .last_known_account_uuid
+        .as_deref()
+        .and_then(safe_local_identifier)
+        .map(ToString::to_string);
+    let mut builders: BTreeMap<String, ClaudeDesktopProfileBuilder> = BTreeMap::new();
+
+    collect_claude_desktop_code_sessions(
+        &root.join("claude-code-sessions"),
+        last_known_account_uuid.as_deref(),
+        &mut builders,
+    );
+    collect_claude_desktop_agent_mode_sessions(
+        &root.join("local-agent-mode-sessions"),
+        &mut builders,
+    );
+
+    builders
+        .into_values()
+        .filter(|builder| {
+            builder.code_session_count > 0
+                || last_known_account_uuid.as_deref() == Some(builder.account_uuid.as_str())
+        })
+        .filter_map(|builder| {
+            claude_desktop_builder_plan_observation(
+                builder,
+                observed_at,
+                last_known_account_uuid.as_deref(),
+            )
+        })
+        .collect()
+}
+
+fn read_claude_desktop_config(root: &Path) -> ClaudeDesktopConfig {
+    let path = root.join("config.json");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ClaudeDesktopConfig>(&body).ok())
+        .unwrap_or_default()
+}
+
+fn collect_claude_desktop_code_sessions(
+    root: &Path,
+    last_known_account_uuid: Option<&str>,
+    builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+) {
+    let Ok(accounts) = fs::read_dir(root) else {
+        return;
+    };
+    for account in accounts.flatten() {
+        let Ok(file_type) = account.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(account_uuid) = account
+            .file_name()
+            .to_str()
+            .and_then(safe_local_identifier)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let Ok(orgs) = fs::read_dir(account.path()) else {
+            continue;
+        };
+        for org in orgs.flatten() {
+            let Ok(file_type) = org.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(org_uuid) = org
+                .file_name()
+                .to_str()
+                .and_then(safe_local_identifier)
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let builder = builders.entry(account_uuid.clone()).or_insert_with(|| {
+                ClaudeDesktopProfileBuilder {
+                    account_uuid: account_uuid.clone(),
+                    ..Default::default()
+                }
+            });
+            builder.organization_uuids.insert(org_uuid.clone());
+            let Ok(files) = fs::read_dir(org.path()) else {
+                continue;
+            };
+            for file in files
+                .flatten()
+                .filter(|entry| looks_like_local_json_file(entry.path().as_path()))
+                .take(CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG)
+            {
+                let metadata = read_json_file::<ClaudeDesktopCodeSessionMetadata>(&file.path());
+                let activity = metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                            .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                    })
+                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let session_id = metadata
+                    .and_then(|metadata| metadata.cli_session_id)
+                    .and_then(|value| safe_local_identifier(&value).map(ToString::to_string));
+                let builder = builders.get_mut(&account_uuid).expect("builder exists");
+                builder.code_session_count += 1;
+                if builder.record_activity(activity, session_id)
+                    && last_known_account_uuid == Some(account_uuid.as_str())
+                {
+                    builder.current_organization_uuid = Some(org_uuid.clone());
+                }
+            }
+        }
+    }
+}
+
+fn collect_claude_desktop_agent_mode_sessions(
+    root: &Path,
+    builders: &mut BTreeMap<String, ClaudeDesktopProfileBuilder>,
+) {
+    let Ok(accounts) = fs::read_dir(root) else {
+        return;
+    };
+    for account in accounts.flatten() {
+        let Ok(file_type) = account.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(account_uuid) = account
+            .file_name()
+            .to_str()
+            .and_then(safe_local_identifier)
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        let Ok(orgs) = fs::read_dir(account.path()) else {
+            continue;
+        };
+        for org in orgs.flatten() {
+            let Ok(file_type) = org.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(org_uuid) = org
+                .file_name()
+                .to_str()
+                .and_then(safe_local_identifier)
+                .map(ToString::to_string)
+            else {
+                continue;
+            };
+            let builder = builders.entry(account_uuid.clone()).or_insert_with(|| {
+                ClaudeDesktopProfileBuilder {
+                    account_uuid: account_uuid.clone(),
+                    ..Default::default()
+                }
+            });
+            builder.organization_uuids.insert(org_uuid);
+            let Ok(files) = fs::read_dir(org.path()) else {
+                continue;
+            };
+            for file in files
+                .flatten()
+                .filter(|entry| looks_like_local_json_file(entry.path().as_path()))
+                .take(CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG)
+            {
+                let Some(metadata) =
+                    read_json_file::<ClaudeDesktopAgentModeSessionMetadata>(&file.path())
+                else {
+                    continue;
+                };
+                let activity = timestamp_value_epoch_seconds(metadata.last_activity_at.as_ref())
+                    .or_else(|| timestamp_value_epoch_seconds(metadata.created_at.as_ref()))
+                    .or_else(|| file_modified_epoch_seconds(&file.path()));
+                let session_id = metadata
+                    .cli_session_id
+                    .as_deref()
+                    .and_then(safe_local_identifier)
+                    .map(ToString::to_string);
+                let builder = builders.get_mut(&account_uuid).expect("builder exists");
+                builder.agent_mode_session_count += 1;
+                builder.record_activity(activity, session_id);
+                builder.account_label = builder.account_label.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.email_address.as_deref(),
+                        metadata.account_email.as_deref(),
+                        metadata.email.as_deref(),
+                    ])
+                    .map(ToString::to_string)
+                });
+                builder.account_name = builder
+                    .account_name
+                    .clone()
+                    .or_else(|| safe_display_label(metadata.account_name.as_deref()));
+                builder.organization_label = builder.organization_label.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.organization_name.as_deref(),
+                        metadata.workspace_name.as_deref(),
+                        metadata.team_name.as_deref(),
+                    ])
+                    .and_then(|value| safe_display_label(Some(value)))
+                });
+                builder.plan_type = builder.plan_type.clone().or_else(|| {
+                    first_non_empty([
+                        metadata.subscription_type.as_deref(),
+                        metadata.plan_type.as_deref(),
+                        metadata.plan.as_deref(),
+                    ])
+                    .map(|value| normalize_plan_type(value.to_string()))
+                });
+            }
+        }
+    }
+}
+
+fn claude_desktop_builder_plan_observation(
+    builder: ClaudeDesktopProfileBuilder,
+    observed_at: &str,
+    last_known_account_uuid: Option<&str>,
+) -> Option<AgentStatusPlanObservation> {
+    let account_identifier_hash =
+        billing_identity_hash("anthropic", "account", &builder.account_uuid);
+    let organization_id = builder
+        .current_organization_uuid
+        .or_else(|| builder.organization_uuids.iter().next().cloned());
+    let organization_identifier_hash = organization_id
+        .as_deref()
+        .and_then(|value| billing_identity_hash("anthropic", "organization", value));
+    let billing_identity_evidence = billing_identity_evidence_for(
+        &account_identifier_hash,
+        &organization_identifier_hash,
+        &None,
+    );
+    if account_identifier_hash.is_none() && organization_identifier_hash.is_none() {
+        return None;
+    }
+    let plan_type = builder.plan_type;
+    let subscription_product = plan_type.clone().map(|plan| {
+        if plan.starts_with("claude_") {
+            plan
+        } else {
+            format!("claude_{plan}")
+        }
+    });
+    let is_current = last_known_account_uuid == Some(builder.account_uuid.as_str());
+    Some(AgentStatusPlanObservation {
+        observed_at: Some(observed_at.to_string()),
+        evidence_method: Some("claude_desktop_session_bucket".to_string()),
+        source_session_id: builder.latest_session_id,
+        provider: Some("anthropic".to_string()),
+        billing_provider: Some("anthropic".to_string()),
+        model_provider: Some("anthropic".to_string()),
+        billing_channel: Some("subscription".to_string()),
+        auth_mode: Some("claude_desktop".to_string()),
+        gateway_provider: None,
+        subscription_product,
+        plan_type,
+        account_label: builder.account_label.or(builder.account_name),
+        account_id: Some(builder.account_uuid),
+        organization_label: builder.organization_label,
+        organization_id,
+        account_identifier_hash,
+        organization_identifier_hash,
+        credential_fingerprint_hash: None,
+        billing_identity_evidence,
+        billing_identity_confidence: AgentStatusConfidence::High,
+        confidence: if is_current {
+            AgentStatusConfidence::High
+        } else {
+            AgentStatusConfidence::Medium
+        },
+        is_current: Some(is_current),
+    })
+}
+
+impl ClaudeDesktopProfileBuilder {
+    fn record_activity(&mut self, activity: Option<i64>, session_id: Option<String>) -> bool {
+        let should_replace = match (activity, self.latest_activity_epoch_seconds) {
+            (Some(next), Some(current)) => next >= current,
+            (Some(_), None) => true,
+            (None, _) => self.latest_session_id.is_none(),
+        };
+        if should_replace {
+            self.latest_activity_epoch_seconds = activity.or(self.latest_activity_epoch_seconds);
+            if session_id.is_some() {
+                self.latest_session_id = session_id;
+            }
+        }
+        should_replace
+    }
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let body = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+fn looks_like_local_json_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("local_") && name.ends_with(".json")
+}
+
+fn safe_local_identifier(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+}
+
+fn safe_display_label(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 255
+        || value.contains('/')
+        || value.contains('\\')
+        || value.to_ascii_lowercase().contains("token")
+        || value.to_ascii_lowercase().contains("secret")
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn timestamp_value_epoch_seconds(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(seconds) = value.as_i64() {
+        return Some(seconds);
+    }
+    if let Some(seconds) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+        return Some(seconds);
+    }
+    if let Some(seconds) = value.as_f64() {
+        if seconds.is_finite() {
+            return Some(seconds.round() as i64);
+        }
+    }
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = text.parse::<i64>() {
+        return Some(seconds);
+    }
+    if let Ok(seconds) = text.parse::<f64>() {
+        if seconds.is_finite() {
+            return Some(seconds.round() as i64);
+        }
+    }
+    OffsetDateTime::parse(text, &Rfc3339)
+        .ok()
+        .map(|value| value.unix_timestamp())
+}
+
+fn file_modified_epoch_seconds(path: &Path) -> Option<i64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(duration.as_secs()).ok()
 }
 
 fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, String> {
@@ -4392,6 +4886,124 @@ for line in sys.stdin:
         assert_eq!(account.plan_type.as_deref(), Some("max"));
         assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
         assert_eq!(account.billing_channel.as_deref(), Some("subscription"));
+    }
+
+    #[test]
+    fn claude_desktop_metadata_observations_split_current_desktop_account() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-profile-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"lastKnownAccountUuid":"desktop-account-current"}"#,
+        )
+        .expect("write config");
+
+        let current_code = root
+            .join("claude-code-sessions")
+            .join("desktop-account-current")
+            .join("singular-org-bucket");
+        std::fs::create_dir_all(&current_code).expect("create current code bucket");
+        std::fs::write(
+            current_code.join("local_current.json"),
+            r#"{
+              "cliSessionId": "current-cli-session",
+              "lastActivityAt": "2026-07-08T10:00:00Z",
+              "cwd": "/Users/example/private",
+              "title": "ignored"
+            }"#,
+        )
+        .expect("write current code metadata");
+        let current_identity = root
+            .join("local-agent-mode-sessions")
+            .join("desktop-account-current")
+            .join("different-agent-mode-bucket");
+        std::fs::create_dir_all(&current_identity).expect("create current identity bucket");
+        std::fs::write(
+            current_identity.join("local_identity.json"),
+            r#"{
+              "cliSessionId": "identity-cli-session",
+              "emailAddress": "ron.s@singular.net",
+              "accountName": "Ron",
+              "organizationName": "Singular",
+              "subscriptionType": "team",
+              "initialMessage": "must not be persisted"
+            }"#,
+        )
+        .expect("write current identity metadata");
+
+        let old_code = root
+            .join("claude-code-sessions")
+            .join("desktop-account-old")
+            .join("gmail-org-bucket");
+        std::fs::create_dir_all(&old_code).expect("create old code bucket");
+        std::fs::write(
+            old_code.join("local_old.json"),
+            r#"{"cliSessionId":"old-cli-session","lastActivityAt":"2026-07-07T10:00:00Z"}"#,
+        )
+        .expect("write old code metadata");
+        let old_identity = root
+            .join("local-agent-mode-sessions")
+            .join("desktop-account-old")
+            .join("gmail-org-bucket");
+        std::fs::create_dir_all(&old_identity).expect("create old identity bucket");
+        std::fs::write(
+            old_identity.join("local_identity.json"),
+            r#"{"emailAddress":"ronshub88@gmail.com"}"#,
+        )
+        .expect("write old identity metadata");
+
+        let observations =
+            claude_desktop_plan_observations_from_root(&root, "2026-07-08T10:01:00Z");
+
+        assert_eq!(observations.len(), 2);
+        let current = observations
+            .iter()
+            .find(|observation| observation.is_current == Some(true))
+            .expect("current desktop observation");
+        assert_eq!(
+            current.evidence_method.as_deref(),
+            Some("claude_desktop_session_bucket")
+        );
+        assert_eq!(current.auth_mode.as_deref(), Some("claude_desktop"));
+        assert_eq!(current.billing_channel.as_deref(), Some("subscription"));
+        assert_eq!(current.account_label.as_deref(), Some("ron.s@singular.net"));
+        assert_eq!(current.organization_label.as_deref(), Some("Singular"));
+        assert_eq!(current.plan_type.as_deref(), Some("team"));
+        assert_eq!(current.subscription_product.as_deref(), Some("claude_team"));
+        assert_eq!(
+            current.account_id.as_deref(),
+            Some("desktop-account-current")
+        );
+        assert_eq!(
+            current.organization_id.as_deref(),
+            Some("singular-org-bucket")
+        );
+        assert_eq!(
+            current.source_session_id.as_deref(),
+            Some("current-cli-session")
+        );
+        assert!(current.account_identifier_hash.is_some());
+        assert!(current.organization_identifier_hash.is_some());
+        assert_eq!(
+            current.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+        assert_eq!(
+            current.billing_identity_confidence,
+            AgentStatusConfidence::High
+        );
+
+        let old = observations
+            .iter()
+            .find(|observation| observation.account_label.as_deref() == Some("ronshub88@gmail.com"))
+            .expect("old desktop observation");
+        assert_eq!(old.is_current, Some(false));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
