@@ -513,9 +513,11 @@ pub fn apply_claude_effort_evidence(
                 }
                 let effort_rows: Vec<(String, UsageTotals)> = grouped
                     .iter()
-                    .filter_map(|((observed_bucket, observed_model, effort), totals)| {
-                        (observed_bucket == &bucket.bucket_start && observed_model == &model)
-                            .then(|| (effort.clone(), totals.clone()))
+                    .filter(|((observed_bucket, observed_model, _effort), _totals)| {
+                        observed_bucket == &bucket.bucket_start && observed_model == &model
+                    })
+                    .map(|((_observed_bucket, _observed_model, effort), totals)| {
+                        (effort.clone(), totals.clone())
                     })
                     .collect();
                 if effort_rows.is_empty() {

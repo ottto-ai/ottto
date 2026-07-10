@@ -284,7 +284,7 @@ fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
     let digest = Sha256::digest(session_id.as_bytes());
     support_dir
         .join(STORE_DIR)
-        .join(format!("{:x}.jsonl", digest))
+        .join(format!("{digest:x}.jsonl"))
 }
 
 fn append_lock() -> &'static Mutex<()> {
