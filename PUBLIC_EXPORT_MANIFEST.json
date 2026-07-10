@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 227,
-  "content_sha256": "1db3c5da16e3aa8bfaf60636a19da04c5d170416deb1e9b8ec922dfd581e3ef5",
+  "candidate_file_count": 228,
+  "content_sha256": "fb51147414a6cbc3eb675944b8e05eaa8ac564f98b31da4c6ba9ae471106da04",
   "files": [
     {
       "executable": false,
@@ -615,8 +615,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "789932f35bfaf69affce9a00aa8ea72dc267fa26dd57468c041dc538337ee6fe",
-      "size_bytes": 26711
+      "sha256": "8d242abb3817d0066b35545f45db62f84b8ab2ce2554b9c5b041ef46e97f14e1",
+      "size_bytes": 26735
     },
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "5c4370a14405c413a570728f9f712c1007e8120adb142908bd7828786bcee61f",
-      "size_bytes": 28220
+      "sha256": "cb0e9ea9ed816d1cc69bbcc6df90a665f52725afd36b6c83703c9a069a3e1bb6",
+      "size_bytes": 28423
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "1239de0558b2926413bd7f5847f6bd3ff3c884eb403f242fa403ac78ad8d437a",
-      "size_bytes": 348749
+      "sha256": "7078b4137b247c6e4ef139062e80caabb3634e1cbc701c2915db7db2c16c4ce1",
+      "size_bytes": 360941
     },
     {
       "executable": false,
@@ -799,6 +799,13 @@
       "path": "docs/session-2026-05-28-snapshot-v5-to-v6-followup.md",
       "sha256": "75babbf8200d6afaf1a758003a7d5bfc27ca8cf105d7b3f85fabdb1a8f7b92dc",
       "size_bytes": 6668
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-10-prompt-cache-economics.md",
+      "sha256": "cf6c0349e2578a256ff88ac0ff14884fd54a50b6bf9bd9bb45697f7054344474",
+      "size_bytes": 2140
     },
     {
       "executable": false,
@@ -1592,9 +1599,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-10T04:53:01Z",
+  "generated_at": "2026-07-10T11:43:39Z",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 228,
+  "output_file_count": 229,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
