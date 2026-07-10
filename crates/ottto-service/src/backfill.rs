@@ -383,6 +383,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
+            cost: None,
             session_display_name: None,
             session_display_name_source: None,
             source_started_at: None,

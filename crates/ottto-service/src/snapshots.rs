@@ -77,9 +77,9 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // and stand up as their own `isSidechain=true` -> ai_agent sessions. The bump
 // re-walks existing project JSONL once so already-scanned subagent files re-emit
 // under the new id instead of remaining folded into their parent.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v17";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v13";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v7";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -248,6 +248,8 @@ pub struct SnapshotItem {
     pub max_time_to_first_token_ms: Option<u64>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<SnapshotCost>,
     pub session_display_name: Option<String>,
     pub session_display_name_source: Option<String>,
     pub source_started_at: Option<String>,
@@ -304,6 +306,31 @@ pub struct SnapshotModelUsage {
     pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_cost_usd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_cost_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_cost_usd: Option<String>,
+    pub evidence_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -452,6 +479,98 @@ struct UsageTotals {
     reasoning_output_tokens: u64,
     unattributed_total_tokens: u64,
     request_count: u64,
+    costs: UsageCosts,
+}
+
+const USD_PICO_SCALE: u128 = 1_000_000_000_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UsageCosts {
+    observed: bool,
+    reported: bool,
+    total: Option<u128>,
+    input: Option<u128>,
+    output: Option<u128>,
+    cache_read: Option<u128>,
+    cache_creation: Option<u128>,
+}
+
+impl UsageCosts {
+    fn add(&mut self, other: &Self) {
+        if !other.observed {
+            return;
+        }
+        if !self.observed {
+            *self = other.clone();
+            return;
+        }
+        self.reported &= other.reported;
+        if !self.reported {
+            self.total = None;
+            self.input = None;
+            self.output = None;
+            self.cache_read = None;
+            self.cache_creation = None;
+            return;
+        }
+        self.total = add_complete_cost(self.total, other.total);
+        self.input = add_complete_cost(self.input, other.input);
+        self.output = add_complete_cost(self.output, other.output);
+        self.cache_read = add_complete_cost(self.cache_read, other.cache_read);
+        self.cache_creation = add_complete_cost(self.cache_creation, other.cache_creation);
+    }
+
+    fn is_monotonic_after(&self, previous: &Self) -> bool {
+        (!previous.observed || self.observed)
+            && (!previous.reported || self.reported)
+            && cost_is_monotonic(self.total, previous.total)
+            && cost_is_monotonic(self.input, previous.input)
+            && cost_is_monotonic(self.output, previous.output)
+            && cost_is_monotonic(self.cache_read, previous.cache_read)
+            && cost_is_monotonic(self.cache_creation, previous.cache_creation)
+    }
+
+    fn delta_from(&self, previous: &Self) -> Self {
+        Self {
+            observed: self.observed,
+            reported: self.reported,
+            total: cost_delta(self.total, previous.total),
+            input: cost_delta(self.input, previous.input),
+            output: cost_delta(self.output, previous.output),
+            cache_read: cost_delta(self.cache_read, previous.cache_read),
+            cache_creation: cost_delta(self.cache_creation, previous.cache_creation),
+        }
+    }
+
+    fn snapshot_cost(&self) -> Option<SnapshotCost> {
+        self.reported.then(|| SnapshotCost {
+            total_cost_usd: self.total.map(usd_picos_string),
+            input_cost_usd: self.input.map(usd_picos_string),
+            output_cost_usd: self.output.map(usd_picos_string),
+            cache_read_cost_usd: self.cache_read.map(usd_picos_string),
+            cache_creation_cost_usd: self.cache_creation.map(usd_picos_string),
+            evidence_source: "pi_usage_cost".to_string(),
+        })
+    }
+}
+
+fn add_complete_cost(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        _ => None,
+    }
+}
+
+fn cost_is_monotonic(current: Option<u128>, previous: Option<u128>) -> bool {
+    match (current, previous) {
+        (Some(current), Some(previous)) => current >= previous,
+        (Some(_), None) | (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+fn cost_delta(current: Option<u128>, previous: Option<u128>) -> Option<u128> {
+    current.map(|current| current - previous.unwrap_or_default())
 }
 
 impl UsageTotals {
@@ -490,6 +609,7 @@ impl UsageTotals {
         self.reasoning_output_tokens += other.reasoning_output_tokens;
         self.unattributed_total_tokens += other.unattributed_total_tokens;
         self.request_count += other.request_count;
+        self.costs.add(&other.costs);
     }
 
     fn is_monotonic_after(&self, previous: &UsageTotals) -> bool {
@@ -501,6 +621,7 @@ impl UsageTotals {
             && self.reasoning_output_tokens >= previous.reasoning_output_tokens
             && self.unattributed_total_tokens >= previous.unattributed_total_tokens
             && self.request_count >= previous.request_count
+            && self.costs.is_monotonic_after(&previous.costs)
     }
 
     fn delta_from(&self, previous: &UsageTotals) -> UsageTotals {
@@ -517,6 +638,7 @@ impl UsageTotals {
             unattributed_total_tokens: self.unattributed_total_tokens
                 - previous.unattributed_total_tokens,
             request_count: self.request_count - previous.request_count,
+            costs: self.costs.delta_from(&previous.costs),
         }
     }
 }
@@ -616,6 +738,7 @@ fn usage_totals_from_item(item: &SnapshotItem) -> UsageTotals {
         reasoning_output_tokens: item.reasoning_output_tokens,
         unattributed_total_tokens: item.unattributed_total_tokens,
         request_count: item.request_count,
+        costs: UsageCosts::default(),
     }
 }
 
@@ -629,6 +752,7 @@ fn usage_totals_from_model_usage(row: &SnapshotModelUsage) -> UsageTotals {
         reasoning_output_tokens: row.reasoning_output_tokens,
         unattributed_total_tokens: row.unattributed_total_tokens,
         request_count: row.request_count,
+        costs: UsageCosts::default(),
     }
 }
 
@@ -1371,6 +1495,7 @@ impl SnapshotAccumulator {
                 .then_some(self.latency_ttft_ms_max),
             model_usage,
             usage_buckets,
+            cost: totals.costs.snapshot_cost(),
             session_display_name: self.title.clone(),
             session_display_name_source: self.title_source.clone(),
             source_started_at: self.started_at.clone(),
@@ -1442,6 +1567,11 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
         gateway_provider: row_key.gateway_provider.clone(),
         model_provider: row_key.model_provider.clone(),
         subscription_product: row_key.subscription_product.clone(),
+        cost_usd: row.usage.costs.total.map(usd_picos_string),
+        input_cost_usd: row.usage.costs.input.map(usd_picos_string),
+        output_cost_usd: row.usage.costs.output.map(usd_picos_string),
+        cache_read_cost_usd: row.usage.costs.cache_read.map(usd_picos_string),
+        cache_creation_cost_usd: row.usage.costs.cache_creation.map(usd_picos_string),
     }
 }
 
@@ -1764,6 +1894,11 @@ fn codex_state_only_snapshot(
         gateway_provider: None,
         model_provider: None,
         subscription_product: None,
+        cost_usd: None,
+        input_cost_usd: None,
+        output_cost_usd: None,
+        cache_read_cost_usd: None,
+        cache_creation_cost_usd: None,
     };
     // v6 requires usage_buckets whenever the snapshot reports any usage.
     // State-only snapshots have no per-line activity to bucket on, so we
@@ -1806,6 +1941,7 @@ fn codex_state_only_snapshot(
         max_time_to_first_token_ms: None,
         model_usage,
         usage_buckets,
+        cost: None,
         session_display_name: display_name,
         session_display_name_source: has_display_name.then(|| "session_index".to_string()),
         source_started_at: thread.created_at.clone(),
@@ -3028,10 +3164,12 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
             .or_else(|| u64_at(root, &["cached_input_tokens"]))
             .or_else(|| u64_at(root, &["cachedInputTokens"]))
             .unwrap_or_default(),
-        // OpenAI / Codex has no cache-write concept (only cached input = cache reads).
-        // Any legacy `cache_creation_tokens` we encounter is treated as 0; if some
-        // future Codex transcript surfaces it, route to 5m as the safer default.
-        cache_creation_5m_tokens: u64_at(root, &["cache_creation_tokens"])
+        // Current Codex JSONL exposes reads but not writes. Accept OpenAI's
+        // newer cache-write aliases now so a future CLI can become complete
+        // without another wire-contract change.
+        cache_creation_5m_tokens: u64_at(root, &["cache_write_tokens"])
+            .or_else(|| u64_at(root, &["cacheWriteTokens"]))
+            .or_else(|| u64_at(root, &["cache_creation_tokens"]))
             .or_else(|| u64_at(root, &["cacheCreationInputTokens"]))
             .unwrap_or_default(),
         cache_creation_1h_tokens: 0,
@@ -3040,6 +3178,7 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         request_count: u64_at(root, &["request_count"])
             .or_else(|| u64_at(root, &["requests"]))
             .unwrap_or(1),
+        costs: UsageCosts::default(),
     };
     if usage.request_count == 0 {
         usage.request_count = 1;
@@ -3196,6 +3335,7 @@ fn pi_message_end_usage(value: &Value) -> Option<UsageTotals> {
         reasoning_output_tokens: u64_at(usage, &["reasoning"]).unwrap_or_default(),
         unattributed_total_tokens: 0,
         request_count: 1,
+        costs: pi_usage_costs(usage),
     };
     Some(totals)
 }
@@ -3218,7 +3358,69 @@ fn pi_cache_creation_split(usage: &Value) -> (u64, u64) {
     let flat = u64_at(usage, &["cacheWrite"])
         .or_else(|| u64_at(usage, &["cache_write"]))
         .unwrap_or_default();
-    (flat, 0)
+    let cache_1h = u64_at(usage, &["cacheWrite1h"])
+        .or_else(|| u64_at(usage, &["cache_write_1h"]))
+        .unwrap_or_default()
+        .min(flat);
+    (flat.saturating_sub(cache_1h), cache_1h)
+}
+
+fn pi_usage_costs(usage: &Value) -> UsageCosts {
+    let Some(cost) = usage.get("cost") else {
+        return UsageCosts {
+            observed: true,
+            ..UsageCosts::default()
+        };
+    };
+    let total = usd_picos_at(cost, &["total"]);
+    let input = usd_picos_at(cost, &["input"]);
+    let output = usd_picos_at(cost, &["output"]);
+    let cache_read = usd_picos_at(cost, &["cacheRead", "cache_read"]);
+    let cache_creation = usd_picos_at(cost, &["cacheWrite", "cache_write"]);
+    let reported = [total, input, output, cache_read, cache_creation]
+        .iter()
+        .any(Option::is_some);
+    if !reported {
+        return UsageCosts {
+            observed: true,
+            ..UsageCosts::default()
+        };
+    }
+    UsageCosts {
+        observed: true,
+        reported: true,
+        total,
+        input,
+        output,
+        cache_read,
+        cache_creation,
+    }
+}
+
+fn usd_picos_at(value: &Value, keys: &[&str]) -> Option<u128> {
+    let raw = keys.iter().find_map(|key| value.get(*key))?;
+    let parsed = match raw {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some((parsed * USD_PICO_SCALE as f64).round() as u128)
+}
+
+fn usd_picos_string(value: u128) -> String {
+    let whole = value / USD_PICO_SCALE;
+    let fraction = value % USD_PICO_SCALE;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let mut fraction_text = format!("{fraction:012}");
+    while fraction_text.ends_with('0') {
+        fraction_text.pop();
+    }
+    format!("{whole}.{fraction_text}")
 }
 
 /// Identity of the API response behind one Claude Code JSONL record, used to
@@ -3261,6 +3463,7 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
         unattributed_total_tokens: 0,
         request_count: 1,
+        costs: UsageCosts::default(),
     };
     Some(usage)
 }
@@ -5713,6 +5916,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
+            cost: None,
             session_display_name: None,
             session_display_name_source: None,
             source_started_at: None,
@@ -7365,6 +7569,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_usage_accepts_future_cache_write_alias() {
+        let value = serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 30,
+                "cache_write_tokens": 20,
+                "output_tokens": 5,
+                "request_count": 1
+            }
+        });
+        let usage = codex_total_usage(&value).expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_creation_5m_tokens, 20);
+    }
+
+    #[test]
     fn pi_parser_applies_selector_custom_entries_to_following_messages() {
         let path = temp_file("pi-selector");
         fs::write(
@@ -7417,6 +7638,78 @@ mod tests {
     }
 
     #[test]
+    fn pi_parser_splits_cache_write_1h_from_flat_total() {
+        let path = temp_file("pi-cache-write-1h");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"pi-cache-write-1h\",\"cwd\":\"/work\",\"timestamp\":\"2026-05-19T11:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"anthropic\",\"model\":\"claude-opus-4-7\",\"timestamp\":1779234002000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":20,\"cacheWrite\":15,\"cacheWrite1h\":9,\"cost\":{\"total\":0.0042,\"input\":0.001,\"output\":0.002,\"cacheRead\":0.0002,\"cacheWrite\":0.001}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-05-19T11:05:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.cache_creation_5m_tokens, 6);
+        assert_eq!(item.cache_creation_1h_tokens, 9);
+        assert_eq!(item.model_usage[0].cache_creation_5m_tokens, 6);
+        assert_eq!(item.model_usage[0].cache_creation_1h_tokens, 9);
+        assert_eq!(item.model_usage[0].cost_usd.as_deref(), Some("0.0042"));
+        assert_eq!(
+            item.model_usage[0].cache_creation_cost_usd.as_deref(),
+            Some("0.001")
+        );
+        let cost = item.cost.as_ref().expect("snapshot cost");
+        assert_eq!(cost.total_cost_usd.as_deref(), Some("0.0042"));
+        assert_eq!(cost.cache_creation_cost_usd.as_deref(), Some("0.001"));
+        assert_eq!(
+            item.usage_buckets[0].model_usage[0].cost_usd,
+            item.model_usage[0].cost_usd
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_cost_parser_preserves_partial_and_invalid_field_coverage() {
+        let partial = serde_json::json!({
+            "cost": {
+                "total": null,
+                "input": "0.001",
+                "output": "invalid",
+                "cacheRead": -1
+            }
+        });
+        let costs = pi_usage_costs(&partial);
+        assert!(costs.observed);
+        assert!(costs.reported);
+        assert_eq!(costs.total, None);
+        assert_eq!(costs.input, Some(1_000_000_000));
+        assert_eq!(costs.output, None);
+        assert_eq!(costs.cache_read, None);
+        let snapshot_cost = costs.snapshot_cost().expect("partial cost evidence");
+        assert_eq!(snapshot_cost.total_cost_usd, None);
+        assert_eq!(snapshot_cost.input_cost_usd.as_deref(), Some("0.001"));
+
+        let invalid = pi_usage_costs(&serde_json::json!({
+            "cost": {"total": null, "input": "invalid"}
+        }));
+        assert!(invalid.observed);
+        assert!(!invalid.reported);
+        assert_eq!(invalid.snapshot_cost(), None);
+
+        let mut aggregate = costs.clone();
+        aggregate.add(&invalid);
+        assert!(!aggregate.reported);
+        assert_eq!(aggregate.snapshot_cost(), None);
+    }
+
+    #[test]
     fn pi_parser_sums_message_end_usage_and_extracts_session_meta() {
         let path = temp_file("pi-basic");
         fs::write(
@@ -7457,6 +7750,29 @@ mod tests {
         assert_eq!(item.model_usage.len(), 1);
         assert_eq!(item.model_usage[0].model, "gemini-2.5-pro");
         assert_eq!(item.model_usage[0].input_tokens, 150);
+        assert_eq!(item.model_usage[0].cost_usd.as_deref(), Some("0.0017"));
+        assert_eq!(
+            item.model_usage[0].input_cost_usd.as_deref(),
+            Some("0.0007")
+        );
+        assert_eq!(
+            item.model_usage[0].output_cost_usd.as_deref(),
+            Some("0.0007")
+        );
+        assert_eq!(
+            item.model_usage[0].cache_read_cost_usd.as_deref(),
+            Some("0.0002")
+        );
+        assert_eq!(
+            item.model_usage[0].cache_creation_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        assert_eq!(
+            item.cost
+                .as_ref()
+                .and_then(|cost| cost.total_cost_usd.as_deref()),
+            Some("0.0017")
+        );
         assert_eq!(item.provenance.collector, "pi_jsonl");
         assert_eq!(
             item.provenance.input_token_scope.as_deref(),
@@ -8094,8 +8410,8 @@ mod tests {
         // backend fixture/model together.
 
         // Allowed AgentSessionSnapshotItem fields (extra="forbid"), copied from
-        // app/schemas/agent_session_snapshots.py. `cost` is allowed but the
-        // daemon does not emit it — we assert subset, not equality.
+        // app/schemas/agent_session_snapshots.py. Pi emits `cost`; the other
+        // collectors omit it.
         const ALLOWED_ITEM_FIELDS: &[&str] = &[
             "source_session_id",
             "snapshot_fingerprint",
@@ -8147,6 +8463,10 @@ mod tests {
             "subscription_product",
             "account_identifier_hash",
             "cost_usd",
+            "input_cost_usd",
+            "output_cost_usd",
+            "cache_read_cost_usd",
+            "cache_creation_cost_usd",
         ];
         // The exact v5 item-level attribution keys the backend now forbids — the
         // shape that produced the 422. A daemon regression that re-adds any of
@@ -8222,6 +8542,11 @@ mod tests {
             gateway_provider: Some("vertex".to_string()),
             model_provider: Some("anthropic".to_string()),
             subscription_product: None,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
         };
         let item = SnapshotItem {
             source_session_id: "claude-vertex-session-1".to_string(),
@@ -8246,6 +8571,7 @@ mod tests {
                 first_activity_at: Some("2026-05-28T17:05:00Z".to_string()),
                 last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
             }],
+            cost: None,
             session_display_name: None,
             session_display_name_source: None,
             source_started_at: Some("2026-05-28T17:00:00Z".to_string()),
@@ -8428,6 +8754,11 @@ mod tests {
             gateway_provider: Some("vertex".to_string()),
             model_provider: Some("anthropic".to_string()),
             subscription_product: None,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
         };
         SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -8457,6 +8788,7 @@ mod tests {
                     first_activity_at: Some("2026-05-28T17:05:00Z".to_string()),
                     last_activity_at: Some("2026-05-28T17:45:00Z".to_string()),
                 }],
+                cost: None,
                 session_display_name: None,
                 session_display_name_source: None,
                 source_started_at: Some("2026-05-28T17:00:00Z".to_string()),
