@@ -4924,8 +4924,13 @@ for line in sys.stdin:
         std::fs::create_dir_all(&current_identity).expect("create current identity bucket");
         std::fs::write(
             current_identity.join("local_identity.json"),
+            // lastActivityAt must be explicit and OLDER than the code-session
+            // bucket's: without it the reader falls back to file mtime (= test
+            // run time), which outranks the code session's fixed timestamp and
+            // flips latest_session_id — a wall-clock time bomb.
             r#"{
               "cliSessionId": "identity-cli-session",
+              "lastActivityAt": "2026-07-06T10:00:00Z",
               "emailAddress": "ron.s@singular.net",
               "accountName": "Ron",
               "organizationName": "Singular",

@@ -70,6 +70,13 @@ const PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE: &str = "pi_oauth_reauth_required";
 /// `not_found` state instead of a blocking telemetry-verification failure.
 pub(crate) const SOURCE_NOT_INSTALLED_VERIFICATION_CODE: &str = "source_not_installed";
 
+/// Stable verification message code for a source whose data/config IS present
+/// on this machine but whose CLI binary cannot be found or executed (for
+/// example a desktop-app-only install). Local session files keep syncing, so
+/// this must project as a non-blocking warning — never a blocking
+/// `verify_failed` that stalls onboarding. Shared with [`control`].
+pub(crate) const AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE: &str = "agent_cli_unavailable";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendErrorKind {
     Unreachable,
@@ -2100,6 +2107,7 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
         StableProblemCode::RelayUnavailable => "relay_unavailable",
         StableProblemCode::TelemetryNotVerified => "telemetry_not_verified",
         StableProblemCode::SourceNotInstalled => "source_not_installed",
+        StableProblemCode::AgentCliUnavailable => "agent_cli_unavailable",
         StableProblemCode::UnsupportedPlatform => "unsupported_platform",
         StableProblemCode::Unknown => "unknown",
     }
@@ -2259,13 +2267,16 @@ fn blocker(
 /// Claude Code on this Mac) is a legitimate, healthy configuration, not a
 /// setup task waiting to be finished. The source stays listed in `sources`
 /// so serving layers can still present it; only the overall state must not
-/// degrade because of it.
+/// degrade because of it. `agent_cli_unavailable` is excluded for the same
+/// reason: a desktop-app-only install keeps syncing local session data, and
+/// the missing CLI is a per-source soft warning, not a machine setup task.
 fn source_counts_toward_finish_setup(source: &LocalHealthSourceV1) -> bool {
-    if source.blocking_reason.as_deref()
-        == Some(stable_problem_code_slug(
-            &StableProblemCode::SourceNotInstalled,
-        ))
-    {
+    if matches!(
+        source.blocking_reason.as_deref(),
+        Some(reason)
+            if reason == stable_problem_code_slug(&StableProblemCode::SourceNotInstalled)
+                || reason == stable_problem_code_slug(&StableProblemCode::AgentCliUnavailable)
+    ) {
         return false;
     }
     matches!(
@@ -2921,6 +2932,7 @@ fn source_health_from_verification(
     let usage_limited = verification_result_is_usage_limited(result);
     let pi_local_only = result.source == SourceKind::Pi && result.message.code == "pi_local_only";
     let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
+    let agent_cli_unavailable = result.message.code == AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
     let (source_state, grade, problems) = if source_not_installed {
         // The CLI is genuinely absent on this Mac. Report it as an informational
         // `not_found` (finish setup) with a `SourceNotInstalled` problem — never
@@ -2934,6 +2946,25 @@ fn source_health_from_verification(
                 title: format!("{} is not installed", source_display_name(&result.source)),
                 detail: result.message.text.clone(),
                 retryable: false,
+            }],
+        )
+    } else if agent_cli_unavailable {
+        // Data/config is present (desktop-app-only install) but the CLI binary
+        // can't be executed, so only the live check is unavailable while local
+        // session files keep syncing. Keep the source visible as a soft
+        // warning; a blocking `verify_failed` would stall onboarding over a
+        // machine that works.
+        (
+            SourceState::NeedsConfirmation,
+            HealthGrade::Warning,
+            vec![HealthProblem {
+                code: StableProblemCode::AgentCliUnavailable,
+                title: format!(
+                    "{} CLI was not found for live checks",
+                    source_display_name(&result.source)
+                ),
+                detail: result.message.text.clone(),
+                retryable: true,
             }],
         )
     } else if config_has_drift {
@@ -4640,6 +4671,84 @@ mod tests {
             "a not-installed source must not degrade the machine"
         );
         assert_eq!(health.overall.next_action, None);
+    }
+
+    #[test]
+    fn cli_unavailable_verify_projects_visible_soft_warning_not_blocking() {
+        // Desktop-app-only install: data/config present, CLI binary not
+        // executable. The source must stay VISIBLE (unlike source_not_installed,
+        // which serving layers suppress) as a soft warning, and must never
+        // produce a blocking verify_failed or degrade the machine.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+
+        let cli_unavailable = SourceVerificationResult {
+            source: SourceKind::Codex,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Warning,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: None,
+            message: StableMessage {
+                code: AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE.to_string(),
+                text: "Ottto keeps syncing Codex activity from this Mac's local session data, but couldn't find the `codex` command-line tool to run a live check."
+                    .to_string(),
+            },
+            route_results: Vec::new(),
+        };
+        daemon
+            .record_verification_result(&cli_unavailable)
+            .expect("record cli-unavailable verification");
+
+        let status = daemon.status(TOKEN).expect("status");
+        assert_eq!(status.sources[0].state, SourceState::NeedsConfirmation);
+        assert_eq!(status.sources[0].grade, HealthGrade::Warning);
+        assert_eq!(
+            status.sources[0].problems[0].code,
+            StableProblemCode::AgentCliUnavailable,
+        );
+
+        let health = status
+            .canonical_health
+            .as_ref()
+            .expect("canonical health should be projected");
+        let codex = health
+            .sources
+            .iter()
+            .find(|source| source.app == SourceKind::Codex)
+            .expect("cli-unavailable source stays listed in sources");
+        assert_eq!(
+            codex.state,
+            LocalHealthSourceState::PendingSetup,
+            "soft state, never verify_failed"
+        );
+        assert_eq!(
+            codex.blocking_reason.as_deref(),
+            Some("agent_cli_unavailable")
+        );
+        assert_ne!(
+            health.overall.state,
+            LocalHealthOverallState::Blocked,
+            "a missing CLI for a data-present source must not block"
+        );
+        assert!(
+            health
+                .blockers
+                .iter()
+                .all(|blocker| blocker.owner != "source"),
+            "no blocking source problem when only the CLI is unavailable"
+        );
+        assert_eq!(
+            health.overall.state,
+            LocalHealthOverallState::Healthy,
+            "a cli-unavailable source must not degrade the machine"
+        );
     }
 
     #[test]

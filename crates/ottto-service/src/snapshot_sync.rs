@@ -1038,7 +1038,14 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
-    let text = error.to_string();
+    // Scan the whole context chain, not just the outermost message, so a known
+    // failure phrase wrapped under another context still classifies instead of
+    // collapsing to the undiagnosable bare "sync failed".
+    let text = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
     if text.contains("relay device") {
         "relay device credentials are unavailable".to_string()
     } else if text.contains("machine identity") {
@@ -1072,6 +1079,14 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         || text.contains("mcp server")
     {
         "mcp inventory sync failed".to_string()
+    } else if text.contains("backend rejected context footprint") {
+        "context footprint upload rejected".to_string()
+    } else if text.contains("context footprint") {
+        "context footprint upload failed".to_string()
+    } else if text.contains("response failed") {
+        // "parse <endpoint> response failed" family: the request went through
+        // but the backend reply didn't decode.
+        "backend response was invalid".to_string()
     } else {
         "sync failed".to_string()
     }

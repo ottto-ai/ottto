@@ -93,6 +93,11 @@ const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
 /// failure. Maps to a non-blocking `not_found` source state. Shared with the
 /// crate-root health projection via [`crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE`].
 const SOURCE_NOT_INSTALLED_CODE: &str = crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
+/// Data/config present but the CLI binary can't be found or executed (desktop-
+/// app-only installs). Maps to a visible, non-blocking soft warning. Shared
+/// with the crate-root health projection via
+/// [`crate::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE`].
+const AGENT_CLI_UNAVAILABLE_CODE: &str = crate::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
@@ -6948,6 +6953,13 @@ fn smoke_failure_verification_result_with_config(
     smoke: &SmokeResult,
     smoke_after: Option<String>,
 ) -> SourceVerificationResult {
+    if !smoke.command_found {
+        // Presence was granted by config or usage metadata (desktop-app-only
+        // installs), but the CLI binary itself cannot be executed. Local
+        // session files keep syncing, so a hard `Failed` (blocking
+        // `verify_failed` + telemetry blocker) would be both wrong and scary.
+        return cli_unavailable_verification_result(source, config);
+    }
     let usage_limited = smoke.error_code.as_deref() == Some(SMOKE_USAGE_LIMIT_ERROR_CODE);
     verification_result_with_config(
         source,
@@ -6977,6 +6989,36 @@ fn smoke_failure_verification_result_with_config(
 /// to short-circuit verification before running a doomed smoke.
 fn source_binary_present(source: &SourceKind) -> bool {
     crate::agent_configs::detection::source_present_locally(source)
+}
+
+/// A non-blocking verification result for a source whose data/config is
+/// present on this Mac but whose CLI binary cannot be found or executed — the
+/// desktop-app-only shape (for example Codex used through the ChatGPT desktop
+/// app, or a Claude Code desktop install whose vendored binary moved). Session
+/// data keeps syncing from local files; only the live CLI check is
+/// unavailable, so this uses the dedicated `agent_cli_unavailable` code that
+/// projects as a visible soft warning instead of a blocking `verify_failed`.
+fn cli_unavailable_verification_result(
+    source: SourceKind,
+    config: SourceConfigState,
+) -> SourceVerificationResult {
+    let name = source_display_name(&source);
+    let binary = crate::agent_configs::detection::source_binary_name(&source);
+    let text = format!(
+        "Ottto keeps syncing {name} activity from this Mac's local session data, but couldn't find the `{binary}` command-line tool to run a live check. Install the {name} CLI on this Mac, then run Verify.",
+    );
+    verification_result_with_config(
+        source,
+        config,
+        SourceVerificationStatus::Warning,
+        false,
+        0,
+        None,
+        None,
+        None,
+        AGENT_CLI_UNAVAILABLE_CODE,
+        &text,
+    )
 }
 
 /// A clean, non-blocking verification result for a source that is not installed
@@ -13549,6 +13591,43 @@ log_user_prompt = true
         assert_eq!(
             result.message.text,
             "Codex is signed in, but its usage limit is reached. Wait for quota to reset or update usage, then retry Verify."
+        );
+    }
+
+    #[test]
+    fn command_not_found_smoke_maps_to_non_blocking_cli_unavailable() {
+        // Desktop-app-only shape: presence was granted by config/usage
+        // metadata, but the CLI binary can't be executed. This must never be a
+        // blocking Failed — local session data keeps syncing.
+        let smoke = SmokeResult {
+            command_found: false,
+            succeeded: false,
+            exit_status: None,
+            duration_ms: 0,
+            message: "codex is not installed or not executable.".to_string(),
+            diagnostic: None,
+            error_code: Some("command_not_found".to_string()),
+            local_session_observed: None,
+        };
+
+        let result = smoke_failure_verification_result(
+            SourceKind::Codex,
+            &smoke,
+            Some("2026-05-06T12:00:00Z".to_string()),
+        );
+
+        assert_eq!(result.status, SourceVerificationStatus::Warning);
+        assert!(!result.verified);
+        assert_eq!(result.message.code, AGENT_CLI_UNAVAILABLE_CODE);
+        assert!(
+            result.message.text.contains("keeps syncing Codex activity"),
+            "copy names ongoing local sync: {}",
+            result.message.text
+        );
+        assert!(
+            result.message.text.contains("`codex`"),
+            "copy names the missing command: {}",
+            result.message.text
         );
     }
 

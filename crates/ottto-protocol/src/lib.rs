@@ -1668,6 +1668,11 @@ pub enum StableProblemCode {
     RelayUnavailable,
     TelemetryNotVerified,
     SourceNotInstalled,
+    /// Data/config for the source is present on this machine but its CLI
+    /// binary cannot be found or executed (for example a desktop-app-only
+    /// install). Local session data keeps syncing; only live CLI checks are
+    /// unavailable, so this is a soft, non-blocking problem.
+    AgentCliUnavailable,
     UnsupportedPlatform,
     Unknown,
 }
