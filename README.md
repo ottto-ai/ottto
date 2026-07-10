@@ -503,6 +503,16 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   session files. The local scan
   reports Pi as requiring install when the Pi CLI/session files are present but
   the device grant does not yet include `pi`.
+- local Claude Code reasoning-effort reduction at that loopback boundary:
+  Claude's documented `claude_code.api_request` logs use OTLP/HTTP JSON while
+  metrics and traces remain protobuf. The relay stores only session id, request
+  timestamp, model, applied effort, and token counters in owner-only hashed
+  sidecars; prompts, responses, commands, paths, account identity, email, and
+  raw OTLP are discarded. Snapshot sync partitions matching transcript
+  model/hour rows by this evidence, leaves uncovered residual usage as unknown,
+  and preserves exact transcript totals. Organization-disabled live telemetry
+  still returns its normal OTLP success response after the local reduction;
+  transient forwarding failures retain the existing exporter retry behavior.
 - source-local snapshot parsing and background sync in `ottto-service` for Codex
   `~/.codex/sessions/**/*.jsonl`, Claude Code
   `~/.claude/projects/**/*.jsonl`, and Pi

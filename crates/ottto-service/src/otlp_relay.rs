@@ -349,6 +349,28 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
     }
 
     let request_source = source_from_request(&request).unwrap_or(source);
+    // Claude Code transcripts do not persist the applied effort tier. Reduce the
+    // official per-request OTLP log locally before cloud forwarding, so an
+    // organization-disabled upstream still feeds the content-free snapshot/GOLD
+    // path. Cloud forwarding remains synchronous: enabled telemetry keeps its
+    // existing delivery/retry contract, while a disabled upstream returns its
+    // normal OTLP-compatible 200 response.
+    if request_source == SnapshotSource::ClaudeCode && request.path == "/v1/logs" {
+        match crate::claude_effort::capture_claude_api_request_logs(
+            &ottto_core::default_support_dir(),
+            &request.body,
+            request
+                .headers
+                .get("content-type")
+                .map(String::as_str)
+                .unwrap_or("application/octet-stream"),
+        ) {
+            Ok(_) => {}
+            Err(_error) => {
+                eprintln!("local Claude effort reduction skipped: invalid local OTLP logs payload");
+            }
+        }
+    }
     match forward_otlp_request(request_source, &request) {
         Ok(response) => write_raw_response(
             &mut stream,

@@ -451,6 +451,184 @@ pub fn apply_upload_policy(
     }
 }
 
+/// Split Claude transcript bucket rows by exact locally-reduced OTLP effort.
+///
+/// The transcript remains authoritative for total tokens. Evidence is applied
+/// only when one transcript row unambiguously owns the model/hour and every
+/// observed component fits inside it. Any uncovered remainder stays as an
+/// effort-unknown row, preserving byte-exact totals under partial collection.
+pub fn apply_claude_effort_evidence(
+    snapshots: &mut [SnapshotItem],
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+) {
+    for item in snapshots {
+        let Some(evidence) = evidence_by_session.get(&item.source_session_id) else {
+            continue;
+        };
+        let mut grouped: BTreeMap<(String, String, String), UsageTotals> = BTreeMap::new();
+        for observed in evidence {
+            let Some((bucket_start, _)) = activity_bucket_from_timestamp(&observed.observed_at)
+            else {
+                continue;
+            };
+            let totals = UsageTotals {
+                input_tokens: observed.input_tokens,
+                output_tokens: observed.output_tokens,
+                cache_read_tokens: observed.cache_read_tokens,
+                cache_creation_5m_tokens: observed.cache_creation_5m_tokens,
+                cache_creation_1h_tokens: observed.cache_creation_1h_tokens,
+                reasoning_output_tokens: observed.reasoning_output_tokens,
+                unattributed_total_tokens: 0,
+                request_count: observed.request_count,
+                costs: UsageCosts::default(),
+            };
+            grouped
+                .entry((
+                    bucket_start,
+                    normalized_evidence_model(&observed.model),
+                    observed.effort.clone(),
+                ))
+                .or_default()
+                .add(&totals);
+        }
+
+        let mut changed = false;
+        for bucket in &mut item.usage_buckets {
+            let mut model_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+            for (index, row) in bucket.model_usage.iter().enumerate() {
+                model_indices
+                    .entry(normalized_evidence_model(&row.model))
+                    .or_default()
+                    .push(index);
+            }
+            let mut replacements: BTreeMap<usize, Vec<SnapshotModelUsage>> = BTreeMap::new();
+            for (model, indices) in model_indices {
+                if indices.len() != 1 {
+                    continue;
+                }
+                let index = indices[0];
+                let base = &bucket.model_usage[index];
+                if model_usage_has_cost(base) {
+                    continue;
+                }
+                let effort_rows: Vec<(String, UsageTotals)> = grouped
+                    .iter()
+                    .filter_map(|((observed_bucket, observed_model, effort), totals)| {
+                        (observed_bucket == &bucket.bucket_start && observed_model == &model)
+                            .then(|| (effort.clone(), totals.clone()))
+                    })
+                    .collect();
+                if effort_rows.is_empty() {
+                    continue;
+                }
+                let base_totals = usage_totals_from_model_usage(base);
+                let mut observed_totals = UsageTotals::default();
+                for (_, totals) in &effort_rows {
+                    observed_totals.add(totals);
+                }
+                if !usage_totals_fit(&observed_totals, &base_totals) {
+                    continue;
+                }
+
+                let mut split = Vec::new();
+                for (effort, totals) in effort_rows {
+                    if !usage_totals_has_usage(&totals) {
+                        continue;
+                    }
+                    split.push(model_usage_with_totals(base, &totals, Some(effort)));
+                }
+                let residual = base_totals.delta_from(&observed_totals);
+                if usage_totals_has_usage(&residual) {
+                    split.push(model_usage_with_totals(base, &residual, None));
+                }
+                if !split.is_empty() {
+                    replacements.insert(index, split);
+                }
+            }
+            if replacements.is_empty() {
+                continue;
+            }
+            let mut rows = Vec::new();
+            for (index, row) in bucket.model_usage.drain(..).enumerate() {
+                if let Some(split) = replacements.remove(&index) {
+                    rows.extend(split);
+                } else {
+                    rows.push(row);
+                }
+            }
+            rows.sort_by_key(row_key_from_model_usage);
+            bucket.model_usage = rows;
+            changed = true;
+        }
+        if changed {
+            rebuild_snapshot_model_usage(item);
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        }
+    }
+}
+
+fn normalized_evidence_model(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+fn model_usage_has_cost(row: &SnapshotModelUsage) -> bool {
+    row.cost_usd.is_some()
+        || row.input_cost_usd.is_some()
+        || row.output_cost_usd.is_some()
+        || row.cache_read_cost_usd.is_some()
+        || row.cache_creation_cost_usd.is_some()
+}
+
+fn usage_totals_fit(observed: &UsageTotals, base: &UsageTotals) -> bool {
+    base.is_monotonic_after(observed)
+}
+
+fn model_usage_with_totals(
+    base: &SnapshotModelUsage,
+    totals: &UsageTotals,
+    effort: Option<String>,
+) -> SnapshotModelUsage {
+    let mut row = base.clone();
+    row.input_tokens = totals.input_tokens;
+    row.output_tokens = totals.output_tokens;
+    row.cache_read_tokens = totals.cache_read_tokens;
+    row.cache_creation_5m_tokens = totals.cache_creation_5m_tokens;
+    row.cache_creation_1h_tokens = totals.cache_creation_1h_tokens;
+    row.reasoning_output_tokens = totals.reasoning_output_tokens;
+    row.unattributed_total_tokens = totals.unattributed_total_tokens;
+    row.request_count = totals.request_count;
+    row.reasoning_effort = effort;
+    row.cost_usd = None;
+    row.input_cost_usd = None;
+    row.output_cost_usd = None;
+    row.cache_read_cost_usd = None;
+    row.cache_creation_cost_usd = None;
+    row
+}
+
+fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
+    let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
+    for bucket in &item.usage_buckets {
+        for row in &bucket.model_usage {
+            let key = row_key_from_model_usage(row);
+            merge_session_row(
+                &mut session_rows,
+                key,
+                BucketRowAccumulator {
+                    selector_context: row.selector_context.clone(),
+                    selector_sources: row.selector_sources.clone(),
+                    usage: usage_totals_from_model_usage(row),
+                    reasoning_effort: row.reasoning_effort.clone(),
+                },
+            );
+        }
+    }
+    item.model_usage = session_rows
+        .iter()
+        .map(|(key, row)| model_usage_from_row(key, row))
+        .collect();
+}
+
 fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     let fingerprint_payload = json!({
         "source": source.api_slug(),
@@ -792,6 +970,7 @@ fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
     RowKey {
         model: row.model.clone(),
         selector_hash,
+        reasoning_effort: row.reasoning_effort.clone(),
         auth_mode: row.auth_mode.clone(),
         billing_channel: row.billing_channel.clone(),
         billing_provider: row.billing_provider.clone(),
@@ -1117,6 +1296,7 @@ fn claude_workflows_dir_has_manifest(dir: &Path) -> bool {
 struct RowKey {
     model: String,
     selector_hash: String,
+    reasoning_effort: Option<String>,
     auth_mode: Option<String>,
     billing_channel: Option<String>,
     billing_provider: Option<String>,
@@ -1130,9 +1310,8 @@ struct BucketRowAccumulator {
     selector_context: BTreeMap<String, String>,
     selector_sources: BTreeMap<String, String>,
     usage: UsageTotals,
-    // Per-turn reasoning effort tier (Codex). "First non-empty wins" — set on
-    // first insert, only filled on merge when still absent. Deliberately NOT a
-    // RowKey dimension, so it never affects row identity/dedup.
+    // Per-turn reasoning effort tier (Codex transcript or Claude local OTLP).
+    // Also present in RowKey so mixed-effort buckets never collapse.
     reasoning_effort: Option<String>,
 }
 
@@ -1482,7 +1661,8 @@ impl SnapshotAccumulator {
 
         let mut merged = self.current_selector.clone();
         merged.merge(selector);
-        let (row_key, reduced_context, reduced_sources) = build_row_identity(&model, &merged);
+        let (row_key, reduced_context, reduced_sources) =
+            build_row_identity(&model, &merged, effort.as_deref());
 
         let bucket = self.usage_buckets.entry(bucket_start).or_default();
         bucket.note_activity_at(&normalized_timestamp);
@@ -1492,11 +1672,7 @@ impl SnapshotAccumulator {
                     row.selector_sources.insert(field, source);
                 }
                 row.usage.add(&usage);
-                // First non-empty wins: only adopt the incoming effort when the
-                // row has not yet captured one.
-                if row.reasoning_effort.is_none() {
-                    row.reasoning_effort = effort;
-                }
+                debug_assert_eq!(row.reasoning_effort, effort);
             }
             None => {
                 bucket.rows.insert(
@@ -1714,10 +1890,7 @@ fn merge_session_row(
                 existing.selector_sources.insert(field, source);
             }
             existing.usage.add(&row.usage);
-            // First non-empty wins across the session aggregation too.
-            if existing.reasoning_effort.is_none() {
-                existing.reasoning_effort = row.reasoning_effort;
-            }
+            debug_assert_eq!(existing.reasoning_effort, row.reasoning_effort);
         }
         None => {
             session_rows.insert(row_key, row);
@@ -1760,6 +1933,7 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
 fn build_row_identity(
     model: &str,
     merged: &SelectorCapture,
+    reasoning_effort: Option<&str>,
 ) -> (RowKey, BTreeMap<String, String>, BTreeMap<String, String>) {
     let mut hoisted: BTreeMap<&'static str, Option<String>> = BTreeMap::new();
     let mut reduced_context = BTreeMap::new();
@@ -1801,6 +1975,7 @@ fn build_row_identity(
     let row_key = RowKey {
         model: model.to_string(),
         selector_hash,
+        reasoning_effort: reasoning_effort.map(str::to_string),
         auth_mode: hoisted.get("auth_mode").cloned().unwrap_or(None),
         billing_channel: hoisted.get("billing_channel").cloned().unwrap_or(None),
         billing_provider: hoisted.get("billing_provider").cloned().unwrap_or(None),
@@ -6647,7 +6822,7 @@ mod tests {
             "claude_code_attribution_field",
         );
 
-        let (_, reduced_context, _) = build_row_identity("claude-opus-4-8", &merged);
+        let (_, reduced_context, _) = build_row_identity("claude-opus-4-8", &merged, None);
 
         assert_eq!(
             reduced_context.get("context_bucket").map(String::as_str),
@@ -7007,6 +7182,38 @@ mod tests {
     }
 
     #[test]
+    fn codex_mixed_effort_in_one_hour_keeps_distinct_rows() {
+        let path = temp_file("codex-mixed-effort");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-mixed-effort\",\"model\":\"gpt-5.5\"}}\n",
+                "{\"timestamp\":\"2026-05-20T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"reasoning_effort\":\"high\",\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":20,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-05-20T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"reasoning_effort\":\"low\",\"total_token_usage\":{\"input_tokens\":160,\"output_tokens\":32,\"request_count\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(&path, "2026-05-20T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 2);
+        assert!(item
+            .model_usage
+            .iter()
+            .any(|row| row.reasoning_effort.as_deref() == Some("high") && row.input_tokens == 100));
+        assert!(item
+            .model_usage
+            .iter()
+            .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 60));
+        validate_snapshot_item(0, &item).expect("mixed effort validates");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_parser_reads_reasoning_effort_from_turn_context_collaboration_mode() {
         // No usage-co-located effort; falls back to the turn_context
         // collaboration_mode.settings.reasoning_effort path. The turn_context
@@ -7314,6 +7521,68 @@ mod tests {
         // and reported false (not None / unknown).
         assert_eq!(origin.used_workflow_orchestration, Some(false));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_local_otel_effort_splits_bucket_without_changing_totals() {
+        let path = temp_file("claude-effort");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-11T10:00:00Z\",\"sessionId\":\"claude-effort-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-07-11T10:01:00Z\",\"sessionId\":\"claude-effort-1\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"sessionId\":\"claude-effort-1\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-07-11T10:04:00Z", "fp".to_string())
+                .expect("parse");
+        let evidence = BTreeMap::from([(
+            "claude-effort-1".to_string(),
+            vec![
+                crate::claude_effort::ClaudeEffortEvidence {
+                    fingerprint: "one".to_string(),
+                    session_id: "claude-effort-1".to_string(),
+                    observed_at: "2026-07-11T10:01:00Z".to_string(),
+                    model: "claude-opus-4-7".to_string(),
+                    effort: "high".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    request_count: 1,
+                    ..Default::default()
+                },
+                crate::claude_effort::ClaudeEffortEvidence {
+                    fingerprint: "two".to_string(),
+                    session_id: "claude-effort-1".to_string(),
+                    observed_at: "2026-07-11T10:02:00Z".to_string(),
+                    model: "claude-opus-4-7".to_string(),
+                    effort: "low".to_string(),
+                    input_tokens: 20,
+                    output_tokens: 7,
+                    request_count: 1,
+                    ..Default::default()
+                },
+            ],
+        )]);
+
+        apply_claude_effort_evidence(&mut items, &evidence);
+
+        assert_eq!(items[0].input_tokens, 30);
+        assert_eq!(items[0].output_tokens, 12);
+        assert_eq!(items[0].request_count, 2);
+        assert_eq!(items[0].model_usage.len(), 2);
+        assert_eq!(items[0].usage_buckets[0].model_usage.len(), 2);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .any(|row| row.reasoning_effort.as_deref() == Some("high") && row.input_tokens == 10));
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 20));
+        validate_snapshot_item(0, &items[0]).expect("split snapshot remains byte-exact");
         let _ = fs::remove_file(path);
     }
 

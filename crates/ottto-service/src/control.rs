@@ -5934,6 +5934,10 @@ fn claude_code_relay_env_with_base(
         ("OTEL_LOGS_EXPORTER", "otlp".to_string()),
         ("OTEL_TRACES_EXPORTER", "otlp".to_string()),
         ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf".to_string()),
+        // The local reducer consumes Claude's exact per-request api_request logs.
+        // Keep metrics/traces protobuf while making only the logs signal safely
+        // inspectable without persisting raw OTLP payloads.
+        ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", "http/json".to_string()),
         (
             "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
             format!("{relay_base}/v1/metrics"),
@@ -13371,6 +13375,11 @@ log_user_prompt = true
             env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
                 .and_then(|value| value.as_str()),
             Some("http://127.0.0.1:44621/v1/logs")
+        );
+        assert_eq!(
+            env.get("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+                .and_then(|value| value.as_str()),
+            Some("http/json")
         );
         assert!(claude_code_settings_has_relay_env(&body));
         assert!(claude_code_settings_has_relay_env_for_base(&body, fallback));
