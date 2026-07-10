@@ -13,7 +13,23 @@ struct DetectionSpec {
     version_args: &'static [&'static str],
     config_path: Option<PathBuf>,
     installed_when_config_parent_exists: bool,
+    /// Usage-generated metadata paths that count as presence on their own.
+    /// Only paths the agent itself creates by being USED on this Mac (session
+    /// transcripts, desktop-app data dirs) belong here — never a file Ottto
+    /// writes during onboarding, which is exactly the false positive the
+    /// `installed_when_config_parent_exists: false` rule exists to prevent.
+    metadata_paths: Vec<PathBuf>,
     install_docs_url: Option<&'static str>,
+}
+
+/// The CLI binary name a source is detected and smoked with, from the same
+/// spec that drives presence — so user-facing copy can name the exact command.
+pub fn source_binary_name(source: &SourceKind) -> &'static str {
+    match source {
+        SourceKind::Codex => "codex",
+        SourceKind::ClaudeCode => "claude",
+        SourceKind::Pi => "pi",
+    }
 }
 
 pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetection {
@@ -35,8 +51,11 @@ pub fn detect_agent_installation(source: &SourceKind) -> AgentInstallationDetect
 /// app". It must NOT be satisfied by config that Ottto itself writes during
 /// onboarding: Claude Code is `installed_when_config_parent_exists: false`, so a
 /// lone `~/.claude/settings.json` (which the relay-base patch creates) does not
-/// count — the `claude` binary must be found. Codex/Pi treat a genuine
-/// user-owned config directory as presence, matching their detection specs.
+/// count. Presence is the binary, or usage-generated metadata the agent itself
+/// created (`metadata_paths` — e.g. `~/.claude/projects` session transcripts or
+/// the Claude desktop app's data dirs, covering desktop-app-only installs).
+/// Codex/Pi additionally treat a genuine user-owned config directory as
+/// presence, matching their detection specs.
 pub fn source_present_locally(source: &SourceKind) -> bool {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -54,6 +73,9 @@ fn source_present_with_home(source: &SourceKind, home: &Path) -> bool {
 /// deterministically without depending on what is installed on the dev machine.
 fn source_present_with_paths(spec: DetectionSpec, binary_found: bool) -> bool {
     if binary_found {
+        return true;
+    }
+    if spec.metadata_paths.iter().any(|path| path.exists()) {
         return true;
     }
     if !spec.installed_when_config_parent_exists {
@@ -83,6 +105,7 @@ fn detect_agent_installation_with_paths(
         }
     });
     let installed = binary_path.is_some()
+        || spec.metadata_paths.iter().any(|path| path.exists())
         || (spec.installed_when_config_parent_exists && config_path.is_some());
 
     AgentInstallationDetection {
@@ -102,6 +125,7 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             version_args: &["--version"],
             config_path: Some(home.join(".codex").join("config.toml")),
             installed_when_config_parent_exists: true,
+            metadata_paths: Vec::new(),
             install_docs_url: Some(CODEX_INSTALL_DOCS_URL),
         },
         SourceKind::ClaudeCode => DetectionSpec {
@@ -109,6 +133,17 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             version_args: &["--version"],
             config_path: Some(home.join(".claude").join("settings.json")),
             installed_when_config_parent_exists: false,
+            // Claude Code creates these only by actually running on this Mac —
+            // session transcripts, plus the Claude desktop app's Claude Code
+            // data (vendored CLI downloads and desktop session dirs). Ottto's
+            // onboarding never writes any of them, so unlike settings.json they
+            // are safe presence evidence for desktop-app-only installs.
+            metadata_paths: vec![
+                home.join(".claude").join("projects"),
+                claude_desktop_support_dir(home).join("claude-code"),
+                claude_desktop_support_dir(home).join("claude-code-sessions"),
+                claude_desktop_support_dir(home).join("local-agent-mode-sessions"),
+            ],
             install_docs_url: Some(CLAUDE_CODE_INSTALL_DOCS_URL),
         },
         SourceKind::Pi => DetectionSpec {
@@ -116,9 +151,16 @@ fn detection_spec(source: &SourceKind, home: &Path) -> DetectionSpec {
             version_args: &["--version"],
             config_path: Some(home.join(".pi")),
             installed_when_config_parent_exists: true,
+            metadata_paths: Vec::new(),
             install_docs_url: None,
         },
     }
+}
+
+fn claude_desktop_support_dir(home: &Path) -> PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Claude")
 }
 
 fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
@@ -285,6 +327,52 @@ mod tests {
             detection_spec(&SourceKind::ClaudeCode, &home),
             false,
         ));
+    }
+
+    #[test]
+    fn presence_claude_session_transcripts_count_without_binary() {
+        let home = test_home("presence-claude-projects");
+        // `~/.claude/projects` only exists because Claude Code actually ran
+        // here (desktop app or CLI); Ottto onboarding never creates it.
+        fs::create_dir_all(home.join(".claude").join("projects")).expect("projects dir");
+
+        assert!(source_present_with_paths(
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            false,
+        ));
+    }
+
+    #[test]
+    fn presence_claude_desktop_app_data_counts_without_binary() {
+        let home = test_home("presence-claude-desktop");
+        fs::create_dir_all(
+            home.join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude-code"),
+        )
+        .expect("desktop vendored dir");
+
+        assert!(source_present_with_paths(
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            false,
+        ));
+    }
+
+    #[test]
+    fn detect_claude_installed_via_usage_metadata_without_binary() {
+        let home = test_home("detect-claude-metadata");
+        fs::create_dir_all(home.join(".claude").join("projects")).expect("projects dir");
+
+        let detected = detect_agent_installation_with_paths(
+            &SourceKind::ClaudeCode,
+            detection_spec(&SourceKind::ClaudeCode, &home),
+            None,
+            None,
+        );
+
+        assert!(detected.installed);
+        assert_eq!(detected.binary_path, None);
     }
 
     #[test]

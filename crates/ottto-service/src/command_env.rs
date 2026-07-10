@@ -46,31 +46,96 @@ fn executable_search_dirs_for_program(program: &str) -> Vec<PathBuf> {
     executable_search_dirs_for_program_with_home(program, env::var_os("HOME"))
 }
 
+/// App bundles that vendor the `codex` CLI under `Contents/Resources`. The
+/// standalone Codex desktop app and the ChatGPT desktop app both ship it; on a
+/// Mac where Codex is used only through a desktop app this is the only `codex`
+/// binary on disk.
+const CODEX_DESKTOP_BUNDLES: &[&str] = &["Codex.app", "ChatGPT.app"];
+
 fn executable_search_dirs_for_program_with_home(
     program: &str,
     home: Option<OsString>,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if program == "codex" {
-        push_unique(
-            &mut dirs,
-            PathBuf::from("/Applications/Codex.app/Contents/Resources"),
-        );
-        if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
+        for bundle in CODEX_DESKTOP_BUNDLES {
             push_unique(
                 &mut dirs,
-                PathBuf::from(home)
-                    .join("Applications")
-                    .join("Codex.app")
+                Path::new("/Applications")
+                    .join(bundle)
                     .join("Contents")
                     .join("Resources"),
             );
+            if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
+                push_unique(
+                    &mut dirs,
+                    PathBuf::from(home)
+                        .join("Applications")
+                        .join(bundle)
+                        .join("Contents")
+                        .join("Resources"),
+                );
+            }
         }
     }
-    for dir in executable_search_dirs_from(env::var_os("PATH"), home, true) {
+    for dir in executable_search_dirs_from(env::var_os("PATH"), home.clone(), true) {
         push_unique(&mut dirs, dir);
     }
+    if program == "claude" {
+        if let Some(home) = home.as_ref().filter(|home| !home.is_empty()) {
+            for dir in claude_desktop_vendored_bin_dirs(&PathBuf::from(home)) {
+                push_unique(&mut dirs, dir);
+            }
+        }
+    }
     dirs
+}
+
+/// Enumerate the Claude desktop app's vendored Claude Code binary directories:
+/// `~/Library/Application Support/Claude/claude-code/<version>/claude.app/Contents/MacOS`.
+/// The desktop app downloads a complete Claude Code CLI per version; on a Mac
+/// where Claude Code is used only through the desktop app this is the only
+/// `claude` binary on disk. Listed after PATH and the per-user CLI prefixes so
+/// an explicit CLI install always wins; versions are ordered newest first so a
+/// stale leftover download never shadows the current one. A missing root
+/// simply yields no directories.
+fn claude_desktop_vendored_bin_dirs(home: &Path) -> Vec<PathBuf> {
+    let root = home
+        .join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("claude-code");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut versioned: Vec<(Vec<u64>, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let bin_dir = entry
+                .path()
+                .join("claude.app")
+                .join("Contents")
+                .join("MacOS");
+            bin_dir.is_dir().then(|| {
+                (
+                    version_sort_key(&entry.file_name().to_string_lossy()),
+                    bin_dir,
+                )
+            })
+        })
+        .collect();
+    versioned.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    versioned.into_iter().map(|(_, dir)| dir).collect()
+}
+
+/// Numeric components of a version-shaped directory name (`2.1.202` →
+/// `[2, 1, 202]`) for a newest-first sort. Non-numeric fragments are skipped so
+/// unexpected names sort last instead of failing enumeration.
+fn version_sort_key(name: &str) -> Vec<u64> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
 }
 
 pub(crate) fn path_env() -> Option<OsString> {
@@ -380,6 +445,87 @@ mod tests {
                 "/Users/tester/Applications/Codex.app/Contents/Resources"
             ))
         );
+        // The ChatGPT desktop app vendors the codex CLI the same way; a Mac
+        // with only ChatGPT.app installed must still resolve codex.
+        assert_eq!(
+            dirs.get(2),
+            Some(&PathBuf::from(
+                "/Applications/ChatGPT.app/Contents/Resources"
+            ))
+        );
+        assert_eq!(
+            dirs.get(3),
+            Some(&PathBuf::from(
+                "/Users/tester/Applications/ChatGPT.app/Contents/Resources"
+            ))
+        );
+    }
+
+    #[test]
+    fn claude_search_dirs_include_desktop_vendored_binaries_newest_first() {
+        let home = scratch_home("claude-desktop");
+        let vendored_root = home.join("Library/Application Support/Claude/claude-code");
+        let old_bin = vendored_root.join("2.1.9/claude.app/Contents/MacOS");
+        let new_bin = vendored_root.join("2.1.202/claude.app/Contents/MacOS");
+        fs::create_dir_all(&old_bin).expect("old vendored dir");
+        fs::create_dir_all(&new_bin).expect("new vendored dir");
+        // A stray non-version entry must not break enumeration.
+        fs::write(vendored_root.join("README"), "x").ok();
+
+        let dirs = executable_search_dirs_for_program_with_home(
+            "claude",
+            Some(home.as_os_str().to_os_string()),
+        );
+
+        let new_pos = dirs.iter().position(|dir| dir == &new_bin);
+        let old_pos = dirs.iter().position(|dir| dir == &old_bin);
+        assert!(new_pos.is_some(), "newest vendored dir searched: {dirs:?}");
+        assert!(old_pos.is_some(), "older vendored dir searched: {dirs:?}");
+        assert!(new_pos < old_pos, "2.1.202 must outrank 2.1.9: {dirs:?}");
+        // Vendored desktop dirs are a fallback: explicit CLI installs win.
+        let local_bin_pos = dirs
+            .iter()
+            .position(|dir| dir == &home.join(".local/bin"))
+            .expect("home cli dir present");
+        assert!(local_bin_pos < new_pos.expect("new pos"));
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn claude_desktop_vendored_dirs_missing_root_is_empty() {
+        let home = scratch_home("claude-desktop-none");
+        assert!(claude_desktop_vendored_bin_dirs(&home).is_empty());
+    }
+
+    #[test]
+    fn executable_path_semantics_find_vendored_claude_binary() {
+        let home = scratch_home("claude-desktop-binary");
+        let bin_dir = home.join(
+            "Library/Application Support/Claude/claude-code/2.1.202/claude.app/Contents/MacOS",
+        );
+        fs::create_dir_all(&bin_dir).expect("vendored dir");
+        let claude = bin_dir.join("claude");
+        fs::write(&claude, "#!/bin/sh\n").expect("write claude");
+
+        let found = executable_search_dirs_for_program_with_home(
+            "claude",
+            Some(home.as_os_str().to_os_string()),
+        )
+        .into_iter()
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| candidate.is_file());
+
+        assert_eq!(found, Some(claude));
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn version_sort_key_orders_numeric_components() {
+        assert!(version_sort_key("2.1.202") > version_sort_key("2.1.9"));
+        assert!(version_sort_key("10.0.0") > version_sort_key("9.9.9"));
+        assert!(version_sort_key("2.1.9") > version_sort_key("README"));
     }
 
     #[test]
