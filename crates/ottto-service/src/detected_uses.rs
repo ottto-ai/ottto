@@ -339,6 +339,11 @@ mod tests {
             gateway_provider: gateway_provider.map(str::to_string),
             model_provider: model_provider.map(str::to_string),
             subscription_product: subscription_product.map(str::to_string),
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
         }
     }
 
@@ -378,6 +383,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             model_usage: Vec::new(),
             usage_buckets,
+            cost: None,
             session_display_name: None,
             session_display_name_source: None,
             source_started_at: None,
