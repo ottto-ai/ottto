@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 230,
-  "content_sha256": "f8b42a85c4ca143c4c39d734e01bc2b19b11d84b7a571a8c6ca51f4d7a991b50",
+  "candidate_file_count": 231,
+  "content_sha256": "b5d676db019bf1aa85087538aa0e90a43ff677d67a3ccb24a7c63f5dc19872b2",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "d0e1d3b987358fb631389058f24158968c5babe3c3371f38ede987f4ee5c8b62",
-      "size_bytes": 214217
+      "sha256": "3d64f284c14a96a630db892072af136b1e65b82269f696cb2fbb0793104cc53f",
+      "size_bytes": 221501
     },
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "398d95897cea1fbb2a3ff968fdeefa6853e13e5f68c58eee86ed29cb79cebc9d",
-      "size_bytes": 395958
+      "sha256": "c591137dbf4c82faa9b1c372d77832b0fe6c78429c5beaa54f14e2ff348bea5f",
+      "size_bytes": 397190
     },
     {
       "executable": false,
@@ -820,6 +820,13 @@
       "path": "docs/session-2026-07-11-claude-local-reasoning-effort.md",
       "sha256": "aa31f7a4d40fa97906d4e438b5a9b4e458ed648bdab1a769b9d8f7d9b1e4393b",
       "size_bytes": 1350
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-11-gpt56-cache-write-evidence.md",
+      "sha256": "c32e8bbbe927635275d72be11dbd38ebcc8caa2018745dd2c9e3cecb6af8b55e",
+      "size_bytes": 1698
     },
     {
       "executable": false,
@@ -1615,7 +1622,7 @@
   ],
   "generated_at": "2026-07-11T14:27:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 231,
+  "output_file_count": 232,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

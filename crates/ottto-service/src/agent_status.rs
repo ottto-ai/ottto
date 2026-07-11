@@ -290,7 +290,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
     }
 
     let models = run_command_capture("codex", &["debug", "models", "--bundled"], COMMAND_TIMEOUT);
-    let mut model_status = collect_model_status_from_output(&models, "openai");
+    let mut model_status = collect_codex_model_status_from_output(&models);
     apply_codex_config_model(
         &mut model_status,
         read_codex_config_model(),
@@ -2992,6 +2992,108 @@ fn collect_model_status_from_output(output: &CommandOutput, provider: &str) -> A
     }
 }
 
+fn collect_codex_model_status_from_output(output: &CommandOutput) -> AgentModelStatus {
+    if !output.command_found || !output.success {
+        return collect_model_status_from_output(output, "openai");
+    }
+    let Ok(json) = serde_json::from_str::<Value>(&output.stdout) else {
+        return collect_model_status_from_output(output, "openai");
+    };
+    let Some(models) = json.get("models").and_then(Value::as_array) else {
+        return collect_model_status_from_output(output, "openai");
+    };
+
+    let mut details = Vec::new();
+    let mut seen = BTreeSet::new();
+    for model in models {
+        let Some(model) = model.as_object() else {
+            continue;
+        };
+        let id = ["slug", "id", "model", "name"]
+            .iter()
+            .find_map(|key| model.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| looks_like_model_name(value) && looks_like_safe_model_id(value));
+        let Some(id) = id else {
+            continue;
+        };
+        if id.chars().any(char::is_whitespace) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let context_window_tokens = model
+            .get("context_window")
+            .or_else(|| model.get("max_context_window"))
+            .and_then(Value::as_u64);
+        let max_output_tokens = model
+            .get("max_output_tokens")
+            .or_else(|| model.get("max_output"))
+            .and_then(Value::as_u64);
+        let supports_thinking = model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .map(|levels| !levels.is_empty())
+            .or_else(|| {
+                model
+                    .get("supports_reasoning_summaries")
+                    .and_then(Value::as_bool)
+            });
+        let supports_images = model
+            .get("input_modalities")
+            .and_then(Value::as_array)
+            .map(|modalities| {
+                modalities
+                    .iter()
+                    .any(|value| value.as_str() == Some("image"))
+            })
+            .or_else(|| {
+                model
+                    .get("supports_image_detail_original")
+                    .and_then(Value::as_bool)
+            });
+        details.push(AgentAvailableModelStatus {
+            id: id.to_string(),
+            provider: Some("openai".to_string()),
+            model_provider: Some("openai".to_string()),
+            // The bundled-model list identifies the model provider, not the
+            // account's actual billing route (subscription, API, or gateway).
+            billing_provider: None,
+            billing_channel: None,
+            auth_mode: None,
+            gateway_provider: None,
+            subscription_product: None,
+            source_category: None,
+            account_identifier_hash: None,
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: None,
+            billing_identity_confidence: AgentStatusConfidence::Unknown,
+            context_window_tokens,
+            max_output_tokens,
+            supports_thinking,
+            supports_images,
+        });
+        if details.len() >= MAX_AVAILABLE_MODELS {
+            break;
+        }
+    }
+
+    if details.is_empty() {
+        return collect_model_status_from_output(output, "openai");
+    }
+    let default_model = details.first().map(|detail| detail.id.clone());
+    let context_window_tokens = details
+        .first()
+        .and_then(|detail| detail.context_window_tokens);
+    AgentModelStatus {
+        active_model: default_model.clone(),
+        default_model,
+        provider: Some("openai".to_string()),
+        available_models: details.iter().map(|detail| detail.id.clone()).collect(),
+        available_model_details: details,
+        context_window_tokens,
+    }
+}
+
 pub(crate) fn read_pi_smoke_routes() -> Vec<PiModelRoute> {
     if let Some(settings) = read_pi_agent_settings() {
         if let Some(route) = collect_default_pi_smoke_route_from_settings(&settings) {
@@ -3034,6 +3136,11 @@ fn apply_codex_config_model(
         );
         model_status.available_models = available_models;
     }
+    model_status.context_window_tokens = model_status
+        .available_model_details
+        .iter()
+        .find(|detail| detail.id == config_model)
+        .and_then(|detail| detail.context_window_tokens);
     if only_config_available && *collection_method == AgentStatusCollectionMethod::CommandProbe {
         *collection_method = AgentStatusCollectionMethod::ConfigFile;
     }
@@ -4573,6 +4680,94 @@ for line in sys.stdin:
             .iter()
             .any(|model| model == "gpt-5.4-codex"));
         assert_eq!(collection_method, AgentStatusCollectionMethod::CommandProbe);
+    }
+
+    #[test]
+    fn codex_bundled_models_preserve_structured_gpt56_metadata() {
+        let output = CommandOutput {
+            command_found: true,
+            success: true,
+            status_code: Some(0),
+            stdout: serde_json::json!({
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6-Sol",
+                        "description": "Latest frontier agentic coding model.",
+                        "context_window": 372000,
+                        "max_context_window": 372000,
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "max"}
+                        ],
+                        "input_modalities": ["text", "image"]
+                    },
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "context_window": 372000,
+                        "supported_reasoning_levels": [{"effort": "medium"}],
+                        "input_modalities": ["text", "image"]
+                    }
+                ]
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let status = collect_codex_model_status_from_output(&output);
+
+        assert_eq!(status.active_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(status.default_model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(status.context_window_tokens, Some(372_000));
+        assert_eq!(
+            status.available_models,
+            vec!["gpt-5.6-sol".to_string(), "gpt-5.6-terra".to_string()]
+        );
+        assert_eq!(status.available_model_details.len(), 2);
+        assert_eq!(
+            status.available_model_details[0].context_window_tokens,
+            Some(372_000)
+        );
+        assert_eq!(
+            status.available_model_details[0].supports_thinking,
+            Some(true)
+        );
+        assert_eq!(
+            status.available_model_details[0].supports_images,
+            Some(true)
+        );
+        assert!(!status
+            .available_models
+            .iter()
+            .any(|model| model.contains("frontier")));
+    }
+
+    #[test]
+    fn codex_config_model_selects_matching_structured_context_window() {
+        let output = CommandOutput {
+            command_found: true,
+            success: true,
+            status_code: Some(0),
+            stdout: serde_json::json!({
+                "models": [
+                    {"slug": "gpt-5.6-sol", "context_window": 372000},
+                    {"slug": "gpt-5.4-mini", "context_window": 258400}
+                ]
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let mut status = collect_codex_model_status_from_output(&output);
+        let mut collection_method = AgentStatusCollectionMethod::CommandProbe;
+
+        apply_codex_config_model(
+            &mut status,
+            Some("gpt-5.4-mini".to_string()),
+            &mut collection_method,
+        );
+
+        assert_eq!(status.active_model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(status.context_window_tokens, Some(258_400));
     }
 
     #[test]
