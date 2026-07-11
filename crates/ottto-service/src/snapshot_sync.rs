@@ -694,6 +694,22 @@ fn sync_source(
         }
     }
 
+    // Backfill snapshots are appended after the live scan, so run the same
+    // content-free effort enrichment over the combined set. Already-split live
+    // buckets are naturally skipped because they now have multiple effort rows.
+    if source == SnapshotSource::ClaudeCode {
+        let session_ids = scan_result
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.clone())
+            .collect::<Vec<_>>();
+        if let Ok(evidence) =
+            crate::claude_effort::load_claude_effort_evidence(support_dir, session_ids)
+        {
+            crate::snapshots::apply_claude_effort_evidence(&mut scan_result.snapshots, &evidence);
+        }
+    }
+
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
     // previous owner's already-ingested history. Applies to everything headed

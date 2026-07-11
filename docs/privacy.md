@@ -36,6 +36,15 @@ Live telemetry is source-level opt-in. Setup can mint scoped setup keys and
 write local source config through `ottto-service`. Opt-out must remove fenced
 local config or Keychain state before backend setup-key revocation completes.
 
+Claude Code can continue sending its documented OTLP logs to Ottto's loopback
+daemon when cloud live telemetry is off. The daemon reduces only content-free
+per-request effort evidence (session id, timestamp, model, effort, and token
+counters) into owner-only hashed local sidecars and uploads it later through
+the aggregate local snapshot path. It never persists the raw OTLP request or
+identity/content attributes such as email, prompts, responses, commands, or
+paths. Any transcript usage not exactly covered by local evidence remains
+explicitly effort-unknown.
+
 ## Repair Boundaries
 
 `ottto fix --json` returns repair authority metadata. Terminal repair is allowed
