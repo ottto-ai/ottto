@@ -505,7 +505,9 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   the device grant does not yet include `pi`.
 - local Claude Code reasoning-effort reduction at that loopback boundary:
   Claude's documented `claude_code.api_request` logs use OTLP/HTTP JSON while
-  metrics and traces remain protobuf. The relay stores only session id, request
+  metrics and traces remain protobuf. The relay accepts both fixed-length and
+  bounded HTTP/1.1 chunked request bodies, de-chunks before reduction and cloud
+  forwarding, and rejects ambiguous or unsupported transfer framing. It stores only session id, request
   timestamp, model, applied effort, and token counters in owner-only hashed
   sidecars; prompts, responses, commands, paths, account identity, email, and
   raw OTLP are discarded. Snapshot sync partitions matching transcript

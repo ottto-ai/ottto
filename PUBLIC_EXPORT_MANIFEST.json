@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 231,
-  "content_sha256": "b5d676db019bf1aa85087538aa0e90a43ff677d67a3ccb24a7c63f5dc19872b2",
+  "content_sha256": "4b34ce5137986a6da95b6178677aa5266b4cb9b4c3def17a8e7b0e92e59a5e3b",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "20356ce329e52618e456fa580e119d25fed3776ccbb80bf532fbb9b17fe45f6f",
-      "size_bytes": 42496
+      "sha256": "80663a0ecbe6e2b633b15c64fa09f97ea83dd62eed07aee8b8fff25cf41674bb",
+      "size_bytes": 42678
     },
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "94d1e0b8dd738640b86c6f0844fc7396f6f60c85c3dfbf21b9127c28385f4d64",
-      "size_bytes": 53514
+      "sha256": "eec15657a56b58d7cd193e17fec112482f5b98cef8823e14bc9e9b8343777b9d",
+      "size_bytes": 65420
     },
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-11-claude-local-reasoning-effort.md",
-      "sha256": "aa31f7a4d40fa97906d4e438b5a9b4e458ed648bdab1a769b9d8f7d9b1e4393b",
-      "size_bytes": 1350
+      "sha256": "0e3a9e3cfa8c8e867645710a5e9b9c67ad0396fa1cf22185669efe026837df26",
+      "size_bytes": 2344
     },
     {
       "executable": false,
@@ -1620,7 +1620,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-11T14:27:32+00:00",
+  "generated_at": "2026-07-11T20:47:08+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 232,
   "public_roots": [
@@ -1656,5 +1656,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "df20adf96cd13408cca3766924e9848989d79f0f"
+  "source_commit": "e34c24d1aeecefca20fbe8ac47311e44edc8f81a"
 }
