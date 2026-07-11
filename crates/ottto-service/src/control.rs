@@ -13615,6 +13615,14 @@ log_user_prompt = true
         assert!(!command_diagnostic_is_usage_limited(Some(
             "Token is expired. Run /login to sign in again."
         )));
+        // Mentioning balances/credits in a transient fetch or auth error is
+        // NOT quota exhaustion and must stay a real failure.
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Failed to fetch credit balance: authentication expired"
+        )));
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Unable to read usage credits due to network error"
+        )));
 
         let result = smoke_failure_verification_result(
             SourceKind::Codex,

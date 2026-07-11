@@ -2164,9 +2164,13 @@ pub(crate) fn text_indicates_usage_limited(text: &str) -> bool {
         "spending limit",
         "spend cap",
         "spending cap",
-        "credit balance",
+        // Exhaustion-specific credit phrases only: a bare "credit balance" or
+        // "usage credits" would also match transient fetch/auth errors that
+        // merely mention balances and wrongly soften a real failure.
+        "credit balance is too low",
         "out of credits",
-        "usage credits",
+        "out of usage credits",
+        "out of extra usage credits",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
