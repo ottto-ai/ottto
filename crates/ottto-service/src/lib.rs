@@ -2154,26 +2154,42 @@ fn problem_detail_is_usage_limited(detail: &str) -> bool {
 /// phrasing here rather than in per-call-site lists.
 pub(crate) fn text_indicates_usage_limited(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    [
+    // Exhaustion-specific phrases only: a bare "credit balance" or "usage
+    // credits" would also match transient fetch/auth errors that merely
+    // mention balances and wrongly soften a real failure.
+    const DIRECT_MARKERS: [&str; 9] = [
         "usage limit",
         "weekly limit",
         "rate limit",
         "purchase more credits",
         "quota",
-        "spend limit",
-        "spending limit",
-        "spend cap",
-        "spending cap",
-        // Exhaustion-specific credit phrases only: a bare "credit balance" or
-        // "usage credits" would also match transient fetch/auth errors that
-        // merely mention balances and wrongly soften a real failure.
         "credit balance is too low",
         "out of credits",
         "out of usage credits",
         "out of extra usage credits",
-    ]
-    .iter()
-    .any(|marker| lowered.contains(marker))
+    ];
+    if DIRECT_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        return true;
+    }
+    // Spend-limit/cap nouns also appear in non-exhaustion diagnostics
+    // ("Unable to fetch spend limit: authentication expired"), so they only
+    // count when the text also carries affirmative depletion wording, as in
+    // Anthropic's "You've hit your org's monthly spend limit".
+    const SPEND_LIMIT_NOUNS: [&str; 4] =
+        ["spend limit", "spending limit", "spend cap", "spending cap"];
+    const DEPLETION_CONTEXT: [&str; 5] = [
+        "you've hit",
+        "you have hit",
+        "hit your",
+        "reached",
+        "exceeded",
+    ];
+    SPEND_LIMIT_NOUNS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+        && DEPLETION_CONTEXT
+            .iter()
+            .any(|marker| lowered.contains(marker))
 }
 
 fn local_health_blockers_for_status(
