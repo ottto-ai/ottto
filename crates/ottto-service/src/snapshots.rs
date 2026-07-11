@@ -3613,6 +3613,13 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| value.pointer("/payload/info/total_token_usage"))
         .or_else(|| value.pointer("/payload/total_token_usage"))
         .or_else(|| value.pointer("/total_token_usage"))?;
+    let input_details = root
+        .get("input_tokens_details")
+        .or_else(|| root.get("prompt_tokens_details"));
+    // Keep Codex input inclusive here. Snapshot provenance declares
+    // `input_token_scope=inclusive_cached`, and backend ingest subtracts the
+    // observed read/write subsets exactly once. Normalizing in both places
+    // would undercount fresh input.
     let mut usage = UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
             .or_else(|| u64_at(root, &["inputTokens"]))
@@ -3623,6 +3630,7 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         cache_read_tokens: u64_at(root, &["cache_read_tokens"])
             .or_else(|| u64_at(root, &["cached_input_tokens"]))
             .or_else(|| u64_at(root, &["cachedInputTokens"]))
+            .or_else(|| input_details.and_then(|details| u64_at(details, &["cached_tokens"])))
             .unwrap_or_default(),
         // Current Codex JSONL exposes reads but not writes. Accept OpenAI's
         // newer cache-write aliases now so a future CLI can become complete
@@ -3631,6 +3639,7 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
             .or_else(|| u64_at(root, &["cacheWriteTokens"]))
             .or_else(|| u64_at(root, &["cache_creation_tokens"]))
             .or_else(|| u64_at(root, &["cacheCreationInputTokens"]))
+            .or_else(|| input_details.and_then(|details| u64_at(details, &["cache_write_tokens"])))
             .unwrap_or_default(),
         cache_creation_1h_tokens: 0,
         reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
@@ -8404,6 +8413,25 @@ mod tests {
                 "input_tokens": 100,
                 "cached_input_tokens": 30,
                 "cache_write_tokens": 20,
+                "output_tokens": 5,
+                "request_count": 1
+            }
+        });
+        let usage = codex_total_usage(&value).expect("usage");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_creation_5m_tokens, 20);
+    }
+
+    #[test]
+    fn codex_usage_accepts_official_openai_input_details_shape() {
+        let value = serde_json::json!({
+            "total_token_usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {
+                    "cached_tokens": 30,
+                    "cache_write_tokens": 20
+                },
                 "output_tokens": 5,
                 "request_count": 1
             }
