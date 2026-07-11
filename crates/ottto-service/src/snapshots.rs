@@ -77,8 +77,18 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // and stand up as their own `isSidechain=true` -> ai_agent sessions. The bump
 // re-walks existing project JSONL once so already-scanned subagent files re-emit
 // under the new id instead of remaining folded into their parent.
+// claude_code v14: Claude Code session titles now also come from the Claude
+// desktop app's per-session store (`~/Library/Application Support/Claude/
+// claude-code-sessions/<accountCtx>/<workspace>/*.json`, `cliSessionId` ->
+// `title`), emitted as `session_display_name_source=desktop_title`, plus a
+// Codex-style first-user-prompt fallback (`first_prompt`) for pure-CLI
+// sessions. Transcripts almost never carry `ai-title`/`summary` records, so
+// most Claude sessions previously uploaded with no title at all. The store is
+// folded into the scan fingerprint (see `ClaudeTitleMetadata`) so a title
+// arriving after the transcript was scanned still re-emits, and the bump
+// re-walks every Claude session once so existing sessions pick up titles.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v13";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v14";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -841,6 +851,147 @@ struct CodexStateThread {
     model: Option<String>,
 }
 
+/// Claude Code sidecar title metadata read from the Claude desktop app's
+/// per-session store — the Claude analogue of `CodexTitleMetadata`.
+///
+/// The desktop app persists one JSON file per session under
+/// `~/Library/Application Support/Claude/claude-code-sessions/<accountCtx>/
+/// <workspace>/*.json` whose `cliSessionId` field equals the transcript file
+/// stem under `~/.claude/projects/**` and whose `title` field is the
+/// human-readable session title shown in the app (LLM-generated
+/// `titleSource=auto` or user-renamed `titleSource=user`). Transcripts almost
+/// never carry `ai-title`/`summary` records, so this store is the only local
+/// source of the real title for most Claude Code sessions — including
+/// CLI-launched sessions later opened in the app.
+///
+/// Privacy: only `cliSessionId`, `title`, and `titleSource` are read; the rest
+/// of the file (MCP tool catalogs, permission state) is never retained. Title
+/// upload stays governed by the org/user `session_titles_enabled` policy via
+/// `apply_upload_policy`, exactly like Codex titles.
+///
+/// `sidecar_fingerprint` is derived from the extracted title CONTENT (not file
+/// stats): the store files are rewritten on every session activity, so a stat
+/// fingerprint would churn every cycle and force full re-parses; the content
+/// fingerprint changes only when a title actually appears or changes, which is
+/// exactly when unchanged transcripts must re-emit.
+#[derive(Debug, Clone, Default)]
+struct ClaudeTitleMetadata {
+    titles: BTreeMap<String, ClaudeTitleCandidate>,
+    sidecar_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeTitleCandidate {
+    title: String,
+    /// True when the desktop `titleSource` is `user` (an explicit rename). A
+    /// user-set title overrides transcript-derived titles; an auto title only
+    /// fills absences.
+    user_set: bool,
+}
+
+// The desktop store holds one ~80KB JSON per session; both caps are far above
+// anything observed and exist only to bound a pathological store.
+const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
+const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
+
+impl ClaudeTitleMetadata {
+    fn load_from_roots(roots: &[PathBuf]) -> Self {
+        let mut store_dirs = BTreeSet::new();
+        for root in roots {
+            // root is `<home>/.claude/projects`; the desktop store lives under
+            // `<home>/Library/Application Support/Claude/claude-code-sessions`.
+            let Some(home) = root.parent().and_then(Path::parent) else {
+                continue;
+            };
+            store_dirs.insert(
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Claude")
+                    .join("claude-code-sessions"),
+            );
+        }
+        Self::load_from_store_dirs(&store_dirs)
+    }
+
+    fn load_from_store_dirs(store_dirs: &BTreeSet<PathBuf>) -> Self {
+        let mut metadata = Self::default();
+        let mut session_files = Vec::new();
+        for dir in store_dirs {
+            collect_claude_desktop_session_files(dir, 0, &mut session_files);
+        }
+        session_files.sort();
+        session_files.truncate(MAX_CLAUDE_DESKTOP_SESSION_FILES);
+        for path in &session_files {
+            load_claude_desktop_session_title(path, &mut metadata.titles);
+        }
+        let sidecar_parts: Vec<String> = metadata
+            .titles
+            .iter()
+            .map(|(id, candidate)| format!("{id}:{}:{}", candidate.user_set, candidate.title))
+            .collect();
+        metadata.sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
+        metadata
+    }
+}
+
+fn collect_claude_desktop_session_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+    if depth > MAX_CLAUDE_DESKTOP_STORE_DEPTH {
+        return;
+    }
+    // Best-effort: a missing/unreadable store (non-macOS, app not installed)
+    // yields no titles and is never load-bearing for collection.
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(entry_metadata) = entry.metadata() else {
+            continue;
+        };
+        if entry_metadata.is_dir() {
+            collect_claude_desktop_session_files(&path, depth + 1, files);
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if entry_metadata.len() > MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES {
+            continue;
+        }
+        files.push(path);
+    }
+}
+
+fn load_claude_desktop_session_title(
+    path: &Path,
+    titles: &mut BTreeMap<String, ClaudeTitleCandidate>,
+) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    // Non-session JSONs in the store (e.g. scheduled-tasks.json) lack these
+    // fields and fall out here.
+    let Some(cli_session_id) = string_at(&value, &["cliSessionId"]) else {
+        return;
+    };
+    let Some(title) = string_at(&value, &["title"]) else {
+        return;
+    };
+    let user_set = string_at(&value, &["titleSource"]).as_deref() == Some("user");
+    // The same cliSessionId can appear in several store files (session reopened
+    // in another workspace); a user-set title wins over an auto one.
+    match titles.get(cli_session_id.as_str()) {
+        Some(existing) if existing.user_set && !user_set => {}
+        _ => {
+            titles.insert(cli_session_id, ClaudeTitleCandidate { title, user_set });
+        }
+    }
+}
+
 /// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
 /// debug DB.
 ///
@@ -1226,6 +1377,33 @@ impl SnapshotAccumulator {
         };
         if let Some(title) = metadata.titles.get(session_id.as_str()) {
             self.set_title_if_absent(Some(title.title.clone()), title.source.as_str());
+        }
+    }
+
+    fn apply_claude_title_metadata(&mut self, path: &Path, metadata: &ClaudeTitleMetadata) {
+        let session_id = self.source_session_id.clone().or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_string())
+        });
+        let Some(session_id) = session_id else {
+            return;
+        };
+        // A Task-tool subagent transcript carries its PARENT's sessionId on
+        // every line (re-keyed later in into_items); never hand a subagent
+        // session its parent's desktop title.
+        if claude_subagent_source_session_id(path, &session_id).is_some() {
+            return;
+        }
+        let Some(candidate) = metadata.titles.get(session_id.as_str()) else {
+            return;
+        };
+        if candidate.user_set {
+            // An explicit user rename in the desktop app beats any
+            // transcript-derived title.
+            self.set_title(Some(candidate.title.clone()), "desktop_title");
+        } else {
+            self.set_title_if_absent(Some(candidate.title.clone()), "desktop_title");
         }
     }
 
@@ -1717,6 +1895,20 @@ fn scan_source_roots_with_limit(
     } else {
         CodexTitleMetadata::default()
     };
+    let claude_title_metadata = if source == SnapshotSource::ClaudeCode {
+        ClaudeTitleMetadata::load_from_roots(roots)
+    } else {
+        ClaudeTitleMetadata::default()
+    };
+    // The per-source sidecar fingerprint rides inside every candidate-file
+    // fingerprint so an unchanged transcript still re-parses when its sidecar
+    // title state changes (Codex: config/state/index files; Claude: desktop
+    // store title content).
+    let sidecar_fingerprint = match source {
+        SnapshotSource::Codex => codex_title_metadata.sidecar_fingerprint.as_str(),
+        SnapshotSource::ClaudeCode => claude_title_metadata.sidecar_fingerprint.as_str(),
+        SnapshotSource::Pi => "",
+    };
     // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
     // it read-only across every session file via Arc. Skipped when the local
     // opt-out is set.
@@ -1733,7 +1925,7 @@ fn scan_source_roots_with_limit(
             source,
             root,
             &mut files,
-            codex_title_metadata.sidecar_fingerprint.as_str(),
+            sidecar_fingerprint,
             backfill_window_days,
         )?;
     }
@@ -1758,10 +1950,11 @@ fn scan_source_roots_with_limit(
                 &codex_title_metadata,
                 codex_turn_traces.clone(),
             )?,
-            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_artifacts(
+            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_title_metadata(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
+                &claude_title_metadata,
                 artifacts_enabled,
             )?,
             SnapshotSource::Pi => parse_pi_jsonl_file(
@@ -1995,6 +2188,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
         SnapshotSource::Codex,
         apply_codex_line,
         Some(title_metadata),
+        None,
         codex_turn_traces,
         // Codex lines never feed the artifact scraper; the value is moot.
         true,
@@ -2018,6 +2212,25 @@ fn parse_claude_code_jsonl_file_with_artifacts(
     source_file_fingerprint: String,
     artifacts_enabled: bool,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_title_metadata(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        &ClaudeTitleMetadata::default(),
+        artifacts_enabled,
+    )
+}
+
+/// Full production form with the desktop-store title metadata threaded in; the
+/// scan path loads the store once per cycle and shares it across every session
+/// file.
+fn parse_claude_code_jsonl_file_with_title_metadata(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &ClaudeTitleMetadata,
+    artifacts_enabled: bool,
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -2025,6 +2238,7 @@ fn parse_claude_code_jsonl_file_with_artifacts(
         SnapshotSource::ClaudeCode,
         apply_claude_code_line,
         None,
+        Some(title_metadata),
         None,
         artifacts_enabled,
     )
@@ -2043,6 +2257,7 @@ pub fn parse_pi_jsonl_file(
         apply_pi_line,
         None,
         None,
+        None,
         // Pi lines never feed the artifact scraper; the value is moot.
         true,
     )
@@ -2056,6 +2271,7 @@ fn parse_jsonl_file(
     source: SnapshotSource,
     apply_line: fn(&Value, &mut SnapshotAccumulator),
     codex_title_metadata: Option<&CodexTitleMetadata>,
+    claude_title_metadata: Option<&ClaudeTitleMetadata>,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
 ) -> Result<Vec<SnapshotItem>> {
@@ -2075,6 +2291,12 @@ fn parse_jsonl_file(
     if source == SnapshotSource::Codex {
         if let Some(metadata) = codex_title_metadata {
             accumulator.apply_codex_title_metadata(path, metadata);
+        }
+        accumulator.apply_first_prompt_fallback();
+    }
+    if source == SnapshotSource::ClaudeCode {
+        if let Some(metadata) = claude_title_metadata {
+            accumulator.apply_claude_title_metadata(path, metadata);
         }
         accumulator.apply_first_prompt_fallback();
     }
@@ -2836,6 +3058,66 @@ fn text_from_array(value: Option<&Value>) -> Option<String> {
     normalize_title(parts.join("\n"))
 }
 
+/// First-user-prompt candidate from one Claude Code transcript record — the
+/// Claude analogue of `codex_first_user_prompt`, feeding the shared
+/// `first_prompt` fallback when no real title exists anywhere (pure-CLI
+/// sessions never opened in the desktop app).
+///
+/// Only genuine human-authored prompts qualify: `type=user` records whose
+/// `message.role` is `user`, skipping `isMeta` records, `tool_result` content
+/// blocks (which also ride `type=user` records), and harness wrappers
+/// (slash-command envelopes, injected system reminders).
+fn claude_first_user_prompt(value: &Value) -> Option<String> {
+    if !string_eq_at(value, &["type"], "user")
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || !string_eq_at(value, &["message", "role"], "user")
+    {
+        return None;
+    }
+    match value.pointer("/message/content") {
+        Some(Value::String(text)) => {
+            if claude_prompt_is_harness_wrapper(text) {
+                return None;
+            }
+            normalize_title(text.clone())
+        }
+        Some(content @ Value::Array(_)) => claude_prompt_text_from_content(content),
+        _ => None,
+    }
+}
+
+fn claude_prompt_text_from_content(content: &Value) -> Option<String> {
+    let Value::Array(items) = content else {
+        return None;
+    };
+    let mut parts = Vec::new();
+    for item in items {
+        if !string_eq_at(item, &["type"], "text") {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(Value::as_str) {
+            if !claude_prompt_is_harness_wrapper(text) {
+                parts.push(text);
+            }
+        }
+    }
+    normalize_title(parts.join("\n"))
+}
+
+/// True for text the Claude Code harness writes into `type=user` records that
+/// is not a human prompt: slash-command envelopes, local command output,
+/// injected system reminders, and background-task notifications.
+fn claude_prompt_is_harness_wrapper(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("<command-")
+        || trimmed.starts_with("<local-command")
+        || trimmed.starts_with("<system-reminder")
+        || trimmed.starts_with("<task-notification")
+        || trimmed.starts_with("[SYSTEM NOTIFICATION")
+        || trimmed.starts_with("[Request interrupted")
+        || trimmed.starts_with("Caveat: the messages below were generated")
+}
+
 fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["sessionId"])
@@ -2875,6 +3157,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["metadata", "title"])),
         "summary",
     );
+    accumulator.set_first_prompt_title(claude_first_user_prompt(value));
     accumulator.set_model(
         string_at(value, &["message", "model"])
             .or_else(|| string_at(value, &["model"]))
@@ -7392,6 +7675,281 @@ mod tests {
             item.session_display_name_source.as_deref(),
             Some("ai_title")
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// Build a fake home with one Claude transcript and one desktop-store
+    /// session file, returning (home, transcript_path, projects_root).
+    fn claude_desktop_fixture(
+        name: &str,
+        session_id: &str,
+        desktop_json: &str,
+        transcript: &str,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let home = temp_dir(name);
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&transcript_path, transcript).expect("write transcript");
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace");
+        fs::create_dir_all(&store_dir).expect("create store dir");
+        fs::write(store_dir.join("local_desktop-1.json"), desktop_json).expect("write store");
+        (home, transcript_path, projects_root)
+    }
+
+    #[test]
+    fn claude_desktop_store_title_applies_to_matching_session() {
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-title",
+            "11111111-2222-3333-4444-555555555555",
+            "{\"sessionId\":\"local_aaa\",\"cliSessionId\":\"11111111-2222-3333-4444-555555555555\",\"title\":\"Cost report export columns\",\"titleSource\":\"auto\"}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n",
+        );
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert_eq!(metadata.titles.len(), 1);
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Cost report export columns")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("desktop_title")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_desktop_auto_title_does_not_override_transcript_title() {
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-auto-vs-transcript",
+            "s-1",
+            "{\"cliSessionId\":\"s-1\",\"title\":\"Desktop auto title\",\"titleSource\":\"auto\"}",
+            concat!(
+                "{\"type\":\"ai-title\",\"sessionId\":\"s-1\",\"aiTitle\":\"Transcript ai title\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ),
+        );
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Transcript ai title")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("ai_title")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_desktop_user_title_overrides_transcript_title() {
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-user-override",
+            "s-2",
+            "{\"cliSessionId\":\"s-2\",\"title\":\"My renamed session\",\"titleSource\":\"user\"}",
+            concat!(
+                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-2\",\"summary\":\"Stale summary title\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-2\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ),
+        );
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("My renamed session")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("desktop_title")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_subagent_transcript_never_inherits_parent_desktop_title() {
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-subagent",
+            "parent-1",
+            "{\"cliSessionId\":\"parent-1\",\"title\":\"Parent session title\",\"titleSource\":\"auto\"}",
+            "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"parent-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+        );
+        // The subagent transcript carries the PARENT's sessionId on every line.
+        let subagents_dir = transcript_path.with_extension("").join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        let subagent_path = subagents_dir.join("agent-abc123.jsonl");
+        fs::write(
+            &subagent_path,
+            "{\"timestamp\":\"2026-07-10T10:02:00Z\",\"sessionId\":\"parent-1\",\"isSidechain\":true,\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n",
+        )
+        .expect("write subagent transcript");
+        let metadata = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &subagent_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.source_session_id, "parent-1_agent-abc123");
+        assert_eq!(item.session_display_name, None);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_title_metadata_fingerprint_tracks_title_content_only() {
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-fingerprint",
+            "s-3",
+            "{\"cliSessionId\":\"s-3\",\"title\":\"First title\",\"titleSource\":\"auto\"}",
+            "",
+        );
+        let store_file = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace")
+            .join("local_desktop-1.json");
+        let first = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+
+        // Rewriting the file with the SAME title (mtime/size churn from
+        // ordinary session activity) must keep the fingerprint stable...
+        fs::write(
+            &store_file,
+            "{\"cliSessionId\":\"s-3\",\"title\":\"First title\",\"titleSource\":\"auto\",\"lastFocusedAt\":\"2026-07-10T11:00:00Z\"}",
+        )
+        .expect("rewrite store");
+        let same = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert_eq!(first.sidecar_fingerprint, same.sidecar_fingerprint);
+
+        // ...while an actual title change must change it so unchanged
+        // transcripts re-parse and pick the new title up.
+        fs::write(
+            &store_file,
+            "{\"cliSessionId\":\"s-3\",\"title\":\"Second title\",\"titleSource\":\"user\"}",
+        )
+        .expect("rewrite store with new title");
+        let changed = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert_ne!(first.sidecar_fingerprint, changed.sidecar_fingerprint);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_first_prompt_falls_back_when_no_title_exists() {
+        let path = temp_file("claude-first-prompt");
+        fs::write(
+            &path,
+            concat!(
+                // Harness wrappers and tool_result user records never title.
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":\"<command-name>/model</command-name>\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"isMeta\":true,\"message\":{\"role\":\"user\",\"content\":\"Caveat: the messages below were generated by the user while running local commands\"}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"text\",\"text\":\"file contents here\"}]}]}}\n",
+                "{\"type\":\"user\",\"sessionId\":\"s-4\",\"timestamp\":\"2026-07-10T10:00:00Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"fix the flaky sessions table sort\"}]}}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-4\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-07-10T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("fix the flaky sessions table sort")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_transcript_title_beats_first_prompt_fallback() {
+        let path = temp_file("claude-first-prompt-vs-summary");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"s-5\",\"message\":{\"role\":\"user\",\"content\":\"rename all the things\"}}\n",
+                "{\"timestamp\":\"2026-07-10T10:00:00Z\",\"sessionId\":\"s-5\",\"summary\":\"Rename cleanup pass\"}\n",
+                "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"s-5\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-07-10T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Rename cleanup pass")
+        );
+        assert_eq!(item.session_display_name_source.as_deref(), Some("summary"));
 
         let _ = fs::remove_file(path);
     }
