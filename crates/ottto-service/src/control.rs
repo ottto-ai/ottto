@@ -6923,15 +6923,7 @@ fn truncate_diagnostic(value: &str) -> String {
 }
 
 fn command_diagnostic_is_usage_limited(diagnostic: Option<&str>) -> bool {
-    let Some(diagnostic) = diagnostic else {
-        return false;
-    };
-    let lowered = diagnostic.to_ascii_lowercase();
-    lowered.contains("usage limit")
-        || lowered.contains("weekly limit")
-        || lowered.contains("rate limit")
-        || lowered.contains("purchase more credits")
-        || lowered.contains("quota")
+    diagnostic.is_some_and(crate::text_indicates_usage_limited)
 }
 
 fn usage_limited_smoke_message(display_name: &str) -> String {
@@ -7889,6 +7881,36 @@ fn verify_source(
         }
     };
     daemon.record_verification_result(&result)?;
+    Ok(result)
+}
+
+/// Re-run source verification from inside the daemon (the background
+/// re-verify loop), with the same post-verify convergence steps the manual
+/// Verify command performs: refresh agent status for soft failures and push
+/// the local-health projection so the app and backend see the new state on
+/// their next poll instead of dwelling on a stale failure.
+pub(crate) fn reverify_failed_source(
+    daemon: &LocalDaemon,
+    source: SourceKind,
+) -> Result<SourceVerificationResult, LocalApiError> {
+    let authorization = RequestAuthorization::TrustedCompanionApp;
+    let result = verify_source(daemon, &authorization, source, false)?;
+    if verification_result_should_refresh_agent_status(&result) {
+        if let Err(error) =
+            refresh_agent_status_for(daemon, &authorization, Some(result.source.clone()))
+        {
+            eprintln!(
+                "background re-verify agent status refresh skipped: {}",
+                cli_error_message(&error)
+            );
+        }
+    }
+    if let Err(error) = crate::snapshot_sync::upload_local_health_projection_now(daemon) {
+        eprintln!(
+            "background re-verify local health projection upload skipped: {}",
+            crate::snapshot_sync::safe_error(&error)
+        );
+    }
     Ok(result)
 }
 
@@ -13577,6 +13599,32 @@ log_user_prompt = true
         ))));
         assert!(command_diagnostic_is_usage_limited(Some(
             "Claude Code smoke session failed: You've hit your weekly limit · resets 8am (Asia/Jerusalem)"
+        )));
+        // Anthropic org spend-cap wording (2026): quota exhaustion, not setup
+        // breakage — it must classify as usage-limited so it never renders as
+        // a blocking Critical failure in the companion app.
+        assert!(command_diagnostic_is_usage_limited(Some(
+            "You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage"
+        )));
+        assert!(command_diagnostic_is_usage_limited(Some(
+            "Your credit balance is too low to access the Anthropic API."
+        )));
+        assert!(command_diagnostic_is_usage_limited(Some(
+            "You're out of extra usage credits."
+        )));
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Token is expired. Run /login to sign in again."
+        )));
+        // Mentioning balances/credits/limits in a transient fetch or auth
+        // error is NOT quota exhaustion and must stay a real failure.
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Failed to fetch credit balance: authentication expired"
+        )));
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Unable to read usage credits due to network error"
+        )));
+        assert!(!command_diagnostic_is_usage_limited(Some(
+            "Unable to fetch spend limit: authentication expired"
         )));
 
         let result = smoke_failure_verification_result(
