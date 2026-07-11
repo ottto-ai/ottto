@@ -961,6 +961,25 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// Sources whose stored health is a blocking verification failure
+    /// (`Failed` state with a `TelemetryNotVerified` problem). These are the
+    /// sticky states that only a new Verify can clear — the background
+    /// re-verify loop retries exactly this set so a transient smoke failure
+    /// heals without the customer pressing Verify by hand.
+    pub fn sources_with_blocking_verification_failure(
+        &self,
+    ) -> Result<Vec<SourceKind>, LocalApiError> {
+        let state = self.state()?;
+        Ok(state
+            .sources
+            .iter()
+            .filter(|health| {
+                health.state == SourceState::Failed && has_verification_failure_problem(health)
+            })
+            .map(|health| health.source.clone())
+            .collect())
+    }
+
     pub fn record_config_repair_result(
         &self,
         source: &SourceKind,
@@ -2123,12 +2142,34 @@ fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
 }
 
 fn problem_detail_is_usage_limited(detail: &str) -> bool {
-    let lowered = detail.to_ascii_lowercase();
-    lowered.contains("usage limit")
-        || lowered.contains("weekly limit")
-        || lowered.contains("rate limit")
-        || lowered.contains("purchase more credits")
-        || lowered.contains("quota")
+    text_indicates_usage_limited(detail)
+}
+
+/// Single source of truth for recognizing provider quota/credit exhaustion in
+/// CLI diagnostics and health-problem text. Quota exhaustion is a plan fact,
+/// not local setup breakage, so anything matched here must stay non-blocking
+/// (`Warning`, never `Failed`/`Critical`). Providers reword these messages
+/// (Anthropic shipped "You've hit your org's monthly spend limit" which the
+/// older list missed and customers saw a Critical source), so keep every known
+/// phrasing here rather than in per-call-site lists.
+pub(crate) fn text_indicates_usage_limited(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    [
+        "usage limit",
+        "weekly limit",
+        "rate limit",
+        "purchase more credits",
+        "quota",
+        "spend limit",
+        "spending limit",
+        "spend cap",
+        "spending cap",
+        "credit balance",
+        "out of credits",
+        "usage credits",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 fn local_health_blockers_for_status(
@@ -5426,6 +5467,87 @@ mod tests {
         assert_eq!(source.state, LocalHealthSourceState::Healthy);
         assert_eq!(source.authority, LocalHealthAuthority::Runtime);
         assert!(source.blocking_reason.is_none());
+    }
+
+    #[test]
+    fn available_agent_status_clears_stale_spend_limit_failed_verification() {
+        // Regression for the 2026-07 incident shape: a smoke failure carrying
+        // Anthropic's "monthly spend limit" wording was recorded as a hard
+        // Failed/Critical (the old keyword list missed "spend limit") and then
+        // re-pinned by every refresh until a manual Verify. The detail now
+        // classifies as usage-limited, so an Available agent scan clears it.
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let result = SourceVerificationResult {
+            source: SourceKind::ClaudeCode,
+            config: SourceConfigState {
+                discovered: true,
+                path_hint: None,
+                fingerprint: None,
+                drift: Vec::new(),
+            },
+            status: SourceVerificationStatus::Failed,
+            verified: false,
+            records_seen: 0,
+            last_record_id: None,
+            last_received_at: None,
+            smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
+            message: StableMessage {
+                code: "smoke_command_failed".to_string(),
+                text: "Claude Code smoke session failed before verification could complete: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
+            },
+            route_results: Vec::new(),
+        };
+
+        daemon
+            .record_verification_result(&result)
+            .expect("record failed spend-limit verification");
+        let before_scan = daemon.status(TOKEN).expect("status before scan");
+        assert_eq!(before_scan.sources[0].state, SourceState::Failed);
+        assert_eq!(before_scan.sources[0].grade, HealthGrade::Critical);
+
+        {
+            let mut state = daemon.inner.lock().expect("state");
+            upsert_agent_status_snapshot(
+                &mut state,
+                available_agent_status(SourceKind::ClaudeCode, "2026-05-05T10:20:00Z"),
+            );
+        }
+
+        let status = daemon.status(TOKEN).expect("status after scan");
+        assert_eq!(status.sources[0].source, SourceKind::ClaudeCode);
+        assert_eq!(status.sources[0].state, SourceState::Healthy);
+        assert_eq!(status.sources[0].grade, HealthGrade::Ok);
+        assert!(status.sources[0].problems.is_empty());
+    }
+
+    #[test]
+    fn blocking_verification_failures_are_listed_for_background_reverify() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .update_sources(TOKEN, vec![codex_health()])
+            .expect("seed healthy source");
+        assert!(daemon
+            .sources_with_blocking_verification_failure()
+            .expect("list with healthy source")
+            .is_empty());
+
+        daemon
+            .record_verification_result(&failed_codex_reconnect())
+            .expect("record failed verification");
+        assert_eq!(
+            daemon
+                .sources_with_blocking_verification_failure()
+                .expect("list with failed source"),
+            vec![SourceKind::Codex]
+        );
+
+        daemon
+            .record_verification_result(&verified_codex("2026-05-05T10:20:00Z"))
+            .expect("record verified result");
+        assert!(daemon
+            .sources_with_blocking_verification_failure()
+            .expect("list after recovery")
+            .is_empty());
     }
 
     #[test]

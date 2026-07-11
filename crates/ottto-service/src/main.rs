@@ -330,6 +330,12 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
     // Reconfirm sources seeded `verifying` by the restart so they settle to real
     // health in seconds instead of dwelling until the next client poll/session.
     ottto_service::snapshot_sync::spawn_startup_source_reverify(daemon.clone());
+    // Retry sources stuck in a blocking verification failure with exponential
+    // backoff so transient smoke failures heal without a manual Verify.
+    match ottto_service::snapshot_sync::spawn_failed_verification_reverify(daemon.clone()) {
+        Ok(()) => eprintln!("serving failed-verification re-verify loop"),
+        Err(error) => eprintln!("failed-verification re-verify loop unavailable: {error}"),
+    }
 }
 
 fn home_dir() -> Result<PathBuf> {

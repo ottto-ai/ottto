@@ -170,6 +170,93 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
     }
 }
 
+/// Cadence for the blocking-verification retry loop below: how often it checks
+/// for sources stuck in a failed verification, and the exponential backoff for
+/// actual re-verify attempts. Each attempt runs a real smoke session (a small
+/// LLM call), so a fixed short interval would burn provider quota exactly when
+/// the machine is quota-starved; exponential backoff recovers transient
+/// failures (network blip, brief provider outage) within minutes while capping
+/// steady-state cost at one smoke per source per half hour until it heals.
+const FAILED_VERIFY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const FAILED_VERIFY_RETRY_INITIAL: Duration = Duration::from_secs(2 * 60);
+const FAILED_VERIFY_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// Exponential backoff for background re-verify attempts: 2m, 4m, 8m, 16m,
+/// then capped at 30m for as long as the source stays failed. The counter
+/// resets whenever the source leaves the failed state (a successful retry,
+/// a manual Verify, or a fresh sign-in).
+fn reverify_backoff_delay(completed_attempts: u32) -> Duration {
+    let factor = 1u32.checked_shl(completed_attempts).unwrap_or(u32::MAX);
+    FAILED_VERIFY_RETRY_INITIAL
+        .saturating_mul(factor)
+        .min(FAILED_VERIFY_RETRY_MAX)
+}
+
+struct ReverifySchedule {
+    source: SourceKind,
+    completed_attempts: u32,
+    next_attempt_at: std::time::Instant,
+}
+
+/// A blocking verification failure (`Failed` + `TelemetryNotVerified`) is
+/// sticky by design: data refreshes only re-pin it and nothing re-runs the
+/// smoke, so before this loop existed a transient failure sat on "needs
+/// attention / Critical" until the customer pressed Verify by hand — even
+/// though pressing Verify immediately healed it. Retry those sources
+/// automatically with exponential backoff so the state converges on its own;
+/// the companion app already self-heals once the daemon reports healthy.
+pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
+    std::thread::Builder::new()
+        .name("ottto-failed-verify-retry".to_string())
+        .spawn(move || {
+            let mut schedules: Vec<ReverifySchedule> = Vec::new();
+            loop {
+                std::thread::sleep(FAILED_VERIFY_POLL_INTERVAL);
+                let failed = match daemon.sources_with_blocking_verification_failure() {
+                    Ok(failed) => failed,
+                    Err(_) => continue,
+                };
+                // A source that healed (retry success, manual Verify, sign-in)
+                // drops its schedule so a future failure restarts the backoff
+                // from the initial delay.
+                schedules.retain(|schedule| failed.contains(&schedule.source));
+                for source in failed {
+                    let now = std::time::Instant::now();
+                    let Some(schedule) = schedules
+                        .iter_mut()
+                        .find(|schedule| schedule.source == source)
+                    else {
+                        schedules.push(ReverifySchedule {
+                            source,
+                            completed_attempts: 0,
+                            next_attempt_at: now + reverify_backoff_delay(0),
+                        });
+                        continue;
+                    };
+                    if now < schedule.next_attempt_at {
+                        continue;
+                    }
+                    match crate::control::reverify_failed_source(&daemon, source.clone()) {
+                        Ok(result) => eprintln!(
+                            "background re-verify for {} finished: {}",
+                            crate::source_slug(&source),
+                            result.message.code
+                        ),
+                        Err(error) => eprintln!(
+                            "background re-verify for {} skipped: {error}",
+                            crate::source_slug(&source)
+                        ),
+                    }
+                    schedule.completed_attempts = schedule.completed_attempts.saturating_add(1);
+                    schedule.next_attempt_at = std::time::Instant::now()
+                        + reverify_backoff_delay(schedule.completed_attempts);
+                }
+            }
+        })
+        .context("spawn failed-verification re-verify loop")?;
+    Ok(())
+}
+
 pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
@@ -1218,6 +1305,17 @@ mod tests {
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles-artifacts.json")
         );
+    }
+
+    #[test]
+    fn reverify_backoff_doubles_from_initial_and_caps() {
+        assert_eq!(reverify_backoff_delay(0), Duration::from_secs(2 * 60));
+        assert_eq!(reverify_backoff_delay(1), Duration::from_secs(4 * 60));
+        assert_eq!(reverify_backoff_delay(2), Duration::from_secs(8 * 60));
+        assert_eq!(reverify_backoff_delay(3), Duration::from_secs(16 * 60));
+        assert_eq!(reverify_backoff_delay(4), FAILED_VERIFY_RETRY_MAX);
+        assert_eq!(reverify_backoff_delay(20), FAILED_VERIFY_RETRY_MAX);
+        assert_eq!(reverify_backoff_delay(u32::MAX), FAILED_VERIFY_RETRY_MAX);
     }
 
     #[test]
