@@ -39,3 +39,19 @@ Validation:
 - exact effort split with invariant snapshot totals;
 - backend-compatible duplicate-row identity by effort;
 - targeted `ottto-service` Rust tests.
+
+## Cache-creation attribution correction
+
+Claude's public `claude_code.api_request` event exposes one aggregate
+`cache_creation_tokens` count, while its transcript carries the billing-sensitive
+5-minute/1-hour split. Stable `0.1.77` temporarily placed the aggregate count in
+the 5-minute evidence field. A real request that wrote only 1-hour cache therefore
+failed the byte-exact enrichment fit and remained `unknown` even though its effort,
+request count, input tokens, and output tokens were available.
+
+The reducer now stores aggregate cache creation separately. Snapshot enrichment
+attributes only fields whose effort grain is exact and leaves cache-creation tokens
+on the transcript's `unknown` residual row, preserving TTL pricing without invented
+per-effort precision. Legacy `0.1.77` sidecars remain readable and receive the same
+conservative treatment. Claude parser version `v15` forces a one-shot replay so
+already-indexed sessions are corrected after upgrade.
