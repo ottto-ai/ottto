@@ -345,6 +345,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         observed_at: None,
         completeness: Some(AgentContextCompleteness::Unavailable),
         reason: Some("codex_active_context_not_collected".to_string()),
+        posture: None,
     });
     snapshot.capabilities = vec![
         supported_capability("account_status", "Detected with Codex CLI/config probes."),
@@ -540,6 +541,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 observed_at: None,
                 completeness: Some(AgentContextCompleteness::Unknown),
                 reason: Some("statusline_context_cache_unreadable".to_string()),
+                posture: None,
             });
             snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                 "claude_statusline_context_cache_unavailable",
@@ -547,6 +549,16 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 message,
             ));
         }
+    }
+    // Machine-local posture summary over recent sessions, derived by the
+    // snapshot scan and cached (see `context_posture`). Independent of the
+    // statusLine live-context channel: posture history is still served when
+    // live pressure is unavailable, and vice versa.
+    if let Some(context) = snapshot.context.as_mut() {
+        context.posture = crate::context_posture::claude_context_posture_summary(
+            &default_support_dir(),
+            OffsetDateTime::now_utc(),
+        );
     }
     snapshot.capabilities = vec![
         supported_capability(
@@ -1608,6 +1620,7 @@ fn claude_statusline_context_from_cache(
         observed_at: rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds),
         completeness: Some(completeness),
         reason: Some(reason.to_string()),
+        posture: None,
     }
 }
 
@@ -1667,6 +1680,7 @@ fn claude_statusline_context_unavailable(
         observed_at,
         completeness: Some(AgentContextCompleteness::Unavailable),
         reason: Some(reason.to_string()),
+        posture: None,
     }
 }
 
@@ -1758,6 +1772,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         observed_at: None,
         completeness: Some(AgentContextCompleteness::Unavailable),
         reason: Some("pi_active_context_not_collected".to_string()),
+        posture: None,
     });
     snapshot.capabilities = vec![
         supported_capability(
@@ -2963,6 +2978,7 @@ fn parse_codex_text_context(text: &str) -> Option<AgentContextStatus> {
         observed_at: None,
         completeness: Some(AgentContextCompleteness::FullPressure),
         reason: Some("codex_status_text_observed".to_string()),
+        posture: None,
     })
 }
 

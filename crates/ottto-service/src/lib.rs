@@ -4,6 +4,7 @@ pub mod agent_status;
 pub mod backfill;
 pub(crate) mod command_env;
 pub mod context_footprint;
+pub mod context_posture;
 pub mod control;
 pub mod detected_uses;
 pub mod keychain;
