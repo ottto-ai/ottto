@@ -280,6 +280,8 @@ fn humanize_plan(product: &str) -> String {
     match product.trim().to_ascii_lowercase().as_str() {
         "pro" => "Pro".to_string(),
         "team" => "Team".to_string(),
+        "team_standard" => "Team Standard".to_string(),
+        "team_premium" => "Team Premium".to_string(),
         "plus" => "Plus".to_string(),
         "enterprise" => "Enterprise".to_string(),
         "business" => "Business".to_string(),
