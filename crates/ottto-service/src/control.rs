@@ -2237,8 +2237,14 @@ fn create_setup_claim(
     nonce: &str,
 ) -> Result<SetupClaimCreateResponse, LocalApiError> {
     let url = api_url("/api/v1/setup-claims");
-    let body = json!({
+    let body = setup_claim_create_body(machine, nonce);
+    backend_post_json(&url, &body, &[])
+}
+
+fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json::Value {
+    json!({
         "machine_id": machine.machine_id,
+        "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "machine_name": machine.display_name,
         "platform": "macos",
@@ -2253,8 +2259,7 @@ fn create_setup_claim(
                 "smoke_verification": true,
             },
         },
-    });
-    backend_post_json(&url, &body, &[])
+    })
 }
 
 fn complete_setup_claim(
@@ -2265,13 +2270,7 @@ fn complete_setup_claim(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
-    let mut body = json!({
-        "nonce": claim.nonce,
-        "machine_id": machine.machine_id,
-        "hardware_uuid": machine.hardware_uuid,
-        "machine_name": machine.display_name,
-        "platform": "macos",
-    });
+    let mut body = setup_claim_complete_body(claim, machine);
     if let Some(device) = FileDeviceStore::default()
         .load()
         .map_err(|_| LocalApiError::StatePoisoned)?
@@ -2286,6 +2285,20 @@ fn complete_setup_claim(
         &body,
         &[("X-Ottto-Setup-Claim-Token", claim.claim_token.as_str())],
     )
+}
+
+fn setup_claim_complete_body(
+    claim: &PendingAuthClaim,
+    machine: &MachineIdentity,
+) -> serde_json::Value {
+    json!({
+        "nonce": claim.nonce,
+        "machine_id": machine.machine_id,
+        "installation_id": machine.installation_id,
+        "hardware_uuid": machine.hardware_uuid,
+        "machine_name": machine.display_name,
+        "platform": "macos",
+    })
 }
 
 fn api_url(path: &str) -> String {
@@ -3467,8 +3480,14 @@ fn attach_setup_run_by_claim_code(
         api_base_url,
         &format!("/api/v1/setup-claims/{claim_code}/attach"),
     );
-    let body = json!({
+    let body = setup_run_attach_body(machine);
+    backend_post_json(&url, &body, &[])
+}
+
+fn setup_run_attach_body(machine: &MachineIdentity) -> serde_json::Value {
+    json!({
         "machine_id": machine.machine_id,
+        "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "machine_name": machine.display_name,
         "platform": operating_system_slug(&machine.os),
@@ -3482,8 +3501,7 @@ fn attach_setup_run_by_claim_code(
                 "smoke_verification": true,
             },
         },
-    });
-    backend_post_json(&url, &body, &[])
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -5126,7 +5144,15 @@ fn register_telemetry_device(
     machine: &MachineIdentity,
 ) -> Result<TelemetryDeviceRegisterApiResponse, LocalApiError> {
     let url = api_url_with_base(api_base_url, "/api/v1/telemetry/devices/register");
-    let body = json!({
+    let body = telemetry_device_register_body(install_session, machine);
+    backend_post_json(&url, &body, &[])
+}
+
+fn telemetry_device_register_body(
+    install_session: &InstallSessionApiResponse,
+    machine: &MachineIdentity,
+) -> serde_json::Value {
+    json!({
         "install_session_id": install_session.install_session_id,
         "install_session_token": install_session.install_session_token,
         "machine_name": machine.display_name,
@@ -5134,9 +5160,9 @@ fn register_telemetry_device(
         "client_name": OTTTO_CLIENT_NAME,
         "client_version": machine.local_platform_version,
         "machine_id": machine.machine_id,
+        "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
-    });
-    backend_post_json(&url, &body, &[])
+    })
 }
 
 fn record_install_session_event(
@@ -10077,6 +10103,37 @@ mod tests {
 
     #[test]
     #[serial]
+    fn account_binding_payloads_include_persistent_installation_identity() {
+        let machine = test_machine();
+        let claim = PendingAuthClaim {
+            claim_code: "claim_installation".to_string(),
+            claim_token: "token_installation".to_string(),
+            nonce: "nonce_installation_identity".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_installation".to_string(),
+            expires_at: "2026-05-05T09:30:00Z".to_string(),
+        };
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install_session_identity".to_string(),
+            install_session_token: "install_token_identity".to_string(),
+        };
+
+        for payload in [
+            setup_claim_create_body(&machine, &claim.nonce),
+            setup_claim_complete_body(&claim, &machine),
+            setup_run_attach_body(&machine),
+            telemetry_device_register_body(&install_session, &machine),
+        ] {
+            assert_eq!(
+                payload
+                    .get("installation_id")
+                    .and_then(serde_json::Value::as_str),
+                Some("install_test")
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn claim_completion_request_includes_existing_relay_device_identity() {
         let support_root = telemetry_key_store_root("claim-complete-request-device");
         let _support_guard =
@@ -10140,6 +10197,12 @@ mod tests {
                     .filter_map(serde_json::Value::as_str)
                     .collect::<Vec<_>>()),
             Some(vec!["codex", "pi"])
+        );
+        assert_eq!(
+            body.get("installation_id")
+                .and_then(serde_json::Value::as_str),
+            Some("install_test"),
+            "claim completion must send the persistent installation identity"
         );
         assert_eq!(
             body.get("hardware_uuid"),
