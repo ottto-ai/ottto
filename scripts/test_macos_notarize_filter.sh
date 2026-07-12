@@ -22,6 +22,9 @@ mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/xcrun" <<'SH'
 #!/usr/bin/env sh
 printf 'xcrun %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+if [ -n "${OTTTO_NOTARIZE_TEST_XCRUN_SLEEP:-}" ]; then
+  sleep "$OTTTO_NOTARIZE_TEST_XCRUN_SLEEP"
+fi
 exit 0
 SH
 chmod +x "$FAKE_BIN/xcrun"
@@ -89,11 +92,29 @@ chmod +x "$FAKE_BIN/xattr"
 cat > "$FAKE_BIN/hdiutil" <<'SH'
 #!/usr/bin/env sh
 printf 'hdiutil %s\n' "$*" >> "$OTTTO_NOTARIZE_TEST_LOG"
+case "${1:-}" in
+  info)
+    if [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:-}" ] && [ -f "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE" ]; then
+      cat "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE"
+    fi
+    exit 0
+    ;;
+  detach)
+    if [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP:-}" ]; then
+      sleep "$OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP"
+    fi
+    : > "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:?hdiutil state required}"
+    exit 0
+    ;;
+esac
 dest=""
 for arg in "$@"; do
   dest="$arg"
 done
 printf 'rebuilt dmg\n' > "$dest"
+if [ "${1:-}" = "create" ] && [ -n "${OTTTO_NOTARIZE_TEST_HDIUTIL_STATE:-}" ]; then
+  printf '================================================\nimage-path      : %s\n/dev/disk99\tGUID_partition_scheme\n' "$dest" > "$OTTTO_NOTARIZE_TEST_HDIUTIL_STATE"
+fi
 exit 0
 SH
 chmod +x "$FAKE_BIN/hdiutil"
@@ -232,15 +253,19 @@ fi
 APP_MANIFEST="$TMP_DIR/app-manifest.json"
 APP_LOG="$TMP_DIR/app.log"
 APP_TOUCH_STATE="$TMP_DIR/app-touch-state"
+APP_HDIUTIL_STATE="$TMP_DIR/app-hdiutil-state"
 write_manifest "$APP_MANIFEST"
 OTTTO_NOTARIZE_TEST_TOUCH_PROVENANCE_FAIL=1 \
   OTTTO_NOTARIZE_TEST_TOUCH_STATE="$APP_TOUCH_STATE" \
-OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$APP_HDIUTIL_STATE" \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=30 \
   OTTTO_NOTARIZE_TEST_LOG="$APP_LOG" \
   PATH="$FAKE_BIN:$PATH" \
   "$NOTARIZE" \
     --manifest "$APP_MANIFEST" \
     --keychain-profile TEST_PROFILE \
+    --timeout 1m \
     --artifact-name Ottto.app >/dev/null
 
 if ! grep -q "ditto -c -k --keepParent .*Ottto.app .*ottto-app-notary.*\\.zip" "$APP_LOG"; then
@@ -263,12 +288,57 @@ if ! grep -q "codesign --force --timestamp --sign Developer ID Application: Test
   echo "Expected rebuilt app DMG to be signed before notarization" >&2
   exit 1
 fi
+if ! grep -q "hdiutil detach /dev/disk99" "$APP_LOG"; then
+  echo "Expected a leaked rebuilt DMG attachment to be detached before notarization" >&2
+  exit 1
+fi
+detach_line="$(grep -n "hdiutil detach /dev/disk99" "$APP_LOG" | head -1 | cut -d: -f1)"
+dmg_submit_line="$(grep -n "notarytool submit .*Ottto-macos-arm64.dmg" "$APP_LOG" | head -1 | cut -d: -f1)"
+if [[ -z "$detach_line" || -z "$dmg_submit_line" || "$detach_line" -ge "$dmg_submit_line" ]]; then
+  echo "Expected leaked DMG attachment cleanup before notarytool submission" >&2
+  exit 1
+fi
 if [[ "$(grep -c "notarytool submit" "$APP_LOG")" -ne 2 ]]; then
   echo "Expected app bundle zip and rebuilt DMG to be submitted for notarization" >&2
   exit 1
 fi
+if ! grep -q "notarytool submit .* --wait --timeout 1m" "$APP_LOG"; then
+  echo "Expected notarytool wait timeout to be preserved inside the whole-process bound" >&2
+  exit 1
+fi
 if [[ "$(jq -r '.artifacts[0].notarized' "$APP_MANIFEST")" != "true" ]]; then
   echo "Expected app artifact to be marked notarized" >&2
+  exit 1
+fi
+
+TIMEOUT_MANIFEST="$TMP_DIR/timeout-manifest.json"
+write_manifest "$TIMEOUT_MANIFEST"
+if OTTTO_NOTARIZE_TEST_XCRUN_SLEEP=5 \
+  OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS=1 \
+  OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/timeout.log" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$TIMEOUT_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-kind cli >/dev/null 2>&1; then
+  echo "Expected whole-process timeout to terminate a stuck notarytool preflight" >&2
+  exit 1
+fi
+
+DETACH_TIMEOUT_MANIFEST="$TMP_DIR/detach-timeout-manifest.json"
+DETACH_TIMEOUT_STATE="$TMP_DIR/detach-timeout-hdiutil-state"
+write_manifest "$DETACH_TIMEOUT_MANIFEST"
+if OTTTO_NOTARIZE_TEST_HDIUTIL_STATE="$DETACH_TIMEOUT_STATE" \
+  OTTTO_NOTARIZE_TEST_HDIUTIL_DETACH_SLEEP=5 \
+  OTTTO_DISK_IMAGE_COMMAND_TIMEOUT_SECONDS=1 \
+  OTTTO_MACOS_CODESIGN_IDENTITY="Developer ID Application: Test" \
+  OTTTO_NOTARIZE_TEST_LOG="$TMP_DIR/detach-timeout.log" \
+  PATH="$FAKE_BIN:$PATH" \
+  "$NOTARIZE" \
+    --manifest "$DETACH_TIMEOUT_MANIFEST" \
+    --keychain-profile TEST_PROFILE \
+    --artifact-name Ottto.app >/dev/null 2>&1; then
+  echo "Expected a stuck disk image detach to hit its process-group timeout" >&2
   exit 1
 fi
 

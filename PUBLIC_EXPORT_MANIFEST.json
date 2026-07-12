@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 231,
-  "content_sha256": "d559e01e375e422f79e8dfc95f367c164a68bddceabff83afe3e6a1945625155",
+  "content_sha256": "d5ae6218efaaedb016ca7ff48d4e3fbd130d2a66677ea793341522d81e66f7a4",
   "files": [
     {
       "executable": false,
@@ -1322,8 +1322,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_notarize.sh",
-      "sha256": "49d7fa44d897d598f8c1409b43bd467a3a66658037de595bdcfd24d76df1dc50",
-      "size_bytes": 9922
+      "sha256": "020ffcc05265c16be15ced5cef8d6f85344ee7229758d442b668143f59632286",
+      "size_bytes": 13190
     },
     {
       "executable": true,
@@ -1490,8 +1490,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_notarize_filter.sh",
-      "sha256": "ad3f6a638b9f31c7fc6060584acd74952f357fd6257468575046ece943fdcbdc",
-      "size_bytes": 9364
+      "sha256": "e3f4e0f4af44b19a4722c5a31ca9c5f150910b663726a37c8a1a12c2f8bb5126",
+      "size_bytes": 12258
     },
     {
       "executable": true,
@@ -1620,7 +1620,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-12T08:47:46+00:00",
+  "generated_at": "2026-07-12T12:08:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 232,
   "public_roots": [
@@ -1656,5 +1656,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "73a9dbbcfe26b512f334c53a72a42de9b95e3f81"
+  "source_commit": "910f8ad40cdaf06992543810074d82ffc76edcab"
 }
