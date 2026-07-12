@@ -92,6 +92,7 @@ require_command shasum
 require_command xcrun
 require_command codesign
 require_command spctl
+require_command perl
 
 sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
@@ -146,14 +147,123 @@ gatekeeper_assessment_type() {
   fi
 }
 
+duration_seconds() {
+  local duration="$1"
+  local value suffix
+  if [[ "$duration" =~ ^([0-9]+)([smh]?)$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[2]}"
+  else
+    echo "Invalid timeout duration: $duration" >&2
+    return 2
+  fi
+  case "$suffix" in
+    ""|s) printf '%s' "$value" ;;
+    m) printf '%s' "$((value * 60))" ;;
+    h) printf '%s' "$((value * 60 * 60))" ;;
+  esac
+}
+
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  if [[ ! "$timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Process timeout must be a positive integer, got: $timeout_seconds" >&2
+    return 2
+  fi
+  perl -e '
+    use POSIX qw(setpgid);
+    my $timeout = shift @ARGV;
+    my $pid = fork();
+    die "fork failed: $!\n" unless defined $pid;
+    if ($pid == 0) {
+      setpgid(0, 0);
+      exec @ARGV;
+      exit 127;
+    }
+    setpgid($pid, $pid);
+    $SIG{ALRM} = sub {
+      kill "TERM", -$pid;
+      select undef, undef, undef, 0.5;
+      kill "KILL", -$pid;
+      waitpid($pid, 0);
+      exit 124;
+    };
+    alarm $timeout;
+    waitpid($pid, 0);
+    alarm 0;
+    my $status = $?;
+    exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+  ' "$timeout_seconds" "$@"
+}
+
+attached_devices_for_image() {
+  local image_path="$1"
+  local command_timeout_seconds="${OTTTO_DISK_IMAGE_COMMAND_TIMEOUT_SECONDS:-30}"
+  run_with_timeout "$command_timeout_seconds" hdiutil info | awk -v target="$image_path" '
+    /^image-path[[:space:]]*:/ {
+      current = $0
+      sub(/^[^:]*:[[:space:]]*/, "", current)
+      matched = (current == target)
+      next
+    }
+    matched && /^[[:space:]]*\/dev\/disk[0-9]+[[:space:]]/ {
+      print $1
+      matched = 0
+      next
+    }
+    /^=+$/ { matched = 0 }
+  '
+}
+
+detach_image_if_attached() {
+  local image_path="$1"
+  local device devices detached="false"
+  local command_timeout_seconds="${OTTTO_DISK_IMAGE_COMMAND_TIMEOUT_SECONDS:-30}"
+  devices="$(attached_devices_for_image "$image_path")"
+  while IFS= read -r device; do
+    [[ -n "$device" ]] || continue
+    echo "Detaching stale disk image attachment before notarization: $device" >&2
+    if ! run_with_timeout "$command_timeout_seconds" hdiutil detach "$device" >/dev/null; then
+      echo "Timed out detaching stale disk image attachment: $device" >&2
+      return 1
+    fi
+    detached="true"
+  done <<<"$devices"
+
+  if [[ "$detached" == "true" ]] && [[ -n "$(attached_devices_for_image "$image_path")" ]]; then
+    echo "Disk image remained attached after detach: $image_path" >&2
+    return 1
+  fi
+}
+
 notary_submit() {
   local archive="$1"
+  local wait_seconds process_timeout_seconds
   local -a submit_args
-  submit_args=(notarytool submit "$archive" --keychain-profile "$KEYCHAIN_PROFILE" --wait)
+
+  if [[ "$archive" == *.dmg ]]; then
+    detach_image_if_attached "$archive"
+  fi
+
+  submit_args=(xcrun notarytool submit "$archive" --keychain-profile "$KEYCHAIN_PROFILE" --wait)
   if [[ -n "$NOTARY_WAIT_TIMEOUT" ]]; then
     submit_args+=(--timeout "$NOTARY_WAIT_TIMEOUT")
+    wait_seconds="$(duration_seconds "$NOTARY_WAIT_TIMEOUT")"
+    process_timeout_seconds="$((wait_seconds + 300))"
+  else
+    process_timeout_seconds="3900"
   fi
-  xcrun "${submit_args[@]}"
+  process_timeout_seconds="${OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS:-$process_timeout_seconds}"
+  if [[ ! "$process_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "OTTTO_NOTARY_PROCESS_TIMEOUT_SECONDS must be a positive integer." >&2
+    return 2
+  fi
+
+  if ! run_with_timeout "$process_timeout_seconds" "${submit_args[@]}"; then
+    echo "notarytool failed or exceeded the ${process_timeout_seconds}s whole-process timeout: $archive" >&2
+    return 1
+  fi
 }
 
 mktemp_zip_path() {
