@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 231,
-  "content_sha256": "0685c8ae8509ff3f3df647d6c71b976b75d09840241a32a0303ab6812ec561d9",
+  "content_sha256": "95ee25401d9dd5f160ee62a9af6049ae503e1d360cdbe63b6192c40f8dd94041",
   "files": [
     {
       "executable": false,
@@ -622,8 +622,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_effort.rs",
-      "sha256": "3be6f97c3e22bfb8e33b1e9d21020290c324c5da67153282ec1dc2201bf45f62",
-      "size_bytes": 11243
+      "sha256": "4abdcb713e8b83dc1b8f9edac0b335200969a6d71148801dc463ef1b65e61535",
+      "size_bytes": 12446
     },
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c591137dbf4c82faa9b1c372d77832b0fe6c78429c5beaa54f14e2ff348bea5f",
-      "size_bytes": 397190
+      "sha256": "d7b1058f5bb16123d1086f509a4506b2420abbf3033538d5275d518837255eee",
+      "size_bytes": 404011
     },
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-11-claude-local-reasoning-effort.md",
-      "sha256": "0e3a9e3cfa8c8e867645710a5e9b9c67ad0396fa1cf22185669efe026837df26",
-      "size_bytes": 2344
+      "sha256": "004217a6a0bbe302bf31a7cfcf8825018641d7e0c9c4a49031dbdc13e2465515",
+      "size_bytes": 3317
     },
     {
       "executable": false,
@@ -1620,7 +1620,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-12T15:53:06+00:00",
+  "generated_at": "2026-07-12T17:49:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 232,
   "public_roots": [
@@ -1656,5 +1656,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f4fb600046a6cf3b5d69c5ad9388899d2d9a208b"
+  "source_commit": "6008e0c8a3b5b29e897b119edabbbab95c3d9742"
 }

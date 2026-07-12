@@ -87,8 +87,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // folded into the scan fingerprint (see `ClaudeTitleMetadata`) so a title
 // arriving after the transcript was scanned still re-emits, and the bump
 // re-walks every Claude session once so existing sessions pick up titles.
+// claude_code v15: local OTLP reasoning-effort enrichment no longer treats
+// Claude's aggregate cache-creation count as a 5-minute TTL. The one-shot
+// backfill re-enriches transcripts indexed by v0.1.77 from their existing
+// content-free effort sidecars after upgrade.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v14";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v15";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -511,7 +515,7 @@ pub fn apply_claude_effort_evidence(
                 if model_usage_has_cost(base) {
                     continue;
                 }
-                let effort_rows: Vec<(String, UsageTotals)> = grouped
+                let mut effort_rows: Vec<(String, UsageTotals)> = grouped
                     .iter()
                     .filter(|((observed_bucket, observed_model, _effort), _totals)| {
                         observed_bucket == &bucket.bucket_start && observed_model == &model
@@ -524,13 +528,11 @@ pub fn apply_claude_effort_evidence(
                     continue;
                 }
                 let base_totals = usage_totals_from_model_usage(base);
-                let mut observed_totals = UsageTotals::default();
-                for (_, totals) in &effort_rows {
-                    observed_totals.add(totals);
-                }
-                if !usage_totals_fit(&observed_totals, &base_totals) {
+                let Some(observed_totals) =
+                    reconcile_effort_cache_creation(&mut effort_rows, &base_totals)
+                else {
                     continue;
-                }
+                };
 
                 let mut split = Vec::new();
                 for (effort, totals) in effort_rows {
@@ -583,6 +585,50 @@ fn model_usage_has_cost(row: &SnapshotModelUsage) -> bool {
 
 fn usage_totals_fit(observed: &UsageTotals, base: &UsageTotals) -> bool {
     base.is_monotonic_after(observed)
+}
+
+fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> UsageTotals {
+    let mut total = UsageTotals::default();
+    for (_, row) in rows {
+        total.add(row);
+    }
+    total
+}
+
+/// Reconcile legacy cache evidence against the transcript's authoritative TTLs.
+///
+/// Stable v0.1.77 placed Claude's unscoped aggregate cache-creation count in
+/// the 5m field. New evidence stores that aggregate separately and never enters
+/// these totals. For old rows, retain each TTL component when its aggregate
+/// independently fits the transcript and discard only a conflicting component;
+/// this preserves genuinely scoped evidence without inventing a billing TTL.
+fn reconcile_effort_cache_creation(
+    rows: &mut [(String, UsageTotals)],
+    base: &UsageTotals,
+) -> Option<UsageTotals> {
+    let observed = sum_effort_totals(rows);
+    if usage_totals_fit(&observed, base) {
+        return Some(observed);
+    }
+
+    let mut non_cache = observed.clone();
+    non_cache.cache_creation_5m_tokens = 0;
+    non_cache.cache_creation_1h_tokens = 0;
+    if !usage_totals_fit(&non_cache, base) {
+        return None;
+    }
+    if observed.cache_creation_5m_tokens > base.cache_creation_5m_tokens {
+        for (_, totals) in rows.iter_mut() {
+            totals.cache_creation_5m_tokens = 0;
+        }
+    }
+    if observed.cache_creation_1h_tokens > base.cache_creation_1h_tokens {
+        for (_, totals) in rows.iter_mut() {
+            totals.cache_creation_1h_tokens = 0;
+        }
+    }
+    let reconciled = sum_effort_totals(rows);
+    usage_totals_fit(&reconciled, base).then_some(reconciled)
 }
 
 fn model_usage_with_totals(
@@ -7595,6 +7641,119 @@ mod tests {
             .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 20));
         validate_snapshot_item(0, &items[0]).expect("split snapshot remains byte-exact");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_local_otel_effort_keeps_unscoped_cache_creation_on_unknown_residual() {
+        let path = temp_file("claude-effort-cache-ttl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-12T15:07:58.000Z\",\"sessionId\":\"claude-effort-cache-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-07-12T15:07:58.785Z\",\"sessionId\":\"claude-effort-cache-1\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":2,\"output_tokens\":9,\"cache_creation_input_tokens\":2014,\"cache_creation\":{\"ephemeral_1h_input_tokens\":2014,\"ephemeral_5m_input_tokens\":0}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-07-12T15:08:00Z", "fp".to_string())
+                .expect("parse");
+        let evidence = BTreeMap::from([(
+            "claude-effort-cache-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                fingerprint: "legacy-v0.1.77".to_string(),
+                session_id: "claude-effort-cache-1".to_string(),
+                observed_at: "2026-07-12T15:07:58.852Z".to_string(),
+                model: "claude-opus-4-8".to_string(),
+                effort: "low".to_string(),
+                input_tokens: 2,
+                output_tokens: 9,
+                // v0.1.77 stored Claude's aggregate cache_creation_tokens in
+                // the 5m field even when the transcript proved they were 1h.
+                cache_creation_5m_tokens: 2014,
+                request_count: 1,
+                ..Default::default()
+            }],
+        )]);
+
+        apply_claude_effort_evidence(&mut items, &evidence);
+
+        let rows = &items[0].usage_buckets[0].model_usage;
+        assert_eq!(rows.len(), 2);
+        let low = rows
+            .iter()
+            .find(|row| row.reasoning_effort.as_deref() == Some("low"))
+            .expect("low effort row");
+        assert_eq!(low.input_tokens, 2);
+        assert_eq!(low.output_tokens, 9);
+        assert_eq!(low.request_count, 1);
+        assert_eq!(low.cache_creation_5m_tokens, 0);
+        assert_eq!(low.cache_creation_1h_tokens, 0);
+        let residual = rows
+            .iter()
+            .find(|row| row.reasoning_effort.is_none())
+            .expect("unknown cache residual");
+        assert_eq!(residual.request_count, 0);
+        assert_eq!(residual.cache_creation_5m_tokens, 0);
+        assert_eq!(residual.cache_creation_1h_tokens, 2014);
+        validate_snapshot_item(0, &items[0]).expect("enriched snapshot remains byte-exact");
+
+        let mut scoped_items =
+            parse_claude_code_jsonl_file(&path, "2026-07-12T15:08:00Z", "fp".to_string())
+                .expect("parse scoped fixture");
+        let scoped_evidence = BTreeMap::from([(
+            "claude-effort-cache-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                fingerprint: "explicit-1h".to_string(),
+                session_id: "claude-effort-cache-1".to_string(),
+                observed_at: "2026-07-12T15:07:58.852Z".to_string(),
+                model: "claude-opus-4-8".to_string(),
+                effort: "low".to_string(),
+                input_tokens: 2,
+                output_tokens: 9,
+                cache_creation_1h_tokens: 2014,
+                request_count: 1,
+                ..Default::default()
+            }],
+        )]);
+        apply_claude_effort_evidence(&mut scoped_items, &scoped_evidence);
+        let scoped_rows = &scoped_items[0].usage_buckets[0].model_usage;
+        assert_eq!(scoped_rows.len(), 1);
+        assert_eq!(scoped_rows[0].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(scoped_rows[0].cache_creation_1h_tokens, 2014);
+        validate_snapshot_item(0, &scoped_items[0])
+            .expect("explicit TTL evidence remains byte-exact");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_effort_cache_reconciliation_drops_only_conflicting_ttl_component() {
+        let mut rows = vec![(
+            "low".to_string(),
+            UsageTotals {
+                input_tokens: 2,
+                output_tokens: 9,
+                cache_creation_5m_tokens: 500,
+                cache_creation_1h_tokens: 700,
+                request_count: 1,
+                ..Default::default()
+            },
+        )];
+        let base = UsageTotals {
+            input_tokens: 2,
+            output_tokens: 9,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 700,
+            request_count: 1,
+            ..Default::default()
+        };
+
+        let reconciled = reconcile_effort_cache_creation(&mut rows, &base)
+            .expect("non-cache totals and explicit 1h cache fit");
+
+        assert_eq!(reconciled.cache_creation_5m_tokens, 0);
+        assert_eq!(reconciled.cache_creation_1h_tokens, 700);
+        assert_eq!(rows[0].1.cache_creation_5m_tokens, 0);
+        assert_eq!(rows[0].1.cache_creation_1h_tokens, 700);
     }
 
     #[test]

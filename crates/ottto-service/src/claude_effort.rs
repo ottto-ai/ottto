@@ -31,6 +31,14 @@ pub struct ClaudeEffortEvidence {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Aggregate cache-creation tokens from Claude's public api_request event.
+    ///
+    /// Claude does not expose the 5-minute/1-hour split on that event. Keep the
+    /// aggregate distinct instead of assigning it to a billing TTL we cannot
+    /// prove. Snapshot enrichment leaves these tokens on the transcript's
+    /// effort-unknown residual row so pricing remains byte-exact and honest.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     pub cache_creation_5m_tokens: u64,
     pub cache_creation_1h_tokens: u64,
     pub reasoning_output_tokens: u64,
@@ -166,6 +174,10 @@ fn evidence_from_record(
                 "gen_ai.usage.cache_read.input_tokens",
             ],
         ),
+        cache_creation_tokens: first_u64(
+            attrs,
+            &["cache_creation_tokens", "claude.tokens.cache_creation"],
+        ),
         cache_creation_5m_tokens: first_u64(
             attrs,
             &[
@@ -191,12 +203,6 @@ fn evidence_from_record(
         ),
         request_count: 1,
     };
-    if item.cache_creation_5m_tokens == 0 && item.cache_creation_1h_tokens == 0 {
-        item.cache_creation_5m_tokens = first_u64(
-            attrs,
-            &["cache_creation_tokens", "claude.tokens.cache_creation"],
-        );
-    }
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
     Some(item)
@@ -300,7 +306,7 @@ mod tests {
     fn captures_only_allowlisted_api_request_fields_and_dedupes_reads() {
         let dir = std::env::temp_dir().join(format!("ottto-effort-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let body = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-1"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+        let body = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-1"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"cache_creation_tokens","value":{"intValue":"2014"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
         assert_eq!(
             capture_claude_api_request_logs(&dir, body, "application/json").unwrap(),
             1
@@ -314,8 +320,22 @@ mod tests {
         let row = &loaded["sess-1"][0];
         assert_eq!(row.effort, "xhigh");
         assert_eq!(row.input_tokens, 12);
+        assert_eq!(row.cache_creation_tokens, 2014);
+        assert_eq!(row.cache_creation_5m_tokens, 0);
+        assert_eq!(row.cache_creation_1h_tokens, 0);
         let persisted = fs::read_to_string(evidence_path(&dir, "sess-1")).unwrap();
         assert!(!persisted.contains("must-not-persist"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_evidence_without_aggregate_cache_field_still_loads() {
+        let row: ClaudeEffortEvidence = serde_json::from_str(
+            r#"{"fingerprint":"legacy","session_id":"sess-1","observed_at":"2026-07-12T15:07:58Z","model":"claude-opus-4-8","effort":"low","input_tokens":2,"output_tokens":9,"cache_read_tokens":0,"cache_creation_5m_tokens":2014,"cache_creation_1h_tokens":0,"reasoning_output_tokens":0,"request_count":1}"#,
+        )
+        .expect("deserialize v0.1.77 evidence");
+
+        assert_eq!(row.cache_creation_tokens, 0);
+        assert_eq!(row.cache_creation_5m_tokens, 2014);
     }
 }
