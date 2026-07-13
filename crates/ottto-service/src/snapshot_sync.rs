@@ -43,6 +43,7 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // work and reliable checkpoint advancement.
 const SNAPSHOT_BATCH_LIMIT: usize = 20;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
+static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
@@ -309,6 +310,14 @@ fn set_one_shot_sync_in_flight(value: bool) {
 }
 
 fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
+    // The periodic loop and setup/UI one-shot path can otherwise scan and save
+    // the same per-source index concurrently. Serialize the full cycle so a
+    // one-shot rescan cannot race the background loop or publish an older
+    // incremental index after it.
+    let _sync_guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));

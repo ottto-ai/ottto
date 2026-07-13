@@ -4654,8 +4654,21 @@ impl ScanIndex {
         }
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        serde_json::from_reader(file)
-            .with_context(|| format!("parse scan index {}", path.display()))
+        match serde_json::from_reader(file) {
+            Ok(index) => Ok(index),
+            Err(error) if !error.is_io() => {
+                // The index is only a local incremental-scan optimization. A
+                // crash or overlapping daemon shutdown must not permanently
+                // block collection because the JSON was left partial. Start
+                // from an empty index; the next successful scan rebuilds it
+                // from source files and replaces the bad file atomically.
+                eprintln!("local snapshot scan index was invalid; rebuilding");
+                Ok(Self::default())
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("parse scan index {}", path.display()))
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -4663,10 +4676,18 @@ impl ScanIndex {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
         }
-        let file =
-            File::create(path).with_context(|| format!("create scan index {}", path.display()))?;
-        serde_json::to_writer_pretty(file, self)
-            .with_context(|| format!("write scan index {}", path.display()))
+        // Never truncate the live index in place. The process id keeps a
+        // briefly overlapping old/new daemon pair from sharing a temp file;
+        // in-process snapshot scans are separately serialized.
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let mut file = File::create(&temp_path)
+            .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
+        serde_json::to_writer_pretty(&mut file, self)
+            .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("replace scan index {}", path.display()))
     }
 
     fn should_process(&self, candidate: &CandidateFile) -> bool {
@@ -5066,6 +5087,40 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ottto-{name}-{unique}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
+        let root = temp_dir("scan-index-recovery");
+        let path = root.join("codex-scan-index.json");
+        fs::write(&path, r#"{"files":{"partial""#).expect("write truncated index");
+
+        let recovered = ScanIndex::load(&path).expect("truncated index should self-heal");
+        assert!(recovered.files.is_empty());
+
+        let replacement = ScanIndex {
+            files: BTreeMap::from([(
+                "content-free-key".to_string(),
+                ScanIndexEntry {
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_700_000_000,
+                    source_file_fingerprint: "sha256:test".to_string(),
+                    last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
+                },
+            )]),
+        };
+        replacement.save(&path).expect("save replacement index");
+
+        assert_eq!(
+            ScanIndex::load(&path)
+                .expect("load replacement")
+                .files
+                .len(),
+            1
+        );
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
