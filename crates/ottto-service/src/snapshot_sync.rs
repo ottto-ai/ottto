@@ -36,7 +36,12 @@ const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
-const SNAPSHOT_BATCH_LIMIT: usize = 100;
+// The backend accepts up to 100 snapshots, but a reconciliation-heavy parser
+// backfill can make that ceiling exceed the load balancer request window. Keep
+// daemon uploads deliberately smaller: normal incremental scans are usually a
+// single chunk, while historical replay trades more requests for bounded DB
+// work and reliable checkpoint advancement.
+const SNAPSHOT_BATCH_LIMIT: usize = 20;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -736,7 +741,7 @@ fn sync_source(
 
     let mut accepted = 0;
 
-    for chunk in scan_result.snapshots.chunks(SNAPSHOT_BATCH_LIMIT) {
+    for chunk in bounded_snapshot_chunks(&scan_result.snapshots) {
         // A first Codex/Claude scan can spend several minutes parsing local
         // history and retroactive backfill before the first upload. Relay
         // tokens are intentionally short-lived, so mint them at the network
@@ -917,6 +922,10 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+fn bounded_snapshot_chunks<T>(items: &[T]) -> std::slice::Chunks<'_, T> {
+    items.chunks(SNAPSHOT_BATCH_LIMIT)
 }
 
 /// Aggregate this cycle's snapshots into detected uses, merge them into the
@@ -1219,6 +1228,18 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn snapshot_upload_chunks_bound_reconciliation_work() {
+        let items = (0..45).collect::<Vec<_>>();
+        let chunk_lengths = bounded_snapshot_chunks(&items)
+            .map(|chunk| chunk.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(SNAPSHOT_BATCH_LIMIT, 20);
+        assert_eq!(chunk_lengths, vec![20, 20, 5]);
+        assert!(chunk_lengths.iter().all(|length| *length <= 20));
+    }
 
     #[test]
     fn enabled_snapshot_sources_follow_device_grants() {
