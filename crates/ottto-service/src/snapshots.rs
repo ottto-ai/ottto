@@ -91,8 +91,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // Claude's aggregate cache-creation count as a 5-minute TTL. The one-shot
 // backfill re-enriches transcripts indexed by v0.1.77 from their existing
 // content-free effort sidecars after upgrade.
+// claude_code v16: derive per-session first-turn/peak context and compaction
+// watermarks. The bump is required in addition to fingerprinting the new
+// fields: the incremental scanner must revisit already-indexed transcripts
+// before their new fingerprint can trigger a one-time backend re-upload and
+// seed the machine-local posture cache.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v15";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v16";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -9744,6 +9749,9 @@ mod tests {
             "reasoning_output_tokens",
             "unattributed_total_tokens",
             "request_count",
+            "peak_context_fill_tokens",
+            "first_turn_context_tokens",
+            "compaction_count",
             "model_usage",
             "usage_buckets",
             "cost",
@@ -9884,9 +9892,9 @@ mod tests {
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
             max_time_to_first_token_ms: None,
-            peak_context_fill_tokens: None,
-            first_turn_context_tokens: None,
-            compaction_count: None,
+            peak_context_fill_tokens: Some(115),
+            first_turn_context_tokens: Some(105),
+            compaction_count: Some(0),
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),

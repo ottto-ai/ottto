@@ -739,6 +739,25 @@ fn sync_source(
         );
     }
 
+    // Persist the Companion-facing posture projection as soon as the local
+    // scan is complete and account-switch filtering has been applied. This is
+    // machine-local evidence and must remain available when the backend is
+    // disabled, offline, or rejects a newer upload contract. Failure is
+    // best-effort and never blocks usage sync; omit raw filesystem errors.
+    if source == SnapshotSource::ClaudeCode
+        && crate::context_posture::update_context_posture_cache(
+            support_dir,
+            &scan_result.snapshots,
+            OffsetDateTime::now_utc(),
+        )
+        .is_err()
+    {
+        eprintln!(
+            "local context-posture cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
     let mut accepted = 0;
 
     for chunk in bounded_snapshot_chunks(&scan_result.snapshots) {
@@ -885,25 +904,6 @@ fn sync_source(
     if update_detected_uses_cache(support_dir, source, &scan_result.snapshots).is_err() {
         eprintln!(
             "local detected-uses cache update skipped for {}",
-            source.api_slug()
-        );
-    }
-
-    // Same delta-merge idea for the machine-local context-posture cache the
-    // agent-status collector serves to the Companion (Claude Code only; the
-    // posture watermarks are derived only for Claude transcripts). Failure
-    // must never fail the sync, and the error is not logged verbatim because
-    // it can embed a local filesystem path.
-    if source == SnapshotSource::ClaudeCode
-        && crate::context_posture::update_context_posture_cache(
-            support_dir,
-            &scan_result.snapshots,
-            OffsetDateTime::now_utc(),
-        )
-        .is_err()
-    {
-        eprintln!(
-            "local context-posture cache update skipped for {}",
             source.api_slug()
         );
     }
