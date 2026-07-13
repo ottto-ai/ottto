@@ -686,8 +686,9 @@ fn sync_source(
     // are idempotent. State is persisted only after this iteration's upload
     // succeeds (see `save_backfill_state` below).
     let backfill_state = load_backfill_state(support_dir);
-    let backfill_ran = pending_backfill_sources(&backfill_state).contains(&source);
-    if backfill_ran {
+    let backfill_pending = pending_backfill_sources(&backfill_state).contains(&source);
+    let mut backfill_succeeded = false;
+    if backfill_pending {
         match run_backfill(
             home,
             &[source],
@@ -697,6 +698,7 @@ fn sync_source(
             Ok((mut backfill_snapshots, _report)) => {
                 apply_upload_policy(source, &mut backfill_snapshots, upload_policy);
                 scan_result.snapshots.extend(backfill_snapshots);
+                backfill_succeeded = true;
             }
             Err(error) => {
                 eprintln!(
@@ -911,7 +913,7 @@ fn sync_source(
         );
     }
 
-    if backfill_ran {
+    if backfill_succeeded {
         // Reload before mutating: a claim completion can persist an
         // account-switch backfill cutoff while this (potentially minutes-long)
         // sync is running, and saving the stale pre-scan copy would clobber it.
