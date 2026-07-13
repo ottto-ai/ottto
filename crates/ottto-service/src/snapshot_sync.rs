@@ -739,11 +739,14 @@ fn sync_source(
         );
     }
 
-    // Persist the Companion-facing posture projection as soon as the local
-    // scan is complete and account-switch filtering has been applied. This is
-    // machine-local evidence and must remain available when the backend is
-    // disabled, offline, or rejects a newer upload contract. Failure is
-    // best-effort and never blocks usage sync; omit raw filesystem errors.
+    // Persist the Companion-facing posture projection as soon as an
+    // activity-hint-authorized local scan is complete and account-switch
+    // filtering has been applied. This deliberately stays behind the master
+    // `local_usage_reconciliation_enabled` collection switch: an unavailable
+    // hint or explicit disable must not cause an offline bypass of user/org
+    // policy. Once a scan is authorized, however, a later batch-upload failure
+    // must not discard its machine-local evidence. Cache writes are best-effort
+    // and never block usage sync; omit raw filesystem errors.
     if source == SnapshotSource::ClaudeCode
         && crate::context_posture::update_context_posture_cache(
             support_dir,
