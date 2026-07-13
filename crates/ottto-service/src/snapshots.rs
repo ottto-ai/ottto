@@ -265,8 +265,8 @@ pub struct SnapshotItem {
     // largest effective input context (uncached input + cache reads + cache
     // writes) any counted response saw — the session's high-water context
     // fill. `first_turn_context_tokens` is the same measure for the session's
-    // FIRST counted response: the session-start baseline (system prompt +
-    // tools + memory files) paid before the user types anything.
+    // FIRST counted response: the first-turn baseline (system prompt + tools +
+    // memory + first user input), not a claim of purely static context.
     // `compaction_count` counts transcript compaction events
     // (`isCompactSummary` records), auto or manual. Claude Code JSONL only;
     // None for Codex / Pi. Backend schema must accept these as optional.
@@ -694,7 +694,7 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
 }
 
 fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
-    let fingerprint_payload = json!({
+    let mut fingerprint_payload = json!({
         "source": source.api_slug(),
         "source_session_id": &item.source_session_id,
         "input_tokens": item.input_tokens,
@@ -717,14 +717,24 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         // already-uploaded sessions (otherwise the fingerprint is unchanged and
         // the snapshot is never re-sent).
         "origin": &item.origin,
-        // Same one-time re-upload rationale as `origin`: including the context
-        // posture fields makes every already-collected Claude Code session
-        // re-upload once when the daemon starts deriving them, backfilling
-        // peak/baseline/compaction for sessions the backend already has.
-        "peak_context_fill_tokens": item.peak_context_fill_tokens,
-        "first_turn_context_tokens": item.first_turn_context_tokens,
-        "compaction_count": item.compaction_count,
     });
+    // Same one-time re-upload rationale as `origin`, but deliberately scoped
+    // to Claude Code. Adding null posture keys for Codex/Pi would change their
+    // fingerprints too and trigger an unrelated cross-source re-upload burst.
+    if source == SnapshotSource::ClaudeCode {
+        let payload = fingerprint_payload
+            .as_object_mut()
+            .expect("snapshot fingerprint payload is an object");
+        payload.insert(
+            "peak_context_fill_tokens".to_string(),
+            json!(item.peak_context_fill_tokens),
+        );
+        payload.insert(
+            "first_turn_context_tokens".to_string(),
+            json!(item.first_turn_context_tokens),
+        );
+        payload.insert("compaction_count".to_string(), json!(item.compaction_count));
+    }
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
 
@@ -3415,7 +3425,9 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // flagged with a top-level `isCompactSummary: true` boolean (the summary
     // prompt that replaces the compacted history). Count each one: frequent
     // compaction is a context-pressure symptom the backend surfaces.
-    if value.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+    if value.get("type").and_then(Value::as_str) == Some("user")
+        && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
         accumulator.compaction_count += 1;
     }
     let timestamp = string_at(value, &["timestamp"])
@@ -3471,8 +3483,9 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.note_claude_turn_duration(timestamp.as_deref());
         // Context posture watermarks from this counted response's effective
         // input context (the prompt volume the model actually saw). The first
-        // counted response with any context becomes the session-start
-        // baseline; the running max is the session's peak fill. Gated by the
+        // counted response with any context becomes the first-turn baseline
+        // (including first user input); the running max is the session's peak.
+        // Gated by the
         // same once-per-response dedup as the usage count above, so repeated
         // content-block records of one API response contribute one sample.
         let effective_input_context = usage.effective_input_context();
@@ -8271,7 +8284,8 @@ mod tests {
                 "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
                 "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n"
+                "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:04:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"assistant\",\"isCompactSummary\":true,\"message\":{\"role\":\"assistant\",\"content\":\"not a compaction event\"}}\n"
             ),
         )
         .expect("write fixture");
@@ -8322,6 +8336,18 @@ mod tests {
         assert!(serialized.get("peak_context_fill_tokens").is_none());
         assert!(serialized.get("first_turn_context_tokens").is_none());
         assert!(serialized.get("compaction_count").is_none());
+
+        // Posture is not a Codex/Pi fingerprint dimension. Even a defensive
+        // mutation must not churn unrelated source indexes on upgrade.
+        let fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
+        let mut mutated = item.clone();
+        mutated.peak_context_fill_tokens = Some(10);
+        mutated.first_turn_context_tokens = Some(5);
+        mutated.compaction_count = Some(1);
+        assert_eq!(
+            snapshot_fingerprint(SnapshotSource::Codex, &mutated),
+            fingerprint
+        );
 
         let _ = fs::remove_file(path);
     }

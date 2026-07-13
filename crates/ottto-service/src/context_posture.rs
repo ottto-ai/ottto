@@ -45,11 +45,10 @@ const POSTURE_CACHE_RETENTION_DAYS: i64 = 14;
 /// sessions cannot grow the cache without bound.
 const POSTURE_CACHE_MAX_ROWS: usize = 400;
 
-/// Claude context windows. There is no model→window catalog in the daemon;
-/// this is a deliberate, documented heuristic: models opted into the 1M
-/// long-context beta carry a `[1m]` / `-1m` marker in their identifier,
-/// everything else on Claude Code is the standard 200k window today.
-const DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+/// Exact long-context window. Claude transcript model identifiers normally use
+/// the same base id for standard and 1M variants, so a model-name heuristic is
+/// not evidence. A measured peak above the regular 200k cap does prove that the
+/// response used the 1M variant; smaller peaks keep their window unknown.
 const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
 
 /// One session's posture-relevant projection, persisted in the cache file.
@@ -59,6 +58,7 @@ pub struct ContextPostureCacheRow {
     /// RFC3339. Drives window filtering, ordering, and pruning.
     pub last_activity_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First measured turn context, including the first user input.
     pub first_turn_context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peak_context_fill_tokens: Option<u64>,
@@ -68,8 +68,9 @@ pub struct ContextPostureCacheRow {
     /// Session-total cache-read tokens: the measured re-read volume.
     #[serde(default)]
     pub cache_read_tokens: u64,
-    /// The session's dominant model (most requests), used to derive the
-    /// context window the peak is measured against.
+    /// The session's dominant model (most requests), retained as display-safe
+    /// diagnostic context only. It is not peak-model provenance and must never
+    /// be used to infer the peak's context-window size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dominant_model: Option<String>,
 }
@@ -209,7 +210,7 @@ pub fn summarize_context_posture(
     if analyzed.is_empty() {
         return None;
     }
-    analyzed.sort_by(|a, b| a.1.cmp(&b.1));
+    analyzed.sort_by_key(|row| row.1);
 
     let mut first_turns: Vec<u64> = analyzed
         .iter()
@@ -219,16 +220,22 @@ pub fn summarize_context_posture(
 
     let mut deep_sessions = 0u64;
     let mut over_window_sessions = 0u64;
+    let mut peak_sessions = 0u64;
+    let mut window_evidenced_sessions = 0u64;
     let mut compactions_observed = false;
     let mut compaction_total = 0u64;
     let mut reread_total = 0u64;
     for (row, _) in &analyzed {
         if let Some(peak) = row.peak_context_fill_tokens {
+            peak_sessions += 1;
             if peak > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
                 deep_sessions += 1;
             }
-            if peak > claude_model_window_tokens(row.dominant_model.as_deref()) {
-                over_window_sessions += 1;
+            if let Some(window) = evidenced_context_window_tokens(peak) {
+                window_evidenced_sessions += 1;
+                if peak > window {
+                    over_window_sessions += 1;
+                }
             }
         }
         if let Some(count) = row.compaction_count {
@@ -244,10 +251,12 @@ pub fn summarize_context_posture(
         .iter()
         .filter_map(|(row, _)| {
             let peak = row.peak_context_fill_tokens?;
-            let window = claude_model_window_tokens(row.dominant_model.as_deref());
+            let window = evidenced_context_window_tokens(peak);
             Some(AgentContextSessionPeak {
-                peak_fill_percent: peak_fill_percent(peak, window),
-                over_window: peak > window,
+                peak_fill_tokens: peak,
+                context_window_tokens: window,
+                peak_fill_percent: window.map(|window| peak_fill_percent(peak, window)),
+                over_window: window.map(|window| peak > window),
             })
         })
         .collect();
@@ -260,27 +269,24 @@ pub fn summarize_context_posture(
         sessions_analyzed: analyzed.len() as u64,
         window_days: POSTURE_SUMMARY_WINDOW_DAYS as u64,
         typical_first_turn_tokens: median(&first_turns),
-        deep_session_count: Some(deep_sessions),
-        over_window_session_count: Some(over_window_sessions),
+        peak_session_count: peak_sessions,
+        window_evidenced_session_count: window_evidenced_sessions,
+        deep_session_count: (peak_sessions > 0).then_some(deep_sessions),
+        over_window_session_count: (peak_sessions > 0
+            && window_evidenced_sessions == peak_sessions)
+            .then_some(over_window_sessions),
         session_peaks,
         compaction_count: compactions_observed.then_some(compaction_total),
         reread_tokens: Some(reread_total),
     })
 }
 
-/// Context window for a Claude Code model identifier. See the constant docs:
-/// a `[1m]` / `-1m` marker means the 1M long-context window, everything else
-/// is the standard 200k.
-pub fn claude_model_window_tokens(model: Option<&str>) -> u64 {
-    let Some(model) = model else {
-        return DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS;
-    };
-    let lowered = model.to_ascii_lowercase();
-    if lowered.contains("[1m]") || lowered.ends_with("-1m") {
-        LONG_CONTEXT_WINDOW_TOKENS
-    } else {
-        DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS
-    }
+/// Return an exact window only when the measurement itself proves use of the
+/// 1M variant. At or below 200k, both the standard and 1M variants are possible,
+/// so percent/over-window claims remain unavailable.
+fn evidenced_context_window_tokens(peak_tokens: u64) -> Option<u64> {
+    (peak_tokens > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS)
+        .then_some(LONG_CONTEXT_WINDOW_TOKENS)
 }
 
 /// Peak fill as percent of the window, rounded, saturating into u16 (an
@@ -342,20 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn model_window_heuristic_maps_long_context_markers() {
-        assert_eq!(claude_model_window_tokens(None), 200_000);
-        assert_eq!(
-            claude_model_window_tokens(Some("claude-sonnet-4-5")),
-            200_000
-        );
-        assert_eq!(
-            claude_model_window_tokens(Some("claude-opus-4-8[1m]")),
-            1_000_000
-        );
-        assert_eq!(
-            claude_model_window_tokens(Some("claude-sonnet-4-5-1m")),
-            1_000_000
-        );
+    fn window_evidence_fails_closed_below_long_context_threshold() {
+        assert_eq!(evidenced_context_window_tokens(0), None);
+        assert_eq!(evidenced_context_window_tokens(200_000), None);
+        assert_eq!(evidenced_context_window_tokens(200_001), Some(1_000_000));
     }
 
     #[test]
@@ -427,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_computes_median_deep_over_and_totals() {
+    fn summarize_computes_measured_totals_and_gates_window_claims() {
         let now = test_now();
         let rows = vec![
             // Outside the 7-day window: ignored entirely.
@@ -440,7 +436,7 @@ mod tests {
                 999,
                 None,
             ),
-            // Healthy: 60k peak on a 200k window (30%).
+            // A 60k peak cannot distinguish the standard and 1M variants.
             row(
                 "a",
                 "2026-07-08T09:00:00Z",
@@ -450,7 +446,7 @@ mod tests {
                 1_000,
                 Some("claude-sonnet-4-5"),
             ),
-            // Deep + over-window: 250k peak on a 200k window.
+            // A >200k peak proves the 1M variant (25%), not a 200k overflow.
             row(
                 "b",
                 "2026-07-10T09:00:00Z",
@@ -460,7 +456,7 @@ mod tests {
                 2_000,
                 Some("claude-sonnet-4-5"),
             ),
-            // Deep but NOT over-window: 400k peak on a 1M window (40%).
+            // Model text is irrelevant; the measured >200k peak proves 1M.
             row(
                 "c",
                 "2026-07-11T09:00:00Z",
@@ -475,17 +471,66 @@ mod tests {
         assert_eq!(summary.sessions_analyzed, 3);
         assert_eq!(summary.window_days, 7);
         assert_eq!(summary.typical_first_turn_tokens, Some(70_000));
+        assert_eq!(summary.peak_session_count, 3);
+        assert_eq!(summary.window_evidenced_session_count, 2);
         assert_eq!(summary.deep_session_count, Some(2));
-        assert_eq!(summary.over_window_session_count, Some(1));
+        assert_eq!(summary.over_window_session_count, None);
         assert_eq!(summary.compaction_count, Some(3));
         assert_eq!(summary.reread_tokens, Some(6_000));
-        let peaks: Vec<(u16, bool)> = summary
-            .session_peaks
-            .iter()
-            .map(|p| (p.peak_fill_percent, p.over_window))
-            .collect();
-        // Oldest → newest, over-window peak exceeds 100 raw.
-        assert_eq!(peaks, vec![(30, false), (125, true), (40, false)]);
+        assert_eq!(
+            summary.session_peaks,
+            vec![
+                AgentContextSessionPeak {
+                    peak_fill_tokens: 60_000,
+                    context_window_tokens: None,
+                    peak_fill_percent: None,
+                    over_window: None,
+                },
+                AgentContextSessionPeak {
+                    peak_fill_tokens: 250_000,
+                    context_window_tokens: Some(1_000_000),
+                    peak_fill_percent: Some(25),
+                    over_window: Some(false),
+                },
+                AgentContextSessionPeak {
+                    peak_fill_tokens: 400_000,
+                    context_window_tokens: Some(1_000_000),
+                    peak_fill_percent: Some(40),
+                    over_window: Some(false),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn summarize_reports_over_window_only_with_complete_exact_evidence() {
+        let now = test_now();
+        let rows = vec![
+            row(
+                "a",
+                "2026-07-10T09:00:00Z",
+                Some(70_000),
+                Some(400_000),
+                Some(0),
+                0,
+                Some("claude-sonnet-4-5"),
+            ),
+            row(
+                "b",
+                "2026-07-11T09:00:00Z",
+                Some(90_000),
+                Some(1_100_000),
+                Some(0),
+                0,
+                Some("claude-opus-4-8"),
+            ),
+        ];
+        let summary = summarize_context_posture(&rows, now).expect("summary");
+        assert_eq!(summary.peak_session_count, 2);
+        assert_eq!(summary.window_evidenced_session_count, 2);
+        assert_eq!(summary.over_window_session_count, Some(1));
+        assert_eq!(summary.session_peaks[1].peak_fill_percent, Some(110));
+        assert_eq!(summary.session_peaks[1].over_window, Some(true));
     }
 
     #[test]
@@ -540,8 +585,18 @@ mod tests {
             POSTURE_SUMMARY_MAX_SESSION_PEAKS
         );
         // The first retained peak is session index 6 (20 - 14), the last is 19.
-        assert_eq!(summary.session_peaks.first().unwrap().peak_fill_percent, 7);
-        assert_eq!(summary.session_peaks.last().unwrap().peak_fill_percent, 20);
+        assert_eq!(
+            summary.session_peaks.first().unwrap().peak_fill_tokens,
+            14_000
+        );
+        assert_eq!(
+            summary.session_peaks.last().unwrap().peak_fill_tokens,
+            40_000
+        );
+        assert!(summary
+            .session_peaks
+            .iter()
+            .all(|peak| peak.peak_fill_percent.is_none() && peak.over_window.is_none()));
     }
 
     #[test]

@@ -1446,15 +1446,25 @@ pub struct AgentContextPostureSummary {
     pub sessions_analyzed: u64,
     /// Width of the summary window in days (currently 7).
     pub window_days: u64,
-    /// Median session-start baseline (`first_turn_context_tokens`) across
-    /// analyzed sessions that reported one. None when no session did.
+    /// Median first-turn context (`first_turn_context_tokens`) across analyzed
+    /// sessions that reported one. This includes the first user input; it is
+    /// not presented as a pure static-context measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typical_first_turn_tokens: Option<u64>,
-    /// Sessions whose peak context fill exceeded the long-context threshold
-    /// (the same 200k boundary that tags `context_bucket = long`).
+    /// Sessions that reported a measured peak. This is the evidence denominator
+    /// for peak-derived counts when some analyzed sessions had no usage sample.
+    pub peak_session_count: u64,
+    /// Peak sessions whose exact context-window size was evidenced locally.
+    /// Claude's base model identifier does not distinguish standard and 1M
+    /// variants, so this can be lower than `peak_session_count`.
+    pub window_evidenced_session_count: u64,
+    /// Peak-evidenced sessions whose fill exceeded the 200k long-context
+    /// threshold. None when no session reported a peak.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deep_session_count: Option<u64>,
-    /// Sessions whose peak context fill exceeded their model's context window.
+    /// Sessions whose peak exceeded the exact evidenced window. Omitted unless
+    /// every peak session has exact window evidence; partial evidence must not
+    /// become a misleading aggregate zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over_window_session_count: Option<u64>,
     /// Per-session peak fill, oldest → newest, most recent sessions last.
@@ -1477,12 +1487,19 @@ pub struct AgentContextPostureSummary {
 /// One session's peak context fill relative to its model window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentContextSessionPeak {
-    /// Peak fill as percent of the session's model context window. Raw value —
-    /// may exceed 100 for over-window sessions; consumers cap the drawn bar.
-    pub peak_fill_percent: u16,
-    /// True when the peak exceeded the model window.
-    #[serde(default)]
-    pub over_window: bool,
+    /// Raw measured high-water effective input context.
+    pub peak_fill_tokens: u64,
+    /// Exact context window when evidenced. Claude transcript model identifiers
+    /// normally omit the 1M variant, so this is intentionally optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    /// Peak fill relative to an exact evidenced window. Raw value may exceed
+    /// 100; consumers cap the drawn bar. Omitted when the window is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_fill_percent: Option<u16>,
+    /// Whether the peak exceeded the exact evidenced window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_window: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3261,16 +3278,22 @@ mod tests {
                 sessions_analyzed: 21,
                 window_days: 7,
                 typical_first_turn_tokens: Some(72_400),
+                peak_session_count: 2,
+                window_evidenced_session_count: 1,
                 deep_session_count: Some(8),
-                over_window_session_count: Some(1),
+                over_window_session_count: None,
                 session_peaks: vec![
                     AgentContextSessionPeak {
-                        peak_fill_percent: 34,
-                        over_window: false,
+                        peak_fill_tokens: 68_000,
+                        context_window_tokens: None,
+                        peak_fill_percent: None,
+                        over_window: None,
                     },
                     AgentContextSessionPeak {
-                        peak_fill_percent: 104,
-                        over_window: true,
+                        peak_fill_tokens: 1_040_000,
+                        context_window_tokens: Some(1_000_000),
+                        peak_fill_percent: Some(104),
+                        over_window: Some(true),
                     },
                 ],
                 compaction_count: Some(5),
@@ -3286,6 +3309,10 @@ mod tests {
         assert_eq!(json["posture"]["sessions_analyzed"], 21);
         assert_eq!(json["posture"]["typical_first_turn_tokens"], 72_400);
         assert_eq!(json["posture"]["session_peaks"][1]["over_window"], true);
+        assert!(json["posture"]["session_peaks"][0]
+            .get("peak_fill_percent")
+            .is_none());
+        assert!(json["posture"].get("over_window_session_count").is_none());
         let round_tripped: AgentContextStatus =
             serde_json::from_value(json).expect("deserialize context");
         assert_eq!(round_tripped, context);
