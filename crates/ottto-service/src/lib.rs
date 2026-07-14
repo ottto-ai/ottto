@@ -2497,6 +2497,7 @@ fn personal_meter_source_from_health(health: &SourceHealth) -> PersonalMeterLoca
                 snapshot
                     .quota_windows
                     .iter()
+                    .filter(|window| quota_window_matches_snapshot_account(snapshot, window))
                     .find_map(|window| window.model.clone())
             })
         });
@@ -2534,7 +2535,14 @@ fn personal_meter_source_from_health(health: &SourceHealth) -> PersonalMeterLoca
         model,
         plan,
         quota_windows: agent_status
-            .map(|snapshot| snapshot.quota_windows.clone())
+            .map(|snapshot| {
+                snapshot
+                    .quota_windows
+                    .iter()
+                    .filter(|window| quota_window_matches_snapshot_account(snapshot, window))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default(),
         pending_local_delta: personal_meter_delta(health),
         freshness: personal_meter_freshness(health),
@@ -3629,7 +3637,13 @@ fn merge_current_plan_quota(detected: &mut [DetectedUse], snapshot: &AgentStatus
     if plan_keys.is_empty() {
         return;
     }
-    let Some(window) = pick_quota_window(&snapshot.quota_windows) else {
+    let account_windows: Vec<AgentQuotaWindow> = snapshot
+        .quota_windows
+        .iter()
+        .filter(|window| quota_window_matches_snapshot_account(snapshot, window))
+        .cloned()
+        .collect();
+    let Some(window) = pick_quota_window(&account_windows) else {
         return;
     };
     let (state, used_percent, resets_at) = quota_state_from_window(window);
@@ -3645,6 +3659,60 @@ fn merge_current_plan_quota(detected: &mut [DetectedUse], snapshot: &AgentStatus
             entry.quota_resets_at = resets_at.clone();
         }
     }
+}
+
+fn quota_window_matches_snapshot_account(
+    snapshot: &AgentStatusSnapshot,
+    window: &AgentQuotaWindow,
+) -> bool {
+    let window_account_hash = window
+        .account_identifier_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let window_organization_hash = window
+        .organization_identifier_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if window_account_hash.is_some() || window_organization_hash.is_some() {
+        let Some(account) = snapshot.account.as_ref() else {
+            return false;
+        };
+        if let Some(window_account_hash) = window_account_hash {
+            let account_matches = account
+                .account_identifier_hash
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|account_hash| account_hash == window_account_hash);
+            if !account_matches {
+                return false;
+            }
+        }
+        return match window_organization_hash {
+            Some(window_organization_hash) => account
+                .organization_identifier_hash
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|organization_hash| organization_hash == window_organization_hash),
+            None => true,
+        };
+    }
+    let Some(window_label) = window
+        .account_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    snapshot
+        .account
+        .as_ref()
+        .and_then(|account| account.email.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|account_label| account_label.eq_ignore_ascii_case(window_label))
 }
 
 /// Pick the most constraining quota window: a rate-limited window first, then
@@ -6356,7 +6424,7 @@ mod tests {
                 login_state: AgentLoginState::SignedIn,
                 provider: Some("openai".to_string()),
                 auth_method: Some("chatgpt".to_string()),
-                email: None,
+                email: Some("current@example.com".to_string()),
                 account_id: None,
                 organization_id: None,
                 organization_label: None,
@@ -6402,6 +6470,37 @@ mod tests {
                     remaining: None,
                     used_percent: Some(92),
                     left_percent: Some(8),
+                    ..Default::default()
+                },
+                AgentQuotaWindow {
+                    name: "other-desktop-account".to_string(),
+                    scope: AgentQuotaWindowScope::Account,
+                    status: AgentQuotaWindowStatus::RateLimited,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: None,
+                    account_label: Some("other@example.com".to_string()),
+                    account_identifier_hash: Some("other-account-hash".to_string()),
+                    organization_identifier_hash: Some("other-organization-hash".to_string()),
+                    window_seconds: Some(604_800),
+                    started_at: None,
+                    resets_at: Some("2026-06-01T00:00:00Z".to_string()),
+                    quota: None,
+                    remaining: None,
+                    used_percent: Some(100),
+                    left_percent: Some(0),
+                    ..Default::default()
+                },
+                AgentQuotaWindow {
+                    name: "other-desktop-organization".to_string(),
+                    scope: AgentQuotaWindowScope::Account,
+                    status: AgentQuotaWindowStatus::RateLimited,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: None,
+                    account_label: Some("current@example.com".to_string()),
+                    organization_identifier_hash: Some("other-organization-hash".to_string()),
+                    window_seconds: Some(604_800),
+                    used_percent: Some(100),
+                    left_percent: Some(0),
                     ..Default::default()
                 },
             ],
@@ -7151,22 +7250,55 @@ mod tests {
             available_model_details: Vec::new(),
             context_window_tokens: None,
         });
-        snapshot.quota_windows = vec![AgentQuotaWindow {
-            name: "weekly".to_string(),
-            scope: ottto_protocol::AgentQuotaWindowScope::Account,
-            status: AgentQuotaWindowStatus::Ok,
-            freshness: AgentQuotaWindowFreshness::Fresh,
-            model: None,
-            account_label: Some("ron@example.com".to_string()),
-            window_seconds: Some(604_800),
-            started_at: Some("2026-05-04T00:00:00Z".to_string()),
-            resets_at: Some("2026-05-11T00:00:00Z".to_string()),
-            quota: Some(100),
-            remaining: Some(42),
-            used_percent: Some(58),
-            left_percent: Some(42),
-            ..Default::default()
-        }];
+        snapshot.quota_windows = vec![
+            AgentQuotaWindow {
+                name: "weekly".to_string(),
+                scope: ottto_protocol::AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: None,
+                account_label: Some("ron@example.com".to_string()),
+                window_seconds: Some(604_800),
+                started_at: Some("2026-05-04T00:00:00Z".to_string()),
+                resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+                quota: Some(100),
+                remaining: Some(42),
+                used_percent: Some(58),
+                left_percent: Some(42),
+                ..Default::default()
+            },
+            AgentQuotaWindow {
+                name: "other-desktop-account".to_string(),
+                scope: ottto_protocol::AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::RateLimited,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: None,
+                account_label: Some("other@example.com".to_string()),
+                account_identifier_hash: Some("other-account-hash".to_string()),
+                organization_identifier_hash: Some("other-organization-hash".to_string()),
+                window_seconds: Some(604_800),
+                started_at: Some("2026-05-04T00:00:00Z".to_string()),
+                resets_at: Some("2026-05-11T00:00:00Z".to_string()),
+                quota: Some(100),
+                remaining: Some(0),
+                used_percent: Some(100),
+                left_percent: Some(0),
+                ..Default::default()
+            },
+            AgentQuotaWindow {
+                name: "other-desktop-organization".to_string(),
+                scope: ottto_protocol::AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::RateLimited,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: None,
+                account_label: Some("ron@example.com".to_string()),
+                organization_identifier_hash: Some("other-organization-hash".to_string()),
+                window_seconds: Some(604_800),
+                used_percent: Some(100),
+                left_percent: Some(0),
+                ..Default::default()
+            },
+        ];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
             evidence_method: Some("local_status".to_string()),

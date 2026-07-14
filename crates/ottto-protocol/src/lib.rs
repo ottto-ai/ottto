@@ -1285,6 +1285,10 @@ pub struct AgentQuotaWindow {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
     pub window_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Rfc3339Timestamp>,
@@ -1362,6 +1366,10 @@ pub struct AgentCreditBalance {
     pub unit: AgentCreditBalanceUnit,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2198,6 +2206,11 @@ pub struct LocalControlRequest {
     pub command: LocalControlCommand,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeDesktopWebUsagePreferenceState {
+    pub enabled: bool,
+}
+
 fn deserialize_local_control_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
 where
     D: Deserializer<'de>,
@@ -2346,6 +2359,13 @@ pub enum LocalControlCommand {
     AuthStatus,
     AgentStatusRefresh {
         source: Option<SourceKind>,
+    },
+    /// Read or update the explicit local opt-in for Claude Desktop web usage.
+    /// The daemon owns the marker and credential access; clients never receive
+    /// cookie or Keychain bytes.
+    ClaudeDesktopWebUsagePreference {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
     },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3858,6 +3878,27 @@ mod tests {
             serde_json::json!("personal_meter_local_snapshot")
         );
         assert_eq!(encoded["source"], serde_json::json!("codex"));
+    }
+
+    #[test]
+    fn claude_desktop_web_usage_preference_command_round_trips() {
+        let request = serde_json::from_str::<LocalControlRequest>(&format!(
+            r#"{{"request_id":"req_desktop_usage","protocol_version":{PROTOCOL_VERSION},"command":"claude_desktop_web_usage_preference","enabled":true}}"#
+        ))
+        .expect("Claude Desktop usage preference request should deserialize");
+
+        assert_eq!(
+            request.command,
+            LocalControlCommand::ClaudeDesktopWebUsagePreference {
+                enabled: Some(true),
+            }
+        );
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(
+            encoded["command"],
+            serde_json::json!("claude_desktop_web_usage_preference")
+        );
+        assert_eq!(encoded["enabled"], serde_json::json!(true));
     }
 
     #[test]

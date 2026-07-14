@@ -1,4 +1,6 @@
+use aes::Aes128;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use ottto_core::{
     compiled_release_version, default_support_dir, read_claude_statusline_cache,
     read_claude_statusline_context_cache, read_claude_statusline_context_history,
@@ -14,18 +16,22 @@ use ottto_protocol::{
     AgentStatusCollectionMethod, AgentStatusConfidence, AgentStatusDiagnostic,
     AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, SourceKind,
 };
+use pbkdf2::pbkdf2_hmac;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
+use zeroize::Zeroizing;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,6 +50,22 @@ const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
+const CLAUDE_DESKTOP_SAFE_STORAGE_SERVICE: &str = "Claude Safe Storage";
+const CLAUDE_DESKTOP_SESSION_COOKIE_NAME: &str = "sessionKey";
+const CLAUDE_DESKTOP_ACTIVE_ORG_COOKIE_NAME: &str = "lastActiveOrg";
+const CLAUDE_DESKTOP_USAGE_CACHE_FILE: &str = "claude-desktop-web-usage-cache.json";
+const CLAUDE_DESKTOP_USAGE_ENABLED_FILE: &str = "claude-desktop-web-usage-enabled";
+const CLAUDE_DESKTOP_USAGE_ENDPOINT_PREFIX: &str = "https://claude.ai/api/organizations";
+const CLAUDE_DESKTOP_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+const CLAUDE_DESKTOP_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 5 * 60;
+const CLAUDE_DESKTOP_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
+const CLAUDE_DESKTOP_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
+const CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION: u16 = 2;
+const CHROMIUM_COOKIE_KEY_ITERATIONS: u32 = 1003;
+const CHROMIUM_COOKIE_KEY_BYTES: usize = 16;
+const CHROMIUM_COOKIE_HOST_DIGEST_VERSION: i64 = 24;
+static CLAUDE_DESKTOP_USAGE_ATTEMPT_GATE: OnceLock<Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+static CLAUDE_DESKTOP_USAGE_ACCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -87,6 +109,30 @@ struct ClaudeOAuthUsageCache {
     /// absent; version-1 caches are discarded wholesale on read.
     #[serde(default)]
     credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeDesktopWebUsageCache {
+    schema_version: u16,
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+    observed_at_epoch_seconds: u64,
+    next_refresh_after_epoch_seconds: u64,
+    windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeDesktopWebUsageTarget {
+    account_identifier_hash: String,
+    account_label: String,
+}
+
+struct ClaudeDesktopWebSession {
+    session_key: Zeroizing<String>,
+    organization_id: String,
+    organization_identifier_hash: String,
 }
 
 const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 2;
@@ -603,6 +649,47 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
             AgentDiagnosticSeverity::Info,
             "Claude Desktop Code account/session bucket metadata was detected.",
         ));
+        if let Some(target) = claude_desktop_web_usage_target(&snapshot.plan_observations) {
+            if !claude_desktop_web_usage_enabled() {
+                snapshot.capabilities.push(unsupported_capability(
+                    "desktop_quota_windows",
+                    "Enable Claude Desktop usage in Ottto Settings to allow local Keychain access.",
+                ));
+                return snapshot;
+            }
+            match collect_claude_desktop_web_usage(&claude_desktop_root, &target) {
+                Ok(usage) if !usage.windows.is_empty() => {
+                    snapshot.quota_windows.extend(usage.windows);
+                    snapshot.credit_balances.extend(usage.credit_balances);
+                    snapshot.capabilities.push(supported_capability(
+                        "desktop_quota_windows",
+                        "Collected from Claude Desktop's local web session without persisting credentials.",
+                    ));
+                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                        "claude_desktop_web_usage_detected",
+                        AgentDiagnosticSeverity::Info,
+                        "Claude Desktop usage windows were collected from its active local session.",
+                    ));
+                }
+                Ok(_) => {
+                    snapshot.capabilities.push(unsupported_capability(
+                        "desktop_quota_windows",
+                        "Claude Desktop's usage response did not contain quota windows.",
+                    ));
+                }
+                Err(message) => {
+                    snapshot.capabilities.push(unsupported_capability(
+                        "desktop_quota_windows",
+                        "Claude Desktop usage is unavailable until local Keychain access succeeds.",
+                    ));
+                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                        "claude_desktop_web_usage_unavailable",
+                        AgentDiagnosticSeverity::Warning,
+                        message,
+                    ));
+                }
+            }
+        }
     }
     snapshot
 }
@@ -903,7 +990,10 @@ fn claude_desktop_builder_plan_observation(
         gateway_provider: None,
         subscription_product,
         plan_type,
-        account_label: builder.account_label.or(builder.account_name),
+        account_label: builder
+            .account_label
+            .or(builder.account_name)
+            .or_else(|| is_current.then(|| "Claude Desktop".to_string())),
         account_id: Some(builder.account_uuid),
         organization_label: builder.organization_label,
         organization_id,
@@ -919,6 +1009,524 @@ fn claude_desktop_builder_plan_observation(
         },
         is_current: Some(is_current),
     })
+}
+
+fn claude_desktop_web_usage_target(
+    observations: &[AgentStatusPlanObservation],
+) -> Option<ClaudeDesktopWebUsageTarget> {
+    observations
+        .iter()
+        .find(|observation| {
+            observation.auth_mode.as_deref() == Some("claude_desktop")
+                && observation.is_current == Some(true)
+        })
+        .and_then(|observation| {
+            Some(ClaudeDesktopWebUsageTarget {
+                account_identifier_hash: observation
+                    .account_identifier_hash
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())?
+                    .to_string(),
+                account_label: observation
+                    .account_label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())?
+                    .to_string(),
+            })
+        })
+}
+
+pub(crate) fn claude_desktop_web_usage_enabled() -> bool {
+    default_support_dir()
+        .join(CLAUDE_DESKTOP_USAGE_ENABLED_FILE)
+        .is_file()
+}
+
+pub(crate) fn set_claude_desktop_web_usage_enabled(enabled: bool) -> std::io::Result<bool> {
+    let access_lock = CLAUDE_DESKTOP_USAGE_ACCESS_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = access_lock
+        .lock()
+        .map_err(|_| std::io::Error::other("Claude Desktop usage access lock is unavailable"))?;
+    let path = default_support_dir().join(CLAUDE_DESKTOP_USAGE_ENABLED_FILE);
+    if enabled {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, b"enabled\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+    } else {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let cache_path = claude_desktop_web_usage_cache_path();
+        match fs::remove_file(cache_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(gate) = CLAUDE_DESKTOP_USAGE_ATTEMPT_GATE.get() {
+            gate.lock()
+                .map_err(|_| {
+                    std::io::Error::other("Claude Desktop usage retry gate is unavailable")
+                })?
+                .clear();
+        }
+    }
+    Ok(claude_desktop_web_usage_enabled())
+}
+
+fn collect_claude_desktop_web_usage(
+    desktop_root: &Path,
+    target: &ClaudeDesktopWebUsageTarget,
+) -> Result<ClaudeOAuthUsage, String> {
+    let access_lock = CLAUDE_DESKTOP_USAGE_ACCESS_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = access_lock
+        .lock()
+        .map_err(|_| "Claude Desktop usage access lock is unavailable.".to_string())?;
+    if !claude_desktop_web_usage_enabled() {
+        return Err("Claude Desktop usage access was disabled.".to_string());
+    }
+
+    let now = current_unix_seconds();
+    let account_cached = read_claude_desktop_web_usage_cache()
+        .filter(|cache| cache.account_identifier_hash == target.account_identifier_hash);
+    if let Some(cache) = account_cached.as_ref() {
+        let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
+        if !cache.windows.is_empty()
+            && cache_age <= CLAUDE_DESKTOP_USAGE_CACHE_MAX_AGE_SECONDS
+            && (cache_age <= CLAUDE_DESKTOP_USAGE_CACHE_FRESH_AGE_SECONDS
+                || now < cache.next_refresh_after_epoch_seconds)
+        {
+            return Ok(claude_desktop_web_usage_from_cache(
+                cache.clone(),
+                now,
+                &target.account_label,
+            ));
+        }
+        if now < cache.next_refresh_after_epoch_seconds {
+            return Err(
+                "Claude Desktop usage refresh is waiting for its local retry window.".to_string(),
+            );
+        }
+    }
+
+    if !claim_claude_desktop_usage_attempt(&target.account_identifier_hash, now) {
+        return Err(
+            "Claude Desktop usage refresh is waiting for its local retry window.".to_string(),
+        );
+    }
+
+    // Persist the retry gate before touching Keychain or the network. Manual UI
+    // refreshes can arrive faster than the normal status cadence; failures must
+    // not turn those refreshes into repeated prompts or endpoint calls.
+    let mut preflight_cache =
+        account_cached
+            .clone()
+            .unwrap_or_else(|| ClaudeDesktopWebUsageCache {
+                schema_version: CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: target.account_identifier_hash.clone(),
+                organization_identifier_hash: String::new(),
+                observed_at_epoch_seconds: 0,
+                next_refresh_after_epoch_seconds: now + CLAUDE_DESKTOP_USAGE_REFRESH_SECONDS,
+                windows: Vec::new(),
+                credit_balances: Vec::new(),
+            });
+    preflight_cache.next_refresh_after_epoch_seconds = now + CLAUDE_DESKTOP_USAGE_REFRESH_SECONDS;
+    let _ = write_claude_desktop_web_usage_cache(&preflight_cache);
+
+    let session = read_claude_desktop_web_session(desktop_root)?;
+    let mut attempt_cache = claude_desktop_attempt_cache_for_session(
+        account_cached,
+        target,
+        &session,
+        preflight_cache.next_refresh_after_epoch_seconds,
+    );
+    let _ = write_claude_desktop_web_usage_cache(&attempt_cache);
+
+    let cookie_header = Zeroizing::new(format!(
+        "{}={}",
+        CLAUDE_DESKTOP_SESSION_COOKIE_NAME,
+        session.session_key.as_str()
+    ));
+    let endpoint = format!(
+        "{}/{}/usage",
+        CLAUDE_DESKTOP_USAGE_ENDPOINT_PREFIX, session.organization_id
+    );
+    let response = ureq::get(&endpoint)
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/json")
+        .set("Cookie", cookie_header.as_str())
+        .set("Origin", "https://claude.ai")
+        .set("Referer", "https://claude.ai/settings/usage")
+        .set("anthropic-client-platform", "web_claude_ai")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/136.0.0.0 Electron/36.0.0 Safari/537.36",
+        )
+        .timeout(COMMAND_TIMEOUT)
+        .call();
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(429, response)) => {
+            let retry_after = claude_desktop_retry_after_epoch_seconds(&response, now);
+            attempt_cache.next_refresh_after_epoch_seconds = retry_after;
+            let _ = write_claude_desktop_web_usage_cache(&attempt_cache);
+            if !attempt_cache.windows.is_empty()
+                && now.saturating_sub(attempt_cache.observed_at_epoch_seconds)
+                    <= CLAUDE_DESKTOP_USAGE_CACHE_MAX_AGE_SECONDS
+            {
+                return Ok(claude_desktop_web_usage_from_cache(
+                    attempt_cache,
+                    now,
+                    &target.account_label,
+                ));
+            }
+            return Err("Claude Desktop usage endpoint is temporarily rate limited.".to_string());
+        }
+        Err(error) => {
+            if !attempt_cache.windows.is_empty()
+                && now.saturating_sub(attempt_cache.observed_at_epoch_seconds)
+                    <= CLAUDE_DESKTOP_USAGE_CACHE_MAX_AGE_SECONDS
+            {
+                return Ok(claude_desktop_web_usage_from_cache(
+                    attempt_cache,
+                    now,
+                    &target.account_label,
+                ));
+            }
+            return Err(claude_desktop_usage_error(error));
+        }
+    };
+    let value: Value = response.into_json().map_err(|_| {
+        "Claude Desktop usage endpoint returned an unreadable response.".to_string()
+    })?;
+    let mut usage = ClaudeOAuthUsage {
+        windows: claude_oauth_quota_windows(&value),
+        credit_balances: claude_oauth_credit_balances(&value),
+    };
+    if !usage.windows.is_empty() {
+        let cache = ClaudeDesktopWebUsageCache {
+            schema_version: CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: target.account_identifier_hash.clone(),
+            organization_identifier_hash: session.organization_identifier_hash.clone(),
+            observed_at_epoch_seconds: now,
+            next_refresh_after_epoch_seconds: now + CLAUDE_DESKTOP_USAGE_REFRESH_SECONDS,
+            windows: usage.windows.clone(),
+            credit_balances: usage.credit_balances.clone(),
+        };
+        let _ = write_claude_desktop_web_usage_cache(&cache);
+    }
+    label_claude_desktop_usage(
+        &mut usage,
+        &target.account_label,
+        &target.account_identifier_hash,
+        &session.organization_identifier_hash,
+    );
+    Ok(usage)
+}
+
+fn claude_desktop_attempt_cache_for_session(
+    cached: Option<ClaudeDesktopWebUsageCache>,
+    target: &ClaudeDesktopWebUsageTarget,
+    session: &ClaudeDesktopWebSession,
+    next_refresh_after_epoch_seconds: u64,
+) -> ClaudeDesktopWebUsageCache {
+    cached
+        .filter(|cache| cache.organization_identifier_hash == session.organization_identifier_hash)
+        .unwrap_or_else(|| ClaudeDesktopWebUsageCache {
+            schema_version: CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: target.account_identifier_hash.clone(),
+            organization_identifier_hash: session.organization_identifier_hash.clone(),
+            observed_at_epoch_seconds: 0,
+            next_refresh_after_epoch_seconds,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        })
+}
+
+fn claim_claude_desktop_usage_attempt(account_identifier_hash: &str, now: u64) -> bool {
+    let gate = CLAUDE_DESKTOP_USAGE_ATTEMPT_GATE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut gate) = gate.lock() else {
+        return false;
+    };
+    if gate
+        .get(account_identifier_hash)
+        .is_some_and(|next_attempt| now < *next_attempt)
+    {
+        return false;
+    }
+    gate.insert(
+        account_identifier_hash.to_string(),
+        now + CLAUDE_DESKTOP_USAGE_REFRESH_SECONDS,
+    );
+    true
+}
+
+fn read_claude_desktop_web_session(desktop_root: &Path) -> Result<ClaudeDesktopWebSession, String> {
+    let cookie_path = desktop_root.join("Cookies");
+    let connection = Connection::open_with_flags(
+        cookie_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| "Claude Desktop's local cookie database could not be read.".to_string())?;
+    let read_cookie = |name: &str| {
+        connection
+            .query_row(
+                "SELECT host_key, encrypted_value FROM cookies \
+             WHERE name = ?1 AND host_key IN ('claude.ai', '.claude.ai') \
+             ORDER BY CASE host_key WHEN '.claude.ai' THEN 0 ELSE 1 END LIMIT 1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| "Claude Desktop's local session cookies could not be read.".to_string())?
+            .ok_or_else(|| format!("Claude Desktop does not currently have a {name} cookie."))
+    };
+    let session_cookie: (String, Vec<u8>) = read_cookie(CLAUDE_DESKTOP_SESSION_COOKIE_NAME)?;
+    let active_org_cookie: (String, Vec<u8>) = read_cookie(CLAUDE_DESKTOP_ACTIVE_ORG_COOKIE_NAME)?;
+    let cookie_database_version = connection
+        .query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_default();
+    let safe_storage_password = read_claude_desktop_safe_storage_password()?;
+    let session_key = decrypt_chromium_cookie(
+        &session_cookie.0,
+        &session_cookie.1,
+        cookie_database_version,
+        safe_storage_password.as_bytes(),
+    )?;
+    let active_org = decrypt_chromium_cookie_value(
+        &active_org_cookie.0,
+        &active_org_cookie.1,
+        cookie_database_version,
+        safe_storage_password.as_bytes(),
+    )?;
+    let organization_id = safe_local_identifier(active_org.as_str())
+        .ok_or_else(|| "Claude Desktop's active organization cookie was invalid.".to_string())?
+        .to_string();
+    let organization_identifier_hash =
+        billing_identity_hash("anthropic", "organization", &organization_id).ok_or_else(|| {
+            "Claude Desktop's active organization could not be identified.".to_string()
+        })?;
+    Ok(ClaudeDesktopWebSession {
+        session_key,
+        organization_id,
+        organization_identifier_hash,
+    })
+}
+
+fn read_claude_desktop_safe_storage_password() -> Result<Zeroizing<String>, String> {
+    let output = run_command_capture(
+        "security",
+        &[
+            "find-generic-password",
+            "-s",
+            CLAUDE_DESKTOP_SAFE_STORAGE_SERVICE,
+            "-w",
+        ],
+        COMMAND_TIMEOUT,
+    );
+    if !output.command_found || !output.success {
+        return Err(
+            "macOS Keychain did not grant access to Claude Desktop's local session.".to_string(),
+        );
+    }
+    let mut password = Zeroizing::new(output.stdout);
+    while matches!(password.as_bytes().last(), Some(b'\n' | b'\r')) {
+        password.pop();
+    }
+    if password.is_empty() {
+        return Err("Claude Desktop's Keychain entry was empty.".to_string());
+    }
+    Ok(password)
+}
+
+fn decrypt_chromium_cookie(
+    host_key: &str,
+    encrypted_value: &[u8],
+    cookie_database_version: i64,
+    safe_storage_password: &[u8],
+) -> Result<Zeroizing<String>, String> {
+    let session_key = decrypt_chromium_cookie_value(
+        host_key,
+        encrypted_value,
+        cookie_database_version,
+        safe_storage_password,
+    )?;
+    if !session_key.starts_with("sk-ant-")
+        || session_key.len() > 512
+        || session_key.chars().any(char::is_whitespace)
+    {
+        return Err("Claude Desktop's session cookie had an invalid format.".to_string());
+    }
+    Ok(session_key)
+}
+
+fn decrypt_chromium_cookie_value(
+    host_key: &str,
+    encrypted_value: &[u8],
+    cookie_database_version: i64,
+    safe_storage_password: &[u8],
+) -> Result<Zeroizing<String>, String> {
+    let ciphertext = encrypted_value.strip_prefix(b"v10").ok_or_else(|| {
+        "Claude Desktop's session cookie uses an unsupported encryption format.".to_string()
+    })?;
+    let mut key = Zeroizing::new([0_u8; CHROMIUM_COOKIE_KEY_BYTES]);
+    pbkdf2_hmac::<Sha1>(
+        safe_storage_password,
+        b"saltysalt",
+        CHROMIUM_COOKIE_KEY_ITERATIONS,
+        key.as_mut(),
+    );
+    let decryptor = cbc::Decryptor::<Aes128>::new(key.as_ref().into(), (&[b' '; 16]).into());
+    let plaintext = decryptor
+        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .map_err(|_| "Claude Desktop's session cookie could not be decrypted.".to_string())?;
+    let mut plaintext = Zeroizing::new(plaintext);
+    if cookie_database_version >= CHROMIUM_COOKIE_HOST_DIGEST_VERSION {
+        let expected_digest = Sha256::digest(host_key.as_bytes());
+        if plaintext.len() < expected_digest.len()
+            || plaintext[..expected_digest.len()] != expected_digest[..]
+        {
+            return Err("Claude Desktop's session cookie failed its host check.".to_string());
+        }
+        plaintext.drain(..expected_digest.len());
+    }
+    let session_key = String::from_utf8(std::mem::take(plaintext.as_mut()))
+        .map_err(|_| "Claude Desktop's session cookie was not valid text.".to_string())?;
+    let mut value = Zeroizing::new(session_key);
+    while matches!(value.as_bytes().last(), Some(b'\n' | b'\r')) {
+        value.pop();
+    }
+    Ok(value)
+}
+
+fn claude_desktop_web_usage_cache_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_DESKTOP_USAGE_CACHE_FILE)
+}
+
+fn read_claude_desktop_web_usage_cache() -> Option<ClaudeDesktopWebUsageCache> {
+    let body = fs::read_to_string(claude_desktop_web_usage_cache_path()).ok()?;
+    let cache: ClaudeDesktopWebUsageCache = serde_json::from_str(&body).ok()?;
+    (cache.schema_version == CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION).then_some(cache)
+}
+
+fn write_claude_desktop_web_usage_cache(cache: &ClaudeDesktopWebUsageCache) -> std::io::Result<()> {
+    let path = claude_desktop_web_usage_cache_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut cache = cache.clone();
+    for window in &mut cache.windows {
+        window.account_label = None;
+        window.account_identifier_hash = None;
+        window.organization_identifier_hash = None;
+    }
+    for balance in &mut cache.credit_balances {
+        balance.account_label = None;
+        balance.account_identifier_hash = None;
+        balance.organization_identifier_hash = None;
+    }
+    let body = serde_json::to_vec_pretty(&cache).map_err(std::io::Error::other)?;
+    fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn claude_desktop_web_usage_from_cache(
+    cache: ClaudeDesktopWebUsageCache,
+    now: u64,
+    account_label: &str,
+) -> ClaudeOAuthUsage {
+    let account_identifier_hash = cache.account_identifier_hash.clone();
+    let organization_identifier_hash = cache.organization_identifier_hash.clone();
+    let cache_is_stale = now.saturating_sub(cache.observed_at_epoch_seconds)
+        > CLAUDE_DESKTOP_USAGE_CACHE_FRESH_AGE_SECONDS;
+    let mut usage = ClaudeOAuthUsage {
+        windows: cache
+            .windows
+            .into_iter()
+            .map(|mut window| {
+                if cache_is_stale {
+                    window.status = AgentQuotaWindowStatus::Unknown;
+                    window.freshness = AgentQuotaWindowFreshness::Stale;
+                }
+                window
+            })
+            .collect(),
+        credit_balances: cache
+            .credit_balances
+            .into_iter()
+            .map(|mut balance| {
+                if cache_is_stale {
+                    balance.status = AgentCreditBalanceStatus::Stale;
+                    balance.freshness = AgentQuotaWindowFreshness::Stale;
+                }
+                balance
+            })
+            .collect(),
+    };
+    label_claude_desktop_usage(
+        &mut usage,
+        account_label,
+        &account_identifier_hash,
+        &organization_identifier_hash,
+    );
+    usage
+}
+
+fn label_claude_desktop_usage(
+    usage: &mut ClaudeOAuthUsage,
+    account_label: &str,
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) {
+    for window in &mut usage.windows {
+        window.account_label = Some(account_label.to_string());
+        window.account_identifier_hash = Some(account_identifier_hash.to_string());
+        window.organization_identifier_hash = Some(organization_identifier_hash.to_string());
+    }
+    for balance in &mut usage.credit_balances {
+        balance.account_label = Some(account_label.to_string());
+        balance.account_identifier_hash = Some(account_identifier_hash.to_string());
+        balance.organization_identifier_hash = Some(organization_identifier_hash.to_string());
+    }
+}
+
+fn claude_desktop_retry_after_epoch_seconds(response: &ureq::Response, now: u64) -> u64 {
+    response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|seconds| now.saturating_add(seconds))
+        .unwrap_or(now + CLAUDE_DESKTOP_USAGE_RETRY_AFTER_FALLBACK_SECONDS)
+}
+
+fn claude_desktop_usage_error(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::Status(401 | 403, _) => {
+            "Claude Desktop rejected its local session; sign in again in Claude.".to_string()
+        }
+        ureq::Error::Status(429, _) => {
+            "Claude Desktop usage endpoint is temporarily rate limited.".to_string()
+        }
+        ureq::Error::Status(status, _) => {
+            format!("Claude Desktop usage endpoint returned HTTP {status}.")
+        }
+        ureq::Error::Transport(_) => "Claude Desktop usage endpoint was unreachable.".to_string(),
+    }
 }
 
 impl ClaudeDesktopProfileBuilder {
@@ -5537,6 +6145,202 @@ for line in sys.stdin:
             parse_claude_oauth_access_token(payload).as_deref(),
             Some("access-token")
         );
+    }
+
+    #[test]
+    fn claude_desktop_chromium_cookie_decrypts_v24_host_bound_value() {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        use zeroize::Zeroize;
+
+        let host = ".claude.ai";
+        let safe_storage_password = b"fixture-safe-storage-password";
+        let expected_session_key = "sk-ant-sid-fixture-value";
+        let mut plaintext = Sha256::digest(host.as_bytes()).to_vec();
+        plaintext.extend_from_slice(expected_session_key.as_bytes());
+        let mut key = [0_u8; CHROMIUM_COOKIE_KEY_BYTES];
+        pbkdf2_hmac::<Sha1>(
+            safe_storage_password,
+            b"saltysalt",
+            CHROMIUM_COOKIE_KEY_ITERATIONS,
+            &mut key,
+        );
+        let iv = [b' '; 16];
+        let ciphertext = cbc::Encryptor::<Aes128>::new((&key).into(), (&iv).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        key.zeroize();
+        plaintext.zeroize();
+        let mut encrypted_value = b"v10".to_vec();
+        encrypted_value.extend_from_slice(&ciphertext);
+
+        let decrypted = decrypt_chromium_cookie(
+            host,
+            &encrypted_value,
+            CHROMIUM_COOKIE_HOST_DIGEST_VERSION,
+            safe_storage_password,
+        )
+        .expect("decrypt host-bound cookie");
+
+        assert_eq!(decrypted.as_str(), expected_session_key);
+    }
+
+    #[test]
+    fn claude_desktop_chromium_cookie_rejects_wrong_host() {
+        use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+        use zeroize::Zeroize;
+
+        let safe_storage_password = b"fixture-safe-storage-password";
+        let mut plaintext = Sha256::digest(b".different.example").to_vec();
+        plaintext.extend_from_slice(b"sk-ant-sid-fixture-value");
+        let mut key = [0_u8; CHROMIUM_COOKIE_KEY_BYTES];
+        pbkdf2_hmac::<Sha1>(
+            safe_storage_password,
+            b"saltysalt",
+            CHROMIUM_COOKIE_KEY_ITERATIONS,
+            &mut key,
+        );
+        let iv = [b' '; 16];
+        let ciphertext = cbc::Encryptor::<Aes128>::new((&key).into(), (&iv).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(&plaintext);
+        key.zeroize();
+        plaintext.zeroize();
+        let mut encrypted_value = b"v10".to_vec();
+        encrypted_value.extend_from_slice(&ciphertext);
+
+        let error = decrypt_chromium_cookie(
+            ".claude.ai",
+            &encrypted_value,
+            CHROMIUM_COOKIE_HOST_DIGEST_VERSION,
+            safe_storage_password,
+        )
+        .expect_err("reject a cookie copied from another host");
+
+        assert_eq!(
+            error,
+            "Claude Desktop's session cookie failed its host check."
+        );
+    }
+
+    #[test]
+    fn claude_desktop_web_target_requires_current_labeled_desktop_account() {
+        let observations = vec![AgentStatusPlanObservation {
+            observed_at: Some("2026-07-14T18:00:00Z".to_string()),
+            evidence_method: Some("claude_desktop_session_bucket".to_string()),
+            source_session_id: None,
+            provider: Some("anthropic".to_string()),
+            billing_provider: Some("anthropic".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            auth_mode: Some("claude_desktop".to_string()),
+            gateway_provider: None,
+            subscription_product: Some("claude_max".to_string()),
+            plan_type: Some("max".to_string()),
+            account_label: Some("person@example.com".to_string()),
+            account_id: Some("account-123".to_string()),
+            organization_label: None,
+            organization_id: Some("organization-456".to_string()),
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("provider_account_id".to_string()),
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::High,
+            is_current: Some(true),
+        }];
+
+        let target = claude_desktop_web_usage_target(&observations).expect("current target");
+
+        assert_eq!(target.account_identifier_hash, "account-hash");
+        assert_eq!(target.account_label, "person@example.com");
+    }
+
+    #[test]
+    fn current_claude_desktop_profile_gets_safe_label_fallback() {
+        let observation = claude_desktop_builder_plan_observation(
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "account-123".to_string(),
+                organization_uuids: BTreeSet::from(["organization-456".to_string()]),
+                code_session_count: 1,
+                ..Default::default()
+            },
+            "2026-07-14T18:00:00Z",
+            Some("account-123"),
+        )
+        .expect("current Desktop observation");
+
+        assert_eq!(observation.account_label.as_deref(), Some("Claude Desktop"));
+        assert!(claude_desktop_web_usage_target(&[observation]).is_some());
+    }
+
+    #[test]
+    fn claude_desktop_org_switch_drops_previous_org_quota_cache() {
+        let target = ClaudeDesktopWebUsageTarget {
+            account_identifier_hash: "account-hash".to_string(),
+            account_label: "person@example.com".to_string(),
+        };
+        let session = ClaudeDesktopWebSession {
+            session_key: Zeroizing::new("sk-ant-sid-fixture".to_string()),
+            organization_id: "new-organization".to_string(),
+            organization_identifier_hash: "new-organization-hash".to_string(),
+        };
+        let old_cache = ClaudeDesktopWebUsageCache {
+            schema_version: CLAUDE_DESKTOP_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-hash".to_string(),
+            organization_identifier_hash: "old-organization-hash".to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 200,
+            windows: vec![AgentQuotaWindow {
+                name: "weekly".to_string(),
+                used_percent: Some(99),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        };
+
+        let cache =
+            claude_desktop_attempt_cache_for_session(Some(old_cache), &target, &session, 300);
+
+        assert_eq!(cache.organization_identifier_hash, "new-organization-hash");
+        assert_eq!(cache.observed_at_epoch_seconds, 0);
+        assert!(cache.windows.is_empty());
+        assert!(cache.credit_balances.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn claude_desktop_web_preference_is_explicit_and_disable_clears_cache() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-web-preference-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+
+        assert!(!claude_desktop_web_usage_enabled());
+        assert!(set_claude_desktop_web_usage_enabled(true).expect("enable preference"));
+        let marker = support_dir.join(CLAUDE_DESKTOP_USAGE_ENABLED_FILE);
+        assert!(marker.is_file());
+        assert_eq!(
+            std::fs::metadata(&marker)
+                .expect("marker metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::write(
+            support_dir.join(CLAUDE_DESKTOP_USAGE_CACHE_FILE),
+            b"normalized-cache-fixture",
+        )
+        .expect("write cache fixture");
+
+        assert!(!set_claude_desktop_web_usage_enabled(false).expect("disable preference"));
+        assert!(!marker.exists());
+        assert!(!support_dir.join(CLAUDE_DESKTOP_USAGE_CACHE_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(support_dir);
     }
 
     #[test]
