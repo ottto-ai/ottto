@@ -161,13 +161,13 @@ pub fn parse_claude_statusline_context_window_payload(
         &["used_percentage", "used_percent", "pct_context"],
     )
     .and_then(percent_to_u8);
-    let active_tokens = active_tokens_from_context_window(&Value::Object(context_window.clone()))
-        .or_else(|| {
+    let mut active_tokens =
+        active_tokens_from_context_window(&Value::Object(context_window.clone())).or_else(|| {
             max_tokens.and_then(|max| {
                 used_percent.map(|percent| ((max as f64) * (percent as f64 / 100.0)).round() as u64)
             })
         });
-    let remaining_tokens = u64_at(
+    let mut remaining_tokens = u64_at(
         &Value::Object(context_window.clone()),
         &[
             "remaining_tokens",
@@ -190,6 +190,17 @@ pub fn parse_claude_statusline_context_window_payload(
         (Some(max), Some(active)) => Some(max.saturating_sub(active)),
         _ => None,
     });
+
+    // Claude can emit a size plus zero-valued token counters before it has
+    // measured live context pressure. Preserve the advertised window size,
+    // but do not turn that sentinel into a synthetic 0%-used observation.
+    if used_percent.is_none()
+        && active_tokens == Some(0)
+        && matches!((max_tokens, remaining_tokens), (Some(max), Some(remaining)) if max == remaining)
+    {
+        active_tokens = None;
+        remaining_tokens = None;
+    }
 
     if max_tokens.is_none() && active_tokens.is_none() && used_percent.is_none() {
         return Ok(None);
@@ -505,6 +516,25 @@ mod tests {
         assert_eq!(cache.active_tokens, Some(42_000));
         assert_eq!(cache.used_percent, Some(4));
         assert_eq!(cache.remaining_tokens, Some(958_000));
+    }
+
+    #[test]
+    fn zero_token_sentinel_preserves_only_context_window_size() {
+        let payload = r#"{
+          "context_window": {
+            "context_window_size": 1000000,
+            "total_input_tokens": 0
+          }
+        }"#;
+
+        let cache = parse_claude_statusline_context_window_payload(payload, 1738422000)
+            .expect("parse context")
+            .expect("context cache");
+
+        assert_eq!(cache.max_tokens, Some(1_000_000));
+        assert_eq!(cache.active_tokens, None);
+        assert_eq!(cache.used_percent, None);
+        assert_eq!(cache.remaining_tokens, None);
     }
 
     #[test]

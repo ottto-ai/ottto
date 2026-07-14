@@ -1603,9 +1603,24 @@ fn claude_statusline_context_from_cache(
     cache: ClaudeStatusLineContextWindowCache,
     history: Option<ClaudeStatusLineContextWindowHistory>,
 ) -> AgentContextStatus {
-    let has_pressure = cache.active_tokens.is_some()
-        || cache.used_percent.is_some()
-        || cache.remaining_tokens.is_some();
+    let zero_sentinel = claude_statusline_context_is_zero_sentinel(
+        cache.active_tokens,
+        cache.max_tokens,
+        cache.used_percent,
+        cache.remaining_tokens,
+    );
+    let active_tokens = if zero_sentinel {
+        None
+    } else {
+        cache.active_tokens
+    };
+    let remaining_tokens = if zero_sentinel {
+        None
+    } else {
+        cache.remaining_tokens
+    };
+    let has_pressure =
+        active_tokens.is_some() || cache.used_percent.is_some() || remaining_tokens.is_some();
     let (status, completeness, reason) = if has_pressure {
         (
             AgentContextState::Available,
@@ -1627,10 +1642,10 @@ fn claude_statusline_context_from_cache(
     };
     AgentContextStatus {
         status,
-        active_tokens: cache.active_tokens,
+        active_tokens,
         max_tokens: cache.max_tokens,
         used_percent: cache.used_percent,
-        remaining_tokens: cache.remaining_tokens,
+        remaining_tokens,
         source: Some("claude_statusline_context_window".to_string()),
         recent_samples: claude_statusline_recent_context_samples(&cache, history),
         observed_at: rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds),
@@ -1657,9 +1672,15 @@ fn claude_statusline_recent_context_samples(
         sample.observed_at_epoch_seconds <= now.saturating_add(60)
             && now.saturating_sub(sample.observed_at_epoch_seconds)
                 <= CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS
+            && !claude_statusline_context_is_zero_sentinel(
+                sample.active_tokens,
+                sample.max_tokens,
+                sample.used_percent,
+                sample.remaining_tokens,
+            )
             && (sample.active_tokens.is_some()
                 || sample.used_percent.is_some()
-                || sample.max_tokens.is_some())
+                || sample.remaining_tokens.is_some())
     });
     samples.sort_by_key(|sample| sample.observed_at_epoch_seconds);
     samples.dedup_by_key(|sample| sample.observed_at_epoch_seconds);
@@ -1679,6 +1700,20 @@ fn claude_statusline_recent_context_samples(
             })
         })
         .collect()
+}
+
+fn claude_statusline_context_is_zero_sentinel(
+    active_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+    used_percent: Option<u8>,
+    remaining_tokens: Option<u64>,
+) -> bool {
+    let remaining_is_unreported = match (max_tokens, remaining_tokens) {
+        (Some(_), None) => true,
+        (Some(max), Some(remaining)) => remaining == max,
+        _ => false,
+    };
+    used_percent.is_none() && matches!(active_tokens, None | Some(0)) && remaining_is_unreported
 }
 
 fn claude_statusline_context_unavailable(
@@ -5929,6 +5964,44 @@ for line in sys.stdin:
             Some(AgentContextCompleteness::WindowSizeOnly)
         );
         assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
+        assert!(context.recent_samples.is_empty());
+    }
+
+    #[test]
+    fn claude_statusline_context_cache_normalizes_legacy_zero_sentinel() {
+        let now = current_unix_seconds();
+        let cache = ClaudeStatusLineContextWindowCache {
+            schema_version: 1,
+            observed_at_epoch_seconds: now,
+            active_tokens: Some(0),
+            max_tokens: Some(1_000_000),
+            used_percent: None,
+            remaining_tokens: Some(1_000_000),
+        };
+        let history = ClaudeStatusLineContextWindowHistory {
+            schema_version: 1,
+            samples: vec![ClaudeStatusLineContextWindowSample {
+                observed_at_epoch_seconds: now.saturating_sub(60),
+                active_tokens: Some(0),
+                max_tokens: Some(1_000_000),
+                used_percent: None,
+                remaining_tokens: Some(1_000_000),
+            }],
+        };
+
+        let context = claude_statusline_context_from_cache(cache, Some(history));
+
+        assert_eq!(context.status, AgentContextState::Available);
+        assert_eq!(context.active_tokens, None);
+        assert_eq!(context.max_tokens, Some(1_000_000));
+        assert_eq!(context.used_percent, None);
+        assert_eq!(context.remaining_tokens, None);
+        assert_eq!(
+            context.completeness,
+            Some(AgentContextCompleteness::WindowSizeOnly)
+        );
+        assert_eq!(context.reason.as_deref(), Some("context_window_size_only"));
+        assert!(context.recent_samples.is_empty());
     }
 
     #[test]
