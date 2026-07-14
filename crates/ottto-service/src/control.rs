@@ -3,8 +3,9 @@ use crate::{
         claude_env, codex_toml, detection::detect_agent_installation, fence::AgentConfigError,
     },
     agent_status::{
-        pi_identity_hints_for_route, read_pi_agent_auth, read_pi_smoke_routes,
-        BillingIdentityHints, PiModelRoute,
+        claude_desktop_web_usage_enabled, pi_identity_hints_for_route, read_pi_agent_auth,
+        read_pi_smoke_routes, set_claude_desktop_web_usage_enabled, BillingIdentityHints,
+        PiModelRoute,
     },
     current_rfc3339_timestamp, diagnostics_local_only_upload_report,
     keychain::TelemetryKeyStore,
@@ -24,18 +25,18 @@ use ottto_core::{
 use ottto_protocol::{
     AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentProviderImpactQuery,
     AgentRecommendationsQuery, AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse,
-    AuthResetResponse, AuthStartResponse, CliError, CliErrorCode, ConfigDrift, ControlResult,
-    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
-    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
-    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
-    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
-    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
-    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
-    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
-    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
-    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    AuthResetResponse, AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError,
+    CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
+    DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
+    DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
+    LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
+    LocalControlCommand, LocalControlRequest, LocalControlResponse, MachineIdentity, RedactedValue,
+    RelayRuntimeState, RelayState, ReleaseChannel, RepairAction, RepairActionApproval,
+    RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus, SecretString,
+    ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
+    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
+    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
+    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -455,6 +456,18 @@ fn handle_command(
         LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
         LocalControlCommand::AgentStatusRefresh { source } => {
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
+        }
+        LocalControlCommand::ClaudeDesktopWebUsagePreference { enabled } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            let enabled = match enabled {
+                Some(enabled) => set_claude_desktop_web_usage_enabled(enabled).map_err(|_| {
+                    LocalApiError::LocalOperationFailed(
+                        "Claude Desktop usage preference could not be updated.".to_string(),
+                    )
+                })?,
+                None => claude_desktop_web_usage_enabled(),
+            };
+            to_value(ClaudeDesktopWebUsagePreferenceState { enabled })
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
             let status = status_for(daemon, &authorization)?;
