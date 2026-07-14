@@ -5,6 +5,7 @@ pub mod backfill;
 pub mod claude_effort;
 pub(crate) mod command_env;
 pub mod context_footprint;
+pub mod context_posture;
 pub mod control;
 pub mod detected_uses;
 pub mod keychain;

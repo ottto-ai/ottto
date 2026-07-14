@@ -1071,6 +1071,13 @@ impl AgentStatusSnapshot {
                 .collect();
         }
 
+        if let Some(context) = self.context.as_mut() {
+            // The posture summary is Companion-facing, machine-local data; the
+            // backend derives its own posture read-model from uploaded
+            // snapshots, so the agent-status upload copy never carries it.
+            context.posture = None;
+        }
+
         self.capabilities = self
             .capabilities
             .drain(..)
@@ -1421,6 +1428,78 @@ pub struct AgentContextStatus {
     pub completeness: Option<AgentContextCompleteness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Machine-local context-posture summary over recent sessions (Claude Code
+    /// only today). Additive optional field: absent on older daemons and
+    /// ignored by older apps. Stripped from the backend-upload copy — this is
+    /// Companion-facing, machine-local data (see `redacted_for_backend`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture: Option<AgentContextPostureSummary>,
+}
+
+/// Aggregate context posture over the recent local session window, derived by
+/// the daemon from the same transcript parse that feeds snapshot sync. All
+/// quantities are measured (token counts, session counts) — the daemon has no
+/// pricing, so no dollar figures are emitted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextPostureSummary {
+    /// Sessions with any activity inside the summary window.
+    pub sessions_analyzed: u64,
+    /// Width of the summary window in days (currently 7).
+    pub window_days: u64,
+    /// Median first-turn context (`first_turn_context_tokens`) across analyzed
+    /// sessions that reported one. This includes the first user input; it is
+    /// not presented as a pure static-context measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typical_first_turn_tokens: Option<u64>,
+    /// Sessions that reported a measured peak. This is the evidence denominator
+    /// for peak-derived counts when some analyzed sessions had no usage sample.
+    pub peak_session_count: u64,
+    /// Peak sessions whose exact context-window size was evidenced locally.
+    /// Claude's base model identifier does not distinguish standard and 1M
+    /// variants, so this can be lower than `peak_session_count`.
+    pub window_evidenced_session_count: u64,
+    /// Peak-evidenced sessions whose fill exceeded the 200k long-context
+    /// threshold. None when no session reported a peak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deep_session_count: Option<u64>,
+    /// Sessions whose peak exceeded the exact evidenced window. Omitted unless
+    /// every peak session has exact window evidence; partial evidence must not
+    /// become a misleading aggregate zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_window_session_count: Option<u64>,
+    /// Per-session peak fill, oldest → newest, most recent sessions last.
+    /// Capped by the producer at a small count (14) for display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_peaks: Vec<AgentContextSessionPeak>,
+    /// Total transcript compaction events across analyzed sessions. `Some(0)`
+    /// means "observed, none happened"; `None` means the sessions carried no
+    /// compaction evidence at all — the consumer must hide the figure rather
+    /// than show a fake 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
+    /// Total cache-read tokens across analyzed sessions: the measured
+    /// re-read volume (context replayed from prompt cache), not an estimate
+    /// of anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_tokens: Option<u64>,
+}
+
+/// One session's peak context fill relative to its model window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentContextSessionPeak {
+    /// Raw measured high-water effective input context.
+    pub peak_fill_tokens: u64,
+    /// Exact context window when evidenced. Claude transcript model identifiers
+    /// normally omit the 1M variant, so this is intentionally optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u64>,
+    /// Peak fill relative to an exact evidenced window. Raw value may exceed
+    /// 100; consumers cap the drawn bar. Omitted when the window is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_fill_percent: Option<u16>,
+    /// Whether the peak exceeded the exact evidenced window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_window: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3181,6 +3260,116 @@ mod tests {
         );
         // Path-like config value is stripped by backend redaction.
         assert!(!runtime_defaults.selector_context.contains_key("leaked"));
+    }
+
+    fn context_status_with_posture() -> AgentContextStatus {
+        AgentContextStatus {
+            status: AgentContextState::Available,
+            active_tokens: Some(120_000),
+            max_tokens: Some(1_000_000),
+            used_percent: Some(12),
+            remaining_tokens: Some(880_000),
+            source: Some("claude_statusline_context_window".to_string()),
+            recent_samples: Vec::new(),
+            observed_at: None,
+            completeness: Some(AgentContextCompleteness::FullPressure),
+            reason: None,
+            posture: Some(AgentContextPostureSummary {
+                sessions_analyzed: 21,
+                window_days: 7,
+                typical_first_turn_tokens: Some(72_400),
+                peak_session_count: 2,
+                window_evidenced_session_count: 1,
+                deep_session_count: Some(8),
+                over_window_session_count: None,
+                session_peaks: vec![
+                    AgentContextSessionPeak {
+                        peak_fill_tokens: 68_000,
+                        context_window_tokens: None,
+                        peak_fill_percent: None,
+                        over_window: None,
+                    },
+                    AgentContextSessionPeak {
+                        peak_fill_tokens: 1_040_000,
+                        context_window_tokens: Some(1_000_000),
+                        peak_fill_percent: Some(104),
+                        over_window: Some(true),
+                    },
+                ],
+                compaction_count: Some(5),
+                reread_tokens: Some(18_000_000),
+            }),
+        }
+    }
+
+    #[test]
+    fn agent_context_posture_summary_round_trips_and_is_additive() {
+        let context = context_status_with_posture();
+        let json = serde_json::to_value(&context).expect("serialize context");
+        assert_eq!(json["posture"]["sessions_analyzed"], 21);
+        assert_eq!(json["posture"]["typical_first_turn_tokens"], 72_400);
+        assert_eq!(json["posture"]["session_peaks"][1]["over_window"], true);
+        assert!(json["posture"]["session_peaks"][0]
+            .get("peak_fill_percent")
+            .is_none());
+        assert!(json["posture"].get("over_window_session_count").is_none());
+        let round_tripped: AgentContextStatus =
+            serde_json::from_value(json).expect("deserialize context");
+        assert_eq!(round_tripped, context);
+
+        // A posture with unknown compactions omits the key entirely (the
+        // consumer must distinguish "observed 0" from unknown).
+        let mut unknown_compactions = context_status_with_posture();
+        unknown_compactions
+            .posture
+            .as_mut()
+            .expect("posture")
+            .compaction_count = None;
+        let json = serde_json::to_value(&unknown_compactions).expect("serialize context");
+        assert!(json["posture"].get("compaction_count").is_none());
+
+        // Older-daemon payloads (no posture key) decode with posture = None.
+        let legacy = serde_json::json!({
+            "status": "available",
+            "active_tokens": null,
+            "max_tokens": 200_000,
+            "used_percent": null,
+            "remaining_tokens": null,
+            "source": "claude_statusline_context_window"
+        });
+        let decoded: AgentContextStatus =
+            serde_json::from_value(legacy).expect("decode legacy context");
+        assert_eq!(decoded.posture, None);
+        // And a None posture never serializes the key (older apps see the
+        // exact pre-change wire shape).
+        let json = serde_json::to_value(&decoded).expect("serialize legacy context");
+        assert!(json.get("posture").is_none());
+    }
+
+    #[test]
+    fn agent_status_backend_redaction_strips_context_posture() {
+        let mut snapshot = AgentStatusSnapshot {
+            source: SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::StatusLine,
+            captured_at: "2026-07-12T00:00:00Z".to_string(),
+            expires_at: "2026-07-12T00:05:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: Some(context_status_with_posture()),
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        };
+        snapshot = snapshot.redacted_for_backend();
+        let context = snapshot.context.expect("context survives redaction");
+        assert_eq!(context.posture, None);
+        // The rest of the context payload is untouched.
+        assert_eq!(context.max_tokens, Some(1_000_000));
+        assert_eq!(context.used_percent, Some(12));
     }
 
     #[test]

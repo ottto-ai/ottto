@@ -91,8 +91,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // Claude's aggregate cache-creation count as a 5-minute TTL. The one-shot
 // backfill re-enriches transcripts indexed by v0.1.77 from their existing
 // content-free effort sidecars after upgrade.
+// claude_code v16: derive per-session first-turn/peak context and compaction
+// watermarks. The bump is required in addition to fingerprinting the new
+// fields: the incremental scanner must revisit already-indexed transcripts
+// before their new fingerprint can trigger a one-time backend re-upload and
+// seed the machine-local posture cache.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v15";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v16";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -260,6 +265,22 @@ pub struct SnapshotItem {
     pub max_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_time_to_first_token_ms: Option<u64>,
+    // Per-session Claude Code context posture, derived from the transcript's
+    // once-per-API-response usage records. `peak_context_fill_tokens` is the
+    // largest effective input context (uncached input + cache reads + cache
+    // writes) any counted response saw — the session's high-water context
+    // fill. `first_turn_context_tokens` is the same measure for the session's
+    // FIRST counted response: the first-turn baseline (system prompt + tools +
+    // memory + first user input), not a claim of purely static context.
+    // `compaction_count` counts transcript compaction events
+    // (`isCompactSummary` records), auto or manual. Claude Code JSONL only;
+    // None for Codex / Pi. Backend schema must accept these as optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_context_fill_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_turn_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -678,7 +699,7 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
 }
 
 fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
-    let fingerprint_payload = json!({
+    let mut fingerprint_payload = json!({
         "source": source.api_slug(),
         "source_session_id": &item.source_session_id,
         "input_tokens": item.input_tokens,
@@ -702,6 +723,23 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         // the snapshot is never re-sent).
         "origin": &item.origin,
     });
+    // Same one-time re-upload rationale as `origin`, but deliberately scoped
+    // to Claude Code. Adding null posture keys for Codex/Pi would change their
+    // fingerprints too and trigger an unrelated cross-source re-upload burst.
+    if source == SnapshotSource::ClaudeCode {
+        let payload = fingerprint_payload
+            .as_object_mut()
+            .expect("snapshot fingerprint payload is an object");
+        payload.insert(
+            "peak_context_fill_tokens".to_string(),
+            json!(item.peak_context_fill_tokens),
+        );
+        payload.insert(
+            "first_turn_context_tokens".to_string(),
+            json!(item.first_turn_context_tokens),
+        );
+        payload.insert("compaction_count".to_string(), json!(item.compaction_count));
+    }
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
 
@@ -1450,6 +1488,14 @@ struct SnapshotAccumulator {
     // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
     // turn duration is derivable this way, never TTFT.
     claude_last_user_ts: Option<String>,
+    // Claude Code context posture (see the SnapshotItem field docs). Running
+    // max / first-seen watermarks over each counted API response's
+    // `effective_input_context()`, plus a count of `isCompactSummary`
+    // transcript records. Only the Claude Code line parser feeds these;
+    // Codex / Pi sessions leave them at their zero values and emit None.
+    peak_context_fill_tokens: u64,
+    first_turn_context_tokens: Option<u64>,
+    compaction_count: u64,
 }
 
 impl SnapshotAccumulator {
@@ -1484,6 +1530,9 @@ impl SnapshotAccumulator {
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
             claude_last_user_ts: None,
+            peak_context_fill_tokens: 0,
+            first_turn_context_tokens: None,
+            compaction_count: 0,
         }
     }
 
@@ -1895,6 +1944,20 @@ impl SnapshotAccumulator {
                 .then_some(self.latency_duration_ms_max),
             max_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
                 .then_some(self.latency_ttft_ms_max),
+            // Claude Code-origin sessions only; other agents emit None. A
+            // Claude session with no counted context leaves peak/first at
+            // None, while compaction_count is always reported for Claude
+            // (Some(0) = "observed, none" vs None = "daemon can't tell").
+            peak_context_fill_tokens: (self.source == SnapshotSource::ClaudeCode
+                && self.peak_context_fill_tokens > 0)
+                .then_some(self.peak_context_fill_tokens),
+            first_turn_context_tokens: if self.source == SnapshotSource::ClaudeCode {
+                self.first_turn_context_tokens
+            } else {
+                None
+            },
+            compaction_count: (self.source == SnapshotSource::ClaudeCode)
+                .then_some(self.compaction_count),
             model_usage,
             usage_buckets,
             cost: totals.costs.snapshot_cost(),
@@ -2355,6 +2418,9 @@ fn codex_state_only_snapshot(
         avg_time_to_first_token_ms: None,
         max_duration_ms: None,
         max_time_to_first_token_ms: None,
+        peak_context_fill_tokens: None,
+        first_turn_context_tokens: None,
+        compaction_count: None,
         model_usage,
         usage_buckets,
         cost: None,
@@ -3360,6 +3426,15 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.origin.is_sidechain =
             Some(accumulator.origin.is_sidechain.unwrap_or(false) || sidechain);
     }
+    // Compaction (auto or manual `/compact`) injects a `type=user` record
+    // flagged with a top-level `isCompactSummary: true` boolean (the summary
+    // prompt that replaces the compacted history). Count each one: frequent
+    // compaction is a context-pressure symptom the backend surfaces.
+    if value.get("type").and_then(Value::as_str) == Some("user")
+        && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+    {
+        accumulator.compaction_count += 1;
+    }
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
@@ -3411,6 +3486,22 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         // Later duplicate content-block records of the same response are gated
         // out here too, so each turn contributes exactly one latency sample.
         accumulator.note_claude_turn_duration(timestamp.as_deref());
+        // Context posture watermarks from this counted response's effective
+        // input context (the prompt volume the model actually saw). The first
+        // counted response with any context becomes the first-turn baseline
+        // (including first user input); the running max is the session's peak.
+        // Gated by the
+        // same once-per-response dedup as the usage count above, so repeated
+        // content-block records of one API response contribute one sample.
+        let effective_input_context = usage.effective_input_context();
+        if effective_input_context > 0 {
+            if accumulator.first_turn_context_tokens.is_none() {
+                accumulator.first_turn_context_tokens = Some(effective_input_context);
+            }
+            accumulator.peak_context_fill_tokens = accumulator
+                .peak_context_fill_tokens
+                .max(effective_input_context);
+        }
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -3432,7 +3523,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .is_some_and(|value| !value.is_empty());
         if !has_explicit_bucket {
             let context_bucket =
-                if usage.effective_input_context() > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
+                if effective_input_context > CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS {
                     "long"
                 } else {
                     "short"
@@ -6484,6 +6575,9 @@ mod tests {
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
             max_time_to_first_token_ms: None,
+            peak_context_fill_tokens: None,
+            first_turn_context_tokens: None,
+            compaction_count: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             cost: None,
@@ -8138,6 +8232,166 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_parser_derives_context_posture_watermarks() {
+        // Multi-turn transcript: the first counted response with any effective
+        // input context (input + cache reads + cache writes) sets the baseline;
+        // the running max across counted responses is the peak. An output-only
+        // response (zero effective context) must not claim the baseline, and
+        // duplicate content-block records of one response (same message.id +
+        // requestId) ride the existing once-per-response dedup.
+        let path = temp_file("claude-context-posture");
+        fs::write(
+            &path,
+            concat!(
+                // Output-only response: effective context 0 -> no baseline.
+                "{\"timestamp\":\"2026-07-01T10:00:00Z\",\"sessionId\":\"claude-posture-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":0,\"output_tokens\":4}}}\n",
+                // Baseline turn: 100 input + 900 cache read = 1000 effective.
+                "{\"timestamp\":\"2026-07-01T10:01:00Z\",\"sessionId\":\"claude-posture-1\",\"requestId\":\"req_011BBB\",\"message\":{\"id\":\"msg_011BBB\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5,\"cache_read_input_tokens\":900}}}\n",
+                // Peak turn: 200 + 4000 read + 800 cache write = 5000 effective,
+                // written twice (duplicate content-block records, same ids).
+                "{\"timestamp\":\"2026-07-01T10:02:00Z\",\"sessionId\":\"claude-posture-1\",\"requestId\":\"req_011CCC\",\"message\":{\"id\":\"msg_011CCC\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":200,\"output_tokens\":7,\"cache_read_input_tokens\":4000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":800}}}}\n",
+                "{\"timestamp\":\"2026-07-01T10:02:01Z\",\"sessionId\":\"claude-posture-1\",\"requestId\":\"req_011CCC\",\"message\":{\"id\":\"msg_011CCC\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":200,\"output_tokens\":7,\"cache_read_input_tokens\":4000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":800}}}}\n",
+                // Later smaller turn: 3000 effective, peak must stay 5000.
+                "{\"timestamp\":\"2026-07-01T10:03:00Z\",\"sessionId\":\"claude-posture-1\",\"requestId\":\"req_011DDD\",\"message\":{\"id\":\"msg_011DDD\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":3000,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-07-01T10:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.first_turn_context_tokens, Some(1000));
+        assert_eq!(item.peak_context_fill_tokens, Some(5000));
+        // No isCompactSummary records: observed-zero, not unknown.
+        assert_eq!(item.compaction_count, Some(0));
+        // Dedup really gated the duplicate peak records (4 counted responses).
+        assert_eq!(item.request_count, 4);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_parser_counts_compaction_records() {
+        // Compaction (auto or /compact) injects a type=user record flagged
+        // with top-level `isCompactSummary: true`. Each one counts; an
+        // explicit `false` does not.
+        let path = temp_file("claude-compaction-count");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:04:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"assistant\",\"isCompactSummary\":true,\"message\":{\"role\":\"assistant\",\"content\":\"not a compaction event\"}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-07-01T11:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.compaction_count, Some(2));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_sessions_emit_no_context_posture_fields() {
+        // Context posture is a Claude Code transcript signal; Codex snapshots
+        // must leave all three fields None so they serialize away entirely.
+        let path = temp_file("codex-no-context-posture");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-01T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-7777-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"2026-07-01T12:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":50,\"output_tokens\":9},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-07-01T12:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.peak_context_fill_tokens, None);
+        assert_eq!(item.first_turn_context_tokens, None);
+        assert_eq!(item.compaction_count, None);
+        let serialized = serde_json::to_value(&item).expect("serialize");
+        assert!(serialized.get("peak_context_fill_tokens").is_none());
+        assert!(serialized.get("first_turn_context_tokens").is_none());
+        assert!(serialized.get("compaction_count").is_none());
+
+        // Posture is not a Codex/Pi fingerprint dimension. Even a defensive
+        // mutation must not churn unrelated source indexes on upgrade.
+        let fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
+        let mut mutated = item.clone();
+        mutated.peak_context_fill_tokens = Some(10);
+        mutated.first_turn_context_tokens = Some(5);
+        mutated.compaction_count = Some(1);
+        assert_eq!(
+            snapshot_fingerprint(SnapshotSource::Codex, &mutated),
+            fingerprint
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn context_posture_fields_change_snapshot_fingerprint() {
+        // The posture fields are part of the fingerprint payload on purpose
+        // (same one-time backfill rationale as `origin`): a daemon that starts
+        // deriving them re-uploads every already-collected Claude session once.
+        let path = temp_file("claude-posture-fingerprint");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-07-01T13:00:00Z\",\"sessionId\":\"claude-posture-fp\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n",
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-07-01T13:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let mut without_posture = item.clone();
+        without_posture.peak_context_fill_tokens = None;
+        without_posture.first_turn_context_tokens = None;
+        without_posture.compaction_count = None;
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &item),
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &without_posture)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn claude_code_parser_prefers_ai_title_rows() {
         let path = temp_file("claude-ai-title");
         fs::write(
@@ -9495,6 +9749,9 @@ mod tests {
             "reasoning_output_tokens",
             "unattributed_total_tokens",
             "request_count",
+            "peak_context_fill_tokens",
+            "first_turn_context_tokens",
+            "compaction_count",
             "model_usage",
             "usage_buckets",
             "cost",
@@ -9635,6 +9892,9 @@ mod tests {
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
             max_time_to_first_token_ms: None,
+            peak_context_fill_tokens: Some(115),
+            first_turn_context_tokens: Some(105),
+            compaction_count: Some(0),
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
@@ -9852,6 +10112,9 @@ mod tests {
                 avg_time_to_first_token_ms: None,
                 max_duration_ms: None,
                 max_time_to_first_token_ms: None,
+                peak_context_fill_tokens: None,
+                first_turn_context_tokens: None,
+                compaction_count: None,
                 model_usage: vec![row.clone()],
                 usage_buckets: vec![SnapshotUsageBucket {
                     bucket_start: "2026-05-28T17:00:00Z".to_string(),
