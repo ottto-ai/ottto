@@ -10,7 +10,7 @@ Review tier: `official`
 - `desktop_quota_status` requires explicit setup and owns the Claude Desktop local-session path described below.
 - `identity_probe` defaults on; it subprocesses `claude auth status --json`, reads `~/.claude/settings.json` env values, and may read the narrow Claude Desktop app-managed metadata paths listed below. Never reads token bytes or Keychain items.
 
-## Approved Surfaces
+## Documented Surfaces
 
 - Claude Code project JSONL files may be read locally for aggregate usage snapshots.
 - Managed telemetry environment/settings may be inspected or written only through the live telemetry setup path.
