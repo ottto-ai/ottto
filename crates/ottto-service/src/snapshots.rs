@@ -3642,10 +3642,9 @@ fn parse_artifact_url(token: &str) -> Option<SessionArtifact> {
     let token = token.trim_end_matches(['.', ';', ':', '!', '?']);
     let (scheme, rest) = if let Some(rest) = token.strip_prefix("https://") {
         ("https", rest)
-    } else if let Some(rest) = token.strip_prefix("http://") {
-        ("http", rest)
     } else {
-        return None;
+        let rest = token.strip_prefix("http://")?;
+        ("http", rest)
     };
     let slash = rest.find('/')?;
     let authority = &rest[..slash];
