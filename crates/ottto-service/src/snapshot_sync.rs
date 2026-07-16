@@ -34,6 +34,18 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+// Non-terminal collector check-in cadence. The sync loop sleeps a fixed
+// SNAPSHOT_SYNC_INTERVAL AFTER a cycle completes, so terminal status receipts
+// alone age by cycle_duration + interval; a long cycle (first onboarding scan,
+// a post-restart backlog drain) makes an alive collector read as stale
+// server-side even while uploads are progressing. The backend's sources.status
+// freshness promise is a check-in within five minutes — beat well inside it so
+// receipt age stays bounded no matter how long a cycle runs.
+const COLLECTOR_CHECKIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
+// Backfill horizon carried on non-terminal receipts. Only meaningful when a
+// receipt seeds a brand-new status row (fresh onboarding, before the first
+// terminal report); terminal reports carry the activity-hint-authorized value.
+const CHECKIN_BACKFILL_WINDOW_DAYS: u64 = 183;
 const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // The backend accepts up to 100 snapshots, but a reconciliation-heavy parser
@@ -345,6 +357,30 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
         ) {
             eprintln!(
                 "local health projection upload skipped: {}",
+                safe_error(&error)
+            );
+        }
+    }
+
+    // Cycle-start scan receipts: one cheap non-terminal status per enabled
+    // source before any scanning. Sources late in the sequential cycle would
+    // otherwise hold receipts from the PREVIOUS cycle for this whole cycle, and
+    // a backlog drain (e.g. after a daemon restart) stretches that well past
+    // the backend's five-minute freshness promise even though uploads are
+    // healthy. Best-effort: a failed receipt must never block the actual sync.
+    let cycle_started_at = current_rfc3339();
+    for source in enabled_sources.iter().copied() {
+        if let Err(error) = report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            &device_secret,
+            source,
+            &machine_id,
+            Some(&cycle_started_at),
+        ) {
+            eprintln!(
+                "local snapshot cycle-start receipt skipped for {}: {}",
+                source.api_slug(),
                 safe_error(&error)
             );
         }
@@ -1088,6 +1124,128 @@ fn report_status_with_fresh_relay_token(
     report_status(client, &relay_token, status)
 }
 
+/// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
+/// deliberately absent: the backend treats that shape as liveness-only — it
+/// bumps the server-received freshness marker (and the scan-start marker when
+/// one is carried) while preserving the previous terminal report's success
+/// evidence, error state, and counters. Terminal reports stay the source of
+/// truth for scan outcomes; this only says "the collector is alive".
+fn report_checkin_status(
+    client: &SnapshotApiClient,
+    relay_token: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    scan_started_at: Option<&str>,
+) -> Result<()> {
+    let request = SnapshotStatusRequest {
+        schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
+        source: source.api_slug().to_string(),
+        machine_id: machine_id.to_string(),
+        enabled: true,
+        disabled_reason: None,
+        last_scan_started_at: scan_started_at.map(str::to_string),
+        last_scan_finished_at: None,
+        last_success_at: None,
+        last_error_code: None,
+        last_error_message: None,
+        last_uploaded_count: 0,
+        last_scanned_session_count: 0,
+        last_scanned_file_count: 0,
+        last_backfill_window_days: CHECKIN_BACKFILL_WINDOW_DAYS,
+        last_backfill_file_limit: 0,
+        last_discovered_file_count: 0,
+        last_skipped_file_count_due_to_limit: 0,
+        last_scan_cap_hit: false,
+        consecutive_failures: 0,
+        next_retry_at: None,
+        collector_version: Some(collector_version()),
+        parser_version: Some(source.parser_version().to_string()),
+    };
+    client.report_status(relay_token, &request)?;
+    Ok(())
+}
+
+fn report_checkin_status_with_fresh_relay_token(
+    client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    scan_started_at: Option<&str>,
+) -> Result<()> {
+    let relay_token = client.issue_relay_token(device, device_secret, source)?;
+    report_checkin_status(client, &relay_token, source, machine_id, scan_started_at)
+}
+
+/// Spawn the periodic non-terminal collector check-in heartbeat.
+///
+/// Terminal receipts track cycle completion, not liveness: the sync loop
+/// sleeps a fixed interval AFTER each cycle and scans sources sequentially, so
+/// a source's receipt can age by cycle_duration + interval — past the
+/// backend's five-minute sources.status freshness promise — while the daemon
+/// is healthy and actively uploading. This loop posts a cheap in-progress
+/// status per enabled source on its own clock, independent of the sync cycle,
+/// so the server-received check-in stays comfortably inside that promise even
+/// during a multi-hour backlog drain.
+pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
+    std::thread::Builder::new()
+        .name("ottto-collector-checkin".to_string())
+        .spawn(move || loop {
+            if let Err(error) = collector_checkin_once() {
+                if !collector_checkin_can_wait_quietly(&error) {
+                    eprintln!("collector check-in skipped: {}", safe_error(&error));
+                }
+            }
+            std::thread::sleep(COLLECTOR_CHECKIN_INTERVAL);
+        })
+        .context("spawn collector check-in heartbeat")?;
+    Ok(())
+}
+
+fn collector_checkin_once() -> Result<()> {
+    let (device, device_secret) = load_snapshot_device_credentials()?;
+    let Some(machine_id) = snapshot_machine_id(&device)? else {
+        return Err(anyhow!("machine identity is missing"));
+    };
+    let enabled_sources = enabled_snapshot_sources(&device);
+    if enabled_sources.is_empty() {
+        return Err(anyhow!("registered device has no enabled sources"));
+    }
+    let client = SnapshotApiClient::new(snapshot_api_base_url());
+    let mut failed_sources = Vec::new();
+    for source in enabled_sources {
+        if report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            &device_secret,
+            source,
+            &machine_id,
+            None,
+        )
+        .is_err()
+        {
+            failed_sources.push(source.api_slug());
+        }
+    }
+    if !failed_sources.is_empty() {
+        return Err(anyhow!(
+            "collector check-in failed for {} source(s)",
+            failed_sources.len()
+        ));
+    }
+    Ok(())
+}
+
+fn collector_checkin_can_wait_quietly(error: &anyhow::Error) -> bool {
+    let safe = safe_error(error);
+    matches!(
+        safe.as_str(),
+        "relay device credentials are unavailable" | "machine identity is unavailable"
+    ) || error
+        .to_string()
+        .contains("registered device has no enabled sources")
+}
+
 pub(crate) fn enabled_snapshot_sources(device: &LocalDeviceBinding) -> Vec<SnapshotSource> {
     [
         SnapshotSource::Codex,
@@ -1740,6 +1898,83 @@ mod tests {
         assert!(requests[1].contains("\"schema_version\":5"));
         assert!(requests[1].contains("\"source\":\"codex\""));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    fn cycle_start_checkin_posts_in_progress_receipt() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = snapshot_status_server(captured.clone());
+        let client = SnapshotApiClient::new(api_base_url);
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            Some("2026-06-01T10:00:00Z"),
+        )
+        .expect("report cycle-start check-in with fresh relay token");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+        assert!(requests[1].contains("POST /api/v1/agent-session-snapshots/status"));
+        assert!(requests[1].contains("relay-token-codex"));
+        assert!(requests[1].contains("\"schema_version\":5"));
+        assert!(requests[1].contains("\"enabled\":true"));
+        // The in-progress shape: a scan-start marker with NO terminal fields, so
+        // the backend bumps freshness without clobbering the last terminal report.
+        assert!(requests[1].contains("\"last_scan_started_at\":\"2026-06-01T10:00:00Z\""));
+        assert!(requests[1].contains("\"last_scan_finished_at\":null"));
+        assert!(requests[1].contains("\"last_success_at\":null"));
+        assert!(requests[1].contains("\"last_error_code\":null"));
+    }
+
+    #[test]
+    fn heartbeat_checkin_posts_liveness_only_receipt() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let api_base_url = snapshot_status_server(captured.clone());
+        let client = SnapshotApiClient::new(api_base_url);
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report heartbeat check-in with fresh relay token");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("POST /api/v1/agent-session-snapshots/status"));
+        // A pure liveness beat carries neither scan markers nor terminal fields:
+        // the backend bumps reported_at and leaves the whole scan lifecycle alone.
+        assert!(requests[1].contains("\"last_scan_started_at\":null"));
+        assert!(requests[1].contains("\"last_scan_finished_at\":null"));
+        assert!(requests[1].contains("\"last_success_at\":null"));
+        assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    fn collector_checkin_interval_stays_inside_freshness_promise() {
+        // The backend's sources.status freshness SLO is five minutes measured
+        // from the server-received check-in. The heartbeat must beat with real
+        // headroom, and faster than the sync loop's own sleep.
+        assert!(COLLECTOR_CHECKIN_INTERVAL <= Duration::from_secs(4 * 60));
+        assert!(COLLECTOR_CHECKIN_INTERVAL < SNAPSHOT_SYNC_INTERVAL);
     }
 
     struct EnvVarGuard {
