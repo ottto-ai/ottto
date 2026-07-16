@@ -102,8 +102,12 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-snapshot-sync".to_string())
         .spawn(move || loop {
-            if let Err(error) = sync_once(&home, &support_dir, &daemon) {
-                eprintln!("local snapshot sync skipped: {}", safe_error(&error));
+            match sync_once(&home, &support_dir, &daemon) {
+                Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
+                Err(error) => {
+                    eprintln!("local snapshot sync skipped: {}", safe_error(&error));
+                    crate::net_resilience::handle_sync_failure(&daemon);
+                }
             }
             std::thread::sleep(SNAPSHOT_SYNC_INTERVAL);
         })
@@ -272,11 +276,15 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let spawn_result = std::thread::Builder::new()
         .name("ottto-snapshot-sync-now".to_string())
         .spawn(move || {
-            if let Err(error) = sync_once(&home, &support_dir, &daemon) {
-                eprintln!(
-                    "local snapshot sync after setup skipped: {}",
-                    safe_error(&error)
-                );
+            match sync_once(&home, &support_dir, &daemon) {
+                Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
+                Err(error) => {
+                    eprintln!(
+                        "local snapshot sync after setup skipped: {}",
+                        safe_error(&error)
+                    );
+                    crate::net_resilience::handle_sync_failure(&daemon);
+                }
             }
             set_one_shot_sync_in_flight(false);
         });
@@ -555,6 +563,7 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
             Ok(response) => {
                 uploaded += response.accepted as usize;
                 persist_machine_icon(&response);
+                crate::net_resilience::note_upstream_upload_succeeded("agent_status");
             }
             Err(_) => {
                 failed_sources.push(source.api_slug());
@@ -1010,6 +1019,7 @@ fn upload_agent_status(
     };
     let response = client.upload_agent_status(relay_token, &request)?;
     persist_machine_icon(&response);
+    crate::net_resilience::note_upstream_upload_succeeded("agent_status");
     Ok(())
 }
 
