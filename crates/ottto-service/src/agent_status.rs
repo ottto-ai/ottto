@@ -1292,11 +1292,7 @@ fn read_claude_desktop_web_session(desktop_root: &Path) -> Result<ClaudeDesktopW
     };
     let session_cookie: (String, Vec<u8>) = read_cookie(CLAUDE_DESKTOP_SESSION_COOKIE_NAME)?;
     let active_org_cookie: (String, Vec<u8>) = read_cookie(CLAUDE_DESKTOP_ACTIVE_ORG_COOKIE_NAME)?;
-    let cookie_database_version = connection
-        .query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
-            row.get(0)
-        })
-        .unwrap_or_default();
+    let cookie_database_version = chromium_cookie_database_version(&connection);
     let safe_storage_password = read_claude_desktop_safe_storage_password()?;
     let session_key = decrypt_chromium_cookie(
         &session_cookie.0,
@@ -1322,6 +1318,19 @@ fn read_claude_desktop_web_session(desktop_root: &Path) -> Result<ClaudeDesktopW
         organization_id,
         organization_identifier_hash,
     })
+}
+
+fn chromium_cookie_database_version(connection: &Connection) -> i64 {
+    // Chromium declares `meta.value` with text affinity. SQLite therefore
+    // returns version 24 as text even though Chromium writes an integer, while
+    // rusqlite's typed getter does not coerce it to i64 for us.
+    connection
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
 }
 
 fn read_claude_desktop_safe_storage_password() -> Result<Zeroizing<String>, String> {
@@ -6181,6 +6190,29 @@ for line in sys.stdin:
         .expect("decrypt host-bound cookie");
 
         assert_eq!(decrypted.as_str(), expected_session_key);
+    }
+
+    #[test]
+    fn claude_desktop_cookie_database_reads_text_affinity_version() {
+        let connection = Connection::open_in_memory().expect("open cookie database fixture");
+        connection
+            .execute_batch(
+                "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);\
+                 INSERT INTO meta(key, value) VALUES('version', 24);",
+            )
+            .expect("create cookie database metadata fixture");
+
+        let storage_class: String = connection
+            .query_row(
+                "SELECT typeof(value) FROM meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read metadata storage class");
+        assert_eq!(storage_class, "text");
+
+        let version = chromium_cookie_database_version(&connection);
+        assert_eq!(version, CHROMIUM_COOKIE_HOST_DIGEST_VERSION);
     }
 
     #[test]
