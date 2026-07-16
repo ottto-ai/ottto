@@ -443,10 +443,20 @@ fn resolve_repository_identity(workspace: &Path, labels_enabled: bool) -> Reposi
     } else {
         "repository_subdir"
     };
+    // For linked worktrees, `--show-toplevel` is the throwaway worktree
+    // directory, so labels would surface names like "gallant-albattani-9baa0b".
+    // Use the main checkout directory (the parent of the shared `.git` common
+    // dir) instead, falling back to the toplevel for layouts where the common
+    // dir does not end in `.git` (e.g. bare-ish repositories).
+    let label_basis: &Path = if linked_worktree {
+        main_checkout_dir(&common_dir).unwrap_or(&toplevel)
+    } else {
+        &toplevel
+    };
     RepositoryIdentity {
         repository_hash: Some(sha256_hex(&[common_text.as_ref()])),
         repository_label: labels_enabled
-            .then(|| toplevel.file_name()?.to_str())
+            .then(|| label_basis.file_name()?.to_str())
             .flatten()
             .and_then(|name| safe_text(name, 255)),
         repository_label_source: labels_enabled.then(|| "git_root".to_string()),
@@ -495,6 +505,17 @@ fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
             Err(_) => return None,
         }
     }
+}
+
+/// The directory holding the main checkout of a repository whose shared git
+/// common dir is `common_dir`. For the standard layout the common dir is
+/// `<main-checkout>/.git`, so this is its parent. Returns `None` when the
+/// common dir does not end in `.git` (bare or unusual layouts), signalling the
+/// caller to fall back to the workspace toplevel.
+fn main_checkout_dir(common_dir: &Path) -> Option<&Path> {
+    (common_dir.file_name()? == ".git")
+        .then(|| common_dir.parent())
+        .flatten()
 }
 
 fn absolutize_git_path(workspace: &Path, raw: &str) -> PathBuf {
@@ -1313,6 +1334,59 @@ mod tests {
         assert_eq!(
             worktree_identity.workspace_kind.as_deref(),
             Some("linked_worktree")
+        );
+        // The label must name the main checkout, not the throwaway worktree
+        // directory the user happens to be working from.
+        assert_eq!(
+            worktree_identity.repository_label,
+            root_identity.repository_label
+        );
+        let worktree_dir_name = worktree.file_name().unwrap().to_str().unwrap();
+        assert_ne!(
+            worktree_identity.repository_label.as_deref(),
+            Some(worktree_dir_name)
+        );
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "remove", "--force", &worktree_text])
+            .status();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn repository_identity_labels_worktree_subdir_after_main_checkout() {
+        let repo = init_git_repo("repo-identity-worktree-subdir");
+        let worktree = temp_dir("repo-identity-worktree-subdir-linked");
+        fs::remove_dir_all(&worktree).unwrap();
+        let worktree_text = worktree.to_string_lossy().to_string();
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "context-subdir-test",
+                &worktree_text,
+            ],
+        );
+        let subdir = worktree.join("nested");
+        fs::create_dir_all(&subdir).unwrap();
+
+        let root_identity = resolve_repository_identity(&repo, true);
+        let subdir_identity = resolve_repository_identity(&subdir, true);
+
+        assert_eq!(
+            root_identity.repository_hash,
+            subdir_identity.repository_hash
+        );
+        assert_eq!(
+            subdir_identity.workspace_kind.as_deref(),
+            Some("linked_worktree")
+        );
+        assert_eq!(
+            subdir_identity.repository_label,
+            root_identity.repository_label
         );
         let _ = Command::new("git")
             .arg("-C")
