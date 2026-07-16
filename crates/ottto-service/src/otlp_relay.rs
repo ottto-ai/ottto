@@ -688,8 +688,18 @@ fn send_otlp_request(
     }
 
     match upstream.send_bytes(&request.body) {
-        Ok(response) => response_from_ureq(response),
-        Err(ureq::Error::Status(_, response)) => response_from_ureq(response),
+        Ok(response) => {
+            // Transport success on the relay path is the sync-stall watchdog's
+            // evidence that a concurrent snapshot-sync outage is process-local
+            // (this warm-pooled path survived the 2026-07-15 DNS pinning
+            // incident while every cold path failed).
+            crate::net_resilience::note_upstream_upload_succeeded("otlp_relay");
+            response_from_ureq(response)
+        }
+        Err(ureq::Error::Status(_, response)) => {
+            crate::net_resilience::note_upstream_upload_succeeded("otlp_relay");
+            response_from_ureq(response)
+        }
         Err(ureq::Error::Transport(error)) => Err(anyhow!("upstream transport failed: {error}")),
     }
 }
@@ -747,11 +757,16 @@ fn upstream_http_agent() -> &'static ureq::Agent {
     UPSTREAM_HTTP_AGENT.get_or_init(build_upstream_http_agent)
 }
 
+// Deliberately a process-lifetime agent that is NEVER rebuilt: its warm
+// keep-alive pool is the path that keeps working through process-local DNS
+// breakage, so dropping it would destroy exactly the connections worth
+// keeping. New connections still get the fallback resolver below.
 fn build_upstream_http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
         .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
         .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)
+        .resolver(crate::net_resilience::shared_fallback_resolver())
         .build()
 }
 

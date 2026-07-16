@@ -12,8 +12,8 @@ use std::time::Duration;
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
-const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The backend rejected a snapshot batch because the payload did not satisfy the
@@ -320,19 +320,23 @@ pub struct SnapshotApiClient {
 
 impl SnapshotApiClient {
     pub fn from_env() -> Self {
-        Self {
-            api_base_url: std::env::var("OTTTO_API_BASE_URL")
+        Self::new(
+            std::env::var("OTTTO_API_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string()),
-            agent: timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
-            batch_agent: timeout_agent(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT),
-        }
+        )
     }
 
     pub fn new(api_base_url: impl Into<String>) -> Self {
+        // Clients are constructed per sync/upload cycle, but the underlying
+        // agents (and their connection pools) are process-wide and shared with
+        // every other upload path, so a warm connection anywhere benefits all
+        // subsystems and a sustained DNS outage rebuilds them in one place.
+        // See `net_resilience` for the 2026-07-15 incident this hardens against.
+        let (agent, batch_agent) = crate::net_resilience::shared_agents();
         Self {
             api_base_url: api_base_url.into(),
-            agent: timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
-            batch_agent: timeout_agent(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT),
+            agent,
+            batch_agent,
         }
     }
 
@@ -597,11 +601,16 @@ impl SnapshotApiClient {
     }
 }
 
-fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
+pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+        // Survive process-local resolver breakage (pinned scoped-DNS state
+        // after a VPN/network transition): fall back to an out-of-process
+        // probe, then the last successfully resolved addresses. TLS SNI and
+        // certificate validation still use the URL hostname.
+        .resolver(crate::net_resilience::shared_fallback_resolver())
         .build()
 }
 
@@ -762,6 +771,36 @@ mod tests {
         );
         assert!(!diagnostics.safe_message().contains("req_"));
         assert!(!diagnostics.safe_message().contains("Bearer"));
+    }
+
+    #[test]
+    fn resolver_failure_through_real_agent_classifies_as_transport_dns() {
+        // The 2026-07-15 incident signature: in-process DNS resolution fails
+        // persistently for a long-running daemon. The failure must classify as
+        // transport_dns end-to-end through the real ureq stack so field logs
+        // and the resilience layer key off the right family.
+        let resolver = crate::net_resilience::FallbackDnsResolver::with_hooks(
+            |_| {
+                Err(std::io::Error::other(
+                    "simulated getaddrinfo failure after network transition",
+                ))
+            },
+            |_| None,
+        );
+        let agent = ureq::AgentBuilder::new().resolver(resolver).build();
+
+        let error = agent
+            .post("http://ottto-transport-dns.test/api/v1/telemetry")
+            .call()
+            .expect_err("resolution must fail");
+
+        assert_eq!(transport_status_family(&error), "transport_dns");
+        let diagnostics =
+            UploadFailureDiagnostics::transport("relay token request", "relay_token", &error);
+        assert_eq!(
+            diagnostics.safe_message(),
+            "relay token request failed (endpoint=relay_token, status_family=transport_dns, retryable=true, request_id=absent)"
+        );
     }
 
     #[test]

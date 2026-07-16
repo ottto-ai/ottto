@@ -11,6 +11,7 @@ pub mod detected_uses;
 pub mod keychain;
 pub mod macos_service;
 pub mod mcp_inventory;
+pub(crate) mod net_resilience;
 pub mod otlp_relay;
 pub mod snapshot_client;
 pub mod snapshot_sync;
@@ -1152,6 +1153,52 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// Record that the local snapshot-sync loop has been failing continuously
+    /// while another upstream path (agent-status upload, OTLP relay forward)
+    /// still reaches the backend — the split-brain signature of process-local
+    /// network breakage (2026-07-15 tier0 freshness RCA). Surfaces as a
+    /// Warning blocker that degrades (not blocks) the local health posture,
+    /// so the UI/user sees the stall instead of silently stale usage data.
+    pub fn record_snapshot_sync_stalled(
+        &self,
+        stalled_minutes: u64,
+        healthy_path: Option<&str>,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        push_local_health_event(
+            &mut state,
+            "SnapshotSyncStalled",
+            "snapshot_sync_stalled",
+            LocalHealthAuthority::Runtime,
+            serde_json::json!({
+                "kind": "snapshot_sync_stalled",
+                "stalled_minutes": stalled_minutes,
+                "healthy_path": healthy_path,
+                "message": "local snapshot sync is stalled while other uploads succeed",
+                "current": true
+            }),
+        );
+        Ok(())
+    }
+
+    /// Clear a previously recorded snapshot-sync stall after a successful
+    /// sync cycle.
+    pub fn record_snapshot_sync_recovered(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        push_local_health_event(
+            &mut state,
+            "SnapshotSyncRecovered",
+            "snapshot_sync_recovered",
+            LocalHealthAuthority::Runtime,
+            serde_json::json!({
+                "kind": "snapshot_sync_recovered",
+                "message": "local snapshot sync recovered",
+                "current": true
+            }),
+        );
+        Ok(())
+    }
+
     pub fn stop(&self, token: &str) -> Result<(), LocalApiError> {
         self.control_token.authorize(token)?;
         self.stop_authorized()
@@ -1698,23 +1745,39 @@ fn push_local_health_upload_event(
     kind: &str,
     message: &str,
 ) {
+    push_local_health_event(
+        state,
+        event_type,
+        &format!("local_health_upload_{kind}"),
+        LocalHealthAuthority::Backend,
+        serde_json::json!({
+            "kind": kind,
+            "message": message,
+            "current": true
+        }),
+    );
+}
+
+fn push_local_health_event(
+    state: &mut DaemonState,
+    event_type: &str,
+    event_id_slug: &str,
+    authority: LocalHealthAuthority,
+    payload: serde_json::Value,
+) {
     let sequence = next_local_health_sequence(state);
     let observed_at = current_rfc3339_timestamp();
     state.local_health_events.push(LocalHealthEventV1 {
-        event_id: format!("evt_local_health_upload_{kind}_{sequence}"),
+        event_id: format!("evt_{event_id_slug}_{sequence}"),
         event_schema_version: "local_health_event.v1".to_string(),
         event_type: event_type.to_string(),
         machine_id: state.machine.machine_id.clone(),
         observed_at,
         sequence,
-        authority: LocalHealthAuthority::Backend,
+        authority,
         source_id: None,
         action_id: None,
-        payload: serde_json::json!({
-            "kind": kind,
-            "message": message,
-            "current": true
-        }),
+        payload,
     });
 }
 
@@ -1976,6 +2039,20 @@ fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealth
                 _ => None,
             }
         })
+}
+
+/// The `observed_at` of the latest snapshot-sync stall, if the most recent
+/// stall/recovery event says the stall is still current.
+fn latest_snapshot_sync_stall(status: &DaemonStatus) -> Option<String> {
+    status
+        .local_health_events
+        .iter()
+        .filter(|event| {
+            event.event_type == "SnapshotSyncStalled" || event.event_type == "SnapshotSyncRecovered"
+        })
+        .max_by_key(|event| event.sequence)
+        .filter(|event| event.event_type == "SnapshotSyncStalled")
+        .map(|event| event.observed_at.clone())
 }
 
 fn local_health_account_for_status(status: &DaemonStatus) -> LocalHealthAccountV1 {
@@ -2270,6 +2347,19 @@ fn local_health_blockers_for_status(
         }
         Some(LatestLocalHealthUpload::Succeeded) | None => {}
     }
+    // Snapshot sync stalled while other uploads succeed: the daemon is
+    // reachable and authorized, but usage freshness is silently dying — a
+    // Warning (degrades, never blocks) so it cannot mask a real blocker.
+    if let Some(observed_at) = latest_snapshot_sync_stall(status) {
+        blockers.push(blocker(
+            "snapshot_sync_stalled",
+            LocalHealthSeverity::Warning,
+            "runtime",
+            LocalHealthAuthority::Runtime,
+            &observed_at,
+            "restart ottto-service (or restore its DNS resolution); usage snapshot sync is stalled while other uploads succeed",
+        ));
+    }
     if matches!(
         account.state,
         LocalHealthAccountState::ReconnectRequired | LocalHealthAccountState::NotConnected
@@ -2375,11 +2465,24 @@ fn local_health_overall(
             next_action: Some("sign_in".to_string()),
         };
     }
-    if let Some(blocker) = blockers.first() {
+    if let Some(blocker) = blockers
+        .iter()
+        .find(|blocker| blocker.severity == LocalHealthSeverity::Blocking)
+    {
         return LocalHealthOverall {
             state: LocalHealthOverallState::Blocked,
             primary_blocker: Some(blocker.code.clone()),
             severity: LocalHealthSeverity::Blocking,
+            next_action: Some("repair_or_verify".to_string()),
+        };
+    }
+    // Only Warning blockers remain (e.g. snapshot_sync_stalled): the machine
+    // works but attention is needed, so degrade instead of blocking.
+    if let Some(warning) = blockers.first() {
+        return LocalHealthOverall {
+            state: LocalHealthOverallState::Degraded,
+            primary_blocker: Some(warning.code.clone()),
+            severity: LocalHealthSeverity::Warning,
             next_action: Some("repair_or_verify".to_string()),
         };
     }
@@ -5095,6 +5198,76 @@ mod tests {
             .blockers
             .iter()
             .all(|blocker| blocker.code != "backend_unreachable"));
+    }
+
+    #[test]
+    fn snapshot_sync_stall_degrades_health_until_recovery() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_snapshot_sync_stalled(45, Some("agent_status"))
+            .expect("record sync stall");
+
+        let stalled = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        let blocker = stalled
+            .blockers
+            .iter()
+            .find(|blocker| blocker.code == "snapshot_sync_stalled")
+            .expect("stall blocker present");
+        assert_eq!(blocker.severity, LocalHealthSeverity::Warning);
+        // A stall degrades the posture so the UI surfaces it, but must never
+        // read as Blocked: the machine still works, freshness is dying.
+        assert_eq!(stalled.overall.state, LocalHealthOverallState::Degraded);
+        assert_eq!(stalled.overall.severity, LocalHealthSeverity::Warning);
+        assert_eq!(
+            stalled.overall.primary_blocker.as_deref(),
+            Some("snapshot_sync_stalled")
+        );
+
+        daemon
+            .record_snapshot_sync_recovered()
+            .expect("record sync recovery");
+        let recovered = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert!(recovered
+            .blockers
+            .iter()
+            .all(|blocker| blocker.code != "snapshot_sync_stalled"));
+        assert_eq!(recovered.overall.state, LocalHealthOverallState::Healthy);
+    }
+
+    #[test]
+    fn snapshot_sync_stall_never_masks_a_blocking_failure() {
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        daemon
+            .record_snapshot_sync_stalled(45, Some("otlp_relay"))
+            .expect("record sync stall");
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
+            .expect("record upload failure");
+
+        let health = daemon
+            .status(TOKEN)
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        // Both blockers are listed, but the Blocking one owns the overall
+        // posture regardless of ordering.
+        assert!(health
+            .blockers
+            .iter()
+            .any(|blocker| blocker.code == "snapshot_sync_stalled"));
+        assert_eq!(health.overall.state, LocalHealthOverallState::Blocked);
+        assert_eq!(
+            health.overall.primary_blocker.as_deref(),
+            Some("backend_unreachable")
+        );
     }
 
     #[test]
