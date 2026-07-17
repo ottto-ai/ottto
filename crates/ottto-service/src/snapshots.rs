@@ -96,7 +96,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // fields: the incremental scanner must revisit already-indexed transcripts
 // before their new fingerprint can trigger a one-time backend re-upload and
 // seed the machine-local posture cache.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v18";
+// codex v19: extend those same context-posture watermarks to Codex rollouts
+// (first-turn/peak context from `last_token_usage`, compactions from the
+// `compacted` records). Same one-shot rationale as claude_code v16 — the
+// incremental scanner must revisit already-indexed rollouts before their new
+// fingerprint can trigger the one-time backend re-upload.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v19";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v16";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
 
@@ -154,6 +159,19 @@ impl SnapshotSource {
             SnapshotSource::Codex => CODEX_SNAPSHOT_PARSER_VERSION,
             SnapshotSource::ClaudeCode => CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
             SnapshotSource::Pi => PI_SNAPSHOT_PARSER_VERSION,
+        }
+    }
+
+    /// Whether this source's parser derives context-posture watermarks (see the
+    /// `SnapshotItem` posture field docs). Keeps the emit gate and the
+    /// fingerprint gate from drifting apart: a source that fingerprints the
+    /// posture keys but never fills them — or the reverse — would either churn
+    /// every fingerprint for nothing or silently stop re-uploading real
+    /// posture. Pi has no derivation, so it stays out of both.
+    fn derives_context_posture(self) -> bool {
+        match self {
+            SnapshotSource::Codex | SnapshotSource::ClaudeCode => true,
+            SnapshotSource::Pi => false,
         }
     }
 
@@ -265,16 +283,28 @@ pub struct SnapshotItem {
     pub max_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_time_to_first_token_ms: Option<u64>,
-    // Per-session Claude Code context posture, derived from the transcript's
-    // once-per-API-response usage records. `peak_context_fill_tokens` is the
-    // largest effective input context (uncached input + cache reads + cache
-    // writes) any counted response saw — the session's high-water context
-    // fill. `first_turn_context_tokens` is the same measure for the session's
-    // FIRST counted response: the first-turn baseline (system prompt + tools +
-    // memory + first user input), not a claim of purely static context.
-    // `compaction_count` counts transcript compaction events
-    // (`isCompactSummary` records), auto or manual. Claude Code JSONL only;
-    // None for Codex / Pi. Backend schema must accept these as optional.
+    // Per-session context posture, derived from each transcript's per-response
+    // usage records. `peak_context_fill_tokens` is the largest effective input
+    // context any counted response saw — the session's high-water context fill.
+    // `first_turn_context_tokens` is the same measure for the session's FIRST
+    // counted response: the first-turn baseline (system prompt + tools + memory
+    // + first user input), not a claim of purely static context.
+    // `compaction_count` counts compaction events, auto or manual.
+    //
+    // Claude Code and Codex both derive these, from different records and with
+    // DIFFERENT input scopes (see `apply_claude_code_line` /
+    // `apply_codex_line`): a Claude response reports uncached input, so its
+    // effective context is input + cache reads + cache writes, whereas Codex
+    // `input_tokens` already includes the cached prefix and IS the effective
+    // context on its own. Both therefore land here as the same
+    // window-comparable measure — the prompt volume the model actually saw —
+    // which is what the backend divides by the model's context window.
+    //
+    // None for Pi (no posture derivation) and for Codex state-only snapshots
+    // (no rollout parsed, so nothing was observed). `compaction_count` is
+    // Some(0) wherever a transcript WAS parsed: Some(0) = "observed, none"
+    // vs None = "daemon can't tell". Backend schema must accept these as
+    // optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_context_fill_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -723,10 +753,12 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         // the snapshot is never re-sent).
         "origin": &item.origin,
     });
-    // Same one-time re-upload rationale as `origin`, but deliberately scoped
-    // to Claude Code. Adding null posture keys for Codex/Pi would change their
-    // fingerprints too and trigger an unrelated cross-source re-upload burst.
-    if source == SnapshotSource::ClaudeCode {
+    // Same one-time re-upload rationale as `origin`, scoped to the sources that
+    // actually derive posture. Including a source here is what makes its
+    // already-uploaded sessions re-send once with the new fields; Pi derives
+    // nothing, so adding null posture keys there would churn every Pi
+    // fingerprint for an unrelated re-upload burst that carries no new data.
+    if source.derives_context_posture() {
         let payload = fingerprint_payload
             .as_object_mut()
             .expect("snapshot fingerprint payload is an object");
@@ -1488,11 +1520,13 @@ struct SnapshotAccumulator {
     // an ms-precision RFC3339 timestamp but no first-token marker, so only whole
     // turn duration is derivable this way, never TTFT.
     claude_last_user_ts: Option<String>,
-    // Claude Code context posture (see the SnapshotItem field docs). Running
-    // max / first-seen watermarks over each counted API response's
-    // `effective_input_context()`, plus a count of `isCompactSummary`
-    // transcript records. Only the Claude Code line parser feeds these;
-    // Codex / Pi sessions leave them at their zero values and emit None.
+    // Context posture (see the SnapshotItem field docs). Running max /
+    // first-seen watermarks over each counted API response's effective input
+    // context, plus a count of compaction records. The Claude Code and Codex
+    // line parsers each feed these from their own records — the per-source
+    // input-scope difference is resolved before it reaches here, so both write
+    // the same window-comparable measure. Pi leaves them at their zero values
+    // and emits None.
     peak_context_fill_tokens: u64,
     first_turn_context_tokens: Option<u64>,
     compaction_count: u64,
@@ -1944,19 +1978,23 @@ impl SnapshotAccumulator {
                 .then_some(self.latency_duration_ms_max),
             max_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
                 .then_some(self.latency_ttft_ms_max),
-            // Claude Code-origin sessions only; other agents emit None. A
-            // Claude session with no counted context leaves peak/first at
-            // None, while compaction_count is always reported for Claude
-            // (Some(0) = "observed, none" vs None = "daemon can't tell").
-            peak_context_fill_tokens: (self.source == SnapshotSource::ClaudeCode
+            // Posture-deriving sources only (Claude Code, Codex); Pi emits
+            // None. A parsed session with no counted context leaves peak/first
+            // at None, while compaction_count is always reported for a parsed
+            // transcript (Some(0) = "observed, none" vs None = "daemon can't
+            // tell") — both sources log compactions explicitly, so a zero here
+            // is a real observation rather than a gap.
+            peak_context_fill_tokens: (self.source.derives_context_posture()
                 && self.peak_context_fill_tokens > 0)
                 .then_some(self.peak_context_fill_tokens),
-            first_turn_context_tokens: if self.source == SnapshotSource::ClaudeCode {
+            first_turn_context_tokens: if self.source.derives_context_posture() {
                 self.first_turn_context_tokens
             } else {
                 None
             },
-            compaction_count: (self.source == SnapshotSource::ClaudeCode)
+            compaction_count: self
+                .source
+                .derives_context_posture()
                 .then_some(self.compaction_count),
             model_usage,
             usage_buckets,
@@ -3172,6 +3210,45 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     {
         accumulator.latest_turn_id = Some(turn_id);
     }
+    // Codex compaction (auto or manual `/compact`) writes a top-level
+    // `type=compacted` rollout record carrying the `replacement_history` that
+    // supersedes the compacted turns. Codex also emits an
+    // `event_msg`/`context_compacted` UI event for the same compaction a few
+    // milliseconds later; the two are strictly paired, so count the rollout
+    // record only — counting both would double every compaction. The rollout
+    // record is the state mutation itself, which makes it the Codex analogue of
+    // the `isCompactSummary` record the Claude parser counts.
+    if string_eq_at(value, &["type"], "compacted") {
+        accumulator.compaction_count += 1;
+    }
+    // Context posture watermarks for this response. Codex states the per-turn
+    // usage directly in `last_token_usage`, so read it off the event rather
+    // than reusing the cumulative delta computed below. The delta agrees with
+    // `last_token_usage` on a healthy sequence, but not on the two cases that
+    // matter here: a duplicated `token_count` event (Codex emits these) yields
+    // a zero delta while `last_token_usage` still states the turn's true
+    // context, and a non-monotonic cumulative (session restart) makes the delta
+    // the whole session's input rather than one turn's — which would post a
+    // wildly inflated peak.
+    //
+    // The value needs no cache adjustment: unlike Claude's `message.usage`,
+    // Codex `input_tokens` is INCLUSIVE of `cached_input_tokens` (hence
+    // `input_token_scope=inclusive_cached` in this snapshot's provenance), so
+    // it already IS the prompt volume the model saw. Adding cache reads on top
+    // — the Claude-side `effective_input_context()` formula — would nearly
+    // double a cache-heavy turn and report a long session as filling more than
+    // its own context window.
+    if let Some(context_tokens) = codex_last_turn_input_context(value) {
+        // The `token_count` event Codex emits at a compaction reports zero
+        // usage; it observed no context, so it must not become the baseline.
+        if context_tokens > 0 {
+            if accumulator.first_turn_context_tokens.is_none() {
+                accumulator.first_turn_context_tokens = Some(context_tokens);
+            }
+            accumulator.peak_context_fill_tokens =
+                accumulator.peak_context_fill_tokens.max(context_tokens);
+        }
+    }
     if let Some(usage) = codex_total_usage(value) {
         // Codex cumulative totals carry request_count as a session-wide count.
         // When the field is missing the parser defaults it to 1 so deltas
@@ -3789,6 +3866,25 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         usage.request_count = 1;
     }
     Some(usage)
+}
+
+/// This response's effective input context from a Codex `token_count` event:
+/// `last_token_usage.input_tokens`, the usage of the single API response the
+/// event reports (the sibling `total_token_usage` is the session-wide running
+/// sum). Already includes the cached prefix — `cached_input_tokens` is a subset
+/// of `input_tokens`, not an addend — so it is the window-comparable context on
+/// its own. `None` for lines carrying no per-response usage, and 0 for the
+/// zero-usage event Codex emits at a compaction.
+///
+/// Pointer fallbacks mirror `codex_total_usage` so both survive the same
+/// rollout-shape variations.
+fn codex_last_turn_input_context(value: &Value) -> Option<u64> {
+    let root = value
+        .pointer("/token_count/info/last_token_usage")
+        .or_else(|| value.pointer("/payload/info/last_token_usage"))
+        .or_else(|| value.pointer("/payload/last_token_usage"))
+        .or_else(|| value.pointer("/last_token_usage"))?;
+    u64_at(root, &["input_tokens"]).or_else(|| u64_at(root, &["inputTokens"]))
 }
 
 fn codex_total_usage_has_request_count(value: &Value) -> bool {
@@ -8310,10 +8406,114 @@ mod tests {
     }
 
     #[test]
-    fn codex_sessions_emit_no_context_posture_fields() {
-        // Context posture is a Claude Code transcript signal; Codex snapshots
-        // must leave all three fields None so they serialize away entirely.
-        let path = temp_file("codex-no-context-posture");
+    fn codex_parser_derives_context_posture_watermarks() {
+        // Codex reports each response's own usage in `last_token_usage`, so the
+        // watermarks come from there. Shapes asserted, in file order:
+        //   * turn 1 (22817) sets the first-turn baseline,
+        //   * turn 2 (33205) raises the peak,
+        //   * a DUPLICATE of turn 2 must be idempotent (max/first, not a sum),
+        //   * turn 3 (45272) is the session peak,
+        //   * the zero-usage event Codex emits at a compaction is ignored,
+        //   * the post-compaction turn (25182) drops well below the peak, which
+        //     must retain the pre-compaction high-water mark.
+        let path = temp_file("codex-context-posture");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-17T03:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019f6d5f-abbf-7502-9448-a68952e2c988\"}}\n",
+                "{\"timestamp\":\"2026-07-17T03:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":22817,\"cached_input_tokens\":9984,\"output_tokens\":440},\"last_token_usage\":{\"input_tokens\":22817,\"cached_input_tokens\":9984,\"output_tokens\":440},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T03:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":56022,\"cached_input_tokens\":32256,\"output_tokens\":921},\"last_token_usage\":{\"input_tokens\":33205,\"cached_input_tokens\":22272,\"output_tokens\":481},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T03:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":56022,\"cached_input_tokens\":32256,\"output_tokens\":921},\"last_token_usage\":{\"input_tokens\":33205,\"cached_input_tokens\":22272,\"output_tokens\":481},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T03:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":101294,\"cached_input_tokens\":75008,\"output_tokens\":1165},\"last_token_usage\":{\"input_tokens\":45272,\"cached_input_tokens\":42752,\"output_tokens\":244},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T03:04:00Z\",\"type\":\"compacted\",\"payload\":{\"message\":\"\",\"replacement_history\":[]}}\n",
+                "{\"timestamp\":\"2026-07-17T03:04:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":101294,\"cached_input_tokens\":75008,\"output_tokens\":1165},\"last_token_usage\":{\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T03:04:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"context_compacted\"}}\n",
+                "{\"timestamp\":\"2026-07-17T03:05:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":126476,\"cached_input_tokens\":97280,\"output_tokens\":1300},\"last_token_usage\":{\"input_tokens\":25182,\"cached_input_tokens\":22272,\"output_tokens\":135},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-07-17T03:06:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.first_turn_context_tokens, Some(22817));
+        assert_eq!(item.peak_context_fill_tokens, Some(45272));
+        // The `compacted` rollout record and its paired `context_compacted` UI
+        // event describe ONE compaction; counting both would report two.
+        assert_eq!(item.compaction_count, Some(1));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_context_posture_reads_per_turn_usage_not_the_cumulative() {
+        // Regression guard for the two ways the cumulative `total_token_usage`
+        // misreports per-turn context, both taken from real rollouts:
+        //   * the cumulative is a session-wide SUM, so on turn 2 it is 56022
+        //     while the turn's actual context is 33205;
+        //   * Codex `input_tokens` already includes `cached_input_tokens`, so
+        //     adding cache reads (the Claude-side formula) would report
+        //     33205 + 22272 = 55477 for a turn that saw 33205.
+        // Either mistake inflates the peak, and the backend divides the peak by
+        // the model's context window — so an inflated peak reads as a session
+        // filling far more of its window than it did.
+        let path = temp_file("codex-posture-not-cumulative");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-17T04:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019f6d5f-1111-7502-9448-bbbbbbbbbbbb\"}}\n",
+                "{\"timestamp\":\"2026-07-17T04:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":22817,\"cached_input_tokens\":9984,\"output_tokens\":440},\"last_token_usage\":{\"input_tokens\":22817,\"cached_input_tokens\":9984,\"output_tokens\":440},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-17T04:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":56022,\"cached_input_tokens\":32256,\"output_tokens\":921},\"last_token_usage\":{\"input_tokens\":33205,\"cached_input_tokens\":22272,\"output_tokens\":481},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-07-17T04:03:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.peak_context_fill_tokens, Some(33205));
+        // The session-wide cumulative and the cache-additive figure must never
+        // surface as a context reading.
+        assert_ne!(item.peak_context_fill_tokens, Some(56022));
+        assert_ne!(item.peak_context_fill_tokens, Some(55477));
+        // Usage accounting still reconciles off the cumulative deltas, and
+        // stays inclusive-scoped: `input_tokens` is the session-wide total with
+        // `cache_read_tokens` as a SUBSET of it, not an addend (the backend
+        // subtracts that subset exactly once, per `input_token_scope`). Summing
+        // the two here would yield 88278 — the same double-count that must
+        // never reach a context reading above.
+        assert_eq!(item.input_tokens, 56022);
+        assert_eq!(item.cache_read_tokens, 32256);
+        assert_eq!(
+            item.provenance.input_token_scope.as_deref(),
+            Some("inclusive_cached")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_sessions_without_per_turn_usage_claim_no_context() {
+        // A rollout whose `token_count` events carry no `last_token_usage`
+        // yields no context reading rather than a guess derived from the
+        // cumulative. `compaction_count` is still Some(0): the parser DID read
+        // this transcript's compaction records and saw none, which is an
+        // observation, not a gap.
+        let path = temp_file("codex-no-last-token-usage");
         fs::write(
             &path,
             concat!(
@@ -8335,21 +8535,88 @@ mod tests {
 
         assert_eq!(item.peak_context_fill_tokens, None);
         assert_eq!(item.first_turn_context_tokens, None);
+        assert_eq!(item.compaction_count, Some(0));
+        let serialized = serde_json::to_value(&item).expect("serialize");
+        assert!(serialized.get("peak_context_fill_tokens").is_none());
+        assert!(serialized.get("first_turn_context_tokens").is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_context_posture_fields_change_snapshot_fingerprint() {
+        // Codex posture joins the fingerprint payload on purpose: that is what
+        // re-uploads every already-collected Codex session once, so the backend
+        // can backfill posture for history rather than only new sessions.
+        let path = temp_file("codex-posture-fingerprint");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-01T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-8888-7000-9000-cccccccccccc\"}}\n",
+                "{\"timestamp\":\"2026-07-01T12:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":5000,\"cached_input_tokens\":1000,\"output_tokens\":9},\"last_token_usage\":{\"input_tokens\":5000,\"cached_input_tokens\":1000,\"output_tokens\":9},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-07-01T12:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.peak_context_fill_tokens, Some(5000));
+        let mut without_posture = item.clone();
+        without_posture.peak_context_fill_tokens = None;
+        without_posture.first_turn_context_tokens = None;
+        without_posture.compaction_count = None;
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::Codex, &item),
+            snapshot_fingerprint(SnapshotSource::Codex, &without_posture)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_sessions_emit_no_context_posture_fields() {
+        // Pi derives no posture, so all three fields stay None and serialize
+        // away — and posture must not be a Pi fingerprint dimension, or every
+        // Pi session would re-upload on upgrade carrying nothing new.
+        let path = temp_file("pi-no-context-posture");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-eeee-7000-9000-444444444444\",\"cwd\":\"/Users/example/work\",\"timestamp\":\"2026-05-19T11:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1779234002000,\"usage\":{\"input\":80,\"output\":20,\"cacheRead\":10,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-05-19T11:05:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.peak_context_fill_tokens, None);
+        assert_eq!(item.first_turn_context_tokens, None);
         assert_eq!(item.compaction_count, None);
         let serialized = serde_json::to_value(&item).expect("serialize");
         assert!(serialized.get("peak_context_fill_tokens").is_none());
         assert!(serialized.get("first_turn_context_tokens").is_none());
         assert!(serialized.get("compaction_count").is_none());
 
-        // Posture is not a Codex/Pi fingerprint dimension. Even a defensive
-        // mutation must not churn unrelated source indexes on upgrade.
-        let fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
+        let fingerprint = snapshot_fingerprint(SnapshotSource::Pi, &item);
         let mut mutated = item.clone();
         mutated.peak_context_fill_tokens = Some(10);
         mutated.first_turn_context_tokens = Some(5);
         mutated.compaction_count = Some(1);
         assert_eq!(
-            snapshot_fingerprint(SnapshotSource::Codex, &mutated),
+            snapshot_fingerprint(SnapshotSource::Pi, &mutated),
             fingerprint
         );
 

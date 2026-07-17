@@ -131,10 +131,15 @@ pub fn claude_context_posture_summary(
 }
 
 /// Project a scanned session onto its cache row. Only rows with posture
-/// evidence qualify: `snapshots.rs` emits the posture fields exclusively for
-/// Claude Code sessions (`compaction_count` is `Some` even at 0 there), so
-/// Codex/Pi items — or a future regression that stops deriving posture —
-/// contribute nothing rather than a fake empty row.
+/// evidence qualify (`compaction_count` is `Some` even at 0 on a parsed
+/// transcript), so a Codex state-only item — or a future regression that stops
+/// deriving posture — contributes nothing rather than a fake empty row.
+///
+/// This does NOT by itself make the cache Claude-only: `snapshots.rs` derives
+/// posture for Codex too, so keeping this cache's `claude_code.json` contract
+/// honest depends on the caller's `source == ClaudeCode` gate in
+/// `snapshot_sync.rs`. Feeding it another source's scan would silently file
+/// those sessions under Claude Code.
 fn cache_row_from_snapshot(item: &SnapshotItem) -> Option<ContextPostureCacheRow> {
     if item.peak_context_fill_tokens.is_none()
         && item.first_turn_context_tokens.is_none()
