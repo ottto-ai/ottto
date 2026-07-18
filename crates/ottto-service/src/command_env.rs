@@ -508,11 +508,15 @@ mod tests {
         let claude = bin_dir.join("claude");
         fs::write(&claude, "#!/bin/sh\n").expect("write claude");
 
+        // The search dirs also include the real machine's PATH entries; keep
+        // only dirs under the scratch home so a genuine `claude` install on
+        // the host cannot satisfy (or shadow) the lookup.
         let found = executable_search_dirs_for_program_with_home(
             "claude",
             Some(home.as_os_str().to_os_string()),
         )
         .into_iter()
+        .filter(|dir| dir.starts_with(&home))
         .map(|dir| dir.join("claude"))
         .find(|candidate| candidate.is_file());
 
