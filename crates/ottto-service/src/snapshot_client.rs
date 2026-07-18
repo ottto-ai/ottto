@@ -606,6 +606,24 @@ pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+        // Disable idle keep-alive connection reuse on this shared upload agent.
+        // After a network transition (VPN flap / macOS en0 MAGICWAKE wake) ureq
+        // 2.12.1 pooled a keep-alive socket bound to the now-dead local IP and
+        // reused it — its liveness peek only detects a peer-closed socket, not a
+        // locally-dead one — so every upload failed status_family=
+        // transport_connection until a manual daemon restart (2026-07-17
+        // incident, ~2.75h stall). ureq 2.12.1 exposes no idle-age/TTL knob, so
+        // setting max_idle_connections(0) to disable idle reuse is the only way
+        // to bound stale-socket reuse short of rebuilding the agent: every
+        // request opens a fresh connect and can never reuse a socket bound to a
+        // dead local IP. Intentional tradeoff: this forfeits the shared pool's
+        // warm-socket survival that #234 relied on, but DNS-incident coverage is
+        // retained independently by the FallbackDnsResolver below, and the cost
+        // is one extra TCP+TLS handshake per request at the 5-min/60-s upload
+        // cadence (bounded by the 5-s connect timeout) — negligible. Do NOT
+        // apply this to the OTLP UPSTREAM_HTTP_AGENT, whose warm pool is
+        // intentional.
+        .max_idle_connections(0)
         // Survive process-local resolver breakage (pinned scoped-DNS state
         // after a VPN/network transition): fall back to an out-of-process
         // probe, then the last successfully resolved addresses. TLS SNI and
