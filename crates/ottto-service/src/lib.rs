@@ -12,6 +12,7 @@ pub mod keychain;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
+pub mod net_transition;
 pub mod otlp_relay;
 pub mod snapshot_client;
 pub mod snapshot_sync;
