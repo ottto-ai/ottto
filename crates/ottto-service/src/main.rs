@@ -307,6 +307,12 @@ impl ServiceCommand {
 }
 
 fn start_builtin_relays(daemon: &LocalDaemon) {
+    // Proactively rebuild upstream HTTP pools on macOS network transitions so
+    // pooled sockets bound to a dead local IP never stall uploads (2026-07-17).
+    match ottto_service::net_transition::spawn_network_transition_observer() {
+        Ok(()) => eprintln!("serving network transition observer"),
+        Err(error) => eprintln!("network transition observer unavailable: {error}"),
+    }
     match ottto_service::otlp_relay::spawn_local_otlp_relay(daemon.clone()) {
         Ok(addr) => eprintln!("serving local OTLP relay at http://{addr}"),
         Err(error) => eprintln!("local OTLP relay unavailable: {error}"),

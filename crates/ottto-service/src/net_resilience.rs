@@ -28,24 +28,42 @@
 //! 4. Last resort: after 1h+ of continuous in-process DNS failure with fresh
 //!    evidence that the host network is fine, the service aborts so launchd
 //!    (KeepAlive.Crashed) relaunches it with fresh process resolver state.
+//! 5. A transport-layer twin of the DNS ladder (2026-07-17 incident: a
+//!    MAGICWAKE network transition left every upload failing as
+//!    `transport_connection` for 2.75h while DNS kept resolving, so ladders
+//!    2-4 never fired): a per-sync-cycle streak over the non-DNS `transport_*`
+//!    failure families drives the same rebuild, and — gated on an
+//!    out-of-process TCP-connect probe or another upload path reaching the
+//!    backend — the same last-resort self-restart.
+//! 6. Proactively, `net_transition` watches macOS routing-table changes and
+//!    force-rebuilds both upstream pools on any interface/address transition,
+//!    independent of the reactive ladders above.
 
+use crate::snapshot_client::UploadFailureDiagnostics;
 use crate::LocalDaemon;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// DNS outage threshold before the shared agents are rebuilt: at least this
-/// many consecutive in-process resolution failures spanning at least the
-/// outage window below.
-const DNS_OUTAGE_MIN_CONSECUTIVE_FAILURES: u32 = 3;
-const DNS_REBUILD_MIN_OUTAGE: Duration = Duration::from_secs(10 * 60);
+/// Outage threshold before the shared agents are rebuilt: at least this many
+/// consecutive failures (DNS resolutions, or transport-failed sync cycles)
+/// spanning at least the outage window below.
+const OUTAGE_MIN_CONSECUTIVE_FAILURES: u32 = 3;
+const REBUILD_MIN_OUTAGE: Duration = Duration::from_secs(10 * 60);
 /// Rebuilding drops warm connections, so never rebuild more often than this.
-const DNS_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Out-of-process probes spawn a child process; keep them rare even when the
 /// resolver is hit on every request during an outage.
 const DNS_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Out-of-process TCP-connect probes also spawn a child process and can block
+/// for the connect timeout; keep them rare during a transport outage.
+const TCP_PROBE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Bound for the out-of-process TCP-connect probe's connect attempt.
+#[cfg(not(test))]
+const TCP_PROBE_CONNECT_TIMEOUT_SECS: u32 = 5;
 /// Loud fallback log lines are rate-limited so a multi-hour outage does not
 /// flood the error log the way the original incident's 47 identical lines did.
 const DNS_FALLBACK_LOG_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -72,40 +90,88 @@ pub(crate) const DNS_SELF_RESTART_ENV: &str = "OTTTO_DNS_SELF_RESTART";
 type PrimaryResolveFn = dyn Fn(&str) -> io::Result<Vec<SocketAddr>> + Send + Sync;
 type ProbeResolveFn = dyn Fn(&str) -> Option<Vec<IpAddr>> + Send + Sync;
 
+/// A consecutive-failure streak with the anti-thrash rebuild stamping shared
+/// by both process-local outage ladders: the DNS resolution streak (#234,
+/// 2026-07-15 incident) and the transport-layer sync-cycle streak (2026-07-17
+/// `transport_connection` stall after an `en0` MAGICWAKE network transition,
+/// which the DNS-keyed ladder structurally could not observe because the host
+/// kept resolving).
+#[derive(Default)]
+struct OutageStreak {
+    consecutive_failures: u32,
+    first_failure_at: Option<Instant>,
+    last_rebuild_at: Option<Instant>,
+}
+
+impl OutageStreak {
+    fn note_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.first_failure_at.get_or_insert(now);
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.first_failure_at = None;
+    }
+
+    /// Continuous outage duration, once the streak is long enough to rule out
+    /// a one-off blip.
+    fn outage_duration(&self, now: Instant) -> Option<Duration> {
+        if self.consecutive_failures < OUTAGE_MIN_CONSECUTIVE_FAILURES {
+            return None;
+        }
+        self.first_failure_at
+            .map(|first| now.saturating_duration_since(first))
+    }
+
+    /// Whether the shared agents should be rebuilt before the next attempt.
+    /// Stamps the rebuild time when it answers yes, so callers that act on it
+    /// automatically respect the min-interval on the next check.
+    fn should_rebuild(&mut self, now: Instant) -> bool {
+        let Some(outage) = self.outage_duration(now) else {
+            return false;
+        };
+        if outage < REBUILD_MIN_OUTAGE {
+            return false;
+        }
+        let rebuilt_recently = self
+            .last_rebuild_at
+            .map(|at| now.saturating_duration_since(at) < REBUILD_MIN_INTERVAL)
+            .unwrap_or(false);
+        if rebuilt_recently {
+            return false;
+        }
+        self.last_rebuild_at = Some(now);
+        true
+    }
+}
+
 /// Process-wide DNS health: the last-good address cache the resolver falls
 /// back to, the consecutive-failure streak that drives agent rebuilds and the
 /// self-restart decision, and the rate-limiter timestamps.
 #[derive(Default)]
 struct DnsState {
     last_good: HashMap<String, Vec<SocketAddr>>,
-    consecutive_failures: u32,
-    first_failure_at: Option<Instant>,
+    streak: OutageStreak,
     last_probe_at: Option<Instant>,
     last_probe_success_at: Option<Instant>,
     last_fallback_log_at: Option<Instant>,
-    last_rebuild_at: Option<Instant>,
 }
 
 impl DnsState {
     fn note_resolution_succeeded(&mut self, netloc: &str, addrs: Vec<SocketAddr>) {
         self.last_good.insert(netloc.to_string(), addrs);
-        self.consecutive_failures = 0;
-        self.first_failure_at = None;
+        self.streak.note_success();
     }
 
     fn note_resolution_failed(&mut self, now: Instant) {
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.first_failure_at.get_or_insert(now);
+        self.streak.note_failure(now);
     }
 
     /// Continuous in-process DNS outage duration, once the streak is long
     /// enough to rule out a one-off blip.
     fn outage_duration(&self, now: Instant) -> Option<Duration> {
-        if self.consecutive_failures < DNS_OUTAGE_MIN_CONSECUTIVE_FAILURES {
-            return None;
-        }
-        self.first_failure_at
-            .map(|first| now.saturating_duration_since(first))
+        self.streak.outage_duration(now)
     }
 
     fn should_attempt_probe(&mut self, now: Instant) -> bool {
@@ -140,25 +206,8 @@ impl DnsState {
         due
     }
 
-    /// Whether the shared agents should be rebuilt before the next attempt.
-    /// Stamps the rebuild time when it answers yes, so callers that act on it
-    /// automatically respect the min-interval on the next check.
     fn should_rebuild_agents(&mut self, now: Instant) -> bool {
-        let Some(outage) = self.outage_duration(now) else {
-            return false;
-        };
-        if outage < DNS_REBUILD_MIN_OUTAGE {
-            return false;
-        }
-        let rebuilt_recently = self
-            .last_rebuild_at
-            .map(|at| now.saturating_duration_since(at) < DNS_REBUILD_MIN_INTERVAL)
-            .unwrap_or(false);
-        if rebuilt_recently {
-            return false;
-        }
-        self.last_rebuild_at = Some(now);
-        true
+        self.streak.should_rebuild(now)
     }
 }
 
@@ -235,7 +284,7 @@ impl FallbackDnsResolver {
                              (failure {} in a row) but an out-of-process probe resolved it; \
                              using probed addresses. The failure is process-local resolver \
                              state, not the network.",
-                            state.consecutive_failures,
+                            state.streak.consecutive_failures,
                         );
                     }
                     return Ok(addrs);
@@ -250,7 +299,7 @@ impl FallbackDnsResolver {
                     "OTTTO-DNS-FALLBACK: in-process DNS resolution failed for {host} \
                      (failure {} in a row); connecting with the last successfully \
                      resolved addresses (TLS still validates the hostname).",
-                    state.consecutive_failures,
+                    state.streak.consecutive_failures,
                 );
             }
             return Ok(stale);
@@ -339,6 +388,261 @@ pub(crate) fn shared_fallback_resolver() -> FallbackDnsResolver {
     FallbackDnsResolver::with_shared_state()
 }
 
+/// Process-wide transport-layer outage tracking for the shared upload agents.
+///
+/// Motivated by the 2026-07-17 stall: after an `en0` MAGICWAKE network
+/// transition every upload on the shared pool failed as
+/// `transport_connection` for 2.75h while DNS kept resolving, so the DNS-keyed
+/// ladder above never fired. This streak is fed one verdict per sync/upload
+/// cycle from the paths that still see the typed
+/// [`UploadFailureDiagnostics`] (see `transport_signal_from_error`), and its
+/// self-restart evidence is an out-of-process TCP-connect probe: a child
+/// process connecting to the API endpoint while every in-process attempt
+/// fails is proof the wedge is process-local, not the network being down.
+#[derive(Default)]
+struct TransportState {
+    streak: OutageStreak,
+    last_probe_at: Option<Instant>,
+    last_probe_success_at: Option<Instant>,
+}
+
+impl TransportState {
+    fn apply_cycle_verdict(&mut self, verdict: TransportSignal, now: Instant) {
+        match verdict {
+            TransportSignal::BackendReached => self.streak.note_success(),
+            TransportSignal::TransportFailure => self.streak.note_failure(now),
+            TransportSignal::Neutral => {}
+        }
+    }
+
+    fn outage_duration(&self, now: Instant) -> Option<Duration> {
+        self.streak.outage_duration(now)
+    }
+
+    /// A probe is worth spawning only once the streak already looks like an
+    /// outage; a lone blip must not cost a child process.
+    fn should_attempt_probe(&mut self, now: Instant) -> bool {
+        if self.streak.outage_duration(now).is_none() {
+            return false;
+        }
+        let due = self
+            .last_probe_at
+            .map(|at| now.saturating_duration_since(at) >= TCP_PROBE_MIN_INTERVAL)
+            .unwrap_or(true);
+        if due {
+            self.last_probe_at = Some(now);
+        }
+        due
+    }
+
+    fn note_probe_succeeded(&mut self, now: Instant) {
+        self.last_probe_success_at = Some(now);
+    }
+
+    fn probe_success_is_fresh(&self, now: Instant) -> bool {
+        self.last_probe_success_at
+            .map(|at| now.saturating_duration_since(at) <= SELF_RESTART_EVIDENCE_FRESHNESS)
+            .unwrap_or(false)
+    }
+}
+
+static TRANSPORT_STATE: OnceLock<Mutex<TransportState>> = OnceLock::new();
+
+fn shared_transport_state() -> &'static Mutex<TransportState> {
+    TRANSPORT_STATE.get_or_init(|| Mutex::new(TransportState::default()))
+}
+
+/// Transport-layer evidence extracted from one upload attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportSignal {
+    /// The backend was demonstrably reached over the transport layer: a
+    /// success, any HTTP status (including rejections), or a local error that
+    /// never blames the transport. Resets the streak so a stale streak can
+    /// never fire a rebuild or restart long after the last transport failure.
+    BackendReached,
+    /// A `transport_*` failure other than `transport_dns` — connection,
+    /// timeout, TLS, or unclassified transport (ENETUNREACH/EPIPE/...).
+    TransportFailure,
+    /// No transport evidence either way (`transport_dns` — the DNS ladder
+    /// above owns that family and its own probe/rebuild/restart path).
+    Neutral,
+}
+
+/// Classify one upload-path error. Only the typed
+/// [`UploadFailureDiagnostics`] can blame the transport; every other error
+/// shape (typed backend rejections, local scan/credential errors, plain
+/// anyhow strings) counts as "not a transport failure" and resets the streak.
+pub(crate) fn transport_signal_from_error(error: &anyhow::Error) -> TransportSignal {
+    let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() else {
+        return TransportSignal::BackendReached;
+    };
+    let family = diagnostics.status_family();
+    if family == "transport_dns" {
+        TransportSignal::Neutral
+    } else if family.starts_with("transport_") {
+        TransportSignal::TransportFailure
+    } else {
+        TransportSignal::BackendReached
+    }
+}
+
+/// Per-cycle fold of every upload attempt's transport evidence. One cycle
+/// (one `sync_once` pass, or one standalone agent-status upload pass) must
+/// move the streak by at most one step, and any reached-the-backend evidence
+/// in the cycle outweighs a transport failure elsewhere in the same cycle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TransportCycleOutcome {
+    reached: bool,
+    transport_failure: bool,
+}
+
+impl TransportCycleOutcome {
+    pub(crate) fn note_success(&mut self) {
+        self.reached = true;
+    }
+
+    pub(crate) fn note_error(&mut self, error: &anyhow::Error) {
+        match transport_signal_from_error(error) {
+            TransportSignal::BackendReached => self.reached = true,
+            TransportSignal::TransportFailure => self.transport_failure = true,
+            TransportSignal::Neutral => {}
+        }
+    }
+
+    fn verdict(self) -> TransportSignal {
+        if self.reached {
+            TransportSignal::BackendReached
+        } else if self.transport_failure {
+            TransportSignal::TransportFailure
+        } else {
+            TransportSignal::Neutral
+        }
+    }
+}
+
+/// Feed one completed upload cycle's folded transport evidence into the
+/// process-wide transport streak, and — once the streak looks like an outage —
+/// run the rate-limited out-of-process TCP-connect probe that the self-restart
+/// decision uses as its process-wedge evidence. The probe runs outside the
+/// state lock because it can block for the connect timeout.
+pub(crate) fn note_sync_cycle_transport(outcome: TransportCycleOutcome) {
+    let now = Instant::now();
+    let verdict = outcome.verdict();
+    let probe_due = shared_transport_state()
+        .lock()
+        .map(|mut state| {
+            state.apply_cycle_verdict(verdict, now);
+            verdict == TransportSignal::TransportFailure && state.should_attempt_probe(now)
+        })
+        .unwrap_or(false);
+    if probe_due && out_of_process_tcp_probe() {
+        if let Ok(mut state) = shared_transport_state().lock() {
+            state.note_probe_succeeded(Instant::now());
+            eprintln!(
+                "OTTTO-TRANSPORT-OUTAGE: in-process uploads keep failing at the transport \
+                 layer, but an out-of-process TCP connect to the API endpoint succeeded; \
+                 the failure is process-local network state, not the network.",
+            );
+        }
+    }
+}
+
+/// Unit tests must never spawn a probe child process or touch the network;
+/// the probe-driven decision logic is exercised through `TransportState`.
+#[cfg(test)]
+fn out_of_process_tcp_probe() -> bool {
+    false
+}
+
+/// TCP-connect to the API endpoint from a freshly spawned child process. A
+/// child succeeds when only THIS process's network path is wedged (the
+/// hypothesized MAGICWAKE blackhole), and fails when the machine is actually
+/// offline — exactly the split the self-restart gate needs. Deliberately NOT
+/// the DNS resolve probe: cached DNS resolves fine on an offline machine.
+#[cfg(not(test))]
+fn out_of_process_tcp_probe() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let Some((host, port)) = api_probe_target() else {
+            return false;
+        };
+        std::process::Command::new("/usr/bin/nc")
+            .args([
+                "-z",
+                "-G",
+                &TCP_PROBE_CONNECT_TIMEOUT_SECS.to_string(),
+                "-w",
+                &TCP_PROBE_CONNECT_TIMEOUT_SECS.to_string(),
+                &host,
+                &port.to_string(),
+            ])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// `(host, port)` of the configured API base URL, for the TCP-connect probe.
+#[cfg(all(target_os = "macos", not(test)))]
+fn api_probe_target() -> Option<(String, u16)> {
+    parse_probe_target(&crate::snapshot_sync::snapshot_api_base_url())
+}
+
+#[cfg(target_os = "macos")]
+fn parse_probe_target(base: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = base.split_once("://")?;
+    let netloc = rest.split(['/', '?']).next()?;
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        443
+    };
+    match netloc.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
+            Ok(port) => Some((host.to_string(), port)),
+            Err(_) => Some((netloc.to_string(), default_port)),
+        },
+        _ if !netloc.is_empty() => Some((netloc.to_string(), default_port)),
+        _ => None,
+    }
+}
+
+/// The OTLP upstream agent lives in `otlp_relay` (its warm pool is
+/// intentionally longer-lived than the shared pair), so rebuilds are
+/// requested through this flag and applied lazily on the relay's next use.
+static OTLP_AGENT_REBUILD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn request_upstream_otlp_agent_rebuild() {
+    OTLP_AGENT_REBUILD_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn take_upstream_otlp_agent_rebuild_request() -> bool {
+    OTLP_AGENT_REBUILD_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// Force-rebuild BOTH upstream pools right now. Called by the proactive
+/// macOS network-transition observer (`net_transition`): after an interface
+/// or address change, every pooled socket may be bound to a dead local IP, so
+/// drop them all instead of waiting for error-classification streaks — this
+/// is independent of (and faster than) both outage ladders.
+pub(crate) fn force_rebuild_upstream_agents(reason: &str) {
+    eprintln!(
+        "OTTTO-NET-TRANSITION: rebuilding upstream HTTP agent pools after {reason} so the \
+         next attempts start from fresh connections.",
+    );
+    if let Some(agents) = SHARED_AGENTS.get() {
+        let mut agents = agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *agents = build_shared_agents();
+    }
+    request_upstream_otlp_agent_rebuild();
+}
+
 struct SharedAgents {
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
@@ -364,18 +668,39 @@ fn build_shared_agents() -> SharedAgents {
 /// a sustained DNS outage the pair is swapped for a fresh one so the next
 /// attempt starts from clean pool state.
 pub(crate) fn shared_agents() -> (ureq::Agent, ureq::Agent) {
-    let rebuild = shared_dns_state()
+    let now = Instant::now();
+    // Evaluate BOTH ladders exactly once per invocation: `should_rebuild`
+    // stamps its own rate-limit timestamp when it answers yes, and skipping
+    // one ladder's check would leave it unstamped and primed to fire a second
+    // rebuild immediately after.
+    let dns_rebuild = shared_dns_state()
         .lock()
-        .map(|mut state| state.should_rebuild_agents(Instant::now()))
+        .map(|mut state| state.should_rebuild_agents(now))
         .unwrap_or(false);
+    let transport_rebuild = shared_transport_state()
+        .lock()
+        .map(|mut state| state.streak.should_rebuild(now))
+        .unwrap_or(false);
+    if transport_rebuild {
+        // A sustained transport outage taints every pool in the process, so
+        // schedule the OTLP upstream agent for the same treatment.
+        request_upstream_otlp_agent_rebuild();
+    }
     let mut agents = SHARED_AGENTS
         .get_or_init(|| Mutex::new(build_shared_agents()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if rebuild {
+    if dns_rebuild || transport_rebuild {
+        let cause = if dns_rebuild && transport_rebuild {
+            "a sustained in-process DNS and transport-layer outage"
+        } else if dns_rebuild {
+            "a sustained in-process DNS outage"
+        } else {
+            "a sustained transport-layer upload outage"
+        };
         eprintln!(
-            "OTTTO-DNS-FALLBACK: rebuilding shared upstream HTTP agents after a sustained \
-             in-process DNS outage so the next attempt starts from fresh pool state.",
+            "OTTTO-NET-RESILIENCE: rebuilding shared upstream HTTP agents after {cause} \
+             so the next attempt starts from fresh pool state.",
         );
         *agents = build_shared_agents();
     }
@@ -388,8 +713,18 @@ pub(crate) fn shared_agents() -> (ureq::Agent, ureq::Agent) {
 pub(crate) struct SyncFailureDecision {
     /// Emit the loud stall line (rate-limited while the stall persists).
     pub stall: Option<SyncStallReport>,
-    /// Abort the process so launchd relaunches it with fresh resolver state.
-    pub self_restart: bool,
+    /// Abort the process so launchd relaunches it with fresh process state.
+    pub self_restart: Option<SelfRestartReason>,
+}
+
+/// Which outage ladder justified the self-restart (drives the log line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfRestartReason {
+    /// Prolonged in-process DNS breakage with a healthy host network.
+    DnsOutage,
+    /// Prolonged transport-layer upload failure (connection/timeout/TLS
+    /// family) with fresh evidence the host network is reachable.
+    TransportOutage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +768,8 @@ impl SyncWatchdogState {
         &mut self,
         dns_outage: Option<Duration>,
         probe_success_fresh: bool,
+        transport_outage: Option<Duration>,
+        tcp_probe_success_fresh: bool,
         now: Instant,
     ) -> SyncFailureDecision {
         let failing_since = *self.sync_failing_since.get_or_insert(now);
@@ -466,7 +803,23 @@ impl SyncWatchdogState {
             && dns_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE)
             && process_local_evidence
         {
-            decision.self_restart = true;
+            decision.self_restart = Some(SelfRestartReason::DnsOutage);
+        }
+
+        // Transport-layer branch (2026-07-17 stall shape). The genuine-
+        // connectivity gate is deliberately NOT the DNS resolve probe: cached
+        // DNS resolves fine on an offline machine. Only a fresh out-of-process
+        // TCP connect to the API endpoint, or another upload path actually
+        // reaching the backend, proves a restart would help rather than churn
+        // a plain offline laptop.
+        let transport_evidence = tcp_probe_success_fresh
+            || self.other_upload_within(SELF_RESTART_EVIDENCE_FRESHNESS, now);
+        if decision.self_restart.is_none()
+            && failing_for >= SELF_RESTART_MIN_OUTAGE
+            && transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE)
+            && transport_evidence
+        {
+            decision.self_restart = Some(SelfRestartReason::TransportOutage);
         }
 
         decision
@@ -517,9 +870,26 @@ pub(crate) fn handle_sync_failure(daemon: &LocalDaemon) {
             )
         })
         .unwrap_or((None, false));
+    let (transport_outage, tcp_probe_success_fresh) = shared_transport_state()
+        .lock()
+        .map(|state| {
+            (
+                state.outage_duration(now),
+                state.probe_success_is_fresh(now),
+            )
+        })
+        .unwrap_or((None, false));
     let decision = sync_watchdog()
         .lock()
-        .map(|mut watchdog| watchdog.decide_sync_failure(dns_outage, probe_success_fresh, now))
+        .map(|mut watchdog| {
+            watchdog.decide_sync_failure(
+                dns_outage,
+                probe_success_fresh,
+                transport_outage,
+                tcp_probe_success_fresh,
+                now,
+            )
+        })
         .unwrap_or_default();
 
     if let Some(stall) = &decision.stall {
@@ -537,16 +907,28 @@ pub(crate) fn handle_sync_failure(daemon: &LocalDaemon) {
         }
     }
 
-    if decision.self_restart && self_restart_enabled() {
-        eprintln!(
-            "OTTTO-SYNC-WATCHDOG: aborting ottto-service after 1h+ of continuous in-process \
-             DNS failure with a healthy host network; launchd (KeepAlive.Crashed) relaunches \
-             the service with fresh resolver state. Set {DNS_SELF_RESTART_ENV}=0 to disable.",
-        );
-        // abort() (not exit()) is deliberate: the installed LaunchAgent only
-        // relaunches on crash-like exits, and a clean exit would leave the
-        // daemon dead until the next XPC connection.
-        std::process::abort();
+    if let Some(reason) = decision.self_restart {
+        if self_restart_enabled() {
+            match reason {
+                SelfRestartReason::DnsOutage => eprintln!(
+                    "OTTTO-SYNC-WATCHDOG: aborting ottto-service after 1h+ of continuous \
+                     in-process DNS failure with a healthy host network; launchd \
+                     (KeepAlive.Crashed) relaunches the service with fresh resolver state. \
+                     Set {DNS_SELF_RESTART_ENV}=0 to disable.",
+                ),
+                SelfRestartReason::TransportOutage => eprintln!(
+                    "OTTTO-SYNC-WATCHDOG: aborting ottto-service after 1h+ of continuous \
+                     transport-layer upload failure while the API endpoint is reachable \
+                     from outside this process; launchd (KeepAlive.Crashed) relaunches the \
+                     service with fresh network state. Set {DNS_SELF_RESTART_ENV}=0 to \
+                     disable.",
+                ),
+            }
+            // abort() (not exit()) is deliberate: the installed LaunchAgent only
+            // relaunches on crash-like exits, and a clean exit would leave the
+            // daemon dead until the next XPC connection.
+            std::process::abort();
+        }
     }
 }
 
@@ -622,7 +1004,7 @@ mod tests {
         assert_eq!(third, vec![addr(443)]);
 
         let state = resolver.state.lock().expect("state");
-        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.streak.consecutive_failures, 1);
     }
 
     #[test]
@@ -703,18 +1085,18 @@ mod tests {
             "streak long enough but outage window not yet spanned"
         );
 
-        let past_window = start + DNS_REBUILD_MIN_OUTAGE + Duration::from_secs(1);
+        let past_window = start + REBUILD_MIN_OUTAGE + Duration::from_secs(1);
         state.note_resolution_failed(past_window);
         assert!(state.should_rebuild_agents(past_window));
         assert!(
             !state.should_rebuild_agents(past_window + Duration::from_secs(60)),
             "rebuilds are rate-limited"
         );
-        assert!(state.should_rebuild_agents(past_window + DNS_REBUILD_MIN_INTERVAL));
+        assert!(state.should_rebuild_agents(past_window + REBUILD_MIN_INTERVAL));
 
         state.note_resolution_succeeded("api.ottto.test:443", vec![addr(443)]);
         assert_eq!(
-            state.outage_duration(past_window + DNS_REBUILD_MIN_INTERVAL),
+            state.outage_duration(past_window + REBUILD_MIN_INTERVAL),
             None,
             "a success ends the outage"
         );
@@ -727,41 +1109,43 @@ mod tests {
         // Sync failing but no other path succeeded: plain offline, no stall.
         let mut offline = SyncWatchdogState::default();
         assert_eq!(
-            offline.decide_sync_failure(None, false, start),
+            offline.decide_sync_failure(None, false, None, false, start),
             SyncFailureDecision::default()
         );
         let later = start + SYNC_STALL_THRESHOLD + Duration::from_secs(1);
         assert_eq!(
-            offline.decide_sync_failure(None, false, later),
+            offline.decide_sync_failure(None, false, None, false, later),
             SyncFailureDecision::default()
         );
 
         // Sync failing while agent-status uploads succeed: the incident shape.
         let mut split = SyncWatchdogState::default();
         assert_eq!(
-            split.decide_sync_failure(None, false, start),
+            split.decide_sync_failure(None, false, None, false, start),
             SyncFailureDecision::default()
         );
         split.note_other_upload("agent_status", later - Duration::from_secs(30));
-        let decision = split.decide_sync_failure(None, false, later);
+        let decision = split.decide_sync_failure(None, false, None, false, later);
         let stall = decision.stall.expect("stall reported");
         assert!(stall.first_report);
         assert_eq!(stall.healthy_path, "agent_status");
         assert!(stall.stalled_for >= SYNC_STALL_THRESHOLD);
-        assert!(!decision.self_restart);
+        assert!(decision.self_restart.is_none());
 
         // Immediately after, the stall keeps holding but must not re-log or
         // re-mark until the re-log interval passes.
         split.note_other_upload("agent_status", later + Duration::from_secs(30));
         assert_eq!(
             split
-                .decide_sync_failure(None, false, later + Duration::from_secs(60))
+                .decide_sync_failure(None, false, None, false, later + Duration::from_secs(60))
                 .stall,
             None
         );
         let relog_at = later + SYNC_STALL_RELOG_INTERVAL;
         split.note_other_upload("agent_status", relog_at - Duration::from_secs(30));
-        let relog = split.decide_sync_failure(None, false, relog_at).stall;
+        let relog = split
+            .decide_sync_failure(None, false, None, false, relog_at)
+            .stall;
         assert!(
             matches!(
                 relog,
@@ -787,46 +1171,48 @@ mod tests {
         // 1h+ sync outage + 1h+ DNS outage, but no evidence the network is
         // fine: could be a plain offline laptop, never restart for that.
         let mut offline = SyncWatchdogState::default();
-        let _ = offline.decide_sync_failure(None, false, start);
-        assert!(
-            !offline
-                .decide_sync_failure(dns_outage, false, past_restart_window)
-                .self_restart
-        );
+        let _ = offline.decide_sync_failure(None, false, None, false, start);
+        assert!(offline
+            .decide_sync_failure(dns_outage, false, None, false, past_restart_window)
+            .self_restart
+            .is_none());
 
         // Same outage with a fresh out-of-process probe success: restart.
         let mut probed = SyncWatchdogState::default();
-        let _ = probed.decide_sync_failure(None, false, start);
-        assert!(
+        let _ = probed.decide_sync_failure(None, false, None, false, start);
+        assert_eq!(
             probed
-                .decide_sync_failure(dns_outage, true, past_restart_window)
-                .self_restart
+                .decide_sync_failure(dns_outage, true, None, false, past_restart_window)
+                .self_restart,
+            Some(SelfRestartReason::DnsOutage)
         );
 
         // Same outage with another upload path healthy: restart.
         let mut split = SyncWatchdogState::default();
-        let _ = split.decide_sync_failure(None, false, start);
+        let _ = split.decide_sync_failure(None, false, None, false, start);
         split.note_other_upload("otlp_relay", past_restart_window - Duration::from_secs(60));
-        assert!(
+        assert_eq!(
             split
-                .decide_sync_failure(dns_outage, false, past_restart_window)
-                .self_restart
+                .decide_sync_failure(dns_outage, false, None, false, past_restart_window)
+                .self_restart,
+            Some(SelfRestartReason::DnsOutage)
         );
 
         // DNS outage shorter than the restart window: keep limping on the
         // fallback resolver instead of churning the process.
         let mut short_dns = SyncWatchdogState::default();
-        let _ = short_dns.decide_sync_failure(None, false, start);
+        let _ = short_dns.decide_sync_failure(None, false, None, false, start);
         short_dns.note_other_upload("otlp_relay", past_restart_window - Duration::from_secs(60));
-        assert!(
-            !short_dns
-                .decide_sync_failure(
-                    Some(Duration::from_secs(30 * 60)),
-                    false,
-                    past_restart_window
-                )
-                .self_restart
-        );
+        assert!(short_dns
+            .decide_sync_failure(
+                Some(Duration::from_secs(30 * 60)),
+                false,
+                None,
+                false,
+                past_restart_window
+            )
+            .self_restart
+            .is_none());
     }
 
     /// End-to-end through the real ureq stack: a hostname URL keeps working
@@ -879,5 +1265,315 @@ mod tests {
             primary_calls.load(Ordering::SeqCst) >= 2,
             "second request must have re-attempted (and failed) live resolution"
         );
+    }
+
+    /// A REAL transport failure through the real ureq stack, shaped exactly
+    /// like `sync_source` propagates it: typed diagnostics under the same
+    /// context wrapper. Connecting to a just-freed local port yields the
+    /// 2026-07-17 incident signature (`transport_connection`).
+    fn refused_connect_transport_error() -> anyhow::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let error = ureq::agent()
+            .post(&format!("http://127.0.0.1:{port}/api/v1/upload"))
+            .call()
+            .expect_err("nothing listens on the freed port");
+        anyhow::Error::new(crate::snapshot_client::UploadFailureDiagnostics::transport(
+            "local snapshot upload",
+            "snapshot_batch",
+            &error,
+        ))
+        .context("upload local snapshots")
+    }
+
+    fn diagnostics_error(status_family: &'static str) -> anyhow::Error {
+        anyhow::Error::new(crate::snapshot_client::UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            status_family,
+            true,
+            false,
+        ))
+        .context("upload local snapshots")
+    }
+
+    /// Run one sync cycle's fold + streak transition exactly the way
+    /// `sync_once` → `note_sync_cycle_transport` does, with an injected clock.
+    fn run_failing_cycle(state: &mut TransportState, error: &anyhow::Error, at: Instant) {
+        let mut cycle = TransportCycleOutcome::default();
+        cycle.note_error(error);
+        state.apply_cycle_verdict(cycle.verdict(), at);
+    }
+
+    #[test]
+    fn real_connection_refusal_classifies_as_a_transport_failure() {
+        let error = refused_connect_transport_error();
+        assert_eq!(
+            transport_signal_from_error(&error),
+            TransportSignal::TransportFailure
+        );
+        // The safe message must carry the incident's status family end-to-end.
+        assert!(
+            error.to_string().contains("upload local snapshots"),
+            "context wrapper preserved: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("transport_connection"),
+            "real refused connect must classify transport_connection: {error:#}"
+        );
+    }
+
+    #[test]
+    fn transport_streak_accrues_over_cycles_and_drives_rebuild() {
+        let mut state = TransportState::default();
+        let start = Instant::now();
+        let error = refused_connect_transport_error();
+
+        // Two failing 5-minute cycles are a blip, not an outage.
+        run_failing_cycle(&mut state, &error, start);
+        run_failing_cycle(&mut state, &error, start + Duration::from_secs(5 * 60));
+        assert_eq!(
+            state.outage_duration(start + Duration::from_secs(5 * 60)),
+            None
+        );
+        assert!(!state
+            .streak
+            .should_rebuild(start + Duration::from_secs(5 * 60)));
+
+        // Third consecutive failing cycle past the 10-minute window: outage.
+        let past_window = start + REBUILD_MIN_OUTAGE + Duration::from_secs(1);
+        run_failing_cycle(&mut state, &error, past_window);
+        assert!(state.outage_duration(past_window).is_some());
+        assert!(state.streak.should_rebuild(past_window));
+        assert!(
+            !state
+                .streak
+                .should_rebuild(past_window + Duration::from_secs(60)),
+            "rebuilds are rate-limited"
+        );
+        run_failing_cycle(&mut state, &error, past_window + REBUILD_MIN_INTERVAL);
+        assert!(state
+            .streak
+            .should_rebuild(past_window + REBUILD_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn transport_streak_resets_on_backend_reached_and_local_errors() {
+        let start = Instant::now();
+        let transport = refused_connect_transport_error();
+
+        // An HTTP status means the backend was reached: transport is fine.
+        let mut state = TransportState::default();
+        run_failing_cycle(&mut state, &transport, start);
+        run_failing_cycle(&mut state, &transport, start + Duration::from_secs(300));
+        run_failing_cycle(
+            &mut state,
+            &diagnostics_error("http_5xx"),
+            start + Duration::from_secs(600),
+        );
+        run_failing_cycle(&mut state, &transport, start + REBUILD_MIN_OUTAGE);
+        assert_eq!(
+            state.outage_duration(start + REBUILD_MIN_OUTAGE),
+            None,
+            "an http_5xx cycle must reset the streak"
+        );
+
+        // A local (downcast-miss) error carries no transport evidence and
+        // must also reset, so a stale streak can never fire much later.
+        let mut local = TransportState::default();
+        run_failing_cycle(&mut local, &transport, start);
+        run_failing_cycle(&mut local, &transport, start + Duration::from_secs(300));
+        run_failing_cycle(
+            &mut local,
+            &anyhow::anyhow!("scan local snapshots failed"),
+            start + Duration::from_secs(600),
+        );
+        assert_eq!(local.streak.consecutive_failures, 0);
+
+        // transport_dns is the DNS ladder's business: neither accrues nor
+        // resets this streak, and the streak survives across a DNS-only cycle.
+        let mut dns = TransportState::default();
+        run_failing_cycle(&mut dns, &transport, start);
+        run_failing_cycle(&mut dns, &transport, start + Duration::from_secs(300));
+        run_failing_cycle(
+            &mut dns,
+            &diagnostics_error("transport_dns"),
+            start + Duration::from_secs(600),
+        );
+        assert_eq!(dns.streak.consecutive_failures, 2);
+        run_failing_cycle(&mut dns, &transport, start + REBUILD_MIN_OUTAGE);
+        assert!(dns.outage_duration(start + REBUILD_MIN_OUTAGE).is_some());
+    }
+
+    #[test]
+    fn cycle_fold_lets_any_reached_source_outweigh_a_transport_failure() {
+        // One source failing transport_connection while another source
+        // succeeds in the SAME cycle proves the transport works.
+        let mut cycle = TransportCycleOutcome::default();
+        cycle.note_error(&refused_connect_transport_error());
+        cycle.note_success();
+        assert_eq!(cycle.verdict(), TransportSignal::BackendReached);
+
+        // And an empty cycle carries no evidence at all.
+        assert_eq!(
+            TransportCycleOutcome::default().verdict(),
+            TransportSignal::Neutral
+        );
+    }
+
+    /// The 2026-07-17 stall shape end-to-end with an injected clock: real
+    /// `transport_connection` diagnostics accrue for over an hour, the
+    /// out-of-process TCP-connect probe proves the wedge is process-local,
+    /// and only then does the watchdog request the transport self-restart.
+    #[test]
+    fn transport_outage_with_probe_proof_requests_self_restart() {
+        let start = Instant::now();
+        let error = refused_connect_transport_error();
+        let mut state = TransportState::default();
+        let mut watchdog = SyncWatchdogState::default();
+        let _ = watchdog.decide_sync_failure(None, false, None, false, start);
+
+        // Failing 5-minute cycles for just over an hour.
+        let mut at = start;
+        let past_restart = start + SELF_RESTART_MIN_OUTAGE + Duration::from_secs(1);
+        while at < past_restart {
+            run_failing_cycle(&mut state, &error, at);
+            at += Duration::from_secs(5 * 60);
+        }
+        let transport_outage = state.outage_duration(past_restart);
+        assert!(transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE));
+
+        // Without process-local evidence the machine may just be offline.
+        assert!(watchdog
+            .decide_sync_failure(None, false, transport_outage, false, past_restart)
+            .self_restart
+            .is_none());
+
+        // The TCP probe (rate-limited, only during an outage) succeeding is
+        // the process-wedge proof — including for timeout-shaped failures.
+        assert!(state.should_attempt_probe(past_restart));
+        assert!(
+            !state.should_attempt_probe(past_restart + Duration::from_secs(1)),
+            "probes are rate-limited"
+        );
+        state.note_probe_succeeded(past_restart);
+        assert!(state.probe_success_is_fresh(past_restart));
+        assert_eq!(
+            watchdog
+                .decide_sync_failure(
+                    None,
+                    false,
+                    transport_outage,
+                    state.probe_success_is_fresh(past_restart),
+                    past_restart
+                )
+                .self_restart,
+            Some(SelfRestartReason::TransportOutage)
+        );
+    }
+
+    /// HOLE A: a MAGICWAKE blackhole makes connects hang, so failures
+    /// classify `transport_timeout` — the streak and the probe-backed
+    /// self-restart must treat that family exactly like connection failures.
+    #[test]
+    fn timeout_family_accrues_and_self_restarts_with_probe_proof() {
+        let start = Instant::now();
+        let error = diagnostics_error("transport_timeout");
+        let mut state = TransportState::default();
+        let mut watchdog = SyncWatchdogState::default();
+        let _ = watchdog.decide_sync_failure(None, false, None, false, start);
+
+        let past_restart = start + SELF_RESTART_MIN_OUTAGE + Duration::from_secs(1);
+        let mut at = start;
+        while at < past_restart {
+            run_failing_cycle(&mut state, &error, at);
+            at += Duration::from_secs(5 * 60);
+        }
+        let transport_outage = state.outage_duration(past_restart);
+        assert!(transport_outage.is_some_and(|outage| outage >= SELF_RESTART_MIN_OUTAGE));
+        state.note_probe_succeeded(past_restart - Duration::from_secs(60));
+        assert_eq!(
+            watchdog
+                .decide_sync_failure(
+                    None,
+                    false,
+                    transport_outage,
+                    state.probe_success_is_fresh(past_restart),
+                    past_restart
+                )
+                .self_restart,
+            Some(SelfRestartReason::TransportOutage)
+        );
+    }
+
+    /// The offline-churn negative: a genuinely offline machine accrues the
+    /// transport streak (ENETUNREACH classifies `transport_error`), its
+    /// cached-DNS resolve probe may even look healthy, but the TCP probe
+    /// fails and no other upload path is fresh — so it must NEVER
+    /// self-restart, however long the outage.
+    #[test]
+    fn offline_machine_never_transport_self_restarts() {
+        let start = Instant::now();
+        let error = diagnostics_error("transport_error");
+        let mut state = TransportState::default();
+        let mut watchdog = SyncWatchdogState::default();
+        let _ = watchdog.decide_sync_failure(None, false, None, false, start);
+
+        let long_after = start + 3 * SELF_RESTART_MIN_OUTAGE;
+        let mut at = start;
+        while at < long_after {
+            run_failing_cycle(&mut state, &error, at);
+            at += Duration::from_secs(5 * 60);
+        }
+        let transport_outage = state.outage_duration(long_after);
+        assert!(transport_outage.is_some());
+        assert!(!state.probe_success_is_fresh(long_after));
+
+        // Cached DNS resolving (dns probe fresh) must NOT count as transport
+        // evidence: pass the DNS branch's probe as fresh and still expect no
+        // restart, because the DNS outage itself is absent.
+        let decision =
+            watchdog.decide_sync_failure(None, true, transport_outage, false, long_after);
+        assert!(decision.self_restart.is_none());
+
+        // Pool rebuilds stay allowed offline — dropping idle sockets is
+        // harmless and leaves the daemon ready for when the network returns.
+        assert!(state.streak.should_rebuild(long_after));
+    }
+
+    #[test]
+    fn transport_rebuild_request_reaches_the_otlp_agent_flag() {
+        // Drain any request left over from other tests in this process.
+        let _ = take_upstream_otlp_agent_rebuild_request();
+        assert!(!take_upstream_otlp_agent_rebuild_request());
+        request_upstream_otlp_agent_rebuild();
+        assert!(take_upstream_otlp_agent_rebuild_request());
+        assert!(
+            !take_upstream_otlp_agent_rebuild_request(),
+            "the request is consumed by the rebuild"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn probe_targets_parse_from_api_base_urls() {
+        assert_eq!(
+            parse_probe_target("https://api.ottto.net"),
+            Some(("api.ottto.net".to_string(), 443))
+        );
+        assert_eq!(
+            parse_probe_target("https://api.ottto.net/"),
+            Some(("api.ottto.net".to_string(), 443))
+        );
+        assert_eq!(
+            parse_probe_target("http://127.0.0.1:8000/api"),
+            Some(("127.0.0.1".to_string(), 8000))
+        );
+        assert_eq!(
+            parse_probe_target("http://localhost"),
+            Some(("localhost".to_string(), 80))
+        );
+        assert_eq!(parse_probe_target("not a url"), None);
     }
 }

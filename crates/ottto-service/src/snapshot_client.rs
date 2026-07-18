@@ -147,7 +147,11 @@ impl UploadFailureDiagnostics {
         }
     }
 
-    fn transport(operation: &'static str, endpoint: &'static str, error: &ureq::Error) -> Self {
+    pub(crate) fn transport(
+        operation: &'static str,
+        endpoint: &'static str,
+        error: &ureq::Error,
+    ) -> Self {
         Self {
             operation,
             endpoint,
@@ -155,6 +159,12 @@ impl UploadFailureDiagnostics {
             retryable: true,
             request_id_present: false,
         }
+    }
+
+    /// The redacted failure family (`transport_connection`, `http_5xx`, ...).
+    /// `net_resilience` keys the transport-layer outage streak on this.
+    pub(crate) fn status_family(&self) -> &'static str {
+        self.status_family
     }
 
     pub fn safe_message(&self) -> String {
@@ -385,9 +395,25 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .call()
-            .map_err(|error| anyhow!("get activity hint failed: {error}"))?
+            // Typed diagnostics (not a plain string) so a transport-layer
+            // failure on this early per-source call feeds the outage streak.
+            .map_err(|error| match error {
+                ureq::Error::Status(status, response) => {
+                    anyhow::Error::new(UploadFailureDiagnostics::http(
+                        "activity hint request",
+                        "activity_hint",
+                        status,
+                        &response,
+                    ))
+                }
+                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "activity hint request",
+                    "activity_hint",
+                    &other,
+                )),
+            })?
             .into_json()
-            .map_err(|error| anyhow!("parse activity hint failed: {error}"))
+            .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
     }
 
     pub fn upload_batch(
@@ -449,7 +475,23 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
-            .map_err(|error| anyhow!("report snapshot status failed: {error}"))?
+            // Typed diagnostics (not a plain string) so a transport-layer
+            // failure on a status receipt feeds the outage streak.
+            .map_err(|error| match error {
+                ureq::Error::Status(status, response) => {
+                    anyhow::Error::new(UploadFailureDiagnostics::http(
+                        "snapshot status report",
+                        "snapshot_status",
+                        status,
+                        &response,
+                    ))
+                }
+                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
+                    "snapshot status report",
+                    "snapshot_status",
+                    &other,
+                )),
+            })?
             .into_json()
             .map_err(|error| anyhow!("parse snapshot status response failed: {error}"))
     }

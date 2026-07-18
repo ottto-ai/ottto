@@ -386,9 +386,14 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
         }
     }
 
+    // Transport-layer outage evidence is folded here, in the per-source loop,
+    // because this is the last point where each failure still carries the
+    // typed `UploadFailureDiagnostics` (the aggregate error below collapses
+    // to a count). One folded verdict per cycle feeds the streak.
+    let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
     let mut failed_sources = Vec::new();
     for source in enabled_sources {
-        if let Err(error) = sync_source(
+        match sync_source(
             &client,
             &device,
             &device_secret,
@@ -397,15 +402,21 @@ fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()
             home,
             support_dir,
             daemon,
+            &mut transport_cycle,
         ) {
-            eprintln!(
-                "local snapshot sync skipped for {}: {}",
-                source.api_slug(),
-                safe_error(&error)
-            );
-            failed_sources.push(source.api_slug());
+            Ok(()) => transport_cycle.note_success(),
+            Err(error) => {
+                transport_cycle.note_error(&error);
+                eprintln!(
+                    "local snapshot sync skipped for {}: {}",
+                    source.api_slug(),
+                    safe_error(&error)
+                );
+                failed_sources.push(source.api_slug());
+            }
         }
     }
+    crate::net_resilience::note_sync_cycle_transport(transport_cycle);
     if !failed_sources.is_empty() {
         return Err(anyhow!(
             "local snapshot sync failed for {} source(s)",
@@ -573,6 +584,11 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
 
     let mut uploaded = 0;
     let mut failed_sources = Vec::new();
+    // This standalone path runs on the shared agents too, so its transport
+    // evidence feeds the same outage streak (folded per invocation): a
+    // persistent agent-status-only transport failure must not stay invisible
+    // to the recovery ladder just because snapshot sync was quiet.
+    let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
     for source in enabled_snapshot_sources(&device) {
         let source_kind = source_kind(source);
         let source_snapshots = snapshots
@@ -586,7 +602,8 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
         }
         let relay_token = match client.issue_relay_token(&device, &device_secret, source) {
             Ok(token) => token,
-            Err(_) => {
+            Err(error) => {
+                transport_cycle.note_error(&error);
                 failed_sources.push(source.api_slug());
                 continue;
             }
@@ -599,13 +616,16 @@ pub fn upload_agent_status_snapshots(snapshots: &[AgentStatusSnapshot]) -> Resul
             Ok(response) => {
                 uploaded += response.accepted as usize;
                 persist_machine_icon(&response);
+                transport_cycle.note_success();
                 crate::net_resilience::note_upstream_upload_succeeded("agent_status");
             }
-            Err(_) => {
+            Err(error) => {
+                transport_cycle.note_error(&error);
                 failed_sources.push(source.api_slug());
             }
         }
     }
+    crate::net_resilience::note_sync_cycle_transport(transport_cycle);
 
     if !failed_sources.is_empty() {
         return Err(anyhow!(
@@ -631,9 +651,10 @@ fn persist_machine_icon(response: &AgentStatusSnapshotUploadResponse) {
     }
 }
 
-// One extra parameter (the daemon handle, for caching the reconciliation
-// policy) pushes this one over clippy's 7-arg threshold; the alternative is a
-// throwaway context struct for an internal helper, which is not worth it.
+// Extra parameters (the daemon handle for caching the reconciliation policy,
+// and the cycle's transport-evidence fold) push this over clippy's 7-arg
+// threshold; the alternative is a throwaway context struct for an internal
+// helper, which is not worth it.
 #[allow(clippy::too_many_arguments)]
 fn sync_source(
     client: &SnapshotApiClient,
@@ -644,6 +665,7 @@ fn sync_source(
     home: &Path,
     support_dir: &Path,
     daemon: &LocalDaemon,
+    transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
 ) -> Result<()> {
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
@@ -656,6 +678,10 @@ fn sync_source(
         activity_hint.local_usage_reconciliation_enabled,
     );
     if let Err(error) = upload_agent_status(client, &relay_token, source, machine_id) {
+        // Best-effort for the sync itself, but not for outage tracking: a
+        // persistent transport-only failure here must still feed the streak
+        // instead of being swallowed with the log line.
+        transport_cycle.note_error(&error);
         eprintln!(
             "local agent status upload skipped for {}: {}",
             source.api_slug(),

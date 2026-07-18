@@ -121,7 +121,7 @@ struct CachedRelayToken {
 
 static RELAY_TOKEN_CACHE: OnceLock<Mutex<BTreeMap<RelayTokenCacheKey, CachedRelayToken>>> =
     OnceLock::new();
-static UPSTREAM_HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+static UPSTREAM_HTTP_AGENT: OnceLock<Mutex<ureq::Agent>> = OnceLock::new();
 
 pub fn spawn_local_otlp_relay(daemon: LocalDaemon) -> Result<SocketAddr> {
     spawn_source_relay(daemon, SnapshotSource::ClaudeCode)
@@ -753,14 +753,30 @@ fn relay_token_cache() -> &'static Mutex<BTreeMap<RelayTokenCacheKey, CachedRela
     RELAY_TOKEN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn upstream_http_agent() -> &'static ureq::Agent {
-    UPSTREAM_HTTP_AGENT.get_or_init(build_upstream_http_agent)
+fn upstream_http_agent() -> ureq::Agent {
+    let mut agent = UPSTREAM_HTTP_AGENT
+        .get_or_init(|| Mutex::new(build_upstream_http_agent()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if crate::net_resilience::take_upstream_otlp_agent_rebuild_request() {
+        eprintln!(
+            "OTTTO-NET-RESILIENCE: rebuilding the OTLP upstream HTTP agent after a sustained \
+             transport-layer outage or network transition so the next forward starts from \
+             fresh pool state.",
+        );
+        *agent = build_upstream_http_agent();
+    }
+    // An `Agent` clone shares the underlying pool, so callers keep pooling
+    // while the swap above stays possible without a long-held lock.
+    agent.clone()
 }
 
-// Deliberately a process-lifetime agent that is NEVER rebuilt: its warm
-// keep-alive pool is the path that keeps working through process-local DNS
-// breakage, so dropping it would destroy exactly the connections worth
-// keeping. New connections still get the fallback resolver below.
+// A process-lifetime agent with a deliberately warm keep-alive pool: that
+// pool is the path that keeps working through process-local DNS breakage, so
+// it is NOT rebuilt on the DNS ladder. It IS swapped (via the rebuild-request
+// flag above) on a sustained transport-layer outage or a macOS network
+// transition, when its pooled sockets are exactly the ones presumed dead.
+// New connections still get the fallback resolver below.
 fn build_upstream_http_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
