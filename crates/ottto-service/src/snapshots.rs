@@ -503,18 +503,17 @@ pub fn apply_upload_policy(
             item.session_display_name_source = None;
             fingerprint_needs_refresh = true;
         }
-        if !policy.workspace_labels_enabled {
-            if item.workspace_display_label.is_some()
+        if !policy.workspace_labels_enabled
+            && (item.workspace_display_label.is_some()
                 || item.workspace_label_source.is_some()
                 || item.repository_label.is_some()
-                || item.repository_label_source.is_some()
-            {
-                item.workspace_display_label = None;
-                item.workspace_label_source = None;
-                item.repository_label = None;
-                item.repository_label_source = None;
-                fingerprint_needs_refresh = true;
-            }
+                || item.repository_label_source.is_some())
+        {
+            item.workspace_display_label = None;
+            item.workspace_label_source = None;
+            item.repository_label = None;
+            item.repository_label_source = None;
+            fingerprint_needs_refresh = true;
         }
         if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
             item.session_artifacts.clear();
