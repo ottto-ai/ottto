@@ -411,6 +411,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            attribution_facts: Vec::new(),
         }
     }
 

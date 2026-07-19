@@ -103,6 +103,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // fingerprint can trigger the one-time backend re-upload.
 // v20/v17/v9: attach privacy-safe git repository identity locally. Raw paths
 // and remotes never enter the snapshot payload.
+// Direct attribution derivation is currently dark and non-persistent: facts
+// are computed for changed sessions but skipped by serde and the snapshot
+// fingerprint. Deliberately do NOT bump these versions yet, because reparsing
+// all history would compute and immediately discard the same dark facts. The
+// backend activation change must enable serialization/fingerprinting and bump
+// all three versions atomically to perform the one-time historical backfill.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v20";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v17";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v9";
@@ -242,6 +248,10 @@ pub struct SnapshotOrigin {
     pub session_kind: Option<String>, // Claude: "bg"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_workflow_orchestration: Option<bool>, // Claude: Workflow tool ran (local wf_*.json footprint)
+    // Dark until the backend fact schema is deployed. This raw provider id is
+    // used only to build the local parent-session fact.
+    #[serde(skip)]
+    pub parent_session_ref: Option<String>, // Provider-native parent session id when present
 }
 
 impl SnapshotOrigin {
@@ -255,6 +265,7 @@ impl SnapshotOrigin {
             && self.is_sidechain.is_none()
             && self.session_kind.is_none()
             && self.used_workflow_orchestration.is_none()
+            && self.parent_session_ref.is_none()
     }
 }
 
@@ -347,6 +358,10 @@ pub struct SnapshotItem {
     /// Raw session-origin signals; the backend re-derives the initiator from these.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<SnapshotOrigin>,
+    /// Compact evidence-first facts. Phase 2 computes these locally; Phase 4
+    /// enables wire serialization only after the backend fact contract exists.
+    #[serde(skip)]
+    pub attribution_facts: Vec<crate::session_attribution::SessionAttributionFact>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1945,6 +1960,13 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
+        let attribution_facts = crate::session_attribution::direct_provider_facts(
+            self.source,
+            Some(&self.origin),
+            &source_session_id,
+            collected_at,
+            self.source.parser_version(),
+        );
         let collector = match self.source {
             SnapshotSource::Codex => "codex_jsonl".to_string(),
             SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
@@ -2072,6 +2094,7 @@ impl SnapshotAccumulator {
                 state_archived: None,
             },
             origin: (!self.origin.is_empty()).then(|| self.origin.clone()),
+            attribution_facts,
         };
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
         vec![item]
@@ -2564,6 +2587,7 @@ fn codex_state_only_snapshot(
         },
         // Codex state-index summaries carry no session_meta -> no raw origin.
         origin: None,
+        attribution_facts: Vec::new(),
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
     item
@@ -3250,6 +3274,8 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             } else if src.is_object() {
                 // Codex subagent form: source = { "subagent": { "thread_spawn": .. } }.
                 accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
+                accumulator.origin.parent_session_ref =
+                    string_at(src, &["subagent", "thread_spawn", "parent_thread_id"]);
             }
         }
     }
@@ -5728,8 +5754,89 @@ mod tests {
         assert_eq!(origin.originator.as_deref(), Some("Codex Desktop"));
         assert_eq!(origin.agent_role.as_deref(), Some("explorer"));
         assert_eq!(origin.source_subagent, None);
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "provider_surface" && fact.value == "codex_desktop" }));
+        assert!(!item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.value == "vscode" || fact.field == "origin_kind"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_emits_direct_scheduled_and_parent_subagent_facts() {
+        let automation_path = temp_file("codex-automation-attribution");
+        fs::write(
+            &automation_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"automation-session\",\"source\":\"app_server\",\"originator\":\"Codex Desktop\",\"thread_source\":\"automation\"}}\n",
+                "{\"timestamp\":\"2026-07-19T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.6-sol\"}}}\n"
+            ),
+        )
+        .expect("write automation fixture");
+        let automation = parse_codex_jsonl_file(
+            &automation_path,
+            "2026-07-19T10:04:00Z",
+            "fp-automation".to_string(),
+        )
+        .expect("parse automation")
+        .into_iter()
+        .next()
+        .expect("automation snapshot");
+        assert!(automation.attribution_facts.iter().any(|fact| {
+            fact.field == "origin_kind" && fact.value == "provider_scheduled_task"
+        }));
+        assert!(automation
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "scheduler_kind" && fact.value == "codex_scheduled" }));
+        let automation_wire = serde_json::to_value(&automation).expect("serialize automation");
+        assert!(
+            automation_wire.get("attribution_facts").is_none(),
+            "dark facts must not cross the v6 wire contract"
+        );
+
+        let subagent_path = temp_file("codex-subagent-attribution");
+        fs::write(
+            &subagent_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-19T11:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"subagent-session\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent-session\",\"depth\":1}}},\"thread_source\":\"subagent\"}}\n",
+                "{\"timestamp\":\"2026-07-19T11:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":8,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.6-sol\"}}}\n"
+            ),
+        )
+        .expect("write subagent fixture");
+        let subagent = parse_codex_jsonl_file(
+            &subagent_path,
+            "2026-07-19T11:04:00Z",
+            "fp-subagent".to_string(),
+        )
+        .expect("parse subagent")
+        .into_iter()
+        .next()
+        .expect("subagent snapshot");
+        assert!(subagent
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
+        assert!(subagent
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "parent_session_ref" && fact.value == "parent-session" }));
+        let subagent_wire = serde_json::to_value(&subagent).expect("serialize subagent");
+        assert!(subagent_wire.get("attribution_facts").is_none());
+        assert!(
+            subagent_wire
+                .get("origin")
+                .and_then(|origin| origin.get("parent_session_ref"))
+                .is_none(),
+            "dark parent metadata must not extend the v6 origin object"
+        );
+
+        let _ = fs::remove_file(automation_path);
+        let _ = fs::remove_file(subagent_path);
     }
 
     #[test]
@@ -6846,6 +6953,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            attribution_facts: Vec::new(),
         };
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
         item
@@ -7969,6 +8077,14 @@ mod tests {
         // No sibling `<session>/workflows/wf_*.json` footprint -> detection ran
         // and reported false (not None / unknown).
         assert_eq!(origin.used_workflow_orchestration, Some(false));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "provider_surface" && fact.value == "claude_cli"));
 
         let _ = fs::remove_file(path);
     }
@@ -10346,6 +10462,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            attribution_facts: Vec::new(),
         };
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -10571,6 +10688,7 @@ mod tests {
                     state_archived: None,
                 },
                 origin: None,
+                attribution_facts: Vec::new(),
             }],
         }
     }
