@@ -21,6 +21,7 @@ cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 cc = "1"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
+hmac = "0.12"
 libc = "0.2"
 notify = "8"
 notify-debouncer-full = "0.6"

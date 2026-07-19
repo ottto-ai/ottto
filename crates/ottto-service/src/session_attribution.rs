@@ -2,13 +2,24 @@
 //!
 //! This module converts provider-native metadata already read by the incremental
 //! transcript scanner into a compact fact list. It never receives raw paths,
-//! scheduler definitions, process arguments, or logs. Prompt/template and skill
-//! grouping are intentionally separate follow-up adapters because they require
-//! an organization-scoped HMAC key.
+//! process arguments, or logs. Prompt/template and skill grouping use a
+//! backend-issued, tenant-scoped HMAC key; provider schedule definitions are
+//! read locally on a six-hour cache and reduced to opaque identifiers before
+//! facts can leave this module.
 
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use toml_edit::DocumentMut;
+use zeroize::Zeroizing;
 
 pub const SESSION_ATTRIBUTION_SCHEMA_VERSION: &str = "session_attribution.v1";
 pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
@@ -16,6 +27,14 @@ pub const MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES: usize = 128;
 pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 2_048;
+pub const SESSION_ATTRIBUTION_HMAC_KEY_VERSION: &str = "hmac-sha256:v1";
+
+const MAX_TEMPLATE_MATERIAL_CHARS: usize = 4_096;
+const MAX_PROVIDER_SCHEDULE_FILES: usize = 256;
+const MAX_PROVIDER_SCHEDULE_FILE_BYTES: u64 = 64 * 1_024;
+const MAX_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS: usize = 96;
+const MIN_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS: usize = 24;
+const PROVIDER_SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SessionFieldEvidence {
@@ -33,10 +52,419 @@ pub struct SessionAttributionFact {
     pub evidence: SessionFieldEvidence,
 }
 
+#[derive(Clone)]
+struct ProviderScheduleDefinition {
+    opaque_id: String,
+    prompt_signature: String,
+}
+
+#[derive(Clone, Default)]
+struct ProviderScheduleInventory {
+    definitions: Vec<ProviderScheduleDefinition>,
+}
+
+struct CachedProviderScheduleInventory {
+    loaded_at: Instant,
+    home: PathBuf,
+    key_fingerprint: String,
+    inventory: ProviderScheduleInventory,
+    files: BTreeMap<PathBuf, CachedProviderScheduleFile>,
+}
+
+#[derive(Clone)]
+struct CachedProviderScheduleFile {
+    size_bytes: u64,
+    modified_unix_nanos: u128,
+    definition: Option<ProviderScheduleDefinition>,
+}
+
+/// Per-cycle privacy context negotiated through the existing activity hint.
+///
+/// The raw HMAC key remains zeroized process memory. Schedule prompts are read
+/// only from the provider's local configuration, normalized into short
+/// in-memory signatures, and never serialized into a snapshot.
+pub struct SessionAttributionContext {
+    key: Zeroizing<Vec<u8>>,
+    provider_schedules: ProviderScheduleInventory,
+}
+
+pub struct SessionAttributionGroupingInput<'a> {
+    pub source: SnapshotSource,
+    pub origin: Option<&'a SnapshotOrigin>,
+    pub source_session_id: &'a str,
+    pub observed_at: &'a str,
+    pub source_version: &'a str,
+    pub first_prompt: Option<&'a str>,
+    pub provider_skills: &'a BTreeSet<String>,
+}
+
+impl SessionAttributionContext {
+    pub fn from_activity_hint(
+        source: SnapshotSource,
+        home: &Path,
+        enabled: bool,
+        encoded_key: Option<&str>,
+        key_version: Option<&str>,
+    ) -> Option<Self> {
+        if !enabled || key_version != Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION) {
+            return None;
+        }
+        let key = URL_SAFE_NO_PAD.decode(encoded_key?).ok()?;
+        if key.len() != 32 {
+            return None;
+        }
+        let key = Zeroizing::new(key);
+        let provider_schedules = if source == SnapshotSource::Codex {
+            cached_codex_schedule_inventory(home, &key)
+        } else {
+            ProviderScheduleInventory::default()
+        };
+        Some(Self {
+            key,
+            provider_schedules,
+        })
+    }
+
+    pub fn grouping_facts(
+        &self,
+        input: SessionAttributionGroupingInput<'_>,
+    ) -> Vec<SessionAttributionFact> {
+        let mut facts = Vec::new();
+        let evidence_context = EvidenceContext {
+            source_session_id: input.source_session_id,
+            observed_at: input.observed_at,
+            source_version: input.source_version,
+        };
+        let normalized_template = input.first_prompt.and_then(normalize_template_material);
+        if let Some(template) = normalized_template.as_deref() {
+            if let Some(value) = opaque_hmac_id(&self.key, "template_group", template) {
+                push_fact(
+                    &mut facts,
+                    "template_group_id",
+                    &value,
+                    "content_derived",
+                    "direct",
+                    &evidence_context,
+                );
+            }
+
+            if input.source == SnapshotSource::Codex
+                && input
+                    .origin
+                    .and_then(|value| value.thread_source.as_deref())
+                    == Some("automation")
+            {
+                if let Some(value) = self.provider_schedules.matching_id(template) {
+                    push_fact(
+                        &mut facts,
+                        "schedule_definition_id",
+                        value,
+                        "provider_artifact",
+                        "corroborated",
+                        &evidence_context,
+                    );
+                }
+            }
+        }
+
+        for skill in input.provider_skills.iter().take(8) {
+            if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
+                push_fact(
+                    &mut facts,
+                    "skill_id",
+                    &value,
+                    "provider_native",
+                    "direct",
+                    &evidence_context,
+                );
+            }
+        }
+        if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
+            if !input.provider_skills.contains(&skill) {
+                if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
+                    push_fact(
+                        &mut facts,
+                        "skill_id",
+                        &value,
+                        "session_prefix",
+                        "direct",
+                        &evidence_context,
+                    );
+                }
+            }
+        }
+
+        enforce_fact_limits(&mut facts);
+        facts
+    }
+}
+
+impl ProviderScheduleInventory {
+    fn matching_id(&self, normalized_template: &str) -> Option<&str> {
+        let mut best: Option<&ProviderScheduleDefinition> = None;
+        let mut ambiguous = false;
+        for definition in &self.definitions {
+            if definition.prompt_signature.chars().count()
+                < MIN_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS
+                || !normalized_template.contains(&definition.prompt_signature)
+            {
+                continue;
+            }
+            match best {
+                None => {
+                    best = Some(definition);
+                    ambiguous = false;
+                }
+                Some(current)
+                    if definition.prompt_signature.len() > current.prompt_signature.len() =>
+                {
+                    best = Some(definition);
+                    ambiguous = false;
+                }
+                Some(current)
+                    if definition.prompt_signature.len() == current.prompt_signature.len()
+                        && definition.opaque_id != current.opaque_id =>
+                {
+                    ambiguous = true;
+                }
+                _ => {}
+            }
+        }
+        (!ambiguous)
+            .then_some(best)
+            .flatten()
+            .map(|definition| definition.opaque_id.as_str())
+    }
+}
+
 struct EvidenceContext<'a> {
     source_session_id: &'a str,
     observed_at: &'a str,
     source_version: &'a str,
+}
+
+fn cached_codex_schedule_inventory(home: &Path, key: &[u8]) -> ProviderScheduleInventory {
+    static CACHE: OnceLock<Mutex<Option<CachedProviderScheduleInventory>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let key_fingerprint = sha256_hex(key);
+    let previous_files = if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.home == home
+                && cached.key_fingerprint == key_fingerprint
+                && cached.loaded_at.elapsed() < PROVIDER_SCHEDULE_CACHE_TTL
+            {
+                return cached.inventory.clone();
+            }
+            if cached.home == home && cached.key_fingerprint == key_fingerprint {
+                cached.files.clone()
+            } else {
+                BTreeMap::new()
+            }
+        } else {
+            BTreeMap::new()
+        }
+    } else {
+        BTreeMap::new()
+    };
+
+    let (inventory, files) = refresh_codex_schedule_inventory(home, key, &previous_files);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedProviderScheduleInventory {
+            loaded_at: Instant::now(),
+            home: home.to_path_buf(),
+            key_fingerprint,
+            inventory: inventory.clone(),
+            files,
+        });
+    }
+    inventory
+}
+
+#[cfg(test)]
+fn load_codex_schedule_inventory(home: &Path, key: &[u8]) -> ProviderScheduleInventory {
+    refresh_codex_schedule_inventory(home, key, &BTreeMap::new()).0
+}
+
+fn refresh_codex_schedule_inventory(
+    home: &Path,
+    key: &[u8],
+    previous_files: &BTreeMap<PathBuf, CachedProviderScheduleFile>,
+) -> (
+    ProviderScheduleInventory,
+    BTreeMap<PathBuf, CachedProviderScheduleFile>,
+) {
+    let root = home.join(".codex").join("automations");
+    let Ok(entries) = fs::read_dir(root) else {
+        return (ProviderScheduleInventory::default(), BTreeMap::new());
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.truncate(MAX_PROVIDER_SCHEDULE_FILES);
+
+    let mut definitions = Vec::new();
+    let mut files = BTreeMap::new();
+    for path in paths {
+        let Ok(directory_metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            continue;
+        }
+        let definition_path = path.join("automation.toml");
+        let Ok(metadata) = fs::symlink_metadata(&definition_path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_PROVIDER_SCHEDULE_FILE_BYTES
+        {
+            continue;
+        }
+        let modified_unix_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let definition = previous_files
+            .get(&definition_path)
+            .filter(|cached| {
+                cached.size_bytes == metadata.len()
+                    && cached.modified_unix_nanos == modified_unix_nanos
+            })
+            .map(|cached| cached.definition.clone())
+            .unwrap_or_else(|| parse_codex_schedule_definition(&definition_path, key));
+        if let Some(definition) = definition.as_ref() {
+            definitions.push(definition.clone());
+        }
+        files.insert(
+            definition_path,
+            CachedProviderScheduleFile {
+                size_bytes: metadata.len(),
+                modified_unix_nanos,
+                definition,
+            },
+        );
+    }
+    definitions.sort_by(|left, right| left.opaque_id.cmp(&right.opaque_id));
+    definitions.dedup_by(|left, right| left.opaque_id == right.opaque_id);
+    (ProviderScheduleInventory { definitions }, files)
+}
+
+fn parse_codex_schedule_definition(
+    definition_path: &Path,
+    key: &[u8],
+) -> Option<ProviderScheduleDefinition> {
+    let document = read_bounded_toml(definition_path)?;
+    let id = document.get("id").and_then(|item| item.as_str())?;
+    let prompt = document.get("prompt").and_then(|item| item.as_str())?;
+    if id.is_empty() || id.len() > 128 {
+        return None;
+    }
+    let normalized_prompt = normalize_template_material(prompt)?;
+    let prompt_signature = normalized_prompt
+        .chars()
+        .take(MAX_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS)
+        .collect::<String>();
+    let opaque_id = opaque_hmac_id(key, "schedule_definition", id)?;
+    Some(ProviderScheduleDefinition {
+        opaque_id,
+        prompt_signature,
+    })
+}
+
+fn read_bounded_toml(path: &Path) -> Option<DocumentMut> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_PROVIDER_SCHEDULE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_PROVIDER_SCHEDULE_FILE_BYTES {
+        return None;
+    }
+    std::str::from_utf8(&bytes).ok()?.parse().ok()
+}
+
+fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(b"ottto:session-attribution:");
+    mac.update(domain.as_bytes());
+    mac.update(b":v1\0");
+    mac.update(material.as_bytes());
+    Some(format!(
+        "{SESSION_ATTRIBUTION_HMAC_KEY_VERSION}:{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ))
+}
+
+fn normalize_template_material(raw: &str) -> Option<String> {
+    let collapsed = raw
+        .split_whitespace()
+        .take(MAX_TEMPLATE_MATERIAL_CHARS)
+        .map(|token| {
+            let comparable =
+                token.trim_matches(|character: char| !character.is_ascii_alphanumeric());
+            if looks_volatile(comparable) {
+                "<dynamic>"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let bounded = collapsed
+        .chars()
+        .take(MAX_TEMPLATE_MATERIAL_CHARS)
+        .collect::<String>();
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+fn looks_volatile(token: &str) -> bool {
+    let ascii = token.as_bytes();
+    let uuid_like = ascii.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .all(|index| ascii.get(*index) == Some(&b'-'))
+        && ascii
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit());
+    let date_like = ascii.len() >= 10
+        && ascii.get(4) == Some(&b'-')
+        && ascii.get(7) == Some(&b'-')
+        && ascii[..4].iter().all(u8::is_ascii_digit)
+        && ascii[5..7].iter().all(u8::is_ascii_digit)
+        && ascii[8..10].iter().all(u8::is_ascii_digit);
+    let long_integer = ascii.len() >= 4 && ascii.iter().all(u8::is_ascii_digit);
+    let long_hex = ascii.len() >= 16 && ascii.iter().all(u8::is_ascii_hexdigit);
+    uuid_like || date_like || long_integer || long_hex
+}
+
+fn slash_skill_name(first_prompt: &str) -> Option<String> {
+    let token = first_prompt.split_whitespace().next()?;
+    let name = token.strip_prefix('/')?.trim_end_matches([':', ',', '.']);
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "compact" | "help" | "login" | "logout" | "model" | "review" | "status"
+        )
+    {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
 }
 
 /// Convert direct provider metadata into allowlisted facts.
@@ -205,8 +633,19 @@ pub fn direct_provider_facts(
         );
     }
 
-    facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    enforce_fact_limits(&mut facts);
     facts
+}
+
+pub(crate) fn enforce_fact_limits(facts: &mut Vec<SessionAttributionFact>) {
+    facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    while facts.len() > 1
+        && serde_json::to_vec(facts)
+            .map(|payload| payload.len() > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES)
+            .unwrap_or(true)
+    {
+        facts.pop();
+    }
 }
 
 fn push_fact(
@@ -255,6 +694,7 @@ fn evidence_ref(source_session_id: &str, field: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn origin() -> SnapshotOrigin {
         SnapshotOrigin::default()
@@ -370,5 +810,151 @@ mod tests {
         ] {
             assert!(!text.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn hint_context_fails_closed_for_unknown_or_invalid_keys() {
+        let home = Path::new("/nonexistent");
+        assert!(SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            home,
+            false,
+            None,
+            None,
+        )
+        .is_none());
+        assert!(SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            home,
+            true,
+            Some("not-base64"),
+            Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .is_none());
+        let encoded = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        assert!(SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            home,
+            true,
+            Some(&encoded),
+            Some("hmac-sha256:v2"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn template_normalization_removes_common_run_specific_values() {
+        let first = normalize_template_material("Review build 123456 at 2026-07-19T09:30:00Z now")
+            .expect("first");
+        let second =
+            normalize_template_material("Review   build 987654 at 2026-08-20T10:45:00Z now")
+                .expect("second");
+
+        assert_eq!(first, second);
+        assert_eq!(first, "review build <dynamic> at <dynamic> now");
+    }
+
+    #[test]
+    fn grouping_facts_are_opaque_and_keep_dimensions_separate() {
+        let key = Zeroizing::new(vec![9_u8; 32]);
+        let scheduled_prompt =
+            "Inspect the landing queue, verify every required check, and report only safe results.";
+        let normalized_schedule =
+            normalize_template_material(scheduled_prompt).expect("normalized schedule");
+        let schedule_id =
+            opaque_hmac_id(&key, "schedule_definition", "schedule-1").expect("schedule id");
+        let context = SessionAttributionContext {
+            key,
+            provider_schedules: ProviderScheduleInventory {
+                definitions: vec![ProviderScheduleDefinition {
+                    opaque_id: schedule_id.clone(),
+                    prompt_signature: normalized_schedule
+                        .chars()
+                        .take(MAX_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS)
+                        .collect(),
+                }],
+            },
+        };
+        let origin = SnapshotOrigin {
+            thread_source: Some("automation".to_string()),
+            ..SnapshotOrigin::default()
+        };
+        let mut skills = BTreeSet::new();
+        skills.insert("landing-lander".to_string());
+        let first_prompt =
+            format!("An automation named Landing has fired. Its prompt is: {scheduled_prompt}");
+
+        let facts = context.grouping_facts(SessionAttributionGroupingInput {
+            source: SnapshotSource::Codex,
+            origin: Some(&origin),
+            source_session_id: "session-opaque",
+            observed_at: "2026-07-19T00:00:00Z",
+            source_version: "codex_jsonl:v21",
+            first_prompt: Some(&first_prompt),
+            provider_skills: &skills,
+        });
+
+        assert!(facts.iter().any(|fact| fact.field == "template_group_id"));
+        assert!(facts.iter().any(|fact| {
+            fact.field == "schedule_definition_id"
+                && fact.value == schedule_id
+                && fact.evidence.strength == "corroborated"
+        }));
+        assert!(facts.iter().any(|fact| fact.field == "skill_id"));
+        assert!(facts.iter().all(|fact| {
+            fact.value.starts_with("hmac-sha256:v1:")
+                || !matches!(
+                    fact.field.as_str(),
+                    "template_group_id" | "schedule_definition_id" | "skill_id"
+                )
+        }));
+        let wire = serde_json::to_string(&facts).expect("facts");
+        assert!(!wire.contains("landing-lander"));
+        assert!(!wire.contains("Inspect the landing queue"));
+        assert!(wire.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn explicit_slash_skill_excludes_builtin_commands() {
+        assert_eq!(
+            slash_skill_name("/frontend-flow-change please update this"),
+            Some("frontend-flow-change".to_string())
+        );
+        assert_eq!(slash_skill_name("/compact"), None);
+        assert_eq!(slash_skill_name("ordinary prompt"), None);
+    }
+
+    #[test]
+    fn codex_schedule_inventory_reads_only_bounded_definition_fields() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "ottto-session-attribution-{}-{unique}",
+            std::process::id()
+        ));
+        let schedule_dir = home.join(".codex/automations/schedule-1");
+        fs::create_dir_all(&schedule_dir).expect("schedule dir");
+        fs::write(
+            schedule_dir.join("automation.toml"),
+            r#"
+id = "schedule-1"
+name = "Private local name"
+prompt = "Inspect the landing queue, verify required checks, and report safe results."
+rrule = "FREQ=HOURLY"
+status = "ACTIVE"
+"#,
+        )
+        .expect("schedule");
+
+        let inventory = load_codex_schedule_inventory(&home, &[3_u8; 32]);
+
+        assert_eq!(inventory.definitions.len(), 1);
+        assert!(inventory.definitions[0]
+            .opaque_id
+            .starts_with("hmac-sha256:v1:"));
+        assert!(!inventory.definitions[0].opaque_id.contains("schedule-1"));
+        fs::remove_dir_all(home).expect("cleanup");
     }
 }

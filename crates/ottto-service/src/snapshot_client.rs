@@ -208,7 +208,7 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ActivityHintResponse {
     pub source: String,
     pub server_time: String,
@@ -230,6 +230,12 @@ pub struct ActivityHintResponse {
     pub mcp_inventory_harvest_enabled: bool,
     #[serde(default = "default_true")]
     pub context_footprint_harvest_enabled: bool,
+    #[serde(default)]
+    pub session_attribution_enabled: bool,
+    #[serde(default)]
+    pub session_attribution_hmac_key: Option<String>,
+    #[serde(default)]
+    pub session_attribution_hmac_key_version: Option<String>,
     pub recommended_scan_after: String,
 }
 

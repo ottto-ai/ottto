@@ -783,6 +783,7 @@ dependencies = [
  "cbc",
  "cc",
  "clap",
+ "hmac",
  "libc",
  "notify",
  "notify-debouncer-full",

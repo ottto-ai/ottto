@@ -6,6 +6,7 @@ use crate::backfill::{
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
 };
+use crate::session_attribution::SessionAttributionContext;
 use crate::snapshot_client::{
     load_snapshot_device_credentials, AgentStatusSnapshotUploadRequest,
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
@@ -14,7 +15,7 @@ use crate::snapshot_client::{
     UploadFailureDiagnostics,
 };
 use crate::snapshots::{
-    apply_upload_policy, collector_version, scan_source_roots_with_artifacts,
+    apply_upload_policy, collector_version, scan_source_roots_with_attribution,
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
     SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION,
     SNAPSHOT_STATUS_SCHEMA_VERSION,
@@ -30,6 +31,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
+use zeroize::Zeroize;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -669,7 +671,7 @@ fn sync_source(
 ) -> Result<()> {
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    let activity_hint = client.get_activity_hint(&relay_token)?;
+    let mut activity_hint = client.get_activity_hint(&relay_token)?;
     // Cache the workspace reconciliation policy so the daemon can surface it on
     // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
     // only error path and is not worth aborting the sync over.
@@ -711,6 +713,19 @@ fn sync_source(
     }
 
     let roots = source.default_roots(home);
+    let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
+    let attribution_context = SessionAttributionContext::from_activity_hint(
+        source,
+        home,
+        activity_hint.session_attribution_enabled,
+        encoded_attribution_key.as_deref(),
+        activity_hint
+            .session_attribution_hmac_key_version
+            .as_deref(),
+    );
+    if let Some(encoded_key) = encoded_attribution_key.as_mut() {
+        encoded_key.zeroize();
+    }
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: activity_hint.session_titles_enabled,
         workspace_labels_enabled: activity_hint.workspace_labels_enabled,
@@ -718,13 +733,14 @@ fn sync_source(
     };
     let index_path = snapshot_index_path(support_dir, source, upload_policy);
     let mut index = ScanIndex::load(&index_path)?;
-    let mut scan_result = match scan_source_roots_with_artifacts(
+    let mut scan_result = match scan_source_roots_with_attribution(
         source,
         &roots,
         &mut index,
         &scan_started_at,
         activity_hint.backfill_window_days,
         upload_policy.session_artifacts_enabled,
+        attribution_context.as_ref(),
     ) {
         Ok(scan_result) => scan_result,
         Err(error) => {
