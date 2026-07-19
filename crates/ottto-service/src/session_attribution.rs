@@ -86,6 +86,7 @@ struct CachedProviderScheduleFile {
 pub struct SessionAttributionContext {
     key: Zeroizing<Vec<u8>>,
     provider_schedules: ProviderScheduleInventory,
+    external_schedulers: crate::external_scheduler_attribution::ExternalSchedulerInventory,
 }
 
 pub struct SessionAttributionGroupingInput<'a> {
@@ -96,6 +97,9 @@ pub struct SessionAttributionGroupingInput<'a> {
     pub source_version: &'a str,
     pub first_prompt: Option<&'a str>,
     pub provider_skills: &'a BTreeSet<String>,
+    pub repository_hash: Option<&'a str>,
+    pub source_started_at: Option<&'a str>,
+    pub transcript_path: &'a Path,
 }
 
 impl SessionAttributionContext {
@@ -119,9 +123,12 @@ impl SessionAttributionContext {
         } else {
             ProviderScheduleInventory::default()
         };
+        let external_schedulers =
+            crate::external_scheduler_attribution::ExternalSchedulerInventory::cached(home, &key);
         Some(Self {
             key,
             provider_schedules,
+            external_schedulers,
         })
     }
 
@@ -142,7 +149,7 @@ impl SessionAttributionContext {
                     &mut facts,
                     "template_group_id",
                     &value,
-                    "content_derived",
+                    "local_template",
                     "direct",
                     &evidence_context,
                 );
@@ -186,7 +193,7 @@ impl SessionAttributionContext {
                         &mut facts,
                         "skill_id",
                         &value,
-                        "session_prefix",
+                        "local_template",
                         "direct",
                         &evidence_context,
                     );
@@ -194,9 +201,58 @@ impl SessionAttributionContext {
             }
         }
 
+        let provider_origin_known = input.origin.map(provider_origin_is_known).unwrap_or(false);
+        if let Some(matched) = (!provider_origin_known)
+            .then(|| {
+                self.external_schedulers.correlate(
+                    crate::external_scheduler_attribution::ExternalSchedulerSession {
+                        source: input.source,
+                        normalized_template: normalized_template.as_deref(),
+                        repository_hash: input.repository_hash,
+                        source_started_at: input.source_started_at,
+                        transcript_path: input.transcript_path,
+                    },
+                )
+            })
+            .flatten()
+        {
+            push_fact(
+                &mut facts,
+                "origin_kind",
+                "external_scheduler",
+                matched.evidence_kind,
+                matched.evidence_strength,
+                &evidence_context,
+            );
+            push_fact(
+                &mut facts,
+                "scheduler_kind",
+                matched.scheduler_kind,
+                matched.evidence_kind,
+                matched.evidence_strength,
+                &evidence_context,
+            );
+            push_fact(
+                &mut facts,
+                "schedule_definition_id",
+                &matched.schedule_definition_id,
+                matched.evidence_kind,
+                matched.evidence_strength,
+                &evidence_context,
+            );
+        }
+
         enforce_fact_limits(&mut facts);
         facts
     }
+}
+
+fn provider_origin_is_known(origin: &SnapshotOrigin) -> bool {
+    matches!(
+        origin.thread_source.as_deref(),
+        Some("automation" | "subagent")
+    ) || origin.source_subagent == Some(true)
+        || origin.is_sidechain == Some(true)
 }
 
 impl ProviderScheduleInventory {
@@ -389,7 +445,7 @@ fn read_bounded_toml(path: &Path) -> Option<DocumentMut> {
     std::str::from_utf8(&bytes).ok()?.parse().ok()
 }
 
-fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option<String> {
+pub(crate) fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
     mac.update(b"ottto:session-attribution:");
     mac.update(domain.as_bytes());
@@ -401,7 +457,7 @@ fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option<String> {
     ))
 }
 
-fn normalize_template_material(raw: &str) -> Option<String> {
+pub(crate) fn normalize_template_material(raw: &str) -> Option<String> {
     let collapsed = raw
         .split_whitespace()
         .take(MAX_TEMPLATE_MATERIAL_CHARS)
@@ -874,6 +930,8 @@ mod tests {
                         .collect(),
                 }],
             },
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
         };
         let origin = SnapshotOrigin {
             thread_source: Some("automation".to_string()),
@@ -892,6 +950,9 @@ mod tests {
             source_version: "codex_jsonl:v21",
             first_prompt: Some(&first_prompt),
             provider_skills: &skills,
+            repository_hash: None,
+            source_started_at: None,
+            transcript_path: Path::new("/missing"),
         });
 
         assert!(facts.iter().any(|fact| fact.field == "template_group_id"));

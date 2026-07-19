@@ -8,6 +8,7 @@ pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
 pub mod detected_uses;
+mod external_scheduler_attribution;
 pub mod keychain;
 pub mod macos_service;
 pub mod mcp_inventory;
