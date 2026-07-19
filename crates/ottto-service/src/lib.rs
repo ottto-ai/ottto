@@ -1,3 +1,4 @@
+pub mod active_sessions;
 pub mod adaptive_collector;
 pub mod agent_configs;
 pub mod agent_status;
@@ -1736,6 +1737,15 @@ fn status_from_state(state: &DaemonState) -> DaemonStatus {
     };
     status.relay = state.relay.clone();
     status.sources = state.sources.clone();
+    for health in &mut status.sources {
+        let source = match health.source {
+            SourceKind::Codex => snapshots::SnapshotSource::Codex,
+            SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
+            SourceKind::Pi => snapshots::SnapshotSource::Pi,
+        };
+        health.active_session_reconciliation =
+            active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
+    }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
     refresh_canonical_local_health(&mut status);
@@ -2921,6 +2931,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         agent_status: None,
         plan_observations: Vec::new(),
         detected_uses: Vec::new(),
+        active_session_reconciliation: None,
         last_seen_at: None,
         last_verified_at: None,
         problems: Vec::new(),
@@ -3275,6 +3286,7 @@ fn source_health_from_verification(
         agent_status,
         plan_observations: Vec::new(),
         detected_uses,
+        active_session_reconciliation: None,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.verified {
             result
@@ -3665,6 +3677,7 @@ fn source_health_from_agent_status(
         agent_status: Some(snapshot.clone()),
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
+        active_session_reconciliation: None,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: None,
         problems,
@@ -7741,6 +7754,7 @@ mod tests {
             agent_status: None,
             plan_observations: Vec::new(),
             detected_uses: Vec::new(),
+            active_session_reconciliation: None,
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
             problems: Vec::new(),

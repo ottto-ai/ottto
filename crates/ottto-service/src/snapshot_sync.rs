@@ -679,7 +679,15 @@ fn sync_source(
         source_kind(source),
         activity_hint.local_usage_reconciliation_enabled,
     );
-    if let Err(error) = upload_agent_status(client, &relay_token, source, machine_id) {
+    let agent_status_captured_at = current_rfc3339();
+    let agent_status_expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+        .unwrap_or_else(|| agent_status_captured_at.clone());
+    let scan_agent_status = collect_agent_status(
+        &source_kind(source),
+        agent_status_captured_at,
+        agent_status_expires_at,
+    );
+    if let Err(error) = upload_agent_status(client, &relay_token, machine_id, &scan_agent_status) {
         // Best-effort for the sync itself, but not for outage tracking: a
         // persistent transport-only failure here must still feed the streak
         // instead of being swallowed with the log line.
@@ -698,6 +706,13 @@ fn sync_source(
     // re-POST unchanged inventories 12×/hour. See `crate::mcp_inventory`.
 
     if !activity_hint.local_usage_reconciliation_enabled {
+        let _ = crate::active_sessions::reconcile_active_sessions(
+            support_dir,
+            source,
+            &[],
+            Some(&scan_agent_status),
+            &scan_started_at,
+        );
         report_status(
             client,
             &relay_token,
@@ -764,6 +779,20 @@ fn sync_source(
         }
     };
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    if crate::active_sessions::reconcile_active_sessions(
+        support_dir,
+        source,
+        &scan_result.snapshots,
+        Some(&scan_agent_status),
+        &scan_started_at,
+    )
+    .is_err()
+    {
+        eprintln!(
+            "local active-session cache update skipped for {}",
+            source.api_slug()
+        );
+    }
 
     // Retroactive backfill: if this source's parser version bumped since the
     // last successful backfill, walk every historical JSONL once and append
@@ -1083,17 +1112,12 @@ fn read_detected_uses_cache(path: &Path) -> Vec<DetectedUse> {
 fn upload_agent_status(
     client: &SnapshotApiClient,
     relay_token: &str,
-    source: SnapshotSource,
     machine_id: &str,
+    snapshot: &AgentStatusSnapshot,
 ) -> Result<()> {
-    let captured_at = current_rfc3339();
-    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
-        .unwrap_or_else(|| captured_at.clone());
-    let snapshot =
-        collect_agent_status(&source_kind(source), captured_at, expires_at).redacted_for_backend();
     let request = AgentStatusSnapshotUploadRequest {
         machine_id: machine_id.to_string(),
-        snapshots: vec![snapshot],
+        snapshots: vec![snapshot.clone().redacted_for_backend()],
     };
     let response = client.upload_agent_status(relay_token, &request)?;
     persist_machine_icon(&response);

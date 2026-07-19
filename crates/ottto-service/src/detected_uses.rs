@@ -386,6 +386,7 @@ mod tests {
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
             compaction_count: None,
+            compaction_timestamps: Vec::new(),
             model_usage: Vec::new(),
             usage_buckets,
             cost: None,

@@ -637,6 +637,12 @@ pub struct SourceHealth {
     /// observed yet (the field is omitted from the wire in that case).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detected_uses: Vec<DetectedUse>,
+    /// Sessions whose transcript activity advanced during the most recent
+    /// successful local reconciliation and is still recent enough to be
+    /// considered active. This is machine-local status, not historical
+    /// analysis; older daemons omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_reconciliation: Option<ActiveSessionReconciliation>,
     pub last_seen_at: Option<Rfc3339Timestamp>,
     pub last_verified_at: Option<Rfc3339Timestamp>,
     pub problems: Vec<HealthProblem>,
@@ -658,6 +664,45 @@ pub struct SourceHealth {
     /// "managed by workspace" state) and for daemons that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_enabled: Option<bool>,
+}
+
+/// Bounded machine-local status from one completed incremental transcript scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSessionReconciliation {
+    pub reconciled_at: Rfc3339Timestamp,
+    pub changed_session_count: u64,
+    #[serde(default)]
+    pub sessions: Vec<ActiveSession>,
+}
+
+/// One recently changed local coding-agent session. Every field is
+/// content-free or already part of the usage snapshot contract. Account hashes
+/// are present only when the scan captured direct session/account evidence or
+/// a matching current-login observation at the same reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_display_name: Option<String>,
+    pub source_last_activity_at: Rfc3339Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_context_fill_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_timestamps: Vec<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_product: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_attribution_source: Option<String>,
 }
 
 /// One detected billing destination for a source, as observed from local
@@ -3976,6 +4021,43 @@ mod tests {
 
         let parsed: DetectedUse = serde_json::from_value(value).expect("round-trips");
         assert_eq!(parsed, detected);
+    }
+
+    #[test]
+    fn active_session_reconciliation_serializes_to_swift_contract_keys() {
+        let reconciliation = ActiveSessionReconciliation {
+            reconciled_at: "2026-07-19T18:00:00Z".to_string(),
+            changed_session_count: 1,
+            sessions: vec![ActiveSession {
+                source_session_id: "session-a".to_string(),
+                session_display_name: Some("Active task".to_string()),
+                source_last_activity_at: "2026-07-19T17:59:00Z".to_string(),
+                workspace_display_label: Some("workspace".to_string()),
+                repository_label: Some("repository".to_string()),
+                peak_context_fill_tokens: Some(186_000),
+                compaction_count: Some(2),
+                compaction_timestamps: vec![
+                    "2026-07-19T17:30:00Z".to_string(),
+                    "2026-07-19T17:50:00Z".to_string(),
+                ],
+                account_identifier_hash: Some("account-hash".to_string()),
+                organization_identifier_hash: Some("org-hash".to_string()),
+                subscription_product: Some("chatgpt_pro".to_string()),
+                account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+            }],
+        };
+
+        let value = serde_json::to_value(&reconciliation).expect("serialize reconciliation");
+        assert_eq!(value["changed_session_count"], 1);
+        assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
+        assert_eq!(value["sessions"][0]["compaction_count"], 2);
+        assert_eq!(
+            value["sessions"][0]["compaction_timestamps"][1],
+            "2026-07-19T17:50:00Z"
+        );
+        let round_tripped: ActiveSessionReconciliation =
+            serde_json::from_value(value).expect("deserialize reconciliation");
+        assert_eq!(round_tripped, reconciliation);
     }
 
     #[test]

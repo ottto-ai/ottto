@@ -103,14 +103,16 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // fingerprint can trigger the one-time backend re-upload.
 // v20/v17/v9: attach privacy-safe git repository identity locally. Raw paths
 // and remotes never enter the snapshot payload.
+// v21/v18: retain timestamped compaction events for the machine-local active
+// session status and the additive backend snapshot contract.
 // Direct attribution derivation is currently dark and non-persistent: facts
 // are computed for changed sessions but skipped by serde and the snapshot
 // fingerprint. Deliberately do NOT bump these versions yet, because reparsing
 // all history would compute and immediately discard the same dark facts. The
 // backend activation change must enable serialization/fingerprinting and bump
 // all three versions atomically to perform the one-time historical backfill.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v20";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v17";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v21";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v18";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v9";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
@@ -326,6 +328,8 @@ pub struct SnapshotItem {
     pub first_turn_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_timestamps: Vec<String>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -810,6 +814,10 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
             json!(item.first_turn_context_tokens),
         );
         payload.insert("compaction_count".to_string(), json!(item.compaction_count));
+        payload.insert(
+            "compaction_timestamps".to_string(),
+            json!(item.compaction_timestamps),
+        );
     }
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
@@ -1578,6 +1586,7 @@ struct SnapshotAccumulator {
     peak_context_fill_tokens: u64,
     first_turn_context_tokens: Option<u64>,
     compaction_count: u64,
+    compaction_timestamps: Vec<String>,
 }
 
 impl SnapshotAccumulator {
@@ -1618,6 +1627,7 @@ impl SnapshotAccumulator {
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
             compaction_count: 0,
+            compaction_timestamps: Vec::new(),
         }
     }
 
@@ -2098,6 +2108,11 @@ impl SnapshotAccumulator {
                 .source
                 .derives_context_posture()
                 .then_some(self.compaction_count),
+            compaction_timestamps: if self.source.derives_context_posture() {
+                self.compaction_timestamps
+            } else {
+                Vec::new()
+            },
             model_usage,
             usage_buckets,
             cost: totals.costs.snapshot_cost(),
@@ -2656,6 +2671,7 @@ fn codex_state_only_snapshot(
         peak_context_fill_tokens: None,
         first_turn_context_tokens: None,
         compaction_count: None,
+        compaction_timestamps: Vec::new(),
         model_usage,
         usage_buckets,
         cost: None,
@@ -3479,6 +3495,9 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     // the `isCompactSummary` record the Claude parser counts.
     if string_eq_at(value, &["type"], "compacted") {
         accumulator.compaction_count += 1;
+        if let Some(timestamp) = timestamp.clone() {
+            accumulator.compaction_timestamps.push(timestamp);
+        }
     }
     // Context posture watermarks for this response. Codex states the per-turn
     // usage directly in `last_token_usage`, so read it off the event rather
@@ -3763,18 +3782,21 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             Some(accumulator.origin.is_sidechain.unwrap_or(false) || sidechain);
     }
     accumulator.note_provider_skill(string_at(value, &["attributionSkill"]));
+    let timestamp = string_at(value, &["timestamp"])
+        .or_else(|| string_at(value, &["created_at"]))
+        .or_else(|| string_at(value, &["message", "created_at"]));
     // Compaction (auto or manual `/compact`) injects a `type=user` record
-    // flagged with a top-level `isCompactSummary: true` boolean (the summary
-    // prompt that replaces the compacted history). Count each one: frequent
-    // compaction is a context-pressure symptom the backend surfaces.
+    // flagged with a top-level `isCompactSummary: true` boolean. Count it and
+    // retain the event timestamp; customer-facing copy calls this compaction,
+    // matching the provider/runtime term.
     if value.get("type").and_then(Value::as_str) == Some("user")
         && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
     {
         accumulator.compaction_count += 1;
+        if let Some(timestamp) = timestamp.clone() {
+            accumulator.compaction_timestamps.push(timestamp);
+        }
     }
-    let timestamp = string_at(value, &["timestamp"])
-        .or_else(|| string_at(value, &["created_at"]))
-        .or_else(|| string_at(value, &["message", "created_at"]));
     accumulator.note_time(timestamp.clone());
     // Remember the latest user-input moment so the next assistant response can
     // derive its turn duration. A `type=user` record is either a real prompt or
@@ -7139,6 +7161,7 @@ mod tests {
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
             compaction_count: None,
+            compaction_timestamps: Vec::new(),
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             cost: None,
@@ -8881,6 +8904,13 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(item.compaction_count, Some(2));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-07-01T11:01:00Z".to_string(),
+                "2026-07-01T11:03:00Z".to_string(),
+            ]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -8928,6 +8958,10 @@ mod tests {
         // The `compacted` rollout record and its paired `context_compacted` UI
         // event describe ONE compaction; counting both would report two.
         assert_eq!(item.compaction_count, Some(1));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec!["2026-07-17T03:04:00Z".to_string()]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -9053,6 +9087,7 @@ mod tests {
         without_posture.peak_context_fill_tokens = None;
         without_posture.first_turn_context_tokens = None;
         without_posture.compaction_count = None;
+        without_posture.compaction_timestamps.clear();
         assert_ne!(
             snapshot_fingerprint(SnapshotSource::Codex, &item),
             snapshot_fingerprint(SnapshotSource::Codex, &without_posture)
@@ -9085,10 +9120,12 @@ mod tests {
         assert_eq!(item.peak_context_fill_tokens, None);
         assert_eq!(item.first_turn_context_tokens, None);
         assert_eq!(item.compaction_count, None);
+        assert!(item.compaction_timestamps.is_empty());
         let serialized = serde_json::to_value(&item).expect("serialize");
         assert!(serialized.get("peak_context_fill_tokens").is_none());
         assert!(serialized.get("first_turn_context_tokens").is_none());
         assert!(serialized.get("compaction_count").is_none());
+        assert!(serialized.get("compaction_timestamps").is_none());
 
         let fingerprint = snapshot_fingerprint(SnapshotSource::Pi, &item);
         let mut mutated = item.clone();
@@ -10498,6 +10535,7 @@ mod tests {
             "peak_context_fill_tokens",
             "first_turn_context_tokens",
             "compaction_count",
+            "compaction_timestamps",
             "model_usage",
             "usage_buckets",
             "cost",
@@ -10646,6 +10684,7 @@ mod tests {
             peak_context_fill_tokens: Some(115),
             first_turn_context_tokens: Some(105),
             compaction_count: Some(0),
+            compaction_timestamps: Vec::new(),
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
@@ -10872,6 +10911,7 @@ mod tests {
                 peak_context_fill_tokens: None,
                 first_turn_context_tokens: None,
                 compaction_count: None,
+                compaction_timestamps: Vec::new(),
                 model_usage: vec![row.clone()],
                 usage_buckets: vec![SnapshotUsageBucket {
                     bucket_start: "2026-05-28T17:00:00Z".to_string(),
