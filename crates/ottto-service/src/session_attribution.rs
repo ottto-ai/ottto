@@ -33,6 +33,12 @@ pub struct SessionAttributionFact {
     pub evidence: SessionFieldEvidence,
 }
 
+struct EvidenceContext<'a> {
+    source_session_id: &'a str,
+    observed_at: &'a str,
+    source_version: &'a str,
+}
+
 /// Convert direct provider metadata into allowlisted facts.
 ///
 /// Absence means omission. In particular, no fact in this function claims a
@@ -47,6 +53,11 @@ pub fn direct_provider_facts(
 ) -> Vec<SessionAttributionFact> {
     let mut facts = Vec::new();
     let origin = origin.cloned().unwrap_or_default();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version,
+    };
 
     match source {
         SnapshotSource::Codex => {
@@ -58,9 +69,7 @@ pub fn direct_provider_facts(
                         "provider_scheduled_task",
                         "provider_native",
                         "direct",
-                        source_session_id,
-                        observed_at,
-                        source_version,
+                        &evidence_context,
                     );
                     push_fact(
                         &mut facts,
@@ -68,9 +77,7 @@ pub fn direct_provider_facts(
                         "codex_scheduled",
                         "provider_native",
                         "direct",
-                        source_session_id,
-                        observed_at,
-                        source_version,
+                        &evidence_context,
                     );
                 }
                 Some("subagent") => push_fact(
@@ -79,9 +86,7 @@ pub fn direct_provider_facts(
                     "subagent",
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 ),
                 _ if origin.source_subagent == Some(true) => push_fact(
                     &mut facts,
@@ -89,9 +94,7 @@ pub fn direct_provider_facts(
                     "subagent",
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 ),
                 _ => {}
             }
@@ -112,9 +115,7 @@ pub fn direct_provider_facts(
                     value,
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 );
             }
             if origin.source.as_deref() == Some("exec") {
@@ -124,9 +125,7 @@ pub fn direct_provider_facts(
                     "headless",
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 );
             }
         }
@@ -138,9 +137,7 @@ pub fn direct_provider_facts(
                     "subagent",
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 );
             }
             let provider_surface = match origin.entrypoint.as_deref() {
@@ -156,9 +153,7 @@ pub fn direct_provider_facts(
                     value,
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 );
             }
             let execution_mode = if origin.session_kind.as_deref() == Some("bg") {
@@ -175,9 +170,7 @@ pub fn direct_provider_facts(
                     value,
                     "provider_native",
                     "direct",
-                    source_session_id,
-                    observed_at,
-                    source_version,
+                    &evidence_context,
                 );
             }
         }
@@ -187,9 +180,7 @@ pub fn direct_provider_facts(
             "pi_cli",
             "provider_native",
             "direct",
-            source_session_id,
-            observed_at,
-            source_version,
+            &evidence_context,
         ),
     }
 
@@ -200,9 +191,7 @@ pub fn direct_provider_facts(
             parent_session_ref,
             "provider_native",
             "direct",
-            source_session_id,
-            observed_at,
-            source_version,
+            &evidence_context,
         );
     }
     if origin.used_workflow_orchestration == Some(true) {
@@ -212,9 +201,7 @@ pub fn direct_provider_facts(
             "dynamic",
             "provider_artifact",
             "direct",
-            source_session_id,
-            observed_at,
-            source_version,
+            &evidence_context,
         );
     }
 
@@ -228,18 +215,16 @@ fn push_fact(
     value: &str,
     kind: &str,
     strength: &str,
-    source_session_id: &str,
-    observed_at: &str,
-    source_version: &str,
+    context: &EvidenceContext<'_>,
 ) {
     if facts.len() >= MAX_SESSION_ATTRIBUTION_FACTS
         || value.is_empty()
         || value.len() > MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
-        || source_version.len() > MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+        || context.source_version.len() > MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
     {
         return;
     }
-    let evidence_ref = evidence_ref(source_session_id, field, value);
+    let evidence_ref = evidence_ref(context.source_session_id, field, value);
     if evidence_ref.len() > MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES {
         return;
     }
@@ -249,8 +234,8 @@ fn push_fact(
         evidence: SessionFieldEvidence {
             kind: kind.to_string(),
             strength: strength.to_string(),
-            observed_at: observed_at.to_string(),
-            source_version: source_version.to_string(),
+            observed_at: context.observed_at.to_string(),
+            source_version: context.source_version.to_string(),
             evidence_ref,
         },
     });
