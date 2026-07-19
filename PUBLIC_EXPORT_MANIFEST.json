@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 238,
-  "content_sha256": "b5f1005430ccd266562f0b41c461a0b2fc2bcc53257b88ebd3b2af4b00e54222",
+  "content_sha256": "4512d2286fffeb0169b6405424f7d13f83c3ff3bf175c739cf3dd47fd34e1366",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_configs/fence.rs",
-      "sha256": "92251a2171789185cd0b1038c142629b3214a83abda8005e892474db2a552be5",
-      "size_bytes": 25585
+      "sha256": "f16484676613bf541b88593ec29df44ead4d86a4457f695d620a7427925a7fd2",
+      "size_bytes": 27413
     },
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "b6f00d6b7fff80391e6b10e9890c7a8eef475d85dbd09ebd5e9a78af7c62635d",
-      "size_bytes": 603065
+      "sha256": "6bfb35e7bfc30aaa73296698c1a0d965ff017bd1492fb137cd19e4909bb612a1",
+      "size_bytes": 609146
     },
     {
       "executable": false,

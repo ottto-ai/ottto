@@ -3417,6 +3417,11 @@ struct SetupScanSource {
     attribution_guess: BTreeMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_status: Option<AgentStatusSnapshot>,
+    /// Redacted preview of the on-disk Ottto-managed fence region, so the
+    /// dashboard's "View managed config" modal shows what is really
+    /// configured on this machine instead of a canned template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7173,7 +7178,9 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let telemetry_installed = config_body
                 .as_deref()
                 .is_some_and(telemetry_config_installed);
-            setup_scan_source(
+            let managed_config =
+                managed_config_preview("~/.codex/config.toml", config_body.as_deref());
+            let mut scan_entry = setup_scan_source(
                 source,
                 "codex",
                 command_found || config.exists(),
@@ -7190,7 +7197,9 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
                     ("billing_channel".to_string(), json!("subscription")),
                     ("auth_mode".to_string(), json!("oauth")),
                 ]),
-            )
+            );
+            scan_entry.managed_config = managed_config;
+            scan_entry
         }
         SourceKind::ClaudeCode => {
             let command_found = executable_exists("claude");
@@ -7199,7 +7208,9 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let telemetry_installed = config_body
                 .as_deref()
                 .is_some_and(claude_code_telemetry_config_installed);
-            setup_scan_source(
+            let managed_config =
+                managed_config_preview("~/.claude/settings.json", config_body.as_deref());
+            let mut scan_entry = setup_scan_source(
                 source,
                 "claude_code",
                 command_found || config.exists(),
@@ -7216,7 +7227,9 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
                     ("billing_channel".to_string(), json!("subscription")),
                     ("auth_mode".to_string(), json!("oauth")),
                 ]),
-            )
+            );
+            scan_entry.managed_config = managed_config;
+            scan_entry
         }
         SourceKind::Pi => {
             let command_found = executable_exists("pi");
@@ -7259,7 +7272,80 @@ fn setup_scan_source(
         missing_fields: Vec::new(),
         attribution_guess,
         agent_status: Some(local_agent_status(source_kind).redacted_for_backend()),
+        managed_config: None,
     }
+}
+
+const MANAGED_CONFIG_PREVIEW_MAX_LINES: usize = 40;
+const MANAGED_CONFIG_PREVIEW_MAX_LINE_LENGTH: usize = 240;
+
+/// Mask token-shaped content in one managed-config line. Never trusts a
+/// specific format: long opaque character runs, anything after "bearer", and
+/// values of secret-bearing keys (key/token/secret/header/authorization) are
+/// all replaced. The backend re-sanitizes on ingest as defense-in-depth.
+fn redact_managed_config_line(line: &str) -> String {
+    let mut redacted = String::new();
+    let mut token = String::new();
+    fn flush(token: &mut String, out: &mut String) {
+        if token.len() >= 32 {
+            out.push_str("…redacted…");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    }
+    for character in line.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '_' | '-') {
+            token.push(character);
+        } else {
+            flush(&mut token, &mut redacted);
+            redacted.push(character);
+        }
+    }
+    flush(&mut token, &mut redacted);
+
+    let lowered = redacted.to_ascii_lowercase();
+    if let Some(index) = lowered.find("bearer") {
+        redacted.truncate(index + "bearer".len());
+        redacted.push_str(" …redacted…");
+    }
+    if let Some(delimiter_index) = redacted.find(['=', ':']) {
+        let key = redacted[..delimiter_index].to_ascii_lowercase();
+        if ["key", "token", "secret", "header", "authorization"]
+            .iter()
+            .any(|marker| key.contains(marker))
+        {
+            let delimiter = redacted[delimiter_index..].chars().next().unwrap_or('=');
+            redacted = format!("{}{delimiter} …redacted…", &redacted[..delimiter_index]);
+        }
+    }
+    redacted
+}
+
+/// Redacted preview of the Ottto-managed fence region for the scan payload.
+/// `path_label` is a home-relative label ("~/.codex/config.toml") so machine
+/// user names never leave the device. Returns `None` when the file is
+/// missing or holds no complete fence.
+fn managed_config_preview(path_label: &str, body: Option<&str>) -> Option<serde_json::Value> {
+    let body = body?;
+    let lines = crate::agent_configs::fence::extract_fence_lines(body)?;
+    let redacted: Vec<String> = lines
+        .iter()
+        .take(MANAGED_CONFIG_PREVIEW_MAX_LINES)
+        .map(|line| {
+            let capped: String = line
+                .chars()
+                .take(MANAGED_CONFIG_PREVIEW_MAX_LINE_LENGTH)
+                .collect();
+            redact_managed_config_line(&capped)
+        })
+        .collect();
+    Some(json!({
+        "path": path_label,
+        "exists": true,
+        "captured_at": current_rfc3339(),
+        "lines": redacted,
+    }))
 }
 
 fn local_agent_status(source: &SourceKind) -> AgentStatusSnapshot {
@@ -9318,6 +9404,68 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_config_preview_extracts_and_redacts_fence_region() {
+        // Assembled at runtime so no token-shaped literal lands in the
+        // public source tree (the public-surface scanner rejects those).
+        let fake_secret = format!("sk-{}", "abcde12345".repeat(4));
+        let body = format!(
+            concat!(
+                "top_level = true\n",
+                "# ottto:start\n",
+                "[otel]\n",
+                "environment = \"prod\"\n",
+                "log_user_prompt = false\n",
+                "exporter_otlp_endpoint = \"http://127.0.0.1:4319\"\n",
+                "exporter_otlp_headers = \"Bearer {}\"\n",
+                "# ottto:end\n",
+                "trailing = true\n",
+            ),
+            fake_secret,
+        );
+        let preview = super::managed_config_preview("~/.codex/config.toml", Some(&body))
+            .expect("fenced body yields a preview");
+        assert_eq!(preview["path"], "~/.codex/config.toml");
+        assert_eq!(preview["exists"], true);
+        let lines: Vec<String> = preview["lines"]
+            .as_array()
+            .expect("lines array")
+            .iter()
+            .map(|line| line.as_str().expect("line string").to_string())
+            .collect();
+        assert_eq!(lines.first().map(String::as_str), Some("# ottto:start"));
+        assert_eq!(lines.last().map(String::as_str), Some("# ottto:end"));
+        assert!(lines.iter().any(|line| line == "[otel]"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "exporter_otlp_endpoint = \"http://127.0.0.1:4319\""));
+        let joined = lines.join("\n");
+        assert!(!joined.contains(&fake_secret));
+        assert!(!joined.contains("top_level"));
+        assert!(!joined.contains("trailing"));
+        assert!(joined.contains("…redacted…"));
+    }
+
+    #[test]
+    fn managed_config_preview_absent_without_fence_or_body() {
+        assert!(super::managed_config_preview("~/.codex/config.toml", None).is_none());
+        assert!(
+            super::managed_config_preview("~/.codex/config.toml", Some("plain = true\n")).is_none()
+        );
+    }
+
+    #[test]
+    fn redact_managed_config_line_masks_secret_bearing_keys() {
+        assert_eq!(
+            super::redact_managed_config_line("export OTEL_EXPORTER_OTLP_HEADERS='x-ottto short'"),
+            "export OTEL_EXPORTER_OTLP_HEADERS= …redacted…",
+        );
+        assert_eq!(
+            super::redact_managed_config_line("log_user_prompt = false"),
+            "log_user_prompt = false",
+        );
+    }
+
     use super::*;
     use crate::agent_status::PiRouteClassification;
     use ottto_protocol::{RepairAuthority, RepairAuthorityMode};

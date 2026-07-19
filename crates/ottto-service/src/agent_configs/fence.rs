@@ -63,6 +63,45 @@ impl std::error::Error for AgentConfigError {
 
 pub type AgentConfigResult<T> = Result<T, AgentConfigError>;
 
+/// Lines of the Ottto-managed fence region (markers included), or `None`
+/// when the body has no single complete fence. Used to report the real
+/// managed region to the dashboard's "View managed config" preview; it is
+/// display-only evidence, so ambiguous fences yield `None` instead of an
+/// error and never fail a scan.
+pub fn extract_fence_lines(body: &str) -> Option<Vec<String>> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut inside = false;
+    let mut found = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed == FENCE_START {
+            if found || inside {
+                return None;
+            }
+            inside = true;
+            lines.push(line.to_string());
+            continue;
+        }
+        if trimmed == FENCE_END {
+            if !inside {
+                return None;
+            }
+            lines.push(line.to_string());
+            inside = false;
+            found = true;
+            continue;
+        }
+        if inside {
+            lines.push(line.to_string());
+        }
+    }
+    if found && !inside {
+        Some(lines)
+    } else {
+        None
+    }
+}
+
 pub fn upsert_fence(path: &Path, body: &str) -> AgentConfigResult<FenceWriteResult> {
     upsert_fence_with_validator(path, body, |_| Ok(()))
 }
@@ -376,6 +415,25 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn extract_fence_lines_returns_region_or_none() {
+        let body = "before\n# ottto:start\na = 1\n# ottto:end\nafter\n";
+        assert_eq!(
+            extract_fence_lines(body),
+            Some(vec![
+                "# ottto:start".to_string(),
+                "a = 1".to_string(),
+                "# ottto:end".to_string(),
+            ])
+        );
+        assert_eq!(extract_fence_lines("no fence here\n"), None);
+        assert_eq!(extract_fence_lines("# ottto:start\nunclosed\n"), None);
+        assert_eq!(
+            extract_fence_lines("# ottto:start\na\n# ottto:end\n# ottto:start\nb\n# ottto:end\n"),
+            None
+        );
+    }
 
     fn test_path(name: &str) -> PathBuf {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
