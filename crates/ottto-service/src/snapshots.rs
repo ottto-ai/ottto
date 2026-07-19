@@ -1984,6 +1984,10 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
+        let repository_identity = self
+            .workspace_path
+            .as_deref()
+            .map(cached_repository_identity);
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
@@ -1992,17 +1996,24 @@ impl SnapshotAccumulator {
             self.source.parser_version(),
         );
         if let Some(context) = attribution_context {
-            attribution_facts.extend(context.grouping_facts(
-                crate::session_attribution::SessionAttributionGroupingInput {
-                    source: self.source,
-                    origin: Some(&self.origin),
-                    source_session_id: &source_session_id,
-                    observed_at: collected_at,
-                    source_version: self.source.parser_version(),
-                    first_prompt: self.first_prompt_material.as_deref(),
-                    provider_skills: &self.provider_skills,
-                },
-            ));
+            attribution_facts.extend(
+                context.grouping_facts(
+                    crate::session_attribution::SessionAttributionGroupingInput {
+                        source: self.source,
+                        origin: Some(&self.origin),
+                        source_session_id: &source_session_id,
+                        observed_at: collected_at,
+                        source_version: self.source.parser_version(),
+                        first_prompt: self.first_prompt_material.as_deref(),
+                        provider_skills: &self.provider_skills,
+                        repository_hash: repository_identity
+                            .as_ref()
+                            .and_then(|identity| identity.repository_hash.as_deref()),
+                        source_started_at: self.started_at.as_deref(),
+                        transcript_path: path,
+                    },
+                ),
+            );
             crate::session_attribution::enforce_fact_limits(&mut attribution_facts);
         }
         let collector = match self.source {
@@ -2049,10 +2060,6 @@ impl SnapshotAccumulator {
         for row in session_rows.values() {
             totals.add(&row.usage);
         }
-        let repository_identity = self
-            .workspace_path
-            .as_deref()
-            .map(cached_repository_identity);
         let mut item = SnapshotItem {
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),

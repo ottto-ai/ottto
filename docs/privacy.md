@@ -39,6 +39,16 @@ reprocesses only files whose size or modification time changed. Missing or
 ambiguous evidence produces no attribution label; it is never reclassified as
 human activity.
 
+On macOS, external-scheduler attribution may also inventory bounded user
+launchd definitions and the user's crontab at startup and once per day. Raw
+plist, crontab, wrapper-script, command, and path content stays local. A
+specific-file `lsof`, content-free process parent table, and bounded
+`launchctl print` lookup run only for a changed session that already matches a
+plausible scheduler definition; there is no process watcher. Static
+correlation requires matching schedule time, prompt signature, provider, and
+repository. Interval jobs require a live job-PID relationship. Missing access,
+timeouts, and ambiguity produce no external-scheduler fact.
+
 ## Live Telemetry
 
 Live telemetry is source-level opt-in. Setup can mint scoped setup keys and
