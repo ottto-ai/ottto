@@ -804,7 +804,7 @@ fn sanitize_relative_path(raw: &str) -> Option<String> {
     safe_text(&candidate, 512)
 }
 
-fn safe_text(raw: &str, max_len: usize) -> Option<String> {
+pub(crate) fn safe_text(raw: &str, max_len: usize) -> Option<String> {
     let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
         return None;
@@ -884,7 +884,11 @@ fn dedupe_workspace_candidates_by_repository(
     out
 }
 
-fn collect_recent_jsonl_files(dir: &Path, now: SystemTime, out: &mut Vec<(PathBuf, SystemTime)>) {
+pub(crate) fn collect_recent_jsonl_files(
+    dir: &Path,
+    now: SystemTime,
+    out: &mut Vec<(PathBuf, SystemTime)>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -907,7 +911,7 @@ fn collect_recent_jsonl_files(dir: &Path, now: SystemTime, out: &mut Vec<(PathBu
     }
 }
 
-fn cwd_values_from_jsonl(path: &Path) -> Vec<String> {
+pub(crate) fn cwd_values_from_jsonl(path: &Path) -> Vec<String> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
@@ -1022,7 +1026,7 @@ fn request_content_hash_for_request(request: &ContextFootprintIngestRequest) -> 
     Ok(sha256_bytes(&canonical))
 }
 
-fn sha256_hex(parts: &[&str]) -> String {
+pub(crate) fn sha256_hex(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update(part.as_bytes());
@@ -1118,7 +1122,7 @@ fn write_marker(path: &Path, identity: &str) {
     let _ = fs::write(path, identity.as_bytes());
 }
 
-fn workspace_label(workspace: &Path) -> Option<String> {
+pub(crate) fn workspace_label(workspace: &Path) -> Option<String> {
     workspace
         .file_name()
         .and_then(|name| name.to_str())
