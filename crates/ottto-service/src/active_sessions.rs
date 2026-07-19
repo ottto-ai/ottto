@@ -73,7 +73,7 @@ pub fn reconcile_active_sessions(
         let advanced = previous
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .is_none_or(|value| last_activity_at > value);
+            .map_or(true, |value| last_activity_at > value);
 
         if advanced
             && last_activity_at >= activity_cutoff
