@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
@@ -101,9 +101,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // `compacted` records). Same one-shot rationale as claude_code v16 — the
 // incremental scanner must revisit already-indexed rollouts before their new
 // fingerprint can trigger the one-time backend re-upload.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v19";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v16";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v8";
+// v20/v17/v9: attach privacy-safe git repository identity locally. Raw paths
+// and remotes never enter the snapshot payload.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v20";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v17";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v9";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -123,6 +125,8 @@ pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
+const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
+const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
 // file COUNT and an mtime window, but the per-file/-line byte lengths were
@@ -326,6 +330,16 @@ pub struct SnapshotItem {
     pub workspace_display_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_label_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_label_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_identity_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_kind: Option<String>,
     pub source_file_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub session_artifacts: Vec<SessionArtifact>,
@@ -489,12 +503,18 @@ pub fn apply_upload_policy(
             item.session_display_name_source = None;
             fingerprint_needs_refresh = true;
         }
-        if !policy.workspace_labels_enabled
-            && (item.workspace_display_label.is_some() || item.workspace_label_source.is_some())
-        {
-            item.workspace_display_label = None;
-            item.workspace_label_source = None;
-            fingerprint_needs_refresh = true;
+        if !policy.workspace_labels_enabled {
+            if item.workspace_display_label.is_some()
+                || item.workspace_label_source.is_some()
+                || item.repository_label.is_some()
+                || item.repository_label_source.is_some()
+            {
+                item.workspace_display_label = None;
+                item.workspace_label_source = None;
+                item.repository_label = None;
+                item.repository_label_source = None;
+                fingerprint_needs_refresh = true;
+            }
         }
         if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
             item.session_artifacts.clear();
@@ -746,6 +766,11 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         "title_source": &item.session_display_name_source,
         "workspace_display_label": &item.workspace_display_label,
         "workspace_label_source": &item.workspace_label_source,
+        "repository_hash": &item.repository_hash,
+        "repository_label": &item.repository_label,
+        "repository_label_source": &item.repository_label_source,
+        "repository_identity_source": &item.repository_identity_source,
+        "workspace_kind": &item.workspace_kind,
         "session_artifacts": &item.session_artifacts,
         // Including origin makes a one-time re-upload happen when the collector
         // starts forwarding it, so the backend can re-derive the initiator for
@@ -1470,6 +1495,9 @@ struct SnapshotAccumulator {
     ended_at: Option<String>,
     last_activity_at: Option<String>,
     workspace_hash: Option<String>,
+    // In-memory only: used to derive privacy-safe repository identity. The raw
+    // path is never copied into SnapshotItem or uploaded.
+    workspace_path: Option<PathBuf>,
     latest_model: Option<String>,
     // Most-recently-observed Codex per-turn reasoning effort tier. Updated as
     // lines stream past so the next usage row picks up the effort co-located
@@ -1544,6 +1572,7 @@ impl SnapshotAccumulator {
             ended_at: None,
             last_activity_at: None,
             workspace_hash: None,
+            workspace_path: None,
             latest_model: None,
             latest_reasoning_effort: None,
             latest_turn_id: None,
@@ -1726,7 +1755,10 @@ impl SnapshotAccumulator {
 
     fn set_workspace_hash(&mut self, value: Option<String>) {
         if self.workspace_hash.is_none() {
-            self.workspace_hash = value.map(|raw| sha256_hex(&[raw.as_str()]));
+            if let Some(raw) = value {
+                self.workspace_hash = Some(sha256_hex(&[raw.as_str()]));
+                self.workspace_path = Some(PathBuf::from(raw));
+            }
         }
     }
 
@@ -1958,6 +1990,10 @@ impl SnapshotAccumulator {
         for row in session_rows.values() {
             totals.add(&row.usage);
         }
+        let repository_identity = self
+            .workspace_path
+            .as_deref()
+            .map(cached_repository_identity);
         let mut item = SnapshotItem {
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
@@ -2008,6 +2044,21 @@ impl SnapshotAccumulator {
             workspace_hash: self.workspace_hash.clone(),
             workspace_display_label: None,
             workspace_label_source: None,
+            repository_hash: repository_identity
+                .as_ref()
+                .and_then(|identity| identity.repository_hash.clone()),
+            repository_label: repository_identity
+                .as_ref()
+                .and_then(|identity| identity.repository_label.clone()),
+            repository_label_source: repository_identity
+                .as_ref()
+                .and_then(|identity| identity.repository_label_source.clone()),
+            repository_identity_source: repository_identity
+                .as_ref()
+                .and_then(|identity| identity.repository_identity_source.clone()),
+            workspace_kind: repository_identity
+                .as_ref()
+                .and_then(|identity| identity.workspace_kind.clone()),
             source_file_fingerprint: Some(source_file_fingerprint.clone()),
             session_artifacts: {
                 let mut artifacts = self.artifacts.clone();
@@ -2026,6 +2077,33 @@ impl SnapshotAccumulator {
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
         vec![item]
     }
+}
+
+fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
+    type Cache = BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let now = SystemTime::now();
+    if let Ok(guard) = cache.lock() {
+        if let Some((captured_at, identity)) = guard.get(workspace) {
+            if now
+                .duration_since(*captured_at)
+                .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
+                .unwrap_or(false)
+            {
+                return identity.clone();
+            }
+        }
+    }
+
+    let identity = crate::context_footprint::resolve_repository_identity(workspace, true);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(workspace.to_path_buf(), (now, identity.clone()));
+    }
+    identity
 }
 
 fn merge_session_row(
@@ -2471,6 +2549,11 @@ fn codex_state_only_snapshot(
         workspace_hash: None,
         workspace_display_label: None,
         workspace_label_source: None,
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: None,
         source_file_fingerprint: None,
         session_artifacts: Vec::new(),
         provenance: SnapshotProvenance {
@@ -6479,6 +6562,8 @@ mod tests {
         .expect("snapshot");
         item.workspace_display_label = Some("Checkout service".to_string());
         item.workspace_label_source = Some("user_approved".to_string());
+        item.repository_label = Some("private-repository".to_string());
+        item.repository_label_source = Some("git_root".to_string());
         let original_fingerprint = item.snapshot_fingerprint.clone();
         let mut snapshots = vec![item];
 
@@ -6497,12 +6582,71 @@ mod tests {
         assert_eq!(stripped.session_display_name_source, None);
         assert_eq!(stripped.workspace_display_label, None);
         assert_eq!(stripped.workspace_label_source, None);
+        assert_eq!(stripped.repository_label, None);
+        assert_eq!(stripped.repository_label_source, None);
         assert_ne!(stripped.snapshot_fingerprint, original_fingerprint);
         let serialized = serde_json::to_string(stripped).expect("serialize");
         assert!(!serialized.contains("Private task title"));
         assert!(!serialized.contains("Checkout service"));
+        assert!(!serialized.contains("private-repository"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_snapshot_derives_repository_identity_without_uploading_raw_cwd() {
+        let repository = temp_dir("codex-repository-identity");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let path = repository.join("session.jsonl");
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-05-14T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019e253c-5555-7000-9000-eeeeeeeeeeea",
+                "cwd": repository.to_string_lossy(),
+            }
+        });
+        let usage = serde_json::json!({
+            "timestamp": "2026-05-14T10:03:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {"input_tokens": 40, "output_tokens": 8},
+                    "model": "gpt-5.5"
+                }
+            }
+        });
+        fs::write(&path, format!("{session_meta}\n{usage}\n")).expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-14T10:04:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(item.repository_hash.as_ref().map(String::len), Some(64));
+        assert_eq!(
+            item.repository_label.as_deref(),
+            repository.file_name().and_then(|value| value.to_str())
+        );
+        assert_eq!(
+            item.repository_identity_source.as_deref(),
+            Some("git_common_dir")
+        );
+        assert_eq!(item.workspace_kind.as_deref(), Some("repository_root"));
+        let serialized = serde_json::to_string(&item).expect("serialize");
+        assert!(!serialized.contains(repository.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(repository);
     }
 
     #[test]
@@ -6685,6 +6829,11 @@ mod tests {
             workspace_hash: None,
             workspace_display_label: None,
             workspace_label_source: None,
+            repository_hash: None,
+            repository_label: None,
+            repository_label_source: None,
+            repository_identity_source: None,
+            workspace_kind: None,
             source_file_fingerprint: None,
             session_artifacts: vec![SessionArtifact {
                 kind: "pull_request".to_string(),
@@ -10178,6 +10327,11 @@ mod tests {
             workspace_hash: Some("b".repeat(32)),
             workspace_display_label: None,
             workspace_label_source: None,
+            repository_hash: None,
+            repository_label: None,
+            repository_label_source: None,
+            repository_identity_source: None,
+            workspace_kind: None,
             source_file_fingerprint: Some("c".repeat(32)),
             session_artifacts: Vec::new(),
             provenance: SnapshotProvenance {
@@ -10398,6 +10552,11 @@ mod tests {
                 workspace_hash: Some("b".repeat(32)),
                 workspace_display_label: None,
                 workspace_label_source: None,
+                repository_hash: None,
+                repository_label: None,
+                repository_label_source: None,
+                repository_identity_source: None,
+                workspace_kind: None,
                 source_file_fingerprint: Some("c".repeat(32)),
                 session_artifacts: Vec::new(),
                 provenance: SnapshotProvenance {
