@@ -107,12 +107,12 @@ struct WorkspaceCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RepositoryIdentity {
-    repository_hash: Option<String>,
-    repository_label: Option<String>,
-    repository_label_source: Option<String>,
-    repository_identity_source: Option<String>,
-    workspace_kind: Option<String>,
+pub(crate) struct RepositoryIdentity {
+    pub(crate) repository_hash: Option<String>,
+    pub(crate) repository_label: Option<String>,
+    pub(crate) repository_label_source: Option<String>,
+    pub(crate) repository_identity_source: Option<String>,
+    pub(crate) workspace_kind: Option<String>,
 }
 
 #[derive(Clone)]
@@ -405,7 +405,10 @@ fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
     }
 }
 
-fn resolve_repository_identity(workspace: &Path, labels_enabled: bool) -> RepositoryIdentity {
+pub(crate) fn resolve_repository_identity(
+    workspace: &Path,
+    labels_enabled: bool,
+) -> RepositoryIdentity {
     let Some(toplevel_raw) = git_stdout(workspace, &["rev-parse", "--show-toplevel"]) else {
         return RepositoryIdentity {
             repository_hash: None,

@@ -396,6 +396,11 @@ mod tests {
             workspace_hash: None,
             workspace_display_label: None,
             workspace_label_source: None,
+            repository_hash: None,
+            repository_label: None,
+            repository_label_source: None,
+            repository_identity_source: None,
+            workspace_kind: None,
             source_file_fingerprint: None,
             session_artifacts: Vec::new(),
             provenance: crate::snapshots::SnapshotProvenance {
