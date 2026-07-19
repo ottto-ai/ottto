@@ -30,6 +30,15 @@ Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
 
+Session attribution follows the same boundary. The daemon may use bounded
+first-prompt material, provider-native skill metadata, and local scheduled-task
+definitions in memory to derive tenant-scoped HMAC identifiers. It does not
+upload the source prompt, skill name, schedule text, definition path, or HMAC
+key. Provider schedule inventory is bounded, cached for six hours, and
+reprocesses only files whose size or modification time changed. Missing or
+ambiguous evidence produces no attribution label; it is never reclassified as
+human activity.
+
 ## Live Telemetry
 
 Live telemetry is source-level opt-in. Setup can mint scoped setup keys and

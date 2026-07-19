@@ -1505,6 +1505,12 @@ struct SnapshotAccumulator {
     title: Option<String>,
     title_source: Option<String>,
     first_prompt_title: Option<String>,
+    // In-memory only: bounded first-user text used to derive opaque template,
+    // schedule, and explicit slash-skill facts. Never copied into SnapshotItem.
+    first_prompt_material: Option<String>,
+    // In-memory only: provider-native skill names. HMACed before facts are
+    // produced and never serialized in plaintext.
+    provider_skills: BTreeSet<String>,
     started_at: Option<String>,
     ended_at: Option<String>,
     last_activity_at: Option<String>,
@@ -1582,6 +1588,8 @@ impl SnapshotAccumulator {
             title: None,
             title_source: None,
             first_prompt_title: None,
+            first_prompt_material: None,
+            provider_skills: BTreeSet::new(),
             started_at: None,
             ended_at: None,
             last_activity_at: None,
@@ -1711,10 +1719,25 @@ impl SnapshotAccumulator {
     }
 
     fn set_first_prompt_title(&mut self, value: Option<String>) {
-        if self.first_prompt_title.is_some() {
+        let Some(value) = value else {
             return;
+        };
+        if self.first_prompt_material.is_none() {
+            self.first_prompt_material = Some(value.clone());
         }
-        self.first_prompt_title = value.and_then(first_prompt_display_title);
+        if self.first_prompt_title.is_none() {
+            self.first_prompt_title = first_prompt_display_title(value);
+        }
+    }
+
+    fn note_provider_skill(&mut self, value: Option<String>) {
+        let Some(value) = value else {
+            return;
+        };
+        let normalized = value.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && normalized.len() <= 128 {
+            self.provider_skills.insert(normalized);
+        }
     }
 
     fn apply_codex_title_metadata(&mut self, path: &Path, metadata: &CodexTitleMetadata) {
@@ -1923,6 +1946,7 @@ impl SnapshotAccumulator {
         path: &Path,
         collected_at: &str,
         source_file_fingerprint: String,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> Vec<SnapshotItem> {
         let Some(source_session_id) = self
             .source_session_id
@@ -1960,13 +1984,27 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
-        let attribution_facts = crate::session_attribution::direct_provider_facts(
+        let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
             &source_session_id,
             collected_at,
             self.source.parser_version(),
         );
+        if let Some(context) = attribution_context {
+            attribution_facts.extend(context.grouping_facts(
+                crate::session_attribution::SessionAttributionGroupingInput {
+                    source: self.source,
+                    origin: Some(&self.origin),
+                    source_session_id: &source_session_id,
+                    observed_at: collected_at,
+                    source_version: self.source.parser_version(),
+                    first_prompt: self.first_prompt_material.as_deref(),
+                    provider_skills: &self.provider_skills,
+                },
+            ));
+            crate::session_attribution::enforce_fact_limits(&mut attribution_facts);
+        }
         let collector = match self.source {
             SnapshotSource::Codex => "codex_jsonl".to_string(),
             SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
@@ -2302,6 +2340,30 @@ pub fn scan_source_roots_with_artifacts(
     )
 }
 
+/// Dark-mode attribution-aware scan. It reuses the normal changed-file path;
+/// the context only adds in-memory HMAC facts to sessions already selected for
+/// parsing and never changes the filesystem polling cadence.
+pub fn scan_source_roots_with_attribution(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        artifacts_enabled,
+        attribution_context,
+    )
+}
+
 // Inner form with an injectable file cap so the cap-policy test can exercise
 // truncation without materializing `MAX_BACKFILL_FILES_PER_SOURCE` files.
 fn scan_source_roots_with_limit(
@@ -2312,6 +2374,29 @@ fn scan_source_roots_with_limit(
     requested_backfill_window_days: u64,
     file_limit: usize,
     artifacts_enabled: bool,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        artifacts_enabled,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_roots_with_limit_and_attribution(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<SourceScanResult> {
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
     let codex_title_metadata = if source == SnapshotSource::Codex {
@@ -2367,24 +2452,29 @@ fn scan_source_roots_with_limit(
         scanned_file_count += 1;
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
         let mut parsed = match source {
-            SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata(
+            SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata_and_attribution(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
                 &codex_title_metadata,
                 codex_turn_traces.clone(),
+                attribution_context,
             )?,
-            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_title_metadata(
+            SnapshotSource::ClaudeCode => {
+                parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
+                    &candidate.path,
+                    collected_at,
+                    source_file_fingerprint.clone(),
+                    &claude_title_metadata,
+                    artifacts_enabled,
+                    attribution_context,
+                )?
+            }
+            SnapshotSource::Pi => parse_pi_jsonl_file_with_attribution(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
-                &claude_title_metadata,
-                artifacts_enabled,
-            )?,
-            SnapshotSource::Pi => parse_pi_jsonl_file(
-                &candidate.path,
-                collected_at,
-                source_file_fingerprint.clone(),
+                attribution_context,
             )?,
         };
         if source == SnapshotSource::Codex {
@@ -2614,6 +2704,24 @@ fn parse_codex_jsonl_file_with_title_metadata(
     title_metadata: &CodexTitleMetadata,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_codex_jsonl_file_with_title_metadata_and_attribution(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        codex_turn_traces,
+        None,
+    )
+}
+
+fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &CodexTitleMetadata,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -2625,6 +2733,7 @@ fn parse_codex_jsonl_file_with_title_metadata(
         codex_turn_traces,
         // Codex lines never feed the artifact scraper; the value is moot.
         true,
+        attribution_context,
     )
 }
 
@@ -2664,6 +2773,24 @@ fn parse_claude_code_jsonl_file_with_title_metadata(
     title_metadata: &ClaudeTitleMetadata,
     artifacts_enabled: bool,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        artifacts_enabled,
+        None,
+    )
+}
+
+fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &ClaudeTitleMetadata,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -2674,6 +2801,7 @@ fn parse_claude_code_jsonl_file_with_title_metadata(
         Some(title_metadata),
         None,
         artifacts_enabled,
+        attribution_context,
     )
 }
 
@@ -2681,6 +2809,15 @@ pub fn parse_pi_jsonl_file(
     path: &Path,
     collected_at: &str,
     source_file_fingerprint: String,
+) -> Result<Vec<SnapshotItem>> {
+    parse_pi_jsonl_file_with_attribution(path, collected_at, source_file_fingerprint, None)
+}
+
+fn parse_pi_jsonl_file_with_attribution(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
     parse_jsonl_file(
         path,
@@ -2693,6 +2830,7 @@ pub fn parse_pi_jsonl_file(
         None,
         // Pi lines never feed the artifact scraper; the value is moot.
         true,
+        attribution_context,
     )
 }
 
@@ -2707,6 +2845,7 @@ fn parse_jsonl_file(
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -2736,7 +2875,12 @@ fn parse_jsonl_file(
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
     }
-    Ok(accumulator.into_items(path, collected_at, source_file_fingerprint))
+    Ok(accumulator.into_items(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        attribution_context,
+    ))
 }
 
 /// Stream a JSONL reader line-by-line with a hard per-line byte ceiling,
@@ -3611,6 +3755,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         accumulator.origin.is_sidechain =
             Some(accumulator.origin.is_sidechain.unwrap_or(false) || sidechain);
     }
+    accumulator.note_provider_skill(string_at(value, &["attributionSkill"]));
     // Compaction (auto or manual `/compact`) injects a `type=user` record
     // flagged with a top-level `isCompactSummary: true` boolean (the summary
     // prompt that replaces the compacted history). Count each one: frequent
@@ -5364,6 +5509,7 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn temp_file(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -5837,6 +5983,69 @@ mod tests {
 
         let _ = fs::remove_file(automation_path);
         let _ = fs::remove_file(subagent_path);
+    }
+
+    #[test]
+    fn codex_parser_groups_template_and_schedule_without_serializing_content() {
+        let home = temp_dir("codex-attribution-groups");
+        let schedule_dir = home.join(".codex/automations/schedule-landing");
+        fs::create_dir_all(&schedule_dir).expect("schedule dir");
+        let scheduled_prompt =
+            "Inspect the landing queue, verify every required check, and report safe results.";
+        fs::write(
+            schedule_dir.join("automation.toml"),
+            format!(
+                "id = \"schedule-landing\"\nprompt = \"{scheduled_prompt}\"\nstatus = \"ACTIVE\"\n"
+            ),
+        )
+        .expect("schedule definition");
+        let encoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            &home,
+            true,
+            Some(&encoded_key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .expect("attribution context");
+        let path = home.join("session.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-19T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"automation-group-session\",\"originator\":\"Codex Desktop\",\"thread_source\":\"automation\"}}}}\n\
+                 {{\"timestamp\":\"2026-07-19T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"An automation named Landing has fired. Its prompt is: {scheduled_prompt}\"}}}}\n\
+                 {{\"timestamp\":\"2026-07-19T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1}},\"model\":\"gpt-5.6-sol\"}}}}}}\n"
+            ),
+        )
+        .expect("session");
+
+        let item = parse_codex_jsonl_file_with_title_metadata_and_attribution(
+            &path,
+            "2026-07-19T10:04:00Z",
+            "fp-attribution-groups".to_string(),
+            &CodexTitleMetadata::default(),
+            None,
+            Some(&context),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "template_group_id"));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "schedule_definition_id"));
+        let local_facts = serde_json::to_string(&item.attribution_facts).expect("local facts");
+        assert!(!local_facts.contains(scheduled_prompt));
+        let wire = serde_json::to_value(&item).expect("snapshot wire");
+        assert!(wire.get("attribution_facts").is_none());
+
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
