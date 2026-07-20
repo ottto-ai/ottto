@@ -5,6 +5,7 @@ pub mod agent_status;
 pub mod backfill;
 pub mod claude_effort;
 pub(crate) mod command_env;
+pub mod context_composition;
 pub mod context_footprint;
 pub mod context_posture;
 pub mod control;

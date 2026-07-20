@@ -333,6 +333,10 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         Ok(()) => eprintln!("serving context footprint harvest"),
         Err(error) => eprintln!("context footprint harvest unavailable: {error}"),
     }
+    match ottto_service::context_composition::spawn_context_composition_sync() {
+        Ok(()) => eprintln!("serving context composition harvest"),
+        Err(error) => eprintln!("context composition harvest unavailable: {error}"),
+    }
     match ottto_service::snapshot_sync::spawn_local_health_projection_sync(daemon.clone()) {
         Ok(()) => eprintln!("serving local health projection sync"),
         Err(error) => eprintln!("local health projection sync unavailable: {error}"),
