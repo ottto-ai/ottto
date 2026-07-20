@@ -18,13 +18,14 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
-use crate::snapshots::{SnapshotItem, SnapshotModelUsage, SnapshotSource};
+use crate::snapshots::{
+    bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
+};
 
 const ACTIVE_ACTIVITY_WINDOW_MINUTES: i64 = 15;
 const WATERMARK_RETENTION_DAYS: i64 = 90;
 const MAX_WATERMARKS: usize = 5_000;
 const MAX_ACTIVE_SESSIONS: usize = 100;
-const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ActiveSessionCache {
@@ -138,13 +139,8 @@ fn active_session_from_snapshot(
     agent_status: Option<&AgentStatusSnapshot>,
 ) -> ActiveSession {
     let attribution = agent_status.and_then(|status| account_attribution(snapshot, status));
-    let mut compaction_timestamps = snapshot.compaction_timestamps.clone();
-    compaction_timestamps.sort();
-    compaction_timestamps.dedup();
-    if compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
-        compaction_timestamps = compaction_timestamps
-            .split_off(compaction_timestamps.len() - MAX_COMPACTION_TIMESTAMPS);
-    }
+    let compaction_timestamps =
+        bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
         session_display_name: snapshot.session_display_name.clone(),
