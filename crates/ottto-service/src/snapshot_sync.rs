@@ -745,8 +745,14 @@ fn sync_source(
         session_titles_enabled: activity_hint.session_titles_enabled,
         workspace_labels_enabled: activity_hint.workspace_labels_enabled,
         session_artifacts_enabled: activity_hint.session_artifacts_enabled,
+        session_attribution_enabled: activity_hint.session_attribution_enabled,
     };
-    let index_path = snapshot_index_path(support_dir, source, upload_policy);
+    let index_path = snapshot_index_path(
+        support_dir,
+        source,
+        upload_policy,
+        attribution_context.as_ref(),
+    );
     let mut index = ScanIndex::load(&index_path)?;
     let mut scan_result = match scan_source_roots_with_attribution(
         source,
@@ -810,6 +816,7 @@ fn sync_source(
             &[source],
             &scan_started_at,
             upload_policy.session_artifacts_enabled,
+            attribution_context.as_ref(),
         ) {
             Ok((mut backfill_snapshots, _report)) => {
                 apply_upload_policy(source, &mut backfill_snapshots, upload_policy);
@@ -1361,13 +1368,14 @@ fn snapshot_index_path(
     support_dir: &Path,
     source: SnapshotSource,
     upload_policy: SnapshotUploadPolicy,
+    attribution_context: Option<&SessionAttributionContext>,
 ) -> PathBuf {
-    let mut suffixes = Vec::new();
+    let mut suffixes: Vec<String> = Vec::new();
     if !upload_policy.session_titles_enabled {
-        suffixes.push("no-titles");
+        suffixes.push("no-titles".to_string());
     }
     if !upload_policy.workspace_labels_enabled {
-        suffixes.push("no-labels");
+        suffixes.push("no-labels".to_string());
     }
     // Artifacts are opt-in (default off), so the suffix marks the ENABLED state.
     // Enabling switches to the fresh `-artifacts` index, forcing a full re-scan
@@ -1376,7 +1384,15 @@ fn snapshot_index_path(
     // artifacts already uploaded persist on the backend until the file changes
     // — consistent with the titles/labels suffix behavior.)
     if upload_policy.session_artifacts_enabled {
-        suffixes.push("artifacts");
+        suffixes.push("artifacts".to_string());
+    }
+    // Attribution is opt-in. A separate index makes a later enablement revisit
+    // unchanged transcripts instead of waiting for their next filesystem edit.
+    if upload_policy.session_attribution_enabled {
+        let namespace = attribution_context
+            .map(SessionAttributionContext::cache_namespace)
+            .unwrap_or_else(|| "pending".to_string());
+        suffixes.push(format!("attribution-{namespace}"));
     }
     let policy_suffix = if suffixes.is_empty() {
         String::new()
@@ -1544,19 +1560,30 @@ mod tests {
         let root = Path::new("/support");
 
         assert_eq!(
-            snapshot_index_path(root, SnapshotSource::Codex, SnapshotUploadPolicy::default()),
+            snapshot_index_path(
+                root,
+                SnapshotSource::Codex,
+                SnapshotUploadPolicy::default(),
+                None,
+            ),
             PathBuf::from("/support/snapshots/codex-scan-index.json")
         );
         assert_eq!(
             snapshot_index_path(
                 root,
                 SnapshotSource::ClaudeCode,
-                SnapshotUploadPolicy::default()
+                SnapshotUploadPolicy::default(),
+                None,
             ),
             PathBuf::from("/support/snapshots/claude_code-scan-index.json")
         );
         assert_eq!(
-            snapshot_index_path(root, SnapshotSource::Pi, SnapshotUploadPolicy::default()),
+            snapshot_index_path(
+                root,
+                SnapshotSource::Pi,
+                SnapshotUploadPolicy::default(),
+                None,
+            ),
             PathBuf::from("/support/snapshots/pi-scan-index.json")
         );
         assert_eq!(
@@ -1567,7 +1594,9 @@ mod tests {
                     session_titles_enabled: false,
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: false,
+                    session_attribution_enabled: false,
                 },
+                None,
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles.json")
         );
@@ -1579,7 +1608,9 @@ mod tests {
                     session_titles_enabled: false,
                     workspace_labels_enabled: false,
                     session_artifacts_enabled: false,
+                    session_attribution_enabled: false,
                 },
+                None,
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles-no-labels.json")
         );
@@ -1593,7 +1624,9 @@ mod tests {
                     session_titles_enabled: true,
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: true,
+                    session_attribution_enabled: false,
                 },
+                None,
             ),
             PathBuf::from("/support/snapshots/claude_code-scan-index-artifacts.json")
         );
@@ -1605,9 +1638,25 @@ mod tests {
                     session_titles_enabled: false,
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: true,
+                    session_attribution_enabled: false,
                 },
+                None,
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-no-titles-artifacts.json")
+        );
+        assert_eq!(
+            snapshot_index_path(
+                root,
+                SnapshotSource::Codex,
+                SnapshotUploadPolicy {
+                    session_titles_enabled: true,
+                    workspace_labels_enabled: true,
+                    session_artifacts_enabled: false,
+                    session_attribution_enabled: true,
+                },
+                None,
+            ),
+            PathBuf::from("/support/snapshots/codex-scan-index-attribution-pending.json")
         );
     }
 

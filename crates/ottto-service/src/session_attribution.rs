@@ -103,6 +103,24 @@ pub struct SessionAttributionGroupingInput<'a> {
 }
 
 impl SessionAttributionContext {
+    /// Short local-only namespace for the incremental scan index. It changes
+    /// when the HMAC key or either scheduler inventory changes, without putting
+    /// raw key/configuration material into the index filename.
+    pub fn cache_namespace(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"session-attribution-context:v1");
+        hasher.update(self.key.as_slice());
+        for definition in &self.provider_schedules.definitions {
+            hasher.update([0]);
+            hasher.update(definition.opaque_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(definition.prompt_signature.as_bytes());
+        }
+        hasher.update([0]);
+        hasher.update(self.external_schedulers.cache_fingerprint().as_bytes());
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    }
+
     pub fn from_activity_hint(
         source: SnapshotSource,
         home: &Path,
@@ -896,6 +914,41 @@ mod tests {
             Some("hmac-sha256:v2"),
         )
         .is_none());
+    }
+
+    #[test]
+    fn cache_namespace_changes_with_key_and_inventory_without_exposing_material() {
+        let context = SessionAttributionContext {
+            key: Zeroizing::new(vec![1_u8; 32]),
+            provider_schedules: ProviderScheduleInventory::default(),
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+        };
+        let rotated = SessionAttributionContext {
+            key: Zeroizing::new(vec![2_u8; 32]),
+            provider_schedules: ProviderScheduleInventory::default(),
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+        };
+        let changed_inventory = SessionAttributionContext {
+            key: Zeroizing::new(vec![1_u8; 32]),
+            provider_schedules: ProviderScheduleInventory {
+                definitions: vec![ProviderScheduleDefinition {
+                    opaque_id: "hmac-sha256:v1:opaque".to_string(),
+                    prompt_signature: "private schedule prompt material".to_string(),
+                }],
+            },
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+        };
+
+        let namespace = context.cache_namespace();
+        assert_eq!(namespace.len(), 16);
+        assert_ne!(namespace, rotated.cache_namespace());
+        assert_ne!(namespace, changed_inventory.cache_namespace());
+        assert!(!changed_inventory
+            .cache_namespace()
+            .contains("private schedule prompt material"));
     }
 
     #[test]

@@ -122,6 +122,38 @@ pub(crate) struct ExternalSchedulerSession<'a> {
 }
 
 impl ExternalSchedulerInventory {
+    pub(crate) fn cache_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"external-scheduler-inventory:v1");
+        for definition in &self.definitions {
+            hasher.update([0]);
+            hasher.update(definition.scheduler_kind.as_str().as_bytes());
+            hasher.update([0]);
+            hasher.update(definition.opaque_id.as_bytes());
+            for value in [
+                definition.launchd_label.as_deref(),
+                definition.provider_source.map(|source| source.api_slug()),
+                definition.prompt_signature.as_deref(),
+                definition.repository_hash.as_deref(),
+            ] {
+                hasher.update([0]);
+                if let Some(value) = value {
+                    hasher.update(value.as_bytes());
+                }
+            }
+            for calendar in &definition.schedule.calendar {
+                hasher.update([
+                    calendar.minute.unwrap_or(u8::MAX),
+                    calendar.hour.unwrap_or(u8::MAX),
+                    calendar.weekday.unwrap_or(u8::MAX),
+                    calendar.day.unwrap_or(u8::MAX),
+                    calendar.month.unwrap_or(u8::MAX),
+                ]);
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     pub(crate) fn cached(home: &Path, key: &[u8]) -> Self {
         static CACHE: OnceLock<Mutex<Option<CachedInventory>>> = OnceLock::new();
         let cache = CACHE.get_or_init(|| Mutex::new(None));
