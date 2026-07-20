@@ -1438,6 +1438,19 @@ pub struct AgentCreditBalance {
     /// Whether the provider marks usage credits as enabled for the account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Whether the provider reports the account's spend control (spend cap) as
+    /// reached. When `true` the balance is effectively spend-capped even if a
+    /// nominal credit figure remains. Additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_control_reached: Option<bool>,
+    /// Provider-reported rate-limit-reached classifier (e.g. `primary`,
+    /// `secondary`), when the account has hit a limit. Free-form string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reached_type: Option<String>,
+    /// Provider-reported limit identifier the balance is scoped to (e.g.
+    /// `codex`). Free-form string; additive and drift-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2701,6 +2714,11 @@ fn redact_credit_balance_for_backend(mut credit: AgentCreditBalance) -> Option<A
         return None;
     }
     credit.account_label = None;
+    // `spend_control_reached` is a boolean flag and safe to forward as-is; the
+    // free-form provider strings pass the backend-text guard so a leaked path or
+    // secret never rides along.
+    credit.rate_limit_reached_type = safe_optional_text(credit.rate_limit_reached_type.take());
+    credit.limit_id = safe_optional_text(credit.limit_id.take());
     Some(credit)
 }
 
@@ -3211,6 +3229,9 @@ mod tests {
                 quota: None,
                 unlimited: Some(false),
                 updated_at: Some("2026-05-07T00:00:00Z".to_string()),
+                spend_control_reached: Some(true),
+                rate_limit_reached_type: Some("primary".to_string()),
+                limit_id: Some("codex".to_string()),
                 ..Default::default()
             }],
             context: None,
@@ -3305,6 +3326,21 @@ mod tests {
         );
         assert_eq!(snapshot.credit_balances[0].account_label, None);
         assert_eq!(snapshot.credit_balances[0].remaining, Some(0));
+        // Safe provider metadata survives redaction; the spend-cap flag forwards.
+        assert_eq!(
+            snapshot.credit_balances[0].spend_control_reached,
+            Some(true)
+        );
+        assert_eq!(
+            snapshot.credit_balances[0]
+                .rate_limit_reached_type
+                .as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            snapshot.credit_balances[0].limit_id.as_deref(),
+            Some("codex")
+        );
         assert_eq!(snapshot.diagnostics[0].message, "diagnostic redacted");
         let runtime_defaults = snapshot.runtime_defaults.expect("runtime_defaults");
         assert_eq!(runtime_defaults.service_tier.as_deref(), Some("default"));

@@ -3161,28 +3161,72 @@ fn codex_usage_probe_error(error: ureq::Error) -> String {
 }
 
 fn codex_usage_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
-    let Some(rate_limit) = value.get("rate_limit") else {
-        return Vec::new();
-    };
+    // The wham/usage payload historically nested the windows under `rate_limit`
+    // with `primary_window`/`secondary_window` keys. Since OpenAI's 2026-07-12
+    // change the fields can arrive top-level as `primary`/`secondary` (with the
+    // primary window now weekly and secondary null). Locate the container either
+    // way, then accept both the legacy and current key names.
+    let container = value
+        .get("rate_limit")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
     let mut windows = Vec::new();
-    if let Some(primary) = rate_limit.get("primary_window") {
-        if let Some(window) = codex_usage_quota_window("session", primary) {
+    if let Some(primary) = container
+        .get("primary_window")
+        .or_else(|| container.get("primary"))
+    {
+        if let Some(window) = codex_usage_quota_window(0, primary) {
             windows.push(window);
         }
     }
-    if let Some(secondary) = rate_limit.get("secondary_window") {
-        if let Some(window) = codex_usage_quota_window("weekly", secondary) {
+    if let Some(secondary) = container
+        .get("secondary_window")
+        .or_else(|| container.get("secondary"))
+    {
+        if let Some(window) = codex_usage_quota_window(1, secondary) {
             windows.push(window);
         }
     }
     windows
 }
 
-fn codex_usage_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindow> {
+/// Window duration in seconds, reading `*_seconds` first and falling back to the
+/// minutes-denominated fields (`limit_window_minutes`/`window_minutes`) that the
+/// current wham/usage payload reports.
+fn codex_usage_window_seconds(value: &Value) -> Option<u64> {
+    json_u64(value, &["limit_window_seconds", "window_seconds"]).or_else(|| {
+        json_u64(value, &["limit_window_minutes", "window_minutes"])
+            .and_then(|minutes| minutes.checked_mul(60))
+    })
+}
+
+/// Name a Codex usage window from its duration when known rather than purely by
+/// position: OpenAI's 2026-07 change made the primary window weekly, so the old
+/// "primary is the session window" assumption no longer holds. Windows lasting
+/// roughly five days or more are weekly; roughly four to six hours are session
+/// windows; anything else keeps the positional fallback (index 0 -> session,
+/// otherwise weekly).
+fn codex_usage_window_name(window_seconds: Option<u64>, position: usize) -> &'static str {
+    if let Some(seconds) = window_seconds {
+        if seconds >= 5 * 86_400 {
+            return "weekly";
+        }
+        if (4 * 3_600..=6 * 3_600).contains(&seconds) {
+            return "session";
+        }
+    }
+    if position == 0 {
+        "session"
+    } else {
+        "weekly"
+    }
+}
+
+fn codex_usage_quota_window(position: usize, value: &Value) -> Option<AgentQuotaWindow> {
     let used_percent = json_u8(value, &["used_percent", "usedPercent"]);
     let left_percent = used_percent.map(|used| 100_u8.saturating_sub(used));
     let resets_at = json_timestamp_rfc3339(value, &["reset_at", "resets_at", "resetAt"]);
-    let window_seconds = json_u64(value, &["limit_window_seconds", "window_seconds"]);
+    let window_seconds = codex_usage_window_seconds(value);
     let started_at = resets_at
         .as_deref()
         .zip(window_seconds)
@@ -3191,7 +3235,7 @@ fn codex_usage_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindo
         return None;
     }
     Some(AgentQuotaWindow {
-        name: name.to_string(),
+        name: codex_usage_window_name(window_seconds, position).to_string(),
         scope: AgentQuotaWindowScope::Account,
         status: match left_percent {
             Some(0) => AgentQuotaWindowStatus::Exhausted,
@@ -3214,19 +3258,39 @@ fn codex_usage_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindo
 }
 
 fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
-    let credits = value
-        .pointer("/rate_limit/credits")
-        .or_else(|| value.get("credits"));
-    let Some(credits) = credits else {
+    // `credits` sits beside `primary`/`secondary`; the sibling `spend_control_reached`,
+    // `rate_limit_reached_type`, and `limit_id` fields live on the same container.
+    let container = value
+        .get("rate_limit")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
+    let Some(credits) = container.get("credits") else {
         return Vec::new();
     };
     let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
     let has_credits = json_bool(credits, &["has_credits", "hasCredits"]).unwrap_or(false);
-    if remaining.is_none() && unlimited.is_none() && !has_credits {
+    let spend_control_reached =
+        json_bool(container, &["spend_control_reached", "spendControlReached"]);
+    let rate_limit_reached_type = first_json_string(
+        container,
+        &["rate_limit_reached_type", "rateLimitReachedType"],
+    );
+    let limit_id = first_json_string(container, &["limit_id", "limitId"]);
+    if remaining.is_none()
+        && unlimited.is_none()
+        && !has_credits
+        && spend_control_reached != Some(true)
+    {
         return Vec::new();
     }
-    let status = codex_credit_balance_status(remaining, unlimited, has_credits);
+    // A reached spend control means the account is spend-capped even if a nominal
+    // credit figure remains, so treat it as exhausted regardless of the balance.
+    let status = if spend_control_reached == Some(true) {
+        AgentCreditBalanceStatus::Exhausted
+    } else {
+        codex_credit_balance_status(remaining, unlimited, has_credits)
+    };
     vec![AgentCreditBalance {
         name: "credits".to_string(),
         status,
@@ -3238,6 +3302,9 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         quota: None,
         unlimited,
         updated_at: None,
+        spend_control_reached,
+        rate_limit_reached_type,
+        limit_id,
         ..Default::default()
     }]
 }
@@ -5712,6 +5779,8 @@ for line in sys.stdin:
         let credits = codex_usage_credit_balances(&json);
 
         assert_eq!(windows.len(), 2);
+        // Names are now derived from duration: 5h -> session, 7d -> weekly, which
+        // happens to match the legacy positional labels for this payload.
         assert_eq!(windows[0].name, "session");
         assert_eq!(windows[0].left_percent, Some(97));
         assert_eq!(
@@ -5723,6 +5792,87 @@ for line in sys.stdin:
         assert_eq!(credits.len(), 1);
         assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
         assert_eq!(credits[0].remaining, Some(0));
+        // The legacy payload carries none of the 2026-07 credit metadata.
+        assert_eq!(credits[0].spend_control_reached, None);
+        assert_eq!(credits[0].rate_limit_reached_type, None);
+        assert_eq!(credits[0].limit_id, None);
+    }
+
+    #[test]
+    fn codex_usage_parser_handles_weekly_primary_window() {
+        // OpenAI's 2026-07-12 change: the wham/usage fields arrive top-level with
+        // a weekly primary window (minutes-denominated), a null secondary, and
+        // sibling credit metadata (limit_id, spend_control_reached, ...).
+        let json = serde_json::json!({
+            "limit_id": "codex",
+            "limit_name": null,
+            "primary": {
+                "used_percent": 30.0,
+                "window_minutes": 10080,
+                "resets_at": 1784963503_u64
+            },
+            "secondary": null,
+            "credits": {
+                "has_credits": false,
+                "unlimited": false,
+                "balance": "0"
+            },
+            "individual_limit": null,
+            "spend_control_reached": null,
+            "plan_type": "pro",
+            "rate_limit_reached_type": null
+        });
+
+        let windows = codex_usage_quota_windows(&json);
+        let credits = codex_usage_credit_balances(&json);
+
+        // Single window: the null secondary is dropped; the primary is weekly by
+        // duration (10080 min == 7 days) despite arriving in the primary slot.
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].name, "weekly");
+        assert_eq!(windows[0].window_seconds, Some(604800));
+        assert_eq!(windows[0].used_percent, Some(30));
+        assert_eq!(windows[0].left_percent, Some(70));
+
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].remaining, Some(0));
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
+        // Explicit JSON nulls stay absent rather than becoming Some(false)/Some("").
+        assert_eq!(credits[0].spend_control_reached, None);
+        assert_eq!(credits[0].rate_limit_reached_type, None);
+    }
+
+    #[test]
+    fn codex_usage_parser_treats_spend_control_reached_as_exhausted() {
+        // A reached spend control caps the account even with a positive balance.
+        let json = serde_json::json!({
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": 12,
+                "window_minutes": 10080,
+                "resets_at": 1784963503_u64
+            },
+            "secondary": null,
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "42"
+            },
+            "spend_control_reached": true,
+            "rate_limit_reached_type": "primary"
+        });
+
+        let credits = codex_usage_credit_balances(&json);
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].remaining, Some(42));
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].spend_control_reached, Some(true));
+        assert_eq!(
+            credits[0].rate_limit_reached_type.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
     }
 
     #[test]

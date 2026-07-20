@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 241,
-  "content_sha256": "621d7e18c02713986283be74a76cfa9f5d681aa287e25c4cbd7413212ef7e180",
+  "content_sha256": "6e1c61b7982059f05b354f72b300804b1d890027bbd22bf6baa38291b20bfcb8",
   "files": [
     {
       "executable": false,
@@ -559,8 +559,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "5ee0cabf4b8e155b36be4deb51f00fa6c1f650fc8e35716e21b372f3afd43229",
-      "size_bytes": 155628
+      "sha256": "e8fdc26b04ca162d9fda80366dd7e52487f9fb22e19025848d404c30cbe16045",
+      "size_bytes": 157468
     },
     {
       "executable": false,
@@ -629,8 +629,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "ed95fe41e20a31c6334d12dec5a16b52be6545e1c5eb98d86aca67045aafc464",
-      "size_bytes": 269005
+      "sha256": "41168a9cfa9090eb04baab2f23fc693d98b19bff3c4a412185ba351fe87ca6f5",
+      "size_bytes": 275272
     },
     {
       "executable": false,
@@ -1726,5 +1726,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a7fc4f5747605e752a0182a076de0f4f4538c09d"
+  "source_commit": "0d2a997beb3d9f207adfe4d240d4127474f4b5ee"
 }
