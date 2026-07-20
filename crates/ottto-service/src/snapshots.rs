@@ -133,9 +133,21 @@ pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
+pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
+
+pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
+    timestamps.sort();
+    timestamps.dedup();
+    if timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
+        timestamps.split_off(timestamps.len() - MAX_COMPACTION_TIMESTAMPS)
+    } else {
+        timestamps
+    }
+}
+
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
 // file COUNT and an mtime window, but the per-file/-line byte lengths were
 // previously unbounded: a transcript whose monitored tool output embeds a huge
@@ -1013,6 +1025,11 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
 }
 
 fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), String> {
+    if item.compaction_timestamps.len() > MAX_COMPACTION_TIMESTAMPS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
+        ));
+    }
     let expected = usage_totals_from_item(item);
     let expected_has_usage = usage_totals_has_usage(&expected);
     if expected_has_usage && item.usage_buckets.is_empty() {
@@ -2109,7 +2126,7 @@ impl SnapshotAccumulator {
                 .derives_context_posture()
                 .then_some(self.compaction_count),
             compaction_timestamps: if self.source.derives_context_posture() {
-                self.compaction_timestamps
+                bounded_compaction_timestamps(self.compaction_timestamps)
             } else {
                 Vec::new()
             },
@@ -8916,6 +8933,31 @@ mod tests {
     }
 
     #[test]
+    fn compaction_timeline_keeps_newest_64_for_snapshot_upload() {
+        let mut timestamps = (0..72)
+            .map(|index| {
+                let day = index / 24 + 1;
+                let hour = index % 24;
+                format!("2026-07-{day:02}T{hour:02}:00:00Z")
+            })
+            .collect::<Vec<_>>();
+        timestamps.reverse();
+        timestamps.push("2026-07-03T23:00:00Z".to_string());
+
+        let bounded = bounded_compaction_timestamps(timestamps);
+
+        assert_eq!(bounded.len(), MAX_COMPACTION_TIMESTAMPS);
+        assert_eq!(
+            bounded.first().map(String::as_str),
+            Some("2026-07-01T08:00:00Z")
+        );
+        assert_eq!(
+            bounded.last().map(String::as_str),
+            Some("2026-07-03T23:00:00Z")
+        );
+    }
+
+    #[test]
     fn codex_parser_derives_context_posture_watermarks() {
         // Codex reports each response's own usage in `last_token_usage`, so the
         // watermarks come from there. Shapes asserted, in file order:
@@ -10833,6 +10875,20 @@ mod tests {
         let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
 
         assert!(error.contains("no usage_buckets"), "{error}");
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_oversized_compaction_timeline() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].compaction_timestamps =
+            vec!["2026-07-20T12:00:00Z".to_string(); MAX_COMPACTION_TIMESTAMPS + 1];
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(
+            error.contains("more than 64 compaction_timestamps"),
+            "{error}"
+        );
     }
 
     #[test]

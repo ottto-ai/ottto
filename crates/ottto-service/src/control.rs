@@ -2818,13 +2818,13 @@ fn client_owner_conflict(client_owner: InstallOwner, service_owner: InstallOwner
     if client_owner == service_owner {
         return false;
     }
-    // The signed app bundle and legacy hosted-installer CLI are compatible
-    // local control surfaces during migration. The launchd/plist owners still
-    // decide real service drift; merely asking from the other compatible client
-    // must not poison canonical health.
+    // The signed app bundle is also the supported UI for a Homebrew-owned
+    // daemon. Client/service packaging can differ without service drift; the
+    // launchd/plist/loaded owners still decide whether mutation is safe.
     if matches!(
         (client_owner, service_owner),
         (InstallOwner::AppBundle, InstallOwner::HostedInstaller)
+            | (InstallOwner::AppBundle, InstallOwner::Homebrew)
             | (InstallOwner::HostedInstaller, InstallOwner::AppBundle)
     ) {
         return false;
@@ -10808,7 +10808,7 @@ mod tests {
     }
 
     #[test]
-    fn app_bundle_client_can_control_hosted_installer_service() {
+    fn app_bundle_client_can_report_supported_service_owner_health() {
         assert!(!client_owner_conflict(
             InstallOwner::AppBundle,
             InstallOwner::HostedInstaller
@@ -10821,7 +10821,7 @@ mod tests {
             InstallOwner::AppBundle,
             InstallOwner::Unknown
         ));
-        assert!(client_owner_conflict(
+        assert!(!client_owner_conflict(
             InstallOwner::AppBundle,
             InstallOwner::Homebrew
         ));
