@@ -105,15 +105,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // and remotes never enter the snapshot payload.
 // v21/v18: retain timestamped compaction events for the machine-local active
 // session status and the additive backend snapshot contract.
-// Direct attribution derivation is currently dark and non-persistent: facts
-// are computed for changed sessions but skipped by serde and the snapshot
-// fingerprint. Deliberately do NOT bump these versions yet, because reparsing
-// all history would compute and immediately discard the same dark facts. The
-// backend activation change must enable serialization/fingerprinting and bump
-// all three versions atomically to perform the one-time historical backfill.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v21";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v18";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v9";
+// v22/v19/v10: activate the backend-gated session-attribution wire contract.
+// Facts join the fingerprint only when present, and all three versions advance
+// atomically so already-indexed history is revisited once.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v22";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v19";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -374,9 +371,10 @@ pub struct SnapshotItem {
     /// Raw session-origin signals; the backend re-derives the initiator from these.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<SnapshotOrigin>,
-    /// Compact evidence-first facts. Phase 2 computes these locally; Phase 4
-    /// enables wire serialization only after the backend fact contract exists.
-    #[serde(skip)]
+    /// Compact evidence-first facts derived locally without transcript content.
+    /// Empty fact sets stay off the wire; populated sets use the backend's v1
+    /// field-evidence contract.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attribution_facts: Vec<crate::session_attribution::SessionAttributionFact>,
 }
 
@@ -506,6 +504,7 @@ pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
     pub session_artifacts_enabled: bool,
+    pub session_attribution_enabled: bool,
 }
 
 impl Default for SnapshotUploadPolicy {
@@ -516,6 +515,9 @@ impl Default for SnapshotUploadPolicy {
             // Opt-in: artifacts are stripped before upload unless the backend
             // activity hint explicitly enables them for the org.
             session_artifacts_enabled: false,
+            // Opt-in: compact facts stay local unless the backend explicitly
+            // enables the additive attribution contract.
+            session_attribution_enabled: false,
         }
     }
 }
@@ -548,6 +550,10 @@ pub fn apply_upload_policy(
         }
         if !policy.session_artifacts_enabled && !item.session_artifacts.is_empty() {
             item.session_artifacts.clear();
+            fingerprint_needs_refresh = true;
+        }
+        if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
+            item.attribution_facts.clear();
             fingerprint_needs_refresh = true;
         }
         if fingerprint_needs_refresh {
@@ -830,6 +836,15 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
             "compaction_timestamps".to_string(),
             json!(item.compaction_timestamps),
         );
+    }
+    if !item.attribution_facts.is_empty() {
+        fingerprint_payload
+            .as_object_mut()
+            .expect("snapshot fingerprint payload is an object")
+            .insert(
+                "attribution_facts".to_string(),
+                json!(item.attribution_facts),
+            );
     }
     sha256_hex(&[&fingerprint_payload.to_string()])
 }
@@ -5969,7 +5984,7 @@ mod tests {
             ),
         )
         .expect("write automation fixture");
-        let automation = parse_codex_jsonl_file(
+        let mut automation = parse_codex_jsonl_file(
             &automation_path,
             "2026-07-19T10:04:00Z",
             "fp-automation".to_string(),
@@ -5985,11 +6000,30 @@ mod tests {
             .attribution_facts
             .iter()
             .any(|fact| { fact.field == "scheduler_kind" && fact.value == "codex_scheduled" }));
-        let automation_wire = serde_json::to_value(&automation).expect("serialize automation");
-        assert!(
-            automation_wire.get("attribution_facts").is_none(),
-            "dark facts must not cross the v6 wire contract"
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut automation),
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
         );
+        let automation_wire = serde_json::to_value(&automation).expect("serialize automation");
+        assert!(automation_wire["attribution_facts"]
+            .as_array()
+            .is_some_and(|facts| facts.iter().any(|fact| {
+                fact["field"] == "origin_kind" && fact["value"] == "provider_scheduled_task"
+            })));
+        let mut unattributed = automation.clone();
+        let attributed_fingerprint = unattributed.snapshot_fingerprint.clone();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut unattributed),
+            SnapshotUploadPolicy::default(),
+        );
+        let unattributed_wire = serde_json::to_value(&unattributed).expect("serialize empty facts");
+        assert!(unattributed_wire.get("attribution_facts").is_none());
+        assert_ne!(unattributed.snapshot_fingerprint, attributed_fingerprint);
 
         let subagent_path = temp_file("codex-subagent-attribution");
         fs::write(
@@ -6000,7 +6034,7 @@ mod tests {
             ),
         )
         .expect("write subagent fixture");
-        let subagent = parse_codex_jsonl_file(
+        let mut subagent = parse_codex_jsonl_file(
             &subagent_path,
             "2026-07-19T11:04:00Z",
             "fp-subagent".to_string(),
@@ -6017,8 +6051,20 @@ mod tests {
             .attribution_facts
             .iter()
             .any(|fact| { fact.field == "parent_session_ref" && fact.value == "parent-session" }));
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut subagent),
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
         let subagent_wire = serde_json::to_value(&subagent).expect("serialize subagent");
-        assert!(subagent_wire.get("attribution_facts").is_none());
+        assert!(subagent_wire["attribution_facts"]
+            .as_array()
+            .is_some_and(|facts| facts
+                .iter()
+                .any(|fact| { fact["field"] == "origin_kind" && fact["value"] == "subagent" })));
         assert!(
             subagent_wire
                 .get("origin")
@@ -6065,7 +6111,7 @@ mod tests {
         )
         .expect("session");
 
-        let item = parse_codex_jsonl_file_with_title_metadata_and_attribution(
+        let mut item = parse_codex_jsonl_file_with_title_metadata_and_attribution(
             &path,
             "2026-07-19T10:04:00Z",
             "fp-attribution-groups".to_string(),
@@ -6088,8 +6134,19 @@ mod tests {
             .any(|fact| fact.field == "schedule_definition_id"));
         let local_facts = serde_json::to_string(&item.attribution_facts).expect("local facts");
         assert!(!local_facts.contains(scheduled_prompt));
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut item),
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
         let wire = serde_json::to_value(&item).expect("snapshot wire");
-        assert!(wire.get("attribution_facts").is_none());
+        let wire_facts =
+            serde_json::to_string(&wire["attribution_facts"]).expect("wire attribution facts");
+        assert!(wire["attribution_facts"].is_array());
+        assert!(!wire_facts.contains(scheduled_prompt));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -6935,6 +6992,7 @@ mod tests {
                 session_titles_enabled: false,
                 workspace_labels_enabled: false,
                 session_artifacts_enabled: false,
+                session_attribution_enabled: false,
             },
         );
 
@@ -7139,6 +7197,7 @@ mod tests {
                 session_titles_enabled: true,
                 workspace_labels_enabled: true,
                 session_artifacts_enabled: false,
+                session_attribution_enabled: false,
             },
         );
         assert!(disabled[0].session_artifacts.is_empty());
@@ -7152,6 +7211,7 @@ mod tests {
                 session_titles_enabled: true,
                 workspace_labels_enabled: true,
                 session_artifacts_enabled: true,
+                session_attribution_enabled: false,
             },
         );
         assert_eq!(enabled[0].session_artifacts.len(), 1);

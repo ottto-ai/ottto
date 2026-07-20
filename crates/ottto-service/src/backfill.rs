@@ -17,8 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::session_attribution::SessionAttributionContext;
 use crate::snapshots::{
-    scan_source_roots_with_artifacts, ScanIndex, SnapshotItem, SnapshotSource,
+    scan_source_roots_with_attribution, ScanIndex, SnapshotItem, SnapshotSource,
     CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SNAPSHOT_PARSER_VERSION,
 };
 
@@ -226,6 +227,7 @@ pub fn run_backfill(
     pending: &[SnapshotSource],
     collected_at: &str,
     artifacts_enabled: bool,
+    attribution_context: Option<&SessionAttributionContext>,
 ) -> Result<(Vec<SnapshotItem>, BackfillReport)> {
     let mut snapshots = Vec::new();
     let mut report = BackfillReport {
@@ -235,13 +237,14 @@ pub fn run_backfill(
     for source in pending {
         let roots = source.default_roots(home_dir);
         let mut index = ScanIndex::default();
-        let result = scan_source_roots_with_artifacts(
+        let result = scan_source_roots_with_attribution(
             *source,
             &roots,
             &mut index,
             collected_at,
             u64::MAX,
             artifacts_enabled,
+            attribution_context,
         )?;
         match source {
             SnapshotSource::ClaudeCode => {
@@ -310,7 +313,7 @@ pub fn spawn_backfill_thread(
             return Ok(state.last_report.clone().unwrap_or_default());
         }
         let (mut snapshots, report) =
-            run_backfill(&home_dir, &pending, &collected_at, artifacts_enabled)?;
+            run_backfill(&home_dir, &pending, &collected_at, artifacts_enabled, None)?;
         apply_backfill_cutoff(&mut snapshots, &state);
         deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
         for source in &pending {
@@ -635,7 +638,7 @@ mod tests {
             SnapshotSource::Pi,
         ];
         let (snapshots, report) =
-            run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true).expect("backfill ok");
+            run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true, None).expect("backfill ok");
         assert_eq!(snapshots.len(), 0);
         assert_eq!(report.total_snapshots(), 0);
         fs::remove_dir_all(&home).ok();
