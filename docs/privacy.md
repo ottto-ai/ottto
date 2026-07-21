@@ -40,12 +40,43 @@ raw provider ids, or cursors. Its local grant is versioned and can be paused or
 revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
 collection. The collector is isolated from snapshot sync, bounded by page/item/
 wall-time limits, and uses semantic no-ops plus circuit-breaking backoff.
+Identical entity polls produce no observation upload; a content-free,
+health-only heartbeat is eligible hourly to keep backend freshness below its
+two-hour stale boundary without rewriting entity or Sessions GOLD rows.
+Every provider cycle first consumes one bounded authenticated backend grant-list
+result for the exact stored grant. Only a strictly decoded
+`server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or
+unknown policy, disabled/revoked state, backend absence, authentication failure,
+and network or parse errors stop before provider access. A nonempty CLI page
+with any missing/invalid task identity or status string is classified locally
+as `provider_payload_invalid`; it neither fabricates mandatory status coverage
+nor becomes an empty healthy observation. The wire emits only the backend's
+allowed coarse `provider_error` category, never detailed local diagnostics.
 The raw installation id is discarded after deriving grant-local HMAC
 fingerprints. Grant state is stored with private-directory and exclusive 0600
 atomic-write semantics. Earlier v1 grants migrate on first read, removing their
 raw installation id while preserving pause and revoke controls. The Codex
 subprocess receives no provider API keys and does not start an interactive
 shell.
+
+The uploaded `account_fingerprint` is an opaque local Ottto organization/user
+collector scope, not an OpenAI or Codex provider-account identity. The official
+CLI path currently exposes no sanctioned safe account discriminator; Ottto does
+not infer one or merge histories across a user-known provider-account switch.
+Such a switch requires explicit local stop, exact backend deletion, and setup
+again.
+
+The strict relay adapter and backend DTO are present for contract testing, but
+public service startup remains hard-wired to deferred transport. It cannot
+invoke Codex or upload until the private backend is deployed and the retention,
+cardinality, prune, and exact-delete-cost gate is approved. Authenticated
+companion/UI code owns backend grant create/delete. Before a create handoff the
+daemon persists only a content-free exact-scope descriptor, never the raw
+installation id. A timeout or restart retries that same idempotent create until
+the backend grant UUID is bound; one intervening list absence cannot clear the
+tombstone or permit replacement while the original POST may still commit. The
+daemon stores only the opaque grant UUID/version/server-policy response and
+rejects stale pre-revoke epochs.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
