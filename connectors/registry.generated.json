@@ -152,6 +152,27 @@
       "manifest_path": "connectors/sources/codex/source.toml",
       "collectors": [
         {
+          "collector_id": "cloud_sessions",
+          "display_name": "Cloud sessions",
+          "operations": [
+            "collect_usage",
+            "diagnostics"
+          ],
+          "data_source_kind": "integration_connector",
+          "default_state": "requires_setup",
+          "review_tier": "official",
+          "maturity": "beta",
+          "risk_classes": [
+            "auth_adjacent",
+            "network_calls"
+          ],
+          "uploads_raw_content": false,
+          "emits": [
+            "cloud_session_observations"
+          ],
+          "manifest_path": "connectors/sources/codex/collectors/cloud_sessions/collector.toml"
+        },
+        {
           "collector_id": "identity_probe",
           "display_name": "Identity probe",
           "operations": [

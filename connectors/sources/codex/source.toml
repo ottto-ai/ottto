@@ -21,5 +21,6 @@ collectors = [
   "logs2_trace",
   "otel_config",
   "quota_status",
-  "identity_probe"
+  "identity_probe",
+  "cloud_sessions"
 ]

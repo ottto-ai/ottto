@@ -52,6 +52,11 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Print the Codex cloud-session collector state without invoking Codex.
+    CloudSessionsStatus {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +107,20 @@ fn main() -> Result<()> {
                 None => ottto_service::mcp_inventory::dump_all_inventories()?,
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Command::CloudSessionsStatus { json } => {
+            let status = ottto_service::cloud_sessions::default_cloud_session_collector_status();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "cloud_sessions {} ({})",
+                    serde_json::to_value(&status.runtime_state)?
+                        .as_str()
+                        .unwrap_or("unknown"),
+                    status.reason_code
+                );
+            }
         }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
@@ -336,6 +355,15 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
     match ottto_service::context_composition::spawn_context_composition_sync() {
         Ok(()) => eprintln!("serving context composition harvest"),
         Err(error) => eprintln!("context composition harvest unavailable: {error}"),
+    }
+    match ottto_service::cloud_sessions::spawn_cloud_session_collector() {
+        Ok(ottto_service::cloud_sessions::CloudSessionCollectorStartup::Started) => {
+            eprintln!("serving Codex cloud-session collector")
+        }
+        Ok(ottto_service::cloud_sessions::CloudSessionCollectorStartup::DeferredTransport) => {
+            eprintln!("Codex cloud-session collector deferred: typed ingest transport is not wired")
+        }
+        Err(error) => eprintln!("Codex cloud-session collector unavailable: {error}"),
     }
     match ottto_service::snapshot_sync::spawn_local_health_projection_sync(daemon.clone()) {
         Ok(()) => eprintln!("serving local health projection sync"),

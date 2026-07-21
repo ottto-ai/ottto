@@ -1,0 +1,17 @@
+schema_version = "collector_manifest.v1"
+source_id = "codex"
+collector_id = "cloud_sessions"
+display_name = "Cloud sessions"
+
+operations = ["collect_usage", "diagnostics"]
+data_source_kind = "integration_connector"
+default_state = "requires_setup"
+
+review_tier = "official"
+maturity = "beta"
+# The installed Codex CLI authenticates as the effective user and the resulting
+# content-free facts cross the Ottto network boundary. No credentials are read.
+risk_classes = ["auth_adjacent", "network_calls"]
+
+uploads_raw_content = false
+emits = ["cloud_session_observations"]

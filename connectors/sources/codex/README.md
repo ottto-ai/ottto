@@ -16,6 +16,7 @@ Collectors:
   that read local OAuth material or call undocumented ChatGPT endpoints remain
   setup-gated and must not upload raw provider responses or token material.
 - `identity_probe`: subprocesses `codex doctor --json` and reads the plain `~/.codex/auth.json` only to derive a hashed `tokens.account_id`. Never reads token bytes (access/refresh/id tokens) and never touches Keychain. Personal-vs-Team disambiguation is handled by the JSONL `rate_limits.plan_type` signal, not this probe.
+- `cloud_sessions`: an explicit-setup supported collector for the official `codex cloud list --json` metadata surface. It runs separately from snapshot sync, bounds pages/items/wall time, uses local HMAC entity keys and semantic no-ops, and supports immediate local pause/revoke plus the `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED` kill switch. Backend transport stays deferred until the typed ingest route exists. `ottto-service cloud-sessions-status --json` reports `transport_deferred` and `provider_cli_invocation_permitted: false` in that state; enabling the grant cannot invoke Codex until a private transport is wired.
 - `logs2_trace`: reads the requested per-turn `service_tier` from the undocumented
   Codex `logs_2.sqlite` debug database (read-only, time-bounded, row-capped,
   best-effort) to mark fast-mode turns — a turn whose `response.create` request

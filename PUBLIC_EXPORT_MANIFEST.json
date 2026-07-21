@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 241,
-  "content_sha256": "6db45ecab0730d667e3ca850d072d72c750e304c64a9c703d920131931e338cb",
+  "candidate_file_count": 245,
+  "content_sha256": "0a087eca80fe3643c3ca2f2ceaf2781b230a01b9500cdbc769a76c26134ba86d",
   "files": [
     {
       "executable": false,
@@ -48,8 +48,8 @@
       "executable": false,
       "mode": "0644",
       "path": "Cargo.lock",
-      "sha256": "35ec44c791e5171fa6bc3027c7f12d561b3134a6ab6feef43557d9b2e89c60ec",
-      "size_bytes": 43157
+      "sha256": "de607f8d7114f9d2e0794168c5f7e4631bf433c8fb07927577cf900f50f736ef",
+      "size_bytes": 43177
     },
     {
       "executable": false,
@@ -132,8 +132,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/registry.generated.json",
-      "sha256": "56d4c0d06e3c6c66ee36ffeef9ce7b4c0cb379a1fe1c36dcad1061138a4a70c1",
-      "size_bytes": 11375
+      "sha256": "51fdf8bbdac17dc2ae2bce24e8a2dfdfc636de03b62bb5860ebb407f0ce29bc4",
+      "size_bytes": 12053
     },
     {
       "executable": false,
@@ -237,15 +237,29 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/POLICY.md",
-      "sha256": "98f9061d55a96203ab6e5a04a76f372051f8fde39a07b402dfd51b58308d3073",
-      "size_bytes": 4326
+      "sha256": "2c44be80db1d5c3c7bde5ecfb8d9ca61c7731e88c9aa4084acc75e0c30480dd1",
+      "size_bytes": 5782
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/README.md",
-      "sha256": "32ca77269fee09df20c057509fa8aa76bcd79c0929583217d6c0d50a3af14037",
-      "size_bytes": 2193
+      "sha256": "c6d765862fd2986e954c600e3dd153e33e0cdf32e4d6578afef2152271b7ba38",
+      "size_bytes": 2813
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/cloud_sessions/collector.toml",
+      "sha256": "acdc7569980bdc5435578b38a5166296f2bfb86b1c1131ff22d585b413a21814",
+      "size_bytes": 570
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "connectors/sources/codex/collectors/cloud_sessions/fixtures/minimal-evidence.json",
+      "sha256": "841f2a2f12a1fec34191665226b9a939baf8bf2df1ea62596417bc9b189b25ab",
+      "size_bytes": 1844
     },
     {
       "executable": false,
@@ -328,8 +342,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/source.toml",
-      "sha256": "b9ddb67dfcdfd4f414c0e3fcbba304c3ee89841d22147d98ad572b05391af600",
-      "size_bytes": 403
+      "sha256": "bbf0e9892892e56e0763755cad50c224ff465dae972f4fb1ad0ced95cd4975b4",
+      "size_bytes": 423
     },
     {
       "executable": false,
@@ -566,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/Cargo.toml",
-      "sha256": "6c3ac36dd03116b709d2fabea50475c36b7c146bc7d600cbde07a2feba695888",
-      "size_bytes": 1009
+      "sha256": "f7b99b54d450fd81179ef6ced4977200b72ee92cc0f13ef9363700a52f93e0c4",
+      "size_bytes": 1036
     },
     {
       "executable": false,
@@ -649,6 +663,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/cloud_sessions.rs",
+      "sha256": "067e149cebd70e08ca03a84b06ccf0be88f44e7be5c138dbd378c7e1cca06c9d",
+      "size_bytes": 45387
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/command_env.rs",
       "sha256": "96fb55c9c35243ed446022aebd666c33b859b2d513c4e14e95c22bc7cebdf983",
       "size_bytes": 22258
@@ -713,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "5447c1317e5360a1cc14c160737825d43dab30bd43150953a0f2cbfa3dcf804e",
-      "size_bytes": 304012
+      "sha256": "07bcf129b8f97e9f13a387da3a0b60be0c3bf2584d674b3fa9d9a912c43520df",
+      "size_bytes": 304036
     },
     {
       "executable": false,
@@ -727,8 +748,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "e4f86a0f2aec33cd5dbc93a830031862036a87d9c50b0fd01f79c1d23129cc55",
-      "size_bytes": 22930
+      "sha256": "1dad812defc6af75bd5ae7c16ed4ff8c9a004ba6145bd7440b6246fa1c146b65",
+      "size_bytes": 24180
     },
     {
       "executable": false,
@@ -860,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "e5a8116897e12202d2514d1379abc7540a5338cd5fae18a4a1996eb3471d6fac",
-      "size_bytes": 4204
+      "sha256": "01e47058863dcc11a9b4de2a102a2eb0ceecab5e2f7cdc4f696145a5d5d44994",
+      "size_bytes": 4974
     },
     {
       "executable": false,
@@ -897,6 +918,13 @@
       "path": "docs/session-2026-07-11-gpt56-cache-write-evidence.md",
       "sha256": "c32e8bbbe927635275d72be11dbd38ebcc8caa2018745dd2c9e3cecb6af8b55e",
       "size_bytes": 1698
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-21-codex-cloud-sessions-collector.md",
+      "sha256": "867afc2820ed903961df86275e48cd15522b9849f7317f9320b68d2525454f1f",
+      "size_bytes": 2004
     },
     {
       "executable": false,
@@ -1690,9 +1718,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-21T10:43:53+00:00",
+  "generated_at": "2026-07-21T16:37:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 242,
+  "output_file_count": 246,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1726,5 +1754,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f315b6a8e5b094c828ea44ae64cfb74e4964050c"
+  "source_commit": "20eea4583f05e2a5f861ceb1ff3e3024946416bf"
 }

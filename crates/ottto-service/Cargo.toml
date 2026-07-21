@@ -18,6 +18,7 @@ base64.workspace = true
 cbc.workspace = true
 clap.workspace = true
 hmac.workspace = true
+getrandom.workspace = true
 libc.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true

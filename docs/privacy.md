@@ -30,6 +30,17 @@ Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
 
+The optional Codex Cloud Sessions collector is disabled until explicit local
+setup. It invokes only `codex cloud list --json` as the effective user and
+derives opaque HMAC entity/account keys plus lifecycle, timestamps, attempt
+count, safe environment kind, coverage, and freshness. It never reads
+`~/.codex/auth.json`, calls private provider endpoints, or uploads raw CLI JSON,
+titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths,
+raw provider ids, or cursors. Its local grant is versioned and can be paused or
+revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
+collection. The collector is isolated from snapshot sync, bounded by page/item/
+wall-time limits, and uses semantic no-ops plus circuit-breaking backoff.
+
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
 definitions in memory to derive tenant-scoped HMAC identifiers. It does not
