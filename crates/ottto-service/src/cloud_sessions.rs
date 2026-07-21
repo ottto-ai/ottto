@@ -48,17 +48,12 @@ pub enum CloudSessionGrantStatus {
     PolicyDisabled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CloudSessionServerPolicyState {
     Approved,
+    #[default]
     Disabled,
-}
-
-impl Default for CloudSessionServerPolicyState {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// Operator/UI status for this collector. The service exposes this without
