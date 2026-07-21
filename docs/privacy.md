@@ -40,6 +40,12 @@ raw provider ids, or cursors. Its local grant is versioned and can be paused or
 revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
 collection. The collector is isolated from snapshot sync, bounded by page/item/
 wall-time limits, and uses semantic no-ops plus circuit-breaking backoff.
+The raw installation id is discarded after deriving grant-local HMAC
+fingerprints. Grant state is stored with private-directory and exclusive 0600
+atomic-write semantics. Earlier v1 grants migrate on first read, removing their
+raw installation id while preserving pause and revoke controls. The Codex
+subprocess receives no provider API keys and does not start an interactive
+shell.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task

@@ -9,6 +9,7 @@
       "sample": {
         "schema_version": "cloud_session_observations.v1",
         "collector_id": "cloud_sessions",
+        "grant_scope_id": "hmac-sha256:grant-fixture",
         "account_fingerprint": "hmac-sha256:fixture",
         "semantic_digest": "sha256:fixture",
         "entity_count": 1,

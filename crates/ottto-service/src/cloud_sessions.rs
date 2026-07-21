@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -82,8 +82,10 @@ pub struct CloudSessionGrant {
     pub release_lane: String,
     pub disclosure_version: String,
     pub status: CloudSessionGrantStatus,
-    /// Ottto installation id; never a provider identifier.
-    pub installation_id: String,
+    /// Opaque grant-local fingerprint; the raw installation id is never persisted.
+    pub installation_fingerprint: String,
+    /// Immutable identity for this exact installation/user/collector grant.
+    pub grant_scope_id: String,
     pub organization_fingerprint: String,
     pub effective_user_fingerprint: String,
     pub account_fingerprint: String,
@@ -107,6 +109,35 @@ struct PersistedGrant {
     schema_version: String,
     hmac_key_hex: String,
     grant: CloudSessionGrant,
+}
+
+/// Upgrade-only representation written before installation scope became
+/// content-free. It is never serialized again after a successful read.
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyPersistedGrantV1 {
+    schema_version: String,
+    hmac_key_hex: String,
+    grant: LegacyCloudSessionGrantV1,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyCloudSessionGrantV1 {
+    schema_version: String,
+    collector_id: String,
+    collector_version: String,
+    release_lane: String,
+    disclosure_version: String,
+    status: CloudSessionGrantStatus,
+    installation_id: String,
+    organization_fingerprint: String,
+    effective_user_fingerprint: String,
+    account_fingerprint: String,
+    granted_at: Option<String>,
+    paused_at: Option<String>,
+    revoked_at: Option<String>,
+    last_collector_health: Option<String>,
+    last_freshness: Option<String>,
+    last_error_category: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +173,17 @@ impl CloudSessionGrantStore {
         }
         let _lock = self.lock()?;
         let key = random_key()?;
+        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
+        let grant_scope_id = opaque_key(
+            &key,
+            &format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                setup.installation_id,
+                setup.organization_scope,
+                setup.effective_user_scope,
+                COLLECTOR_ID
+            ),
+        );
         let grant = CloudSessionGrant {
             schema_version: GRANT_SCHEMA_VERSION.to_string(),
             collector_id: COLLECTOR_ID.to_string(),
@@ -149,7 +191,8 @@ impl CloudSessionGrantStore {
             release_lane: "supported".to_string(),
             disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
             status: CloudSessionGrantStatus::Enabled,
-            installation_id: setup.installation_id.clone(),
+            installation_fingerprint,
+            grant_scope_id,
             organization_fingerprint: opaque_key(&key, &setup.organization_scope),
             effective_user_fingerprint: opaque_key(&key, &setup.effective_user_scope),
             account_fingerprint: opaque_key(
@@ -185,7 +228,7 @@ impl CloudSessionGrantStore {
     fn change_status(&self, status: CloudSessionGrantStatus, now: OffsetDateTime) -> Result<()> {
         let _lock = self.lock()?;
         let mut state = self
-            .read()?
+            .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
         state.grant.status = status.clone();
         state.grant.last_collector_health = Some(
@@ -210,15 +253,77 @@ impl CloudSessionGrantStore {
         if !self.path.exists() {
             return Ok(None);
         }
+        let _lock = self.lock()?;
+        self.read_locked()
+    }
+
+    fn read_locked(&self) -> Result<Option<PersistedGrant>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
         let bytes = fs::read(&self.path).context("read cloud-session grant")?;
-        let state: PersistedGrant =
-            serde_json::from_slice(&bytes).context("decode cloud-session grant")?;
+        let state = match serde_json::from_slice::<PersistedGrant>(&bytes) {
+            Ok(state) => state,
+            Err(current_error) => {
+                let legacy: LegacyPersistedGrantV1 = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("decode cloud-session grant: {current_error}"))?;
+                self.migrate_legacy_v1(legacy)?
+            }
+        };
         if state.schema_version != GRANT_SCHEMA_VERSION
             || state.grant.schema_version != GRANT_SCHEMA_VERSION
         {
             return Err(anyhow!("unsupported cloud-session grant version"));
         }
         Ok(Some(state))
+    }
+
+    fn migrate_legacy_v1(&self, legacy: LegacyPersistedGrantV1) -> Result<PersistedGrant> {
+        if legacy.schema_version != GRANT_SCHEMA_VERSION
+            || legacy.grant.schema_version != GRANT_SCHEMA_VERSION
+            || legacy.grant.installation_id.trim().is_empty()
+        {
+            return Err(anyhow!("unsupported cloud-session grant version"));
+        }
+        let key = decode_hex(&legacy.hmac_key_hex)
+            .filter(|key| key.len() == 32)
+            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+        let installation_fingerprint = opaque_key(&key, &legacy.grant.installation_id);
+        let grant_scope_id = opaque_key(
+            &key,
+            &format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                legacy.grant.installation_id,
+                legacy.grant.organization_fingerprint,
+                legacy.grant.effective_user_fingerprint,
+                legacy.grant.collector_id
+            ),
+        );
+        let state = PersistedGrant {
+            schema_version: legacy.schema_version,
+            hmac_key_hex: legacy.hmac_key_hex,
+            grant: CloudSessionGrant {
+                schema_version: legacy.grant.schema_version,
+                collector_id: legacy.grant.collector_id,
+                collector_version: legacy.grant.collector_version,
+                release_lane: legacy.grant.release_lane,
+                disclosure_version: legacy.grant.disclosure_version,
+                status: legacy.grant.status,
+                installation_fingerprint,
+                grant_scope_id,
+                organization_fingerprint: legacy.grant.organization_fingerprint,
+                effective_user_fingerprint: legacy.grant.effective_user_fingerprint,
+                account_fingerprint: legacy.grant.account_fingerprint,
+                granted_at: legacy.grant.granted_at,
+                paused_at: legacy.grant.paused_at,
+                revoked_at: legacy.grant.revoked_at,
+                last_collector_health: legacy.grant.last_collector_health,
+                last_freshness: legacy.grant.last_freshness,
+                last_error_category: legacy.grant.last_error_category,
+            },
+        };
+        self.write(&state)?;
+        Ok(state)
     }
 
     fn write(&self, state: &PersistedGrant) -> Result<()> {
@@ -232,7 +337,7 @@ impl CloudSessionGrantStore {
         error_category: Option<&str>,
     ) -> Result<()> {
         let _lock = self.lock()?;
-        let Some(mut state) = self.read()? else {
+        let Some(mut state) = self.read_locked()? else {
             return Ok(());
         };
         if state.grant.status != CloudSessionGrantStatus::Enabled {
@@ -250,14 +355,27 @@ impl CloudSessionGrantStore {
             .parent()
             .ok_or_else(|| anyhow!("cloud-session grant path has no parent"))?;
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
         let path = self.path.with_extension("lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
             .context("open cloud-session grant lock")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
         #[cfg(unix)]
         {
             // The state can be changed by the local UI/control process while
@@ -370,6 +488,7 @@ pub struct CloudSessionObservationBatchV1 {
     pub schema_version: String,
     pub collector_id: String,
     pub collector_version: String,
+    pub grant_scope_id: String,
     pub account_fingerprint: String,
     pub observed_at: String,
     pub collected_at: String,
@@ -485,13 +604,32 @@ impl CloudSessionRunner for CodexCloudCliRunner {
         if let Some(cursor) = cursor.filter(|value| !value.is_empty()) {
             command.args(["--cursor", cursor]);
         }
+        // Codex authenticates through its own effective-user configuration.
+        // Never recover or forward provider API keys from the service or an
+        // interactive shell for this metadata-only collector.
+        command.env_clear();
         if let Some(path) = crate::command_env::path_env() {
             command.env("PATH", path);
         }
-        for (key, value) in crate::command_env::provider_env() {
-            command.env(key, value);
+        for key in [
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "CODEX_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+                command.env(key, value);
+            }
         }
-        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let mut child = command
             .spawn()
             .map_err(|_| anyhow!("Codex cloud list could not be started"))?;
@@ -529,7 +667,12 @@ impl CloudSessionRunner for CodexCloudCliRunner {
                     return Err(anyhow!("Codex cloud list timed out"));
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(_) => return Err(anyhow!("Codex cloud list status could not be read")),
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(anyhow!("Codex cloud list status could not be read"));
+                }
             }
         }
     }
@@ -681,6 +824,7 @@ fn collect_enabled_cycle(
         schema_version: "cloud_session_observations.v1".to_string(),
         collector_id: COLLECTOR_ID.to_string(),
         collector_version: compiled_release_version(),
+        grant_scope_id: state.grant.grant_scope_id,
         account_fingerprint: state.grant.account_fingerprint,
         observed_at: timestamp(now),
         collected_at: timestamp(now),
@@ -871,16 +1015,51 @@ fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("cloud-session state path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let payload = serde_json::to_vec(value)?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, payload)?;
-    fs::rename(temporary, path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(())
+    let payload = serde_json::to_vec(value)?;
+    let mut nonce = [0_u8; 16];
+    random_fill(&mut nonce).map_err(|_| anyhow!("generate cloud-session state nonce"))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("cloud-session state filename is invalid"))?;
+    let temporary = parent.join(format!(".{filename}.{}.tmp", hex(&nonce)));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .context("create cloud-session temporary state")?;
+        file.write_all(&payload)
+            .context("write cloud-session temporary state")?;
+        file.sync_all()
+            .context("sync cloud-session temporary state")?;
+        drop(file);
+        fs::rename(&temporary, path).context("replace cloud-session state")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(unix)]
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .context("sync cloud-session state directory")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1019,6 +1198,92 @@ mod tests {
     }
 
     #[test]
+    fn persisted_grant_discards_raw_scope_and_uses_private_atomic_state() {
+        let (grants, _checkpoints) = stores("private-grant-state");
+        enabled(&grants);
+
+        let encoded = String::from_utf8(fs::read(grants.path()).unwrap()).unwrap();
+        assert!(!encoded.contains("install_fixture"));
+        assert!(!encoded.contains("org_fixture"));
+        assert!(!encoded.contains("user_fixture"));
+        assert!(encoded.contains("installation_fingerprint"));
+        assert!(encoded.contains("grant_scope_id"));
+
+        let parent = grants.path().parent().unwrap();
+        assert!(fs::read_dir(parent).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(parent).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                fs::metadata(grants.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(grants.path().with_extension("lock"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_v1_grant_is_privately_migrated_and_remains_revocable() {
+        let (grants, _checkpoints) = stores("legacy-grant-migration");
+        let legacy = json!({
+            "schema_version": GRANT_SCHEMA_VERSION,
+            "hmac_key_hex": "11".repeat(32),
+            "grant": {
+                "schema_version": GRANT_SCHEMA_VERSION,
+                "collector_id": COLLECTOR_ID,
+                "collector_version": COLLECTOR_VERSION,
+                "release_lane": "supported",
+                "disclosure_version": "cloud_sessions_disclosure.v1",
+                "status": CloudSessionGrantStatus::Enabled,
+                "installation_id": "legacy-installation-raw",
+                "organization_fingerprint": "hmac-sha256:legacy-org",
+                "effective_user_fingerprint": "hmac-sha256:legacy-user",
+                "account_fingerprint": "hmac-sha256:legacy-account",
+                "granted_at": "2026-07-20T12:00:00Z",
+                "paused_at": null,
+                "revoked_at": null,
+                "last_collector_health": "enabled",
+                "last_freshness": "unavailable",
+                "last_error_category": null
+            }
+        });
+        fs::write(grants.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let migrated = grants.load().unwrap().unwrap();
+        assert_eq!(migrated.status, CloudSessionGrantStatus::Enabled);
+        assert!(migrated.installation_fingerprint.starts_with("hmac-sha256:"));
+        assert!(migrated.grant_scope_id.starts_with("hmac-sha256:"));
+        let encoded = String::from_utf8(fs::read(grants.path()).unwrap()).unwrap();
+        assert!(!encoded.contains("legacy-installation-raw"));
+        assert!(!encoded.contains("installation_id"));
+
+        grants.pause(now()).unwrap();
+        assert_eq!(
+            grants.load().unwrap().unwrap().status,
+            CloudSessionGrantStatus::Paused
+        );
+        grants.revoke(now()).unwrap();
+        assert_eq!(
+            grants.load().unwrap().unwrap().status,
+            CloudSessionGrantStatus::Revoked
+        );
+    }
+
+    #[test]
     fn repeated_semantics_are_a_transport_noop() {
         let (grants, checkpoints) = stores("noop");
         enabled(&grants);
@@ -1050,6 +1315,7 @@ mod tests {
         assert!(!encoded.contains("install_fixture"));
         assert!(!encoded.contains("org_fixture"));
         assert!(!encoded.contains("user_fixture"));
+        assert!(encoded.contains("grant_scope_id"));
     }
 
     #[test]
