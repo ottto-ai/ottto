@@ -7208,8 +7208,7 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let telemetry_installed = config_body
                 .as_deref()
                 .is_some_and(claude_code_telemetry_config_installed);
-            let managed_config =
-                managed_config_preview("~/.claude/settings.json", config_body.as_deref());
+            let managed_config = claude_managed_config_preview(config_body.as_deref());
             let mut scan_entry = setup_scan_source(
                 source,
                 "claude_code",
@@ -7287,7 +7286,12 @@ fn redact_managed_config_line(line: &str) -> String {
     let mut redacted = String::new();
     let mut token = String::new();
     fn flush(token: &mut String, out: &mut String) {
-        if token.len() >= 32 {
+        // Long opaque runs are masked, but pure UPPER_SNAKE runs are env-key
+        // names (OTEL_EXPORTER_OTLP_LOGS_ENDPOINT is 32 chars), not secrets.
+        let looks_like_env_key = token
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character == '_');
+        if token.len() >= 32 && !looks_like_env_key {
             out.push_str("…redacted…");
         } else {
             out.push_str(token);
@@ -7326,6 +7330,61 @@ fn redact_managed_config_line(line: &str) -> String {
 /// `path_label` is a home-relative label ("~/.codex/config.toml") so machine
 /// user names never leave the device. Returns `None` when the file is
 /// missing or holds no complete fence.
+/// Ottto-managed env keys in `~/.claude/settings.json`, in write order (see
+/// `claude_code_relay_env_with_base`). Claude Code's config is JSON, so the
+/// fence-based extractor can never apply; the preview instead renders the
+/// managed keys as they actually exist on disk.
+const CLAUDE_MANAGED_ENV_KEYS: [&str; 13] = [
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_RESOURCE_ATTRIBUTES",
+];
+
+/// Redacted preview of the Ottto-managed env keys inside
+/// `~/.claude/settings.json`. Reports what is really on disk (never the
+/// template): only keys present in the file appear, and values ride through
+/// the same redaction as the fence path. Returns `None` when the file is
+/// missing, unparseable, or holds none of the managed keys.
+fn claude_managed_config_preview(body: Option<&str>) -> Option<serde_json::Value> {
+    let body = body?;
+    let settings: serde_json::Value = serde_json::from_str(body).ok()?;
+    let env = settings.get("env")?.as_object()?;
+    let mut lines: Vec<String> = Vec::new();
+    for key in CLAUDE_MANAGED_ENV_KEYS {
+        let Some(value) = env.get(key) else {
+            continue;
+        };
+        let rendered = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let line: String = format!("{key} = \"{rendered}\"")
+            .chars()
+            .take(MANAGED_CONFIG_PREVIEW_MAX_LINE_LENGTH)
+            .collect();
+        lines.push(redact_managed_config_line(&line));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "path": "~/.claude/settings.json",
+        "exists": true,
+        "captured_at": current_rfc3339(),
+        "lines": lines,
+    }))
+}
+
 fn managed_config_preview(path_label: &str, body: Option<&str>) -> Option<serde_json::Value> {
     let body = body?;
     let lines = crate::agent_configs::fence::extract_fence_lines(body)?;
@@ -9444,6 +9503,51 @@ mod tests {
         assert!(!joined.contains("top_level"));
         assert!(!joined.contains("trailing"));
         assert!(joined.contains("…redacted…"));
+    }
+
+    #[test]
+    fn claude_managed_config_preview_renders_managed_env_keys() {
+        let fake_secret = format!("otel_{}", "k1v2x3y4z5".repeat(4));
+        let body = format!(
+            concat!(
+                "{{\n",
+                "  \"env\": {{\n",
+                "    \"CLAUDE_CODE_ENABLE_TELEMETRY\": \"1\",\n",
+                "    \"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT\": \"http://127.0.0.1:43119/v1/logs\",\n",
+                "    \"OTEL_EXPORTER_OTLP_HEADERS\": \"X-Ottto-Key {}\",\n",
+                "    \"UNRELATED_KEY\": \"kept-private\"\n",
+                "  }},\n",
+                "  \"statusLine\": {{\"type\": \"command\"}}\n",
+                "}}\n",
+            ),
+            fake_secret,
+        );
+        let preview = super::claude_managed_config_preview(Some(&body))
+            .expect("managed env keys yield a preview");
+        assert_eq!(preview["path"], "~/.claude/settings.json");
+        let lines: Vec<String> = preview["lines"]
+            .as_array()
+            .expect("lines array")
+            .iter()
+            .map(|line| line.as_str().expect("line string").to_string())
+            .collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("CLAUDE_CODE_ENABLE_TELEMETRY = \"1\""));
+        assert!(joined
+            .contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = \"http://127.0.0.1:43119/v1/logs\""));
+        // Secret-bearing header values are masked; unmanaged keys never leak.
+        assert!(!joined.contains(&fake_secret));
+        assert!(!joined.contains("UNRELATED_KEY"));
+        assert!(!joined.contains("kept-private"));
+    }
+
+    #[test]
+    fn claude_managed_config_preview_absent_without_managed_keys() {
+        assert!(super::claude_managed_config_preview(None).is_none());
+        assert!(super::claude_managed_config_preview(Some("not json")).is_none());
+        assert!(
+            super::claude_managed_config_preview(Some("{\"env\": {\"OTHER\": \"1\"}}")).is_none()
+        );
     }
 
     #[test]
