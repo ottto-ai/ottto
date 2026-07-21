@@ -746,6 +746,9 @@ fn sync_source(
         workspace_labels_enabled: activity_hint.workspace_labels_enabled,
         session_artifacts_enabled: activity_hint.session_artifacts_enabled,
         session_attribution_enabled: activity_hint.session_attribution_enabled,
+        session_attribution_labels_enabled: activity_hint.session_attribution_enabled
+            && activity_hint.session_titles_enabled
+            && activity_hint.session_attribution_labels_enabled,
     };
     let index_path = snapshot_index_path(
         support_dir,
@@ -1394,6 +1397,12 @@ fn snapshot_index_path(
             .unwrap_or_else(|| "pending".to_string());
         suffixes.push(format!("attribution-{namespace}"));
     }
+    // The capability changes only wire-safe display metadata, but it still
+    // needs a fresh index so unchanged historical transcripts are revisited
+    // once after backend support becomes available.
+    if upload_policy.session_attribution_labels_enabled {
+        suffixes.push("attribution-labels".to_string());
+    }
     let policy_suffix = if suffixes.is_empty() {
         String::new()
     } else {
@@ -1595,6 +1604,7 @@ mod tests {
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: false,
                     session_attribution_enabled: false,
+                    session_attribution_labels_enabled: false,
                 },
                 None,
             ),
@@ -1609,6 +1619,7 @@ mod tests {
                     workspace_labels_enabled: false,
                     session_artifacts_enabled: false,
                     session_attribution_enabled: false,
+                    session_attribution_labels_enabled: false,
                 },
                 None,
             ),
@@ -1625,6 +1636,7 @@ mod tests {
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: true,
                     session_attribution_enabled: false,
+                    session_attribution_labels_enabled: false,
                 },
                 None,
             ),
@@ -1639,6 +1651,7 @@ mod tests {
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: true,
                     session_attribution_enabled: false,
+                    session_attribution_labels_enabled: false,
                 },
                 None,
             ),
@@ -1653,10 +1666,26 @@ mod tests {
                     workspace_labels_enabled: true,
                     session_artifacts_enabled: false,
                     session_attribution_enabled: true,
+                    session_attribution_labels_enabled: false,
                 },
                 None,
             ),
             PathBuf::from("/support/snapshots/codex-scan-index-attribution-pending.json")
+        );
+        assert_eq!(
+            snapshot_index_path(
+                root,
+                SnapshotSource::Codex,
+                SnapshotUploadPolicy {
+                    session_attribution_enabled: true,
+                    session_attribution_labels_enabled: true,
+                    ..SnapshotUploadPolicy::default()
+                },
+                None,
+            ),
+            PathBuf::from(
+                "/support/snapshots/codex-scan-index-attribution-pending-attribution-labels.json"
+            )
         );
     }
 
