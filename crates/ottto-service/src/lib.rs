@@ -4,6 +4,7 @@ pub mod agent_configs;
 pub mod agent_status;
 pub mod backfill;
 pub mod claude_effort;
+pub mod cloud_sessions;
 pub(crate) mod command_env;
 pub mod context_composition;
 pub mod context_footprint;
@@ -4114,6 +4115,7 @@ mod tests {
                 .map(|collector| collector.collector_id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "cloud_sessions",
                 "identity_probe",
                 "local_sessions",
                 "logs2_trace",

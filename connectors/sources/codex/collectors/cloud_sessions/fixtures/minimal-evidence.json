@@ -1,0 +1,60 @@
+{
+  "schema_version": "collector_fixture.v1",
+  "source_id": "codex",
+  "collector_id": "cloud_sessions",
+  "input_fixture_paths": [],
+  "emitted_records": [
+    {
+      "record_type": "cloud_session_observations",
+      "sample": {
+        "schema_version": "cloud_session_observations.v1",
+        "collector_id": "cloud_sessions",
+        "grant_scope_id": "hmac-sha256:grant-fixture",
+        "account_fingerprint": "hmac-sha256:fixture",
+        "semantic_digest": "sha256:fixture",
+        "entity_count": 1,
+        "entities": [
+          {
+            "source": "codex",
+            "opaque_provider_entity_key": "hmac-sha256:fixture",
+            "entity_kind": "task",
+            "execution_location": "provider_cloud",
+            "lifecycle": "completed",
+            "environment_kind": "unknown",
+            "measurement_basis": "not_itemized",
+            "field_coverage_mask": ["identity", "status", "timing"],
+            "freshness": "fresh"
+          }
+        ]
+      }
+    }
+  ],
+  "upload_policy": {
+    "uploads_raw_content": false,
+    "boundary": "Only official codex cloud list metadata transformed into opaque entity keys, lifecycle, safe timestamps, attempt count, normalized environment kind, coverage, and freshness. Titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths, raw provider ids, raw cursors, credentials, and raw JSON stay local or memory-only.",
+    "redacts": [
+      "prompt",
+      "response",
+      "tool_output",
+      "command_output",
+      "local_path",
+      "credential",
+      "secret",
+      "password",
+      "api_key",
+      "access_token",
+      "id_token",
+      "refresh_token",
+      "tokens.access_token",
+      "tokens.id_token",
+      "tokens.refresh_token",
+      "cookie",
+      "account_id",
+      "user_id",
+      "org_id",
+      "organization_id",
+      "machine_id",
+      "installation_id"
+    ]
+  }
+}
