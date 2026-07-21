@@ -63,6 +63,43 @@ impl std::fmt::Display for BatchAuthorizationRejected {
 
 impl std::error::Error for BatchAuthorizationRejected {}
 
+/// The dedicated cloud-session ingest route rejected the relay principal.
+/// Kept typed so the transport can refresh once without inspecting response
+/// bodies or logging token-adjacent material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionAuthorizationRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionAuthorizationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected cloud-session relay authorization: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionAuthorizationRejected {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudSessionContractRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudSessionContractRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected cloud-session observation contract: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for CloudSessionContractRejected {}
+
 /// The backend refused to mint a relay token for this local device. Keep this
 /// typed so the daemon can mark canonical local health as an auth/rebind issue
 /// instead of treating the projection as merely delayed by a transient upload.
@@ -583,6 +620,46 @@ impl SnapshotApiClient {
                 Err(anyhow!("backend rejected context footprint: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload context footprint failed: {error}")),
+        }
+    }
+
+    /// Upload one bounded, content-free cloud-session batch using the same
+    /// source-scoped relay principal as local snapshots. Response bodies are
+    /// never retained on auth/contract failures.
+    pub fn upload_cloud_session_batch(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse cloud-session batch response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
+                Err(anyhow::Error::new(CloudSessionContractRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "cloud-session upload",
+                    "cloud_session_batch",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "cloud-session upload",
+                "cloud_session_batch",
+                &error,
+            ))),
         }
     }
 

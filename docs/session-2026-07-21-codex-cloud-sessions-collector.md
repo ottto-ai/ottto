@@ -16,11 +16,15 @@ Implemented the supported public-runtime slice for Cloud Sessions Observability.
   stored. State uses a private 0700 directory and randomized, exclusive 0600
   atomic writes. Earlier v1 files migrate on first read without losing
   pause/revoke control. Revocation is rechecked before transport.
-- Added the content-free `cloud_session_observations.v1` wire and typed deferred
-  transport interface. The backend endpoint is intentionally not guessed; this
-  public build does not register a poller or construct a Codex runner until a
-  future private transport implementation attaches without changing parsing,
-  grants, checkpoints, or privacy boundaries.
+- Grant creation now persists a privacy-safe exact-scope tombstone and returns
+  the same idempotent request after timeout or restart until the grant UUID is
+  bound. A single backend-list absence cannot clear the tombstone. Every
+  provider cycle also requires a fresh bounded backend grant-list response with
+  strict server policy approval before the Codex process can start.
+- Added the initial content-free `cloud_session_observations.v1` boundary and
+  typed deferred transport interface. A follow-up alignment supplies the exact
+  server-owned grant epoch, nested health, strict observation fields, and relay
+  adapter; public startup remains deferred until its separate activation gates.
 - Added the operator/UI-safe `ottto-service cloud-sessions-status --json`
   contract. It reports `transport_deferred` and
   `provider_cli_invocation_permitted: false` without constructing or invoking a
@@ -29,8 +33,11 @@ Implemented the supported public-runtime slice for Cloud Sessions Observability.
   stdin. Provider API keys are neither inherited nor recovered from an
   interactive shell.
 
-Validation: `cargo test -p ottto-service cloud_sessions --lib` exercises twelve
-focused tests covering content leak prevention, idempotency/no-op,
+Validation: `cargo test -p ottto-service cloud_sessions --lib` passes 29
+focused tests covering content leak prevention, idempotency/no-op, ambiguous
+create/restart/late-response races, strict policy parsing and transitions,
+backend-error fail-closed behavior, invalid required provider identity/status
+rows, strict coarse backend health mapping,
 disabled/revoked grants, the revoke-before-send race, deferred-transport
 no-call behavior, pagination/cursor persistence, and circuit breaking. Local
 load evidence is an in-memory 60-task, three-page fixture under the hard
