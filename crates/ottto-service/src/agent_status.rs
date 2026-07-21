@@ -3048,7 +3048,7 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     let mut balances = Vec::new();
     if let Some(rate_limit) = codex_app_server_rate_limit_snapshot(value) {
         if let Some(credits) = rate_limit.get("credits") {
-            if let Some(balance) = codex_credit_balance_from_credits_snapshot(credits) {
+            if let Some(balance) = codex_credit_balance_from_credits_snapshot(credits, rate_limit) {
                 balances.push(balance);
             }
         }
@@ -3077,16 +3077,41 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     balances
 }
 
-fn codex_credit_balance_from_credits_snapshot(credits: &Value) -> Option<AgentCreditBalance> {
+fn codex_credit_balance_from_credits_snapshot(
+    credits: &Value,
+    container: &Value,
+) -> Option<AgentCreditBalance> {
     let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
     let has_credits = json_bool(credits, &["hasCredits", "has_credits"]).unwrap_or(false);
-    if remaining.is_none() && unlimited.is_none() && !has_credits {
+    // `credits` sits beside `primary`/`secondary` on the rate-limit snapshot; the
+    // sibling `spend_control_reached`, `rate_limit_reached_type`, and `limit_id`
+    // fields (e.g. `limitId: "codex"`) live on that container. Mirror the OAuth
+    // wham/usage path so both collectors carry the spend-cap contract.
+    let spend_control_reached =
+        json_bool(container, &["spend_control_reached", "spendControlReached"]);
+    let rate_limit_reached_type = first_json_string(
+        container,
+        &["rate_limit_reached_type", "rateLimitReachedType"],
+    );
+    let limit_id = first_json_string(container, &["limit_id", "limitId"]);
+    if remaining.is_none()
+        && unlimited.is_none()
+        && !has_credits
+        && spend_control_reached != Some(true)
+    {
         return None;
     }
+    // A reached spend control means the account is spend-capped even if a nominal
+    // credit figure remains, so treat it as exhausted regardless of the balance.
+    let status = if spend_control_reached == Some(true) {
+        AgentCreditBalanceStatus::Exhausted
+    } else {
+        codex_credit_balance_status(remaining, unlimited, has_credits)
+    };
     Some(AgentCreditBalance {
         name: "credits".to_string(),
-        status: codex_credit_balance_status(remaining, unlimited, has_credits),
+        status,
         freshness: AgentQuotaWindowFreshness::Fresh,
         unit: AgentCreditBalanceUnit::Credits,
         account_label: None,
@@ -3095,6 +3120,9 @@ fn codex_credit_balance_from_credits_snapshot(credits: &Value) -> Option<AgentCr
         quota: None,
         unlimited,
         updated_at: None,
+        spend_control_reached,
+        rate_limit_reached_type,
+        limit_id,
         ..Default::default()
     })
 }
@@ -5942,10 +5970,53 @@ for line in sys.stdin:
         assert_eq!(credits.len(), 2);
         assert_eq!(credits[0].name, "credits");
         assert_eq!(credits[0].remaining, Some(12));
+        // A payload without the spend-cap fields leaves them unset.
+        assert_eq!(credits[0].spend_control_reached, None);
+        assert_eq!(credits[0].rate_limit_reached_type, None);
+        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
         assert_eq!(credits[1].name, "reset_bank");
         assert_eq!(credits[1].unit, AgentCreditBalanceUnit::Resets);
         assert_eq!(credits[1].status, AgentCreditBalanceStatus::Ok);
         assert_eq!(credits[1].remaining, Some(2));
+    }
+
+    #[test]
+    fn codex_app_server_parser_carries_credit_spend_control_fields() {
+        // The app-server snapshot is the PRIMARY collector (the OAuth wham/usage
+        // path is legacy fallback), so it must carry the spend-cap contract too.
+        let json = serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1779049800
+                    },
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": "9"
+                    },
+                    "spendControlReached": true,
+                    "rateLimitReachedType": "primary"
+                }
+            }
+        });
+
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].name, "credits");
+        assert_eq!(credits[0].remaining, Some(9));
+        // A reached spend cap is a hard stop even with a nominal balance remaining.
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].spend_control_reached, Some(true));
+        assert_eq!(
+            credits[0].rate_limit_reached_type.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
     }
 
     #[test]
