@@ -713,6 +713,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            originator: None,
             attribution_facts: Vec::new(),
         }
     }

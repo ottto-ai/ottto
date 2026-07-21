@@ -371,6 +371,16 @@ pub struct SnapshotItem {
     /// Raw session-origin signals; the backend re-derives the initiator from these.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<SnapshotOrigin>,
+    /// Codex-only raw session-surface label read from `session_meta.originator`
+    /// (e.g. `codex_work_desktop` for the unified ChatGPT desktop app's local
+    /// "Work" sessions, `codex_cli_rs`/`codex_vscode` for the CLI/editor
+    /// surfaces). Forward-looking top-level mirror of `origin.originator`: the
+    /// backend prefers this field and derives a display sub-surface at serve
+    /// time (never classified here). None for non-Codex sources (Claude Code /
+    /// Pi have no originator concept) and when the Codex `session_meta` omits it.
+    /// Additive/optional so older backends ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub originator: Option<String>,
     /// Compact evidence-first facts derived locally without transcript content.
     /// Empty fact sets stay off the wire; populated sets use the backend's v1
     /// field-evidence contract.
@@ -812,6 +822,12 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
         // starts forwarding it, so the backend can re-derive the initiator for
         // already-uploaded sessions (otherwise the fingerprint is unchanged and
         // the snapshot is never re-sent).
+        //
+        // The top-level `originator` is deliberately NOT fingerprinted: it is a
+        // pure Codex-only mirror of `origin.originator`, which is already hashed
+        // above, and the backend falls back to `origin.originator` when the
+        // top-level field is absent. Hashing it too would only re-churn every
+        // Codex fingerprint for a re-upload that carries no new data.
         "origin": &item.origin,
     });
     // Same one-time re-upload rationale as `origin`, scoped to the sources that
@@ -2186,6 +2202,14 @@ impl SnapshotAccumulator {
                 state_archived: None,
             },
             origin: (!self.origin.is_empty()).then(|| self.origin.clone()),
+            // Forward-looking top-level mirror of the Codex `session_meta`
+            // originator (e.g. `codex_work_desktop`). `origin.originator` is only
+            // ever populated by the Codex line parser, but guard on `source` too
+            // so a non-Codex path can never fabricate one.
+            originator: match self.source {
+                SnapshotSource::Codex => self.origin.originator.clone(),
+                SnapshotSource::ClaudeCode | SnapshotSource::Pi => None,
+            },
             attribution_facts,
         };
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
@@ -2732,6 +2756,7 @@ fn codex_state_only_snapshot(
         },
         // Codex state-index summaries carry no session_meta -> no raw origin.
         origin: None,
+        originator: None,
         attribution_facts: Vec::new(),
     };
     item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, &item);
@@ -5974,6 +5999,70 @@ mod tests {
     }
 
     #[test]
+    fn codex_parser_forwards_top_level_originator_for_chatgpt_work() {
+        // The unified ChatGPT desktop app writes its local "Work" sessions as
+        // normal Codex rollout JSONLs with session_meta.originator ==
+        // "codex_work_desktop". The daemon forwards that verbatim on the
+        // forward-looking top-level `originator` field (the backend derives the
+        // display sub-surface). The raw value must also stay on
+        // `origin.originator` for the fallback path.
+        let path = temp_file("codex-originator-work");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-work-codex\",\"source\":\"exec\",\"originator\":\"codex_work_desktop\",\"thread_source\":\"user\"}}\n",
+                "{\"timestamp\":\"2026-07-21T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(&path, "2026-07-21T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.originator.as_deref(), Some("codex_work_desktop"));
+        assert_eq!(
+            item.origin.as_ref().and_then(|o| o.originator.as_deref()),
+            Some("codex_work_desktop")
+        );
+        // Serializes as a top-level `originator` string (what the backend reads).
+        let wire = serde_json::to_value(&item).expect("serialize");
+        assert_eq!(wire["originator"], serde_json::json!("codex_work_desktop"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_parser_omits_originator_when_session_meta_lacks_it() {
+        // Backward compat: a Codex session_meta with no `originator` yields None,
+        // and the field is skipped on the wire (additive/optional).
+        let path = temp_file("codex-originator-absent");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019dfb9a-noorig-codex\",\"source\":\"cli\",\"thread_source\":\"user\"}}\n",
+                "{\"timestamp\":\"2026-07-21T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(&path, "2026-07-21T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.originator, None);
+        let wire = serde_json::to_value(&item).expect("serialize");
+        assert!(
+            wire.get("originator").is_none(),
+            "None originator must be skipped on the wire"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn codex_parser_emits_direct_scheduled_and_parent_subagent_facts() {
         let automation_path = temp_file("codex-automation-attribution");
         fs::write(
@@ -7269,6 +7358,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            originator: None,
             attribution_facts: Vec::new(),
         };
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
@@ -8393,6 +8483,8 @@ mod tests {
         // No sibling `<session>/workflows/wf_*.json` footprint -> detection ran
         // and reported false (not None / unknown).
         assert_eq!(origin.used_workflow_orchestration, Some(false));
+        // `originator` is Codex-only; Claude Code sessions never carry one.
+        assert_eq!(item.originator, None);
         assert!(item
             .attribution_facts
             .iter()
@@ -10819,6 +10911,7 @@ mod tests {
                 state_archived: None,
             },
             origin: None,
+            originator: None,
             attribution_facts: Vec::new(),
         };
         let request = SnapshotBatchRequest {
@@ -11060,6 +11153,7 @@ mod tests {
                     state_archived: None,
                 },
                 origin: None,
+                originator: None,
                 attribution_facts: Vec::new(),
             }],
         }
