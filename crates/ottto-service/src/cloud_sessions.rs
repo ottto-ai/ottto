@@ -1220,7 +1220,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(parent).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
             assert_eq!(
                 fs::metadata(grants.path()).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -1265,7 +1268,9 @@ mod tests {
 
         let migrated = grants.load().unwrap().unwrap();
         assert_eq!(migrated.status, CloudSessionGrantStatus::Enabled);
-        assert!(migrated.installation_fingerprint.starts_with("hmac-sha256:"));
+        assert!(migrated
+            .installation_fingerprint
+            .starts_with("hmac-sha256:"));
         assert!(migrated.grant_scope_id.starts_with("hmac-sha256:"));
         let encoded = String::from_utf8(fs::read(grants.path()).unwrap()).unwrap();
         assert!(!encoded.contains("legacy-installation-raw"));

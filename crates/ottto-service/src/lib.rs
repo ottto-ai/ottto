@@ -4115,6 +4115,7 @@ mod tests {
                 .map(|collector| collector.collector_id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "cloud_sessions",
                 "identity_probe",
                 "local_sessions",
                 "logs2_trace",
