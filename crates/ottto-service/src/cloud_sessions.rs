@@ -9,7 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
 use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -25,9 +25,10 @@ const COLLECTOR_ID: &str = "cloud_sessions";
 const COLLECTOR_VERSION: &str = "cloud_session_observations.v1";
 const GRANT_SCHEMA_VERSION: &str = "cloud_session_grant.v1";
 const CHECKPOINT_SCHEMA_VERSION: &str = "cloud_session_checkpoint.v1";
-const MAX_PAGES: usize = 3;
-const MAX_ITEMS: usize = 60;
+const MAX_PAGES: usize = 10;
+const MAX_ITEMS: usize = 200;
 const PAGE_LIMIT: usize = 20;
+const MAX_PAGE_OUTPUT_BYTES: u64 = (PAGE_LIMIT * 256 * 1024) as u64;
 const CYCLE_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -965,7 +966,14 @@ pub fn default_cloud_session_collector_status() -> CloudSessionCollectorStatusV1
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSessionBatchKind {
+    Snapshot,
+    Heartbeat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CloudSessionObservationBatchV1 {
     pub grant_id: String,
     pub grant_version: u64,
@@ -974,12 +982,77 @@ pub struct CloudSessionObservationBatchV1 {
     pub schema_version: String,
     pub collector_version: String,
     pub account_fingerprint: String,
+    pub batch_kind: CloudSessionBatchKind,
+    pub snapshot_complete: bool,
     pub collected_at: String,
     pub observations: Vec<CloudSessionObservationEntityV1>,
     pub health: CloudSessionCollectorHealthV1,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudSessionObservationBatchWireV1 {
+    grant_id: String,
+    grant_version: u64,
+    grant_scope_fingerprint: String,
+    collector_id: String,
+    schema_version: String,
+    collector_version: String,
+    account_fingerprint: String,
+    batch_kind: CloudSessionBatchKind,
+    snapshot_complete: bool,
+    collected_at: String,
+    observations: Vec<CloudSessionObservationEntityV1>,
+    health: CloudSessionCollectorHealthV1,
+}
+
+impl CloudSessionObservationBatchV1 {
+    fn validate_wire_contract(&self) -> Result<()> {
+        if self.observations.len() > MAX_ITEMS {
+            return Err(anyhow!(
+                "cloud-session batch exceeds {MAX_ITEMS} observations"
+            ));
+        }
+        if self.batch_kind == CloudSessionBatchKind::Heartbeat
+            && (!self.observations.is_empty() || self.snapshot_complete)
+        {
+            return Err(anyhow!(
+                "cloud-session heartbeat must be empty and incomplete"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for CloudSessionObservationBatchV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CloudSessionObservationBatchWireV1::deserialize(deserializer)?;
+        let batch = Self {
+            grant_id: wire.grant_id,
+            grant_version: wire.grant_version,
+            grant_scope_fingerprint: wire.grant_scope_fingerprint,
+            collector_id: wire.collector_id,
+            schema_version: wire.schema_version,
+            collector_version: wire.collector_version,
+            account_fingerprint: wire.account_fingerprint,
+            batch_kind: wire.batch_kind,
+            snapshot_complete: wire.snapshot_complete,
+            collected_at: wire.collected_at,
+            observations: wire.observations,
+            health: wire.health,
+        };
+        batch
+            .validate_wire_contract()
+            .map_err(serde::de::Error::custom)?;
+        Ok(batch)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudSessionObservationEntityV1 {
     pub entity_key: String,
     pub entity_kind: String,
@@ -996,6 +1069,7 @@ pub struct CloudSessionObservationEntityV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudSessionCollectorHealthV1 {
     pub state: String,
     pub observed_at: String,
@@ -1012,6 +1086,7 @@ struct CloudSessionCheckpoint {
     last_error_category: Option<String>,
     last_success_at: Option<String>,
     last_health_upload_at: Option<String>,
+    last_complete_snapshot_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1154,6 +1229,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         if !self.is_configured() {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
         }
+        batch.validate_wire_contract()?;
         let request = serde_json::to_value(batch)?;
         let token = self.token(false)?;
         match self.client.upload_cloud_session_batch(&token, &request) {
@@ -1227,7 +1303,7 @@ impl CloudSessionRunner for CodexCloudCliRunner {
         let reader = thread::spawn(move || {
             let mut bytes = Vec::new();
             stdout
-                .take((MAX_ITEMS * 256 * 1024) as u64)
+                .take(MAX_PAGE_OUTPUT_BYTES)
                 .read_to_end(&mut bytes)
                 .map(|_| bytes)
         });
@@ -1312,13 +1388,19 @@ pub fn collect_cloud_sessions_once(
             let _ = grants.record_health("ok", "fresh", None);
             CloudSessionCycleOutcome::Heartbeat
         }
-        Ok(CycleResult::Uploaded(digest)) => {
+        Ok(CycleResult::Uploaded {
+            digest,
+            snapshot_complete,
+        }) => {
             checkpoint.semantic_digest = Some(digest);
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
             checkpoint.last_error_category = None;
             checkpoint.last_success_at = Some(timestamp(now));
             checkpoint.last_health_upload_at = Some(timestamp(now));
+            if snapshot_complete {
+                checkpoint.last_complete_snapshot_at = Some(timestamp(now));
+            }
             let _ = checkpoints.save(&checkpoint);
             let _ = grants.record_health("ok", "fresh", None);
             CloudSessionCycleOutcome::Uploaded
@@ -1342,7 +1424,10 @@ pub fn collect_cloud_sessions_once(
 enum CycleResult {
     Noop,
     Heartbeat,
-    Uploaded(String),
+    Uploaded {
+        digest: String,
+        snapshot_complete: bool,
+    },
 }
 #[derive(Debug)]
 struct CycleError {
@@ -1404,6 +1489,7 @@ fn collect_enabled_cycle(
     let deadline = Instant::now() + CYCLE_BUDGET;
     let mut cursor: Option<String> = None;
     let mut entities = Vec::new();
+    let mut snapshot_complete = false;
     for _ in 0..MAX_PAGES {
         if Instant::now() >= deadline || entities.len() >= MAX_ITEMS {
             break;
@@ -1451,27 +1537,44 @@ fn collect_enabled_cycle(
                 health_uploaded: true,
             });
         }
-        let count = (MAX_ITEMS - entities.len()).min(page.entities.len());
+        let remaining = MAX_ITEMS - entities.len();
+        let page_fits = page.entities.len() <= remaining;
+        let page_is_terminal = page.next_cursor.is_none();
+        let count = remaining.min(page.entities.len());
         entities.extend(page.entities.into_iter().take(count));
         cursor = page.next_cursor;
-        if cursor.is_none() {
+        if page_is_terminal {
+            snapshot_complete = page_fits && !page.truncated;
+            break;
+        }
+        if !page_fits || page.truncated {
             break;
         }
     }
     entities.sort_by(|left, right| left.entity_key.cmp(&right.entity_key));
     entities.dedup_by(|left, right| left.entity_key == right.entity_key);
-    let digest = semantic_digest(&state.grant, &entities).map_err(|_| CycleError {
-        category: "digest_failed",
-        health_uploaded: false,
-    })?;
-    if checkpoint.semantic_digest.as_deref() == Some(digest.as_str()) {
+    let digest =
+        semantic_digest(&state.grant, &entities, snapshot_complete).map_err(|_| CycleError {
+            category: "digest_failed",
+            health_uploaded: false,
+        })?;
+    let daily_complete_due = snapshot_complete && complete_snapshot_due(checkpoint, now);
+    if checkpoint.semantic_digest.as_deref() == Some(digest.as_str()) && !daily_complete_due {
         if checkpoint.last_error_category.is_none() && !health_heartbeat_due(checkpoint, now) {
             return Ok(CycleResult::Noop);
         }
         if kill_switch_enabled() || !grant_still_current(grants, &state.grant) {
             return Ok(CycleResult::Noop);
         }
-        let batch = observation_batch(&state.grant, Vec::new(), now)?;
+        let batch = heartbeat_batch(
+            &state.grant,
+            now,
+            CloudSessionCollectorHealthV1 {
+                state: "healthy".to_string(),
+                observed_at: timestamp(now),
+                error_category: None,
+            },
+        )?;
         transport.send(&batch).map_err(|_| CycleError {
             category: "transport_unavailable",
             health_uploaded: false,
@@ -1483,12 +1586,15 @@ fn collect_enabled_cycle(
     if kill_switch_enabled() || !grant_still_current(grants, &state.grant) {
         return Ok(CycleResult::Noop);
     }
-    let batch = observation_batch(&state.grant, entities, now)?;
+    let batch = snapshot_batch(&state.grant, entities, now, snapshot_complete)?;
     transport.send(&batch).map_err(|_| CycleError {
         category: "transport_unavailable",
         health_uploaded: false,
     })?;
-    Ok(CycleResult::Uploaded(digest))
+    Ok(CycleResult::Uploaded {
+        digest,
+        snapshot_complete,
+    })
 }
 
 struct ParsedPage {
@@ -1496,6 +1602,7 @@ struct ParsedPage {
     next_cursor: Option<String>,
     source_item_count: usize,
     invalid_required_rows: usize,
+    truncated: bool,
 }
 
 fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Result<ParsedPage> {
@@ -1509,7 +1616,8 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             .ok_or_else(|| anyhow!("Codex cloud list tasks are missing"))?
     };
     let mut entities = Vec::new();
-    let source_item_count = items.len().min(PAGE_LIMIT);
+    let source_item_count = items.len();
+    let truncated = source_item_count > PAGE_LIMIT;
     let mut invalid_required_rows = 0;
     for item in items.iter().take(PAGE_LIMIT) {
         let Some(object) = item.as_object() else {
@@ -1598,6 +1706,7 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             .map(str::to_string),
         source_item_count,
         invalid_required_rows,
+        truncated,
     })
 }
 
@@ -1655,6 +1764,7 @@ fn environment_kind(value: Option<&str>) -> String {
 fn semantic_digest(
     grant: &CloudSessionGrant,
     entities: &[CloudSessionObservationEntityV1],
+    snapshot_complete: bool,
 ) -> Result<String> {
     let binding = grant
         .backend_binding
@@ -1675,32 +1785,67 @@ fn semantic_digest(
         "collector_version": grant.collector_version,
         "grant_id": binding.grant_id,
         "grant_version": binding.grant_version,
+        "batch_kind": "snapshot",
+        "snapshot_complete": snapshot_complete,
         "observations": semantics,
     }))?;
     Ok(sha256(&payload))
 }
 
-fn observation_batch(
+fn snapshot_batch(
     grant: &CloudSessionGrant,
     observations: Vec<CloudSessionObservationEntityV1>,
     now: OffsetDateTime,
+    snapshot_complete: bool,
 ) -> std::result::Result<CloudSessionObservationBatchV1, CycleError> {
-    observation_batch_with_health(
-        grant,
-        observations,
-        now,
+    let health = if snapshot_complete {
         CloudSessionCollectorHealthV1 {
             state: "healthy".to_string(),
             observed_at: timestamp(now),
             error_category: None,
-        },
+        }
+    } else {
+        // The backend v1 enum has no coverage-limited category. Use its
+        // existing coarse degraded/provider_error pair so a bounded partial
+        // scan cannot make UI freshness look complete, while the explicit
+        // snapshot_complete bit remains authoritative for absence semantics.
+        CloudSessionCollectorHealthV1 {
+            state: "degraded".to_string(),
+            observed_at: timestamp(now),
+            error_category: Some("provider_error".to_string()),
+        }
+    };
+    build_observation_batch(
+        grant,
+        observations,
+        now,
+        CloudSessionBatchKind::Snapshot,
+        snapshot_complete,
+        health,
     )
 }
 
-fn observation_batch_with_health(
+fn heartbeat_batch(
+    grant: &CloudSessionGrant,
+    now: OffsetDateTime,
+    health: CloudSessionCollectorHealthV1,
+) -> std::result::Result<CloudSessionObservationBatchV1, CycleError> {
+    build_observation_batch(
+        grant,
+        Vec::new(),
+        now,
+        CloudSessionBatchKind::Heartbeat,
+        false,
+        health,
+    )
+}
+
+fn build_observation_batch(
     grant: &CloudSessionGrant,
     observations: Vec<CloudSessionObservationEntityV1>,
     now: OffsetDateTime,
+    batch_kind: CloudSessionBatchKind,
+    snapshot_complete: bool,
     health: CloudSessionCollectorHealthV1,
 ) -> std::result::Result<CloudSessionObservationBatchV1, CycleError> {
     let binding = grant.backend_binding.as_ref().ok_or(CycleError {
@@ -1718,7 +1863,7 @@ fn observation_batch_with_health(
             health_uploaded: false,
         });
     }
-    Ok(CloudSessionObservationBatchV1 {
+    let batch = CloudSessionObservationBatchV1 {
         grant_id: binding.grant_id.clone(),
         grant_version: binding.grant_version,
         grant_scope_fingerprint: grant.grant_scope_id.clone(),
@@ -1726,10 +1871,17 @@ fn observation_batch_with_health(
         schema_version: COLLECTOR_VERSION.to_string(),
         collector_version: grant.collector_version.clone(),
         account_fingerprint: grant.account_fingerprint.clone(),
+        batch_kind,
+        snapshot_complete,
         collected_at: timestamp(now),
         observations,
         health,
-    })
+    };
+    batch.validate_wire_contract().map_err(|_| CycleError {
+        category: "batch_invalid",
+        health_uploaded: false,
+    })?;
+    Ok(batch)
 }
 
 fn report_provider_failure(
@@ -1737,9 +1889,8 @@ fn report_provider_failure(
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
 ) -> std::result::Result<(), CycleError> {
-    let batch = observation_batch_with_health(
+    let batch = heartbeat_batch(
         grant,
-        Vec::new(),
         now,
         CloudSessionCollectorHealthV1 {
             state: "failing".to_string(),
@@ -1920,6 +2071,18 @@ fn health_heartbeat_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime
         None => true,
     }
 }
+
+fn complete_snapshot_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
+    match checkpoint
+        .last_complete_snapshot_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+    {
+        Some(last) => last.date() != now.date(),
+        None => true,
+    }
+}
+
 fn circuit_open(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
     checkpoint
         .circuit_open_until
@@ -2391,11 +2554,92 @@ mod tests {
         let wire: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(wire["grant_id"], GRANT_ID);
         assert_eq!(wire["grant_version"], 1);
+        assert_eq!(wire["batch_kind"], "snapshot");
+        assert_eq!(wire["snapshot_complete"], true);
         assert_eq!(wire["observations"][0]["entity_kind"], "task");
         assert_eq!(wire["observations"][0]["observed_at"], timestamp(now()));
         assert_eq!(wire["health"]["state"], "healthy");
         assert!(wire.get("entities").is_none());
         assert!(wire.get("observed_at").is_none());
+    }
+
+    #[test]
+    fn strict_batch_schema_rejects_invalid_heartbeat_and_unknown_fields() {
+        let (grants, _checkpoints) = stores("strict-batch-wire");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let observations = parse_cloud_page(&page("one", None), b"fixture-key", now())
+            .unwrap()
+            .entities;
+        let snapshot = snapshot_batch(&grant, observations, now(), true).unwrap();
+        let snapshot_value = serde_json::to_value(&snapshot).unwrap();
+        let decoded: CloudSessionObservationBatchV1 =
+            serde_json::from_value(snapshot_value.clone()).unwrap();
+        assert_eq!(decoded.batch_kind, CloudSessionBatchKind::Snapshot);
+        assert!(decoded.snapshot_complete);
+
+        let mut heartbeat_with_rows = snapshot_value.clone();
+        heartbeat_with_rows["batch_kind"] = json!("heartbeat");
+        heartbeat_with_rows["snapshot_complete"] = json!(false);
+        assert!(
+            serde_json::from_value::<CloudSessionObservationBatchV1>(heartbeat_with_rows).is_err()
+        );
+
+        let mut complete_heartbeat = serde_json::to_value(
+            heartbeat_batch(
+                &grant,
+                now(),
+                CloudSessionCollectorHealthV1 {
+                    state: "healthy".to_string(),
+                    observed_at: timestamp(now()),
+                    error_category: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        complete_heartbeat["snapshot_complete"] = json!(true);
+        assert!(
+            serde_json::from_value::<CloudSessionObservationBatchV1>(complete_heartbeat).is_err()
+        );
+
+        let mut unknown_kind = snapshot_value.clone();
+        unknown_kind["batch_kind"] = json!("delta");
+        assert!(serde_json::from_value::<CloudSessionObservationBatchV1>(unknown_kind).is_err());
+
+        let mut unknown_field = snapshot_value;
+        unknown_field["provider_cursor"] = json!("must-not-cross-wire");
+        assert!(serde_json::from_value::<CloudSessionObservationBatchV1>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn empty_terminal_enumeration_is_an_authoritative_complete_snapshot() {
+        let (grants, checkpoints) = stores("empty-complete-snapshot");
+        enabled(&grants);
+        let runner = Pages {
+            pages: RefCell::new(vec![json!({"tasks": [], "next_cursor": null}).to_string()]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let transport = RecordingTransport {
+            calls: Cell::new(0),
+            batches: RefCell::new(Vec::new()),
+            fail: false,
+        };
+
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        let batches = transport.batches.borrow();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch_kind, CloudSessionBatchKind::Snapshot);
+        assert!(batches[0].snapshot_complete);
+        assert!(batches[0].observations.is_empty());
+        assert_eq!(
+            checkpoints.load().last_complete_snapshot_at.as_deref(),
+            Some("2026-07-21T12:00:00Z")
+        );
     }
 
     #[test]
@@ -2835,7 +3079,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_polls_emit_only_hourly_health_heartbeats() {
+    fn unchanged_polls_emit_hourly_heartbeats_and_one_complete_snapshot_per_active_day() {
         let (grants, checkpoints) = stores("heartbeat");
         enabled(&grants);
         let transport = RecordingTransport {
@@ -2865,16 +3109,31 @@ mod tests {
             run(now() + TimeDuration::hours(2)),
             CloudSessionCycleOutcome::Heartbeat
         );
-        assert_eq!(transport.calls.get(), 3);
+        assert_eq!(
+            run(now() + TimeDuration::days(1)),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert_eq!(transport.calls.get(), 4);
         let batches = transport.batches.borrow();
         assert_eq!(batches[0].observations.len(), 1);
+        assert_eq!(batches[0].batch_kind, CloudSessionBatchKind::Snapshot);
+        assert!(batches[0].snapshot_complete);
         assert!(batches[1].observations.is_empty());
         assert!(batches[2].observations.is_empty());
+        assert_eq!(batches[1].batch_kind, CloudSessionBatchKind::Heartbeat);
+        assert!(!batches[1].snapshot_complete);
         assert_eq!(batches[2].health.state, "healthy");
+        assert_eq!(batches[3].batch_kind, CloudSessionBatchKind::Snapshot);
+        assert!(batches[3].snapshot_complete);
+        assert_eq!(batches[3].observations.len(), 1);
         let checkpoint = checkpoints.load();
         assert_eq!(
             checkpoint.last_health_upload_at.as_deref(),
-            Some("2026-07-21T14:00:00Z")
+            Some("2026-07-22T12:00:00Z")
+        );
+        assert_eq!(
+            checkpoint.last_complete_snapshot_at.as_deref(),
+            Some("2026-07-22T12:00:00Z")
         );
     }
 
@@ -2932,12 +3191,16 @@ mod tests {
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].observations.len(), 1);
         assert!(batches[1].observations.is_empty());
+        assert_eq!(batches[1].batch_kind, CloudSessionBatchKind::Heartbeat);
+        assert!(!batches[1].snapshot_complete);
         assert_eq!(batches[1].health.state, "failing");
         assert_eq!(
             batches[1].health.error_category.as_deref(),
             Some("provider_error")
         );
         assert!(batches[2].observations.is_empty());
+        assert_eq!(batches[2].batch_kind, CloudSessionBatchKind::Heartbeat);
+        assert!(!batches[2].snapshot_complete);
         assert_eq!(batches[2].health.state, "healthy");
     }
 
@@ -2963,6 +3226,8 @@ mod tests {
         let batches = transport.batches.borrow();
         assert_eq!(batches.len(), 1);
         assert!(batches[0].observations.is_empty());
+        assert_eq!(batches[0].batch_kind, CloudSessionBatchKind::Heartbeat);
+        assert!(!batches[0].snapshot_complete);
         assert_eq!(batches[0].health.state, "failing");
         assert_eq!(
             serde_json::to_value(&batches[0].health).unwrap(),
@@ -3134,7 +3399,7 @@ mod tests {
         let observations = parse_cloud_page(&page("one", None), b"fixture-key", now())
             .unwrap()
             .entities;
-        let batch = observation_batch(&grant, observations, now()).unwrap();
+        let batch = snapshot_batch(&grant, observations, now(), true).unwrap();
         let transport = RelayCloudSessionTransport::new(
             format!("http://{address}"),
             LocalDeviceBinding {
@@ -3244,6 +3509,48 @@ mod tests {
     fn pagination_is_bounded_and_cursors_are_not_checkpointed() {
         let (grants, checkpoints) = stores("pages");
         enabled(&grants);
+        let mut pages = (0..MAX_PAGES)
+            .map(|index| {
+                page(
+                    &format!("provider-{index}"),
+                    Some(&format!("cursor-{index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        pages.push(page("must-not-read", None));
+        let runner = Pages {
+            pages: RefCell::new(pages),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let transport = RecordingTransport {
+            calls: Cell::new(0),
+            batches: RefCell::new(Vec::new()),
+            fail: false,
+        };
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert_eq!(runner.calls.get(), MAX_PAGES);
+        let batches = transport.batches.borrow();
+        assert_eq!(batches[0].observations.len(), MAX_PAGES);
+        assert_eq!(batches[0].batch_kind, CloudSessionBatchKind::Snapshot);
+        assert!(!batches[0].snapshot_complete);
+        assert_eq!(batches[0].health.state, "degraded");
+        assert_eq!(
+            batches[0].health.error_category.as_deref(),
+            Some("provider_error")
+        );
+        assert!(!String::from_utf8(fs::read(&checkpoints.path).unwrap())
+            .unwrap()
+            .contains("cursor-"));
+    }
+
+    #[test]
+    fn terminal_multi_page_enumeration_is_complete() {
+        let (grants, checkpoints) = stores("terminal-pages");
+        enabled(&grants);
         let runner = Pages {
             pages: RefCell::new(vec![
                 page("one", Some("cursor-1")),
@@ -3259,15 +3566,50 @@ mod tests {
             batches: RefCell::new(Vec::new()),
             fail: false,
         };
+
         assert_eq!(
             collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
             CloudSessionCycleOutcome::Uploaded
         );
-        assert_eq!(runner.calls.get(), MAX_PAGES);
-        assert_eq!(transport.batches.borrow()[0].observations.len(), MAX_PAGES);
-        assert!(!String::from_utf8(fs::read(&checkpoints.path).unwrap())
-            .unwrap()
-            .contains("cursor-"));
+        assert_eq!(runner.calls.get(), 4);
+        let batches = transport.batches.borrow();
+        assert_eq!(batches[0].observations.len(), 4);
+        assert!(batches[0].snapshot_complete);
+    }
+
+    #[test]
+    fn overfull_provider_page_is_never_absence_authoritative() {
+        let (grants, checkpoints) = stores("overfull-page");
+        enabled(&grants);
+        let tasks = (0..PAGE_LIMIT + 1)
+            .map(|id| json!({"id": format!("provider-{id}"), "status": "running"}))
+            .collect::<Vec<_>>();
+        let runner = Pages {
+            pages: RefCell::new(vec![
+                json!({"tasks": tasks, "next_cursor": null}).to_string()
+            ]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let transport = RecordingTransport {
+            calls: Cell::new(0),
+            batches: RefCell::new(Vec::new()),
+            fail: false,
+        };
+
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        let batches = transport.batches.borrow();
+        assert_eq!(batches[0].observations.len(), PAGE_LIMIT);
+        assert!(!batches[0].snapshot_complete);
+        assert_eq!(batches[0].health.state, "degraded");
+        assert_eq!(
+            batches[0].health.error_category.as_deref(),
+            Some("provider_error")
+        );
+        assert!(checkpoints.load().last_complete_snapshot_at.is_none());
     }
 
     #[test]
@@ -3293,6 +3635,17 @@ mod tests {
             CloudSessionCycleOutcome::CircuitOpen
         );
         assert_eq!(runner.calls.get(), 1);
+    }
+
+    #[test]
+    fn collector_cadence_and_backoff_remain_load_bounded() {
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(5 * 60));
+        assert_eq!(MAX_JITTER, Duration::from_secs(20));
+        assert!(MAX_JITTER < POLL_INTERVAL);
+        assert_eq!(HEALTH_HEARTBEAT_INTERVAL, TimeDuration::hours(1));
+        assert_eq!(backoff_seconds(1), 120);
+        assert_eq!(backoff_seconds(6), 3_840);
+        assert_eq!(backoff_seconds(100), 3_840);
     }
 
     #[test]
@@ -3333,10 +3686,10 @@ mod tests {
     }
 
     #[test]
-    fn sixty_item_fixture_stays_inside_page_and_wall_time_caps() {
+    fn two_hundred_item_fixture_stays_inside_batch_and_wall_time_caps() {
         let (grants, checkpoints) = stores("load");
         enabled(&grants);
-        let batch_page = |start: u32, cursor: Option<&str>| {
+        let batch_page = |start: u32, cursor: Value| {
             let tasks = (start..start + PAGE_LIMIT as u32)
                 .map(|id| {
                     json!({"id":format!("provider-{id}"),"status":"running","updated_at":"2026-07-21T11:00:00Z"})
@@ -3344,12 +3697,18 @@ mod tests {
                 .collect::<Vec<_>>();
             json!({"tasks":tasks,"next_cursor":cursor}).to_string()
         };
+        let pages = (0..MAX_PAGES)
+            .map(|index| {
+                let cursor = if index + 1 == MAX_PAGES {
+                    Value::Null
+                } else {
+                    json!(format!("cursor-{}", index + 1))
+                };
+                batch_page((index * PAGE_LIMIT) as u32, cursor)
+            })
+            .collect::<Vec<_>>();
         let runner = Pages {
-            pages: RefCell::new(vec![
-                batch_page(0, Some("cursor-1")),
-                batch_page(20, Some("cursor-2")),
-                batch_page(40, Some("cursor-3")),
-            ]),
+            pages: RefCell::new(pages),
             calls: Cell::new(0),
             revoke: None,
         };
@@ -3365,6 +3724,13 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(runner.calls.get(), MAX_PAGES);
-        assert_eq!(transport.batches.borrow()[0].observations.len(), MAX_ITEMS);
+        let batches = transport.batches.borrow();
+        assert_eq!(batches[0].observations.len(), MAX_ITEMS);
+        assert!(batches[0].snapshot_complete);
+
+        let mut oversized = serde_json::to_value(&batches[0]).unwrap();
+        let row = oversized["observations"][0].clone();
+        oversized["observations"] = Value::Array(vec![row; MAX_ITEMS + 1]);
+        assert!(serde_json::from_value::<CloudSessionObservationBatchV1>(oversized).is_err());
     }
 }

@@ -1,5 +1,9 @@
 # Cloud Session Transport Alignment
 
+> Updated by `session-2026-07-22-cloud-session-complete-snapshots.md`: the
+> strict v1 batch now distinguishes snapshots from heartbeats and carries an
+> explicit completeness proof. Production activation still remains deferred.
+
 Aligned the public Codex cloud-session collector to the private backend's
 strict, content-free contract without activating collection or releasing a new
 runtime.
@@ -49,11 +53,11 @@ runtime.
   device-secret relay-token path, caches one token in memory, and refreshes once
   on 401/403. Tokens and response bodies are not persisted or logged.
 - Added a separate bounded authenticated grant-list preflight before every
-  five-minute provider cycle. Network/auth/parse/absence failures stop before
+  provider cycle. Network/auth/parse/absence failures stop before
   Codex invocation, as do server disabled/revoked responses. Upload wiring alone
   is not reported transport-ready; the prepared relay remains deferred until an
   ordinary-user revalidation channel is composed.
-- Unchanged five-minute entity polls remain a local transport no-op. Successful
+- Unchanged entity polls remain a local transport no-op. Successful
   observation uploads also carry health; otherwise one empty, health-only batch
   is eligible hourly. This stays safely below the backend's two-hour stale
   boundary while avoiding observation or Sessions GOLD writes.
@@ -67,8 +71,8 @@ runtime.
   `provider_payload_invalid` and can never become a healthy empty observation.
   The health upload maps this local detail to the backend's strict
   `provider_error` enum.
-- Existing caps remain three pages, 60 observations, 45 seconds per cycle, and
-  12 seconds per Codex CLI process. Provider timestamps after collection,
+- Current caps are ten pages, 200 observations, 45 seconds per cycle, and 12
+  seconds per Codex CLI process. Provider timestamps after collection,
   inconsistent chronology, and attempts above 100,000 are dropped locally
   instead of causing retry churn.
 
@@ -78,7 +82,8 @@ Production `spawn_cloud_session_collector` remains hard-wired to
 `DeferredCloudSessionTransport`; no Codex runner or network transport can start.
 Do not activate or release 0.1.90 until all are true:
 
-1. Private backend foundation is landed and deployed.
+1. Private backend Phase 10, including strict snapshot completeness, is landed
+   and deployed.
 2. Retention/cardinality/prune/delete-cost evidence is green.
 3. Authenticated companion setup/revoke composition is landed and QA'd.
 4. Demo-user consent, revocation, privacy, load, and stale-freshness QA pass.

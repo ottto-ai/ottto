@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 246,
-  "content_sha256": "b5bc68fd4335a005d6587cfe542809bdf81d69242f17957db7bed6b150bd34a4",
+  "candidate_file_count": 247,
+  "content_sha256": "5d9d08b7f2aa12692eb66fc14e0bb5494690f832e85e8dda0eb4f61322c43e2f",
   "files": [
     {
       "executable": false,
@@ -237,15 +237,15 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/POLICY.md",
-      "sha256": "0458b97464f223bb88df3b20def0ab17f38e3ca8e55368978b8498fc4e226445",
-      "size_bytes": 7776
+      "sha256": "3e16598d8caf7b917eb088ae139e2955212ce6cc279eed9e22386bc42d3919fc",
+      "size_bytes": 8673
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/README.md",
-      "sha256": "9748621d282580d8bab0f647af749724de639ea4ea841aaf4dc7c6e46cb57754",
-      "size_bytes": 3614
+      "sha256": "00fd602fccfdb8a786bf707274aa2440d1fcb0d9dbccbc66c93d30a1efff9b09",
+      "size_bytes": 3938
     },
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "ab147449c8943ddb23cb1bd0944e31e4955c91671b5c20e4e3338d8ce92b13e6",
-      "size_bytes": 130407
+      "sha256": "0b43b741f8a6fe1563e5cc976c3e0a91da06426a66ba2029a5258ce17ad6809f",
+      "size_bytes": 143924
     },
     {
       "executable": false,
@@ -881,8 +881,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "38e698f9bb3d42f0068c1acb2a7bb815801ca9d1abceae430611f10b0b9f6529",
-      "size_bytes": 7475
+      "sha256": "7607e6afc7e7927f3956121db4616140f81bf3f524d29f96169d3b51c436b935",
+      "size_bytes": 8189
     },
     {
       "executable": false,
@@ -923,15 +923,22 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-21-cloud-session-transport-alignment.md",
-      "sha256": "36cc42fdc687fde7cda52fe1450c3e321053ab286620a0bdaef4b4b8995c488a",
-      "size_bytes": 6335
+      "sha256": "6e730189c0020d8a974a2aea7810f6489e6a54ad8ce9fe001024b8fd8c54e42f",
+      "size_bytes": 6578
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-21-codex-cloud-sessions-collector.md",
-      "sha256": "112832acb6a61e7d9132c6c4737ce17eca300d7e6f8690c1ab9f0d6018d546fc",
-      "size_bytes": 2968
+      "sha256": "b0bbd5a88717c9edcae4976a606906bc7643ec67dca690d160783149fbbd4be3",
+      "size_bytes": 3162
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-22-cloud-session-complete-snapshots.md",
+      "sha256": "85c363dc6297f3e76e46a1d02fc381e2e70c224fb8c5d161ed3772eb6ae771b5",
+      "size_bytes": 4437
     },
     {
       "executable": false,
@@ -1725,9 +1732,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-21T20:55:41+00:00",
+  "generated_at": "2026-07-22T00:39:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 247,
+  "output_file_count": 248,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1761,5 +1768,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ad6b08efd0182cacabd38f621778c32b188676ee"
+  "source_commit": "4d282255fc345d8b2fc7489e56ae5239e08238f3"
 }
