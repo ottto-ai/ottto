@@ -366,7 +366,11 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   cleanup when the backend cannot be reached or the website state is stale.
   Neither mode clears account/device identity while Cloud sessions still needs
   an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
-  confirmation, then retry logout.
+  confirmation, then retry logout. Browser claim completion and setup-driven
+  relay-device registration use the same guard before any backend identity
+  rotation. While one accepted identity update is in flight, competing setup,
+  logout, device writes, and Cloud-session mutations fail with
+  `identity_mutation_in_progress` and are safe to retry.
 - native app account-state UX now treats browser login and local app binding as
   separate states: Verify returns a sign-in-specific message when no local
   account is bound, and the SwiftUI app keeps polling a pending browser claim so

@@ -34,6 +34,14 @@ activation without changing public startup.
   release the lifecycle lock while waiting for the provider-call fence, and
   Revoke then reacquires it and revalidates exact account/device identity before
   binding a raced POST response or returning the DELETE target.
+- Backend-mutating claim completion and setup-driven relay-device registration
+  acquire a process-local RAII identity reservation under that lifecycle lock
+  before sending the request. A pending/active/unconfirmed grant prevents the
+  request entirely. On a clean start, the mutex is released for network I/O;
+  Cloud-session mutations and every local account/device writer remain blocked
+  until the response is installed against an exact account/device snapshot.
+  Reset and staged account switch use the same reservation around their remote
+  disconnect phases. The reservation clears on success, error, or panic.
 
 ## Runtime authority and stop fence
 
@@ -211,6 +219,12 @@ Authorization: Bearer <source-scoped relay token>
   lifecycle lock is available during the idle wait and that a raced identity
   change is rejected before a Revoke DELETE target is returned. A malformed
   grant store also blocks reset.
+- Backend-mutation race tests prove pending and bound grants prevent claim or
+  device-registration requests entirely (including cross-account takeover),
+  and prove an observed clean request releases the lifecycle mutex while its
+  reservation rejects Prepare, reset, device persistence, and a second
+  reservation. Releasing each controlled response installs the exact new
+  identity atomically; panic coverage proves the reservation cannot strand.
 - Protocol completed with 36 passed/1 intentionally ignored; the focused
   cloud-session module completed with 60 passed; both cloud control workflows,
   formatting, and Clippy with warnings denied passed.

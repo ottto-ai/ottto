@@ -146,6 +146,10 @@ pub enum LocalApiError {
         "cloud-session cleanup is required before changing this Mac's Ottto account or device; revoke Cloud sessions in the Ottto app and wait for confirmation, then retry"
     )]
     CloudSessionCleanupRequired,
+    #[error(
+        "another Ottto account or device update is in progress; wait for it to finish, then retry"
+    )]
+    IdentityMutationInProgress,
     #[error("invalid local control request: {0}")]
     InvalidRequest(String),
     #[error("Ottto found a manually edited managed fence and needs you to review it.")]

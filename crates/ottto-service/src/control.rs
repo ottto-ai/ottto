@@ -54,6 +54,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -110,11 +111,93 @@ const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
 // admission. The same lock must cover the grant preflight and the identity
 // write/reset so a concurrent prepare/bind cannot strand cleanup authority.
 static SETUP_RUN_BINDING_LOCK: Mutex<()> = Mutex::new(());
+static IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(0);
+static NEXT_IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
 fn lock_setup_run_binding() -> MutexGuard<'static, ()> {
     SETUP_RUN_BINDING_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalIdentityAuthoritySnapshot {
+    account: LocalAccountBinding,
+    device: Option<LocalDeviceBinding>,
+}
+
+struct IdentityMutationReservation {
+    id: u64,
+    snapshot: LocalIdentityAuthoritySnapshot,
+}
+
+impl IdentityMutationReservation {
+    fn validate_locked(&self) -> Result<(), LocalApiError> {
+        require_identity_mutation_reservation(Some(self))?;
+        if load_local_identity_authority_snapshot()? != self.snapshot {
+            return Err(LocalApiError::IdentityMutationInProgress);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IdentityMutationReservation {
+    fn drop(&mut self) {
+        let _ = IDENTITY_MUTATION_RESERVATION.compare_exchange(
+            self.id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+fn reserve_identity_mutation(
+    pause_enabled_on_cleanup_required: bool,
+) -> Result<IdentityMutationReservation, LocalApiError> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    require_identity_mutation_reservation(None)?;
+    let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
+    if pause_enabled_on_cleanup_required {
+        require_cloud_session_cleanup_before_identity_change(&grants)?;
+    } else {
+        require_cloud_session_cleanup_before_identity_change_without_pause(&grants)?;
+    }
+    let snapshot = load_local_identity_authority_snapshot()?;
+    let id = NEXT_IDENTITY_MUTATION_RESERVATION.fetch_add(1, Ordering::Relaxed);
+    if id == 0
+        || IDENTITY_MUTATION_RESERVATION
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return Err(LocalApiError::IdentityMutationInProgress);
+    }
+    Ok(IdentityMutationReservation { id, snapshot })
+}
+
+fn require_identity_mutation_reservation(
+    owner: Option<&IdentityMutationReservation>,
+) -> Result<(), LocalApiError> {
+    let active = IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire);
+    if match owner {
+        Some(owner) => active == owner.id,
+        None => active == 0,
+    } {
+        Ok(())
+    } else {
+        Err(LocalApiError::IdentityMutationInProgress)
+    }
+}
+
+fn load_local_identity_authority_snapshot() -> Result<LocalIdentityAuthoritySnapshot, LocalApiError>
+{
+    let account = FileAccountStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let device = FileDeviceStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    Ok(LocalIdentityAuthoritySnapshot { account, device })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1996,6 +2079,9 @@ fn cloud_sessions_control_with_stores(
     // through the grant transition. Identity reset/replacement paths acquire
     // this same lock around their grant preflight and filesystem mutation.
     let identity_lifecycle_lock = lock_setup_run_binding();
+    if action != CloudSessionsControlAction::Status {
+        require_identity_mutation_reservation(None)?;
+    }
 
     let account = accounts.load().map_err(|_| {
         LocalApiError::LocalOperationFailed(
@@ -2352,6 +2438,11 @@ fn complete_pending_auth_claim(
     machine: &MachineIdentity,
     pending: PendingAuthClaim,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
+    // Claim completion can rotate/revoke backend device credentials. Reserve
+    // identity mutation before that remote side effect, but release the
+    // lifecycle mutex during network I/O. The RAII guard blocks concurrent
+    // Cloud-session admission and clears on every return or panic.
+    let identity_reservation = reserve_identity_mutation(false)?;
     let completed = match complete_setup_claim(&pending, machine) {
         Ok(completed) => completed,
         Err(error) => {
@@ -2406,7 +2497,10 @@ fn complete_pending_auth_claim(
         });
     }
     let _binding_lock = lock_setup_run_binding();
-    require_cloud_session_cleanup_before_account_replacement(&account)?;
+    identity_reservation.validate_locked()?;
+    require_cloud_session_cleanup_before_identity_change_without_pause(
+        &crate::cloud_sessions::CloudSessionGrantStore::default(),
+    )?;
     // Persist the server-issued backfill policy BEFORE committing any of the
     // new binding (token, relay credentials, account/connection files): if
     // this write failed after the binding were already durable, the daemon
@@ -2424,7 +2518,7 @@ fn complete_pending_auth_claim(
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let relay_credentials_persisted = match &relay_credentials {
         Some((device, secret)) => {
-            persist_relay_device_credentials_locked(device, secret)?;
+            persist_relay_device_credentials_locked(device, secret, Some(&identity_reservation))?;
             true
         }
         None => false,
@@ -2491,15 +2585,10 @@ fn auth_switch_account(
     // the browser has completed the exact grant DELETE + local confirmation.
     // This check must precede `take_staged_account_switch`, which mutates the
     // in-memory switch state.
-    {
-        let _identity_lifecycle_lock = lock_setup_run_binding();
-        require_cloud_session_cleanup_before_identity_change(
-            &crate::cloud_sessions::CloudSessionGrantStore::default(),
-        )?;
-    }
+    let identity_reservation = reserve_identity_mutation(true)?;
     let staged = daemon.take_staged_account_switch(claim_code)?;
     disconnect_previous_binding_best_effort(daemon);
-    match install_staged_account_switch(daemon, &staged) {
+    match install_staged_account_switch(daemon, &staged, &identity_reservation) {
         Ok(response) => Ok(response),
         Err(error) => {
             // Keep the staged completion so the user can retry the confirm
@@ -2539,15 +2628,17 @@ fn disconnect_previous_binding_best_effort(daemon: &LocalDaemon) {
 fn install_staged_account_switch(
     daemon: &LocalDaemon,
     staged: &StagedAccountSwitch,
+    identity_reservation: &IdentityMutationReservation,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
     let _binding_lock = lock_setup_run_binding();
+    identity_reservation.validate_locked()?;
     // Defense in depth for direct/internal callers and for a grant transition
     // that raced the earlier auth-switch preflight. No account/device file is
     // changed before this second fail-closed check.
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    reset_local_account_files_locked()?;
+    reset_local_account_files_locked(Some(identity_reservation))?;
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
     // Persist the server-issued backfill policy BEFORE committing the new
@@ -2569,7 +2660,7 @@ fn install_staged_account_switch(
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let relay_credentials_persisted = match (&staged.relay_device, &staged.relay_device_secret) {
         (Some(device), Some(secret)) => {
-            persist_relay_device_credentials_locked(device, secret)?;
+            persist_relay_device_credentials_locked(device, secret, Some(identity_reservation))?;
             true
         }
         _ => false,
@@ -2713,26 +2804,32 @@ fn persist_relay_device_credentials(
     device_secret: &str,
 ) -> Result<(), LocalApiError> {
     let _identity_lifecycle_lock = lock_setup_run_binding();
-    persist_relay_device_credentials_locked(device, device_secret)
+    persist_relay_device_credentials_locked(device, device_secret, None)
 }
 
 fn persist_relay_device_credentials_locked(
     device: &LocalDeviceBinding,
     device_secret: &str,
+    reservation: Option<&IdentityMutationReservation>,
 ) -> Result<(), LocalApiError> {
-    save_relay_device_binding_locked(device)?;
+    save_relay_device_binding_locked(device, reservation)?;
     KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
         .save(device_secret)
         .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn save_relay_device_binding(device: &LocalDeviceBinding) -> Result<(), LocalApiError> {
     let _identity_lifecycle_lock = lock_setup_run_binding();
-    save_relay_device_binding_locked(device)
+    save_relay_device_binding_locked(device, None)
 }
 
-fn save_relay_device_binding_locked(device: &LocalDeviceBinding) -> Result<(), LocalApiError> {
+fn save_relay_device_binding_locked(
+    device: &LocalDeviceBinding,
+    reservation: Option<&IdentityMutationReservation>,
+) -> Result<(), LocalApiError> {
+    require_identity_mutation_reservation(reservation)?;
     let store = FileDeviceStore::default();
     let current = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
     let changes_cleanup_authority = match current.as_ref() {
@@ -2751,6 +2848,7 @@ fn save_relay_device_binding_locked(device: &LocalDeviceBinding) -> Result<(), L
     store.save(device).map_err(|_| LocalApiError::StatePoisoned)
 }
 
+#[cfg(test)]
 fn require_cloud_session_cleanup_before_account_replacement(
     next: &LocalAccountBinding,
 ) -> Result<(), LocalApiError> {
@@ -2793,12 +2891,7 @@ fn auth_reset(
     // Both ordinary and explicit local-only logout clear the account/device
     // authority needed for exact backend cleanup, so neither may strand an
     // unconfirmed cloud-session grant.
-    {
-        let _identity_lifecycle_lock = lock_setup_run_binding();
-        require_cloud_session_cleanup_before_identity_change(
-            &crate::cloud_sessions::CloudSessionGrantStore::default(),
-        )?;
-    }
+    let identity_reservation = reserve_identity_mutation(true)?;
     let mut cloud_disconnect: Option<SetupRunDisconnectResponse> = None;
 
     if !local_only {
@@ -2816,7 +2909,14 @@ fn auth_reset(
         )?);
     }
 
-    reset_local_account_files()?;
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        reset_local_account_files_locked(Some(&identity_reservation))?;
+    }
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
     let mut reset = daemon.reset_account_for_authorized_client()?;
@@ -2843,12 +2943,16 @@ fn auth_reset(
     Ok(reset)
 }
 
+#[cfg(test)]
 fn reset_local_account_files() -> Result<(), LocalApiError> {
     let _identity_lifecycle_lock = lock_setup_run_binding();
-    reset_local_account_files_locked()
+    reset_local_account_files_locked(None)
 }
 
-fn reset_local_account_files_locked() -> Result<(), LocalApiError> {
+fn reset_local_account_files_locked(
+    reservation: Option<&IdentityMutationReservation>,
+) -> Result<(), LocalApiError> {
+    require_identity_mutation_reservation(reservation)?;
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
@@ -2873,13 +2977,7 @@ fn require_cloud_session_cleanup_before_identity_change(
     else {
         return Ok(());
     };
-    if grant.status == crate::cloud_sessions::CloudSessionGrantStatus::Revoked
-        && !grant.backend_create_pending
-        && match grant.backend_binding.as_ref() {
-            Some(binding) => binding.backend_revoked,
-            None => true,
-        }
-    {
+    if cloud_session_cleanup_is_confirmed(&grant) {
         return Ok(());
     }
     // A logout/switch/identity-rotation attempt is itself a stop intent. Close
@@ -2892,6 +2990,31 @@ fn require_cloud_session_cleanup_before_identity_change(
             .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
     }
     Err(LocalApiError::CloudSessionCleanupRequired)
+}
+
+fn require_cloud_session_cleanup_before_identity_change_without_pause(
+    grants: &crate::cloud_sessions::CloudSessionGrantStore,
+) -> Result<(), LocalApiError> {
+    let grant = grants
+        .load()
+        .map_err(|_| LocalApiError::CloudSessionCleanupRequired)?;
+    if match grant.as_ref() {
+        Some(grant) => cloud_session_cleanup_is_confirmed(grant),
+        None => true,
+    } {
+        Ok(())
+    } else {
+        Err(LocalApiError::CloudSessionCleanupRequired)
+    }
+}
+
+fn cloud_session_cleanup_is_confirmed(grant: &crate::cloud_sessions::CloudSessionGrant) -> bool {
+    grant.status == crate::cloud_sessions::CloudSessionGrantStatus::Revoked
+        && !grant.backend_create_pending
+        && match grant.backend_binding.as_ref() {
+            Some(binding) => binding.backend_revoked,
+            None => true,
+        }
 }
 
 fn cloud_logout_requires_connection_error() -> LocalApiError {
@@ -3681,6 +3804,13 @@ fn cli_error(error: LocalApiError) -> CliError {
             details.insert(
                 "reason_code".to_string(),
                 RedactedValue::String("cloud_session_cleanup_required".to_string()),
+            );
+            CliErrorCode::NeedsUserAction
+        }
+        LocalApiError::IdentityMutationInProgress => {
+            details.insert(
+                "reason_code".to_string(),
+                RedactedValue::String("identity_mutation_in_progress".to_string()),
             );
             CliErrorCode::NeedsUserAction
         }
@@ -4893,6 +5023,10 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
             "cloud_session_cleanup_required",
             error.to_string(),
         ),
+        LocalApiError::IdentityMutationInProgress => (
+            "identity_mutation_in_progress",
+            error.to_string(),
+        ),
         LocalApiError::InvalidRequest(_) => (
             "invalid_setup_action",
             "Ottto could not run this setup action. Start setup again from the Ottto app.".to_string(),
@@ -5096,9 +5230,14 @@ fn run_install_source_action(
             device_id: None,
         },
     )?;
+    // Device registration can rotate/revoke backend device credentials. Hold
+    // a panic-safe reservation across that remote side effect and the exact
+    // local identity install, while leaving the lifecycle mutex free during
+    // network I/O.
+    let identity_reservation = reserve_identity_mutation(false)?;
     let registered = register_telemetry_device(api_base_url, &install_session, machine)?;
     let device_id = registered.device.id.clone();
-    save_relay_device_binding(&LocalDeviceBinding {
+    let device = LocalDeviceBinding {
         device_id: registered.device.id.clone(),
         machine_id: registered
             .device
@@ -5107,10 +5246,20 @@ fn run_install_source_action(
             .or_else(|| credentials.connection.machine_id.clone())
             .or_else(|| Some(machine.machine_id.clone())),
         sources: registered.device.sources.clone(),
-    })?;
-    KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
-        .save(&registered.device_secret)
-        .map_err(|_| LocalApiError::StatePoisoned)?;
+    };
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        persist_relay_device_credentials_locked(
+            &device,
+            &registered.device_secret,
+            Some(&identity_reservation),
+        )?;
+    }
+    drop(identity_reservation);
     // The local device binding + secret are now durable. Wake the snapshot
     // collector before any backend completion/event call that can transiently
     // fail after registration has already succeeded.
@@ -12824,7 +12973,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("remote validation response completed");
 
-        reset_local_account_files_locked().expect("reset wins while admission is fenced");
+        reset_local_account_files_locked(None).expect("reset wins while admission is fenced");
         drop(lifecycle_lock);
         assert!(matches!(
             worker.join().unwrap(),
@@ -12954,6 +13103,363 @@ mod tests {
                 .device_id,
             device_id
         );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_never_mutates_backend_before_cloud_cleanup() {
+        let _guard = lock_backend_test_env();
+        for bind_backend in [false, true] {
+            let root = telemetry_key_store_root(if bind_backend {
+                "claim-reservation-active-grant"
+            } else {
+                "claim-reservation-pending-grant"
+            });
+            let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let account = connected_account();
+            let device = LocalDeviceBinding {
+                device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            };
+            FileAccountStore::default().save(&account).unwrap();
+            FileDeviceStore::default().save(&device).unwrap();
+            let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
+            let local = grants
+                .enable(
+                    &crate::cloud_sessions::CloudSessionGrantSetup {
+                        installation_id: device.device_id.clone(),
+                        organization_scope: "org_test".to_string(),
+                        effective_user_scope: "user_test".to_string(),
+                    },
+                    time::OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+            grants.grant_create_request(&device.device_id).unwrap();
+            if bind_backend {
+                grants
+                    .bind_backend_grant(
+                        &cloud_control_backend_grant(&local, &device.device_id, "enabled", 1),
+                        &device.device_id,
+                    )
+                    .unwrap();
+            }
+            let before = grants.load().unwrap().unwrap();
+            let (api_base, observed) = observed_cross_account_claim_completion_server();
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            let pending = PendingAuthClaim {
+                claim_code: "claim_cross_account".to_string(),
+                claim_token: "claim_token_cross_account".to_string(),
+                nonce: "nonce_cross_account".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_cross_account".to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+            };
+
+            assert!(matches!(
+                complete_pending_auth_claim(
+                    &daemon().with_account(account.clone()),
+                    &test_machine(),
+                    pending
+                ),
+                Err(LocalApiError::CloudSessionCleanupRequired)
+            ));
+            assert!(
+                observed
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_none(),
+                "cross-account completion must not reach backend before cleanup"
+            );
+            assert_eq!(grants.load().unwrap().unwrap(), before);
+            assert_eq!(FileAccountStore::default().load().unwrap(), account);
+            assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+            assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_reservation_blocks_prepare_and_identity_writers_until_install() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("claim-reservation-clean-race");
+        let secret_root = telemetry_key_store_root("claim-reservation-clean-race-secret");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let old_device = LocalDeviceBinding {
+            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&old_device).unwrap();
+        let pending = PendingAuthClaim {
+            claim_code: "claim_reserved".to_string(),
+            claim_token: "claim_token_reserved".to_string(),
+            nonce: "nonce_reserved".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_reserved".to_string(),
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        let daemon = Arc::new(daemon().with_account(account.clone()));
+        daemon.begin_auth_with_claim(pending.clone()).unwrap();
+        let (claim_api, request_seen, allow_response) = controlled_claim_completion_server();
+        let _claim_api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &claim_api);
+        let worker_daemon = Arc::clone(&daemon);
+        let worker_pending = pending.clone();
+        let worker = thread::spawn(move || {
+            complete_pending_auth_claim(worker_daemon.as_ref(), &test_machine(), worker_pending)
+        });
+        request_seen
+            .recv_timeout(Duration::from_secs(2))
+            .expect("claim completion reached controlled backend");
+        assert_ne!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            reset_local_account_files(),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        assert!(matches!(
+            save_relay_device_binding(&LocalDeviceBinding {
+                device_id: "device_competing_writer".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            }),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        assert!(matches!(
+            reserve_identity_mutation(false),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        assert_eq!(
+            FileDeviceStore::default().load().unwrap(),
+            Some(old_device.clone())
+        );
+
+        let prepare_action = CloudSessionsControlAction::Prepare;
+        let prepare_slug = cloud_sessions_action_slug(&prepare_action);
+        let validation_api = cloud_control_validation_server(
+            prepare_slug,
+            "claim-race-prepare",
+            &old_device.device_id,
+        );
+        {
+            let _validation_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &validation_api);
+            assert!(matches!(
+                cloud_sessions_control(
+                    prepare_action,
+                    SecretString::new(test_control_token(prepare_slug, "codex", 240)),
+                    None,
+                    None,
+                ),
+                Err(LocalApiError::IdentityMutationInProgress)
+            ));
+        }
+        assert!(crate::cloud_sessions::CloudSessionGrantStore::default()
+            .load()
+            .unwrap()
+            .is_none());
+
+        allow_response.send(()).unwrap();
+        let completed = worker
+            .join()
+            .unwrap()
+            .expect("claim installs after release");
+        assert_eq!(completed.account.user.unwrap().id, "user_test");
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .unwrap()
+                .unwrap()
+                .device_id,
+            "device_reserved_claim"
+        );
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn identity_mutation_reservation_clears_after_panic() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("identity-reservation-panic");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+
+        let panic_result = std::panic::catch_unwind(|| {
+            let _reservation = reserve_identity_mutation(false).unwrap();
+            panic!("exercise reservation RAII cleanup");
+        });
+        assert!(panic_result.is_err());
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+
+        let reservation = reserve_identity_mutation(false).unwrap();
+        assert_ne!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+        drop(reservation);
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn install_registration_never_mutates_backend_before_cloud_cleanup() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("install-reservation-active-grant");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string(), "pi".to_string()],
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&device).unwrap();
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
+        let local = grants
+            .enable(
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device.device_id.clone(),
+                    organization_scope: "org_test".to_string(),
+                    effective_user_scope: "user_test".to_string(),
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        grants.grant_create_request(&device.device_id).unwrap();
+        grants
+            .bind_backend_grant(
+                &cloud_control_backend_grant(&local, &device.device_id, "enabled", 1),
+                &device.device_id,
+            )
+            .unwrap();
+        let grant_before = grants.load().unwrap().unwrap();
+        let (api_base, register_observed) = observed_install_registration_server();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_install_blocked".to_string(),
+            setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base.clone(),
+        };
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "otsr_install_blocked".to_string(),
+            connection: connection.clone(),
+        };
+        let daemon = daemon()
+            .with_account(account.clone())
+            .with_connection(Some(connection));
+        let action = SetupRunActionApiResponse {
+            id: "action_install_blocked".to_string(),
+            action_type: "install_source".to_string(),
+            source: Some("pi".to_string()),
+        };
+
+        assert!(matches!(
+            run_install_source_action(
+                &daemon,
+                &api_base,
+                &mut credentials,
+                &action,
+                &test_machine(),
+            ),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        ));
+        assert!(
+            !register_observed
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            "device registration must not reach backend before cleanup"
+        );
+        assert_eq!(grants.load().unwrap().unwrap(), grant_before);
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+    }
+
+    #[test]
+    #[serial]
+    fn install_registration_reservation_blocks_prepare_until_local_install() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("install-reservation-clean-race");
+        let secret_root = telemetry_key_store_root("install-reservation-clean-race-secret");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let old_device = LocalDeviceBinding {
+            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string(), "pi".to_string()],
+        };
+        FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default().save(&old_device).unwrap();
+        let (api_base, register_seen, allow_register) = controlled_install_registration_server();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_install_reserved".to_string(),
+            setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url: api_base.clone(),
+        };
+        let worker_daemon = Arc::new(
+            daemon()
+                .with_account(account)
+                .with_connection(Some(connection.clone())),
+        );
+        let worker_api = api_base.clone();
+        let worker = thread::spawn(move || {
+            let mut credentials = SetupRunCredentials {
+                setup_run_token: "otsr_install_reserved".to_string(),
+                connection,
+            };
+            run_install_source_action(
+                worker_daemon.as_ref(),
+                &worker_api,
+                &mut credentials,
+                &SetupRunActionApiResponse {
+                    id: "action_install_reserved".to_string(),
+                    action_type: "install_source".to_string(),
+                    source: Some("pi".to_string()),
+                },
+                &test_machine(),
+            )
+        });
+        register_seen
+            .recv_timeout(Duration::from_secs(2))
+            .expect("registration reached controlled backend");
+        assert_ne!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
+
+        let prepare_action = CloudSessionsControlAction::Prepare;
+        let prepare_slug = cloud_sessions_action_slug(&prepare_action);
+        let validation_api = cloud_control_validation_server(
+            prepare_slug,
+            "install-race-prepare",
+            &old_device.device_id,
+        );
+        let _validation_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &validation_api);
+        assert!(matches!(
+            cloud_sessions_control(
+                prepare_action,
+                SecretString::new(test_control_token(prepare_slug, "codex", 240)),
+                None,
+                None,
+            ),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        assert!(crate::cloud_sessions::CloudSessionGrantStore::default()
+            .load()
+            .unwrap()
+            .is_none());
+
+        allow_register.send(()).unwrap();
+        let result = worker
+            .join()
+            .unwrap()
+            .expect("registration installs after release");
+        assert_eq!(result.0, "succeeded");
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .unwrap()
+                .unwrap()
+                .device_id,
+            "device_reserved_install"
+        );
+        assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -17482,6 +17988,147 @@ log_user_prompt = true
             allow_response_tx,
             response_sent_rx,
         )
+    }
+
+    fn observed_cross_account_claim_completion_server() -> (String, mpsc::Receiver<Option<String>>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().expect("claim backend address");
+        let (observed_tx, observed_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_complete_http_request(&mut stream);
+                        write_json_response(
+                            &mut stream,
+                            200,
+                            "OK",
+                            r#"{"setup_run_id":"setup_cross_account","setup_run_token":"otsr_cross_account","setup_run_token_expires_at":"2030-01-01T00:00:00Z","machine_id":"machine_test","relay_device":{"id":"device_cross_account","machine_id":"machine_test","sources":["codex"]},"relay_device_secret":"relay_cross_account","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_other","email":"other@example.com","display_name":null},"organization":{"id":"org_other","name":"Other Org"}}"#,
+                        );
+                        observed_tx.send(Some(request)).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            observed_tx.send(None).unwrap();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept claim completion: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), observed_rx)
+    }
+
+    fn controlled_claim_completion_server() -> (String, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
+        let address = listener.local_addr().expect("claim backend address");
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let (allow_response_tx, allow_response_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept claim completion");
+            read_complete_http_request(&mut stream);
+            request_seen_tx.send(()).unwrap();
+            allow_response_rx.recv().unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_reserved_claim","setup_run_token":"otsr_reserved_claim","setup_run_token_expires_at":"2030-01-01T00:00:00Z","machine_id":"machine_test","relay_device":{"id":"device_reserved_claim","machine_id":"machine_test","sources":["codex"]},"relay_device_secret":"relay_reserved_claim","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_test","email":"user@example.com","display_name":null},"organization":{"id":"org_test","name":"Test Org"}}"#,
+            );
+        });
+        (
+            format!("http://{address}"),
+            request_seen_rx,
+            allow_response_tx,
+        )
+    }
+
+    fn controlled_install_registration_server() -> (String, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind install backend");
+        let address = listener.local_addr().expect("install backend address");
+        let (register_seen_tx, register_seen_rx) = mpsc::channel();
+        let (allow_register_tx, allow_register_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().expect("accept install request");
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/local-client/install-sessions") {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"install_session_id":"install_reserved","install_session_token":"install_token_reserved"}"#,
+                    );
+                } else if request.contains("/api/v1/telemetry/devices/register") {
+                    register_seen_tx.send(()).unwrap();
+                    allow_register_rx.recv().unwrap();
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_reserved_install"}"#,
+                    );
+                } else {
+                    write_json_response(&mut stream, 200, "OK", "{}");
+                }
+            }
+        });
+        (
+            format!("http://{address}"),
+            register_seen_rx,
+            allow_register_tx,
+        )
+    }
+
+    fn observed_install_registration_server() -> (String, mpsc::Receiver<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind install backend");
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().expect("install backend address");
+        let (observed_tx, observed_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_complete_http_request(&mut stream);
+                        if request.contains("/local-client/install-sessions") {
+                            write_json_response(
+                                &mut stream,
+                                200,
+                                "OK",
+                                r#"{"install_session_id":"install_blocked","install_session_token":"install_token_blocked"}"#,
+                            );
+                        } else if request.contains("/api/v1/telemetry/devices/register") {
+                            write_json_response(
+                                &mut stream,
+                                200,
+                                "OK",
+                                r#"{"device":{"id":"device_should_not_rotate","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_should_not_rotate"}"#,
+                            );
+                            observed_tx.send(true).unwrap();
+                            return;
+                        } else {
+                            write_json_response(&mut stream, 200, "OK", "{}");
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            observed_tx.send(false).unwrap();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept install registration: {error}"),
+                }
+            }
+        });
+        (format!("http://{address}"), observed_rx)
     }
 
     fn cloud_control_validation_rejection_server(action: &str) -> String {

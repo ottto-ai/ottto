@@ -102,6 +102,14 @@ retains the old account/device and exact grant id so the ordinary browser can
 retry DELETE and confirm its monotonic revocation epoch. `--local-only` logout
 does not bypass this reachability guard.
 
+Claim completion and setup-driven relay-device registration can rotate or
+revoke backend credentials, so the daemon checks this reachability guard before
+sending either request. It then holds a process-local, panic-safe identity
+reservation—not the lifecycle mutex—across the bounded network request and
+exact local install. Concurrent Cloud-session admission and account/device
+writes fail retryably; the old backend device is never rotated while cleanup is
+pending, and no provider or backend call runs under the lifecycle mutex.
+
 The strict v2 chunk/finalize relay adapters, exact relay authority read, and
 backend DTOs are present for contract testing, but public service startup
 remains hard-wired to deferred transport. It cannot

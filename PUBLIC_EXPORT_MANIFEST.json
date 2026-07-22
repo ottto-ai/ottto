@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 255,
-  "content_sha256": "2551a61bf53e35bc2a6ea496ab948e9987907eccb1beee26f5958b3d7cda5374",
+  "content_sha256": "6dd25abf66fa5cd5478eec918dd36181c2b25b7ef97ba8d662975064b37c710a",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "e9a184b9a8a185fed0169031d8f3e67b0c25c32c8e4a5eb307bedc9abf832d3c",
-      "size_bytes": 45104
+      "sha256": "f7b3022bacd8d47d5782e7aea0ddb0c72c82c747c4a0879bae362e6c2ec080c3",
+      "size_bytes": 45419
     },
     {
       "executable": false,
@@ -706,8 +706,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "96f9597bad12d3b0595e36546bacc8d96a7e895f739a3201fd2ca1fec0958fa7",
-      "size_bytes": 684502
+      "sha256": "0223e0eaf51bc58d80a3336a23d7a3e4f0ef6671cf128b4576b08258a9d40661",
+      "size_bytes": 713133
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "b19fb743439b4fc6abcf0163945b3406380de91e30af3ec4f4d24833e8eba6c4",
-      "size_bytes": 304957
+      "sha256": "bcf59dfe06efe3d1b0709a11da802ab3de51fbb5423abf43bcfed713a0f51f9c",
+      "size_bytes": 305108
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "97cc0eeb84b9bf614b94ee0564c28ac029e7fc34415859bcea80c315069b5523",
-      "size_bytes": 11990
+      "sha256": "202366aef08e55db302f38142b200c7d6911e6bc78b541ed035b738b93500143",
+      "size_bytes": 12527
     },
     {
       "executable": false,
@@ -965,8 +965,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-22-cloud-session-activation-authority-bridge.md",
-      "sha256": "79461306409e488970dcbe298d9ba0ff08a644146427011a4a43a056e97e4536",
-      "size_bytes": 10867
+      "sha256": "bdfd78187e43edd5d481bd61abc3f011894b10935ac594711d21730dc5aab8a1",
+      "size_bytes": 11937
     },
     {
       "executable": false,
@@ -1788,7 +1788,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T14:54:12+00:00",
+  "generated_at": "2026-07-22T14:54:33+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 256,
   "public_roots": [
@@ -1824,5 +1824,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "0481de50afbacb03fd96edbcfb6b1bc5a94af9be"
+  "source_commit": "15db26cfb3f1942f21fc7e114596f92a46ed0a7d"
 }
