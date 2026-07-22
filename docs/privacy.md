@@ -55,9 +55,10 @@ content-free SHA-256 values; semantic digests exclude observation/collection
 time. Identical response-loss retries reuse the exact chunk or finalize body.
 
 The collector polls no more often than every five minutes plus up to 20 seconds
-of jitter. Normal polls read one head page; unchanged heads upload nothing and
-allow an observation-empty v1 heartbeat hourly. A full scan runs daily and
-until one has completed. Every provider page, chunk, finalize, and heartbeat is
+of jitter. Normal polls read one head page; unchanged heads produce zero
+observation/ingest upload, though mandatory backend grant revalidation still
+occurs, and allow an observation-empty v1 heartbeat hourly. A full scan runs
+daily and until one has completed. Every provider page, chunk, finalize, and heartbeat is
 preceded by local kill/pause/revoke checks and exact backend grant/policy
 revalidation. Only a strictly decoded
 `server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or

@@ -10,7 +10,9 @@ scan protocol while preserving hard-deferred public startup.
   a new UUID from page zero.
 - Each cycle remains limited to ten provider pages and 45 seconds. A scan is
   limited to 100 pages, 2,000 unique observations, and ten ordered chunks of at
-  most 200 observations.
+  most 200 observations. The same deadline covers provider execution, grant
+  revalidation, token refresh, chunk upload, and finalize; an immutable
+  prepared upload resumes next cycle when the budget expires.
 - Chunks contain positive observations only. Finalize is emitted only after a
   terminal, non-truncated provider response. A one-response terminal result of
   at most 20 entities is `single_response`; every multi-page result is
@@ -24,8 +26,12 @@ scan protocol while preserving hard-deferred public startup.
   byte DTO identity.
 - Every provider page and upload revalidates local kill/pause/revoke state and
   the exact backend grant/policy. Normal polls inspect one head page; unchanged
-  heads produce no observation upload, hourly v1 heartbeats remain available,
-  and full scans run daily and until completed.
+  heads produce zero observation/ingest upload while mandatory grant
+  revalidation still occurs, hourly v1 heartbeats remain available, and full
+  scans run daily and until completed.
+- Cycle ownership is reserved under the runtime mutex, but provider and network
+  I/O run after releasing it. Revalidation denial reports an explicit unsent
+  outcome, so no heartbeat or failure-upload checkpoint is fabricated.
 
 ## Activation
 

@@ -1110,12 +1110,26 @@ pub struct CloudSessionObservationChunkV2 {
 impl CloudSessionObservationChunkV2 {
     fn validate_wire_contract(&self) -> Result<()> {
         if !is_uuid(&self.scan_id)
+            || !valid_v2_binding(
+                &self.grant_id,
+                self.grant_version,
+                &self.grant_scope_fingerprint,
+                &self.collector_id,
+                &self.collector_version,
+                &self.account_fingerprint,
+            )
             || self.schema_version != CHUNK_SCHEMA_VERSION
+            || !valid_rfc3339(&self.scan_started_at)
             || usize::from(self.chunk_index) >= MAX_SCAN_CHUNKS
             || self.observations.is_empty()
             || self.observations.len() > MAX_ITEMS
             || !valid_sha256_digest(&self.chunk_identity_digest)
             || !valid_sha256_digest(&self.chunk_semantic_digest)
+            || self
+                .observations
+                .iter()
+                .any(|observation| !valid_v2_observation(observation))
+            || !valid_v2_health(&self.health)
         {
             return Err(anyhow!("invalid cloud-session v2 observation chunk"));
         }
@@ -1158,7 +1172,16 @@ pub struct CloudSessionScanFinalizeV2 {
 impl CloudSessionScanFinalizeV2 {
     fn validate_wire_contract(&self) -> Result<()> {
         if !is_uuid(&self.scan_id)
+            || !valid_v2_binding(
+                &self.grant_id,
+                self.grant_version,
+                &self.grant_scope_fingerprint,
+                &self.collector_id,
+                &self.collector_version,
+                &self.account_fingerprint,
+            )
             || self.schema_version != FINALIZE_SCHEMA_VERSION
+            || !valid_rfc3339(&self.scan_started_at)
             || !self.terminal_reached
             || usize::from(self.chunk_count) > MAX_SCAN_CHUNKS
             || self.unique_entity_count as usize > MAX_SCAN_ITEMS
@@ -1178,6 +1201,74 @@ impl CloudSessionScanFinalizeV2 {
         }
         Ok(())
     }
+}
+
+fn valid_v2_binding(
+    grant_id: &str,
+    grant_version: u64,
+    grant_scope_fingerprint: &str,
+    collector_id: &str,
+    collector_version: &str,
+    account_fingerprint: &str,
+) -> bool {
+    is_uuid(grant_id)
+        && grant_version > 0
+        && valid_hmac_fingerprint(grant_scope_fingerprint)
+        && collector_id == COLLECTOR_ID
+        && collector_version == compiled_release_version()
+        && valid_hmac_fingerprint(account_fingerprint)
+}
+
+fn valid_v2_observation(observation: &CloudSessionObservationEntityV1) -> bool {
+    let coverage = observation
+        .coverage
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let has_timing = observation.created_at.is_some()
+        || observation.started_at.is_some()
+        || observation.updated_at.is_some()
+        || observation.completed_at.is_some();
+    valid_hmac_fingerprint(&observation.entity_key)
+        && observation.entity_kind == "task"
+        && matches!(
+            observation.lifecycle.as_str(),
+            "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown"
+        )
+        && observation
+            .attempt_count
+            .map_or(true, |attempts| attempts <= 100_000)
+        && matches!(
+            observation.environment_kind.as_str(),
+            "hosted" | "container" | "unknown"
+        )
+        && observation.measurement_basis == "not_itemized"
+        && observation.coverage.len() == coverage.len()
+        && coverage
+            .iter()
+            .all(|field| matches!(*field, "identity" | "status" | "timing" | "attempts"))
+        && coverage.contains("identity")
+        && coverage.contains("status")
+        && coverage.contains("timing") == has_timing
+        && coverage.contains("attempts") == observation.attempt_count.is_some()
+        && valid_rfc3339(&observation.observed_at)
+        && [
+            &observation.created_at,
+            &observation.started_at,
+            &observation.updated_at,
+            &observation.completed_at,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| valid_rfc3339(value))
+}
+
+fn valid_v2_health(health: &CloudSessionCollectorHealthV1) -> bool {
+    valid_rfc3339(&health.observed_at)
+        && matches!(
+            (health.state.as_str(), health.error_category.as_deref()),
+            ("healthy", None) | ("degraded", Some("provider_error"))
+        )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1209,6 +1300,8 @@ pub struct CloudSessionCheckpointStore {
 #[derive(Default)]
 struct CloudSessionScanRuntime {
     active: Option<ActiveCloudSessionScan>,
+    cycle_in_progress: bool,
+    cancel_requested: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1275,6 +1368,17 @@ impl Default for CloudSessionCheckpointStore {
 pub trait CloudSessionRunner {
     /// `cursor` may only be retained by the caller for this single cycle.
     fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String>;
+
+    /// Production runners must honor the remaining cycle budget. Test runners
+    /// may use the default because they perform no blocking I/O.
+    fn list_page_bounded(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        _timeout: Duration,
+    ) -> Result<String> {
+        self.list_page(cursor, limit)
+    }
 }
 
 pub trait CloudSessionTransport {
@@ -1300,18 +1404,46 @@ pub trait CloudSessionTransport {
             "cloud-session backend grant revalidation is not configured"
         ))
     }
+    fn revalidate_grant_bounded(
+        &self,
+        grant: &CloudSessionGrant,
+        _timeout: Duration,
+    ) -> Result<CloudSessionBackendGrantResponseV1> {
+        self.revalidate_grant(grant)
+    }
     fn send_scan_chunk(&self, _chunk: &CloudSessionObservationChunkV2) -> Result<()> {
         Err(anyhow!(
             "cloud-session v2 chunk transport is not configured"
         ))
+    }
+    fn send_scan_chunk_bounded(
+        &self,
+        chunk: &CloudSessionObservationChunkV2,
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.send_scan_chunk(chunk)
     }
     fn finalize_scan(&self, _finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
         Err(anyhow!(
             "cloud-session v2 finalize transport is not configured"
         ))
     }
+    fn finalize_scan_bounded(
+        &self,
+        finalize: &CloudSessionScanFinalizeV2,
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.finalize_scan(finalize)
+    }
     /// V1 is retained only for observation-empty health heartbeats.
     fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()>;
+    fn send_bounded(
+        &self,
+        batch: &CloudSessionObservationBatchV1,
+        _timeout: Duration,
+    ) -> Result<()> {
+        self.send(batch)
+    }
 }
 
 /// Deliberately keeps production collection disabled. The strict route and
@@ -1355,43 +1487,56 @@ impl RelayCloudSessionTransport {
         }
     }
 
-    fn token(&self, force_refresh: bool) -> Result<String> {
+    fn token(&self, force_refresh: bool, deadline: Instant) -> Result<String> {
+        {
+            let mut cached = self
+                .relay_token
+                .lock()
+                .map_err(|_| anyhow!("cloud-session relay token lock is unavailable"))?;
+            if force_refresh {
+                *cached = None;
+            } else if let Some(token) = cached.as_ref() {
+                return Ok(token.clone());
+            }
+        }
+        let timeout = remaining_budget(deadline)
+            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+        let token = self.client.issue_relay_token_with_timeout(
+            &self.device,
+            &self.device_secret,
+            crate::snapshots::SnapshotSource::Codex,
+            timeout,
+        )?;
         let mut cached = self
             .relay_token
             .lock()
             .map_err(|_| anyhow!("cloud-session relay token lock is unavailable"))?;
-        if force_refresh {
-            *cached = None;
-        }
-        if let Some(token) = cached.as_ref() {
-            return Ok(token.clone());
-        }
-        let token = self.client.issue_relay_token(
-            &self.device,
-            &self.device_secret,
-            crate::snapshots::SnapshotSource::Codex,
-        )?;
         *cached = Some(token.clone());
         Ok(token)
     }
 
-    fn send_with_relay_retry<F>(&self, send: F) -> Result<()>
+    fn send_with_relay_retry<F>(&self, timeout: Duration, send: F) -> Result<()>
     where
-        F: Fn(&crate::snapshot_client::SnapshotApiClient, &str) -> Result<Value>,
+        F: Fn(&crate::snapshot_client::SnapshotApiClient, &str, Duration) -> Result<Value>,
     {
         if !self.is_configured() {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
         }
-        let token = self.token(false)?;
-        match send(&self.client, &token) {
+        let deadline = Instant::now() + timeout;
+        let token = self.token(false, deadline)?;
+        let request_timeout = remaining_budget(deadline)
+            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+        match send(&self.client, &token, request_timeout) {
             Ok(_) => Ok(()),
             Err(error)
                 if error
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
                     .is_some() =>
             {
-                let refreshed = self.token(true)?;
-                send(&self.client, &refreshed).map(|_| ())
+                let refreshed = self.token(true, deadline)?;
+                let retry_timeout = remaining_budget(deadline)
+                    .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+                send(&self.client, &refreshed, retry_timeout).map(|_| ())
             }
             Err(error) => Err(error),
         }
@@ -1406,22 +1551,38 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
     }
 
     fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
+        self.send_bounded(batch, CYCLE_BUDGET)
+    }
+
+    fn send_bounded(
+        &self,
+        batch: &CloudSessionObservationBatchV1,
+        timeout: Duration,
+    ) -> Result<()> {
         if !self.is_configured() {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
         }
         batch.validate_wire_contract()?;
         let request = serde_json::to_value(batch)?;
-        let token = self.token(false)?;
-        match self.client.upload_cloud_session_batch(&token, &request) {
+        let deadline = Instant::now() + timeout;
+        let token = self.token(false, deadline)?;
+        let request_timeout = remaining_budget(deadline)
+            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+        match self
+            .client
+            .upload_cloud_session_batch_with_timeout(&token, &request, request_timeout)
+        {
             Ok(_) => Ok(()),
             Err(error)
                 if error
                     .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
                     .is_some() =>
             {
-                let refreshed = self.token(true)?;
+                let refreshed = self.token(true, deadline)?;
+                let retry_timeout = remaining_budget(deadline)
+                    .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
                 self.client
-                    .upload_cloud_session_batch(&refreshed, &request)
+                    .upload_cloud_session_batch_with_timeout(&refreshed, &request, retry_timeout)
                     .map(|_| ())
             }
             Err(error) => Err(error),
@@ -1429,18 +1590,44 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
     }
 
     fn send_scan_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
+        self.send_scan_chunk_bounded(chunk, CYCLE_BUDGET)
+    }
+
+    fn send_scan_chunk_bounded(
+        &self,
+        chunk: &CloudSessionObservationChunkV2,
+        timeout: Duration,
+    ) -> Result<()> {
         chunk.validate_wire_contract()?;
         let request = serde_json::to_value(chunk)?;
-        self.send_with_relay_retry(|client, token| {
-            client.upload_cloud_session_scan_chunk(token, &chunk.scan_id, &request)
+        self.send_with_relay_retry(timeout, |client, token, request_timeout| {
+            client.upload_cloud_session_scan_chunk_with_timeout(
+                token,
+                &chunk.scan_id,
+                &request,
+                request_timeout,
+            )
         })
     }
 
     fn finalize_scan(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
+        self.finalize_scan_bounded(finalize, CYCLE_BUDGET)
+    }
+
+    fn finalize_scan_bounded(
+        &self,
+        finalize: &CloudSessionScanFinalizeV2,
+        timeout: Duration,
+    ) -> Result<()> {
         finalize.validate_wire_contract()?;
         let request = serde_json::to_value(finalize)?;
-        self.send_with_relay_retry(|client, token| {
-            client.finalize_cloud_session_scan(token, &finalize.scan_id, &request)
+        self.send_with_relay_retry(timeout, |client, token, request_timeout| {
+            client.finalize_cloud_session_scan_with_timeout(
+                token,
+                &finalize.scan_id,
+                &request,
+                request_timeout,
+            )
         })
     }
 }
@@ -1448,6 +1635,15 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
 pub struct CodexCloudCliRunner;
 impl CloudSessionRunner for CodexCloudCliRunner {
     fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
+        self.list_page_bounded(cursor, limit, COMMAND_TIMEOUT)
+    }
+
+    fn list_page_bounded(
+        &self,
+        cursor: Option<&str>,
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<String> {
         let program = crate::command_env::executable_path("codex")
             .ok_or_else(|| anyhow!("Codex CLI is unavailable"))?;
         let mut command = Command::new(program);
@@ -1504,6 +1700,7 @@ impl CloudSessionRunner for CodexCloudCliRunner {
                 .map(|_| bytes)
         });
         let started = Instant::now();
+        let timeout = timeout.min(COMMAND_TIMEOUT);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -1517,7 +1714,7 @@ impl CloudSessionRunner for CodexCloudCliRunner {
                     return String::from_utf8(output)
                         .map_err(|_| anyhow!("Codex cloud list returned non-UTF-8 JSON"));
                 }
-                Ok(None) if started.elapsed() >= COMMAND_TIMEOUT => {
+                Ok(None) if started.elapsed() >= timeout => {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = reader.join();
@@ -1552,9 +1749,28 @@ pub fn collect_cloud_sessions_once(
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
 ) -> CloudSessionCycleOutcome {
+    collect_cloud_sessions_once_with_budget(
+        grants,
+        checkpoints,
+        runner,
+        transport,
+        now,
+        CYCLE_BUDGET,
+    )
+}
+
+fn collect_cloud_sessions_once_with_budget(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    runner: &dyn CloudSessionRunner,
+    transport: &dyn CloudSessionTransport,
+    now: OffsetDateTime,
+    cycle_budget: Duration,
+) -> CloudSessionCycleOutcome {
     if kill_switch_enabled() || !grant_preflight_eligible(grants) {
         if let Ok(mut runtime) = checkpoints.runtime.lock() {
             runtime.active = None;
+            runtime.cancel_requested = runtime.cycle_in_progress;
         }
         return CloudSessionCycleOutcome::Disabled;
     }
@@ -1567,17 +1783,46 @@ pub fn collect_cloud_sessions_once(
         return CloudSessionCycleOutcome::CircuitOpen;
     }
     let mut runtime = match checkpoints.runtime.lock() {
-        Ok(runtime) => runtime,
+        Ok(mut shared) => {
+            if shared.cycle_in_progress {
+                return CloudSessionCycleOutcome::Noop;
+            }
+            shared.cycle_in_progress = true;
+            CloudSessionScanRuntime {
+                active: shared.active.take(),
+                ..Default::default()
+            }
+        }
         Err(_) => return CloudSessionCycleOutcome::Failed,
     };
-    let result = collect_enabled_cycle(grants, &checkpoint, &mut runtime, runner, transport, now);
+    let deadline = Instant::now() + cycle_budget;
+    let result = collect_enabled_cycle(
+        grants,
+        &checkpoint,
+        &mut runtime,
+        runner,
+        transport,
+        now,
+        deadline,
+    );
     let preserve_incomplete_health = checkpoint.last_error_category.as_deref()
         == Some("scan_incomplete")
         && runtime
             .active
             .as_ref()
             .is_some_and(|scan| scan.mode == CloudSessionScanMode::Full);
+    let mut shared = match checkpoints.runtime.lock() {
+        Ok(shared) => shared,
+        Err(_) => return CloudSessionCycleOutcome::Failed,
+    };
+    if !shared.cancel_requested && !kill_switch_enabled() && grant_preflight_eligible(grants) {
+        shared.active = runtime.active.take();
+    }
+    shared.cycle_in_progress = false;
+    shared.cancel_requested = false;
+    drop(shared);
     match result {
+        Ok(CycleResult::Deferred) => CloudSessionCycleOutcome::Noop,
         Ok(CycleResult::Noop) => {
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
@@ -1652,6 +1897,7 @@ pub fn collect_cloud_sessions_once(
 }
 
 enum CycleResult {
+    Deferred,
     Noop,
     Heartbeat,
     Uploaded {
@@ -1675,6 +1921,7 @@ fn collect_enabled_cycle(
     runner: &dyn CloudSessionRunner,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
+    deadline: Instant,
 ) -> std::result::Result<CycleResult, CycleError> {
     let state = grants
         .read()
@@ -1697,8 +1944,11 @@ fn collect_enabled_cycle(
         })?;
     let mut first_page_prevalidated = false;
     if runtime.active.is_none() {
-        let Some(current_grant) = revalidate_scan_start(grants, transport, &state.grant)? else {
-            return Ok(CycleResult::Noop);
+        let current_grant = match revalidate_scan_start(grants, transport, &state.grant, deadline)?
+        {
+            RevalidationOutcome::Granted(grant) => *grant,
+            RevalidationOutcome::Denied => return Ok(CycleResult::Noop),
+            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
         };
         first_page_prevalidated = true;
         runtime.active = Some(ActiveCloudSessionScan {
@@ -1730,10 +1980,9 @@ fn collect_enabled_cycle(
         .as_ref()
         .is_some_and(|scan| scan.prepared.is_some())
     {
-        return upload_prepared_scan(grants, runtime, transport);
+        return upload_prepared_scan(grants, runtime, transport, deadline);
     }
 
-    let deadline = Instant::now() + CYCLE_BUDGET;
     for _ in 0..MAX_PAGES {
         if Instant::now() >= deadline {
             break;
@@ -1748,17 +1997,29 @@ fn collect_enabled_cycle(
             })?;
         if first_page_prevalidated {
             first_page_prevalidated = false;
-        } else if revalidate_before_io(grants, transport, &expected_grant)?.is_none() {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
+        } else {
+            match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
+                RevalidationOutcome::Granted(_) => {}
+                RevalidationOutcome::Denied => {
+                    runtime.active = None;
+                    return Ok(CycleResult::Noop);
+                }
+                RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
+            }
         }
         let cursor = runtime
             .active
             .as_ref()
             .and_then(|scan| scan.cursor.as_deref());
-        let raw = match runner.list_page(cursor, PAGE_LIMIT) {
+        let Some(timeout) = remaining_budget(deadline) else {
+            return Ok(CycleResult::Deferred);
+        };
+        let raw = match runner.list_page_bounded(cursor, PAGE_LIMIT, timeout) {
             Ok(raw) => raw,
             Err(_) => {
+                if remaining_budget(deadline).is_none() {
+                    return Ok(CycleResult::Deferred);
+                }
                 if !grant_still_current(grants, &expected_grant) || kill_switch_enabled() {
                     runtime.active = None;
                     return Ok(CycleResult::Noop);
@@ -1772,11 +2033,20 @@ fn collect_enabled_cycle(
                     break;
                 }
                 runtime.active = None;
-                report_provider_failure_revalidated(grants, &expected_grant, transport, now)?;
-                return Err(CycleError {
-                    category: "provider_unavailable",
-                    health_uploaded: true,
-                });
+                return match report_provider_failure_revalidated(
+                    grants,
+                    &expected_grant,
+                    transport,
+                    now,
+                    deadline,
+                )? {
+                    SendOutcome::Sent => Err(CycleError {
+                        category: "provider_unavailable",
+                        health_uploaded: true,
+                    }),
+                    SendOutcome::NotSent => Ok(CycleResult::Noop),
+                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
+                };
             }
         };
         let page = match parse_cloud_page(&raw, &key, now) {
@@ -1796,11 +2066,20 @@ fn collect_enabled_cycle(
                     break;
                 }
                 runtime.active = None;
-                report_provider_failure_revalidated(grants, &expected_grant, transport, now)?;
-                return Err(CycleError {
-                    category: "provider_payload_invalid",
-                    health_uploaded: true,
-                });
+                return match report_provider_failure_revalidated(
+                    grants,
+                    &expected_grant,
+                    transport,
+                    now,
+                    deadline,
+                )? {
+                    SendOutcome::Sent => Err(CycleError {
+                        category: "provider_payload_invalid",
+                        health_uploaded: true,
+                    }),
+                    SendOutcome::NotSent => Ok(CycleResult::Noop),
+                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
+                };
             }
         };
 
@@ -1840,8 +2119,17 @@ fn collect_enabled_cycle(
                 {
                     return Ok(CycleResult::Noop);
                 }
-                send_heartbeat_revalidated(grants, &expected_grant, transport, now)?;
-                return Ok(CycleResult::Heartbeat);
+                return match send_heartbeat_revalidated(
+                    grants,
+                    &expected_grant,
+                    transport,
+                    now,
+                    deadline,
+                )? {
+                    SendOutcome::Sent => Ok(CycleResult::Heartbeat),
+                    SendOutcome::NotSent => Ok(CycleResult::Noop),
+                    SendOutcome::BudgetExpired => Ok(CycleResult::Deferred),
+                };
             }
             prepare_active_scan(
                 runtime,
@@ -1870,26 +2158,55 @@ fn collect_enabled_cycle(
         .as_ref()
         .is_some_and(|scan| scan.prepared.is_some())
     {
-        upload_prepared_scan(grants, runtime, transport)
+        upload_prepared_scan(grants, runtime, transport, deadline)
     } else {
         Ok(CycleResult::Noop)
     }
+}
+
+enum RevalidationOutcome {
+    Granted(Box<CloudSessionGrant>),
+    Denied,
+    BudgetExpired,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendOutcome {
+    Sent,
+    NotSent,
+    BudgetExpired,
+}
+
+fn remaining_budget(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn revalidate_before_io(
     grants: &CloudSessionGrantStore,
     transport: &dyn CloudSessionTransport,
     expected: &CloudSessionGrant,
-) -> std::result::Result<Option<CloudSessionGrant>, CycleError> {
+    deadline: Instant,
+) -> std::result::Result<RevalidationOutcome, CycleError> {
     if kill_switch_enabled() || !grant_still_current(grants, expected) {
-        return Ok(None);
+        return Ok(RevalidationOutcome::Denied);
     }
-    let response = transport
-        .revalidate_grant(expected)
-        .map_err(|_| CycleError {
-            category: "grant_revalidation_unavailable",
-            health_uploaded: false,
-        })?;
+    let Some(timeout) = remaining_budget(deadline) else {
+        return Ok(RevalidationOutcome::BudgetExpired);
+    };
+    let response = match transport.revalidate_grant_bounded(expected, timeout) {
+        Ok(response) => response,
+        Err(_) if remaining_budget(deadline).is_none() => {
+            return Ok(RevalidationOutcome::BudgetExpired)
+        }
+        Err(_) => {
+            return Err(CycleError {
+                category: "grant_revalidation_unavailable",
+                health_uploaded: false,
+            })
+        }
+    };
     grants
         .apply_backend_grant_revalidation(&response)
         .map_err(|_| CycleError {
@@ -1897,11 +2214,15 @@ fn revalidate_before_io(
             health_uploaded: false,
         })?;
     if kill_switch_enabled() || !grant_still_current(grants, expected) {
-        return Ok(None);
+        return Ok(RevalidationOutcome::Denied);
     }
-    grants.load().map_err(|_| CycleError {
+    let current = grants.load().map_err(|_| CycleError {
         category: "grant_unavailable",
         health_uploaded: false,
+    })?;
+    Ok(match current {
+        Some(grant) => RevalidationOutcome::Granted(Box::new(grant)),
+        None => RevalidationOutcome::Denied,
     })
 }
 
@@ -1909,16 +2230,26 @@ fn revalidate_scan_start(
     grants: &CloudSessionGrantStore,
     transport: &dyn CloudSessionTransport,
     expected: &CloudSessionGrant,
-) -> std::result::Result<Option<CloudSessionGrant>, CycleError> {
+    deadline: Instant,
+) -> std::result::Result<RevalidationOutcome, CycleError> {
     if kill_switch_enabled() || !cloud_grant_preflight_eligible(expected) {
-        return Ok(None);
+        return Ok(RevalidationOutcome::Denied);
     }
-    let response = transport
-        .revalidate_grant(expected)
-        .map_err(|_| CycleError {
-            category: "grant_revalidation_unavailable",
-            health_uploaded: false,
-        })?;
+    let Some(timeout) = remaining_budget(deadline) else {
+        return Ok(RevalidationOutcome::BudgetExpired);
+    };
+    let response = match transport.revalidate_grant_bounded(expected, timeout) {
+        Ok(response) => response,
+        Err(_) if remaining_budget(deadline).is_none() => {
+            return Ok(RevalidationOutcome::BudgetExpired)
+        }
+        Err(_) => {
+            return Err(CycleError {
+                category: "grant_revalidation_unavailable",
+                health_uploaded: false,
+            })
+        }
+    };
     grants
         .apply_backend_grant_revalidation(&response)
         .map_err(|_| CycleError {
@@ -1947,9 +2278,12 @@ fn revalidate_scan_start(
                         .map(|binding| &binding.grant_id)
         })
     {
-        return Ok(None);
+        return Ok(RevalidationOutcome::Denied);
     }
-    Ok(current)
+    Ok(match current {
+        Some(grant) => RevalidationOutcome::Granted(Box::new(grant)),
+        None => RevalidationOutcome::Denied,
+    })
 }
 
 fn prepare_active_scan(
@@ -2074,6 +2408,7 @@ fn upload_prepared_scan(
     grants: &CloudSessionGrantStore,
     runtime: &mut CloudSessionScanRuntime,
     transport: &dyn CloudSessionTransport,
+    deadline: Instant,
 ) -> std::result::Result<CycleResult, CycleError> {
     loop {
         let (expected_grant, chunk) = {
@@ -2093,14 +2428,26 @@ fn upload_prepared_scan(
         let Some(chunk) = chunk else {
             break;
         };
-        if revalidate_before_io(grants, transport, &expected_grant)?.is_none() {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
+        match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
+            RevalidationOutcome::Granted(_) => {}
+            RevalidationOutcome::Denied => {
+                runtime.active = None;
+                return Ok(CycleResult::Noop);
+            }
+            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
         }
-        transport.send_scan_chunk(&chunk).map_err(|_| CycleError {
-            category: "transport_unavailable",
-            health_uploaded: false,
-        })?;
+        let Some(timeout) = remaining_budget(deadline) else {
+            return Ok(CycleResult::Deferred);
+        };
+        if transport.send_scan_chunk_bounded(&chunk, timeout).is_err() {
+            if remaining_budget(deadline).is_none() {
+                return Ok(CycleResult::Deferred);
+            }
+            return Err(CycleError {
+                category: "transport_unavailable",
+                health_uploaded: false,
+            });
+        }
         let prepared = runtime
             .active
             .as_mut()
@@ -2125,14 +2472,26 @@ fn upload_prepared_scan(
         )
     };
     if let Some(finalize) = &finalize {
-        if revalidate_before_io(grants, transport, &expected_grant)?.is_none() {
-            runtime.active = None;
-            return Ok(CycleResult::Noop);
+        match revalidate_before_io(grants, transport, &expected_grant, deadline)? {
+            RevalidationOutcome::Granted(_) => {}
+            RevalidationOutcome::Denied => {
+                runtime.active = None;
+                return Ok(CycleResult::Noop);
+            }
+            RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
         }
-        transport.finalize_scan(finalize).map_err(|_| CycleError {
-            category: "transport_unavailable",
-            health_uploaded: false,
-        })?;
+        let Some(timeout) = remaining_budget(deadline) else {
+            return Ok(CycleResult::Deferred);
+        };
+        if transport.finalize_scan_bounded(finalize, timeout).is_err() {
+            if remaining_budget(deadline).is_none() {
+                return Ok(CycleResult::Deferred);
+            }
+            return Err(CycleError {
+                category: "transport_unavailable",
+                health_uploaded: false,
+            });
+        }
     }
     let finished = runtime.active.take().ok_or(CycleError {
         category: "scan_unavailable",
@@ -2158,9 +2517,12 @@ fn send_heartbeat_revalidated(
     expected: &CloudSessionGrant,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
-) -> std::result::Result<(), CycleError> {
-    if revalidate_before_io(grants, transport, expected)?.is_none() {
-        return Ok(());
+    deadline: Instant,
+) -> std::result::Result<SendOutcome, CycleError> {
+    match revalidate_before_io(grants, transport, expected, deadline)? {
+        RevalidationOutcome::Granted(_) => {}
+        RevalidationOutcome::Denied => return Ok(SendOutcome::NotSent),
+        RevalidationOutcome::BudgetExpired => return Ok(SendOutcome::BudgetExpired),
     }
     let batch = heartbeat_batch(
         expected,
@@ -2171,10 +2533,17 @@ fn send_heartbeat_revalidated(
             error_category: None,
         },
     )?;
-    transport.send(&batch).map_err(|_| CycleError {
-        category: "transport_unavailable",
-        health_uploaded: false,
-    })
+    let Some(timeout) = remaining_budget(deadline) else {
+        return Ok(SendOutcome::BudgetExpired);
+    };
+    match transport.send_bounded(&batch, timeout) {
+        Ok(()) => Ok(SendOutcome::Sent),
+        Err(_) if remaining_budget(deadline).is_none() => Ok(SendOutcome::BudgetExpired),
+        Err(_) => Err(CycleError {
+            category: "transport_unavailable",
+            health_uploaded: false,
+        }),
+    }
 }
 
 fn report_provider_failure_revalidated(
@@ -2182,11 +2551,14 @@ fn report_provider_failure_revalidated(
     expected: &CloudSessionGrant,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
-) -> std::result::Result<(), CycleError> {
-    if revalidate_before_io(grants, transport, expected)?.is_none() {
-        return Ok(());
+    deadline: Instant,
+) -> std::result::Result<SendOutcome, CycleError> {
+    match revalidate_before_io(grants, transport, expected, deadline)? {
+        RevalidationOutcome::Granted(_) => {}
+        RevalidationOutcome::Denied => return Ok(SendOutcome::NotSent),
+        RevalidationOutcome::BudgetExpired => return Ok(SendOutcome::BudgetExpired),
     }
-    report_provider_failure(expected, transport, now)
+    report_provider_failure(expected, transport, now, deadline)
 }
 
 struct ParsedPage {
@@ -2454,7 +2826,8 @@ fn report_provider_failure(
     grant: &CloudSessionGrant,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
-) -> std::result::Result<(), CycleError> {
+    deadline: Instant,
+) -> std::result::Result<SendOutcome, CycleError> {
     let batch = heartbeat_batch(
         grant,
         now,
@@ -2467,10 +2840,17 @@ fn report_provider_failure(
             error_category: Some("provider_error".to_string()),
         },
     )?;
-    transport.send(&batch).map_err(|_| CycleError {
-        category: "transport_unavailable",
-        health_uploaded: false,
-    })
+    let Some(timeout) = remaining_budget(deadline) else {
+        return Ok(SendOutcome::BudgetExpired);
+    };
+    match transport.send_bounded(&batch, timeout) {
+        Ok(()) => Ok(SendOutcome::Sent),
+        Err(_) if remaining_budget(deadline).is_none() => Ok(SendOutcome::BudgetExpired),
+        Err(_) => Err(CycleError {
+            category: "transport_unavailable",
+            health_uploaded: false,
+        }),
+    }
 }
 
 fn grant_scope_fingerprint(key: &[u8], setup: &CloudSessionGrantSetup) -> String {
@@ -2670,6 +3050,16 @@ fn kill_switch_enabled() -> bool {
 fn timestamp(value: OffsetDateTime) -> String {
     value.format(&Rfc3339).unwrap_or_default()
 }
+fn valid_rfc3339(value: &str) -> bool {
+    !value.is_empty() && OffsetDateTime::parse(value, &Rfc3339).is_ok()
+}
+fn valid_hmac_fingerprint(value: &str) -> bool {
+    value.len() == 76
+        && value.starts_with("hmac-sha256:")
+        && value[12..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
 fn sha256(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(bytes);
@@ -2678,7 +3068,9 @@ fn sha256(bytes: &[u8]) -> String {
 fn valid_sha256_digest(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256:")
-        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 fn push_length_framed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -3098,6 +3490,98 @@ mod tests {
         revalidation_calls: Cell<usize>,
         fail_next_chunk: Cell<bool>,
     }
+
+    struct SequencedStatusTransport {
+        statuses: RefCell<VecDeque<&'static str>>,
+        revalidation_calls: Cell<usize>,
+        send_calls: Cell<usize>,
+    }
+    impl CloudSessionTransport for SequencedStatusTransport {
+        fn supports_grant_revalidation(&self) -> bool {
+            true
+        }
+
+        fn revalidate_grant(
+            &self,
+            grant: &CloudSessionGrant,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            let call = self.revalidation_calls.get() + 1;
+            self.revalidation_calls.set(call);
+            let status = self
+                .statuses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| anyhow!("unexpected revalidation"))?;
+            Ok(backend_grant(
+                grant,
+                status,
+                if status == "revoked" { 2 } else { 1 },
+            ))
+        }
+
+        fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+            self.send_calls.set(self.send_calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    struct SlowBudgetTransport<'a> {
+        checkpoints: &'a CloudSessionCheckpointStore,
+        revalidation_calls: Cell<usize>,
+        send_calls: Cell<usize>,
+        timeouts: RefCell<Vec<Duration>>,
+        mutex_was_available: Cell<bool>,
+    }
+    impl SlowBudgetTransport<'_> {
+        fn observe_mutex(&self) {
+            self.mutex_was_available
+                .set(self.mutex_was_available.get() && self.checkpoints.runtime.try_lock().is_ok());
+        }
+    }
+    impl CloudSessionTransport for SlowBudgetTransport<'_> {
+        fn supports_grant_revalidation(&self) -> bool {
+            true
+        }
+
+        fn revalidate_grant(
+            &self,
+            grant: &CloudSessionGrant,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            Ok(backend_grant(grant, "enabled", 1))
+        }
+
+        fn revalidate_grant_bounded(
+            &self,
+            _grant: &CloudSessionGrant,
+            timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            self.observe_mutex();
+            self.revalidation_calls
+                .set(self.revalidation_calls.get() + 1);
+            self.timeouts.borrow_mut().push(timeout);
+            thread::sleep(timeout);
+            Err(anyhow!("cycle budget exhausted during revalidation"))
+        }
+
+        fn send_scan_chunk(&self, _chunk: &CloudSessionObservationChunkV2) -> Result<()> {
+            Err(anyhow!("bounded method required"))
+        }
+
+        fn send_scan_chunk_bounded(
+            &self,
+            _chunk: &CloudSessionObservationChunkV2,
+            timeout: Duration,
+        ) -> Result<()> {
+            self.observe_mutex();
+            self.send_calls.set(self.send_calls.get() + 1);
+            self.timeouts.borrow_mut().push(timeout);
+            Err(anyhow!("unexpected upload after expired revalidation"))
+        }
+
+        fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+            Err(anyhow!("unexpected heartbeat"))
+        }
+    }
     impl V2RecordingTransport {
         fn new() -> Self {
             Self {
@@ -3224,6 +3708,32 @@ mod tests {
         assert!(!encoded.contains("private-cursor"));
         assert!(!encoded.contains("provider-account-private"));
         assert!(encoded.contains("hmac-sha256:"));
+    }
+
+    #[test]
+    fn v2_public_wire_rejects_raw_or_noncanonical_entity_keys_and_open_values() {
+        let (grants, checkpoints) = stores("v2-crafted-privacy-boundary");
+        enabled(&grants);
+        let runner = CursorRecordingPages::new(vec![page("raw-provider-id", None)]);
+        let transport = V2RecordingTransport::new();
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        let chunk = transport.chunks.borrow()[0].clone();
+        assert!(chunk.validate_wire_contract().is_ok());
+
+        let mut raw_key = chunk.clone();
+        raw_key.observations[0].entity_key = "raw-provider-id".to_string();
+        assert!(raw_key.validate_wire_contract().is_err());
+
+        let mut uppercase_key = chunk.clone();
+        uppercase_key.observations[0].entity_key = format!("hmac-sha256:{}", "A".repeat(64));
+        assert!(uppercase_key.validate_wire_contract().is_err());
+
+        let mut open_lifecycle = chunk;
+        open_lifecycle.observations[0].lifecycle = "provider_future_state".to_string();
+        assert!(open_lifecycle.validate_wire_contract().is_err());
     }
 
     #[test]
@@ -3685,6 +4195,144 @@ mod tests {
             checkpoints.load().last_error_category.as_deref(),
             Some("grant_revalidation_unavailable")
         );
+    }
+
+    #[test]
+    fn revalidation_denial_never_checkpoints_unsent_heartbeat_or_failure_health() {
+        let (heartbeat_grants, heartbeat_checkpoints) = stores("denied-heartbeat-checkpoint");
+        enabled(&heartbeat_grants);
+        let initial_transport = V2RecordingTransport::new();
+        let initial_runner = CursorRecordingPages::new(vec![page("stable", None)]);
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &heartbeat_grants,
+                &heartbeat_checkpoints,
+                &initial_runner,
+                &initial_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        let original_health_upload = heartbeat_checkpoints.load().last_health_upload_at;
+        let heartbeat_transport = SequencedStatusTransport {
+            statuses: RefCell::new(VecDeque::from(["enabled", "revoked"])),
+            revalidation_calls: Cell::new(0),
+            send_calls: Cell::new(0),
+        };
+        let heartbeat_runner = CursorRecordingPages::new(vec![page("stable", None)]);
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &heartbeat_grants,
+                &heartbeat_checkpoints,
+                &heartbeat_runner,
+                &heartbeat_transport,
+                now() + TimeDuration::minutes(61),
+            ),
+            CloudSessionCycleOutcome::Noop
+        );
+        assert_eq!(heartbeat_transport.revalidation_calls.get(), 2);
+        assert_eq!(heartbeat_transport.send_calls.get(), 0);
+        assert_eq!(
+            heartbeat_checkpoints.load().last_health_upload_at,
+            original_health_upload
+        );
+
+        let (failure_grants, failure_checkpoints) = stores("denied-failure-checkpoint");
+        enabled(&failure_grants);
+        let failure_transport = SequencedStatusTransport {
+            statuses: RefCell::new(VecDeque::from(["enabled", "revoked"])),
+            revalidation_calls: Cell::new(0),
+            send_calls: Cell::new(0),
+        };
+        let failure_runner = FailingPages {
+            calls: Cell::new(0),
+        };
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &failure_grants,
+                &failure_checkpoints,
+                &failure_runner,
+                &failure_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Noop
+        );
+        assert_eq!(failure_transport.revalidation_calls.get(), 2);
+        assert_eq!(failure_transport.send_calls.get(), 0);
+        assert_eq!(failure_checkpoints.load().last_health_upload_at, None);
+    }
+
+    #[test]
+    fn cycle_budget_defers_prepared_upload_and_does_not_hold_runtime_mutex_during_io() {
+        let (grants, checkpoints) = stores("bounded-slow-upload");
+        enabled(&grants);
+        let runner = CursorRecordingPages::new(vec![page("budgeted", None)]);
+        let seed_transport = V2RecordingTransport::new();
+        seed_transport.fail_next_chunk.set(true);
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &seed_transport, now(),),
+            CloudSessionCycleOutcome::Failed
+        );
+        assert_eq!(seed_transport.chunks.borrow().len(), 1);
+
+        let slow_transport = SlowBudgetTransport {
+            checkpoints: &checkpoints,
+            revalidation_calls: Cell::new(0),
+            send_calls: Cell::new(0),
+            timeouts: RefCell::new(Vec::new()),
+            mutex_was_available: Cell::new(true),
+        };
+        let unused_runner = CursorRecordingPages::new(Vec::new());
+        let started = Instant::now();
+        assert_eq!(
+            collect_cloud_sessions_once_with_budget(
+                &grants,
+                &checkpoints,
+                &unused_runner,
+                &slow_transport,
+                now() + TimeDuration::minutes(3),
+                Duration::from_millis(40),
+            ),
+            CloudSessionCycleOutcome::Noop
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(slow_transport.mutex_was_available.get());
+        assert_eq!(slow_transport.revalidation_calls.get(), 1);
+        assert_eq!(slow_transport.send_calls.get(), 0);
+        let timeouts = slow_transport.timeouts.borrow();
+        assert_eq!(timeouts.len(), 1);
+        assert!(timeouts[0] <= Duration::from_millis(40));
+        drop(timeouts);
+        {
+            let runtime = checkpoints.runtime.lock().unwrap();
+            let prepared = runtime
+                .active
+                .as_ref()
+                .and_then(|scan| scan.prepared.as_ref())
+                .expect("prepared scan must survive budget exhaustion");
+            assert_eq!(prepared.next_chunk, 0);
+            assert_eq!(prepared.chunks.len(), 1);
+            assert!(prepared.finalize.is_some());
+        }
+        assert_eq!(checkpoints.load().consecutive_failures, 1);
+        assert!(unused_runner.cursors.borrow().is_empty());
+
+        let resumed_transport = V2RecordingTransport::new();
+        let resumed_runner = CursorRecordingPages::new(Vec::new());
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &resumed_runner,
+                &resumed_transport,
+                now() + TimeDuration::minutes(6),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert!(resumed_runner.cursors.borrow().is_empty());
+        assert_eq!(resumed_transport.chunks.borrow().len(), 1);
+        assert_eq!(resumed_transport.finalizes.borrow().len(), 1);
+        assert_eq!(resumed_transport.revalidation_calls.get(), 2);
     }
 
     #[test]
@@ -4262,6 +4910,125 @@ mod tests {
         }
         assert!(requests[3].contains("Authorization: Bearer relay-cloud-new"));
         assert!(requests[4].contains("Authorization: Bearer relay-cloud-new"));
+    }
+
+    #[test]
+    fn v2_relay_uses_exact_paths_and_retries_exact_body_after_auth_refresh() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+
+        let (grants, checkpoints) = stores("v2-relay-http-fixture");
+        enabled(&grants);
+        let fixture_runner = CursorRecordingPages::new(vec![page("raw-provider-private-id", None)]);
+        let fixture_transport = V2RecordingTransport::new();
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &fixture_runner,
+                &fixture_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        let chunk = fixture_transport.chunks.borrow()[0].clone();
+        let finalize = fixture_transport.finalizes.borrow()[0].clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|offset| offset + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        if request.len() >= header_end + content_length.unwrap_or(0) {
+                            break;
+                        }
+                    }
+                }
+                server_captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let (status, body) = match index {
+                    0 => ("200 OK", r#"{"token":"relay-v2-old"}"#),
+                    1 => ("401 Unauthorized", r#"{"detail":"expired"}"#),
+                    2 => ("200 OK", r#"{"token":"relay-v2-new"}"#),
+                    _ => ("200 OK", r#"{"accepted":true}"#),
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let relay = RelayCloudSessionTransport::new(
+            format!("http://{address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            },
+            "device-secret".to_string(),
+        );
+        relay.send_scan_chunk(&chunk).unwrap();
+        relay.finalize_scan(&finalize).unwrap();
+        server.join().unwrap();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].starts_with(&format!(
+            "POST /api/v1/telemetry/devices/{INSTALLATION_ID}/relay-token HTTP/1.1"
+        )));
+        let chunk_path = format!("/api/v1/cloud-sessions/scans/{}/chunks", chunk.scan_id);
+        let finalize_path = format!("/api/v1/cloud-sessions/scans/{}/finalize", finalize.scan_id);
+        for request in [&requests[1], &requests[3]] {
+            assert!(request.starts_with(&format!("POST {chunk_path} HTTP/1.1")));
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            let payload: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(payload["scan_id"], chunk.scan_id);
+            assert!(!body.contains("raw-provider-private-id"));
+            assert!(!body.contains("cursor"));
+        }
+        assert!(requests[1].contains("Authorization: Bearer relay-v2-old"));
+        assert!(requests[3].contains("Authorization: Bearer relay-v2-new"));
+        assert_eq!(
+            requests[1].split_once("\r\n\r\n").unwrap().1,
+            requests[3].split_once("\r\n\r\n").unwrap().1
+        );
+        assert!(requests[4].starts_with(&format!("POST {finalize_path} HTTP/1.1")));
+        let finalize_body = requests[4].split_once("\r\n\r\n").unwrap().1;
+        let finalize_payload: Value = serde_json::from_str(finalize_body).unwrap();
+        assert_eq!(finalize_payload["scan_id"], finalize.scan_id);
+        assert!(!finalize_body.contains("raw-provider-private-id"));
+        assert!(!finalize_body.contains("cursor"));
     }
 
     #[test]
@@ -4959,7 +5726,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_head_poll_has_zero_uploads_then_hourly_heartbeat_and_daily_scan() {
+    fn unchanged_head_poll_has_zero_observation_upload_but_revalidates_then_runs_cadence() {
         let (grants, checkpoints) = stores("v2-head-cadence");
         enabled(&grants);
         let transport = V2RecordingTransport::new();
@@ -4985,6 +5752,7 @@ mod tests {
         assert_eq!(transport.chunks.borrow().len(), 1);
         assert_eq!(transport.finalizes.borrow().len(), 1);
         assert!(transport.heartbeats.borrow().is_empty());
+        assert_eq!(transport.revalidation_calls.get(), 4);
 
         let hourly = CursorRecordingPages::new(vec![page("stable", None)]);
         assert_eq!(
@@ -4998,6 +5766,7 @@ mod tests {
             CloudSessionCycleOutcome::Heartbeat
         );
         assert_eq!(transport.heartbeats.borrow().len(), 1);
+        assert_eq!(transport.revalidation_calls.get(), 6);
 
         let daily = CursorRecordingPages::new(vec![page("stable", None)]);
         assert_eq!(
@@ -5012,6 +5781,7 @@ mod tests {
         );
         assert_eq!(transport.chunks.borrow().len(), 2);
         assert_eq!(transport.finalizes.borrow().len(), 2);
+        assert_eq!(transport.revalidation_calls.get(), 9);
     }
 
     #[test]

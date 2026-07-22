@@ -399,6 +399,21 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
     ) -> Result<String> {
+        self.issue_relay_token_with_timeout(
+            device,
+            device_secret,
+            source,
+            SNAPSHOT_HTTP_READ_TIMEOUT,
+        )
+    }
+
+    pub fn issue_relay_token_with_timeout(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id
@@ -406,6 +421,7 @@ impl SnapshotApiClient {
         let response: RelayTokenResponse = self
             .agent
             .post(&url)
+            .timeout(timeout)
             .set("Accept", "application/json")
             .set("X-Ottto-Device-Secret", device_secret)
             .send_json(relay_token_request_payload(device, source.api_slug()))
@@ -627,9 +643,23 @@ impl SnapshotApiClient {
     /// source-scoped relay principal as local snapshots. Response bodies are
     /// never retained on auth/contract failures.
     pub fn upload_cloud_session_batch(&self, relay_token: &str, request: &Value) -> Result<Value> {
+        self.upload_cloud_session_batch_with_timeout(
+            relay_token,
+            request,
+            SNAPSHOT_HTTP_READ_TIMEOUT,
+        )
+    }
+
+    pub fn upload_cloud_session_batch_with_timeout(
+        &self,
+        relay_token: &str,
+        request: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         match self
             .agent
             .post(&self.api_url("/api/v1/cloud-session-observations/batches"))
+            .timeout(timeout)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
@@ -670,11 +700,28 @@ impl SnapshotApiClient {
         scan_id: &str,
         request: &Value,
     ) -> Result<Value> {
+        self.upload_cloud_session_scan_chunk_with_timeout(
+            relay_token,
+            scan_id,
+            request,
+            SNAPSHOT_HTTP_READ_TIMEOUT,
+        )
+    }
+
+    pub fn upload_cloud_session_scan_chunk_with_timeout(
+        &self,
+        relay_token: &str,
+        scan_id: &str,
+        request: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         self.upload_cloud_session_scan_request(
             relay_token,
-            &format!("/api/v1/cloud-sessions/scans/{scan_id}/chunks"),
+            scan_id,
+            "chunks",
             request,
             "cloud_session_scan_chunk",
+            timeout,
         )
     }
 
@@ -685,24 +732,52 @@ impl SnapshotApiClient {
         scan_id: &str,
         request: &Value,
     ) -> Result<Value> {
+        self.finalize_cloud_session_scan_with_timeout(
+            relay_token,
+            scan_id,
+            request,
+            SNAPSHOT_HTTP_READ_TIMEOUT,
+        )
+    }
+
+    pub fn finalize_cloud_session_scan_with_timeout(
+        &self,
+        relay_token: &str,
+        scan_id: &str,
+        request: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         self.upload_cloud_session_scan_request(
             relay_token,
-            &format!("/api/v1/cloud-sessions/scans/{scan_id}/finalize"),
+            scan_id,
+            "finalize",
             request,
             "cloud_session_scan_finalize",
+            timeout,
         )
     }
 
     fn upload_cloud_session_scan_request(
         &self,
         relay_token: &str,
-        path: &str,
+        scan_id: &str,
+        action: &str,
         request: &Value,
         operation: &'static str,
+        timeout: Duration,
     ) -> Result<Value> {
+        if !valid_cloud_scan_id(scan_id)
+            || request.get("scan_id").and_then(Value::as_str) != Some(scan_id)
+        {
+            return Err(anyhow!(
+                "cloud-session scan path and payload scan_id are invalid or do not match"
+            ));
+        }
+        let path = format!("/api/v1/cloud-sessions/scans/{scan_id}/{action}");
         match self
             .agent
-            .post(&self.api_url(path))
+            .post(&self.api_url(&path))
+            .timeout(timeout)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
@@ -825,6 +900,15 @@ impl SnapshotApiClient {
     fn api_url(&self, path: &str) -> String {
         format!("{}{}", self.api_base_url.trim_end_matches('/'), path)
     }
+}
+
+fn valid_cloud_scan_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
@@ -1093,6 +1177,19 @@ mod tests {
             client.api_url("/api/v1/agent-status/snapshots"),
             "https://ottto.test/backend/api/v1/agent-status/snapshots"
         );
+    }
+
+    #[test]
+    fn cloud_scan_path_rejects_mismatched_payload_scan_id_before_io() {
+        let client = SnapshotApiClient::new("http://127.0.0.1:1");
+        let error = client
+            .upload_cloud_session_scan_chunk(
+                "relay-token",
+                "00000000-0000-4000-8000-000000000001",
+                &json!({"scan_id":"00000000-0000-4000-8000-000000000002"}),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("scan_id are invalid"));
     }
 
     #[test]
