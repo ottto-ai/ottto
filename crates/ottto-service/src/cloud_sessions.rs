@@ -1633,6 +1633,15 @@ impl CloudSessionCheckpointStore {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_provider_calls_active_for_test(&self, active_calls: usize) {
+        let mut active = self.provider_calls.active_calls.lock().unwrap();
+        *active = active_calls;
+        if active_calls == 0 {
+            self.provider_calls.idle.notify_all();
+        }
+    }
     fn load(&self) -> CloudSessionCheckpoint {
         fs::read(&self.path)
             .ok()

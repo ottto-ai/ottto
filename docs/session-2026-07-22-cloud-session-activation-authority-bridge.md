@@ -20,6 +20,20 @@ activation without changing public startup.
 - Prepare returns the credential-free backend create DTO. Bind and
   confirm-revoked accept only the strict backend grant response. Revoke stops
   locally and returns one exact grant UUID for ordinary-browser DELETE.
+- Logout, account switch, same-user organization replacement, relay-device
+  rotation, and removal of the Codex device source all fail closed with
+  `reason_code: cloud_session_cleanup_required` until exact backend DELETE is
+  confirmed. An enabled grant is paused before rejection, while the old
+  account/device remains available for cleanup.
+- One process-local lifecycle lock now serializes the local account/device
+  read-check-write transaction with every Cloud sessions Prepare/Bind/Pause/
+  Revoke/Confirm transition. Trusted remote action-token validation finishes
+  before this lock is acquired; provider and network I/O never run while it is
+  held. Lock order is lifecycle lock, then grant/checkpoint file lock, so stop
+  fencing cannot deadlock with admission. Pause/Revoke persist their local stop,
+  release the lifecycle lock while waiting for the provider-call fence, and
+  Revoke then reacquires it and revalidates exact account/device identity before
+  binding a raced POST response or returning the DELETE target.
 
 ## Runtime authority and stop fence
 
@@ -158,6 +172,11 @@ Authorization: Bearer <source-scoped relay token>
 - A local-control timeout is an unknown outcome. The consumer mints a fresh
   `cloud_sessions_status` token and observes local state before repeating any
   backend mutation.
+- Logout/account/device-change rejection is retry-safe. The consumer keeps the
+  old identity selected, retries exact DELETE and confirm with fresh action
+  tokens, then repeats the identity change. Ordinary and `--local-only` logout
+  use the same guard; neither may silently discard an enabled, paused,
+  policy-disabled, ambiguous-create, or locally-revoked-but-unconfirmed grant.
 - Authority responses must match the requested and locally bound epoch exactly;
   even a higher valid-looking epoch is rejected without updating local state or
   invoking the provider. Authority absence, auth failure, epoch conflict,
@@ -178,6 +197,20 @@ Authorization: Bearer <source-scoped relay token>
 - The rollout-race control test proves POST success followed by bind `403` can
   still locally revoke, return the exact DELETE target, and confirm cleanup
   without provider permission.
+- Identity-lifecycle tests cover pending create/bind, enabled, paused,
+  policy-disabled, locally revoked cleanup-pending, logout, staged account
+  switch, account replacement, and relay-device rotation. They prove rejection
+  precedes account/device mutation, enabled admission is paused, the staged
+  switch remains retryable, and exact DELETE confirmation permits the original
+  operation.
+- Deterministic interleaving tests cover both transaction winners: reset clears
+  identity before a validated Prepare reaches the local lock, so Prepare
+  rejects without creating a grant; Prepare and Bind can commit while reset is
+  waiting, so reset returns `cloud_session_cleanup_required` with the exact
+  account/device/grant retained. A provider-fence interleaving proves the
+  lifecycle lock is available during the idle wait and that a raced identity
+  change is rejected before a Revoke DELETE target is returned. A malformed
+  grant store also blocks reset.
 - Protocol completed with 36 passed/1 intentionally ignored; the focused
   cloud-session module completed with 60 passed; both cloud control workflows,
   formatting, and Clippy with warnings denied passed.

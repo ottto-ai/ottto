@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 254,
-  "content_sha256": "af120a14b945eacfadbff36134e27293afe2e2e665cf33282571a45da6d474e5",
+  "candidate_file_count": 255,
+  "content_sha256": "2551a61bf53e35bc2a6ea496ab948e9987907eccb1beee26f5958b3d7cda5374",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "8e13682c29c4b7b554fdc3650504bbbf02112545552914260b3df9b5ce7ef406",
-      "size_bytes": 44913
+      "sha256": "e9a184b9a8a185fed0169031d8f3e67b0c25c32c8e4a5eb307bedc9abf832d3c",
+      "size_bytes": 45104
     },
     {
       "executable": false,
@@ -454,8 +454,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "ec102b97cef45103bfb9d1c0834d5f5458a6e80dfe541f40f1d817a9fb66c54e",
-      "size_bytes": 156513
+      "sha256": "16ec8b4ed75fbf495a07d97d2b832c5204f5ca7fe0a068e53a08bc2dacf7beef",
+      "size_bytes": 156599
     },
     {
       "executable": false,
@@ -573,8 +573,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "c344e460f5e5cfab313b20397086e6d2bef9bb4cd248c30f683c853297595007",
-      "size_bytes": 158088
+      "sha256": "2008c7c6c72c9243c4df69f9157b9f7e6fc377252fe5dd2e4c5fb9427357c4f8",
+      "size_bytes": 162489
     },
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "b1f127599a14f41d6a240b8294076d2fd84b8921fc32d70b6dc4eeec688babeb",
-      "size_bytes": 250366
+      "sha256": "e8a3c86bcecb5a12fe9b762c338413adf6a3cdeb8b78444e2df94ff392f77f48",
+      "size_bytes": 281041
     },
     {
       "executable": false,
@@ -706,8 +706,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "cb14cf7bb37a8902e2e673222729df8ab775c655fafb32163dd509710f24762c",
-      "size_bytes": 625487
+      "sha256": "96f9597bad12d3b0595e36546bacc8d96a7e895f739a3201fd2ca1fec0958fa7",
+      "size_bytes": 684502
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "905048b9b96af4a1effe5d52ac07b6260f468d10aa1e5b80368ee22ed58eefea",
-      "size_bytes": 304094
+      "sha256": "b19fb743439b4fc6abcf0163945b3406380de91e30af3ec4f4d24833e8eba6c4",
+      "size_bytes": 304957
     },
     {
       "executable": false,
@@ -776,8 +776,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "35c0a5e6db85dd5793b34197af1f189a14c8978d4a2f51ead7eb48055e30a8db",
-      "size_bytes": 67078
+      "sha256": "40dab5e40389f8a1ababf75b1c63d2115b0f2e3c18bcf6e763574997769668c3",
+      "size_bytes": 67155
     },
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "071d9d25bfb425c0fbd023ae302ff57ecd9bfab1a0d905b195048743676ad760",
-      "size_bytes": 54664
+      "sha256": "0c042a90def19e7ad99c70ce7a778ab33431dc6cb71efdd7030591b721046cf0",
+      "size_bytes": 56887
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "ea678aec289fc4171b679ef353371b5cca9e33a453e50fb40ebba74db27f94e7",
-      "size_bytes": 10110
+      "sha256": "97cc0eeb84b9bf614b94ee0564c28ac029e7fc34415859bcea80c315069b5523",
+      "size_bytes": 11990
     },
     {
       "executable": false,
@@ -960,6 +960,13 @@
       "path": "docs/session-2026-07-22-cloud-connector-daemon-bridge.md",
       "sha256": "593cb405abcd1c00c4a6f13104118e2e78a360c1af70b15bb4659a0941f69f48",
       "size_bytes": 840
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-22-cloud-session-activation-authority-bridge.md",
+      "sha256": "79461306409e488970dcbe298d9ba0ff08a644146427011a4a43a056e97e4536",
+      "size_bytes": 10867
     },
     {
       "executable": false,
@@ -1781,9 +1788,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T14:39:09+00:00",
+  "generated_at": "2026-07-22T14:54:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 255,
+  "output_file_count": 256,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1817,5 +1824,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b88f424daa3eec4608287009c24e6ea858e7c970"
+  "source_commit": "0481de50afbacb03fd96edbcfb6b1bc5a94af9be"
 }

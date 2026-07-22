@@ -94,7 +94,13 @@ collector scope, not an OpenAI or Codex provider-account identity. The official
 CLI path currently exposes no sanctioned safe account discriminator; Ottto does
 not infer one or merge histories across a user-known provider-account switch.
 Such a switch requires explicit local stop, exact backend deletion, and setup
-again.
+again. Ottto also refuses logout, account replacement, relay-device rotation,
+or removal of the Codex device source while a local cloud-session record is not
+fully backend-revoked. The rejected identity-change attempt pauses an enabled
+grant before returning the stable `cloud_session_cleanup_required` reason, but
+retains the old account/device and exact grant id so the ordinary browser can
+retry DELETE and confirm its monotonic revocation epoch. `--local-only` logout
+does not bypass this reachability guard.
 
 The strict v2 chunk/finalize relay adapters, exact relay authority read, and
 backend DTOs are present for contract testing, but public service startup

@@ -364,6 +364,9 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `local-client/disconnect` in Ottto before clearing local account, connection,
   and setup-run token state. `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
+  Neither mode clears account/device identity while Cloud sessions still needs
+  an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
+  confirmation, then retry logout.
 - native app account-state UX now treats browser login and local app binding as
   separate states: Verify returns a sign-in-specific message when no local
   account is bound, and the SwiftUI app keeps polling a pending browser claim so
