@@ -684,6 +684,9 @@ pub struct ActiveSession {
     pub source_session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_display_name: Option<String>,
+    /// Provider-native session start, when the local transcript exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_started_at: Option<Rfc3339Timestamp>,
     pub source_last_activity_at: Rfc3339Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_display_label: Option<String>,
@@ -695,6 +698,32 @@ pub struct ActiveSession {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<Rfc3339Timestamp>,
+    /// Cumulative observed session counters. Optional keeps older daemons and
+    /// sources that cannot prove a counter honest in the Companion UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Subset of output tokens spent on reasoning, when the source reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+    /// Provider total that could not be assigned to a named counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unattributed_total_tokens: Option<u64>,
+    /// Whether `input_tokens` excludes or includes cached input. Free-form and
+    /// additive so provider semantics can evolve without breaking old apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_token_scope: Option<String>,
+    /// Content-free role used only for a truthful fallback title, e.g.
+    /// `subagent` or `automation`, when no provider title exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1326,6 +1355,10 @@ pub struct AgentQuotaWindow {
     pub scope: AgentQuotaWindowScope,
     pub status: AgentQuotaWindowStatus,
     pub freshness: AgentQuotaWindowFreshness,
+    /// When the provider/cache actually observed this quota value. This is
+    /// distinct from the later agent-status check that merely read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4205,6 +4238,7 @@ mod tests {
             sessions: vec![ActiveSession {
                 source_session_id: "session-a".to_string(),
                 session_display_name: Some("Active task".to_string()),
+                source_started_at: Some("2026-07-19T17:00:00Z".to_string()),
                 source_last_activity_at: "2026-07-19T17:59:00Z".to_string(),
                 workspace_display_label: Some("workspace".to_string()),
                 repository_label: Some("repository".to_string()),
@@ -4214,6 +4248,15 @@ mod tests {
                     "2026-07-19T17:30:00Z".to_string(),
                     "2026-07-19T17:50:00Z".to_string(),
                 ],
+                input_tokens: Some(1_000),
+                cache_read_tokens: Some(800),
+                cache_creation_5m_tokens: Some(50),
+                cache_creation_1h_tokens: Some(25),
+                output_tokens: Some(200),
+                reasoning_output_tokens: Some(20),
+                unattributed_total_tokens: None,
+                input_token_scope: Some("inclusive_cached".to_string()),
+                session_kind: Some("subagent".to_string()),
                 account_identifier_hash: Some("account-hash".to_string()),
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
@@ -4225,6 +4268,12 @@ mod tests {
         assert_eq!(value["changed_session_count"], 1);
         assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
         assert_eq!(value["sessions"][0]["compaction_count"], 2);
+        assert_eq!(
+            value["sessions"][0]["source_started_at"],
+            "2026-07-19T17:00:00Z"
+        );
+        assert_eq!(value["sessions"][0]["input_tokens"], 1_000);
+        assert_eq!(value["sessions"][0]["session_kind"], "subagent");
         assert_eq!(
             value["sessions"][0]["compaction_timestamps"][1],
             "2026-07-19T17:50:00Z"
