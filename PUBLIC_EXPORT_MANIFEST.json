@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 255,
-  "content_sha256": "3e893479b36df0dfc4e385d5c16d695ff718b57b9b826b18aff4590ceec5122c",
+  "content_sha256": "96129d1956afc1ec42f8b66032d3fe82ab43911e891cbf2af7069414b381b50c",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "f7b3022bacd8d47d5782e7aea0ddb0c72c82c747c4a0879bae362e6c2ec080c3",
-      "size_bytes": 45419
+      "sha256": "e7635c17002702550651745006f788042749252a4d55aecc349831eb77ca0d0b",
+      "size_bytes": 45935
     },
     {
       "executable": false,
@@ -776,8 +776,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "40dab5e40389f8a1ababf75b1c63d2115b0f2e3c18bcf6e763574997769668c3",
-      "size_bytes": 67155
+      "sha256": "cbc755d91ceb01529e55d23e909a92b53397d2c7820eda655554c43453c0abe4",
+      "size_bytes": 69151
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "202366aef08e55db302f38142b200c7d6911e6bc78b541ed035b738b93500143",
-      "size_bytes": 12527
+      "sha256": "77ce811f74876c7bf43e97a7e4037d395b7b18591ec86b050d2c4c137f3b21f3",
+      "size_bytes": 13000
     },
     {
       "executable": false,
@@ -1788,7 +1788,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T14:54:54+00:00",
+  "generated_at": "2026-07-22T18:10:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 256,
   "public_roots": [
@@ -1824,5 +1824,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6d4117e09731e697ced26a387bcc62121f665c48"
+  "source_commit": "68b4a678adf548796cbfc030c1ff2ebf9a32c3c8"
 }
