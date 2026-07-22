@@ -286,8 +286,7 @@ fn assert_collector_fixture(
             )
         },
     );
-    if source.manifest.source_id == "codex" && collector.manifest.collector_id == "cloud_sessions"
-    {
+    if source.manifest.source_id == "codex" && collector.manifest.collector_id == "cloud_sessions" {
         assert_cloud_session_fixture_digests(fixture);
     }
 }
@@ -308,7 +307,11 @@ fn assert_cloud_session_fixture_digests(fixture: &LoadedFixture) {
             .get("observations")
             .and_then(Value::as_array)
             .unwrap_or_else(|| panic!("{} has no observations", fixture.path.display()));
-        assert!(!observations.is_empty(), "{} is empty", fixture.path.display());
+        assert!(
+            !observations.is_empty(),
+            "{} is empty",
+            fixture.path.display()
+        );
 
         let mut identity_keys = Vec::new();
         let mut semantics = Vec::new();
