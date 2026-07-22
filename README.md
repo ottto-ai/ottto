@@ -582,7 +582,15 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - adaptive per-source local snapshot cadence primitives: debounced file watches
   through `notify`, hot/warm/idle/cold/failing/disabled scheduler states,
   backend activity-hint polling, and a persisted scan index under
-  `~/Library/Application Support/Ottto` whose backend-visible fields are hashes
+  `~/Library/Application Support/Ottto` whose backend-visible fields are hashes.
+  Multi-page scans also keep an atomic, policy- and relay-device-scoped upload
+  checkpoint made only of accepted semantic snapshot fingerprints plus a
+  one-way destination namespace hash. A timeout, restart, or one invalid
+  snapshot therefore resumes at the unaccepted work instead of replaying every
+  earlier page. Scan indexes and historical-bootstrap completion are also bound
+  to that destination so an account switch cannot reuse another account's
+  delivery cursor; the checkpoint is removed only after the final markers are
+  durable.
 - source-scoped relay snapshot client helpers for relay-token exchange, batch
   upload, collector status, and backend activity-hints, with missing relay
   device credentials logged as a safe local skip instead of leaking paths or
