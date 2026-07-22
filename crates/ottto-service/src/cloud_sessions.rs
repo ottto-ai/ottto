@@ -1,14 +1,20 @@
 //! Supported, metadata-only Codex Cloud session collector.
 //!
 //! The collector invokes only `codex cloud list --json` as the effective user.
-//! It never opens `auth.json`, touches Keychain credentials, or calls provider
-//! endpoints directly. Raw CLI JSON, task titles, URLs, provider ids, and
-//! cursors are used only in memory to derive content-free observations.
+//! It never opens `auth.json`, reads OpenAI credentials, or calls provider
+//! endpoints directly. After exact consent and destination checks, it reads
+//! only Ottto's relay device credential for Ottto backend authentication. Raw
+//! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
+//! memory to derive content-free observations.
 
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
-use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
+use ottto_core::{
+    compiled_release_version, default_support_dir, FileAccountStore, FileConnectionStore,
+    FileDeviceStore, LocalDeviceBinding,
+};
+use ottto_protocol::LocalAccountState;
 pub use ottto_protocol::{CloudSessionBackendGrantResponseV1, CloudSessionServerPolicyState};
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
@@ -20,6 +26,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,6 +53,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HEALTH_HEARTBEAT_INTERVAL: TimeDuration = TimeDuration::hours(1);
 const MAX_JITTER: Duration = Duration::from_secs(20);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
+
+static COLLECTOR_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -346,6 +357,44 @@ impl CloudSessionGrantStore {
 
     pub fn load(&self) -> Result<Option<CloudSessionGrant>> {
         Ok(self.read()?.map(|state| state.grant))
+    }
+
+    /// Return a collection candidate only when the persisted HMAC scope still
+    /// binds the exact local device, organization, and user. This is read-only:
+    /// a mismatch cannot rewrite consent or make a stale grant current again.
+    fn runtime_candidate_for(
+        &self,
+        setup: &CloudSessionGrantSetup,
+    ) -> Result<Option<CloudSessionGrant>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        if !cloud_grant_preflight_eligible(&state.grant) {
+            return Ok(None);
+        }
+        let key = decode_hex(&state.hmac_key_hex)
+            .filter(|key| key.len() == 32)
+            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+        let exact_scope = state.grant.installation_fingerprint
+            == opaque_key(&key, &setup.installation_id)
+            && state.grant.organization_fingerprint == opaque_key(&key, &setup.organization_scope)
+            && state.grant.effective_user_fingerprint
+                == opaque_key(&key, &setup.effective_user_scope)
+            && state.grant.account_fingerprint
+                == opaque_key(
+                    &key,
+                    &format!(
+                        "{}\u{0}{}",
+                        setup.organization_scope, setup.effective_user_scope
+                    ),
+                )
+            && state.grant.grant_scope_id == grant_scope_fingerprint(&key, setup);
+        if !exact_scope {
+            return Err(anyhow!(
+                "cloud-session grant does not match the current local identity"
+            ));
+        }
+        Ok(Some(state.grant))
     }
 
     /// Prepare explicit local consent. Scope inputs are converted to HMAC
@@ -1007,8 +1056,8 @@ impl Drop for CloudSessionGrantLock {
 }
 
 /// Build the visible collector state without creating a runner or invoking
-/// Codex. The default service wiring deliberately passes the deferred
-/// transport, which makes provider CLI use impossible in this public slice.
+/// Codex. Runtime readiness is supplied as a credential-free status view;
+/// collection still requires exact grant authority inside the supervisor.
 pub fn cloud_session_collector_status(
     grants: &CloudSessionGrantStore,
     transport: &dyn CloudSessionTransport,
@@ -1101,10 +1150,39 @@ pub fn cloud_session_collector_status(
 }
 
 pub fn default_cloud_session_collector_status() -> CloudSessionCollectorStatusV1 {
+    let transport_configured = runtime_transport_locally_configured_with(
+        &CloudSessionGrantStore::default(),
+        &FileAccountStore::default(),
+        &FileDeviceStore::default(),
+        &FileConnectionStore::default(),
+        crate::snapshot_client::load_snapshot_device_credentials,
+    );
     cloud_session_collector_status(
         &CloudSessionGrantStore::default(),
-        &DeferredCloudSessionTransport,
+        &RuntimeAvailabilityTransport(transport_configured),
     )
+}
+
+fn runtime_transport_locally_configured_with<F>(
+    grants: &CloudSessionGrantStore,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+    load_credentials: F,
+) -> bool
+where
+    F: FnOnce() -> Result<(LocalDeviceBinding, String)>,
+{
+    !kill_switch_enabled()
+        && load_cloud_session_runtime_binding(grants, accounts, devices, connections)
+            .ok()
+            .flatten()
+            .and_then(|candidate| {
+                load_credentials().ok().map(|(device, secret)| {
+                    device == candidate.binding.device && !secret.trim().is_empty()
+                })
+            })
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1499,6 +1577,10 @@ struct CloudSessionCheckpoint {
     head_semantic_digest: Option<String>,
     #[serde(default)]
     grant_epoch_digest: Option<String>,
+    /// Grant epoch that owns the current circuit-breaker backoff. A new grant
+    /// must not inherit a prior consent epoch's transient failures.
+    #[serde(default)]
+    circuit_grant_epoch_digest: Option<String>,
     consecutive_failures: u32,
     circuit_open_until: Option<String>,
     last_error_category: Option<String>,
@@ -1768,12 +1850,28 @@ impl CloudSessionTransport for DeferredCloudSessionTransport {
     }
 }
 
-/// Prepared relay transport for the strict backend route. It deliberately is
-/// not used by `spawn_cloud_session_collector`: production activation remains a
-/// separate release/deployment/retention gate. When explicitly composed, it
-/// reuses one in-memory relay token and refreshes it once on 401/403.
-/// Ordinary-user grant revalidation must be supplied separately, so this
-/// adapter alone never reports a collection-ready transport.
+/// Status-only view of the process-local runtime composition. It carries no
+/// credentials and cannot send; collection always uses the relay transport.
+struct RuntimeAvailabilityTransport(bool);
+
+impl CloudSessionTransport for RuntimeAvailabilityTransport {
+    fn is_configured(&self) -> bool {
+        self.0
+    }
+
+    fn supports_grant_revalidation(&self) -> bool {
+        self.0
+    }
+
+    fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+        Err(anyhow!("cloud-session status transport cannot send"))
+    }
+}
+
+/// Relay transport for the strict backend route. The consent-gated experimental
+/// runtime composes it only after exact local identity/grant checks. Collection
+/// then revalidates that exact grant before every provider or upload boundary.
+/// It reuses one in-memory relay token and refreshes it once on 401/403.
 pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
@@ -2179,19 +2277,26 @@ fn collect_cloud_sessions_once_with_budget(
     now: OffsetDateTime,
     cycle_budget: Duration,
 ) -> CloudSessionCycleOutcome {
-    if kill_switch_enabled() || !grant_preflight_eligible(grants) {
-        if let Ok(mut runtime) = checkpoints.runtime.lock() {
-            runtime.active = None;
-            runtime.cancel_requested = runtime.cycle_in_progress;
-        }
+    if kill_switch_enabled() {
+        disable_checkpoint_runtime(checkpoints);
         return CloudSessionCycleOutcome::Disabled;
     }
+    let Some(admitted_grant) = grants
+        .load()
+        .ok()
+        .flatten()
+        .filter(cloud_grant_preflight_eligible)
+    else {
+        disable_checkpoint_runtime(checkpoints);
+        return CloudSessionCycleOutcome::Disabled;
+    };
     if !transport.is_configured() || !transport.supports_grant_revalidation() {
         let _ = grants.record_health("unavailable", "unavailable", Some("transport_unconfigured"));
         return CloudSessionCycleOutcome::Noop;
     }
     let mut checkpoint = checkpoints.load();
-    if circuit_open(&checkpoint, now) {
+    reset_stale_circuit_for_grant(&mut checkpoint, &admitted_grant);
+    if circuit_open_for_grant(&checkpoint, &admitted_grant, now) {
         return CloudSessionCycleOutcome::CircuitOpen;
     }
     let mut runtime = match checkpoints.runtime.lock() {
@@ -2239,6 +2344,7 @@ fn collect_cloud_sessions_once_with_budget(
         Ok(CycleResult::Noop) => {
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_success_at = Some(timestamp(now));
             if !preserve_incomplete_health {
                 checkpoint.last_error_category = None;
@@ -2254,6 +2360,7 @@ fn collect_cloud_sessions_once_with_budget(
         Ok(CycleResult::Heartbeat) => {
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_error_category = None;
             checkpoint.last_success_at = Some(timestamp(now));
             checkpoint.last_health_upload_at = Some(timestamp(now));
@@ -2276,6 +2383,7 @@ fn collect_cloud_sessions_once_with_budget(
             }
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_success_at = Some(timestamp(now));
             checkpoint.last_health_upload_at = Some(timestamp(now));
             if completed_full_scan {
@@ -2296,6 +2404,7 @@ fn collect_cloud_sessions_once_with_budget(
         Err(error) => {
             checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
             checkpoint.last_error_category = Some(error.category.to_string());
+            checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(&admitted_grant));
             checkpoint.circuit_open_until = Some(timestamp(
                 now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
             ));
@@ -2306,6 +2415,13 @@ fn collect_cloud_sessions_once_with_budget(
             let _ = grants.record_health("failing", "stale", Some(error.category));
             CloudSessionCycleOutcome::Failed
         }
+    }
+}
+
+fn disable_checkpoint_runtime(checkpoints: &CloudSessionCheckpointStore) {
+    if let Ok(mut runtime) = checkpoints.runtime.lock() {
+        runtime.active = None;
+        runtime.cancel_requested = runtime.cycle_in_progress;
     }
 }
 
@@ -3470,18 +3586,45 @@ fn complete_snapshot_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTim
     }
 }
 
-fn circuit_open(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
-    checkpoint
-        .circuit_open_until
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        .is_some_and(|until| until > now)
+fn circuit_open_for_grant(
+    checkpoint: &CloudSessionCheckpoint,
+    grant: &CloudSessionGrant,
+    now: OffsetDateTime,
+) -> bool {
+    checkpoint.circuit_grant_epoch_digest.as_deref() == Some(grant_epoch_digest(grant).as_str())
+        && checkpoint
+            .circuit_open_until
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|until| until > now)
+}
+fn reset_stale_circuit_for_grant(
+    checkpoint: &mut CloudSessionCheckpoint,
+    grant: &CloudSessionGrant,
+) {
+    let current_epoch = grant_epoch_digest(grant);
+    let has_circuit_state = checkpoint.consecutive_failures > 0
+        || checkpoint.circuit_open_until.is_some()
+        || checkpoint.circuit_grant_epoch_digest.is_some();
+    if has_circuit_state
+        && checkpoint.circuit_grant_epoch_digest.as_deref() != Some(current_epoch.as_str())
+    {
+        checkpoint.consecutive_failures = 0;
+        checkpoint.circuit_open_until = None;
+        checkpoint.circuit_grant_epoch_digest = None;
+        if checkpoint.last_error_category.as_deref() != Some("scan_incomplete") {
+            checkpoint.last_error_category = None;
+        }
+    }
 }
 fn backoff_seconds(failures: u32) -> u64 {
     60 * (1_u64 << failures.min(6))
 }
 fn kill_switch_enabled() -> bool {
-    std::env::var(KILL_SWITCH_ENV).ok().is_some_and(|value| {
+    truthy_env(KILL_SWITCH_ENV)
+}
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -3667,27 +3810,350 @@ pub enum CloudSessionCollectorStartup {
     Started,
 }
 
-pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
-    // Public builds have no ingest endpoint. Do not register a poller that
-    // merely looks active: deferred transport means no runner is constructed
-    // and no provider CLI process can be started.
-    let transport = DeferredCloudSessionTransport;
-    if !transport.is_configured() || !transport.supports_grant_revalidation() {
-        return Ok(CloudSessionCollectorStartup::DeferredTransport);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudSessionRuntimeBinding {
+    api_base_url: String,
+    device: LocalDeviceBinding,
+    grant_id: String,
+    grant_version: u64,
+    grant_scope_id: String,
+}
+
+struct CloudSessionRuntimeCandidate {
+    binding: CloudSessionRuntimeBinding,
+    grant: CloudSessionGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudSessionRuntimeTransportKey {
+    binding: CloudSessionRuntimeBinding,
+    device_secret_digest: String,
+}
+
+type ActiveCloudSessionTransport = Option<(
+    CloudSessionRuntimeTransportKey,
+    Box<dyn CloudSessionTransport + Send>,
+)>;
+
+fn load_cloud_session_runtime_binding(
+    grants: &CloudSessionGrantStore,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+) -> Result<Option<CloudSessionRuntimeCandidate>> {
+    // The default/off path is intentionally one local grant read. Do not touch
+    // account, connection, device, or Keychain state until consent is capable
+    // of becoming runtime-ready.
+    if !grant_preflight_eligible(grants) {
+        return Ok(None);
     }
-    thread::Builder::new()
+    let account = accounts.load()?;
+    let user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("cloud-session local user binding is unavailable"))?;
+    let organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("cloud-session local organization binding is unavailable"))?;
+    if account.state != LocalAccountState::Connected {
+        return Err(anyhow!("cloud-session local account is not connected"));
+    }
+    let device = devices
+        .load()?
+        .ok_or_else(|| anyhow!("cloud-session relay device binding is unavailable"))?;
+    if !is_uuid(&device.device_id) || !device.sources.iter().any(|source| source == "codex") {
+        return Err(anyhow!(
+            "cloud-session relay device is not exactly Codex-bound"
+        ));
+    }
+    let connection = connections
+        .load()?
+        .ok_or_else(|| anyhow!("cloud-session backend connection is unavailable"))?;
+    if connection.setup_run_id.trim().is_empty() || connection.machine_id != device.machine_id {
+        return Err(anyhow!(
+            "cloud-session backend connection does not match the relay device"
+        ));
+    }
+    // Validate the persisted destination before the caller reads the device
+    // secret. Loopback is accepted only when the daemon process explicitly
+    // carries the exact same developer override.
+    let api_base_url = validated_cloud_session_api_base_url(&connection.api_base_url)?;
+    let setup = CloudSessionGrantSetup {
+        installation_id: device.device_id.clone(),
+        organization_scope: organization_id.to_string(),
+        effective_user_scope: user_id.to_string(),
+    };
+    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
+        return Ok(None);
+    };
+    let backend = grant
+        .backend_binding
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
+    Ok(Some(CloudSessionRuntimeCandidate {
+        binding: CloudSessionRuntimeBinding {
+            api_base_url,
+            device,
+            grant_id: backend.grant_id.clone(),
+            grant_version: backend.grant_version,
+            grant_scope_id: grant.grant_scope_id.clone(),
+        },
+        grant,
+    }))
+}
+
+fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() || value.contains(['@', '?', '#']) {
+        return Err(anyhow!("cloud-session backend destination is untrusted"));
+    }
+    let production = value == DEFAULT_API_BASE_URL
+        || value == LEGACY_API_BASE_URL
+        || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
+        || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"));
+    let exact_developer_override = std::env::var("OTTTO_API_BASE_URL")
+        .ok()
+        .map(|override_value| override_value.trim().trim_end_matches('/').to_string())
+        .is_some_and(|override_value| override_value == value && is_loopback_http_base(value));
+    if !production && !exact_developer_override {
+        return Err(anyhow!("cloud-session backend destination is untrusted"));
+    }
+    Ok(value.to_string())
+}
+
+fn is_loopback_http_base(value: &str) -> bool {
+    ["http://127.0.0.1", "http://localhost"]
+        .iter()
+        .any(|prefix| {
+            value.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.is_empty()
+                    || suffix.starts_with('/')
+                    || suffix.strip_prefix(':').is_some_and(|port_and_path| {
+                        let port = port_and_path.split('/').next().unwrap_or_default();
+                        !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        })
+}
+
+fn deactivate_composed_runtime(
+    active_transport: &mut ActiveCloudSessionTransport,
+    checkpoints: &CloudSessionCheckpointStore,
+) {
+    active_transport.take();
+    disable_checkpoint_runtime(checkpoints);
+}
+
+fn collect_composed_cloud_sessions_once(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    runner: &dyn CloudSessionRunner,
+    active_transport: &mut ActiveCloudSessionTransport,
+    now: OffsetDateTime,
+) -> CloudSessionCycleOutcome {
+    let accounts = FileAccountStore::default();
+    let devices = FileDeviceStore::default();
+    let connections = FileConnectionStore::default();
+    collect_composed_cloud_sessions_once_with(
+        grants,
+        checkpoints,
+        runner,
+        active_transport,
+        &accounts,
+        &devices,
+        &connections,
+        crate::snapshot_client::load_snapshot_device_credentials,
+        |api_base_url, device, device_secret| {
+            Box::new(RelayCloudSessionTransport::new(
+                api_base_url,
+                device,
+                device_secret,
+            ))
+        },
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_composed_cloud_sessions_once_with<FLoadCredentials, FComposeTransport>(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    runner: &dyn CloudSessionRunner,
+    active_transport: &mut ActiveCloudSessionTransport,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+    load_credentials: FLoadCredentials,
+    compose_transport: FComposeTransport,
+    now: OffsetDateTime,
+) -> CloudSessionCycleOutcome
+where
+    FLoadCredentials: FnOnce() -> Result<(LocalDeviceBinding, String)>,
+    FComposeTransport:
+        FnOnce(String, LocalDeviceBinding, String) -> Box<dyn CloudSessionTransport + Send>,
+{
+    if kill_switch_enabled() {
+        deactivate_composed_runtime(active_transport, checkpoints);
+        return CloudSessionCycleOutcome::Disabled;
+    }
+    let candidate = match load_cloud_session_runtime_binding(grants, accounts, devices, connections)
+    {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            return CloudSessionCycleOutcome::Disabled;
+        }
+        Err(_) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            let _ =
+                grants.record_health("unavailable", "unavailable", Some("local_binding_invalid"));
+            return CloudSessionCycleOutcome::Failed;
+        }
+    };
+    let mut checkpoint = checkpoints.load();
+    reset_stale_circuit_for_grant(&mut checkpoint, &candidate.grant);
+    if circuit_open_for_grant(&checkpoint, &candidate.grant, now) {
+        return CloudSessionCycleOutcome::CircuitOpen;
+    }
+    let binding = candidate.binding;
+    // `load_cloud_session_runtime_binding` validates the destination first, so
+    // an on-disk URL cannot receive this long-lived secret. Reloading the
+    // device with the secret also closes an identity-change race.
+    let (credential_device, device_secret) = match load_credentials() {
+        Ok(credentials) => credentials,
+        Err(_) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            let _ = grants.record_health(
+                "unavailable",
+                "unavailable",
+                Some("relay_credentials_unavailable"),
+            );
+            return CloudSessionCycleOutcome::Failed;
+        }
+    };
+    if credential_device != binding.device || device_secret.trim().is_empty() {
+        deactivate_composed_runtime(active_transport, checkpoints);
+        let _ = grants.record_health("unavailable", "unavailable", Some("local_binding_changed"));
+        return CloudSessionCycleOutcome::Failed;
+    }
+    let key = CloudSessionRuntimeTransportKey {
+        binding: binding.clone(),
+        device_secret_digest: sha256(device_secret.as_bytes()),
+    };
+    let transport_changed = active_transport
+        .as_ref()
+        .map_or(true, |(current, _)| current != &key);
+    if transport_changed {
+        // Scan receipt bookkeeping belongs to one transport instance. Restart
+        // the in-memory scan before dropping that instance so a replacement
+        // never resumes with receipts it cannot prove.
+        deactivate_composed_runtime(active_transport, checkpoints);
+        let transport = compose_transport(binding.api_base_url, credential_device, device_secret);
+        // A candidate transport remains local and unretained until the server
+        // confirms this exact grant epoch. This is a one-time activation read
+        // per identity/credential change; normal polling keeps the established
+        // transport and its relay token.
+        let authority = match transport.revalidate_grant_bounded(&candidate.grant, COMMAND_TIMEOUT)
+        {
+            Ok(authority) => authority,
+            Err(_) => {
+                deactivate_composed_runtime(active_transport, checkpoints);
+                record_runtime_activation_failure(
+                    grants,
+                    checkpoints,
+                    &candidate.grant,
+                    now,
+                    "grant_revalidation_unavailable",
+                );
+                return CloudSessionCycleOutcome::Failed;
+            }
+        };
+        let current = match grants.apply_backend_grant_revalidation(&authority) {
+            Ok(current) => current,
+            Err(_) => {
+                deactivate_composed_runtime(active_transport, checkpoints);
+                record_runtime_activation_failure(
+                    grants,
+                    checkpoints,
+                    &candidate.grant,
+                    now,
+                    "grant_revalidation_invalid",
+                );
+                return CloudSessionCycleOutcome::Failed;
+            }
+        };
+        if !cloud_grant_runtime_ready(&current)
+            || !same_runtime_grant_identity(&current, &candidate.grant)
+        {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            return CloudSessionCycleOutcome::Disabled;
+        }
+        *active_transport = Some((key, transport));
+    }
+    let transport = active_transport
+        .as_ref()
+        .expect("cloud-session transport was just composed")
+        .1
+        .as_ref();
+    // The collector performs exact backend grant authority revalidation before
+    // its first provider subprocess and at every later provider/upload fence.
+    let outcome = collect_cloud_sessions_once(grants, checkpoints, runner, transport, now);
+    if kill_switch_enabled() || !grant_preflight_eligible(grants) {
+        deactivate_composed_runtime(active_transport, checkpoints);
+    }
+    outcome
+}
+
+fn record_runtime_activation_failure(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    grant: &CloudSessionGrant,
+    now: OffsetDateTime,
+    category: &'static str,
+) {
+    let mut checkpoint = checkpoints.load();
+    reset_stale_circuit_for_grant(&mut checkpoint, grant);
+    checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
+    checkpoint.last_error_category = Some(category.to_string());
+    checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(grant));
+    checkpoint.circuit_open_until = Some(timestamp(
+        now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
+    ));
+    let _ = checkpoints.save(&checkpoint);
+    let _ = grants.record_health("failing", "stale", Some(category));
+}
+
+fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
+    started
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_ok()
+}
+
+pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
+    // The supervisor is always available so a newly approved local grant can
+    // activate without restarting the daemon. Each cycle remains inert until
+    // exact local consent and server policy both authorize collection.
+    if !reserve_collector_supervisor(&COLLECTOR_SUPERVISOR_STARTED) {
+        return Ok(CloudSessionCollectorStartup::Started);
+    }
+    let spawned = thread::Builder::new()
         .name("ottto-codex-cloud-sessions".to_string())
         .spawn(|| {
             let grants = CloudSessionGrantStore::default();
             let checkpoints = CloudSessionCheckpointStore::default();
             let runner = CodexCloudCliRunner;
-            let transport = DeferredCloudSessionTransport;
+            let mut active_transport = None;
             loop {
-                let outcome = collect_cloud_sessions_once(
+                let outcome = collect_composed_cloud_sessions_once(
                     &grants,
                     &checkpoints,
                     &runner,
-                    &transport,
+                    &mut active_transport,
                     OffsetDateTime::now_utc(),
                 );
                 if !matches!(
@@ -3698,8 +4164,11 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
                 }
                 thread::sleep(POLL_INTERVAL + cycle_jitter());
             }
-        })
-        .map_err(|error| anyhow!("spawn Codex cloud-session collector: {error}"))?;
+        });
+    if let Err(error) = spawned {
+        COLLECTOR_SUPERVISOR_STARTED.store(false, AtomicOrdering::Release);
+        return Err(anyhow!("spawn Codex cloud-session collector: {error}"));
+    }
     Ok(CloudSessionCollectorStartup::Started)
 }
 
@@ -3753,6 +4222,51 @@ mod tests {
         store
             .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
             .unwrap();
+    }
+
+    fn runtime_identity_stores(
+        root: &Path,
+        user_id: &str,
+        organization_id: &str,
+        api_base_url: &str,
+    ) -> (FileAccountStore, FileDeviceStore, FileConnectionStore) {
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        accounts
+            .save(&ottto_protocol::LocalAccountBinding {
+                state: LocalAccountState::Connected,
+                user: Some(ottto_protocol::LocalAccountUser {
+                    id: user_id.to_string(),
+                    email: "runtime@example.com".to_string(),
+                    display_name: None,
+                }),
+                organization: Some(ottto_protocol::LocalAccountOrganization {
+                    id: organization_id.to_string(),
+                    name: "Runtime Org".to_string(),
+                }),
+                connected_at: None,
+                last_refreshed_at: None,
+                message: None,
+            })
+            .unwrap();
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: Some("machine-runtime".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        let connections = FileConnectionStore::new(root.join("connection.json"));
+        connections
+            .save(&ottto_core::LocalConnectionBinding {
+                setup_run_id: "setup-runtime".to_string(),
+                setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-runtime".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.to_string(),
+            })
+            .unwrap();
+        (accounts, devices, connections)
     }
 
     #[test]
@@ -6466,11 +6980,427 @@ mod tests {
     }
 
     #[test]
-    fn public_startup_remains_hard_deferred() {
+    fn collector_supervisor_has_one_process_owner_under_concurrency() {
+        let started = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let attempts = (0..8)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    reserve_collector_supervisor(&started)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
         assert_eq!(
-            spawn_cloud_session_collector().unwrap(),
-            CloudSessionCollectorStartup::DeferredTransport
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
         );
+    }
+
+    #[test]
+    fn paused_runtime_clears_process_scan_without_provider_or_state_writes() {
+        let (grants, checkpoints) = stores("runtime-paused-clear");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        grants.pause(now()).unwrap();
+        let before_grant = fs::read(grants.path()).unwrap();
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        checkpoints.runtime.lock().unwrap().active = Some(ActiveCloudSessionScan {
+            scan_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            scan_started_at: timestamp(now()),
+            mode: CloudSessionScanMode::Full,
+            grant: grant.clone(),
+            cursor: Some("private-cursor".to_string()),
+            seen_cursors: HashSet::new(),
+            observations: BTreeMap::new(),
+            provider_page_count: 1,
+            head_semantic_digest: None,
+            prepared: None,
+        });
+        let device = LocalDeviceBinding {
+            device_id: INSTALLATION_ID.to_string(),
+            machine_id: Some("machine-runtime".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let mut active_transport: ActiveCloudSessionTransport = Some((
+            CloudSessionRuntimeTransportKey {
+                binding: CloudSessionRuntimeBinding {
+                    api_base_url: DEFAULT_API_BASE_URL.to_string(),
+                    device: device.clone(),
+                    grant_id: GRANT_ID.to_string(),
+                    grant_version: 1,
+                    grant_scope_id: grant.grant_scope_id,
+                },
+                device_secret_digest: sha256(b"device-secret"),
+            },
+            Box::new(RelayCloudSessionTransport::new(
+                DEFAULT_API_BASE_URL,
+                device,
+                "device-secret".into(),
+            )),
+        ));
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(checkpoints.runtime.lock().unwrap().active.is_none());
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+        assert!(!checkpoints.path.exists());
+    }
+
+    #[test]
+    fn no_grant_is_zero_touch_beyond_the_local_grant_read() {
+        let root = temp_dir("runtime-no-grant-zero-touch");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let unreadable_account = root.join("unreadable-account");
+        let unreadable_device = root.join("unreadable-device");
+        let unreadable_connection = root.join("unreadable-connection");
+        fs::create_dir(&unreadable_account).unwrap();
+        fs::create_dir(&unreadable_device).unwrap();
+        fs::create_dir(&unreadable_connection).unwrap();
+        let accounts = FileAccountStore::new(unreadable_account);
+        let devices = FileDeviceStore::new(unreadable_device);
+        let connections = FileConnectionStore::new(unreadable_connection);
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let mut active_transport: ActiveCloudSessionTransport = None;
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || panic!("no grant must not read relay credentials"),
+                |_, _, _| panic!("no grant must not compose or contact the relay"),
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(!grants.path().exists());
+        assert!(!checkpoints.path.exists());
+        assert!(checkpoints.runtime.lock().unwrap().active.is_none());
+    }
+
+    #[test]
+    fn later_consent_activates_the_existing_supervisor_without_restart() {
+        let root = temp_dir("runtime-later-consent");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        let runner = Pages {
+            pages: RefCell::new(vec![page("after-consent", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let credential_reads = Cell::new(0);
+        let transport_compositions = Cell::new(0);
+        let mut active_transport: ActiveCloudSessionTransport = None;
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || panic!("dormant supervisor must not read relay credentials"),
+                |_, _, _| panic!("dormant supervisor must not compose a relay"),
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(!checkpoints.path.exists());
+
+        // A previous consent epoch's relay/provider failure may have left a
+        // long backoff. New consent must not inherit that stale circuit.
+        checkpoints
+            .save(&CloudSessionCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+                circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+                consecutive_failures: 6,
+                circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+                last_error_category: Some("provider_error".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        enabled(&grants);
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || {
+                    credential_reads.set(credential_reads.get() + 1);
+                    Ok((
+                        devices.load().unwrap().unwrap(),
+                        "device-secret".to_string(),
+                    ))
+                },
+                |_, _, _| {
+                    transport_compositions.set(transport_compositions.get() + 1);
+                    Box::new(V2RecordingTransport::new())
+                },
+                now() + TimeDuration::minutes(5),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert_eq!(credential_reads.get(), 1);
+        assert_eq!(transport_compositions.get(), 1);
+        assert_eq!(runner.calls.get(), 1);
+        assert!(active_transport.is_some());
+        let checkpoint = checkpoints.load();
+        assert!(checkpoint.circuit_open_until.is_none());
+        assert!(checkpoint.circuit_grant_epoch_digest.is_none());
+    }
+
+    #[test]
+    fn new_grant_failure_starts_a_fresh_circuit_epoch() {
+        let root = temp_dir("runtime-new-grant-circuit");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        checkpoints
+            .save(&CloudSessionCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+                circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+                consecutive_failures: 6,
+                circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+                last_error_category: Some("provider_error".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let mut active_transport: ActiveCloudSessionTransport = None;
+        let attempt_at = now() + TimeDuration::minutes(5);
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || Ok((
+                    devices.load().unwrap().unwrap(),
+                    "device-secret".to_string()
+                )),
+                |_, _, _| {
+                    Box::new(RevalidationTransport {
+                        response: None,
+                        revalidation_calls: Cell::new(0),
+                        send_calls: Cell::new(0),
+                    })
+                },
+                attempt_at,
+            ),
+            CloudSessionCycleOutcome::Failed
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        let checkpoint = checkpoints.load();
+        assert_eq!(checkpoint.consecutive_failures, 1);
+        assert_eq!(
+            checkpoint.circuit_grant_epoch_digest.as_deref(),
+            Some(grant_epoch_digest(&grant).as_str())
+        );
+        assert_eq!(
+            checkpoint.circuit_open_until.as_deref(),
+            Some(timestamp(attempt_at + TimeDuration::minutes(2)).as_str())
+        );
+    }
+
+    #[test]
+    fn stale_circuit_reset_preserves_incomplete_scan_health() {
+        let (grants, _) = stores("runtime-circuit-scan-health");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let mut checkpoint = CloudSessionCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+            circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+            consecutive_failures: 6,
+            circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+            last_error_category: Some("scan_incomplete".to_string()),
+            ..Default::default()
+        };
+
+        reset_stale_circuit_for_grant(&mut checkpoint, &grant);
+
+        assert_eq!(checkpoint.consecutive_failures, 0);
+        assert!(checkpoint.circuit_open_until.is_none());
+        assert!(checkpoint.circuit_grant_epoch_digest.is_none());
+        assert_eq!(
+            checkpoint.last_error_category.as_deref(),
+            Some("scan_incomplete")
+        );
+    }
+
+    #[test]
+    fn runtime_composition_requires_the_exact_local_grant_identity() {
+        let root = temp_dir("runtime-exact-identity");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+
+        let candidate =
+            load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections)
+                .unwrap()
+                .expect("exact local identity should compose");
+        let binding = candidate.binding;
+        assert_eq!(binding.device.device_id, INSTALLATION_ID);
+        assert_eq!(binding.grant_id, GRANT_ID);
+        assert_eq!(binding.grant_version, 1);
+        assert_eq!(binding.api_base_url, DEFAULT_API_BASE_URL);
+
+        let mismatched_accounts = FileAccountStore::new(root.join("mismatch-account.json"));
+        mismatched_accounts
+            .save(&ottto_protocol::LocalAccountBinding {
+                state: LocalAccountState::Connected,
+                user: Some(ottto_protocol::LocalAccountUser {
+                    id: "other-user".to_string(),
+                    email: "other@example.com".to_string(),
+                    display_name: None,
+                }),
+                organization: Some(ottto_protocol::LocalAccountOrganization {
+                    id: "org_fixture".to_string(),
+                    name: "Runtime Org".to_string(),
+                }),
+                connected_at: None,
+                last_refreshed_at: None,
+                message: None,
+            })
+            .unwrap();
+        let before_grant = fs::read(grants.path()).unwrap();
+        assert!(load_cloud_session_runtime_binding(
+            &grants,
+            &mismatched_accounts,
+            &devices,
+            &connections,
+        )
+        .is_err());
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+    }
+
+    #[test]
+    fn status_configuration_is_derived_without_process_local_runtime_state() {
+        let root = temp_dir("runtime-derived-status");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        let credential_reads = Cell::new(0);
+
+        assert!(runtime_transport_locally_configured_with(
+            &grants,
+            &accounts,
+            &devices,
+            &connections,
+            || {
+                credential_reads.set(credential_reads.get() + 1);
+                Ok((
+                    devices.load().unwrap().unwrap(),
+                    "device-secret".to_string(),
+                ))
+            },
+        ));
+        assert_eq!(credential_reads.get(), 1);
+        let no_grant = CloudSessionGrantStore::new(root.join("no-grant.json"));
+        assert!(!runtime_transport_locally_configured_with(
+            &no_grant,
+            &accounts,
+            &devices,
+            &connections,
+            || panic!("status without consent must not read credentials"),
+        ));
+    }
+
+    #[test]
+    fn dormant_grant_short_circuits_before_other_local_state_reads() {
+        let root = temp_dir("runtime-dormant-short-circuit");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        fs::create_dir(root.join("unreadable-account")).unwrap();
+        fs::create_dir(root.join("unreadable-device")).unwrap();
+        fs::create_dir(root.join("unreadable-connection")).unwrap();
+
+        assert!(load_cloud_session_runtime_binding(
+            &grants,
+            &FileAccountStore::new(root.join("unreadable-account")),
+            &FileDeviceStore::new(root.join("unreadable-device")),
+            &FileConnectionStore::new(root.join("unreadable-connection")),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn runtime_rejects_untrusted_destination_without_mutating_grant() {
+        let root = temp_dir("runtime-untrusted-destination");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) = runtime_identity_stores(
+            &root,
+            "user_fixture",
+            "org_fixture",
+            "https://attacker.example",
+        );
+        let before_grant = fs::read(grants.path()).unwrap();
+
+        assert!(
+            load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections,)
+                .is_err()
+        );
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+        assert!(validated_cloud_session_api_base_url("http://localhost.evil").is_err());
+        assert!(validated_cloud_session_api_base_url("https://api.ottto.net@evil").is_err());
     }
 
     #[test]

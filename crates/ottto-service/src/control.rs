@@ -2039,7 +2039,7 @@ fn cloud_sessions_control(
     api_base_url: Option<String>,
     backend_grant: Option<CloudSessionBackendGrantResponseV1>,
 ) -> Result<CloudSessionsControlResult, LocalApiError> {
-    cloud_sessions_control_with_stores(
+    let mut result = cloud_sessions_control_with_stores(
         action,
         control_token,
         api_base_url,
@@ -2049,7 +2049,12 @@ fn cloud_sessions_control(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
         &crate::cloud_sessions::CloudSessionCheckpointStore::default(),
         &crate::cloud_sessions::CloudSessionControlTokenUseStore::default(),
-    )
+    )?;
+    // Production control runs inside the daemon, so report the same local
+    // experimental/runtime composition readiness as the standalone status
+    // command. Store-injected tests keep their explicit deferred transport.
+    result.status = crate::cloud_sessions::default_cloud_session_collector_status();
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -416,7 +416,7 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
             eprintln!("serving Codex cloud-session collector")
         }
         Ok(ottto_service::cloud_sessions::CloudSessionCollectorStartup::DeferredTransport) => {
-            eprintln!("Codex cloud-session collector deferred: typed ingest transport is not wired")
+            eprintln!("Codex cloud-session collector deferred")
         }
         Err(error) => eprintln!("Codex cloud-session collector unavailable: {error}"),
     }
