@@ -1320,18 +1320,12 @@ mod tests {
     }
 
     #[test]
-    fn permanently_blocked_primary_uses_bounded_probe_and_builds_restart_evidence() {
+    fn bounded_probe_builds_restart_evidence_after_primary_deadline() {
         let probe_calls = Arc::new(AtomicU32::new(0));
         let counted = probe_calls.clone();
         let resolver = DeadlineFallbackDnsResolver::with_hooks(
-            // This test exercises recovery evidence, not the 30 ms deadline
-            // edge covered above. Leave enough scheduling budget for both
-            // worker threads when the full Rust suite runs in parallel.
-            Duration::from_millis(250),
-            |_| {
-                std::thread::sleep(Duration::from_secs(2));
-                Err(io::Error::other("permanently blocked primary"))
-            },
+            Duration::from_millis(30),
+            |_| panic!("primary resolution is injected as an expired deadline"),
             move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
@@ -1352,7 +1346,17 @@ mod tests {
             start + SELF_RESTART_MIN_OUTAGE,
         ] {
             assert_eq!(
-                resolver.resolve_at("recovery.test:443", at).unwrap(),
+                resolver
+                    .resolve_primary_result_bounded(
+                        "recovery.test:443",
+                        at,
+                        Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "simulated primary resolution deadline",
+                        )),
+                        Instant::now() + DNS_PROBE_PROCESS_TIMEOUT,
+                    )
+                    .unwrap(),
                 vec![addr(443)]
             );
         }

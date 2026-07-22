@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 248,
-  "content_sha256": "78786c58439310916b381d5caad53e03a2d9a70889adb275ee686ffe76541d52",
+  "content_sha256": "953569a1a0540e80f91dfd382219ecbaf0ea812f6bfe26f992b4ce6de19ee54a",
   "files": [
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/net_resilience.rs",
-      "sha256": "0ef7fa31f4b2ae1014cd4a2072884e5573506d3107fee153073fe93abfb1bff9",
-      "size_bytes": 79981
+      "sha256": "50cf67ab2a758db34e079b67ec37d370ce51cb27d1658d703f752e59a6ed6b8f",
+      "size_bytes": 80055
     },
     {
       "executable": false,
@@ -1739,7 +1739,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T03:42:25+00:00",
+  "generated_at": "2026-07-22T03:51:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 249,
   "public_roots": [
@@ -1775,5 +1775,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9028f7ee839de9c3080527f31ac2758adf609c53"
+  "source_commit": "607f6d9f7504758aef07be62e8656217543e1879"
 }
