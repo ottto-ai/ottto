@@ -65,6 +65,8 @@ enum Command {
     Context(ContextArgs),
     #[command(about = "Print cloud cost breakdown for AI agents")]
     Costs(CostsArgs),
+    #[command(about = "Plan, register, test, sync, or inspect cloud connectors")]
+    Cloud(CloudArgs),
     #[command(about = "Print cloud sessions for AI agents")]
     Sessions(SessionsArgs),
     #[command(about = "Print Advisor recommendations for AI agents")]
@@ -102,6 +104,157 @@ enum Command {
 struct JsonArgs {
     #[arg(long, help = "Print one final JSON object and no human summary text")]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CloudArgs {
+    #[arg(
+        long,
+        global = true,
+        help = "Print one final JSON object and no human summary text"
+    )]
+    json: bool,
+    #[command(subcommand)]
+    command: CloudCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudCommand {
+    #[command(about = "Show provider-side setup commands; makes no changes")]
+    Materials(CloudSourceArgs),
+    #[command(about = "Preview a keyless connector manifest; makes no changes")]
+    Plan(CloudManifestArgs),
+    #[command(about = "Save a tested keyless connector manifest")]
+    Register(CloudApprovedManifestArgs),
+    #[command(about = "Test supplied or already-saved connector settings")]
+    Test(CloudTestArgs),
+    #[command(about = "Run an explicitly approved cloud billing sync")]
+    Sync(CloudSyncArgs),
+    #[command(about = "Show configured cloud connector status; makes no changes")]
+    Status(CloudStatusArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CloudSourceArg {
+    Bedrock,
+    Vertex,
+}
+
+impl CloudSourceArg {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Bedrock => "bedrock",
+            Self::Vertex => "vertex",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CloudSourceArgs {
+    #[arg(long, value_enum)]
+    source: CloudSourceArg,
+}
+
+#[derive(Debug, Args)]
+struct CloudManifestArgs {
+    #[arg(long, value_enum)]
+    source: CloudSourceArg,
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = parse_cloud_manifest,
+        help = "Keyless connector JSON manifest"
+    )]
+    config_file: serde_json::Value,
+}
+
+#[derive(Debug, Args)]
+struct CloudApprovedManifestArgs {
+    #[command(flatten)]
+    manifest: CloudManifestArgs,
+    #[arg(long, help = "Approve saving this connector configuration")]
+    approve: bool,
+}
+
+#[derive(Debug, Args)]
+struct CloudTestArgs {
+    #[arg(long, value_enum)]
+    source: CloudSourceArg,
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = parse_cloud_manifest,
+        help = "Optional keyless connector JSON manifest"
+    )]
+    config_file: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Args)]
+struct CloudSyncArgs {
+    #[arg(long, value_enum)]
+    source: CloudSourceArg,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=31))]
+    days: u8,
+    #[arg(long, help = "Approve starting this billable provider query")]
+    approve: bool,
+}
+
+#[derive(Debug, Args)]
+struct CloudStatusArgs {
+    #[arg(long, value_enum)]
+    source: Option<CloudSourceArg>,
+}
+
+fn parse_cloud_manifest(path: &str) -> Result<serde_json::Value, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read cloud config file: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("cloud config file is not valid JSON: {error}"))?;
+    reject_secret_cloud_fields(&value)?;
+    if !value.is_object() {
+        return Err("cloud config file must contain one JSON object".to_string());
+    }
+    Ok(value)
+}
+
+fn reject_secret_cloud_fields(value: &serde_json::Value) -> Result<(), String> {
+    fn is_forbidden(key: &str) -> bool {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        matches!(
+            normalized.as_str(),
+            "accesskeyid"
+                | "awsaccesskeyid"
+                | "secretaccesskey"
+                | "awssecretaccesskey"
+                | "sessiontoken"
+                | "awssessiontoken"
+                | "privatekey"
+                | "clientemail"
+        )
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                if is_forbidden(key) {
+                    return Err(format!(
+                        "cloud config files cannot contain secret credential field '{key}'"
+                    ));
+                }
+                reject_secret_cloud_fields(child)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                reject_secret_cloud_fields(item)?;
+            }
+        }
+        _ => return Ok(()),
+    }
+    Ok(())
 }
 
 #[derive(Debug, Args)]
@@ -614,20 +767,20 @@ struct Invocation {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(error) = validate_cli(&cli) {
-        let code = print_error(error, OutputMode::Human, None);
-        std::process::exit(code);
-    }
-    let setup_args = match &cli.command {
-        Command::Setup(args) | Command::Login(args) => Some(args.clone()),
-        _ => None,
-    };
     let output_mode = match output_mode(command_json(&cli.command), cli.watch) {
         Ok(mode) => mode,
         Err(error) => {
             let code = print_error(error, OutputMode::Human, None);
             std::process::exit(code);
         }
+    };
+    if let Err(error) = validate_cli(&cli) {
+        let code = print_error(error, output_mode, None);
+        std::process::exit(code);
+    }
+    let setup_args = match &cli.command {
+        Command::Setup(args) | Command::Login(args) => Some(args.clone()),
+        _ => None,
     };
     if let Command::ClaudeCodeStatusline(args) = &cli.command {
         let code = run_claude_code_statusline(args.json);
@@ -647,6 +800,21 @@ fn main() {
 }
 
 fn validate_cli(cli: &Cli) -> Result<(), CliError> {
+    if let Command::Cloud(args) = &cli.command {
+        let approved = match &args.command {
+            CloudCommand::Register(args) => args.approve,
+            CloudCommand::Sync(args) => args.approve,
+            _ => true,
+        };
+        if !approved {
+            return Err(CliError {
+                code: CliErrorCode::InvalidRequest,
+                message: "cloud register and sync require explicit --approve".to_string(),
+                retryable: false,
+                details: BTreeMap::new(),
+            });
+        }
+    }
     if matches!(&cli.command, Command::Context(args) if !args.json) {
         return Err(CliError {
             code: CliErrorCode::InvalidRequest,
@@ -763,6 +931,12 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
             | LocalControlCommand::AgentSessions { .. }
             | LocalControlCommand::AgentRecommendations { .. }
             | LocalControlCommand::AgentProviderImpact { .. }
+            | LocalControlCommand::CloudMaterials { .. }
+            | LocalControlCommand::CloudPlan { .. }
+            | LocalControlCommand::CloudRegister { .. }
+            | LocalControlCommand::CloudTest { .. }
+            | LocalControlCommand::CloudSync { .. }
+            | LocalControlCommand::CloudStatus { .. }
             | LocalControlCommand::Setup { .. }
             | LocalControlCommand::SetupAnswer { .. }
             | LocalControlCommand::SetupAction { .. }
@@ -1734,6 +1908,32 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Costs(args) => LocalControlCommand::AgentCosts {
             query: args.query(),
         },
+        Command::Cloud(args) => match args.command {
+            CloudCommand::Materials(args) => LocalControlCommand::CloudMaterials {
+                source: args.source.slug().to_string(),
+            },
+            CloudCommand::Plan(args) => LocalControlCommand::CloudPlan {
+                source: args.source.slug().to_string(),
+                manifest: args.config_file,
+            },
+            CloudCommand::Register(args) => LocalControlCommand::CloudRegister {
+                source: args.manifest.source.slug().to_string(),
+                manifest: args.manifest.config_file,
+                approved: args.approve,
+            },
+            CloudCommand::Test(args) => LocalControlCommand::CloudTest {
+                source: args.source.slug().to_string(),
+                manifest: args.config_file,
+            },
+            CloudCommand::Sync(args) => LocalControlCommand::CloudSync {
+                source: args.source.slug().to_string(),
+                days: args.days,
+                approved: args.approve,
+            },
+            CloudCommand::Status(args) => LocalControlCommand::CloudStatus {
+                source: args.source.map(|source| source.slug().to_string()),
+            },
+        },
         Command::Sessions(args) => LocalControlCommand::AgentSessions {
             query: args.query(),
         },
@@ -1805,6 +2005,7 @@ fn command_json(command: &Command) -> bool {
         Command::Logout(args) => args.json,
         Command::Context(args) => args.json,
         Command::Costs(args) => args.json,
+        Command::Cloud(args) => args.json,
         Command::Sessions(args) => args.json,
         Command::Recommendations(args) => args.json,
         Command::ProviderImpact(args) => args.json,
@@ -1907,6 +2108,12 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AgentSessions { .. } => "agent_sessions",
         LocalControlCommand::AgentRecommendations { .. } => "agent_recommendations",
         LocalControlCommand::AgentProviderImpact { .. } => "agent_provider_impact",
+        LocalControlCommand::CloudMaterials { .. } => "cloud_materials",
+        LocalControlCommand::CloudPlan { .. } => "cloud_plan",
+        LocalControlCommand::CloudRegister { .. } => "cloud_register",
+        LocalControlCommand::CloudTest { .. } => "cloud_test",
+        LocalControlCommand::CloudSync { .. } => "cloud_sync",
+        LocalControlCommand::CloudStatus { .. } => "cloud_status",
         LocalControlCommand::AuthStart => "auth_start",
         LocalControlCommand::AuthComplete { .. } => "auth_complete",
         LocalControlCommand::AuthCompletePending { .. } => "auth_complete_pending",
@@ -2231,7 +2438,7 @@ mod tests {
     }
 
     fn cli_help_snapshot() -> String {
-        let commands: [(&str, &[&str]); 23] = [
+        let commands: [(&str, &[&str]); 30] = [
             ("ottto --help", &["ottto", "--help"]),
             ("ottto status --help", &["ottto", "status", "--help"]),
             ("ottto apps --help", &["ottto", "apps", "--help"]),
@@ -2249,6 +2456,31 @@ mod tests {
             ),
             ("ottto context --help", &["ottto", "context", "--help"]),
             ("ottto costs --help", &["ottto", "costs", "--help"]),
+            ("ottto cloud --help", &["ottto", "cloud", "--help"]),
+            (
+                "ottto cloud materials --help",
+                &["ottto", "cloud", "materials", "--help"],
+            ),
+            (
+                "ottto cloud plan --help",
+                &["ottto", "cloud", "plan", "--help"],
+            ),
+            (
+                "ottto cloud register --help",
+                &["ottto", "cloud", "register", "--help"],
+            ),
+            (
+                "ottto cloud test --help",
+                &["ottto", "cloud", "test", "--help"],
+            ),
+            (
+                "ottto cloud sync --help",
+                &["ottto", "cloud", "sync", "--help"],
+            ),
+            (
+                "ottto cloud status --help",
+                &["ottto", "cloud", "status", "--help"],
+            ),
             ("ottto sessions --help", &["ottto", "sessions", "--help"]),
             (
                 "ottto recommendations --help",
@@ -4091,5 +4323,58 @@ mod tests {
         assert!(!sanitized.contains('\x1b'));
         assert!(!sanitized.contains('\r'));
         assert_eq!(sanitized, "claim_REAL[2Kclaim_FAKE");
+    }
+
+    #[test]
+    fn cloud_status_maps_to_read_only_local_command() {
+        let cli = Cli::try_parse_from(["ottto", "cloud", "status", "--source", "vertex", "--json"])
+            .expect("cloud status parses");
+        assert!(validate_cli(&cli).is_ok());
+        let invocation = build_invocation(cli, OutputMode::Json);
+        assert_eq!(
+            invocation.request.command,
+            LocalControlCommand::CloudStatus {
+                source: Some("vertex".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn cloud_sync_requires_explicit_approval() {
+        let cli = Cli::try_parse_from(["ottto", "cloud", "sync", "--source", "vertex", "--json"])
+            .expect("cloud sync parses before policy validation");
+        assert_eq!(
+            output_mode(command_json(&cli.command), cli.watch).expect("json output mode"),
+            OutputMode::Json
+        );
+        let error = validate_cli(&cli).expect_err("approval is required");
+        assert!(error.message.contains("--approve"));
+    }
+
+    #[test]
+    fn cloud_manifest_rejects_secret_credentials_at_any_depth() {
+        let manifest = serde_json::json!({
+            "credentials": {"private_key": "must-not-cross-local-control"}
+        });
+        let error = reject_secret_cloud_fields(&manifest).expect_err("secret rejected");
+        assert!(error.contains("private_key"));
+        assert!(reject_secret_cloud_fields(&serde_json::json!({
+            "credentials": {"role_arn": "arn:aws:iam::123456789012:role/OtttoRead"}
+        }))
+        .is_ok());
+        let env_secret_alias = ["AWS", "SECRET", "ACCESS", "KEY"].join("_");
+        for alias in [
+            "aws_access_key_id".to_string(),
+            env_secret_alias,
+            "AccessKeyId".to_string(),
+            "SecretAccessKey".to_string(),
+            "SessionToken".to_string(),
+        ] {
+            let manifest = serde_json::json!({"credentials": {alias.clone(): "must-not-cross"}});
+            assert!(
+                reject_secret_cloud_fields(&manifest).is_err(),
+                "accepted {alias}"
+            );
+        }
     }
 }

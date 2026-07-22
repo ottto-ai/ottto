@@ -2449,6 +2449,32 @@ pub enum LocalControlCommand {
         #[serde(default)]
         query: AgentProviderImpactQuery,
     },
+    CloudMaterials {
+        source: String,
+    },
+    CloudPlan {
+        source: String,
+        manifest: serde_json::Value,
+    },
+    CloudRegister {
+        source: String,
+        manifest: serde_json::Value,
+        approved: bool,
+    },
+    CloudTest {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<serde_json::Value>,
+    },
+    CloudSync {
+        source: String,
+        days: u8,
+        approved: bool,
+    },
+    CloudStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
     AuthStart,
     AuthComplete {
         claim_code: String,
