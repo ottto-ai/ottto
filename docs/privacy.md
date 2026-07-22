@@ -40,9 +40,18 @@ raw provider ids, or cursors. Its local grant is versioned and can be paused or
 revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
 collection. The collector is isolated from snapshot sync, bounded by page/item/
 wall-time limits, and uses semantic no-ops plus circuit-breaking backoff.
-Identical entity polls produce no observation upload; a content-free,
-health-only heartbeat is eligible hourly to keep backend freshness below its
-two-hour stale boundary without rewriting entity or Sessions GOLD rows.
+It polls no more often than every five minutes plus up to 20 seconds of jitter. Snapshot
+completeness is asserted only after the official CLI reaches a terminal cursor
+without page, item, time, cancellation, or error truncation. Empty complete
+snapshots are valid; partial snapshots never make missing entities deletable.
+Partial snapshots also report degraded collector health; backend v1's existing
+coarse `provider_error` category is used because it has no coverage-limited
+category. UI completeness must use `snapshot_complete`, not health alone.
+One complete snapshot is replayed per active UTC day even when unchanged so the
+backend can drain stale rows in bounded work. Other identical polls produce no
+observation upload; a content-free, observation-empty heartbeat with
+`snapshot_complete: false` is eligible hourly to keep backend freshness below
+its two-hour stale boundary without rewriting entity or Sessions GOLD rows.
 Every provider cycle first consumes one bounded authenticated backend grant-list
 result for the exact stored grant. Only a strictly decoded
 `server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or

@@ -1,5 +1,9 @@
 # Codex Cloud Sessions Collector
 
+> Historical foundation note. Daily complete-snapshot semantics and the newer
+> 200-observation/five-minute bounds are documented in
+> `session-2026-07-22-cloud-session-complete-snapshots.md`.
+
 Implemented the supported public-runtime slice for Cloud Sessions Observability.
 
 - Added the explicit-setup `codex:cloud_sessions` connector. It uses only the
