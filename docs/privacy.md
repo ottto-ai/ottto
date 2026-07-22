@@ -39,21 +39,28 @@ titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths,
 raw provider ids, or cursors. Its local grant is versioned and can be paused or
 revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
 collection. The collector is isolated from snapshot sync, bounded by page/item/
-wall-time limits, and uses semantic no-ops plus circuit-breaking backoff.
-It polls no more often than every five minutes plus up to 20 seconds of jitter. Snapshot
-completeness is asserted only after the official CLI reaches a terminal cursor
-without page, item, time, cancellation, or error truncation. Empty complete
-snapshots are valid; partial snapshots never make missing entities deletable.
-Partial snapshots also report degraded collector health; backend v1's existing
-coarse `provider_error` category is used because it has no coverage-limited
-category. UI completeness must use `snapshot_complete`, not health alone.
-One complete snapshot is replayed per active UTC day even when unchanged so the
-backend can drain stale rows in bounded work. Other identical polls produce no
-observation upload; a content-free, observation-empty heartbeat with
-`snapshot_complete: false` is eligible hourly to keep backend freshness below
-its two-hour stale boundary without rewriting entity or Sessions GOLD rows.
-Every provider cycle first consumes one bounded authenticated backend grant-list
-result for the exact stored grant. Only a strictly decoded
+wall-time limits, and uses semantic no-ops plus circuit-breaking backoff. Active
+full scans are bounded to 2,000 unique entities, 100 provider pages, and ten
+ordered chunks of at most 200 observations. The current cursor, raw response,
+and scan inventory exist only in the long-lived collector process; restart
+drops them, creates a new local UUID, and starts again from page zero.
+
+Cursor pagination proves positive observations only. Absence can be considered
+only by the server after a single terminal provider response containing at most
+20 entities; multi-page terminal scans are labeled `unstable_cursor`. Cap,
+cursor churn, malformed/truncated response, timeout, cancellation, or error
+paths can upload bounded positive chunks but never finalize an absence-capable
+epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
+content-free SHA-256 values; semantic digests exclude observation/collection
+time. Identical response-loss retries reuse the exact chunk or finalize body.
+
+The collector polls no more often than every five minutes plus up to 20 seconds
+of jitter. Normal polls read one head page; unchanged heads produce zero
+observation/ingest upload, though mandatory backend grant revalidation still
+occurs, and allow an observation-empty v1 heartbeat hourly. A full scan runs
+daily and until one has completed. Every provider page, chunk, finalize, and heartbeat is
+preceded by local kill/pause/revoke checks and exact backend grant/policy
+revalidation. Only a strictly decoded
 `server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or
 unknown policy, disabled/revoked state, backend absence, authentication failure,
 and network or parse errors stop before provider access. A nonempty CLI page
@@ -75,7 +82,7 @@ not infer one or merge histories across a user-known provider-account switch.
 Such a switch requires explicit local stop, exact backend deletion, and setup
 again.
 
-The strict relay adapter and backend DTO are present for contract testing, but
+The strict v2 chunk/finalize relay adapters and backend DTOs are present for contract testing, but
 public service startup remains hard-wired to deferred transport. It cannot
 invoke Codex or upload until the private backend is deployed and the retention,
 cardinality, prune, and exact-delete-cost gate is approved. Authenticated
