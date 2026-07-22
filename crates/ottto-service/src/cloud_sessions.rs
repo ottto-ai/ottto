@@ -3886,6 +3886,39 @@ mod tests {
         }
     }
 
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| offset + 4)
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                });
+                if request.len() >= header_end + content_length.unwrap_or(0) {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
     #[test]
     fn emitted_wire_is_content_free_and_opaque() {
         let parsed = parse_cloud_page(
@@ -5108,7 +5141,7 @@ mod tests {
                     2 => ("200 OK", r#"{"token":"relay-cloud-new"}"#),
                     _ => (
                         "200 OK",
-                        r#"{"accepted":1,"observations_written":1,"noop":false,"grant_status":"enabled","fresh_at":"2026-07-21T12:00:00Z"}"#,
+                        r#"{"schema_version":"cloud_session_heartbeat_ack.v1","accepted":true,"observations_written":0,"noop":true,"grant_status":"enabled","fresh_at":"2026-07-21T12:00:00Z"}"#,
                     ),
                 };
                 write!(
@@ -5227,6 +5260,150 @@ mod tests {
             assert!(transport.send(&payload).is_err());
         }
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn v1_heartbeat_checkpoint_requires_an_exact_bound_receipt() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        struct RevalidatingHeartbeatRelay {
+            relay: RelayCloudSessionTransport,
+            grant: CloudSessionBackendGrantResponseV1,
+        }
+        impl CloudSessionTransport for RevalidatingHeartbeatRelay {
+            fn supports_grant_revalidation(&self) -> bool {
+                true
+            }
+            fn revalidate_grant(
+                &self,
+                _grant: &CloudSessionGrant,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                Ok(self.grant.clone())
+            }
+            fn revalidate_grant_bounded(
+                &self,
+                grant: &CloudSessionGrant,
+                _timeout: Duration,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                self.revalidate_grant(grant)
+            }
+            fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
+                self.relay.send(batch)
+            }
+            fn send_bounded(
+                &self,
+                batch: &CloudSessionObservationBatchV1,
+                timeout: Duration,
+            ) -> Result<()> {
+                self.relay.send_bounded(batch, timeout)
+            }
+        }
+
+        let exact = json!({
+            "schema_version": "cloud_session_heartbeat_ack.v1",
+            "accepted": true,
+            "observations_written": 0,
+            "noop": true,
+            "grant_status": "enabled",
+            "fresh_at": "2026-07-21T13:00:00Z",
+        });
+        let mut negative = exact.clone();
+        negative["accepted"] = json!(false);
+        let mut mismatch = exact.clone();
+        mismatch["fresh_at"] = json!("2026-07-21T13:00:01Z");
+        let mut unknown = exact.clone();
+        unknown["unexpected"] = json!(true);
+        let cases = [
+            ("negative", negative.to_string(), false),
+            ("mismatch", mismatch.to_string(), false),
+            ("malformed", r#"{"accepted":true}"#.to_string(), false),
+            ("unknown", unknown.to_string(), false),
+            ("exact", exact.to_string(), true),
+        ];
+
+        for (name, response_body, accepted) in cases {
+            let (grants, checkpoints) = stores(&format!("v1-heartbeat-receipt-{name}"));
+            enabled(&grants);
+            let seed_runner = CursorRecordingPages::new(vec![page("stable", None)]);
+            let seed_transport = V2RecordingTransport::new();
+            assert_eq!(
+                collect_cloud_sessions_once(
+                    &grants,
+                    &checkpoints,
+                    &seed_runner,
+                    &seed_transport,
+                    now(),
+                ),
+                CloudSessionCycleOutcome::Uploaded
+            );
+            assert_eq!(
+                checkpoints.load().last_health_upload_at.as_deref(),
+                Some("2026-07-21T12:00:00Z")
+            );
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                for index in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&mut stream);
+                    let body = if index == 0 {
+                        r#"{"token":"relay-v1"}"#
+                    } else {
+                        assert!(request.contains("/api/v1/cloud-session-observations/batches"));
+                        &response_body
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            });
+            let current = grants.load().unwrap().unwrap();
+            let transport = RevalidatingHeartbeatRelay {
+                grant: backend_grant(&current, "enabled", 1),
+                relay: RelayCloudSessionTransport::new(
+                    format!("http://{address}"),
+                    LocalDeviceBinding {
+                        device_id: INSTALLATION_ID.to_string(),
+                        machine_id: None,
+                        sources: vec!["codex".to_string()],
+                    },
+                    "device-secret".to_string(),
+                ),
+            };
+            let runner = CursorRecordingPages::new(vec![page("stable", None)]);
+            let outcome = collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &runner,
+                &transport,
+                now() + TimeDuration::hours(1),
+            );
+            assert_eq!(
+                outcome,
+                if accepted {
+                    CloudSessionCycleOutcome::Heartbeat
+                } else {
+                    CloudSessionCycleOutcome::Failed
+                },
+                "case {name}"
+            );
+            assert_eq!(
+                checkpoints.load().last_health_upload_at.as_deref(),
+                Some(if accepted {
+                    "2026-07-21T13:00:00Z"
+                } else {
+                    "2026-07-21T12:00:00Z"
+                }),
+                "case {name}"
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]

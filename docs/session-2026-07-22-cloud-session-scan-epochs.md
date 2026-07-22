@@ -42,13 +42,19 @@ scan protocol while preserving hard-deferred public startup.
   connector testkit against its recomputed digests.
 - V1 relay upload is restricted to strict empty, incomplete health heartbeats.
   Snapshot, nonempty, complete, raw-key, and open-enum payloads fail locally
-  before relay-token or ingest network traffic.
+  before relay-token or ingest network traffic. A heartbeat counts as sent only
+  after a strict, unknown-field-denying receipt reports `accepted=true`, zero
+  observations written, noop semantics, an enabled grant, and a valid
+  `fresh_at` exactly bound to the heartbeat time.
 - Cloud-session HTTP agents split each remaining hard budget between a
   deadline-aware DNS resolver and the request. Blocking in-process resolution
   returns at the DNS deadline; a process-wide single-flight gate bounds a
-  wedged resolver to one worker while later attempts fail fast. macOS fallback
-  resolver subprocesses are killed at their deadline, and bounded grant
-  revalidation never falls back to an unbounded trait method.
+  wedged resolver to one worker. Deadline and busy paths still accrue shared
+  DNS outage evidence and use the remaining budget for a bounded
+  out-of-process probe or last-good cache, so the watchdog can recover or
+  self-restart instead of getting stuck in a silent fail-fast state. macOS
+  fallback resolver subprocesses are killed at their deadline, and bounded
+  grant revalidation never falls back to an unbounded trait method.
 
 ## Activation
 
@@ -62,7 +68,8 @@ Focused Rust tests cover 100x20 and 101x20 page bounds, deterministic digest
 vectors, duplicate collapse, cursor churn, restart, malformed/truncated/timeout
 paths, exact retry identity, head/hour/day cadence, grant controls, strict
 single-response marking, exact/negative/mismatched real-HTTP acknowledgments,
-pre-network v1 rejection, DNS/subprocess deadlines, and deferred startup.
+pre-network v1 rejection, strict heartbeat receipts, DNS/subprocess deadlines,
+permanently blocked resolver recovery evidence, and deferred startup.
 Required closeout also runs
 formatting, Clippy with warnings denied, full cloud-session tests, connector
 tests, manifest validation, and public-surface checks.

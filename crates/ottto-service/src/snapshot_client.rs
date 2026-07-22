@@ -8,6 +8,7 @@ use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHe
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -15,6 +16,7 @@ const SNAPSHOT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const SNAPSHOT_BATCH_HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const SNAPSHOT_HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION: &str = "cloud_session_heartbeat_ack.v1";
 const CLOUD_SCAN_CHUNK_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_chunk_ack.v1";
 const CLOUD_SCAN_FINALIZE_ACK_SCHEMA_VERSION: &str = "cloud_session_scan_finalize_ack.v1";
 
@@ -101,6 +103,17 @@ impl std::fmt::Display for CloudSessionContractRejected {
 }
 
 impl std::error::Error for CloudSessionContractRejected {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudSessionHeartbeatAckV1 {
+    schema_version: String,
+    accepted: bool,
+    observations_written: u32,
+    noop: bool,
+    grant_status: String,
+    fresh_at: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -701,9 +714,13 @@ impl SnapshotApiClient {
             .set("Authorization", &format!("Bearer {relay_token}"))
             .send_json(request)
         {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse cloud-session batch response failed: {error}")),
+            Ok(response) => {
+                let receipt = response.into_json().map_err(|error| {
+                    anyhow!("parse cloud-session batch response failed: {error}")
+                })?;
+                validate_cloud_session_heartbeat_receipt(request, &receipt)?;
+                Ok(receipt)
+            }
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
                     status: code,
@@ -950,6 +967,33 @@ fn valid_cloud_scan_id(value: &str) -> bool {
             8 | 13 | 18 | 23 => *byte == b'-',
             _ => byte.is_ascii_hexdigit(),
         })
+}
+
+fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {
+    let ack: CloudSessionHeartbeatAckV1 = serde_json::from_value(receipt.clone())
+        .map_err(|error| anyhow!("invalid cloud-session heartbeat receipt: {error}"))?;
+    let collected_at = request
+        .get("collected_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing collected_at"))?;
+    let observed_at = request
+        .pointer("/health/observed_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("cloud-session heartbeat request is missing health.observed_at"))?;
+    if ack.schema_version != CLOUD_SESSION_HEARTBEAT_ACK_SCHEMA_VERSION
+        || !ack.accepted
+        || ack.observations_written != 0
+        || !ack.noop
+        || ack.grant_status != "enabled"
+        || ack.fresh_at != collected_at
+        || ack.fresh_at != observed_at
+        || OffsetDateTime::parse(&ack.fresh_at, &Rfc3339).is_err()
+    {
+        return Err(anyhow!(
+            "cloud-session heartbeat receipt does not acknowledge the exact heartbeat"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_cloud_session_scan_receipt(
