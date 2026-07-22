@@ -20,6 +20,14 @@ diagnostics flow sends a redacted payload.
 Agents, the CLI, the macOS app, and the web app are clients. They should not
 duplicate local setup or repair logic.
 
+The loopback `/local-health` endpoint may return the current pseudonymous
+relay-device id to an allowlisted Ottto browser origin so the web app can
+distinguish two macOS users on one physical Mac. Origin-less callers do not
+receive that id. The origin allowlist enforces browser CORS; it is not
+authentication for native loopback clients, so the id is treated only as a
+non-secret binding label. The endpoint never returns the relay secret, account
+ids, or hardware UUID.
+
 ## What Stays Local
 
 The local platform must not upload raw prompts, raw responses, tool output,

@@ -4,7 +4,7 @@ use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use ottto_core::FileConnectionStore;
+use ottto_core::{FileConnectionStore, FileDeviceStore};
 use ottto_protocol::{
     LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
 };
@@ -554,7 +554,19 @@ fn handle_local_health_request(
         );
     }
 
-    match local_health_response_payload(daemon) {
+    // Exact installation identity is useful to the Ottto web app, but it
+    // should not be exposed to ordinary origin-less loopback probes. The
+    // validated Origin is a browser CORS boundary, not caller authentication,
+    // so this response must contain only the non-secret pseudonymous device id.
+    let device_id = local_health_browser_device_id(origin, || {
+        FileDeviceStore::default()
+            .load()
+            .ok()
+            .flatten()
+            .map(|device| device.device_id)
+    });
+
+    match local_health_response_payload(daemon, device_id) {
         Ok(payload) => write_json_response_with_headers(stream, 200, payload, &cors_headers),
         Err(_) => write_json_response_with_headers(
             stream,
@@ -565,11 +577,22 @@ fn handle_local_health_request(
     }
 }
 
-fn local_health_response_payload(daemon: &LocalDaemon) -> Result<serde_json::Value> {
+fn local_health_browser_device_id(
+    origin: Option<&str>,
+    load_device_id: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    origin.and_then(|_| load_device_id())
+}
+
+fn local_health_response_payload(
+    daemon: &LocalDaemon,
+    device_id: Option<String>,
+) -> Result<serde_json::Value> {
     let status = daemon.status_for_trusted_client()?;
     let Some(mut health) = status.canonical_health else {
         return Err(anyhow!("local health is not available"));
     };
+    health.device_id = device_id;
     health.org_id = None;
     health.user_id = None;
     Ok(json!({
@@ -1396,14 +1419,48 @@ mod tests {
             message: None,
         });
 
-        let payload = local_health_response_payload(&daemon).expect("payload");
+        let payload = local_health_response_payload(&daemon, None).expect("payload");
 
         assert_eq!(payload["machine_id"], "machine_test");
         assert_eq!(payload["machine_name"], "Test Mac");
         assert_eq!(payload["health"]["machine_id"], "machine_test");
         assert!(payload["health"].get("user_id").is_none());
         assert!(payload["health"].get("org_id").is_none());
+        assert!(payload["health"].get("device_id").is_none());
         assert_eq!(payload["health"]["account"]["state"], "connected");
+    }
+
+    #[test]
+    fn local_health_response_payload_includes_browser_device_identity() {
+        let daemon = test_daemon();
+
+        let payload =
+            local_health_response_payload(&daemon, Some("device_current_installation".to_string()))
+                .expect("payload");
+
+        assert_eq!(
+            payload["health"]["device_id"],
+            "device_current_installation"
+        );
+        assert!(payload["health"].get("user_id").is_none());
+        assert!(payload["health"].get("org_id").is_none());
+        assert!(payload.get("hardware_uuid").is_none());
+    }
+
+    #[test]
+    fn local_health_device_identity_requires_a_validated_browser_origin() {
+        assert_eq!(
+            local_health_browser_device_id(None, || {
+                panic!("origin-less callers must not load device identity")
+            }),
+            None
+        );
+        assert_eq!(
+            local_health_browser_device_id(Some("https://app.ottto.net"), || {
+                Some("device_current_installation".to_string())
+            }),
+            Some("device_current_installation".to_string())
+        );
     }
 
     #[test]
