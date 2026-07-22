@@ -1324,7 +1324,10 @@ mod tests {
         let probe_calls = Arc::new(AtomicU32::new(0));
         let counted = probe_calls.clone();
         let resolver = DeadlineFallbackDnsResolver::with_hooks(
-            Duration::from_millis(30),
+            // This test exercises recovery evidence, not the 30 ms deadline
+            // edge covered above. Leave enough scheduling budget for both
+            // worker threads when the full Rust suite runs in parallel.
+            Duration::from_millis(250),
             |_| {
                 std::thread::sleep(Duration::from_secs(2));
                 Err(io::Error::other("permanently blocked primary"))
