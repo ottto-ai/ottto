@@ -37,6 +37,11 @@ pub struct BackfillState {
     /// is advanced only when a deliberately-declared full replay succeeds.
     #[serde(default)]
     pub completed_replay_revisions: BTreeMap<String, String>,
+    /// Relay-device destination namespace that received each source's completed
+    /// historical bootstrap. Legacy state has no entry and therefore re-arms
+    /// one bootstrap before it can become destination-complete.
+    #[serde(default)]
+    pub completed_destination_namespaces: BTreeMap<String, String>,
     #[serde(default)]
     pub last_completed_at: Option<String>,
     #[serde(default)]
@@ -256,6 +261,31 @@ pub fn pending_backfill_sources(state: &BackfillState) -> Vec<SnapshotSource> {
     .collect()
 }
 
+/// Destination-aware bootstrap gate used by snapshot delivery. A completed
+/// source is reusable only for the same irreversible relay-device namespace;
+/// switching accounts/devices must walk historical transcripts for the new
+/// destination according to its server-issued cutoff policy.
+pub fn pending_backfill_sources_for_destination(
+    state: &BackfillState,
+    destination_namespace_hash: &str,
+) -> Vec<SnapshotSource> {
+    [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .filter(|source| {
+        source_needs_backfill(state, *source, current_historical_replay(*source))
+            || state
+                .completed_destination_namespaces
+                .get(source.api_slug())
+                .map(String::as_str)
+                != Some(destination_namespace_hash)
+    })
+    .collect()
+}
+
 pub fn mark_backfill_complete(state: &mut BackfillState, source: SnapshotSource) {
     state.completed_parser_versions.insert(
         source.api_slug().to_string(),
@@ -268,6 +298,18 @@ pub fn mark_backfill_complete(state: &mut BackfillState, source: SnapshotSource)
             directive.revision.to_string(),
         );
     }
+}
+
+pub fn mark_backfill_complete_for_destination(
+    state: &mut BackfillState,
+    source: SnapshotSource,
+    destination_namespace_hash: &str,
+) {
+    mark_backfill_complete(state, source);
+    state.completed_destination_namespaces.insert(
+        source.api_slug().to_string(),
+        destination_namespace_hash.to_string(),
+    );
 }
 
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
@@ -622,6 +664,32 @@ mod tests {
         let state = BackfillState::default();
         let pending = pending_backfill_sources(&state);
         assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn different_destination_full_policy_rearms_completed_backfill() {
+        let dir = temp_dir("destination-full-policy");
+        let mut state = BackfillState {
+            backfill_cutoff_at: Some("2026-07-06T10:00:00Z".to_string()),
+            backfill_cutoff_user_id: Some("user_a".to_string()),
+            ..Default::default()
+        };
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::Codex, "destination-a");
+        save_backfill_state(&dir, &state).expect("save destination A completion");
+
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b")
+            .expect("apply destination B full policy");
+        let state = load_backfill_state(&dir);
+        assert!(state.backfill_cutoff_at.is_none());
+        assert!(
+            !pending_backfill_sources_for_destination(&state, "destination-a")
+                .contains(&SnapshotSource::Codex)
+        );
+        assert!(
+            pending_backfill_sources_for_destination(&state, "destination-b")
+                .contains(&SnapshotSource::Codex)
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

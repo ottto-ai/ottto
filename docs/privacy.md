@@ -30,6 +30,18 @@ Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
 
+When a scan needs multiple uploads, `ottto-service` stores a temporary local
+resume checkpoint containing only the semantic hashes of snapshots the backend
+already accepted and a one-way hash that binds the checkpoint to its relay
+device. It does not store raw account/device identifiers, titles, prompts,
+responses, paths, session ids, usage payloads, or attribution labels. The
+checkpoint is scoped to the active collection policy and relay destination;
+legacy or destination-mismatched state is discarded, and valid state is removed
+after the final destination-scoped scan and bootstrap markers are durable. The
+daemon prunes accepted hashes that are no longer present in the current scan, so
+a permanently invalid session cannot make the checkpoint grow with every
+historical revision.
+
 The optional Codex Cloud Sessions collector is disabled until explicit local
 setup. It invokes only `codex cloud list --json` as the effective user and
 derives opaque HMAC entity/account keys plus lifecycle, timestamps, attempt

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 252,
-  "content_sha256": "034854aeb14745070536639cf987dda6f16019f36d73b135db7f542b51944593",
+  "candidate_file_count": 253,
+  "content_sha256": "37ed8d81d11f6661ecd1077043ced08fb7375a2f7eb6e166f63ad883497250a6",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "04ca4cc6fd4866cdc41f88b0b53b6c763883f58853954811bcd66d8123300bc9",
-      "size_bytes": 44365
+      "sha256": "8e13682c29c4b7b554fdc3650504bbbf02112545552914260b3df9b5ce7ef406",
+      "size_bytes": 44913
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "278ec28f0c46674d09cfafd18fd519a053f98f211509ec24b34c57f0bbb26a29",
-      "size_bytes": 29979
+      "sha256": "93b589d4314b548194d08fb7947653818bd80a88b9175878fb4c7644df2c5736",
+      "size_bytes": 32653
     },
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "94b55464064d81333ea22f26169e6dba7e6e4a77f0e0e5846f9042dc2f66b3cb",
-      "size_bytes": 96017
+      "sha256": "ecd6189491e5609fee364ff18496228493c6ec644bd56871c1fb6830a1b1ecb1",
+      "size_bytes": 126710
     },
     {
       "executable": false,
@@ -888,8 +888,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "047c78cbbdbf1b11779b37e69f71612f1e516bbef816e04ea0d0b2e44bdd4c0f",
-      "size_bytes": 9319
+      "sha256": "ea678aec289fc4171b679ef353371b5cca9e33a453e50fb40ebba74db27f94e7",
+      "size_bytes": 10110
     },
     {
       "executable": false,
@@ -974,6 +974,13 @@
       "path": "docs/session-2026-07-22-local-semantic-sync-phase-1.md",
       "sha256": "b0d3896db7e3f8ef28e45087af743627a39cd231806a10d4907e0c12613a56de",
       "size_bytes": 3562
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-22-snapshot-upload-resume-checkpoint.md",
+      "sha256": "6cc0e1fd5234b367faf0090e9b28c9f771455fd3bfe0687e6362fdf89ca26bb7",
+      "size_bytes": 3535
     },
     {
       "executable": false,
@@ -1767,9 +1774,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T12:31:57+00:00",
+  "generated_at": "2026-07-22T13:37:40+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 253,
+  "output_file_count": 254,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1803,5 +1810,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4986af1adc269ed3ccde1f41b9d0f2b3db8ff0ab"
+  "source_commit": "b2108a112cdb8483ea2cbfff84156b5f013ce5e2"
 }

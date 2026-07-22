@@ -1,7 +1,7 @@
 use crate::agent_status::collect_agent_status;
 use crate::backfill::{
-    apply_backfill_cutoff, load_backfill_state, mark_backfill_complete, pending_backfill_sources,
-    run_backfill, save_backfill_state,
+    apply_backfill_cutoff, load_backfill_state, mark_backfill_complete_for_destination,
+    pending_backfill_sources_for_destination, run_backfill, save_backfill_state,
 };
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
@@ -25,7 +25,10 @@ use crate::LocalHealthUploadFailureKind;
 use anyhow::{anyhow, Context, Result};
 use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, LocalDeviceBinding};
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
-use std::io::Write;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, VecDeque};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -56,8 +59,99 @@ const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
 // single chunk, while historical replay trades more requests for bounded DB
 // work and reliable checkpoint advancement.
 const SNAPSHOT_BATCH_LIMIT: usize = 20;
+// A 20-item page needs at most five binary splits to isolate one poison item.
+// Keep only one extra split of headroom so broad schema drift cannot turn one
+// five-minute cycle into dozens of doomed backend calls.
+const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
+const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = 12;
+const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 1;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Durable, privacy-minimal progress for one policy-scoped scan index.
+///
+/// The scanner cannot commit its final `ScanIndex` until every changed
+/// snapshot is accepted: committing it earlier would silently drop the files
+/// represented by a later failed batch. Persisting only the stable semantic
+/// snapshot fingerprints lets a restart skip already-accepted pages without
+/// retaining titles, paths, prompts, usage payloads, or session ids locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapshotUploadProgress {
+    schema_version: u16,
+    destination_namespace_hash: String,
+    #[serde(default)]
+    accepted_fingerprints: BTreeSet<String>,
+}
+
+impl SnapshotUploadProgress {
+    fn new(destination_namespace_hash: String) -> Self {
+        Self {
+            schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+            destination_namespace_hash,
+            accepted_fingerprints: BTreeSet::new(),
+        }
+    }
+
+    fn load(path: &Path, expected_destination_namespace_hash: &str) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new(expected_destination_namespace_hash.to_string()));
+        }
+        let bytes = std::fs::read(path).context("read snapshot upload progress")?;
+        let Ok(progress) = serde_json::from_slice::<Self>(&bytes) else {
+            eprintln!("local snapshot upload progress was invalid; rebuilding");
+            Self::clear(path)?;
+            return Ok(Self::new(expected_destination_namespace_hash.to_string()));
+        };
+        if progress.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            || progress.destination_namespace_hash != expected_destination_namespace_hash
+            || !is_snapshot_fingerprint(&progress.destination_namespace_hash)
+            || progress
+                .accepted_fingerprints
+                .iter()
+                .any(|value| !is_snapshot_fingerprint(value))
+        {
+            eprintln!("local snapshot upload progress destination changed; rebuilding");
+            Self::clear(path)?;
+            return Ok(Self::new(expected_destination_namespace_hash.to_string()));
+        }
+        Ok(progress)
+    }
+
+    fn contains(&self, fingerprint: &str) -> bool {
+        self.accepted_fingerprints.contains(fingerprint)
+    }
+
+    fn record<'a>(&mut self, fingerprints: impl IntoIterator<Item = &'a str>) {
+        self.accepted_fingerprints
+            .extend(fingerprints.into_iter().map(str::to_string));
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
+        }
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let mut file =
+            std::fs::File::create(&temp_path).context("create snapshot upload progress temp")?;
+        serde_json::to_writer_pretty(&mut file, self)
+            .context("write snapshot upload progress temp")?;
+        file.sync_all()
+            .context("sync snapshot upload progress temp")?;
+        std::fs::rename(&temp_path, path).context("replace snapshot upload progress")
+    }
+
+    fn clear(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("clear snapshot upload progress"),
+        }
+    }
+}
+
+fn is_snapshot_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
@@ -750,12 +844,18 @@ fn sync_source(
             && activity_hint.session_titles_enabled
             && activity_hint.session_attribution_labels_enabled,
     };
-    let index_path = snapshot_index_path(
+    let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    let policy_index_path = snapshot_index_path(
         support_dir,
         source,
         upload_policy,
         attribution_context.as_ref(),
     );
+    let index_path =
+        snapshot_destination_scoped_index_path(&policy_index_path, &upload_destination_namespace);
+    let upload_progress_path = snapshot_upload_progress_path(&index_path);
+    let mut upload_progress =
+        SnapshotUploadProgress::load(&upload_progress_path, &upload_destination_namespace)?;
     let mut index = ScanIndex::load(&index_path)?;
     let mut scan_result = match scan_source_roots_with_attribution(
         source,
@@ -808,7 +908,9 @@ fn sync_source(
     // has never completed its initial bootstrap or for a reviewed replay
     // directive. State advances only after this iteration's upload succeeds.
     let backfill_state = load_backfill_state(support_dir);
-    let backfill_pending = pending_backfill_sources(&backfill_state).contains(&source);
+    let backfill_pending =
+        pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
+            .contains(&source);
     let mut backfill_succeeded = false;
     if backfill_pending {
         match run_backfill(
@@ -887,29 +989,146 @@ fn sync_source(
     }
 
     let mut accepted = 0;
+    let upload_result = upload_resumable_batches(
+        &scan_result.snapshots,
+        &mut upload_progress,
+        &mut accepted,
+        |snapshot| snapshot.snapshot_fingerprint.as_str(),
+        |snapshots| {
+            // A first Codex/Claude scan can spend several minutes parsing local
+            // history and retroactive backfill before the first upload. Relay
+            // tokens are intentionally short-lived, so mint them at the network
+            // boundary instead of reusing the pre-scan activity-hint token.
+            let request = SnapshotBatchRequest {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                source: source.api_slug().to_string(),
+                machine_id: machine_id.to_string(),
+                collector_version: Some(collector_version()),
+                snapshots,
+            };
+            if let Err(reason) = validate_snapshot_batch_request(&request) {
+                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                    reason,
+                }));
+            }
+            let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
+            client.upload_batch(&upload_relay_token, &request)
+        },
+        |progress| progress.save(&upload_progress_path),
+    )
+    .and_then(|result| {
+        if result == ResumableUploadResult::Completed {
+            // A setup/account switch can replace the relay binding while a
+            // long historical scan is uploading. Never commit destination A's
+            // delivery cursor after the machine has moved to destination B.
+            ensure_snapshot_destination_current(&upload_destination_namespace)?;
+        }
+        Ok(result)
+    });
 
-    for chunk in bounded_snapshot_chunks(&scan_result.snapshots) {
-        // A first Codex/Claude scan can spend several minutes parsing local
-        // history and retroactive backfill before the first upload. Relay
-        // tokens are intentionally short-lived, so mint them at the network
-        // boundary instead of reusing the pre-scan activity-hint token.
-        let request = SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: source.api_slug().to_string(),
-            machine_id: machine_id.to_string(),
-            collector_version: Some(collector_version()),
-            snapshots: chunk.to_vec(),
-        };
-        if let Err(reason) = validate_snapshot_batch_request(&request) {
-            eprintln!(
-                "ottto-service: local snapshot batch failed daemon v{} contract preflight for {} — {}; usage/cost sync is NOT reaching the backend until the daemon serializer is fixed.",
-                SNAPSHOT_SCHEMA_VERSION,
-                source.api_slug(),
-                reason,
-            );
-            let state = CollectorState::Error {
-                code: "backend_validation_error",
-                message: "local snapshot batch failed daemon/backend contract preflight",
+    match upload_result {
+        Ok(ResumableUploadResult::Completed) => {}
+        Ok(ResumableUploadResult::Disabled(disabled_reason)) => {
+            report_status_with_fresh_relay_token(
+                client,
+                device,
+                device_secret,
+                source,
+                CollectorStatus {
+                    source,
+                    machine_id,
+                    scan_started_at: &scan_started_at,
+                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    state: CollectorState::Disabled(
+                        disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
+                    ),
+                },
+            )?;
+            return Ok(());
+        }
+        Err(error) => {
+            // Distinguish local serializer drift, authorization failures, and
+            // backend payload rejection. The resumable driver has already
+            // checkpointed every accepted sibling before this terminal error.
+            let (state, context) = if snapshot_upload_error_class(&error)
+                == Some(SnapshotUploadErrorClass::LocalState)
+            {
+                (
+                    CollectorState::Error {
+                        code: "local_state_error",
+                        message: "local snapshot checkpoint or destination state failed",
+                    },
+                    "local snapshot state failed",
+                )
+            } else if snapshot_upload_error_class(&error)
+                == Some(SnapshotUploadErrorClass::BackendResponse)
+            {
+                (
+                    CollectorState::Error {
+                        code: "backend_response_error",
+                        message: "backend snapshot response did not match the request",
+                    },
+                    "backend snapshot response was invalid",
+                )
+            } else if let Some(rejected) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
+                eprintln!(
+                    "ottto-service: local snapshot batch failed daemon v{} contract preflight for {} — {}; usage/cost sync is NOT reaching the backend until the daemon serializer is fixed.",
+                    SNAPSHOT_SCHEMA_VERSION,
+                    source.api_slug(),
+                    rejected.reason,
+                );
+                (
+                    CollectorState::Error {
+                        code: "backend_validation_error",
+                        message: "local snapshot batch failed daemon/backend contract preflight",
+                    },
+                    "local snapshot batch failed daemon/backend contract preflight",
+                )
+            } else if let Some(rejected) = error.downcast_ref::<BatchAuthorizationRejected>() {
+                eprintln!(
+                    "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
+                     for {}; start setup or sign in from the Ottto app before retrying \
+                     local usage sync.",
+                    rejected.status,
+                    source.api_slug(),
+                );
+                (
+                    CollectorState::Error {
+                        code: "auth_error",
+                        message: "backend rejected snapshot batch authorization",
+                    },
+                    "backend rejected snapshot batch authorization",
+                )
+            } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+                let body = rejected
+                    .body_excerpt
+                    .as_deref()
+                    .unwrap_or("backend returned no validation detail");
+                eprintln!(
+                    "ottto-service: snapshot batch payload rejected by backend (HTTP {}) for {} — \
+                     daemon SNAPSHOT_SCHEMA_VERSION={}; backend detail: {}; usage/cost sync is \
+                     NOT reaching the backend until the daemon payload or backend validator is \
+                     updated. This is a payload validation failure, not a network error.",
+                    rejected.status,
+                    source.api_slug(),
+                    SNAPSHOT_SCHEMA_VERSION,
+                    body,
+                );
+                (
+                    CollectorState::Error {
+                        code: "backend_validation_error",
+                        message: "backend rejected snapshot batch payload validation",
+                    },
+                    "backend rejected snapshot batch payload validation",
+                )
+            } else {
+                (
+                    CollectorState::Error {
+                        code: "network_error",
+                        message: "local snapshot upload failed",
+                    },
+                    "upload local snapshots",
+                )
             };
             let _ = report_status_with_fresh_relay_token(
                 client,
@@ -924,102 +1143,8 @@ fn sync_source(
                     state,
                 },
             );
-            return Err(anyhow!(
-                "local snapshot batch failed daemon/backend contract preflight: {reason}"
-            ));
+            return Err(error.context(context));
         }
-        let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-        let response = match client.upload_batch(&upload_relay_token, &request) {
-            Ok(response) => response,
-            Err(error) => {
-                // Distinguish authorization failures from backend payload
-                // rejections. Only validation-like rejections are schema drift;
-                // 401/403 means the relay binding or token needs attention.
-                let (state, context) = if let Some(rejected) =
-                    error.downcast_ref::<BatchAuthorizationRejected>()
-                {
-                    eprintln!(
-                        "ottto-service: snapshot batch authorization rejected by backend (HTTP {}) \
-                         for {}; start setup or sign in from the Ottto app before retrying \
-                         local usage sync.",
-                        rejected.status,
-                        source.api_slug(),
-                    );
-                    (
-                        CollectorState::Error {
-                            code: "auth_error",
-                            message: "backend rejected snapshot batch authorization",
-                        },
-                        "backend rejected snapshot batch authorization",
-                    )
-                } else if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
-                    let body = rejected
-                        .body_excerpt
-                        .as_deref()
-                        .unwrap_or("backend returned no validation detail");
-                    eprintln!(
-                        "ottto-service: snapshot batch payload rejected by backend (HTTP {}) for {} — \
-                         daemon SNAPSHOT_SCHEMA_VERSION={}; backend detail: {}; usage/cost sync is \
-                         NOT reaching the backend until the daemon payload or backend validator is \
-                         updated. This is a payload validation failure, not a network error.",
-                        rejected.status,
-                        source.api_slug(),
-                        SNAPSHOT_SCHEMA_VERSION,
-                        body,
-                    );
-                    (
-                        CollectorState::Error {
-                            code: "backend_validation_error",
-                            message: "backend rejected snapshot batch payload validation",
-                        },
-                        "backend rejected snapshot batch payload validation",
-                    )
-                } else {
-                    (
-                        CollectorState::Error {
-                            code: "network_error",
-                            message: "local snapshot upload failed",
-                        },
-                        "upload local snapshots",
-                    )
-                };
-                let _ = report_status_with_fresh_relay_token(
-                    client,
-                    device,
-                    device_secret,
-                    source,
-                    CollectorStatus {
-                        source,
-                        machine_id,
-                        scan_started_at: &scan_started_at,
-                        counts: SyncCounts::from_scan_result(&scan_result, accepted),
-                        state,
-                    },
-                );
-                return Err(error.context(context));
-            }
-        };
-        if response.disabled {
-            report_status_with_fresh_relay_token(
-                client,
-                device,
-                device_secret,
-                source,
-                CollectorStatus {
-                    source,
-                    machine_id,
-                    scan_started_at: &scan_started_at,
-                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
-                    state: CollectorState::Disabled(
-                        response
-                            .disabled_reason
-                            .or_else(|| Some("disabled_by_admin".to_string())),
-                    ),
-                },
-            )?;
-            return Ok(());
-        }
-        accepted += response.accepted;
     }
 
     index.save(&index_path)?;
@@ -1041,7 +1166,11 @@ fn sync_source(
         // account-switch backfill cutoff while this (potentially minutes-long)
         // sync is running, and saving the stale pre-scan copy would clobber it.
         let mut backfill_state = load_backfill_state(support_dir);
-        mark_backfill_complete(&mut backfill_state, source);
+        mark_backfill_complete_for_destination(
+            &mut backfill_state,
+            source,
+            &upload_destination_namespace,
+        );
         backfill_state.last_completed_at = Some(scan_started_at.clone());
         if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
             eprintln!(
@@ -1049,8 +1178,14 @@ fn sync_source(
                 source.api_slug(),
                 safe_error(&error)
             );
+            return Err(anyhow!("local snapshot backfill state save failed"));
         }
     }
+
+    // Final scan/backfill markers are durable before progress disappears. A
+    // crash anywhere above leaves the hash-only ledger in place; the next run
+    // safely resumes/finalizes without replaying accepted pages.
+    SnapshotUploadProgress::clear(&upload_progress_path)?;
 
     report_status_with_fresh_relay_token(
         client,
@@ -1068,8 +1203,229 @@ fn sync_source(
     Ok(())
 }
 
-fn bounded_snapshot_chunks<T>(items: &[T]) -> std::slice::Chunks<'_, T> {
-    items.chunks(SNAPSHOT_BATCH_LIMIT)
+#[derive(Debug, PartialEq, Eq)]
+enum ResumableUploadResult {
+    Completed,
+    Disabled(Option<String>),
+}
+
+#[derive(Debug)]
+struct SnapshotBatchPreflightRejected {
+    reason: String,
+}
+
+impl std::fmt::Display for SnapshotBatchPreflightRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "local snapshot batch contract preflight failed: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for SnapshotBatchPreflightRejected {}
+
+#[derive(Debug)]
+struct SnapshotLocalStateRejected {
+    operation: &'static str,
+}
+
+impl std::fmt::Display for SnapshotLocalStateRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "local snapshot state failed: {}", self.operation)
+    }
+}
+
+impl std::error::Error for SnapshotLocalStateRejected {}
+
+#[derive(Debug)]
+struct SnapshotBatchResponseRejected {
+    expected: u64,
+    accepted: u64,
+}
+
+impl std::fmt::Display for SnapshotBatchResponseRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "snapshot batch accepted-count mismatch: expected {}, received {}",
+            self.expected, self.accepted
+        )
+    }
+}
+
+impl std::error::Error for SnapshotBatchResponseRejected {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotUploadErrorClass {
+    LocalState,
+    BackendResponse,
+}
+
+fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadErrorClass> {
+    if error.downcast_ref::<SnapshotLocalStateRejected>().is_some() {
+        Some(SnapshotUploadErrorClass::LocalState)
+    } else if error
+        .downcast_ref::<SnapshotBatchResponseRejected>()
+        .is_some()
+    {
+        Some(SnapshotUploadErrorClass::BackendResponse)
+    } else {
+        None
+    }
+}
+
+fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
+    if let Some(preflight) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
+        return preflight.reason.starts_with("snapshot[");
+    }
+    error
+        .downcast_ref::<BatchRejected>()
+        .and_then(|rejected| rejected.body_excerpt.as_deref())
+        .is_some_and(|body| {
+            body.contains("\"loc\":[\"body\",\"snapshots\"")
+                || body.contains("'loc': ['body', 'snapshots'")
+        })
+}
+
+fn is_timeout_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(|diagnostics| diagnostics.status_family() == "transport_timeout")
+}
+
+/// Upload changed snapshots in bounded pages while durably checkpointing every
+/// accepted page. Item-specific validation failures are bisected so one poison
+/// snapshot cannot replay or block its valid siblings; timeout-heavy pages are
+/// also bisected to reduce per-request reconciliation work. Splits are capped
+/// so an outage or broad contract mismatch cannot fan out into unbounded calls.
+fn upload_resumable_batches<T, Fingerprint, Upload, Persist>(
+    items: &[T],
+    progress: &mut SnapshotUploadProgress,
+    accepted: &mut u64,
+    fingerprint: Fingerprint,
+    mut upload: Upload,
+    mut persist: Persist,
+) -> Result<ResumableUploadResult>
+where
+    T: Clone,
+    Fingerprint: Fn(&T) -> &str,
+    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Persist: FnMut(&SnapshotUploadProgress) -> Result<()>,
+{
+    // A permanently invalid snapshot can keep the final scan index uncommitted
+    // across many cycles while valid sessions continue changing. Retain only
+    // fingerprints present in this cycle's policy/cutoff-filtered work so the
+    // hash-only ledger stays O(current scan), not O(all historical revisions).
+    let current_fingerprints = items
+        .iter()
+        .map(|item| fingerprint(item).to_string())
+        .collect::<BTreeSet<_>>();
+    let progress_len_before_prune = progress.accepted_fingerprints.len();
+    progress
+        .accepted_fingerprints
+        .retain(|value| current_fingerprints.contains(value));
+    if progress.accepted_fingerprints.len() != progress_len_before_prune {
+        persist(progress).map_err(|_| {
+            anyhow::Error::new(SnapshotLocalStateRejected {
+                operation: "prune upload checkpoint",
+            })
+        })?;
+    }
+
+    let pending_indices = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (!progress.contains(fingerprint(item))).then_some(index))
+        .collect::<Vec<_>>();
+    let mut batches = pending_indices
+        .chunks(SNAPSHOT_BATCH_LIMIT)
+        .map(|indices| (indices.to_vec(), false))
+        .collect::<VecDeque<_>>();
+    let mut adaptive_splits = 0usize;
+    let mut adaptive_attempts = 0usize;
+    let mut deferred_validation_error: Option<anyhow::Error> = None;
+
+    while let Some((indices, adaptive)) = batches.pop_front() {
+        // A duplicate fingerprint may occur in the live scan and historical
+        // bootstrap. Re-check after earlier batches checkpointed it.
+        let indices = indices
+            .into_iter()
+            .filter(|index| !progress.contains(fingerprint(&items[*index])))
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            continue;
+        }
+        if adaptive {
+            if adaptive_attempts >= SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT {
+                return Err(anyhow!("snapshot adaptive upload attempt limit reached"));
+            }
+            adaptive_attempts += 1;
+        }
+        let batch = indices
+            .iter()
+            .map(|index| items[*index].clone())
+            .collect::<Vec<_>>();
+
+        match upload(batch) {
+            Ok(response) if response.disabled => {
+                return Ok(ResumableUploadResult::Disabled(response.disabled_reason));
+            }
+            Ok(response) => {
+                if response.accepted != indices.len() as u64 {
+                    return Err(anyhow::Error::new(SnapshotBatchResponseRejected {
+                        expected: indices.len() as u64,
+                        accepted: response.accepted,
+                    }));
+                }
+                progress.record(indices.iter().map(|index| fingerprint(&items[*index])));
+                // The remote write happened first. If this local atomic save
+                // fails, stop: at most this one idempotent page can replay.
+                persist(progress).map_err(|_| {
+                    anyhow::Error::new(SnapshotLocalStateRejected {
+                        operation: "save upload checkpoint",
+                    })
+                })?;
+                *accepted = accepted.saturating_add(response.accepted);
+            }
+            Err(error)
+                if indices.len() > 1
+                    && adaptive_splits < SNAPSHOT_ADAPTIVE_SPLIT_LIMIT
+                    && (is_item_specific_validation_failure(&error)
+                        || is_timeout_failure(&error)) =>
+            {
+                adaptive_splits += 1;
+                let midpoint = indices.len() / 2;
+                let right = indices[midpoint..].to_vec();
+                let left = indices[..midpoint].to_vec();
+                batches.push_front((right, true));
+                batches.push_front((left, true));
+            }
+            Err(error) if indices.len() > 1 && is_item_specific_validation_failure(&error) => {
+                // Keep the original typed validation error in the anyhow
+                // chain so the caller still reports backend_validation_error
+                // when the bounded isolation budget is exhausted.
+                return Err(error.context("snapshot adaptive upload split limit reached"));
+            }
+            Err(error) if is_item_specific_validation_failure(&error) => {
+                // Preserve the first poison-item diagnostic, but continue so
+                // every valid sibling is accepted and checkpointed exactly
+                // once. The caller still reports the cycle as failed and does
+                // not commit the final scan index.
+                if deferred_validation_error.is_none() {
+                    deferred_validation_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(error) = deferred_validation_error {
+        Err(error)
+    } else {
+        Ok(ResumableUploadResult::Completed)
+    }
 }
 
 /// Aggregate this cycle's snapshots into detected uses, merge them into the
@@ -1409,6 +1765,69 @@ fn snapshot_index_path(
     ))
 }
 
+fn snapshot_upload_progress_path(index_path: &Path) -> PathBuf {
+    let stem = index_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("snapshot-scan-index");
+    index_path.with_file_name(format!("{stem}-upload-progress.json"))
+}
+
+fn snapshot_destination_scoped_index_path(
+    policy_index_path: &Path,
+    destination_namespace_hash: &str,
+) -> PathBuf {
+    let parent = policy_index_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = policy_index_path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("snapshot-scan-index.json"));
+    parent
+        .join("destinations")
+        .join(destination_namespace_hash)
+        .join(file_name)
+}
+
+fn snapshot_upload_destination_namespace(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:snapshot-delivery-destination:relay-device:v1\0");
+    hasher.update(device.device_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_secret.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn ensure_snapshot_destination_current(expected_namespace_hash: &str) -> Result<()> {
+    let (current_device, current_device_secret) =
+        load_snapshot_device_credentials().map_err(|_| {
+            anyhow::Error::new(SnapshotLocalStateRejected {
+                operation: "revalidate relay destination",
+            })
+        })?;
+    validate_snapshot_destination(
+        expected_namespace_hash,
+        &current_device,
+        &current_device_secret,
+    )
+}
+
+fn validate_snapshot_destination(
+    expected_namespace_hash: &str,
+    current_device: &LocalDeviceBinding,
+    current_device_secret: &str,
+) -> Result<()> {
+    if snapshot_upload_destination_namespace(current_device, current_device_secret)
+        != expected_namespace_hash
+    {
+        return Err(anyhow::Error::new(SnapshotLocalStateRejected {
+            operation: "relay destination changed during snapshot sync",
+        }));
+    }
+    Ok(())
+}
+
 pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1435,6 +1854,15 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
+    }
+    match snapshot_upload_error_class(error) {
+        Some(SnapshotUploadErrorClass::LocalState) => {
+            return "local snapshot state failed".to_string();
+        }
+        Some(SnapshotUploadErrorClass::BackendResponse) => {
+            return "backend snapshot response was invalid".to_string();
+        }
+        None => {}
     }
     // Scan the whole context chain, not just the outermost message, so a known
     // failure phrase wrapped under another context still classifies instead of
@@ -1506,16 +1934,385 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    fn test_fingerprints(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("{index:064x}")).collect()
+    }
+
+    fn test_upload_progress() -> SnapshotUploadProgress {
+        SnapshotUploadProgress::new(format!("{:064x}", 99))
+    }
+
+    fn accepted_batch(count: usize) -> crate::snapshot_client::SnapshotBatchResponse {
+        crate::snapshot_client::SnapshotBatchResponse {
+            accepted: count as u64,
+            sessions_reconciled: count as u64,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+        }
+    }
+
     #[test]
-    fn snapshot_upload_chunks_bound_reconciliation_work() {
-        let items = (0..45).collect::<Vec<_>>();
-        let chunk_lengths = bounded_snapshot_chunks(&items)
-            .map(|chunk| chunk.len())
-            .collect::<Vec<_>>();
+    fn snapshot_upload_batches_bound_reconciliation_work() {
+        let items = test_fingerprints(45);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut chunk_lengths = Vec::new();
+
+        let result = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                chunk_lengths.push(batch.len());
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect("upload succeeds");
 
         assert_eq!(SNAPSHOT_BATCH_LIMIT, 20);
         assert_eq!(chunk_lengths, vec![20, 20, 5]);
         assert!(chunk_lengths.iter().all(|length| *length <= 20));
+        assert_eq!(accepted, 45);
+        assert_eq!(result, ResumableUploadResult::Completed);
+    }
+
+    #[test]
+    fn checkpoint_persist_failure_is_local_state_not_transport() {
+        let items = test_fingerprints(1);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| Ok(accepted_batch(batch.len())),
+            |_| Err(anyhow!("private/path/checkpoint.json")),
+        )
+        .expect_err("remote success without durable checkpoint must fail locally");
+
+        assert_eq!(
+            snapshot_upload_error_class(&error),
+            Some(SnapshotUploadErrorClass::LocalState)
+        );
+        assert_eq!(safe_error(&error), "local snapshot state failed");
+        assert!(!error.to_string().contains("private/path"));
+        assert_eq!(accepted, 0);
+    }
+
+    #[test]
+    fn accepted_count_mismatch_is_backend_response_not_transport() {
+        let items = test_fingerprints(1);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| Ok(accepted_batch(0)),
+            |_| Ok(()),
+        )
+        .expect_err("accepted-count mismatch must reject the response");
+
+        assert_eq!(
+            snapshot_upload_error_class(&error),
+            Some(SnapshotUploadErrorClass::BackendResponse)
+        );
+        assert_eq!(safe_error(&error), "backend snapshot response was invalid");
+        assert_eq!(accepted, 0);
+    }
+
+    #[test]
+    fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
+        let root = test_dir("snapshot-upload-resume-timeout");
+        let path = root.join("codex-scan-index-attribution-test-upload-progress.json");
+        let items = test_fingerprints(45);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let first_page = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
+
+        let first_error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                if batch == first_page {
+                    Ok(accepted_batch(batch.len()))
+                } else {
+                    Err(anyhow::Error::new(UploadFailureDiagnostics::for_test(
+                        "local snapshot upload",
+                        "snapshot_batch",
+                        "transport_timeout",
+                        true,
+                        false,
+                    )))
+                }
+            },
+            |state| state.save(&path),
+        )
+        .expect_err("persistent timeout stops after checkpointing the first page");
+
+        assert!(is_timeout_failure(&first_error));
+        assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
+        let mut resumed = SnapshotUploadProgress::load(&path, &progress.destination_namespace_hash)
+            .expect("reload progress");
+        assert_eq!(resumed.accepted_fingerprints.len(), SNAPSHOT_BATCH_LIMIT);
+
+        let mut resumed_accepted = 0;
+        let mut resumed_items = Vec::new();
+        let result = upload_resumable_batches(
+            &items,
+            &mut resumed,
+            &mut resumed_accepted,
+            String::as_str,
+            |batch| {
+                resumed_items.extend(batch.iter().cloned());
+                Ok(accepted_batch(batch.len()))
+            },
+            |state| state.save(&path),
+        )
+        .expect("restart uploads only remaining pages");
+
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(resumed_accepted, 25);
+        assert_eq!(resumed_items, items[SNAPSHOT_BATCH_LIMIT..]);
+        assert!(resumed_items
+            .iter()
+            .all(|fingerprint| !first_page.contains(fingerprint)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn item_specific_422_isolates_poison_and_checkpoints_valid_siblings() {
+        let items = test_fingerprints(25);
+        let poison = items[19].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let uploaded = Arc::new(Mutex::new(Vec::new()));
+        let uploaded_capture = uploaded.clone();
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            move |batch| {
+                if batch.contains(&poison) {
+                    return Err(anyhow::Error::new(BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(
+                            r#"{"errors":[{"loc":["body","snapshots",0,"compaction_timestamps"]}]}"#
+                                .to_string(),
+                        ),
+                    }));
+                }
+                uploaded_capture
+                    .lock()
+                    .expect("capture lock")
+                    .extend(batch.iter().cloned());
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("poison snapshot keeps the cycle failed");
+
+        assert!(is_item_specific_validation_failure(&error));
+        assert_eq!(accepted, 24);
+        assert_eq!(progress.accepted_fingerprints.len(), 24);
+        assert!(!progress.contains(&items[19]));
+        let uploaded = uploaded.lock().expect("capture lock");
+        assert_eq!(uploaded.len(), 24);
+        assert!(uploaded.iter().all(|item| item != &items[19]));
+        assert_eq!(uploaded.iter().collect::<BTreeSet<_>>().len(), 24);
+        drop(uploaded);
+
+        let mut retry_accepted = 0;
+        let mut retry_attempts = Vec::new();
+        let retry_error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut retry_accepted,
+            String::as_str,
+            |batch| {
+                retry_attempts.push(batch.clone());
+                Err(anyhow::Error::new(BatchRejected {
+                    status: 422,
+                    body_excerpt: Some(
+                        r#"{"errors":[{"loc":["body","snapshots",0,"compaction_timestamps"]}]}"#
+                            .to_string(),
+                    ),
+                }))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("restart still reports the poison item");
+
+        assert!(is_item_specific_validation_failure(&retry_error));
+        assert_eq!(retry_accepted, 0);
+        assert_eq!(retry_attempts, vec![vec![items[19].clone()]]);
+    }
+
+    #[test]
+    fn broad_item_validation_failure_caps_adaptive_requests() {
+        let items = test_fingerprints(45);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut attempts = 0usize;
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_batch| {
+                attempts += 1;
+                Err(anyhow::Error::new(BatchRejected {
+                    status: 422,
+                    body_excerpt: Some(
+                        r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                    ),
+                }))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("broad contract failure is bounded");
+
+        assert_eq!(
+            error.to_string(),
+            "snapshot adaptive upload split limit reached"
+        );
+        assert!(is_item_specific_validation_failure(&error));
+        assert!(error.downcast_ref::<BatchRejected>().is_some());
+        assert_eq!(accepted, 0);
+        assert!(attempts <= SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT);
+    }
+
+    #[test]
+    fn permanent_poison_prunes_old_revisions_from_progress() {
+        let poison = format!("{:064x}", 9000);
+        let mut progress = test_upload_progress();
+
+        for revision in 0..20 {
+            let valid = format!("{:064x}", 10_000 + revision);
+            let items = vec![valid.clone(), poison.clone()];
+            let mut accepted = 0;
+            let error = upload_resumable_batches(
+                &items,
+                &mut progress,
+                &mut accepted,
+                String::as_str,
+                |batch| {
+                    if batch.contains(&poison) {
+                        Err(anyhow::Error::new(BatchRejected {
+                            status: 422,
+                            body_excerpt: Some(
+                                r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#
+                                    .to_string(),
+                            ),
+                        }))
+                    } else {
+                        Ok(accepted_batch(batch.len()))
+                    }
+                },
+                |_| Ok(()),
+            )
+            .expect_err("permanent poison keeps the cycle incomplete");
+
+            assert!(is_item_specific_validation_failure(&error));
+            assert_eq!(accepted, 1);
+            assert_eq!(progress.accepted_fingerprints.len(), 1);
+            assert!(progress.contains(&valid));
+        }
+    }
+
+    #[test]
+    fn snapshot_upload_progress_path_stays_policy_scoped() {
+        let index = Path::new(
+            "/support/snapshots/codex-scan-index-attribution-key-attribution-labels.json",
+        );
+
+        assert_eq!(
+            snapshot_upload_progress_path(index),
+            PathBuf::from(
+                "/support/snapshots/codex-scan-index-attribution-key-attribution-labels-upload-progress.json"
+            )
+        );
+    }
+
+    #[test]
+    fn snapshot_scan_index_is_relay_destination_scoped() {
+        let policy_index = Path::new("/support/snapshots/codex-scan-index-attribution-labels.json");
+        let destination = format!("{:064x}", 42);
+
+        assert_eq!(
+            snapshot_destination_scoped_index_path(policy_index, &destination),
+            PathBuf::from(format!(
+                "/support/snapshots/destinations/{destination}/codex-scan-index-attribution-labels.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn snapshot_upload_progress_resets_when_relay_device_changes() {
+        let root = test_dir("snapshot-upload-progress-destination-switch");
+        let path = root.join("codex-scan-index-upload-progress.json");
+        let device_a = LocalDeviceBinding {
+            device_id: "relay-device-a".to_string(),
+            machine_id: Some("machine-shared".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let device_b = LocalDeviceBinding {
+            // Backend may preserve the device row while rotating its account
+            // credential, so the secret participates in destination identity.
+            device_id: "relay-device-a".to_string(),
+            machine_id: Some("machine-shared".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let namespace_a = snapshot_upload_destination_namespace(&device_a, "secret-a");
+        let namespace_b = snapshot_upload_destination_namespace(&device_b, "secret-b");
+        assert_ne!(namespace_a, namespace_b);
+
+        let accepted = format!("{:064x}", 7);
+        let mut progress = SnapshotUploadProgress::new(namespace_a);
+        progress.record([accepted.as_str()]);
+        progress.save(&path).expect("save account A progress");
+
+        let loaded = SnapshotUploadProgress::load(&path, &namespace_b)
+            .expect("account B discards account A progress");
+        assert_eq!(loaded.destination_namespace_hash, namespace_b);
+        assert!(loaded.accepted_fingerprints.is_empty());
+        assert!(!path.exists(), "mismatched ledger is removed immediately");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_relay_switch_rejects_final_cursor_commit() {
+        let device_a = LocalDeviceBinding {
+            device_id: "relay-device-a".to_string(),
+            machine_id: Some("machine-shared".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let device_b = LocalDeviceBinding {
+            device_id: "relay-device-a".to_string(),
+            machine_id: Some("machine-shared".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let expected = snapshot_upload_destination_namespace(&device_a, "secret-a");
+
+        let error = validate_snapshot_destination(&expected, &device_b, "secret-b")
+            .expect_err("destination B must not commit destination A's cursor");
+        assert_eq!(
+            snapshot_upload_error_class(&error),
+            Some(SnapshotUploadErrorClass::LocalState)
+        );
+        assert_eq!(safe_error(&error), "local snapshot state failed");
     }
 
     #[test]
