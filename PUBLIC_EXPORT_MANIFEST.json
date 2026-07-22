@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 249,
-  "content_sha256": "f8e592325884dc0166ba9480b911d5f646db35aa3ac0795858adac87df221385",
+  "candidate_file_count": 250,
+  "content_sha256": "aee89d9f9e667bf513d72e02b5e569681eb5d97e04742bb40bf5e53edb46921f",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "866a34a0012b203e8ff9b0b8608c65f57dd63944074416b00e7e4c3c5316c1c0",
-      "size_bytes": 43068
+      "sha256": "18d4a59aeaf5db8601088c5854d6a0acd6cb8ef0895f6db97c2ae2cc1f28bcbd",
+      "size_bytes": 43997
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "75b2eb4be053418ef3207dcd3bedf33113467e3809f4e5b122ef887415d3eb57",
-      "size_bytes": 27343
+      "sha256": "278ec28f0c46674d09cfafd18fd519a053f98f211509ec24b34c57f0bbb26a29",
+      "size_bytes": 29979
     },
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "5e7bd7b08706499f28d7a65ae6b6938581bfef129bc3d2746024d9cbfb278869",
-      "size_bytes": 96365
+      "sha256": "94b55464064d81333ea22f26169e6dba7e6e4a77f0e0e5846f9042dc2f66b3cb",
+      "size_bytes": 96017
     },
     {
       "executable": false,
@@ -811,8 +811,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "a3d7d5a9772dd224bc67b770b7baa1977786e9dfea2dc8c80f315eea310f1b30",
-      "size_bytes": 472061
+      "sha256": "d3e0d07e990e44f27b721fd8137d940d4a02b6e2220ca78f80590b793d7d4bf7",
+      "size_bytes": 499878
     },
     {
       "executable": false,
@@ -953,6 +953,13 @@
       "path": "docs/session-2026-07-22-cloud-session-scan-epochs.md",
       "sha256": "7ce746d651566bf74c549dacd16f286192bd996006dc6838f682de33d33ebc43",
       "size_bytes": 4589
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-22-local-semantic-sync-phase-1.md",
+      "sha256": "b0d3896db7e3f8ef28e45087af743627a39cd231806a10d4907e0c12613a56de",
+      "size_bytes": 3562
     },
     {
       "executable": false,
@@ -1746,9 +1753,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T10:35:27+00:00",
+  "generated_at": "2026-07-22T11:28:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 250,
+  "output_file_count": 251,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1782,5 +1789,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ffe8c64a0e5502268d553ea48c0b538d9499669d"
+  "source_commit": "3c10f8280c2e7c021a2b067d35e73a389961a1d9"
 }
