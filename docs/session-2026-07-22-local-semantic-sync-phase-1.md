@@ -57,6 +57,26 @@ bootstrap and real session updates.
   per-session sidecar isolation, semantic no-op suppression, observation/parser
   metadata stability, and real component changes.
 - The complete snapshot unit-test group passes.
+- `ottto-service snapshot-audit` now wraps the production scanner with a
+  content-free, HMAC-blinded audit schema. It disables optional identity and
+  artifact surfaces and has explicit leak/short-key tests. Audit checkpoints
+  live only in a marked, dedicated `0700` state directory with `0600` files;
+  production index files, unmarked directories, symlinks, and unsafe modes are
+  rejected. The scan index advances only after the report output is flushed.
+- The audit carries the source token-scope contract. In particular, Codex input
+  is inclusive of cached tokens on the wire, so the private comparison can
+  apply the backend normalization exactly once without guessing or silently
+  treating raw and accepted counters as equal.
+- A separate private `0600` upload-payload output exists only for hermetic
+  transport validation. It contains ingest identifiers and must not be treated
+  as a shareable audit or diagnostics artifact.
+- A cross-repository synthetic Codex test is green through the stable batch API,
+  accepted semantic head, GOLD facts/session, hourly/day rollups, summary/cost
+  reads, and the sessions API. Repeat, unrelated-sidecar, real-append, and
+  legacy-config-cutover waves all behave as designed.
+- Closed-output, production-index collision, and unsafe-state tests prove the
+  audit cannot consume a live daemon checkpoint or acknowledge a report that
+  was not delivered.
 
 ## Follow-up phases
 

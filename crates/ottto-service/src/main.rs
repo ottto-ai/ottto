@@ -57,6 +57,33 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run the production local-session scanner and print a privacy-safe audit.
+    SnapshotAudit {
+        /// `codex`, `claude_code`, or `pi`.
+        #[arg(long)]
+        source: String,
+        /// Source transcript root. Repeat for multiple roots.
+        #[arg(long = "root", required = true)]
+        roots: Vec<PathBuf>,
+        /// Dedicated private audit-state directory; production index files are rejected.
+        #[arg(long)]
+        audit_state_dir: PathBuf,
+        /// File containing at least 32 bytes used to blind audit identifiers.
+        #[arg(long)]
+        audit_key_file: PathBuf,
+        /// Machine id used by the normal upload contract; never printed raw.
+        #[arg(long)]
+        machine_id: String,
+        /// Deterministic collection timestamp. Defaults to the current time.
+        #[arg(long)]
+        collected_at: Option<String>,
+        /// Requested lookback, capped by the production scanner.
+        #[arg(long, default_value_t = ottto_service::snapshots::BACKFILL_WINDOW_DAYS)]
+        backfill_window_days: u64,
+        /// Optional private 0600 file containing the normal stripped upload payload.
+        #[arg(long = "private-upload-payload-out")]
+        private_upload_payload_out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +148,34 @@ fn main() -> Result<()> {
                     status.reason_code
                 );
             }
+        }
+        Command::SnapshotAudit {
+            source,
+            roots,
+            audit_state_dir,
+            audit_key_file,
+            machine_id,
+            collected_at,
+            backfill_window_days,
+            private_upload_payload_out,
+        } => {
+            let source = ottto_service::snapshot_audit::snapshot_source_from_slug(&source)?;
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            ottto_service::snapshot_audit::run_snapshot_audit(
+                ottto_service::snapshot_audit::SnapshotAuditOptions {
+                    source,
+                    roots,
+                    audit_state_dir,
+                    audit_key_path: audit_key_file,
+                    machine_id,
+                    collected_at: collected_at
+                        .unwrap_or_else(ottto_service::current_rfc3339_timestamp),
+                    backfill_window_days,
+                    private_upload_payload_out,
+                },
+                &mut output,
+            )?;
         }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
