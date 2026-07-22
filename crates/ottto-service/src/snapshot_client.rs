@@ -663,6 +663,79 @@ impl SnapshotApiClient {
         }
     }
 
+    /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
+    pub fn upload_cloud_session_scan_chunk(
+        &self,
+        relay_token: &str,
+        scan_id: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        self.upload_cloud_session_scan_request(
+            relay_token,
+            &format!("/api/v1/cloud-sessions/scans/{scan_id}/chunks"),
+            request,
+            "cloud_session_scan_chunk",
+        )
+    }
+
+    /// Finalize an ordered v2 scan epoch after every chunk is acknowledged.
+    pub fn finalize_cloud_session_scan(
+        &self,
+        relay_token: &str,
+        scan_id: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        self.upload_cloud_session_scan_request(
+            relay_token,
+            &format!("/api/v1/cloud-sessions/scans/{scan_id}/finalize"),
+            request,
+            "cloud_session_scan_finalize",
+        )
+    }
+
+    fn upload_cloud_session_scan_request(
+        &self,
+        relay_token: &str,
+        path: &str,
+        request: &Value,
+        operation: &'static str,
+    ) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url(path))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse cloud-session scan response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
+                Err(anyhow::Error::new(CloudSessionContractRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "cloud-session scan upload",
+                    operation,
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "cloud-session scan upload",
+                operation,
+                &error,
+            ))),
+        }
+    }
+
     /// POST a per-day context-composition capture to the composition ingest
     /// endpoint. Auth is the same source-scoped relay token used for snapshot
     /// batches; the backend validates the relay principal and enforces the

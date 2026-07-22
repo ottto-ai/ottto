@@ -1,0 +1,43 @@
+# Cloud Session Bounded Scan Epochs
+
+Implemented the public Rust collector half of the cloud-session v2 bounded
+scan protocol while preserving hard-deferred public startup.
+
+## Contract
+
+- Active full scans live only in the long-lived collector process and continue
+  across five-minute cycles. Restart discards cursor/inventory state and starts
+  a new UUID from page zero.
+- Each cycle remains limited to ten provider pages and 45 seconds. A scan is
+  limited to 100 pages, 2,000 unique observations, and ten ordered chunks of at
+  most 200 observations.
+- Chunks contain positive observations only. Finalize is emitted only after a
+  terminal, non-truncated provider response. A one-response terminal result of
+  at most 20 entities is `single_response`; every multi-page result is
+  `unstable_cursor`, leaving absence authority entirely to the server.
+- Identity and inventory digests SHA-256 hash length-framed, lexically ordered
+  HMAC entity keys. Semantic digests hash canonical observations without
+  `observed_at`/`collected_at`. Epoch digests hash ordered chunk index, count,
+  identity digest, and semantic digest tuples.
+- Provider cursor/raw identity/title/URL/prompt/output/repository path never
+  reaches disk, wire, or logs. Exact response-loss retries preserve byte-for-
+  byte DTO identity.
+- Every provider page and upload revalidates local kill/pause/revoke state and
+  the exact backend grant/policy. Normal polls inspect one head page; unchanged
+  heads produce no observation upload, hourly v1 heartbeats remain available,
+  and full scans run daily and until completed.
+
+## Activation
+
+`spawn_cloud_session_collector` remains hard-wired to
+`DeferredCloudSessionTransport`. The v2 relay routes compile for contract
+testing only; this change cannot invoke Codex or a real provider at startup.
+
+## Validation
+
+Focused Rust tests cover 100x20 and 101x20 page bounds, deterministic digest
+vectors, duplicate collapse, cursor churn, restart, malformed/truncated/timeout
+paths, exact retry identity, head/hour/day cadence, grant controls, strict
+single-response marking, and deferred startup. Required closeout also runs
+formatting, Clippy with warnings denied, full cloud-session tests, connector
+tests, manifest validation, and public-surface checks.
