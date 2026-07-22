@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 248,
-  "content_sha256": "d8a1096257bd0f34034a11a39618776da5a8910800d28ae45abf8e90756ded39",
+  "content_sha256": "95f8884bad5bab404883055b7306080a62d14d435247b41b8307afde1710e352",
   "files": [
     {
       "executable": false,
@@ -258,8 +258,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/collectors/cloud_sessions/fixtures/minimal-evidence.json",
-      "sha256": "4d1aa326064c30f68ffbea1643e2177379c40185cfc05d971d6e7a9e1993d72a",
-      "size_bytes": 2713
+      "sha256": "198a1995c1c8b2758d120b65c9319a3ad2cd26161af8af5f01411a12a6ac4d86",
+      "size_bytes": 2878
     },
     {
       "executable": false,
@@ -433,8 +433,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/Cargo.lock",
-      "sha256": "cf06b78c1432acdd27575e9895bcd5b7e726cf72c690495235833f54eb99ce7e",
-      "size_bytes": 4839
+      "sha256": "ebe2b87b52c797461a49d001325f4f90a328105dc356d73e861968e6bf880a68",
+      "size_bytes": 7059
     },
     {
       "executable": false,
@@ -475,8 +475,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/Cargo.toml",
-      "sha256": "7b4db4ae0ff8f129aabd684dd4883455c3652858ab3740af8565fec43306b895",
-      "size_bytes": 409
+      "sha256": "b801f634c05c8b2852d33f1174c101aa5a3445f1207d598f6a6d11db112a0703",
+      "size_bytes": 423
     },
     {
       "executable": false,
@@ -489,8 +489,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-connector-testkit/tests/first_party_sources.rs",
-      "sha256": "0b70b4c163e65e1290d1c54bd70347b5b79e98eaa410f335b5cb0acd94979f67",
-      "size_bytes": 15353
+      "sha256": "7b36a4adcbaf369b1418d1ff9816a7301018772afae0a7e0c13d8879e24b843a",
+      "size_bytes": 19272
     },
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "75a5e03a5ec618086aa6b90942de733be046f79ac2831004ab372bf666c2bd70",
-      "size_bytes": 223749
+      "sha256": "4c5aa050cc0ccf871f9ffc9a4e0d1e1adb8f44cca45e123023493ec1e8a6a635",
+      "size_bytes": 243668
     },
     {
       "executable": false,
@@ -762,8 +762,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/net_resilience.rs",
-      "sha256": "bc0db5cacab40949ed8d64b2718b7ebec34a0e04b3a0ac485355891d4ecba650",
-      "size_bytes": 64675
+      "sha256": "0d88c95e752843c86e5b440e76dc850cd8d06a5463e29cdc6c38e71758851c48",
+      "size_bytes": 70227
     },
     {
       "executable": false,
@@ -790,8 +790,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "c242fdbbb791e760a9f8ec4e4d54817adc92305c3b93d1cbcd8b1c2fe1dac23f",
-      "size_bytes": 46150
+      "sha256": "3aabe4e1c3f40b81187bcda657ca7d4a00c9abf4ad211713c900a49ae71d0350",
+      "size_bytes": 51348
     },
     {
       "executable": false,
@@ -944,8 +944,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-22-cloud-session-scan-epochs.md",
-      "sha256": "cccc4e49a418845ac939c7e2e379a2ca1ca8739ad84aea4efd8f2bb10f5fcc7c",
-      "size_bytes": 2743
+      "sha256": "c6bc6b5855531f8c35696891d4b6680467f94ae6293d79c44726196c6e2399a9",
+      "size_bytes": 4063
     },
     {
       "executable": false,
@@ -1739,7 +1739,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T02:21:17+00:00",
+  "generated_at": "2026-07-22T02:58:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 249,
   "public_roots": [
@@ -1775,5 +1775,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e7c755a4097423735f47eed749bb8a9d884d4d39"
+  "source_commit": "a056b8174e16f286c65621ca41aa506d715fbb37"
 }

@@ -10,6 +10,7 @@ use ottto_connector_testkit::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const SOURCE_FIELDS: &[&str] = &[
     "schema_version",
@@ -285,6 +286,106 @@ fn assert_collector_fixture(
             )
         },
     );
+    if source.manifest.source_id == "codex" && collector.manifest.collector_id == "cloud_sessions"
+    {
+        assert_cloud_session_fixture_digests(fixture);
+    }
+}
+
+fn assert_cloud_session_fixture_digests(fixture: &LoadedFixture) {
+    for record in &fixture.payload.emitted_records {
+        let sample = &record.sample;
+        assert_eq!(
+            sample.get("schema_version").and_then(Value::as_str),
+            Some("cloud_session_observation_chunk.v2"),
+            "{} must carry the strict v2 chunk schema",
+            fixture.path.display()
+        );
+        for field in ["grant_scope_fingerprint", "account_fingerprint"] {
+            assert_prefixed_lower_hex(sample, field, "hmac-sha256:", 64, &fixture.path);
+        }
+        let observations = sample
+            .get("observations")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{} has no observations", fixture.path.display()));
+        assert!(!observations.is_empty(), "{} is empty", fixture.path.display());
+
+        let mut identity_keys = Vec::new();
+        let mut semantics = Vec::new();
+        for observation in observations {
+            let entity_key = observation
+                .get("entity_key")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{} has no entity_key", fixture.path.display()));
+            assert!(
+                valid_prefixed_lower_hex(entity_key, "hmac-sha256:", 64),
+                "{} has a noncanonical entity_key",
+                fixture.path.display()
+            );
+            identity_keys.push(entity_key.as_bytes().to_vec());
+            let mut semantic = observation.clone();
+            let object = semantic
+                .as_object_mut()
+                .expect("cloud-session fixture observation is an object");
+            object.remove("observed_at");
+            object.remove("collected_at");
+            semantics.push((entity_key.to_string(), semantic));
+        }
+        identity_keys.sort_unstable();
+        identity_keys.dedup();
+        let mut framed = Vec::new();
+        for key in identity_keys {
+            framed.extend_from_slice(&(key.len() as u64).to_be_bytes());
+            framed.extend_from_slice(&key);
+        }
+        let expected_identity = format!("sha256:{:x}", Sha256::digest(&framed));
+        assert_eq!(
+            sample.get("chunk_identity_digest").and_then(Value::as_str),
+            Some(expected_identity.as_str()),
+            "{} identity digest drifted from its observations",
+            fixture.path.display()
+        );
+
+        semantics.sort_by(|left, right| left.0.cmp(&right.0));
+        let canonical = semantics
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        let semantic_bytes = serde_json::to_vec(&canonical).unwrap();
+        let expected_semantic = format!("sha256:{:x}", Sha256::digest(&semantic_bytes));
+        assert_eq!(
+            sample.get("chunk_semantic_digest").and_then(Value::as_str),
+            Some(expected_semantic.as_str()),
+            "{} semantic digest drifted from its observations",
+            fixture.path.display()
+        );
+    }
+}
+
+fn assert_prefixed_lower_hex(
+    sample: &Value,
+    field: &str,
+    prefix: &str,
+    digits: usize,
+    path: &Path,
+) {
+    let value = sample
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{} has no {field}", path.display()));
+    assert!(
+        valid_prefixed_lower_hex(value, prefix, digits),
+        "{} has noncanonical {field}",
+        path.display()
+    );
+}
+
+fn valid_prefixed_lower_hex(value: &str, prefix: &str, digits: usize) -> bool {
+    value.len() == prefix.len() + digits
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn assert_safe_default_posture(collector: &LoadedCollector) {

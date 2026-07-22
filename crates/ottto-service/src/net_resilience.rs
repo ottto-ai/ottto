@@ -88,7 +88,9 @@ const SELF_RESTART_EVIDENCE_FRESHNESS: Duration = Duration::from_secs(15 * 60);
 pub(crate) const DNS_SELF_RESTART_ENV: &str = "OTTTO_DNS_SELF_RESTART";
 
 type PrimaryResolveFn = dyn Fn(&str) -> io::Result<Vec<SocketAddr>> + Send + Sync;
-type ProbeResolveFn = dyn Fn(&str) -> Option<Vec<IpAddr>> + Send + Sync;
+type ProbeResolveFn = dyn Fn(&str, Duration) -> Option<Vec<IpAddr>> + Send + Sync;
+const DNS_PROBE_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+static DEADLINE_DNS_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// A consecutive-failure streak with the anti-thrash rebuild stamping shared
 /// by both process-local outage ladders: the DNS resolution streak (#234,
@@ -223,6 +225,7 @@ pub(crate) struct FallbackDnsResolver {
     state: Arc<Mutex<DnsState>>,
     primary: Arc<PrimaryResolveFn>,
     probe: Arc<ProbeResolveFn>,
+    probe_timeout: Duration,
 }
 
 impl FallbackDnsResolver {
@@ -231,6 +234,7 @@ impl FallbackDnsResolver {
             state: shared_dns_state().clone(),
             primary: Arc::new(|netloc: &str| netloc.to_socket_addrs().map(|addrs| addrs.collect())),
             probe: Arc::new(out_of_process_resolve),
+            probe_timeout: DNS_PROBE_PROCESS_TIMEOUT,
         }
     }
 
@@ -242,7 +246,17 @@ impl FallbackDnsResolver {
         Self {
             state: Arc::new(Mutex::new(DnsState::default())),
             primary: Arc::new(primary),
-            probe: Arc::new(probe),
+            probe: Arc::new(move |host, _timeout| probe(host)),
+            probe_timeout: DNS_PROBE_PROCESS_TIMEOUT,
+        }
+    }
+
+    fn with_shared_state_timeout(timeout: Duration) -> Self {
+        Self {
+            state: shared_dns_state().clone(),
+            primary: Arc::new(|netloc: &str| netloc.to_socket_addrs().map(|addrs| addrs.collect())),
+            probe: Arc::new(out_of_process_resolve),
+            probe_timeout: timeout.min(DNS_PROBE_PROCESS_TIMEOUT),
         }
     }
 
@@ -268,7 +282,7 @@ impl FallbackDnsResolver {
 
         if state.should_attempt_probe(now) {
             if let Some((host, port)) = split_netloc(netloc) {
-                if let Some(addrs) = (self.probe)(host)
+                if let Some(addrs) = (self.probe)(host, self.probe_timeout)
                     .map(|ips| {
                         ips.into_iter()
                             .map(|ip| SocketAddr::new(ip, port))
@@ -312,6 +326,68 @@ impl FallbackDnsResolver {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DeadlineFallbackDnsResolver {
+    inner: FallbackDnsResolver,
+    timeout: Duration,
+}
+
+impl DeadlineFallbackDnsResolver {
+    #[cfg(test)]
+    fn with_hooks(
+        timeout: Duration,
+        primary: impl Fn(&str) -> io::Result<Vec<SocketAddr>> + Send + Sync + 'static,
+        probe: impl Fn(&str) -> Option<Vec<IpAddr>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: FallbackDnsResolver::with_hooks(primary, probe),
+            timeout,
+        }
+    }
+}
+
+impl ureq::Resolver for DeadlineFallbackDnsResolver {
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        if let Ok(literal) = netloc.parse::<SocketAddr>() {
+            return Ok(vec![literal]);
+        }
+        if self.timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "dns resolution deadline expired",
+            ));
+        }
+        if DEADLINE_DNS_WORKER_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "a prior deadline DNS resolution is still active",
+            ));
+        }
+        let resolver = self.inner.clone();
+        let netloc = netloc.to_string();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("ottto-deadline-dns".to_string())
+            .spawn(move || {
+                let result = resolver.resolve_at(&netloc, Instant::now());
+                DEADLINE_DNS_WORKER_ACTIVE.store(false, Ordering::Release);
+                let _ = sender.send(result);
+            });
+        if let Err(error) = worker {
+            DEADLINE_DNS_WORKER_ACTIVE.store(false, Ordering::Release);
+            return Err(io::Error::other(format!(
+                "cannot start deadline DNS worker: {error}"
+            )));
+        }
+        receiver.recv_timeout(self.timeout).map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "dns resolution deadline expired")
+        })?
+    }
+}
+
 impl ureq::Resolver for FallbackDnsResolver {
     fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
         self.resolve_at(netloc, Instant::now())
@@ -334,13 +410,15 @@ fn split_netloc(netloc: &str) -> Option<(&str, u16)> {
 /// is pinned/broken (the incident signature: other processes resolved fine).
 /// IPv4 addresses are ordered first. Returns `None` off macOS and on any
 /// probe failure — the caller falls through to the last-good cache.
-fn out_of_process_resolve(host: &str) -> Option<Vec<IpAddr>> {
+fn out_of_process_resolve(host: &str, timeout: Duration) -> Option<Vec<IpAddr>> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/usr/bin/dscacheutil")
-            .args(["-q", "host", "-a", "name", host])
-            .output()
-            .ok()?;
+        let output = bounded_command_output(
+            "/usr/bin/dscacheutil",
+            &["-q", "host", "-a", "name", host],
+            timeout,
+        )
+        .ok()??;
         if !output.status.success() {
             return None;
         }
@@ -370,8 +448,44 @@ fn out_of_process_resolve(host: &str) -> Option<Vec<IpAddr>> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = host;
+        let _ = (host, timeout);
         None
+    }
+}
+
+fn bounded_command_output(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Option<std::process::Output>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            return Ok(Some(std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -386,6 +500,13 @@ fn shared_dns_state() -> &'static Arc<Mutex<DnsState>> {
 /// benefits (and a failure on any path is evidence for) all of them.
 pub(crate) fn shared_fallback_resolver() -> FallbackDnsResolver {
     FallbackDnsResolver::with_shared_state()
+}
+
+pub(crate) fn deadline_fallback_resolver(timeout: Duration) -> DeadlineFallbackDnsResolver {
+    DeadlineFallbackDnsResolver {
+        inner: FallbackDnsResolver::with_shared_state_timeout(timeout),
+        timeout,
+    }
 }
 
 /// Process-wide transport-layer outage tracking for the shared upload agents.
@@ -971,6 +1092,40 @@ mod tests {
 
         assert_eq!(resolved, vec![addr(8080)]);
         assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn deadline_resolver_returns_before_a_blocked_primary_or_probe_can_escape_budget() {
+        let resolver = DeadlineFallbackDnsResolver::with_hooks(
+            Duration::from_millis(30),
+            |_| {
+                std::thread::sleep(Duration::from_secs(2));
+                Err(io::Error::other("late primary failure"))
+            },
+            |_| {
+                std::thread::sleep(Duration::from_secs(2));
+                None
+            },
+        );
+        let started = Instant::now();
+        let error = ureq::Resolver::resolve(&resolver, "deadline.test:443").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        let second_started = Instant::now();
+        let second_error = ureq::Resolver::resolve(&resolver, "second.test:443").unwrap_err();
+        assert_eq!(second_error.kind(), io::ErrorKind::TimedOut);
+        assert!(second_started.elapsed() < Duration::from_millis(30));
+    }
+
+    #[test]
+    fn dns_probe_subprocess_is_killed_at_its_deadline() {
+        let started = Instant::now();
+        let output =
+            bounded_command_output("/bin/sh", &["-c", "sleep 2"], Duration::from_millis(30))
+                .expect("spawn bounded test child");
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

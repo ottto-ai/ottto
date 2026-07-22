@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1030,6 +1030,29 @@ impl CloudSessionObservationBatchV1 {
         }
         Ok(())
     }
+
+    fn validate_relay_wire_contract(&self) -> Result<()> {
+        if self.batch_kind != CloudSessionBatchKind::Heartbeat
+            || self.snapshot_complete
+            || !self.observations.is_empty()
+            || !valid_v2_binding(
+                &self.grant_id,
+                self.grant_version,
+                &self.grant_scope_fingerprint,
+                &self.collector_id,
+                &self.collector_version,
+                &self.account_fingerprint,
+            )
+            || self.schema_version != COLLECTOR_VERSION
+            || !valid_rfc3339(&self.collected_at)
+            || !valid_v1_heartbeat_health(&self.health)
+        {
+            return Err(anyhow!(
+                "cloud-session v1 relay accepts only a strict empty heartbeat"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for CloudSessionObservationBatchV1 {
@@ -1109,6 +1132,12 @@ pub struct CloudSessionObservationChunkV2 {
 
 impl CloudSessionObservationChunkV2 {
     fn validate_wire_contract(&self) -> Result<()> {
+        let keys_are_strictly_ordered = self
+            .observations
+            .windows(2)
+            .all(|rows| rows[0].entity_key < rows[1].entity_key);
+        let expected_identity_digest = identity_digest(&self.observations);
+        let expected_semantic_digest = observation_semantic_digest(&self.observations)?;
         if !is_uuid(&self.scan_id)
             || !valid_v2_binding(
                 &self.grant_id,
@@ -1125,6 +1154,9 @@ impl CloudSessionObservationChunkV2 {
             || self.observations.len() > MAX_ITEMS
             || !valid_sha256_digest(&self.chunk_identity_digest)
             || !valid_sha256_digest(&self.chunk_semantic_digest)
+            || !keys_are_strictly_ordered
+            || self.chunk_identity_digest != expected_identity_digest
+            || self.chunk_semantic_digest != expected_semantic_digest
             || self
                 .observations
                 .iter()
@@ -1201,6 +1233,52 @@ impl CloudSessionScanFinalizeV2 {
         }
         Ok(())
     }
+
+    fn validate_against_chunks(&self, chunks: &[CloudSessionObservationChunkV2]) -> Result<()> {
+        self.validate_wire_contract()?;
+        if usize::from(self.chunk_count) != chunks.len()
+            || chunks
+                .iter()
+                .enumerate()
+                .any(|(index, chunk)| usize::from(chunk.chunk_index) != index)
+            || chunks.iter().any(|chunk| {
+                chunk.scan_id != self.scan_id
+                    || chunk.scan_started_at != self.scan_started_at
+                    || chunk.grant_id != self.grant_id
+                    || chunk.grant_version != self.grant_version
+                    || chunk.grant_scope_fingerprint != self.grant_scope_fingerprint
+                    || chunk.collector_id != self.collector_id
+                    || chunk.collector_version != self.collector_version
+                    || chunk.account_fingerprint != self.account_fingerprint
+                    || chunk.validate_wire_contract().is_err()
+            })
+        {
+            return Err(anyhow!(
+                "cloud-session finalize does not bind the acknowledged chunk sequence"
+            ));
+        }
+        let observations = chunks
+            .iter()
+            .flat_map(|chunk| chunk.observations.iter())
+            .collect::<Vec<_>>();
+        let unique_keys = observations
+            .iter()
+            .map(|observation| observation.entity_key.as_str())
+            .collect::<HashSet<_>>();
+        if unique_keys.len() != self.unique_entity_count as usize
+            || inventory_digest(
+                observations
+                    .iter()
+                    .map(|observation| &observation.entity_key),
+            ) != self.inventory_digest
+            || epoch_digest(chunks) != self.epoch_digest
+        {
+            return Err(anyhow!(
+                "cloud-session finalize digests do not bind the acknowledged inventory"
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn valid_v2_binding(
@@ -1268,6 +1346,14 @@ fn valid_v2_health(health: &CloudSessionCollectorHealthV1) -> bool {
         && matches!(
             (health.state.as_str(), health.error_category.as_deref()),
             ("healthy", None) | ("degraded", Some("provider_error"))
+        )
+}
+
+fn valid_v1_heartbeat_health(health: &CloudSessionCollectorHealthV1) -> bool {
+    valid_rfc3339(&health.observed_at)
+        && matches!(
+            (health.state.as_str(), health.error_category.as_deref()),
+            ("healthy", None) | ("failing", Some("provider_error"))
         )
 }
 
@@ -1406,10 +1492,12 @@ pub trait CloudSessionTransport {
     }
     fn revalidate_grant_bounded(
         &self,
-        grant: &CloudSessionGrant,
+        _grant: &CloudSessionGrant,
         _timeout: Duration,
     ) -> Result<CloudSessionBackendGrantResponseV1> {
-        self.revalidate_grant(grant)
+        Err(anyhow!(
+            "bounded cloud-session grant revalidation is not configured"
+        ))
     }
     fn send_scan_chunk(&self, _chunk: &CloudSessionObservationChunkV2) -> Result<()> {
         Err(anyhow!(
@@ -1471,6 +1559,7 @@ pub struct RelayCloudSessionTransport {
     device: LocalDeviceBinding,
     device_secret: String,
     relay_token: Mutex<Option<String>>,
+    acknowledged_chunks: Mutex<HashMap<String, Vec<CloudSessionObservationChunkV2>>>,
 }
 
 impl RelayCloudSessionTransport {
@@ -1484,7 +1573,49 @@ impl RelayCloudSessionTransport {
             device,
             device_secret,
             relay_token: Mutex::new(None),
+            acknowledged_chunks: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn record_acknowledged_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
+        let mut scans = self
+            .acknowledged_chunks
+            .lock()
+            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?;
+        // The collector owns one active scan. Drop an abandoned partial
+        // sequence when a later scan begins so truncated scans cannot grow
+        // this in-memory receipt ledger without bound.
+        scans.retain(|scan_id, _| scan_id == &chunk.scan_id);
+        let chunks = scans.entry(chunk.scan_id.clone()).or_default();
+        if usize::from(chunk.chunk_index) != chunks.len() {
+            return Err(anyhow!(
+                "cloud-session chunk acknowledgment is out of sequence"
+            ));
+        }
+        chunks.push(chunk.clone());
+        Ok(())
+    }
+
+    fn validate_finalize_sequence(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
+        let mut scans = self
+            .acknowledged_chunks
+            .lock()
+            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?;
+        scans.retain(|scan_id, _| scan_id == &finalize.scan_id);
+        finalize.validate_against_chunks(
+            scans
+                .get(&finalize.scan_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    }
+
+    fn clear_finalized_sequence(&self, scan_id: &str) -> Result<()> {
+        self.acknowledged_chunks
+            .lock()
+            .map_err(|_| anyhow!("cloud-session acknowledged-chunk lock is unavailable"))?
+            .remove(scan_id);
+        Ok(())
     }
 
     fn token(&self, force_refresh: bool, deadline: Instant) -> Result<String> {
@@ -1562,7 +1693,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         if !self.is_configured() {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
         }
-        batch.validate_wire_contract()?;
+        batch.validate_relay_wire_contract()?;
         let request = serde_json::to_value(batch)?;
         let deadline = Instant::now() + timeout;
         let token = self.token(false, deadline)?;
@@ -1607,7 +1738,8 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                 &request,
                 request_timeout,
             )
-        })
+        })?;
+        self.record_acknowledged_chunk(chunk)
     }
 
     fn finalize_scan(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
@@ -1619,7 +1751,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         finalize: &CloudSessionScanFinalizeV2,
         timeout: Duration,
     ) -> Result<()> {
-        finalize.validate_wire_contract()?;
+        self.validate_finalize_sequence(finalize)?;
         let request = serde_json::to_value(finalize)?;
         self.send_with_relay_retry(timeout, |client, token, request_timeout| {
             client.finalize_cloud_session_scan_with_timeout(
@@ -1628,7 +1760,8 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                 &request,
                 request_timeout,
             )
-        })
+        })?;
+        self.clear_finalized_sequence(&finalize.scan_id)
     }
 }
 
@@ -2381,10 +2514,12 @@ fn prepare_active_scan(
             epoch_digest,
             enumeration_consistency,
         };
-        finalize.validate_wire_contract().map_err(|_| CycleError {
-            category: "finalize_invalid",
-            health_uploaded: false,
-        })?;
+        finalize
+            .validate_against_chunks(&chunks)
+            .map_err(|_| CycleError {
+                category: "finalize_invalid",
+                health_uploaded: false,
+            })?;
         Some(finalize)
     } else {
         None
@@ -3381,6 +3516,14 @@ mod tests {
             ))
         }
 
+        fn revalidate_grant_bounded(
+            &self,
+            grant: &CloudSessionGrant,
+            _timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            self.revalidate_grant(grant)
+        }
+
         fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
             self.batches.borrow_mut().push(batch.clone());
@@ -3468,6 +3611,14 @@ mod tests {
                 .ok_or_else(|| anyhow!("backend unavailable"))
         }
 
+        fn revalidate_grant_bounded(
+            &self,
+            grant: &CloudSessionGrant,
+            _timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            self.revalidate_grant(grant)
+        }
+
         fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
             self.send_calls.set(self.send_calls.get() + 1);
             Ok(())
@@ -3517,6 +3668,14 @@ mod tests {
                 status,
                 if status == "revoked" { 2 } else { 1 },
             ))
+        }
+
+        fn revalidate_grant_bounded(
+            &self,
+            grant: &CloudSessionGrant,
+            _timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            self.revalidate_grant(grant)
         }
 
         fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
@@ -3612,6 +3771,14 @@ mod tests {
                     .map_or(1, |binding| binding.grant_version),
             ))
         }
+
+        fn revalidate_grant_bounded(
+            &self,
+            grant: &CloudSessionGrant,
+            _timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            self.revalidate_grant(grant)
+        }
         fn send_scan_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
             self.chunks.borrow_mut().push(chunk.clone());
             if self.fail_next_chunk.replace(false) {
@@ -3693,6 +3860,32 @@ mod tests {
         json!({"tasks":[{"id":id,"title":"private title","url":"https://example.invalid/private","account_id":"provider-account-private","status":"completed","created_at":"2026-07-21T11:00:00Z","attempt_count":2}], "next_cursor": cursor}).to_string()
     }
 
+    fn exact_scan_ack(request: &str) -> String {
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        if request.contains("/chunks HTTP/1.1") {
+            json!({
+                "schema_version": "cloud_session_scan_chunk_ack.v1",
+                "accepted": true,
+                "scan_id": body["scan_id"],
+                "chunk_index": body["chunk_index"],
+                "chunk_identity_digest": body["chunk_identity_digest"],
+                "chunk_semantic_digest": body["chunk_semantic_digest"],
+            })
+            .to_string()
+        } else {
+            json!({
+                "schema_version": "cloud_session_scan_finalize_ack.v1",
+                "accepted": true,
+                "scan_id": body["scan_id"],
+                "chunk_count": body["chunk_count"],
+                "unique_entity_count": body["unique_entity_count"],
+                "inventory_digest": body["inventory_digest"],
+                "epoch_digest": body["epoch_digest"],
+            })
+            .to_string()
+        }
+    }
+
     #[test]
     fn emitted_wire_is_content_free_and_opaque() {
         let parsed = parse_cloud_page(
@@ -3731,9 +3924,27 @@ mod tests {
         uppercase_key.observations[0].entity_key = format!("hmac-sha256:{}", "A".repeat(64));
         assert!(uppercase_key.validate_wire_contract().is_err());
 
+        let mut wrong_identity = chunk.clone();
+        wrong_identity.chunk_identity_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(wrong_identity.validate_wire_contract().is_err());
+
+        let mut wrong_semantics = chunk.clone();
+        wrong_semantics.chunk_semantic_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(wrong_semantics.validate_wire_contract().is_err());
+
         let mut open_lifecycle = chunk;
         open_lifecycle.observations[0].lifecycle = "provider_future_state".to_string();
         assert!(open_lifecycle.validate_wire_contract().is_err());
+
+        let chunks = transport.chunks.borrow().clone();
+        let finalize = transport.finalizes.borrow()[0].clone();
+        assert!(finalize.validate_against_chunks(&chunks).is_ok());
+        let mut wrong_inventory = finalize.clone();
+        wrong_inventory.inventory_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(wrong_inventory.validate_against_chunks(&chunks).is_err());
+        let mut wrong_epoch = finalize;
+        wrong_epoch.epoch_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(wrong_epoch.validate_against_chunks(&chunks).is_err());
     }
 
     #[test]
@@ -4336,6 +4547,45 @@ mod tests {
     }
 
     #[test]
+    fn bounded_revalidation_never_falls_back_to_an_unbounded_override() {
+        struct UnboundedOnlyTransport {
+            calls: Cell<usize>,
+        }
+        impl CloudSessionTransport for UnboundedOnlyTransport {
+            fn supports_grant_revalidation(&self) -> bool {
+                true
+            }
+            fn revalidate_grant(
+                &self,
+                grant: &CloudSessionGrant,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(backend_grant(grant, "enabled", 1))
+            }
+            fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (grants, checkpoints) = stores("bounded-revalidation-fail-closed");
+        enabled(&grants);
+        let runner = CursorRecordingPages::new(vec![page("must-not-run", None)]);
+        let transport = UnboundedOnlyTransport {
+            calls: Cell::new(0),
+        };
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Failed
+        );
+        assert_eq!(transport.calls.get(), 0);
+        assert!(runner.cursors.borrow().is_empty());
+        assert_eq!(
+            checkpoints.load().last_error_category.as_deref(),
+            Some("grant_revalidation_unavailable")
+        );
+    }
+
+    #[test]
     fn server_revocation_stops_provider_and_future_preflights() {
         let (grants, checkpoints) = stores("server-revocation");
         enabled(&grants);
@@ -4874,10 +5124,16 @@ mod tests {
         let (grants, _checkpoints) = stores("relay-transport");
         enabled(&grants);
         let grant = grants.load().unwrap().unwrap();
-        let observations = parse_cloud_page(&page("one", None), b"fixture-key", now())
-            .unwrap()
-            .entities;
-        let batch = snapshot_batch(&grant, observations, now(), true).unwrap();
+        let batch = heartbeat_batch(
+            &grant,
+            now(),
+            CloudSessionCollectorHealthV1 {
+                state: "healthy".to_string(),
+                observed_at: timestamp(now()),
+                error_category: None,
+            },
+        )
+        .unwrap();
         let transport = RelayCloudSessionTransport::new(
             format!("http://{address}"),
             LocalDeviceBinding {
@@ -4902,6 +5158,9 @@ mod tests {
             let body = request.split_once("\r\n\r\n").unwrap().1;
             let payload: Value = serde_json::from_str(body).unwrap();
             assert_eq!(payload["grant_version"], 1);
+            assert_eq!(payload["batch_kind"], "heartbeat");
+            assert_eq!(payload["snapshot_complete"], false);
+            assert_eq!(payload["observations"], json!([]));
             assert_eq!(payload["health"]["state"], "healthy");
             assert!(!request.contains("semantic_digest"));
             assert!(!request.contains("private title"));
@@ -4910,6 +5169,64 @@ mod tests {
         }
         assert!(requests[3].contains("Authorization: Bearer relay-cloud-new"));
         assert!(requests[4].contains("Authorization: Bearer relay-cloud-new"));
+    }
+
+    #[test]
+    fn v1_relay_rejects_non_heartbeat_payloads_before_network() {
+        use std::io::ErrorKind;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (grants, _checkpoints) = stores("v1-relay-local-rejection");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let heartbeat = heartbeat_batch(
+            &grant,
+            now(),
+            CloudSessionCollectorHealthV1 {
+                state: "healthy".to_string(),
+                observed_at: timestamp(now()),
+                error_category: None,
+            },
+        )
+        .unwrap();
+        let transport = RelayCloudSessionTransport::new(
+            format!("http://{address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            },
+            "device-secret".to_string(),
+        );
+
+        let mut invalid = Vec::new();
+        let mut snapshot = heartbeat.clone();
+        snapshot.batch_kind = CloudSessionBatchKind::Snapshot;
+        invalid.push(snapshot);
+        let mut complete = heartbeat.clone();
+        complete.snapshot_complete = true;
+        invalid.push(complete);
+        let mut nonempty = heartbeat.clone();
+        nonempty.observations = parse_cloud_page(&page("private-id", None), b"fixture-key", now())
+            .unwrap()
+            .entities;
+        invalid.push(nonempty.clone());
+        nonempty.observations[0].entity_key = "raw-private-id".to_string();
+        invalid.push(nonempty);
+        let mut raw_scope = heartbeat.clone();
+        raw_scope.grant_scope_fingerprint = "raw-scope".to_string();
+        invalid.push(raw_scope);
+        let mut open_health = heartbeat;
+        open_health.health.state = "degraded".to_string();
+        invalid.push(open_health);
+
+        for payload in invalid {
+            assert!(transport.send(&payload).is_err());
+        }
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     }
 
     #[test]
@@ -4969,15 +5286,25 @@ mod tests {
                         }
                     }
                 }
+                let captured_request = String::from_utf8_lossy(&request).to_string();
                 server_captured
                     .lock()
                     .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
+                    .push(captured_request.clone());
                 let (status, body) = match index {
-                    0 => ("200 OK", r#"{"token":"relay-v2-old"}"#),
-                    1 => ("401 Unauthorized", r#"{"detail":"expired"}"#),
-                    2 => ("200 OK", r#"{"token":"relay-v2-new"}"#),
-                    _ => ("200 OK", r#"{"accepted":true}"#),
+                    0 => (
+                        "200 OK".to_string(),
+                        r#"{"token":"relay-v2-old"}"#.to_string(),
+                    ),
+                    1 => (
+                        "401 Unauthorized".to_string(),
+                        r#"{"detail":"expired"}"#.to_string(),
+                    ),
+                    2 => (
+                        "200 OK".to_string(),
+                        r#"{"token":"relay-v2-new"}"#.to_string(),
+                    ),
+                    _ => ("200 OK".to_string(), exact_scan_ack(&captured_request)),
                 };
                 write!(
                     stream,
@@ -5029,6 +5356,183 @@ mod tests {
         assert_eq!(finalize_payload["scan_id"], finalize.scan_id);
         assert!(!finalize_body.contains("raw-provider-private-id"));
         assert!(!finalize_body.contains("cursor"));
+    }
+
+    #[test]
+    fn v2_receipts_must_exactly_acknowledge_before_progress_or_completion() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        struct RevalidatingRelay {
+            relay: RelayCloudSessionTransport,
+            grant: CloudSessionBackendGrantResponseV1,
+        }
+        impl CloudSessionTransport for RevalidatingRelay {
+            fn supports_grant_revalidation(&self) -> bool {
+                true
+            }
+            fn revalidate_grant(
+                &self,
+                _grant: &CloudSessionGrant,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                Ok(self.grant.clone())
+            }
+            fn revalidate_grant_bounded(
+                &self,
+                grant: &CloudSessionGrant,
+                _timeout: Duration,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                self.revalidate_grant(grant)
+            }
+            fn send_scan_chunk(&self, chunk: &CloudSessionObservationChunkV2) -> Result<()> {
+                self.relay.send_scan_chunk(chunk)
+            }
+            fn send_scan_chunk_bounded(
+                &self,
+                chunk: &CloudSessionObservationChunkV2,
+                timeout: Duration,
+            ) -> Result<()> {
+                self.relay.send_scan_chunk_bounded(chunk, timeout)
+            }
+            fn finalize_scan(&self, finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
+                self.relay.finalize_scan(finalize)
+            }
+            fn finalize_scan_bounded(
+                &self,
+                finalize: &CloudSessionScanFinalizeV2,
+                timeout: Duration,
+            ) -> Result<()> {
+                self.relay.finalize_scan_bounded(finalize, timeout)
+            }
+            fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
+                self.relay.send(batch)
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|offset| offset + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        if request.len() >= header_end + content_length.unwrap_or(0) {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let body = if index == 0 {
+                    r#"{"token":"relay-v2"}"#.to_string()
+                } else {
+                    let mut ack: Value = serde_json::from_str(&exact_scan_ack(&request)).unwrap();
+                    if index == 1 {
+                        ack["accepted"] = json!(false);
+                    } else if index == 3 {
+                        ack["epoch_digest"] = json!(format!("sha256:{}", "0".repeat(64)));
+                    }
+                    ack.to_string()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let (grants, checkpoints) = stores("v2-strict-receipts");
+        enabled(&grants);
+        let current = grants.load().unwrap().unwrap();
+        let transport = RevalidatingRelay {
+            grant: backend_grant(&current, "enabled", 1),
+            relay: RelayCloudSessionTransport::new(
+                format!("http://{address}"),
+                LocalDeviceBinding {
+                    device_id: INSTALLATION_ID.to_string(),
+                    machine_id: None,
+                    sources: vec!["codex".to_string()],
+                },
+                "device-secret".to_string(),
+            ),
+        };
+        let runner = CursorRecordingPages::new(vec![page("strict-receipt", None)]);
+
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Failed
+        );
+        {
+            let runtime = checkpoints.runtime.lock().unwrap();
+            assert_eq!(
+                runtime
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .prepared
+                    .as_ref()
+                    .unwrap()
+                    .next_chunk,
+                0
+            );
+        }
+        assert!(checkpoints.load().last_complete_snapshot_at.is_none());
+
+        let unused_runner = CursorRecordingPages::new(Vec::new());
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &unused_runner,
+                &transport,
+                now() + TimeDuration::minutes(3),
+            ),
+            CloudSessionCycleOutcome::Failed
+        );
+        {
+            let runtime = checkpoints.runtime.lock().unwrap();
+            let prepared = runtime.active.as_ref().unwrap().prepared.as_ref().unwrap();
+            assert_eq!(prepared.next_chunk, 1);
+            assert!(prepared.finalize.is_some());
+        }
+        assert!(checkpoints.load().last_complete_snapshot_at.is_none());
+
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &unused_runner,
+                &transport,
+                now() + TimeDuration::minutes(8),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert!(checkpoints.load().last_complete_snapshot_at.is_some());
+        assert!(checkpoints.runtime.lock().unwrap().active.is_none());
+        assert!(unused_runner.cursors.borrow().is_empty());
+        server.join().unwrap();
     }
 
     #[test]
