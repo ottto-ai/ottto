@@ -32,10 +32,9 @@ pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
 pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
-// Parser versions bumped together with the schema cutover so the on-disk scan
-// index treats every previously-scanned file as fresh and re-emits at the v6
-// shape; pending-backfill tracking re-runs the retroactive walk for the same
-// reason.
+// Parser versions describe parser provenance only. They MUST NOT be reused as
+// incremental-scan identity or historical replay policy: a parser build bump
+// is not proof that every historical session changed semantically.
 // v16: the Codex state-only fallback now treats a session whose rollout was
 // parsed in ANY prior scan run (tracked in the persisted scan index) as
 // covered, instead of only sessions parsed in the current run. The version
@@ -112,6 +111,16 @@ pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v22";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v19";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 
+// Frozen scan-identity versions. They intentionally begin at the versions used
+// by the 0.1.91 baseline so upgrading to semantic sync does not itself select
+// every indexed transcript. Advance only for a reviewed scan-index derivation
+// change, never for ordinary parser implementation work.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v22";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v19";
+pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
+const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
+const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
+
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
 /// context)" window enabled — the regular Claude context cap is 200K tokens.
@@ -180,6 +189,14 @@ impl SnapshotSource {
             SnapshotSource::Codex => CODEX_SNAPSHOT_PARSER_VERSION,
             SnapshotSource::ClaudeCode => CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
             SnapshotSource::Pi => PI_SNAPSHOT_PARSER_VERSION,
+        }
+    }
+
+    pub fn scan_identity_version(self) -> &'static str {
+        match self {
+            SnapshotSource::Codex => CODEX_SCAN_IDENTITY_VERSION,
+            SnapshotSource::ClaudeCode => CLAUDE_CODE_SCAN_IDENTITY_VERSION,
+            SnapshotSource::Pi => PI_SCAN_IDENTITY_VERSION,
         }
     }
 
@@ -493,8 +510,15 @@ pub struct ScanIndex {
 pub struct ScanIndexEntry {
     pub size_bytes: u64,
     pub modified_unix_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_nanos: Option<u64>,
     pub source_file_fingerprint: String,
     pub last_snapshot_fingerprint: Option<String>,
+    /// Marks entries written by the semantic-sync scan derivation. `None`
+    /// identifies a pre-cutover entry that can be adopted without reparsing
+    /// when transcript size and mtime are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_identity_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +531,7 @@ pub struct SourceScanResult {
     pub scan_cap_hit: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
+    pub semantic_noop_count: usize,
     pub snapshots: Vec<SnapshotItem>,
 }
 
@@ -804,75 +829,165 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
         .collect();
 }
 
-fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
-    let mut fingerprint_payload = json!({
-        "source": source.api_slug(),
-        "source_session_id": &item.source_session_id,
-        "input_tokens": item.input_tokens,
-        "output_tokens": item.output_tokens,
-        "cache_read_tokens": item.cache_read_tokens,
-        "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
-        "cache_creation_1h_tokens": item.cache_creation_1h_tokens,
-        "reasoning_output_tokens": item.reasoning_output_tokens,
-        "unattributed_total_tokens": item.unattributed_total_tokens,
-        "request_count": item.request_count,
-        "model_usage": &item.model_usage,
-        "usage_buckets": &item.usage_buckets,
-        "title": &item.session_display_name,
-        "title_source": &item.session_display_name_source,
-        "workspace_display_label": &item.workspace_display_label,
-        "workspace_label_source": &item.workspace_label_source,
-        "repository_hash": &item.repository_hash,
-        "repository_label": &item.repository_label,
-        "repository_label_source": &item.repository_label_source,
-        "repository_identity_source": &item.repository_identity_source,
-        "workspace_kind": &item.workspace_kind,
-        "session_artifacts": &item.session_artifacts,
-        // Including origin makes a one-time re-upload happen when the collector
-        // starts forwarding it, so the backend can re-derive the initiator for
-        // already-uploaded sessions (otherwise the fingerprint is unchanged and
-        // the snapshot is never re-sent).
-        //
-        // The top-level `originator` is deliberately NOT fingerprinted: it is a
-        // pure Codex-only mirror of `origin.originator`, which is already hashed
-        // above, and the backend falls back to `origin.originator` when the
-        // top-level field is absent. Hashing it too would only re-churn every
-        // Codex fingerprint for a re-upload that carries no new data.
-        "origin": &item.origin,
-    });
-    // Same one-time re-upload rationale as `origin`, scoped to the sources that
-    // actually derive posture. Including a source here is what makes its
-    // already-uploaded sessions re-send once with the new fields; Pi derives
-    // nothing, so adding null posture keys there would churn every Pi
-    // fingerprint for an unrelated re-upload burst that carries no new data.
+fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
+    let mut facts = item
+        .attribution_facts
+        .iter()
+        .map(|fact| {
+            json!({
+                "field": &fact.field,
+                "value": &fact.value,
+                "display_label": &fact.display_label,
+                "display_label_source": &fact.display_label_source,
+                "evidence_kind": &fact.evidence.kind,
+                "evidence_strength": &fact.evidence.strength,
+            })
+        })
+        .collect::<Vec<_>>();
+    facts.sort_by_key(Value::to_string);
+    facts
+}
+
+fn semantic_model_usage(row: &SnapshotModelUsage) -> Value {
+    json!({
+        "model": &row.model,
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "cache_read_tokens": row.cache_read_tokens,
+        "cache_creation_5m_tokens": row.cache_creation_5m_tokens,
+        "cache_creation_1h_tokens": row.cache_creation_1h_tokens,
+        "reasoning_output_tokens": row.reasoning_output_tokens,
+        "reasoning_effort": &row.reasoning_effort,
+        "unattributed_total_tokens": row.unattributed_total_tokens,
+        "request_count": row.request_count,
+        "selector_context": &row.selector_context,
+        "selector_sources": &row.selector_sources,
+        "auth_mode": &row.auth_mode,
+        "billing_channel": &row.billing_channel,
+        "billing_provider": &row.billing_provider,
+        "gateway_provider": &row.gateway_provider,
+        "model_provider": &row.model_provider,
+        "subscription_product": &row.subscription_product,
+        "cost_usd": &row.cost_usd,
+        "input_cost_usd": &row.input_cost_usd,
+        "output_cost_usd": &row.output_cost_usd,
+        "cache_read_cost_usd": &row.cache_read_cost_usd,
+        "cache_creation_cost_usd": &row.cache_creation_cost_usd,
+    })
+}
+
+fn semantic_usage_buckets(item: &SnapshotItem) -> Vec<Value> {
+    item.usage_buckets
+        .iter()
+        .map(|bucket| {
+            json!({
+                "bucket_start": &bucket.bucket_start,
+                "model_usage": bucket.model_usage.iter().map(semantic_model_usage).collect::<Vec<_>>(),
+                "first_activity_at": &bucket.first_activity_at,
+                "last_activity_at": &bucket.last_activity_at,
+            })
+        })
+        .collect()
+}
+
+fn snapshot_semantic_component_hashes(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+) -> BTreeMap<&'static str, String> {
+    let mut components = BTreeMap::new();
+    let mut insert = |name: &'static str, payload: Value| {
+        components.insert(name, sha256_hex(&[&payload.to_string()]));
+    };
+
+    insert(
+        "usage_accounting",
+        json!({
+            "input_tokens": item.input_tokens,
+            "output_tokens": item.output_tokens,
+            "cache_read_tokens": item.cache_read_tokens,
+            "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
+            "cache_creation_1h_tokens": item.cache_creation_1h_tokens,
+            "reasoning_output_tokens": item.reasoning_output_tokens,
+            "unattributed_total_tokens": item.unattributed_total_tokens,
+            "request_count": item.request_count,
+            "model_usage": item.model_usage.iter().map(semantic_model_usage).collect::<Vec<_>>(),
+            "usage_buckets": semantic_usage_buckets(item),
+            "cost": item.cost.as_ref().map(|cost| json!({
+                "total_cost_usd": &cost.total_cost_usd,
+                "input_cost_usd": &cost.input_cost_usd,
+                "output_cost_usd": &cost.output_cost_usd,
+                "cache_read_cost_usd": &cost.cache_read_cost_usd,
+                "cache_creation_cost_usd": &cost.cache_creation_cost_usd,
+            })),
+        }),
+    );
+    insert(
+        "lifecycle_activity",
+        json!({
+            "status": &item.status,
+            "source_started_at": &item.source_started_at,
+            "source_ended_at": &item.source_ended_at,
+            "source_last_activity_at": &item.source_last_activity_at,
+            "state_total_tokens": item.provenance.state_total_tokens,
+            "state_archived": item.provenance.state_archived,
+        }),
+    );
+    insert(
+        "latency",
+        json!({
+            "avg_duration_ms": item.avg_duration_ms,
+            "avg_time_to_first_token_ms": item.avg_time_to_first_token_ms,
+            "max_duration_ms": item.max_duration_ms,
+            "max_time_to_first_token_ms": item.max_time_to_first_token_ms,
+        }),
+    );
     if source.derives_context_posture() {
-        let payload = fingerprint_payload
-            .as_object_mut()
-            .expect("snapshot fingerprint payload is an object");
-        payload.insert(
-            "peak_context_fill_tokens".to_string(),
-            json!(item.peak_context_fill_tokens),
-        );
-        payload.insert(
-            "first_turn_context_tokens".to_string(),
-            json!(item.first_turn_context_tokens),
-        );
-        payload.insert("compaction_count".to_string(), json!(item.compaction_count));
-        payload.insert(
-            "compaction_timestamps".to_string(),
-            json!(item.compaction_timestamps),
+        insert(
+            "context_posture",
+            json!({
+                "peak_context_fill_tokens": item.peak_context_fill_tokens,
+                "first_turn_context_tokens": item.first_turn_context_tokens,
+                "compaction_count": item.compaction_count,
+                "compaction_timestamps": &item.compaction_timestamps,
+            }),
         );
     }
-    if !item.attribution_facts.is_empty() {
-        fingerprint_payload
-            .as_object_mut()
-            .expect("snapshot fingerprint payload is an object")
-            .insert(
-                "attribution_facts".to_string(),
-                json!(item.attribution_facts),
-            );
-    }
-    sha256_hex(&[&fingerprint_payload.to_string()])
+    insert(
+        "display_identity",
+        json!({
+            "title": &item.session_display_name,
+            "title_source": &item.session_display_name_source,
+            "workspace_hash": &item.workspace_hash,
+            "workspace_display_label": &item.workspace_display_label,
+            "workspace_label_source": &item.workspace_label_source,
+            "repository_hash": &item.repository_hash,
+            "repository_label": &item.repository_label,
+            "repository_label_source": &item.repository_label_source,
+            "repository_identity_source": &item.repository_identity_source,
+            "workspace_kind": &item.workspace_kind,
+        }),
+    );
+    insert(
+        "attribution",
+        json!({
+            "origin": &item.origin,
+            "facts": semantic_attribution_facts(item),
+        }),
+    );
+    insert("artifacts", json!(&item.session_artifacts));
+    components
+}
+
+fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
+    let component_hashes = snapshot_semantic_component_hashes(source, item);
+    let component_payload = serde_json::to_string(&component_hashes)
+        .expect("snapshot semantic component hashes serialize");
+    sha256_hex(&[
+        SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+        source.api_slug(),
+        &item.source_session_id,
+        &component_payload,
+    ])
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1235,8 +1350,11 @@ impl SelectorCapture {
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
-    sidecar_fingerprint: String,
-    default_selector: SelectorCapture,
+    legacy_sidecar_fingerprint: String,
+    /// The old index retained only config file stats, not content or affected
+    /// session ids. Presence therefore requires one conservative corrective
+    /// reconciliation; absence plus a matching legacy identity is provable.
+    legacy_config_file_present: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1273,15 +1391,12 @@ struct CodexStateThread {
 /// upload stays governed by the org/user `session_titles_enabled` policy via
 /// `apply_upload_policy`, exactly like Codex titles.
 ///
-/// `sidecar_fingerprint` is derived from the extracted title CONTENT (not file
-/// stats): the store files are rewritten on every session activity, so a stat
-/// fingerprint would churn every cycle and force full re-parses; the content
-/// fingerprint changes only when a title actually appears or changes, which is
-/// exactly when unchanged transcripts must re-emit.
+/// Candidate identity is derived per session from extracted title content (not
+/// file stats): rewriting one store file can select only its matching session.
 #[derive(Debug, Clone, Default)]
 struct ClaudeTitleMetadata {
     titles: BTreeMap<String, ClaudeTitleCandidate>,
-    sidecar_fingerprint: String,
+    legacy_sidecar_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1300,6 +1415,18 @@ const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 
 impl ClaudeTitleMetadata {
+    fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
+        let candidate = self.titles.get(source_session_id);
+        sha256_hex(&[
+            "claude_session_sidecar:v1",
+            source_session_id,
+            candidate.map(|value| value.title.as_str()).unwrap_or(""),
+            candidate
+                .map(|value| if value.user_set { "user" } else { "auto" })
+                .unwrap_or(""),
+        ])
+    }
+
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut store_dirs = BTreeSet::new();
         for root in roots {
@@ -1329,12 +1456,12 @@ impl ClaudeTitleMetadata {
         for path in &session_files {
             load_claude_desktop_session_title(path, &mut metadata.titles);
         }
-        let sidecar_parts: Vec<String> = metadata
+        let sidecar_parts = metadata
             .titles
             .iter()
             .map(|(id, candidate)| format!("{id}:{}:{}", candidate.user_set, candidate.title))
-            .collect();
-        metadata.sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
+            .collect::<Vec<_>>();
+        metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
         metadata
     }
 }
@@ -1705,15 +1832,6 @@ impl SnapshotAccumulator {
                 self.artifacts.push(artifact);
             }
         }
-    }
-
-    fn with_default_selector(source: SnapshotSource, selector: SelectorCapture) -> Self {
-        let mut accumulator = Self::new(source);
-        // Default selector (e.g. Codex config defaults) feeds the running
-        // display context for usage rows. Row keys are derived per-line
-        // from the merged selector at usage time.
-        accumulator.current_selector = selector;
-        accumulator
     }
 
     fn note_time(&mut self, timestamp: Option<String>) {
@@ -2501,15 +2619,6 @@ fn scan_source_roots_with_limit_and_attribution(
     } else {
         ClaudeTitleMetadata::default()
     };
-    // The per-source sidecar fingerprint rides inside every candidate-file
-    // fingerprint so an unchanged transcript still re-parses when its sidecar
-    // title state changes (Codex: config/state/index files; Claude: desktop
-    // store title content).
-    let sidecar_fingerprint = match source {
-        SnapshotSource::Codex => codex_title_metadata.sidecar_fingerprint.as_str(),
-        SnapshotSource::ClaudeCode => claude_title_metadata.sidecar_fingerprint.as_str(),
-        SnapshotSource::Pi => "",
-    };
     // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
     // it read-only across every session file via Arc. Skipped when the local
     // opt-out is set.
@@ -2522,13 +2631,58 @@ fn scan_source_roots_with_limit_and_attribution(
         });
     let mut files = Vec::new();
     for root in roots {
-        collect_recent_jsonl_files(
-            source,
-            root,
-            &mut files,
-            sidecar_fingerprint,
-            backfill_window_days,
-        )?;
+        collect_recent_jsonl_files(source, root, &mut files, backfill_window_days)?;
+    }
+    for candidate in &mut files {
+        let legacy_sidecar_fingerprint = match source {
+            SnapshotSource::Codex => codex_title_metadata.legacy_sidecar_fingerprint.as_str(),
+            SnapshotSource::ClaudeCode => claude_title_metadata.legacy_sidecar_fingerprint.as_str(),
+            SnapshotSource::Pi => "",
+        };
+        candidate.legacy_source_file_fingerprint = source_file_fingerprint_with_context(
+            &candidate.path,
+            candidate.size_bytes,
+            candidate.modified_unix_seconds,
+            source.parser_version(),
+            legacy_sidecar_fingerprint,
+        );
+        candidate.legacy_config_reconciliation_required =
+            source == SnapshotSource::Codex && codex_title_metadata.legacy_config_file_present;
+        let sidecar_fingerprint = match source {
+            SnapshotSource::Codex => codex_session_id_from_path(&candidate.path)
+                .map(|session_id| {
+                    codex_title_metadata.session_sidecar_fingerprint(session_id.as_str())
+                })
+                .unwrap_or_default(),
+            SnapshotSource::ClaudeCode => {
+                let is_subagent = candidate
+                    .path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    == Some("subagents");
+                if is_subagent {
+                    String::new()
+                } else {
+                    candidate
+                        .path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .map(|session_id| {
+                            claude_title_metadata.session_sidecar_fingerprint(session_id)
+                        })
+                        .unwrap_or_default()
+                }
+            }
+            SnapshotSource::Pi => String::new(),
+        };
+        candidate.source_file_fingerprint = scan_file_fingerprint_with_context(
+            &candidate.path,
+            candidate.size_bytes,
+            candidate.modified_unix_nanos,
+            source.scan_identity_version(),
+            &sidecar_fingerprint,
+        );
     }
     let discovered_file_count = files.len();
     let skipped_file_count_due_to_limit = discovered_file_count.saturating_sub(file_limit);
@@ -2537,11 +2691,20 @@ fn scan_source_roots_with_limit_and_attribution(
 
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
+    let mut scanned_session_count = 0;
+    let mut semantic_noop_count = 0;
     for candidate in files {
-        if !index.should_process(&candidate) {
-            continue;
+        let decision = index.candidate_decision(&candidate);
+        match decision {
+            CandidateDecision::Skip => continue,
+            CandidateDecision::Migrate => {
+                index.migrate(candidate);
+                continue;
+            }
+            CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
         }
         scanned_file_count += 1;
+        let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
         let mut parsed = match source {
             SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata_and_attribution(
@@ -2574,21 +2737,37 @@ fn scan_source_roots_with_limit_and_attribution(
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
             }
         }
+        scanned_session_count += parsed.len();
         let last_snapshot_fingerprint = parsed
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
+        let is_semantic_noop = if decision == CandidateDecision::ReconcileLegacy {
+            // The legacy index cannot prove which rows inherited mutable config
+            // defaults. Emit the current provider-native snapshot once; after
+            // the index advances, config can never select history again.
+            false
+        } else {
+            last_snapshot_fingerprint.is_some()
+                && last_snapshot_fingerprint == previous_snapshot_fingerprint
+        };
         if source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some() {
             index.record(candidate, last_snapshot_fingerprint);
         }
-        snapshots.extend(parsed);
+        if is_semantic_noop {
+            semantic_noop_count += parsed.len();
+        } else {
+            snapshots.extend(parsed);
+        }
     }
     if source == SnapshotSource::Codex {
+        let before_state_only = snapshots.len();
         append_codex_state_only_snapshots(
             &mut snapshots,
             &codex_title_metadata,
             collected_at,
             index,
         );
+        scanned_session_count += snapshots.len().saturating_sub(before_state_only);
     }
     Ok(SourceScanResult {
         source,
@@ -2598,7 +2777,8 @@ fn scan_source_roots_with_limit_and_attribution(
         skipped_file_count_due_to_limit,
         scan_cap_hit: skipped_file_count_due_to_limit > 0,
         scanned_file_count,
-        scanned_session_count: snapshots.len(),
+        scanned_session_count,
+        semantic_noop_count,
         snapshots,
     })
 }
@@ -2943,11 +3123,11 @@ fn parse_jsonl_file(
 ) -> Result<Vec<SnapshotItem>> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut accumulator = if let Some(metadata) = codex_title_metadata {
-        SnapshotAccumulator::with_default_selector(source, metadata.default_selector.clone())
-    } else {
-        SnapshotAccumulator::new(source)
-    };
+    // Snapshot semantics come from provider-native session evidence. Mutable
+    // current config defaults are useful for live status display, but applying
+    // today's defaults to cumulative historical usage would retroactively
+    // rewrite old sessions and make a config edit a global replay trigger.
+    let mut accumulator = SnapshotAccumulator::new(source);
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
     read_bounded_jsonl_lines(reader, MAX_JSONL_LINE_BYTES, |value| {
@@ -4553,13 +4733,46 @@ struct CandidateFile {
     path: PathBuf,
     size_bytes: u64,
     modified_unix_seconds: u64,
+    modified_unix_nanos: u64,
     source_file_fingerprint: String,
+    legacy_source_file_fingerprint: String,
+    legacy_config_reconciliation_required: bool,
 }
 
 impl CodexTitleMetadata {
+    fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
+        let title = self.titles.get(source_session_id);
+        let thread = self.state_threads.get(source_session_id);
+        sha256_hex(&[
+            "codex_session_sidecar:v1",
+            source_session_id,
+            title.map(|value| value.title.as_str()).unwrap_or(""),
+            title.map(|value| value.source.as_str()).unwrap_or(""),
+            thread
+                .and_then(|value| value.title.as_deref())
+                .unwrap_or(""),
+            &thread
+                .map(|value| value.tokens_used)
+                .unwrap_or_default()
+                .to_string(),
+            thread
+                .map(|value| if value.archived { "archived" } else { "active" })
+                .unwrap_or(""),
+            thread
+                .and_then(|value| value.created_at.as_deref())
+                .unwrap_or(""),
+            thread
+                .and_then(|value| value.updated_at.as_deref())
+                .unwrap_or(""),
+            thread
+                .and_then(|value| value.model.as_deref())
+                .unwrap_or(""),
+        ])
+    }
+
     fn load_from_roots(roots: &[PathBuf]) -> Self {
         let mut metadata = Self::default();
-        let mut sidecar_parts = Vec::new();
+        let mut legacy_sidecar_parts = Vec::new();
         let mut codex_dirs = BTreeSet::new();
         for root in roots {
             if let Some(parent) = root.parent() {
@@ -4569,22 +4782,19 @@ impl CodexTitleMetadata {
 
         for codex_dir in codex_dirs {
             let config_path = codex_dir.join("config.toml");
-            sidecar_parts.push(sidecar_stat_fingerprint(&config_path));
-            metadata
-                .default_selector
-                .merge(load_codex_config_selector(&config_path));
+            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&config_path));
+            metadata.legacy_config_file_present |= config_path.is_file();
 
             let state_path = codex_dir.join("state_5.sqlite");
-            sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
+            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
             load_codex_sqlite_titles(&state_path, &mut metadata.titles);
             load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
 
             let index_path = codex_dir.join("session_index.jsonl");
-            sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
+            legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
             load_codex_session_index_titles(&index_path, &mut metadata.titles);
         }
-
-        metadata.sidecar_fingerprint = sha256_hex_owned(&sidecar_parts);
+        metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&legacy_sidecar_parts);
         metadata
     }
 }
@@ -5072,6 +5282,9 @@ fn insert_codex_sidecar_title(
     );
 }
 
+// Pre-semantic-sync indexes embedded one source-wide sidecar stat digest in
+// every file fingerprint. Retain this derivation only to prove whether a legacy
+// entry can be migrated without parsing; new entries never use it.
 fn sidecar_stat_fingerprint(path: &Path) -> String {
     match fs::metadata(path) {
         Ok(metadata) => {
@@ -5095,7 +5308,6 @@ fn collect_recent_jsonl_files(
     source: SnapshotSource,
     root: &Path,
     files: &mut Vec<CandidateFile>,
-    source_fingerprint_context: &str,
     backfill_window_days: u64,
 ) -> Result<()> {
     if !root.exists() {
@@ -5109,13 +5321,7 @@ fn collect_recent_jsonl_files(
             Err(_) => continue,
         };
         if metadata.is_dir() {
-            collect_recent_jsonl_files(
-                source,
-                &path,
-                files,
-                source_fingerprint_context,
-                backfill_window_days,
-            )?;
+            collect_recent_jsonl_files(source, &path, files, backfill_window_days)?;
             continue;
         }
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
@@ -5126,6 +5332,11 @@ fn collect_recent_jsonl_files(
             .ok()
             .and_then(unix_seconds)
             .unwrap_or_default();
+        let modified_unix_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(unix_nanos)
+            .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
         if !is_recent_enough(modified_unix_seconds, backfill_window_days) {
             continue;
         }
@@ -5137,16 +5348,19 @@ fn collect_recent_jsonl_files(
             continue;
         }
         files.push(CandidateFile {
-            source_file_fingerprint: source_file_fingerprint_with_context(
+            source_file_fingerprint: scan_file_fingerprint_with_context(
                 &path,
                 metadata.len(),
-                modified_unix_seconds,
-                source.parser_version(),
-                source_fingerprint_context,
+                modified_unix_nanos,
+                source.scan_identity_version(),
+                "",
             ),
             path,
             size_bytes: metadata.len(),
             modified_unix_seconds,
+            modified_unix_nanos,
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
         });
     }
     Ok(())
@@ -5184,6 +5398,21 @@ fn unix_seconds(value: SystemTime) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
+}
+
+fn unix_nanos(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateDecision {
+    Skip,
+    Migrate,
+    ReconcileLegacy,
+    Parse,
 }
 
 impl ScanIndex {
@@ -5229,13 +5458,67 @@ impl ScanIndex {
             .with_context(|| format!("replace scan index {}", path.display()))
     }
 
-    fn should_process(&self, candidate: &CandidateFile) -> bool {
+    fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
-        self.files.get(&key).map_or(true, |entry| {
-            entry.size_bytes != candidate.size_bytes
-                || entry.modified_unix_seconds != candidate.modified_unix_seconds
-                || entry.source_file_fingerprint != candidate.source_file_fingerprint
-        })
+        let Some(entry) = self.files.get(&key) else {
+            return CandidateDecision::Parse;
+        };
+        let transcript_changed = entry.size_bytes != candidate.size_bytes
+            || entry.modified_unix_seconds != candidate.modified_unix_seconds
+            || entry
+                .modified_unix_nanos
+                .is_some_and(|value| value != candidate.modified_unix_nanos);
+        if transcript_changed {
+            return CandidateDecision::Parse;
+        }
+        if entry.last_snapshot_fingerprint.is_none() {
+            return CandidateDecision::Parse;
+        }
+        if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) {
+            return if entry.source_file_fingerprint == candidate.legacy_source_file_fingerprint {
+                if candidate.legacy_config_reconciliation_required {
+                    CandidateDecision::ReconcileLegacy
+                } else {
+                    CandidateDecision::Migrate
+                }
+            } else {
+                // The legacy source-wide sidecar identity changed while this
+                // entry was not observed. We cannot prove which session was
+                // affected from the irreversible old digest, so correctness
+                // requires a one-time parse instead of silently absorbing it.
+                CandidateDecision::Parse
+            };
+        }
+        if entry.source_file_fingerprint != candidate.source_file_fingerprint {
+            CandidateDecision::Parse
+        } else {
+            CandidateDecision::Skip
+        }
+    }
+
+    fn last_snapshot_fingerprint(&self, candidate: &CandidateFile) -> Option<String> {
+        self.files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|entry| entry.last_snapshot_fingerprint.clone())
+    }
+
+    fn migrate(&mut self, candidate: CandidateFile) {
+        let key = local_index_key(&candidate.path);
+        let last_snapshot_fingerprint = self
+            .files
+            .get(&key)
+            .and_then(|entry| entry.last_snapshot_fingerprint.clone());
+        self.files.insert(
+            key,
+            ScanIndexEntry {
+                size_bytes: candidate.size_bytes,
+                modified_unix_seconds: candidate.modified_unix_seconds,
+                modified_unix_nanos: Some(candidate.modified_unix_nanos),
+                source_file_fingerprint: candidate.source_file_fingerprint,
+                last_snapshot_fingerprint,
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+            },
+        );
     }
 
     fn record(&mut self, candidate: CandidateFile, last_snapshot_fingerprint: Option<String>) {
@@ -5244,8 +5527,10 @@ impl ScanIndex {
             ScanIndexEntry {
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
+                modified_unix_nanos: Some(candidate.modified_unix_nanos),
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
     }
@@ -5279,6 +5564,22 @@ fn source_file_fingerprint_with_context(
         &modified_unix_seconds.to_string(),
         parser_version,
         source_fingerprint_context,
+    ])
+}
+
+fn scan_file_fingerprint_with_context(
+    path: &Path,
+    size_bytes: u64,
+    modified_unix_nanos: u64,
+    scan_identity_version: &str,
+    session_sidecar_fingerprint: &str,
+) -> String {
+    sha256_hex(&[
+        &path.to_string_lossy(),
+        &size_bytes.to_string(),
+        &modified_unix_nanos.to_string(),
+        scan_identity_version,
+        session_sidecar_fingerprint,
     ])
 }
 
@@ -5644,8 +5945,10 @@ mod tests {
                 ScanIndexEntry {
                     size_bytes: 42,
                     modified_unix_seconds: 1_700_000_000,
+                    modified_unix_nanos: Some(1_700_000_000_000_000_000),
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
+                    scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
         };
@@ -5660,6 +5963,292 @@ mod tests {
         );
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         assert!(!temp_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_scan_index_adopts_unchanged_transcript_without_reparse() {
+        let root = temp_dir("scan-index-migration");
+        let path = root.join("rollout-019e253c-6666-7000-9000-ffffffffffff.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-ffffffffffff\"}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let metadata = fs::metadata(&path).expect("metadata");
+        let modified_unix_seconds = metadata
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .expect("mtime seconds");
+        let legacy_metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&root));
+        let legacy_source_file_fingerprint = source_file_fingerprint_with_context(
+            &path,
+            metadata.len(),
+            modified_unix_seconds,
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            &legacy_metadata.legacy_sidecar_fingerprint,
+        );
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: metadata.len(),
+                    modified_unix_seconds,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: legacy_source_file_fingerprint,
+                    last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
+                    scan_identity_version: None,
+                },
+            )]),
+        };
+
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert_eq!(scan.scanned_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        let migrated = index.files.get(&local_index_key(&path)).expect("entry");
+        assert_eq!(
+            migrated.scan_identity_version.as_deref(),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        );
+        assert_eq!(
+            migrated.last_snapshot_fingerprint.as_deref(),
+            Some("legacy-snapshot-fingerprint")
+        );
+        assert!(migrated.modified_unix_nanos.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_codex_config_presence_forces_one_corrective_snapshot() {
+        let home = temp_dir("legacy-config-cutover");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        // The current parser extracts no selector from this valid config. Its
+        // mere presence still cannot prove what the old stat-only index saw.
+        fs::write(
+            codex_dir.join("config.toml"),
+            "personality = \"pragmatic\"\n",
+        )
+        .expect("write config");
+        let path = sessions_dir.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write transcript");
+        let file_metadata = fs::metadata(&path).expect("metadata");
+        let modified_unix_seconds = file_metadata
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .expect("mtime seconds");
+        let legacy_metadata =
+            CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert!(legacy_metadata.legacy_config_file_present);
+        let legacy_file_fingerprint = source_file_fingerprint_with_context(
+            &path,
+            file_metadata.len(),
+            modified_unix_seconds,
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            &legacy_metadata.legacy_sidecar_fingerprint,
+        );
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: file_metadata.len(),
+                    modified_unix_seconds,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: legacy_file_fingerprint,
+                    last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
+                    scan_identity_version: None,
+                },
+            )]),
+        };
+
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].model_usage[0].selector_context.is_empty());
+        assert_eq!(
+            index
+                .files
+                .get(&local_index_key(&path))
+                .and_then(|entry| entry.scan_identity_version.as_deref()),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn nanosecond_mtime_change_forces_parse_inside_same_second() {
+        let path = PathBuf::from("/redacted/session.jsonl");
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 1_777_777_777,
+            modified_unix_nanos: 1_777_777_777_000_000_002,
+            source_file_fingerprint: "new".to_string(),
+            legacy_source_file_fingerprint: "legacy".to_string(),
+            legacy_config_reconciliation_required: false,
+        };
+        let index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_777_777_777,
+                    modified_unix_nanos: Some(1_777_777_777_000_000_001),
+                    source_file_fingerprint: "old".to_string(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                },
+            )]),
+        };
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
+    fn legacy_index_reparses_when_old_sidecar_identity_cannot_be_proven() {
+        let path = PathBuf::from("/redacted/session.jsonl");
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 1_777_777_777,
+            modified_unix_nanos: 1_777_777_777_000_000_001,
+            source_file_fingerprint: "semantic-sync".to_string(),
+            legacy_source_file_fingerprint: "legacy-current-sidecar".to_string(),
+            legacy_config_reconciliation_required: false,
+        };
+        let index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_777_777_777,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: "legacy-previous-sidecar".to_string(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    scan_identity_version: None,
+                },
+            )]),
+        };
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
+    fn legacy_index_targets_config_derived_rows_for_reconciliation() {
+        let path = PathBuf::from("/redacted/session.jsonl");
+        let candidate = CandidateFile {
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 1_777_777_777,
+            modified_unix_nanos: 1_777_777_777_000_000_001,
+            source_file_fingerprint: "semantic-sync".to_string(),
+            legacy_source_file_fingerprint: "legacy-matching-sidecar".to_string(),
+            legacy_config_reconciliation_required: true,
+        };
+        let index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: 42,
+                    modified_unix_seconds: 1_777_777_777,
+                    modified_unix_nanos: None,
+                    source_file_fingerprint: "legacy-matching-sidecar".to_string(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    scan_identity_version: None,
+                },
+            )]),
+        };
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::ReconcileLegacy
+        );
+    }
+
+    #[test]
+    fn parsed_semantic_noop_is_not_returned_for_upload() {
+        let root = temp_dir("semantic-noop");
+        let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
+        let base = concat!(
+            "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+            "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
+        );
+        fs::write(&path, base).expect("write first fixture");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+
+        fs::write(&path, format!("{base}{{}}\n")).expect("add ignored row");
+        let noop = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("noop scan");
+        assert_eq!(noop.scanned_file_count, 1);
+        assert_eq!(noop.scanned_session_count, 1);
+        assert_eq!(noop.semantic_noop_count, 1);
+        assert!(noop.snapshots.is_empty());
+
+        fs::write(
+            &path,
+            format!(
+                "{base}{{\"type\":\"message_end\",\"message\":{{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707202000,\"usage\":{{\"input\":3,\"output\":1,\"cacheRead\":0,\"cacheWrite\":0}}}}}}\n"
+            ),
+        )
+        .expect("add real usage");
+        let changed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("changed scan");
+        assert_eq!(changed.snapshots.len(), 1);
+        assert_eq!(changed.semantic_noop_count, 0);
+        assert_eq!(changed.snapshots[0].input_tokens, 15);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6992,8 +7581,10 @@ mod tests {
         let legacy_entry = ScanIndexEntry {
             size_bytes,
             modified_unix_seconds,
+            modified_unix_nanos: None,
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
+            scan_identity_version: None,
         };
 
         let mut index = ScanIndex {
@@ -7025,12 +7616,17 @@ mod tests {
         assert_ne!(entry.source_file_fingerprint, v6_key);
         assert_eq!(
             entry.source_file_fingerprint,
-            source_file_fingerprint(
+            scan_file_fingerprint_with_context(
                 &path,
                 size_bytes,
-                modified_unix_seconds,
-                PI_SNAPSHOT_PARSER_VERSION
+                entry.modified_unix_nanos.expect("nanosecond mtime"),
+                PI_SCAN_IDENTITY_VERSION,
+                "",
             )
+        );
+        assert_eq!(
+            entry.scan_identity_version.as_deref(),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -7418,7 +8014,102 @@ mod tests {
     }
 
     #[test]
-    fn codex_title_changes_affect_snapshot_and_source_file_fingerprints() {
+    fn semantic_fingerprint_excludes_observation_and_parser_metadata() {
+        let mut item = sample_session_artifact_item();
+        let origin = SnapshotOrigin {
+            thread_source: Some("automation".to_string()),
+            ..Default::default()
+        };
+        item.origin = Some(origin.clone());
+        item.attribution_facts = crate::session_attribution::direct_provider_facts(
+            SnapshotSource::Codex,
+            Some(&origin),
+            &item.source_session_id,
+            "2026-07-22T08:00:00Z",
+            "codex_jsonl:v22",
+        );
+        let baseline = snapshot_fingerprint(SnapshotSource::Codex, &item);
+
+        let mut later_observation = item.clone();
+        later_observation.collected_at = "2026-07-22T09:00:00Z".to_string();
+        later_observation.source_file_fingerprint = Some("different-local-file-fp".to_string());
+        later_observation.provenance.collector = "codex_jsonl:v23-build".to_string();
+        for fact in &mut later_observation.attribution_facts {
+            fact.evidence.observed_at = "2026-07-22T09:00:00Z".to_string();
+            fact.evidence.source_version = "codex_jsonl:v23".to_string();
+            fact.evidence.evidence_ref = "sha256:lineage-only-change".to_string();
+        }
+        assert_eq!(
+            snapshot_fingerprint(SnapshotSource::Codex, &later_observation),
+            baseline
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_tracks_real_usage_lifecycle_and_latency_changes() {
+        let item = sample_session_artifact_item();
+        let baseline = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+
+        let mut usage = item.clone();
+        usage.input_tokens += 1;
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &usage),
+            baseline
+        );
+
+        let mut lifecycle = item.clone();
+        lifecycle.status = "active".to_string();
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &lifecycle),
+            baseline
+        );
+
+        let mut latency = item;
+        latency.max_duration_ms = Some(42);
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, &latency),
+            baseline
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_tracks_selector_evidence_source() {
+        let path = temp_file("selector-evidence-semantic");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-eeeeeeeeeeee\"}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"service_tier\":\"fast\",\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let item = parse_codex_jsonl_file(&path, "2026-07-22T08:02:00Z", "file-fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let baseline = snapshot_fingerprint(SnapshotSource::Codex, &item);
+        let mut changed_source = item;
+        changed_source.model_usage[0].selector_sources.insert(
+            "service_tier".to_string(),
+            "different_evidence_source".to_string(),
+        );
+        changed_source.usage_buckets[0].model_usage[0]
+            .selector_sources
+            .insert(
+                "service_tier".to_string(),
+                "different_evidence_source".to_string(),
+            );
+        assert_ne!(
+            snapshot_fingerprint(SnapshotSource::Codex, &changed_source),
+            baseline
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_title_changes_affect_only_that_sessions_sidecar_identity() {
         let path = temp_file("codex-title-fingerprint");
         fs::write(
             &path,
@@ -7472,33 +8163,52 @@ mod tests {
             second_item.snapshot_fingerprint
         );
 
-        let source_file = source_file_fingerprint_with_context(
-            &path,
-            100,
-            1_777_777_777,
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "sidecar-a",
+        insert_codex_sidecar_title(
+            &mut first.titles,
+            "unrelated-session".to_string(),
+            Some("Unrelated title".to_string()),
+            "session_index",
+            true,
         );
-        let source_file_after_sidecar_change = source_file_fingerprint_with_context(
-            &path,
-            100,
-            1_777_777_777,
-            CODEX_SNAPSHOT_PARSER_VERSION,
-            "sidecar-b",
+        insert_codex_sidecar_title(
+            &mut second.titles,
+            "unrelated-session".to_string(),
+            Some("Unrelated title".to_string()),
+            "session_index",
+            true,
         );
-        assert_ne!(source_file, source_file_after_sidecar_change);
+        assert_ne!(
+            first.session_sidecar_fingerprint("019e253c-6666-7000-9000-ffffffffffff"),
+            second.session_sidecar_fingerprint("019e253c-6666-7000-9000-ffffffffffff")
+        );
+        assert_eq!(
+            first.session_sidecar_fingerprint("unrelated-session"),
+            second.session_sidecar_fingerprint("unrelated-session")
+        );
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn source_file_fingerprint_changes_with_parser_version() {
+    fn scan_identity_is_decoupled_from_parser_build_version() {
         let path = Path::new("/redacted/session.jsonl");
-        let old = source_file_fingerprint(path, 100, 1_777_777_777, "codex_jsonl:v2");
-        let current =
-            source_file_fingerprint(path, 100, 1_777_777_777, CODEX_SNAPSHOT_PARSER_VERSION);
+        let before_parser_upgrade = scan_file_fingerprint_with_context(
+            path,
+            100,
+            1_777_777_777_123_456_789,
+            SnapshotSource::Codex.scan_identity_version(),
+            "session-sidecar",
+        );
+        let after_parser_upgrade = scan_file_fingerprint_with_context(
+            path,
+            100,
+            1_777_777_777_123_456_789,
+            CODEX_SCAN_IDENTITY_VERSION,
+            "session-sidecar",
+        );
 
-        assert_ne!(old, current);
+        assert_eq!(before_parser_upgrade, after_parser_upgrade);
+        assert_ne!(CODEX_SNAPSHOT_PARSER_VERSION, "codex_jsonl:v23");
     }
 
     #[test]
@@ -8261,7 +8971,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_uses_config_fast_mode_as_low_confidence_default() {
+    fn codex_parser_does_not_apply_mutable_config_defaults_to_history() {
         let root = temp_dir("codex-config-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -8295,18 +9005,8 @@ mod tests {
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("service_tier").map(String::as_str),
-            Some("fast")
-        );
-        assert_eq!(selector.get("mode").map(String::as_str), Some("fast"));
-        assert_eq!(
-            item.model_usage[0]
-                .selector_sources
-                .get("mode")
-                .map(String::as_str),
-            Some("codex.config.features.fast_mode")
-        );
+        assert!(selector.is_empty());
+        assert!(item.model_usage[0].selector_sources.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8395,7 +9095,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_uses_fast_default_opt_out_as_standard_default() {
+    fn codex_parser_does_not_backdate_fast_opt_out_to_history() {
         let root = temp_dir("codex-config-standard-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -8429,31 +9129,14 @@ mod tests {
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("service_tier").map(String::as_str),
-            Some("standard")
-        );
-        assert_eq!(selector.get("mode").map(String::as_str), Some("standard"));
-        assert_eq!(
-            item.model_usage[0]
-                .selector_sources
-                .get("service_tier")
-                .map(String::as_str),
-            Some("codex.config.fast_default_opt_out")
-        );
-        assert_eq!(
-            item.model_usage[0]
-                .selector_sources
-                .get("mode")
-                .map(String::as_str),
-            Some("codex.config.fast_default_opt_out")
-        );
+        assert!(selector.is_empty());
+        assert!(item.model_usage[0].selector_sources.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn codex_parser_uses_notice_fast_default_opt_out_as_standard_default() {
+    fn codex_parser_does_not_backdate_notice_fast_opt_out_to_history() {
         let root = temp_dir("codex-notice-standard-selector");
         let codex_dir = root.join(".codex");
         let sessions_dir = codex_dir.join("sessions");
@@ -8487,25 +9170,8 @@ mod tests {
         .expect("snapshot");
 
         let selector = &item.model_usage[0].selector_context;
-        assert_eq!(
-            selector.get("service_tier").map(String::as_str),
-            Some("standard")
-        );
-        assert_eq!(selector.get("mode").map(String::as_str), Some("standard"));
-        assert_eq!(
-            item.model_usage[0]
-                .selector_sources
-                .get("service_tier")
-                .map(String::as_str),
-            Some("codex.config.notice.fast_default_opt_out")
-        );
-        assert_eq!(
-            item.model_usage[0]
-                .selector_sources
-                .get("mode")
-                .map(String::as_str),
-            Some("codex.config.notice.fast_default_opt_out")
-        );
+        assert!(selector.is_empty());
+        assert!(item.model_usage[0].selector_sources.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9629,7 +10295,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_title_metadata_fingerprint_tracks_title_content_only() {
+    fn claude_title_metadata_fingerprint_is_content_stable_and_session_scoped() {
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-fingerprint",
             "s-3",
@@ -9645,6 +10311,7 @@ mod tests {
             .join("workspace")
             .join("local_desktop-1.json");
         let first = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        let unrelated_before = first.session_sidecar_fingerprint("unrelated-session");
 
         // Rewriting the file with the SAME title (mtime/size churn from
         // ordinary session activity) must keep the fingerprint stable...
@@ -9654,7 +10321,10 @@ mod tests {
         )
         .expect("rewrite store");
         let same = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        assert_eq!(first.sidecar_fingerprint, same.sidecar_fingerprint);
+        assert_eq!(
+            first.session_sidecar_fingerprint("s-3"),
+            same.session_sidecar_fingerprint("s-3")
+        );
 
         // ...while an actual title change must change it so unchanged
         // transcripts re-parse and pick the new title up.
@@ -9664,7 +10334,14 @@ mod tests {
         )
         .expect("rewrite store with new title");
         let changed = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
-        assert_ne!(first.sidecar_fingerprint, changed.sidecar_fingerprint);
+        assert_ne!(
+            first.session_sidecar_fingerprint("s-3"),
+            changed.session_sidecar_fingerprint("s-3")
+        );
+        assert_eq!(
+            unrelated_before,
+            changed.session_sidecar_fingerprint("unrelated-session")
+        );
 
         let _ = fs::remove_dir_all(home);
     }

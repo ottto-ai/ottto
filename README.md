@@ -525,10 +525,13 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `payload.info.total_token_usage` totals, and selector fields such as
   `service_tier`, `actual_service_tier`, `fast_mode`, `batch_mode`,
   `inference_geo`, `context_bucket`, and cache TTL aliases from direct or
-  nested `selector_context` rows; if a Codex usage row lacks an observed
-  selector, locald can use `~/.codex/config.toml` fast-mode settings or the
-  explicit top-level or `[notice].fast_default_opt_out=true` standard-mode
-  preference as a low-confidence current-default selector. It then fills
+  nested `selector_context` rows. Mutable `~/.codex/config.toml` defaults are
+  available to live status display but are not backdated onto cumulative
+  historical usage rows; only session-native selector evidence enters snapshot
+  semantics. During the semantic-sync cutover, a legacy Codex index that had a
+  config file in scope receives one conservative corrective reconciliation:
+  the old stat-only index cannot prove which rows inherited config guesses.
+  This correction cannot recur after the index advances. The parser then fills
   missing titles from local Codex sidecars in this order:
   `~/.codex/session_index.jsonl` `thread_name`,
   `~/.codex/state_5.sqlite` `threads.title`, and finally a short, filtered
@@ -542,9 +545,18 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   aliases into subsequent assistant-message usage rows. All three parsers emit
   content-free hourly activity buckets from persisted request/usage event
   timestamps; polling cadence affects freshness only and no wall-clock activity
-  is inferred. Parser-versioned file
-  fingerprints plus Codex sidecar/config metadata fingerprints force a reparse
-  of recent files when title or selector sources change. The daemon starts the
+  is inferred. Parser build versions are provenance and do not trigger scans or
+  historical replay. Incremental scan identity uses transcript size,
+  nanosecond mtime, a frozen scan-derivation version, and only that session's
+  title/state sidecar digest. A pre-cutover entry migrates without parsing only
+  when transcript stats and the reconstructed legacy sidecar identity both
+  match; uncertainty forces a one-time correctness parse. Parsed snapshots are compared by
+  semantic component hashes (usage, lifecycle, latency, context, display,
+  attribution, and artifacts); collection time, parser build, file identity,
+  and evidence-lineage metadata cannot manufacture a new snapshot. Semantic
+  no-ops are retained in the local index but omitted from upload. Historical
+  walks occur only for first bootstrap or an explicit reviewed replay revision.
+  The daemon starts the
   snapshot sync loop beside the local OTLP relay,
   uses source-scoped relay tokens and backend activity hints, scans the last
   six months by default with stricter backend windows allowed, caps each

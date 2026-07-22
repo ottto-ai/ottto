@@ -1,11 +1,11 @@
 //! Retroactive snapshot backfill.
 //!
-//! When `CLAUDE_CODE_SNAPSHOT_PARSER_VERSION`, `CODEX_SNAPSHOT_PARSER_VERSION`,
-//! or `PI_SNAPSHOT_PARSER_VERSION` advances, the daemon owes a one-shot walk of
-//! every historical JSONL on disk so the upstream service can relabel existing
-//! sessions with the new attribution (gateway provider, plan fingerprint). The
-//! upstream UPSERT keys on `snapshot_fingerprint`, so re-runs on partial
-//! failure are idempotent.
+//! Historical snapshot bootstrap and explicitly-declared replay.
+//!
+//! Parser build versions are provenance, not replay policy. A parser upgrade
+//! must not walk every historical JSONL unless the source's replay directive
+//! explicitly requests it. A machine with no prior successful bootstrap still
+//! receives the initial historical walk.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -29,8 +29,14 @@ const BACKFILL_STATE_FILENAME: &str = "snapshot_backfill_state.json";
 /// reconciled. The daemon stores one entry per source slug.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackfillState {
+    /// Legacy bootstrap marker. Kept for backward compatibility with installed
+    /// daemons, but parser-version mismatches no longer trigger replay.
     #[serde(default)]
     pub completed_parser_versions: BTreeMap<String, String>,
+    /// Explicit historical replay revisions completed per source. A revision
+    /// is advanced only when a deliberately-declared full replay succeeds.
+    #[serde(default)]
+    pub completed_replay_revisions: BTreeMap<String, String>,
     #[serde(default)]
     pub last_completed_at: Option<String>,
     #[serde(default)]
@@ -196,8 +202,49 @@ pub fn current_parser_version(source: SnapshotSource) -> &'static str {
     }
 }
 
-/// Returns the set of sources whose parser version has changed since the last
-/// recorded backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoricalReplayPolicy {
+    None,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoricalReplayDirective {
+    pub revision: &'static str,
+    pub policy: HistoricalReplayPolicy,
+}
+
+/// Compiled replay intent. Changing a parser version does nothing here. A
+/// deliberate full replay requires both `Full` and a new revision, making the
+/// expensive operation visible in code review and one-shot in production.
+pub fn current_historical_replay(_source: SnapshotSource) -> HistoricalReplayDirective {
+    HistoricalReplayDirective {
+        revision: "historical_replay:none:v1",
+        policy: HistoricalReplayPolicy::None,
+    }
+}
+
+fn source_needs_backfill(
+    state: &BackfillState,
+    source: SnapshotSource,
+    directive: HistoricalReplayDirective,
+) -> bool {
+    let slug = source.api_slug();
+    let has_bootstrapped = state.completed_parser_versions.contains_key(slug)
+        || state.completed_replay_revisions.contains_key(slug);
+    if !has_bootstrapped {
+        return true;
+    }
+    directive.policy == HistoricalReplayPolicy::Full
+        && state
+            .completed_replay_revisions
+            .get(slug)
+            .map(|recorded| recorded.as_str() != directive.revision)
+            .unwrap_or(true)
+}
+
+/// Returns sources that need their first historical bootstrap or an explicit
+/// full replay. Parser-version drift alone is intentionally ignored.
 pub fn pending_backfill_sources(state: &BackfillState) -> Vec<SnapshotSource> {
     [
         SnapshotSource::ClaudeCode,
@@ -205,15 +252,22 @@ pub fn pending_backfill_sources(state: &BackfillState) -> Vec<SnapshotSource> {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .filter(|source| {
-        let slug = source.api_slug();
-        state
-            .completed_parser_versions
-            .get(slug)
-            .map(|recorded| recorded.as_str() != current_parser_version(*source))
-            .unwrap_or(true)
-    })
+    .filter(|source| source_needs_backfill(state, *source, current_historical_replay(*source)))
     .collect()
+}
+
+pub fn mark_backfill_complete(state: &mut BackfillState, source: SnapshotSource) {
+    state.completed_parser_versions.insert(
+        source.api_slug().to_string(),
+        current_parser_version(source).to_string(),
+    );
+    let directive = current_historical_replay(source);
+    if directive.policy == HistoricalReplayPolicy::Full {
+        state.completed_replay_revisions.insert(
+            source.api_slug().to_string(),
+            directive.revision.to_string(),
+        );
+    }
 }
 
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
@@ -287,7 +341,7 @@ impl BackfillNotificationSink for LoggingBackfillSink {
 
 /// Delivery sink for backfill snapshots. Returning `Err` from `deliver`
 /// signals that the upstream pipeline did NOT accept the snapshots; the
-/// backfill thread will then refuse to advance `completed_parser_versions`
+/// backfill thread will then refuse to advance its completion markers
 /// so the next start retries the walk rather than silently losing data.
 pub type SnapshotDeliverer = Arc<dyn Fn(Vec<SnapshotItem>) -> Result<()> + Send + Sync + 'static>;
 
@@ -295,7 +349,7 @@ pub type SnapshotDeliverer = Arc<dyn Fn(Vec<SnapshotItem>) -> Result<()> + Send 
 /// completion notification through the sink. The handle returns the joined
 /// result so callers (e.g. tests) can await it. Production callers detach.
 /// State is only persisted (and the sink notified) when `deliver` returns
-/// `Ok`; a failing deliver leaves the parser-version bookkeeping untouched
+/// `Ok`; a failing deliver leaves the replay bookkeeping untouched
 /// so the next daemon start retries the backfill. `artifacts_enabled` is the
 /// org session-artifacts upload policy, threaded down to `run_backfill`.
 pub fn spawn_backfill_thread(
@@ -317,10 +371,7 @@ pub fn spawn_backfill_thread(
         apply_backfill_cutoff(&mut snapshots, &state);
         deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
         for source in &pending {
-            state.completed_parser_versions.insert(
-                source.api_slug().to_string(),
-                current_parser_version(*source).to_string(),
-            );
+            mark_backfill_complete(&mut state, *source);
         }
         state.last_completed_at = Some(report.completed_at.clone());
         state.last_report = Some(report.clone());
@@ -592,14 +643,34 @@ mod tests {
     }
 
     #[test]
-    fn pending_backfill_returns_source_when_parser_version_changes() {
+    fn parser_version_change_does_not_trigger_historical_replay() {
         let mut state = BackfillState::default();
         state.completed_parser_versions.insert(
             SnapshotSource::Codex.api_slug().to_string(),
             "codex_jsonl:vOLD".to_string(),
         );
         let pending = pending_backfill_sources(&state);
-        assert!(pending.contains(&SnapshotSource::Codex));
+        assert!(!pending.contains(&SnapshotSource::Codex));
+    }
+
+    #[test]
+    fn explicit_full_replay_revision_is_one_shot() {
+        let source = SnapshotSource::Codex;
+        let directive = HistoricalReplayDirective {
+            revision: "codex_semantics:v2",
+            policy: HistoricalReplayPolicy::Full,
+        };
+        let mut state = BackfillState::default();
+        state.completed_parser_versions.insert(
+            source.api_slug().to_string(),
+            CODEX_SNAPSHOT_PARSER_VERSION.to_string(),
+        );
+        assert!(source_needs_backfill(&state, source, directive));
+        state.completed_replay_revisions.insert(
+            source.api_slug().to_string(),
+            directive.revision.to_string(),
+        );
+        assert!(!source_needs_backfill(&state, source, directive));
     }
 
     #[test]

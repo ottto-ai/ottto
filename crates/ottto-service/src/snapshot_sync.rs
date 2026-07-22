@@ -1,7 +1,7 @@
 use crate::agent_status::collect_agent_status;
 use crate::backfill::{
-    apply_backfill_cutoff, current_parser_version as backfill_current_parser_version,
-    load_backfill_state, pending_backfill_sources, run_backfill, save_backfill_state,
+    apply_backfill_cutoff, load_backfill_state, mark_backfill_complete, pending_backfill_sources,
+    run_backfill, save_backfill_state,
 };
 use crate::detected_uses::{
     aggregate_detected_uses, merge_detected_uses, DETECTED_USE_RETENTION_DAYS,
@@ -803,13 +803,10 @@ fn sync_source(
         );
     }
 
-    // Retroactive backfill: if this source's parser version bumped since the
-    // last successful backfill, walk every historical JSONL once and append
-    // those snapshots to the live-scan batch. The existing chunked upload
-    // path handles them via the same relay_token + retry semantics. The
-    // backend UPSERTs by snapshot_fingerprint so re-runs on partial failure
-    // are idempotent. State is persisted only after this iteration's upload
-    // succeeds (see `save_backfill_state` below).
+    // Historical bootstrap / explicit replay. Parser build changes are not a
+    // trigger: `pending_backfill_sources` returns true only for a machine that
+    // has never completed its initial bootstrap or for a reviewed replay
+    // directive. State advances only after this iteration's upload succeeds.
     let backfill_state = load_backfill_state(support_dir);
     let backfill_pending = pending_backfill_sources(&backfill_state).contains(&source);
     let mut backfill_succeeded = false;
@@ -1044,10 +1041,7 @@ fn sync_source(
         // account-switch backfill cutoff while this (potentially minutes-long)
         // sync is running, and saving the stale pre-scan copy would clobber it.
         let mut backfill_state = load_backfill_state(support_dir);
-        backfill_state.completed_parser_versions.insert(
-            source.api_slug().to_string(),
-            backfill_current_parser_version(source).to_string(),
-        );
+        mark_backfill_complete(&mut backfill_state, source);
         backfill_state.last_completed_at = Some(scan_started_at.clone());
         if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
             eprintln!(
