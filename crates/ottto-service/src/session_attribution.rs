@@ -5,7 +5,10 @@
 //! process arguments, or logs. Prompt/template and skill grouping use a
 //! backend-issued, tenant-scoped HMAC key; provider schedule definitions are
 //! read locally on a six-hour cache and reduced to opaque identifiers before
-//! facts can leave this module.
+//! facts can leave this module. Optional display labels contain only a
+//! sanitized 96-byte prompt prefix or allowlisted skill name; upload policy
+//! removes them unless the existing session-title privacy consent and the
+//! backend capability are both active.
 
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -26,6 +29,8 @@ pub const MAX_SESSION_ATTRIBUTION_FACTS: usize = 24;
 pub const MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES: usize = 128;
 pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
+pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES: usize = 96;
+pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 2_048;
 pub const SESSION_ATTRIBUTION_HMAC_KEY_VERSION: &str = "hmac-sha256:v1";
 
@@ -49,6 +54,10 @@ pub struct SessionFieldEvidence {
 pub struct SessionAttributionFact {
     pub field: String,
     pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_label_source: Option<String>,
     pub evidence: SessionFieldEvidence,
 }
 
@@ -163,10 +172,13 @@ impl SessionAttributionContext {
         let normalized_template = input.first_prompt.and_then(normalize_template_material);
         if let Some(template) = normalized_template.as_deref() {
             if let Some(value) = opaque_hmac_id(&self.key, "template_group", template) {
-                push_fact(
+                let display_label = input.first_prompt.and_then(prompt_prefix_display_label);
+                push_labeled_fact(
                     &mut facts,
                     "template_group_id",
                     &value,
+                    display_label.as_deref(),
+                    Some("prompt_prefix"),
                     "local_template",
                     "direct",
                     &evidence_context,
@@ -194,10 +206,13 @@ impl SessionAttributionContext {
 
         for skill in input.provider_skills.iter().take(8) {
             if let Some(value) = opaque_hmac_id(&self.key, "skill", skill) {
-                push_fact(
+                let display_label = skill_name_display_label(skill);
+                push_labeled_fact(
                     &mut facts,
                     "skill_id",
                     &value,
+                    display_label.as_deref(),
+                    Some("skill_name"),
                     "provider_native",
                     "direct",
                     &evidence_context,
@@ -207,10 +222,13 @@ impl SessionAttributionContext {
         if let Some(skill) = input.first_prompt.and_then(slash_skill_name) {
             if !input.provider_skills.contains(&skill) {
                 if let Some(value) = opaque_hmac_id(&self.key, "skill", &skill) {
-                    push_fact(
+                    let display_label = skill_name_display_label(&skill);
+                    push_labeled_fact(
                         &mut facts,
                         "skill_id",
                         &value,
+                        display_label.as_deref(),
+                        Some("skill_name"),
                         "local_template",
                         "direct",
                         &evidence_context,
@@ -537,6 +555,102 @@ fn slash_skill_name(first_prompt: &str) -> Option<String> {
     Some(name.to_ascii_lowercase())
 }
 
+fn prompt_prefix_display_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || contains_private_prompt_scaffolding(trimmed) {
+        return None;
+    }
+
+    // Codex scheduled sessions wrap the configured prompt in a stable sentence.
+    // The useful label is the configured prompt's prefix, not that shared wrapper.
+    let lowered = trimmed.to_ascii_lowercase();
+    let candidate = lowered
+        .find("its prompt is:")
+        .map(|index| &trimmed[index + "its prompt is:".len()..])
+        .unwrap_or(trimmed)
+        .trim();
+    if candidate.is_empty() || contains_private_prompt_scaffolding(candidate) {
+        return None;
+    }
+
+    let mut label = String::new();
+    for token in candidate.split_whitespace() {
+        let safe_token = if looks_like_local_path(token) {
+            "[path]"
+        } else {
+            token
+        };
+        let separator_bytes = usize::from(!label.is_empty());
+        if label.len() + separator_bytes + safe_token.len()
+            > MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+        {
+            break;
+        }
+        if !label.is_empty() {
+            label.push(' ');
+        }
+        label.push_str(safe_token);
+    }
+
+    let label = label
+        .trim_matches(|character: char| character.is_control())
+        .trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+fn skill_name_display_label(raw: &str) -> Option<String> {
+    let label = raw.trim().trim_start_matches('/');
+    if label.is_empty()
+        || label.len() > 64
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(label.to_string())
+}
+
+fn contains_private_prompt_scaffolding(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.contains("<instructions>")
+        || lowered.contains("<environment_context>")
+        || lowered.contains("agents.md instructions")
+        || lowered.contains("knowledge cutoff:")
+        || lowered.contains("current date:")
+}
+
+fn looks_like_local_path(token: &str) -> bool {
+    let comparable = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+        )
+    });
+    let lowered = comparable.to_ascii_lowercase();
+    let windows_absolute = comparable.as_bytes().get(1) == Some(&b':')
+        && comparable
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| matches!(byte, b'\\' | b'/'));
+    let unix_absolute = comparable.starts_with('/')
+        && comparable[1..].contains('/')
+        && !comparable.starts_with("//");
+    let relative_path =
+        (!comparable.starts_with('/') && comparable.contains('/')) || comparable.contains('\\');
+    windows_absolute
+        || unix_absolute
+        || relative_path
+        || comparable.starts_with("~/")
+        || lowered.starts_with("file://")
+        || lowered.contains("/users/")
+        || lowered.contains("/home/")
+        || lowered.contains("/volumes/")
+        || lowered.contains("/private/")
+        || lowered.contains("/var/folders/")
+        || lowered.contains("/tmp/")
+}
+
 fn sha256_hex(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
@@ -722,10 +836,89 @@ pub(crate) fn enforce_fact_limits(facts: &mut Vec<SessionAttributionFact>) {
     }
 }
 
+pub(crate) fn strip_display_labels(facts: &mut [SessionAttributionFact]) -> bool {
+    let mut changed = false;
+    for fact in facts {
+        if fact.display_label.take().is_some() {
+            changed = true;
+        }
+        if fact.display_label_source.take().is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub(crate) fn validate_fact_limits(facts: &[SessionAttributionFact]) -> Result<(), String> {
+    if facts.len() > MAX_SESSION_ATTRIBUTION_FACTS {
+        return Err(format!(
+            "more than {MAX_SESSION_ATTRIBUTION_FACTS} attribution facts"
+        ));
+    }
+    if serde_json::to_vec(facts)
+        .map(|payload| payload.len() > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "attribution facts exceed {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    for fact in facts {
+        if fact.value.is_empty() || fact.value.len() > MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES {
+            return Err("attribution fact value is empty or oversized".to_string());
+        }
+        if fact.evidence.source_version.len() > MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+            || fact.evidence.evidence_ref.len() > MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
+        {
+            return Err("attribution evidence is oversized".to_string());
+        }
+        match (
+            fact.display_label.as_deref(),
+            fact.display_label_source.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(label), Some(source)) => {
+                if label.is_empty()
+                    || label.len() > MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+                    || label.chars().any(char::is_control)
+                    || label.split_whitespace().any(looks_like_local_path)
+                    || source.is_empty()
+                    || source.len() > MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+                {
+                    return Err("attribution display label is unsafe or oversized".to_string());
+                }
+                let allowed = matches!(
+                    (fact.field.as_str(), source),
+                    ("template_group_id", "prompt_prefix") | ("skill_id", "skill_name")
+                );
+                if !allowed {
+                    return Err("attribution display label source is invalid for field".to_string());
+                }
+            }
+            _ => return Err("attribution display label is incomplete".to_string()),
+        }
+    }
+    Ok(())
+}
+
 fn push_fact(
     facts: &mut Vec<SessionAttributionFact>,
     field: &str,
     value: &str,
+    kind: &str,
+    strength: &str,
+    context: &EvidenceContext<'_>,
+) {
+    push_labeled_fact(facts, field, value, None, None, kind, strength, context);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_labeled_fact(
+    facts: &mut Vec<SessionAttributionFact>,
+    field: &str,
+    value: &str,
+    display_label: Option<&str>,
+    display_label_source: Option<&str>,
     kind: &str,
     strength: &str,
     context: &EvidenceContext<'_>,
@@ -741,9 +934,22 @@ fn push_fact(
     if evidence_ref.len() > MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES {
         return;
     }
+    let (display_label, display_label_source) = match (display_label, display_label_source) {
+        (Some(label), Some(source))
+            if !label.is_empty()
+                && label.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+                && !source.is_empty()
+                && source.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES =>
+        {
+            (Some(label.to_string()), Some(source.to_string()))
+        }
+        _ => (None, None),
+    };
     facts.push(SessionAttributionFact {
         field: field.to_string(),
         value: value.to_string(),
+        display_label,
+        display_label_source,
         evidence: SessionFieldEvidence {
             kind: kind.to_string(),
             strength: strength.to_string(),
@@ -964,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn grouping_facts_are_opaque_and_keep_dimensions_separate() {
+    fn grouping_facts_keep_opaque_ids_and_bounded_private_labels_separate() {
         let key = Zeroizing::new(vec![9_u8; 32]);
         let scheduled_prompt =
             "Inspect the landing queue, verify every required check, and report only safe results.";
@@ -1014,7 +1220,16 @@ mod tests {
                 && fact.value == schedule_id
                 && fact.evidence.strength == "corroborated"
         }));
-        assert!(facts.iter().any(|fact| fact.field == "skill_id"));
+        assert!(facts.iter().any(|fact| {
+            fact.field == "template_group_id"
+                && fact.display_label.as_deref() == Some(scheduled_prompt)
+                && fact.display_label_source.as_deref() == Some("prompt_prefix")
+        }));
+        assert!(facts.iter().any(|fact| {
+            fact.field == "skill_id"
+                && fact.display_label.as_deref() == Some("landing-lander")
+                && fact.display_label_source.as_deref() == Some("skill_name")
+        }));
         assert!(facts.iter().all(|fact| {
             fact.value.starts_with("hmac-sha256:v1:")
                 || !matches!(
@@ -1023,9 +1238,35 @@ mod tests {
                 )
         }));
         let wire = serde_json::to_string(&facts).expect("facts");
-        assert!(!wire.contains("landing-lander"));
-        assert!(!wire.contains("Inspect the landing queue"));
+        assert!(wire.contains("landing-lander"));
+        assert!(wire.contains("Inspect the landing queue"));
         assert!(wire.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn prompt_prefix_label_is_bounded_single_line_and_redacts_paths() {
+        let label = prompt_prefix_display_label(
+            "An automation named Review has fired. Its prompt is:\nInspect /Users/alice/secret/repo, C:\\work\\private, and src/internal/config.rs then report a concise result that keeps going beyond the display limit until it is truncated.",
+        )
+        .expect("display label");
+
+        assert!(label.starts_with("Inspect [path] [path] and [path]"));
+        assert!(!label.contains("alice"));
+        assert!(!label.contains("private"));
+        assert!(!label.contains('\n'));
+        assert!(label.len() <= MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES);
+    }
+
+    #[test]
+    fn prompt_prefix_label_omits_private_scaffolding_and_keeps_slash_skills() {
+        assert_eq!(
+            prompt_prefix_display_label("# AGENTS.md instructions for /private/repo"),
+            None
+        );
+        assert_eq!(
+            prompt_prefix_display_label("/frontend-flow-change improve the filter"),
+            Some("/frontend-flow-change improve the filter".to_string())
+        );
     }
 
     #[test]

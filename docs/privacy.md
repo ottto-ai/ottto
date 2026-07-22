@@ -96,12 +96,23 @@ rejects stale pre-revoke epochs.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task
-definitions in memory to derive tenant-scoped HMAC identifiers. It does not
-upload the source prompt, skill name, schedule text, definition path, or HMAC
-key. Provider schedule inventory is bounded, cached for six hours, and
-reprocesses only files whose size or modification time changed. Missing or
-ambiguous evidence produces no attribution label; it is never reclassified as
-human activity.
+definitions in memory to derive tenant-scoped HMAC identifiers. When the
+existing **session titles and minimal descriptions** setting is enabled and the
+backend advertises support, a template or skill fact may additionally include
+one display label: either a sanitized prompt prefix of at most 96 bytes or an
+allowlisted skill name of at most 64 bytes. New daemons default this capability
+off with older backends. Turning off the existing setting strips these labels
+and session titles before upload while preserving opaque grouping identifiers.
+The daemon does not upload a full prompt, response, scheduled-task definition,
+definition path, transcript path, or HMAC key. Path-like prompt fragments are
+replaced with `[path]`. Provider schedule inventory is bounded, cached for six
+hours, and reprocesses only files whose size or modification time changed.
+Missing or ambiguous evidence produces no attribution label; it is never
+reclassified as human activity.
+
+This label transport reuses data already read by the incremental transcript
+scanner. It adds no filesystem polling, process inspection, permission prompt,
+or always-on watcher.
 
 On macOS, external-scheduler attribution may also inventory bounded user
 launchd definitions and the user's crontab at startup and once per day. Raw

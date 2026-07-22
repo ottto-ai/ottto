@@ -600,7 +600,13 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `rate_limited` is an explicit state. Local snapshots can include optional
   user-approved `workspace_display_label` text while keeping the hashed
   workspace identity as the only default project key; org and user telemetry
-  settings can independently disable title and workspace-label upload.
+  settings can independently disable title and workspace-label upload. The
+  same title/privacy choice gates optional attribution display labels: a
+  sanitized prompt prefix (96 bytes maximum) or allowlisted skill name may
+  accompany an opaque template/skill fact only when a compatible backend
+  advertises support. Older backends keep that capability off, and no new
+  polling, process inspection, local permission, full transcript, or path is
+  introduced.
 - display-safe agent status snapshots attached to `SourceHealth` for Codex,
   Claude Code, and Pi, including account, subscription, model, context,
   quota-window, credit-balance, capability-gap, and diagnostic fields where each

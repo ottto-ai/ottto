@@ -383,7 +383,8 @@ pub struct SnapshotItem {
     pub originator: Option<String>,
     /// Compact evidence-first facts derived locally without transcript content.
     /// Empty fact sets stay off the wire; populated sets use the backend's v1
-    /// field-evidence contract.
+    /// field-evidence contract. Opaque template/skill facts may carry optional
+    /// bounded labels only under the existing title-upload consent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attribution_facts: Vec<crate::session_attribution::SessionAttributionFact>,
 }
@@ -515,6 +516,10 @@ pub struct SnapshotUploadPolicy {
     pub workspace_labels_enabled: bool,
     pub session_artifacts_enabled: bool,
     pub session_attribution_enabled: bool,
+    /// Backend capability derived from the existing session-title privacy
+    /// choice. It is not a separate user setting and defaults off for older
+    /// backends that do not advertise the additive private-label contract.
+    pub session_attribution_labels_enabled: bool,
 }
 
 impl Default for SnapshotUploadPolicy {
@@ -528,6 +533,7 @@ impl Default for SnapshotUploadPolicy {
             // Opt-in: compact facts stay local unless the backend explicitly
             // enables the additive attribution contract.
             session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
         }
     }
 }
@@ -564,6 +570,10 @@ pub fn apply_upload_policy(
         }
         if !policy.session_attribution_enabled && !item.attribution_facts.is_empty() {
             item.attribution_facts.clear();
+            fingerprint_needs_refresh = true;
+        } else if (!policy.session_titles_enabled || !policy.session_attribution_labels_enabled)
+            && crate::session_attribution::strip_display_labels(&mut item.attribution_facts)
+        {
             fingerprint_needs_refresh = true;
         }
         if fingerprint_needs_refresh {
@@ -1061,6 +1071,8 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
         ));
     }
+    crate::session_attribution::validate_fact_limits(&item.attribution_facts)
+        .map_err(|error| format!("snapshot[{index}] {error}"))?;
     let expected = usage_totals_from_item(item);
     let expected_has_usage = usage_totals_has_usage(&expected);
     if expected_has_usage && item.usage_buckets.is_empty() {
@@ -1562,10 +1574,12 @@ struct SnapshotAccumulator {
     title_source: Option<String>,
     first_prompt_title: Option<String>,
     // In-memory only: bounded first-user text used to derive opaque template,
-    // schedule, and explicit slash-skill facts. Never copied into SnapshotItem.
+    // schedule, and explicit slash-skill facts. The source text is never copied
+    // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
     first_prompt_material: Option<String>,
     // In-memory only: provider-native skill names. HMACed before facts are
-    // produced and never serialized in plaintext.
+    // produced; an allowlisted short name may also become a private display
+    // label, which upload policy strips unless title consent is active.
     provider_skills: BTreeSet<String>,
     started_at: Option<String>,
     ended_at: Option<String>,
@@ -6167,7 +6181,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_parser_groups_template_and_schedule_without_serializing_content() {
+    fn codex_parser_gates_bounded_template_labels_on_existing_title_consent() {
         let home = temp_dir("codex-attribution-groups");
         let schedule_dir = home.join(".codex/automations/schedule-landing");
         fs::create_dir_all(&schedule_dir).expect("schedule dir");
@@ -6222,20 +6236,55 @@ mod tests {
             .iter()
             .any(|fact| fact.field == "schedule_definition_id"));
         let local_facts = serde_json::to_string(&item.attribution_facts).expect("local facts");
-        assert!(!local_facts.contains(scheduled_prompt));
+        assert!(local_facts.contains(scheduled_prompt));
+        assert!(!local_facts.contains(path.to_string_lossy().as_ref()));
+
+        let mut labels_disabled = item.clone();
         apply_upload_policy(
             SnapshotSource::Codex,
-            std::slice::from_mut(&mut item),
+            std::slice::from_mut(&mut labels_disabled),
             SnapshotUploadPolicy {
                 session_attribution_enabled: true,
                 ..SnapshotUploadPolicy::default()
             },
         );
-        let wire = serde_json::to_value(&item).expect("snapshot wire");
-        let wire_facts =
-            serde_json::to_string(&wire["attribution_facts"]).expect("wire attribution facts");
-        assert!(wire["attribution_facts"].is_array());
-        assert!(!wire_facts.contains(scheduled_prompt));
+        let disabled_wire = serde_json::to_value(&labels_disabled).expect("disabled snapshot wire");
+        let disabled_facts = serde_json::to_string(&disabled_wire["attribution_facts"])
+            .expect("disabled wire attribution facts");
+        assert!(disabled_wire["attribution_facts"].is_array());
+        assert!(!disabled_facts.contains("display_label"));
+        assert!(!disabled_facts.contains(scheduled_prompt));
+
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut item),
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
+        let enabled_wire = serde_json::to_value(&item).expect("enabled snapshot wire");
+        let enabled_facts = serde_json::to_string(&enabled_wire["attribution_facts"])
+            .expect("enabled wire attribution facts");
+        assert!(enabled_facts.contains(scheduled_prompt));
+        assert!(enabled_facts.contains("prompt_prefix"));
+        assert!(!enabled_facts.contains(path.to_string_lossy().as_ref()));
+
+        let mut title_opted_out = item.clone();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut title_opted_out),
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
+        let opted_out_wire = serde_json::to_string(&title_opted_out).expect("opted out wire");
+        assert!(!opted_out_wire.contains("display_label"));
+        assert!(!opted_out_wire.contains(scheduled_prompt));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -7082,6 +7131,7 @@ mod tests {
                 workspace_labels_enabled: false,
                 session_artifacts_enabled: false,
                 session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
             },
         );
 
@@ -7287,6 +7337,7 @@ mod tests {
                 workspace_labels_enabled: true,
                 session_artifacts_enabled: false,
                 session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
             },
         );
         assert!(disabled[0].session_artifacts.is_empty());
@@ -7301,6 +7352,7 @@ mod tests {
                 workspace_labels_enabled: true,
                 session_artifacts_enabled: true,
                 session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
             },
         );
         assert_eq!(enabled[0].session_artifacts.len(), 1);

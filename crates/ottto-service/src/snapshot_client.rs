@@ -307,6 +307,12 @@ pub struct ActivityHintResponse {
     pub context_footprint_harvest_enabled: bool,
     #[serde(default)]
     pub session_attribution_enabled: bool,
+    /// Additive server capability for bounded private labels on opaque
+    /// attribution facts. Defaults false so a new daemon never sends nested
+    /// fields to an older backend. The backend derives this from the existing
+    /// `session_titles_enabled` privacy choice; it is not a second consent.
+    #[serde(default)]
+    pub session_attribution_labels_enabled: bool,
     #[serde(default)]
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
@@ -1202,6 +1208,38 @@ pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)
 mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
+
+    fn activity_hint_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "source":"codex",
+                "server_time":"2026-07-21T10:00:00Z",
+                "last_data_at":null,
+                "record_count_15m":0,
+                "record_count_24h":0,
+                "local_usage_reconciliation_enabled":true,
+                "backfill_window_days":183,
+                "session_titles_enabled":true,
+                "workspace_labels_enabled":true,
+                "session_attribution_enabled":true,
+                "recommended_scan_after":"2026-07-21T10:05:00Z"
+                {extra}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn attribution_private_label_capability_defaults_off_for_older_backends() {
+        let old_backend: ActivityHintResponse =
+            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
+        assert!(!old_backend.session_attribution_labels_enabled);
+
+        let new_backend: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_attribution_labels_enabled":true"#,
+        ))
+        .expect("new activity hint");
+        assert!(new_backend.session_attribution_labels_enabled);
+    }
 
     #[test]
     fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
