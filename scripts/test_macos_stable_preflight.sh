@@ -77,6 +77,7 @@ jq -n \
       verify_codex: "passed",
       diagnostics_redaction: "passed",
       update_check: "passed",
+      mixed_owner_app_version_truth: "passed",
       rollback_notes: "passed",
       stable_formula_static: "passed",
       stable_hosted_installer_static: "passed"

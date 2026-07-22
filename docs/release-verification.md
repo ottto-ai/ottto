@@ -160,6 +160,14 @@ version/channel, and the candidate release-manifest SHA-256. The evidence must
 not include private repo paths, local user paths, raw claim/setup tokens,
 account or machine identifiers, passwords, API keys, or bearer credentials.
 
+`mixed_owner_app_version_truth` must pass on a real lower-to-higher update when
+the signed GUI uses Sparkle and Homebrew owns the service. After Homebrew reaches
+the target but before Sparkle replaces the app, the UI must still show the lower
+bundle version and an update pending/in progress. A target-version or `up to
+date` claim while the lower bundle still runs fails the gate. Pass only after
+Sparkle installs the target bundle, relaunches a new app process, and GUI plus
+service versions converge without losing the account or sources.
+
 ## Verify Installed Runtime
 
 After installation:

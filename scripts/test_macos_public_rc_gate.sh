@@ -382,9 +382,10 @@ expect_failure "private path evidence" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$private_path_evidence"
 
 missing_check_evidence="$TMP_DIR/missing-check-stable-candidate-rc-qa.json"
-jq 'del(.checks.verify_codex)' "$passed_evidence" > "$missing_check_evidence"
-expect_failure "missing required check" \
+jq 'del(.checks.mixed_owner_app_version_truth)' "$passed_evidence" > "$missing_check_evidence"
+expect_failure "missing mixed-owner app version truth check" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$missing_check_evidence"
+grep -q "mixed_owner_app_version_truth" /tmp/macos-public-rc-gate.out
 
 bad_stable_sha="$TMP_DIR/bad-stable-sha-manifest.json"
 write_stable_binding_manifest \
