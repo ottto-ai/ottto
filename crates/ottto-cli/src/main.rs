@@ -2125,6 +2125,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::SetupAnswer { .. } => "setup_answer",
         LocalControlCommand::SetupAction { .. } => "setup_action",
         LocalControlCommand::TelemetryControl { .. } => "telemetry_control",
+        LocalControlCommand::CloudSessionsControl { .. } => "cloud_sessions_control",
         LocalControlCommand::ClaudeDesktopWebUsagePreference { .. } => {
             "claude_desktop_web_usage_preference"
         }

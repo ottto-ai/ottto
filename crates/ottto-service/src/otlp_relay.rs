@@ -441,11 +441,12 @@ fn handle_control_request(
     if !matches!(
         &control_request.command,
         LocalControlCommand::TelemetryControl { .. }
+            | LocalControlCommand::CloudSessionsControl { .. }
     ) {
         return write_json_response_with_headers(
             stream,
             400,
-            json!({"error":"unsupported_command","message":"Browser local control only accepts telemetry_control"}),
+            json!({"error":"unsupported_command","message":"Browser local control only accepts approved control-token commands"}),
             &cors_headers,
         );
     }

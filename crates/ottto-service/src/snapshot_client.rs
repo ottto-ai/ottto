@@ -753,6 +753,58 @@ impl SnapshotApiClient {
         }
     }
 
+    /// Read one exact, relay-device-bound cloud grant epoch. This endpoint is
+    /// deliberately not a list and never accepts browser authentication.
+    pub fn get_cloud_session_grant_authority_with_timeout(
+        &self,
+        relay_token: &str,
+        grant_id: &str,
+        grant_version: u64,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if !valid_cloud_grant_id(grant_id) || grant_version == 0 {
+            return Err(anyhow!("cloud-session authority identity is invalid"));
+        }
+        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        let path = format!(
+            "/api/v1/cloud-session-observations/grants/{grant_id}/authority?grant_version={grant_version}"
+        );
+        match agent
+            .get(&self.api_url(&path))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .call()
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
+                Err(anyhow::Error::new(CloudSessionContractRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "cloud-session authority read",
+                    "cloud_session_authority",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "cloud-session authority read",
+                "cloud_session_authority",
+                &error,
+            ))),
+        }
+    }
+
     /// Upload one idempotent positive-observation chunk for a bounded v2 scan.
     pub fn upload_cloud_session_scan_chunk(
         &self,
@@ -973,6 +1025,10 @@ fn valid_cloud_scan_id(value: &str) -> bool {
             8 | 13 | 18 | 23 => *byte == b'-',
             _ => byte.is_ascii_hexdigit(),
         })
+}
+
+fn valid_cloud_grant_id(value: &str) -> bool {
+    valid_cloud_scan_id(value)
 }
 
 fn validate_cloud_session_heartbeat_receipt(request: &Value, receipt: &Value) -> Result<()> {
