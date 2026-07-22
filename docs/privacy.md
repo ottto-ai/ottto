@@ -70,9 +70,11 @@ The collector polls no more often than every five minutes plus up to 20 seconds
 of jitter. Normal polls read one head page; unchanged heads produce zero
 observation/ingest upload, though mandatory backend grant revalidation still
 occurs, and allow an observation-empty v1 heartbeat hourly. A full scan runs
-daily and until one has completed. Every provider page, chunk, finalize, and heartbeat is
-preceded by local kill/pause/revoke checks and exact backend grant/policy
-revalidation. Only a strictly decoded
+daily and until one has completed. Every provider page, chunk, finalize, and
+heartbeat is preceded by local kill/pause/revoke checks and exact backend
+grant/policy revalidation. Revalidation uses a short-lived source-scoped relay
+token and an exact grant UUID/version authority read; it never lists another
+grant or carries the browser JWT. Only a strictly decoded
 `server_policy_state: "approved"` permits that cycle to invoke Codex. Missing or
 unknown policy, disabled/revoked state, backend absence, authentication failure,
 and network or parse errors stop before provider access. A nonempty CLI page
@@ -94,8 +96,9 @@ not infer one or merge histories across a user-known provider-account switch.
 Such a switch requires explicit local stop, exact backend deletion, and setup
 again.
 
-The strict v2 chunk/finalize relay adapters and backend DTOs are present for contract testing, but
-public service startup remains hard-wired to deferred transport. It cannot
+The strict v2 chunk/finalize relay adapters, exact relay authority read, and
+backend DTOs are present for contract testing, but public service startup
+remains hard-wired to deferred transport. It cannot
 invoke Codex or upload until the private backend is deployed and the retention,
 cardinality, prune, and exact-delete-cost gate is approved. Authenticated
 companion/UI code owns backend grant create/delete. Before a create handoff the
@@ -105,6 +108,15 @@ the backend grant UUID is bound; one intervening list absence cannot clear the
 tombstone or permit replacement while the original POST may still commit. The
 daemon stores only the opaque grant UUID/version/server-policy response and
 rejects stale pre-revoke epochs.
+
+Browser consent controls use one short-lived backend-signed token bound to the
+action, organization, effective user, Codex relay device, and source. The daemon
+validates it only against a trusted Ottto backend, compares every binding with
+the connected local account/device, and atomically consumes it before a side
+effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
+the JWT and raw token id are never persisted. Pause/revoke closes provider-call
+admission first and waits for an already admitted bounded subprocess to finish
+before returning the exact backend DELETE target.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task

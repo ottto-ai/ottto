@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
 use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
+pub use ottto_protocol::{CloudSessionBackendGrantResponseV1, CloudSessionServerPolicyState};
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
 use serde_json::json;
@@ -19,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
@@ -30,6 +31,8 @@ const CHUNK_SCHEMA_VERSION: &str = "cloud_session_observation_chunk.v2";
 const FINALIZE_SCHEMA_VERSION: &str = "cloud_session_scan_finalize.v2";
 const GRANT_SCHEMA_VERSION: &str = "cloud_session_grant.v1";
 const CHECKPOINT_SCHEMA_VERSION: &str = "cloud_session_checkpoint.v1";
+const CONTROL_TOKEN_LEDGER_SCHEMA_VERSION: &str = "cloud_session_control_token_uses.v1";
+const MAX_CONTROL_TOKEN_USES: usize = 64;
 const MAX_PAGES: usize = 10;
 const MAX_ITEMS: usize = 200;
 const MAX_SCAN_PAGES: usize = 100;
@@ -55,14 +58,6 @@ pub enum CloudSessionGrantStatus {
     Paused,
     Revoked,
     PolicyDisabled,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionServerPolicyState {
-    Approved,
-    #[default]
-    Disabled,
 }
 
 /// Operator/UI status for this collector. The service exposes this without
@@ -154,28 +149,6 @@ pub struct CloudSessionPendingBackendCreateV1 {
     pub consent: bool,
 }
 
-/// Strict subset of the authenticated backend grant response needed to bind
-/// collection. The daemon never acquires or persists the user's web JWT; the
-/// companion/UI owns POST/DELETE consent and hands this response back locally.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionBackendGrantResponseV1 {
-    pub id: String,
-    pub installation_id: String,
-    pub source: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub release_lane: String,
-    pub disclosure_version: String,
-    pub grant_scope_fingerprint: String,
-    pub account_fingerprint: String,
-    pub status: String,
-    pub grant_version: u64,
-    /// Required and strictly decoded. Missing or unknown values cannot make a
-    /// local grant runtime-ready.
-    pub server_policy_state: CloudSessionServerPolicyState,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSessionBackendGrantCreateRequestV1 {
     pub installation_id: String,
@@ -236,6 +209,127 @@ struct LegacyCloudSessionGrantV1 {
     last_error_category: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudSessionControlTokenUseLedger {
+    schema_version: String,
+    entries: Vec<CloudSessionControlTokenUse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudSessionControlTokenUse {
+    token_digest: String,
+    expires_at_unix: u64,
+}
+
+/// Owner-only, bounded replay ledger for device-bound one-time action tokens.
+/// Only SHA-256(jti) and expiry are persisted; the signed token and raw jti are
+/// never written to disk.
+#[derive(Debug, Clone)]
+pub struct CloudSessionControlTokenUseStore {
+    path: PathBuf,
+}
+
+impl CloudSessionControlTokenUseStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn consume(&self, token_id: &str, expires_at_unix: u64, now_unix: u64) -> Result<()> {
+        let token_id = token_id.trim();
+        if token_id.is_empty()
+            || token_id.len() > 128
+            || expires_at_unix <= now_unix
+            || expires_at_unix > now_unix.saturating_add(300)
+        {
+            return Err(anyhow!("cloud-session control token lifetime is invalid"));
+        }
+        let _lock = self.lock()?;
+        let mut ledger = if self.path.exists() {
+            serde_json::from_slice::<CloudSessionControlTokenUseLedger>(
+                &fs::read(&self.path).context("read cloud-session control token ledger")?,
+            )
+            .context("decode cloud-session control token ledger")?
+        } else {
+            CloudSessionControlTokenUseLedger {
+                schema_version: CONTROL_TOKEN_LEDGER_SCHEMA_VERSION.to_string(),
+                entries: Vec::new(),
+            }
+        };
+        if ledger.schema_version != CONTROL_TOKEN_LEDGER_SCHEMA_VERSION {
+            return Err(anyhow!("unsupported cloud-session control token ledger"));
+        }
+        ledger
+            .entries
+            .retain(|entry| entry.expires_at_unix > now_unix);
+        let token_digest = hex(&Sha256::digest(token_id.as_bytes()));
+        if ledger
+            .entries
+            .iter()
+            .any(|entry| entry.token_digest == token_digest)
+        {
+            return Err(anyhow!("cloud-session control token was already used"));
+        }
+        // Never evict an unexpired digest to make room: that would make its
+        // still-valid action token replayable. A full five-minute window fails
+        // closed until expiry pruning creates capacity.
+        if ledger.entries.len() >= MAX_CONTROL_TOKEN_USES {
+            return Err(anyhow!(
+                "cloud-session control token replay ledger is at capacity"
+            ));
+        }
+        ledger.entries.push(CloudSessionControlTokenUse {
+            token_digest,
+            expires_at_unix,
+        });
+        ledger.entries.sort_by_key(|entry| entry.expires_at_unix);
+        atomic_json_write(&self.path, &ledger)
+    }
+
+    fn lock(&self) -> Result<CloudSessionGrantLock> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow!("cloud-session control token ledger path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        let path = self.path.with_extension("lock");
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&path)
+            .context("open cloud-session control token ledger lock")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
+        #[cfg(unix)]
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
+            return Err(anyhow!("lock cloud-session control token ledger"));
+        }
+        Ok(CloudSessionGrantLock { file })
+    }
+}
+
+impl Default for CloudSessionControlTokenUseStore {
+    fn default() -> Self {
+        Self::new(
+            default_support_dir()
+                .join("cloud_sessions")
+                .join("control-token-uses.json"),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CloudSessionGrantStore {
     path: PathBuf,
@@ -278,6 +372,21 @@ impl CloudSessionGrantStore {
             let expected_scope = grant_scope_fingerprint(&key, setup);
             if state.grant.grant_scope_id == expected_scope {
                 if state.grant.backend_create_pending {
+                    // A browser may lose the loopback prepare response before
+                    // issuing the authenticated POST. Repeating the exact
+                    // device/user/org action returns the same tombstoned create
+                    // payload; scope replacement remains blocked below.
+                    if state.grant.status == CloudSessionGrantStatus::ConsentRequired {
+                        validate_pending_backend_create(
+                            &state.grant,
+                            &state
+                                .grant
+                                .pending_backend_create
+                                .clone()
+                                .unwrap_or_else(|| pending_backend_create(&state.grant)),
+                        )?;
+                        return Ok(state.grant);
+                    }
                     return Err(anyhow!(
                         "pending cloud-session backend grant creation must be reconciled before setup changes"
                     ));
@@ -1381,6 +1490,35 @@ pub struct CloudSessionCheckpointStore {
     /// collector instance. Reconstructing the store after restart drops the
     /// cursor and starts a new UUID from page zero.
     runtime: Mutex<CloudSessionScanRuntime>,
+    provider_calls: Arc<CloudSessionProviderCallFence>,
+}
+
+#[derive(Default)]
+struct CloudSessionProviderCallFence {
+    active_calls: Mutex<usize>,
+    idle: Condvar,
+}
+
+struct CloudSessionProviderCallLease<'a> {
+    fence: &'a CloudSessionProviderCallFence,
+}
+
+impl Drop for CloudSessionProviderCallLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.fence.active_calls.lock() {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.fence.idle.notify_all();
+            }
+        }
+    }
+}
+
+fn default_provider_call_fence() -> Arc<CloudSessionProviderCallFence> {
+    static FENCE: OnceLock<Arc<CloudSessionProviderCallFence>> = OnceLock::new();
+    FENCE
+        .get_or_init(|| Arc::new(CloudSessionProviderCallFence::default()))
+        .clone()
 }
 
 #[derive(Default)]
@@ -1422,7 +1560,54 @@ impl CloudSessionCheckpointStore {
         Self {
             path: path.into(),
             runtime: Mutex::new(CloudSessionScanRuntime::default()),
+            provider_calls: Arc::new(CloudSessionProviderCallFence::default()),
         }
+    }
+
+    fn begin_provider_call<'a>(
+        &'a self,
+        grants: &CloudSessionGrantStore,
+        expected: &CloudSessionGrant,
+    ) -> Result<Option<CloudSessionProviderCallLease<'a>>> {
+        let mut active = self
+            .provider_calls
+            .active_calls
+            .lock()
+            .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+        if kill_switch_enabled() || !grant_still_current(grants, expected) {
+            return Ok(None);
+        }
+        *active = active.saturating_add(1);
+        Ok(Some(CloudSessionProviderCallLease {
+            fence: &self.provider_calls,
+        }))
+    }
+
+    /// Wait until every provider subprocess admitted before a local stop has
+    /// returned. Pause/revoke callers must complete this before reporting that
+    /// provider activity is stopped or deleting backend consent.
+    pub fn wait_for_provider_idle(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut active = self
+            .provider_calls
+            .active_calls
+            .lock()
+            .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+        while *active > 0 {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("cloud-session provider call did not stop in time"))?;
+            let (next, timeout_result) =
+                self.provider_calls
+                    .idle
+                    .wait_timeout(active, remaining)
+                    .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+            active = next;
+            if timeout_result.timed_out() && *active > 0 {
+                return Err(anyhow!("cloud-session provider call did not stop in time"));
+            }
+        }
+        Ok(())
     }
     fn load(&self) -> CloudSessionCheckpoint {
         fs::read(&self.path)
@@ -1443,11 +1628,13 @@ impl CloudSessionCheckpointStore {
 
 impl Default for CloudSessionCheckpointStore {
     fn default() -> Self {
-        Self::new(
-            default_support_dir()
+        Self {
+            path: default_support_dir()
                 .join("cloud_sessions")
                 .join("checkpoint.json"),
-        )
+            runtime: Mutex::new(CloudSessionScanRuntime::default()),
+            provider_calls: default_provider_call_fence(),
+        }
     }
 }
 
@@ -1679,6 +1866,65 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
         !self.device_secret.is_empty()
             && is_uuid(&self.device.device_id)
             && self.device.sources.iter().any(|source| source == "codex")
+    }
+
+    fn supports_grant_revalidation(&self) -> bool {
+        self.is_configured()
+    }
+
+    fn revalidate_grant(
+        &self,
+        grant: &CloudSessionGrant,
+    ) -> Result<CloudSessionBackendGrantResponseV1> {
+        self.revalidate_grant_bounded(grant, CYCLE_BUDGET)
+    }
+
+    fn revalidate_grant_bounded(
+        &self,
+        grant: &CloudSessionGrant,
+        timeout: Duration,
+    ) -> Result<CloudSessionBackendGrantResponseV1> {
+        if !self.is_configured() {
+            return Err(anyhow!("cloud-session relay transport is not source-bound"));
+        }
+        let binding = grant
+            .backend_binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
+        if !is_uuid(&binding.grant_id) || binding.grant_version == 0 {
+            return Err(anyhow!("cloud-session backend grant binding is invalid"));
+        }
+        let deadline = Instant::now() + timeout;
+        let token = self.token(false, deadline)?;
+        let request_timeout = remaining_budget(deadline)
+            .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+        let first = self.client.get_cloud_session_grant_authority_with_timeout(
+            &token,
+            &binding.grant_id,
+            binding.grant_version,
+            request_timeout,
+        );
+        let value = match first {
+            Ok(value) => value,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::snapshot_client::CloudSessionAuthorizationRejected>()
+                    .is_some() =>
+            {
+                let refreshed = self.token(true, deadline)?;
+                let retry_timeout = remaining_budget(deadline)
+                    .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
+                self.client.get_cloud_session_grant_authority_with_timeout(
+                    &refreshed,
+                    &binding.grant_id,
+                    binding.grant_version,
+                    retry_timeout,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
+        serde_json::from_value(value)
+            .map_err(|error| anyhow!("invalid cloud-session authority response: {error}"))
     }
 
     fn send(&self, batch: &CloudSessionObservationBatchV1) -> Result<()> {
@@ -1931,6 +2177,7 @@ fn collect_cloud_sessions_once_with_budget(
     let deadline = Instant::now() + cycle_budget;
     let result = collect_enabled_cycle(
         grants,
+        checkpoints,
         &checkpoint,
         &mut runtime,
         runner,
@@ -2047,8 +2294,10 @@ struct CycleError {
     health_uploaded: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_enabled_cycle(
     grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
     checkpoint: &CloudSessionCheckpoint,
     runtime: &mut CloudSessionScanRuntime,
     runner: &dyn CloudSessionRunner,
@@ -2147,7 +2396,22 @@ fn collect_enabled_cycle(
         let Some(timeout) = remaining_budget(deadline) else {
             return Ok(CycleResult::Deferred);
         };
-        let raw = match runner.list_page_bounded(cursor, PAGE_LIMIT, timeout) {
+        let provider_call = checkpoints
+            .begin_provider_call(grants, &expected_grant)
+            .map_err(|_| CycleError {
+                category: "provider_fence_unavailable",
+                health_uploaded: false,
+            })?;
+        let Some(provider_call) = provider_call else {
+            runtime.active = None;
+            return Ok(CycleResult::Noop);
+        };
+        let raw_result = runner.list_page_bounded(cursor, PAGE_LIMIT, timeout);
+        // The lease represents provider-process activity only. Release it as
+        // soon as the bounded runner returns so pause/revoke never waits on
+        // later backend health or revalidation I/O from an error path.
+        drop(provider_call);
+        let raw = match raw_result {
             Ok(raw) => raw,
             Err(_) => {
                 if remaining_budget(deadline).is_none() {
@@ -3448,6 +3712,225 @@ mod tests {
             .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
             .unwrap();
     }
+
+    #[test]
+    fn control_token_ledger_is_atomic_bounded_and_replay_safe_across_restart() {
+        let root = temp_dir("control-token-ledger");
+        let path = root.join("control-token-uses.json");
+        let now = 1_800_000_000;
+        let token_id = "apps-control-private-jti";
+        let store = Arc::new(CloudSessionControlTokenUseStore::new(&path));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let attempts = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    store.consume(token_id, now + 120, now)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+        let restarted = CloudSessionControlTokenUseStore::new(&path);
+        assert!(restarted.consume(token_id, now + 120, now).is_err());
+        let bytes = fs::read_to_string(&path).unwrap();
+        assert!(!bytes.contains(token_id));
+        assert!(!bytes.contains("header.payload.signature"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        for index in 0..(MAX_CONTROL_TOKEN_USES - 1) {
+            restarted
+                .consume(&format!("token-{index}"), now + 121 + index as u64, now)
+                .unwrap();
+        }
+        let ledger: CloudSessionControlTokenUseLedger =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(ledger.entries.len(), MAX_CONTROL_TOKEN_USES);
+        assert!(restarted.consume("over-cap", now + 240, now).is_err());
+        assert!(restarted.consume(token_id, now + 120, now).is_err());
+        restarted
+            .consume("post-expiry", now + 500, now + 400)
+            .unwrap();
+        let pruned: CloudSessionControlTokenUseLedger =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pruned.entries.len(), 1);
+    }
+
+    #[test]
+    fn revoke_prevents_new_provider_admission_and_waits_for_inflight_call() {
+        use std::sync::mpsc;
+
+        struct BlockingRunner {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl CloudSessionRunner for BlockingRunner {
+            fn list_page(&self, _cursor: Option<&str>, _limit: usize) -> Result<String> {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                Ok(page("blocked-provider-call", None))
+            }
+        }
+        struct AuthorityTransport;
+        impl CloudSessionTransport for AuthorityTransport {
+            fn supports_grant_revalidation(&self) -> bool {
+                true
+            }
+            fn revalidate_grant_bounded(
+                &self,
+                grant: &CloudSessionGrant,
+                _timeout: Duration,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                Ok(backend_grant(grant, "enabled", 1))
+            }
+            fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = temp_dir("provider-call-fence");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &BlockingRunner {
+                    entered: entered_tx,
+                    release: release_rx,
+                },
+                &AuthorityTransport,
+                now(),
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        grants.revoke(now()).unwrap();
+        let waiter_checkpoints = Arc::clone(&checkpoints);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result = waiter_checkpoints.wait_for_provider_idle(Duration::from_secs(2));
+            stopped_tx.send(result).unwrap();
+        });
+        assert!(stopped_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (_second_release_tx, second_release_rx) = mpsc::channel();
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &BlockingRunner {
+                    entered: second_entered_tx,
+                    release: second_release_rx,
+                },
+                &AuthorityTransport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert!(second_entered_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn provider_error_releases_stop_fence_before_backend_health_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        struct ErrorRunner;
+        impl CloudSessionRunner for ErrorRunner {
+            fn list_page(&self, _cursor: Option<&str>, _limit: usize) -> Result<String> {
+                Err(anyhow!("provider failed"))
+            }
+        }
+        struct BlockingFailureTransport {
+            authority_calls: AtomicUsize,
+            backend_entered: mpsc::Sender<()>,
+            backend_release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl CloudSessionTransport for BlockingFailureTransport {
+            fn supports_grant_revalidation(&self) -> bool {
+                true
+            }
+            fn revalidate_grant_bounded(
+                &self,
+                grant: &CloudSessionGrant,
+                _timeout: Duration,
+            ) -> Result<CloudSessionBackendGrantResponseV1> {
+                if self.authority_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                    self.backend_entered.send(()).unwrap();
+                    self.backend_release.lock().unwrap().recv().unwrap();
+                }
+                Ok(backend_grant(grant, "enabled", 1))
+            }
+            fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = temp_dir("provider-error-fence");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let (backend_entered_tx, backend_entered_rx) = mpsc::channel();
+        let (backend_release_tx, backend_release_rx) = mpsc::channel();
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &ErrorRunner,
+                &BlockingFailureTransport {
+                    authority_calls: AtomicUsize::new(0),
+                    backend_entered: backend_entered_tx,
+                    backend_release: Mutex::new(backend_release_rx),
+                },
+                now(),
+            )
+        });
+        backend_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        checkpoints
+            .wait_for_provider_idle(Duration::from_millis(100))
+            .unwrap();
+        backend_release_tx.send(()).unwrap();
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Failed);
+    }
+
     fn backend_grant(
         local: &CloudSessionGrant,
         status: &str,
@@ -5202,6 +5685,117 @@ mod tests {
         }
         assert!(requests[3].contains("Authorization: Bearer relay-cloud-new"));
         assert!(requests[4].contains("Authorization: Bearer relay-cloud-new"));
+    }
+
+    #[test]
+    fn relay_transport_revalidates_one_exact_device_bound_grant_epoch() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let (grants, _checkpoints) = stores("relay-authority-exact");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let authority_body = serde_json::to_string(&backend_grant(&grant, "enabled", 1)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                server_captured.lock().unwrap().push(request);
+                let body = if index == 0 {
+                    r#"{"token":"relay-authority"}"#
+                } else {
+                    &authority_body
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let transport = RelayCloudSessionTransport::new(
+            format!("http://{address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            },
+            "device-secret".to_string(),
+        );
+
+        let response = transport
+            .revalidate_grant_bounded(&grant, Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(response.id, GRANT_ID);
+        assert_eq!(response.grant_version, 1);
+        server.join().unwrap();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("/relay-token"));
+        assert!(requests[0].contains("X-Ottto-Device-Secret: device-secret"));
+        assert!(requests[1].contains(&format!(
+            "GET /api/v1/cloud-session-observations/grants/{GRANT_ID}/authority?grant_version=1"
+        )));
+        assert!(requests[1].contains("Authorization: Bearer relay-authority"));
+        assert!(!requests[1].contains("device-secret"));
+    }
+
+    #[test]
+    fn authority_absence_or_epoch_conflict_prevents_provider_call() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        for (name, authority_status) in [("absent", "404 Not Found"), ("epoch", "409 Conflict")] {
+            let (grants, checkpoints) = stores(&format!("relay-authority-{name}"));
+            enabled(&grants);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                for index in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let _request = read_http_request(&mut stream);
+                    let (status, body) = if index == 0 {
+                        ("200 OK", r#"{"token":"relay-authority"}"#)
+                    } else {
+                        (authority_status, r#"{"detail":"redacted"}"#)
+                    };
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            });
+            let transport = RelayCloudSessionTransport::new(
+                format!("http://{address}"),
+                LocalDeviceBinding {
+                    device_id: INSTALLATION_ID.to_string(),
+                    machine_id: None,
+                    sources: vec!["codex".to_string()],
+                },
+                "device-secret".to_string(),
+            );
+            let runner = Pages {
+                pages: RefCell::new(vec![page("must-not-run", None)]),
+                calls: Cell::new(0),
+                revoke: None,
+            };
+            assert_eq!(
+                collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+                CloudSessionCycleOutcome::Failed,
+                "case {name}"
+            );
+            assert_eq!(runner.calls.get(), 0, "case {name}");
+            server.join().unwrap();
+        }
     }
 
     #[test]

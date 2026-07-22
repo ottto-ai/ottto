@@ -26,17 +26,18 @@ use ottto_protocol::{
     AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentProviderImpactQuery,
     AgentRecommendationsQuery, AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse,
     AuthResetResponse, AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError,
-    CliErrorCode, ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
-    DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
-    DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
-    LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
-    LocalControlCommand, LocalControlRequest, LocalControlResponse, MachineIdentity, RedactedValue,
-    RelayRuntimeState, RelayState, ReleaseChannel, RepairAction, RepairActionApproval,
-    RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus, SecretString,
-    ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
-    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
-    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    CliErrorCode, CloudSessionBackendGrantResponseV1, CloudSessionsControlAction, ConfigDrift,
+    ControlResult, ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
+    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
+    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
+    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
+    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
+    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
+    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
+    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -684,6 +685,17 @@ fn handle_command(
             organization_id,
             otlp_endpoint,
             ingest_key,
+        )?),
+        LocalControlCommand::CloudSessionsControl {
+            action,
+            control_token,
+            api_base_url,
+            backend_grant,
+        } => to_value(cloud_sessions_control(
+            action,
+            control_token,
+            api_base_url,
+            backend_grant,
         )?),
         LocalControlCommand::UpdateCheck => to_value(check_update_state()),
         LocalControlCommand::UninstallPlan | LocalControlCommand::Uninstall => {
@@ -1342,6 +1354,9 @@ fn redacted_string(value: &RedactedValue) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BackendControlTokenClaims {
     organization_id: Option<String>,
+    user_id: Option<String>,
+    device_id: Option<String>,
+    token_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1354,6 +1369,9 @@ struct BackendControlTokenValidationRequest {
 #[derive(Debug, Deserialize)]
 struct BackendControlTokenValidationResponse {
     organization_id: Option<String>,
+    user_id: Option<String>,
+    device_id: Option<String>,
+    token_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1832,17 +1850,34 @@ fn validate_control_token_with_backend(
     action: &TelemetryControlAction,
     source: &SourceKind,
 ) -> Result<BackendControlTokenClaims, LocalApiError> {
+    validate_control_token_with_backend_for(
+        api_base_url,
+        token,
+        action_slug(action),
+        source_slug(source),
+    )
+}
+
+fn validate_control_token_with_backend_for(
+    api_base_url: &str,
+    token: &str,
+    action: &str,
+    source: &str,
+) -> Result<BackendControlTokenClaims, LocalApiError> {
     let url = api_url_with_base(api_base_url, "/api/v1/apps/control-token/validate");
     let request = BackendControlTokenValidationRequest {
         token: token.to_string(),
-        source: source_slug(source).to_string(),
-        action: action_slug(action).to_string(),
+        source: source.to_string(),
+        action: action.to_string(),
     };
     match backend_post_json::<BackendControlTokenValidationResponse>(&url, &request, &[]) {
         Ok(response) => Ok(BackendControlTokenClaims {
             organization_id: response
                 .organization_id
                 .filter(|value| !value.trim().is_empty()),
+            user_id: response.user_id.filter(|value| !value.trim().is_empty()),
+            device_id: response.device_id.filter(|value| !value.trim().is_empty()),
+            token_id: response.token_id.filter(|value| !value.trim().is_empty()),
         }),
         Err(LocalApiError::Backend(details)) if matches!(details.status, Some(401) | Some(403)) => {
             Err(LocalApiError::LocalClientNotTrusted)
@@ -1856,6 +1891,14 @@ fn validate_control_token_fresh(
     action: &TelemetryControlAction,
     source: &SourceKind,
 ) -> Result<(), LocalApiError> {
+    validate_control_token_fresh_for(token, action_slug(action), source_slug(source)).map(|_| ())
+}
+
+fn validate_control_token_fresh_for(
+    token: &str,
+    action: &str,
+    source: &str,
+) -> Result<u64, LocalApiError> {
     if token.trim().is_empty() {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
@@ -1863,10 +1906,10 @@ fn validate_control_token_fresh(
     if payload.get("type").and_then(|value| value.as_str()) != Some("apps_control") {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
-    if payload.get("source").and_then(|value| value.as_str()) != Some(source_slug(source)) {
+    if payload.get("source").and_then(|value| value.as_str()) != Some(source) {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
-    if payload.get("action").and_then(|value| value.as_str()) != Some(action_slug(action)) {
+    if payload.get("action").and_then(|value| value.as_str()) != Some(action) {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
     let exp = payload
@@ -1880,7 +1923,189 @@ fn validate_control_token_fresh(
     if exp <= now {
         return Err(LocalApiError::LocalClientNotTrusted);
     }
-    Ok(())
+    Ok(exp)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CloudSessionsControlResult {
+    action: CloudSessionsControlAction,
+    status: crate::cloud_sessions::CloudSessionCollectorStatusV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_create_request: Option<crate::cloud_sessions::CloudSessionBackendGrantCreateRequestV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_revoke_target: Option<crate::cloud_sessions::CloudSessionBackendGrantRevokeTargetV1>,
+}
+
+fn cloud_sessions_action_slug(action: &CloudSessionsControlAction) -> &'static str {
+    match action {
+        CloudSessionsControlAction::Prepare => "prepare_cloud_sessions",
+        CloudSessionsControlAction::Bind => "bind_cloud_sessions",
+        CloudSessionsControlAction::Pause => "pause_cloud_sessions",
+        CloudSessionsControlAction::Revoke => "revoke_cloud_sessions",
+        CloudSessionsControlAction::ConfirmRevoked => "confirm_cloud_sessions_revoked",
+        CloudSessionsControlAction::Status => "cloud_sessions_status",
+    }
+}
+
+fn cloud_sessions_control(
+    action: CloudSessionsControlAction,
+    control_token: SecretString,
+    api_base_url: Option<String>,
+    backend_grant: Option<CloudSessionBackendGrantResponseV1>,
+) -> Result<CloudSessionsControlResult, LocalApiError> {
+    cloud_sessions_control_with_stores(
+        action,
+        control_token,
+        api_base_url,
+        backend_grant,
+        &FileAccountStore::default(),
+        &FileDeviceStore::default(),
+        &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        &crate::cloud_sessions::CloudSessionCheckpointStore::default(),
+        &crate::cloud_sessions::CloudSessionControlTokenUseStore::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_sessions_control_with_stores(
+    action: CloudSessionsControlAction,
+    control_token: SecretString,
+    api_base_url: Option<String>,
+    backend_grant: Option<CloudSessionBackendGrantResponseV1>,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    grants: &crate::cloud_sessions::CloudSessionGrantStore,
+    checkpoints: &crate::cloud_sessions::CloudSessionCheckpointStore,
+    token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
+) -> Result<CloudSessionsControlResult, LocalApiError> {
+    let action_slug = cloud_sessions_action_slug(&action);
+    let control_token = control_token.expose_secret();
+    let expires_at_unix = validate_control_token_fresh_for(control_token, action_slug, "codex")?;
+    let token_validation_base_url = control_token_validation_base_url(api_base_url.as_deref())?;
+    let claims = validate_control_token_with_backend_for(
+        &token_validation_base_url,
+        control_token,
+        action_slug,
+        "codex",
+    )?;
+
+    let account = accounts.load().map_err(|_| {
+        LocalApiError::LocalOperationFailed(
+            "cloud-session account binding is unavailable".to_string(),
+        )
+    })?;
+    let device = devices
+        .load()
+        .map_err(|_| {
+            LocalApiError::LocalOperationFailed(
+                "cloud-session device binding is unavailable".to_string(),
+            )
+        })?
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    if account.state != LocalAccountState::Connected
+        || claims.user_id.as_deref() != Some(local_user_id)
+        || claims.organization_id.as_deref() != Some(local_organization_id)
+        || claims.device_id.as_deref() != Some(device.device_id.as_str())
+        || !device.sources.iter().any(|source| source == "codex")
+    {
+        return Err(LocalApiError::LocalClientNotTrusted);
+    }
+    let token_id = claims
+        .token_id
+        .as_deref()
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+
+    let backend_grant_required = matches!(
+        action,
+        CloudSessionsControlAction::Bind | CloudSessionsControlAction::ConfirmRevoked
+    );
+    if backend_grant_required != backend_grant.is_some() {
+        return Err(LocalApiError::InvalidRequest(
+            "backend_grant presence does not match cloud-session action".to_string(),
+        ));
+    }
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_secs();
+    // Atomic consumption happens after trusted-backend and exact local binding
+    // validation, but before any local grant side effect.
+    token_uses
+        .consume(token_id, expires_at_unix, now_unix)
+        .map_err(|_| LocalApiError::LocalClientNotTrusted)?;
+
+    let mut backend_create_request = None;
+    let mut backend_revoke_target = None;
+    let result = match action {
+        CloudSessionsControlAction::Prepare => grants
+            .enable(
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device.device_id.clone(),
+                    organization_scope: local_organization_id.to_string(),
+                    effective_user_scope: local_user_id.to_string(),
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .and_then(|grant| {
+                if grant.backend_binding.is_some() && !grant.backend_create_pending {
+                    Ok(None)
+                } else {
+                    grants.grant_create_request(&device.device_id).map(Some)
+                }
+            })
+            .map(|request| backend_create_request = request),
+        CloudSessionsControlAction::Bind => grants
+            .bind_backend_grant(
+                backend_grant
+                    .as_ref()
+                    .expect("backend grant presence validated"),
+                &device.device_id,
+            )
+            .map(|_| ()),
+        CloudSessionsControlAction::Pause => grants
+            .pause(time::OffsetDateTime::now_utc())
+            .and_then(|_| checkpoints.wait_for_provider_idle(Duration::from_secs(15))),
+        CloudSessionsControlAction::Revoke => grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .and_then(|_| checkpoints.wait_for_provider_idle(Duration::from_secs(15)))
+            .and_then(|_| grants.grant_revoke_target())
+            .map(|target| backend_revoke_target = Some(target)),
+        CloudSessionsControlAction::ConfirmRevoked => grants
+            .apply_backend_revocation(
+                backend_grant
+                    .as_ref()
+                    .expect("backend grant presence validated"),
+                &device.device_id,
+            )
+            .map(|_| ()),
+        CloudSessionsControlAction::Status => Ok(()),
+    };
+    result.map_err(|_| {
+        LocalApiError::LocalOperationFailed("cloud-session local control failed".to_string())
+    })?;
+
+    Ok(CloudSessionsControlResult {
+        action,
+        status: crate::cloud_sessions::cloud_session_collector_status(
+            grants,
+            &crate::cloud_sessions::DeferredCloudSessionTransport,
+        ),
+        backend_create_request,
+        backend_revoke_target,
+    })
 }
 
 fn decode_control_token_payload(token: &str) -> Result<serde_json::Value, LocalApiError> {
@@ -12009,6 +12234,132 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn cloud_sessions_control_composes_prepare_bind_pause_resume_and_revoke() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("cloud-session-control");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints =
+            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let token_path = root.join("control-token-uses.json");
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(&token_path);
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |action: CloudSessionsControlAction,
+                   token_id: &str,
+                   backend_grant: Option<CloudSessionBackendGrantResponseV1>| {
+            let action_slug = cloud_sessions_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            cloud_sessions_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
+                backend_grant,
+                &accounts,
+                &devices,
+                &grants,
+                &checkpoints,
+                &token_uses,
+            )
+        };
+
+        let prepared = run(
+            CloudSessionsControlAction::Prepare,
+            "apps-control-prepare",
+            None,
+        )
+        .unwrap();
+        let create = prepared.backend_create_request.unwrap();
+        assert_eq!(create.installation_id, device_id);
+        assert_eq!(create.source, "codex");
+        assert!(create.consent);
+        let local = grants.load().unwrap().unwrap();
+        let enabled_response = cloud_control_backend_grant(&local, device_id, "enabled", 1);
+
+        let bound = run(
+            CloudSessionsControlAction::Bind,
+            "apps-control-bind",
+            Some(enabled_response),
+        )
+        .unwrap();
+        assert_eq!(
+            bound.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::TransportDeferred
+        );
+        assert!(!bound.status.provider_cli_invocation_permitted);
+
+        let paused = run(
+            CloudSessionsControlAction::Pause,
+            "apps-control-pause",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            paused.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::Paused
+        );
+
+        let resumed = run(
+            CloudSessionsControlAction::Prepare,
+            "apps-control-resume",
+            None,
+        )
+        .unwrap();
+        assert!(resumed.backend_create_request.is_none());
+        assert_eq!(
+            resumed.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::TransportDeferred
+        );
+
+        let revoked = run(
+            CloudSessionsControlAction::Revoke,
+            "apps-control-revoke",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            revoked.backend_revoke_target.unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+        let revoked_response =
+            cloud_control_backend_grant(&grants.load().unwrap().unwrap(), device_id, "revoked", 2);
+        let confirmed = run(
+            CloudSessionsControlAction::ConfirmRevoked,
+            "apps-control-confirm",
+            Some(revoked_response),
+        )
+        .unwrap();
+        assert_eq!(
+            confirmed.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::Revoked
+        );
+
+        let persisted = fs::read_to_string(token_path).unwrap();
+        for raw_id in [
+            "apps-control-prepare",
+            "apps-control-bind",
+            "apps-control-pause",
+            "apps-control-resume",
+            "apps-control-revoke",
+            "apps-control-confirm",
+        ] {
+            assert!(!persisted.contains(raw_id));
+        }
+        assert!(!persisted.contains("header."));
+    }
+
+    #[test]
     fn verification_marker_body_has_single_magic_metric() {
         let marker = verification_marker_body(
             &SourceKind::Codex,
@@ -16107,6 +16458,57 @@ log_user_prompt = true
                 .expect("write validation response");
         });
         format!("http://{address}")
+    }
+
+    fn cloud_control_validation_server(action: &str, token_id: &str, device_id: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cloud control backend");
+        let address = listener.local_addr().expect("local address");
+        let action = action.to_string();
+        let token_id = token_id.to_string();
+        let device_id = device_id.to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept cloud control validation");
+            let request = read_complete_http_request(&mut stream);
+            let body: serde_json::Value =
+                serde_json::from_str(http_request_body(&request)).expect("validation body");
+            assert_eq!(body["source"], "codex");
+            assert_eq!(body["action"], action);
+            let response = serde_json::json!({
+                "valid": true,
+                "source": "codex",
+                "action": action,
+                "organization_id": "org_test",
+                "user_id": "user_test",
+                "device_id": device_id,
+                "token_id": token_id,
+                "expires_at": "2030-01-01T00:00:00Z"
+            });
+            write_json_response(&mut stream, 200, "OK", &response.to_string());
+        });
+        format!("http://{address}")
+    }
+
+    fn cloud_control_backend_grant(
+        local: &crate::cloud_sessions::CloudSessionGrant,
+        device_id: &str,
+        status: &str,
+        grant_version: u64,
+    ) -> CloudSessionBackendGrantResponseV1 {
+        CloudSessionBackendGrantResponseV1 {
+            id: "00000000-0000-4000-8000-000000000002".to_string(),
+            installation_id: device_id.to_string(),
+            source: "codex".to_string(),
+            collector_id: "cloud_sessions".to_string(),
+            schema_version: "cloud_session_observations.v1".to_string(),
+            collector_version: compiled_release_version(),
+            release_lane: "supported".to_string(),
+            disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
+            grant_scope_fingerprint: local.grant_scope_id.clone(),
+            account_fingerprint: local.account_fingerprint.clone(),
+            status: status.to_string(),
+            grant_version,
+            server_policy_state: ottto_protocol::CloudSessionServerPolicyState::Approved,
+        }
     }
 
     fn control_token_validation_server_with_marker(status: u16) -> String {

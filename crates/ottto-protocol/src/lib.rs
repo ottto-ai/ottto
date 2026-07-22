@@ -2528,6 +2528,16 @@ pub enum LocalControlCommand {
         otlp_endpoint: Option<String>,
         ingest_key: Option<SecretString>,
     },
+    /// One short-lived, backend-authorized mutation/read of the local Codex
+    /// cloud-session consent state. Browser JWTs never cross this boundary.
+    CloudSessionsControl {
+        action: CloudSessionsControlAction,
+        control_token: SecretString,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_grant: Option<CloudSessionBackendGrantResponseV1>,
+    },
     Repair {
         source: SourceKind,
         dry_run: bool,
@@ -2561,6 +2571,44 @@ pub enum TelemetryControlAction {
     EnableTelemetry,
     DisableTelemetry,
     Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSessionsControlAction {
+    Prepare,
+    Bind,
+    Pause,
+    Revoke,
+    ConfirmRevoked,
+    Status,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudSessionServerPolicyState {
+    Approved,
+    #[default]
+    Disabled,
+}
+
+/// Strict identity-bearing subset needed to bind an ordinary-browser grant
+/// response locally. Provider content and credentials are never represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSessionBackendGrantResponseV1 {
+    pub id: String,
+    pub installation_id: String,
+    pub source: String,
+    pub collector_id: String,
+    pub schema_version: String,
+    pub collector_version: String,
+    pub release_lane: String,
+    pub disclosure_version: String,
+    pub grant_scope_fingerprint: String,
+    pub account_fingerprint: String,
+    pub status: String,
+    pub grant_version: u64,
+    pub server_policy_state: CloudSessionServerPolicyState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3188,6 +3236,54 @@ mod tests {
         let debug = format!("{request:?}");
         assert!(!debug.contains("transit_secret_for_tests"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn cloud_sessions_control_command_round_trips_without_browser_credentials() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_cloud_bind",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_kind": "web_ui",
+            "command": "cloud_sessions_control",
+            "action": "bind",
+            "control_token": "header.payload.signature",
+            "api_base_url": "https://api.ottto.net",
+            "backend_grant": {
+                "id": "00000000-0000-4000-8000-000000000002",
+                "installation_id": "00000000-0000-4000-8000-000000000001",
+                "source": "codex",
+                "collector_id": "cloud_sessions",
+                "schema_version": "cloud_session_observations.v1",
+                "collector_version": "0.1.90",
+                "release_lane": "supported",
+                "disclosure_version": "cloud_sessions_disclosure.v1",
+                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+                "status": "enabled",
+                "grant_version": 1,
+                "server_policy_state": "approved"
+            }
+        }))
+        .expect("cloud-session bind control request");
+
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::CloudSessionsControl {
+                action: CloudSessionsControlAction::Bind,
+                backend_grant: Some(CloudSessionBackendGrantResponseV1 {
+                    grant_version: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("header.payload.signature"));
+        assert!(debug.contains("<redacted>"));
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(!wire.contains("browser_jwt"));
+        assert!(!wire.contains("device_secret"));
+        assert!(!wire.contains("provider"));
     }
 
     #[test]
