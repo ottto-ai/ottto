@@ -2442,7 +2442,7 @@ fn complete_pending_auth_claim(
     // identity mutation before that remote side effect, but release the
     // lifecycle mutex during network I/O. The RAII guard blocks concurrent
     // Cloud-session admission and clears on every return or panic.
-    let identity_reservation = reserve_identity_mutation(false)?;
+    let identity_reservation = reserve_identity_mutation(true)?;
     let completed = match complete_setup_claim(&pending, machine) {
         Ok(completed) => completed,
         Err(error) => {
@@ -5234,7 +5234,7 @@ fn run_install_source_action(
     // a panic-safe reservation across that remote side effect and the exact
     // local identity install, while leaving the lifecycle mutex free during
     // network I/O.
-    let identity_reservation = reserve_identity_mutation(false)?;
+    let identity_reservation = reserve_identity_mutation(true)?;
     let registered = register_telemetry_device(api_base_url, &install_session, machine)?;
     let device_id = registered.device.id.clone();
     let device = LocalDeviceBinding {
@@ -13170,7 +13170,20 @@ mod tests {
                     .is_none(),
                 "cross-account completion must not reach backend before cleanup"
             );
-            assert_eq!(grants.load().unwrap().unwrap(), before);
+            let after = grants.load().unwrap().unwrap();
+            assert_eq!(
+                after.status,
+                if bind_backend {
+                    crate::cloud_sessions::CloudSessionGrantStatus::Paused
+                } else {
+                    crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired
+                }
+            );
+            assert_eq!(after.grant_scope_id, before.grant_scope_id);
+            assert_eq!(after.account_fingerprint, before.account_fingerprint);
+            assert_eq!(after.backend_binding, before.backend_binding);
+            assert_eq!(after.backend_create_pending, before.backend_create_pending);
+            assert_eq!(after.pending_backend_create, before.pending_backend_create);
             assert_eq!(FileAccountStore::default().load().unwrap(), account);
             assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
             assert_eq!(IDENTITY_MUTATION_RESERVATION.load(Ordering::Acquire), 0);
@@ -13366,7 +13379,21 @@ mod tests {
                 .unwrap(),
             "device registration must not reach backend before cleanup"
         );
-        assert_eq!(grants.load().unwrap().unwrap(), grant_before);
+        let grant_after = grants.load().unwrap().unwrap();
+        assert_eq!(
+            grant_after.status,
+            crate::cloud_sessions::CloudSessionGrantStatus::Paused
+        );
+        assert_eq!(grant_after.grant_scope_id, grant_before.grant_scope_id);
+        assert_eq!(
+            grant_after.account_fingerprint,
+            grant_before.account_fingerprint
+        );
+        assert_eq!(grant_after.backend_binding, grant_before.backend_binding);
+        assert_eq!(
+            grant_after.backend_create_pending,
+            grant_before.backend_create_pending
+        );
         assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
     }
 
