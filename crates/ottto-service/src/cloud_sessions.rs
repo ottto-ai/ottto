@@ -567,16 +567,36 @@ impl CloudSessionGrantStore {
             .read_locked()?
             .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
         let local_status = state.grant.status.clone();
-        if !state.grant.backend_create_pending {
-            return Err(anyhow!(
-                "cloud-session backend grant response has no pending authenticated create"
-            ));
-        }
         validate_local_installation_binding(
             &state,
             expected_installation_id,
             "backend cloud-session grant",
         )?;
+        if !state.grant.backend_create_pending {
+            validate_backend_grant_response(&state, response, &state.grant.collector_version)?;
+            if response.installation_id != expected_installation_id || response.status != "enabled"
+            {
+                return Err(anyhow!("backend cloud-session grant does not match"));
+            }
+            let existing = state
+                .grant
+                .backend_binding
+                .as_ref()
+                .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
+            if existing.grant_id == response.id
+                && existing.grant_version == response.grant_version
+                && !existing.backend_revoked
+                && existing.server_policy_state == response.server_policy_state
+            {
+                // Lost loopback responses retry the exact authenticated bind.
+                // Return the current local state without rewriting timestamps
+                // or resurrecting a later pause/revoke.
+                return Ok(state.grant);
+            }
+            return Err(anyhow!(
+                "backend cloud-session grant response differs from the bound grant"
+            ));
+        }
         let pending = state
             .grant
             .pending_backend_create
@@ -612,9 +632,10 @@ impl CloudSessionGrantStore {
         state.grant.collector_version = response.collector_version.clone();
         if local_status == CloudSessionGrantStatus::Revoked {
             self.write(&state)?;
-            return Err(anyhow!(
-                "local cloud-session consent was revoked; backend grant must be deleted"
-            ));
+            // A POST may commit just before local revoke or rollout removal.
+            // Preserve only its exact identity for compensating DELETE; local
+            // revoked state continues to block every provider admission.
+            return Ok(state.grant);
         }
         if local_status == CloudSessionGrantStatus::Paused {
             state.grant.granted_at = Some(timestamp(OffsetDateTime::now_utc()));
@@ -711,7 +732,7 @@ impl CloudSessionGrantStore {
             .backend_binding
             .as_ref()
             .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-        if response.id != existing.grant_id || response.grant_version < existing.grant_version {
+        if response.id != existing.grant_id || response.grant_version != existing.grant_version {
             return Err(anyhow!(
                 "backend cloud-session grant revalidation does not match"
             ));
@@ -720,6 +741,7 @@ impl CloudSessionGrantStore {
             return Err(anyhow!("backend cloud-session grant status is invalid"));
         }
         let backend_revoked = response.status == "revoked";
+        let before = state.grant.clone();
         state.grant.backend_binding = Some(CloudSessionBackendGrantBindingV1 {
             grant_id: response.id.clone(),
             grant_version: response.grant_version,
@@ -749,7 +771,9 @@ impl CloudSessionGrantStore {
             );
             state.grant.last_freshness = Some("unavailable".to_string());
         }
-        self.write(&state)?;
+        if state.grant != before {
+            self.write(&state)?;
+        }
         Ok(state.grant)
     }
 
@@ -2661,19 +2685,9 @@ fn revalidate_scan_start(
         })?
         .filter(cloud_grant_runtime_ready);
     if kill_switch_enabled()
-        || current.as_ref().is_some_and(|grant| {
-            grant.grant_scope_id != expected.grant_scope_id
-                || grant.account_fingerprint != expected.account_fingerprint
-                || grant.collector_version != expected.collector_version
-                || grant
-                    .backend_binding
-                    .as_ref()
-                    .map(|binding| &binding.grant_id)
-                    != expected
-                        .backend_binding
-                        .as_ref()
-                        .map(|binding| &binding.grant_id)
-        })
+        || current
+            .as_ref()
+            .is_some_and(|grant| !same_runtime_grant_identity(grant, expected))
     {
         return Ok(RevalidationOutcome::Denied);
     }
@@ -3396,14 +3410,33 @@ fn cloud_grant_runtime_ready(grant: &CloudSessionGrant) -> bool {
 fn grant_still_current(store: &CloudSessionGrantStore, expected: &CloudSessionGrant) -> bool {
     store.load().ok().flatten().is_some_and(|current| {
         cloud_grant_runtime_ready(&current)
-            && current.collector_version == expected.collector_version
-            && current.grant_scope_id == expected.grant_scope_id
-            && current.account_fingerprint == expected.account_fingerprint
-            && current.backend_binding == expected.backend_binding
+            && same_runtime_grant_identity(&current, expected)
             && current
                 .backend_binding
                 .is_some_and(|binding| !binding.backend_revoked)
     })
+}
+
+fn same_runtime_grant_identity(current: &CloudSessionGrant, expected: &CloudSessionGrant) -> bool {
+    current.schema_version == expected.schema_version
+        && current.collector_id == expected.collector_id
+        && current.collector_version == expected.collector_version
+        && current.release_lane == expected.release_lane
+        && current.disclosure_version == expected.disclosure_version
+        && current.installation_fingerprint == expected.installation_fingerprint
+        && current.grant_scope_id == expected.grant_scope_id
+        && current.organization_fingerprint == expected.organization_fingerprint
+        && current.effective_user_fingerprint == expected.effective_user_fingerprint
+        && current.account_fingerprint == expected.account_fingerprint
+        && matches!(
+            (
+                current.backend_binding.as_ref(),
+                expected.backend_binding.as_ref(),
+            ),
+            (Some(current), Some(expected))
+                if current.grant_id == expected.grant_id
+                    && current.grant_version == expected.grant_version
+        )
 }
 
 fn health_heartbeat_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
@@ -4146,11 +4179,7 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .ok_or_else(|| anyhow!("unexpected revalidation"))?;
-            Ok(backend_grant(
-                grant,
-                status,
-                if status == "revoked" { 2 } else { 1 },
-            ))
+            Ok(backend_grant(grant, status, 1))
         }
 
         fn revalidate_grant_bounded(
@@ -4736,9 +4765,33 @@ mod tests {
             .bind_backend_grant(&wrong_installation, "00000000-0000-4000-8000-000000000099",)
             .is_err());
 
-        grants
-            .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
+        let first_response = backend_grant(&local, "enabled", 1);
+        let first_bound = grants
+            .bind_backend_grant(&first_response, INSTALLATION_ID)
             .unwrap();
+        let bound_bytes = fs::read(grants.path()).unwrap();
+        assert_eq!(
+            grants
+                .bind_backend_grant(&first_response, INSTALLATION_ID)
+                .unwrap(),
+            first_bound
+        );
+        assert_eq!(fs::read(grants.path()).unwrap(), bound_bytes);
+        let mut different_id = first_response.clone();
+        different_id.id = "00000000-0000-4000-8000-000000000099".to_string();
+        assert!(grants
+            .bind_backend_grant(&different_id, INSTALLATION_ID)
+            .is_err());
+        let mut different_epoch = first_response.clone();
+        different_epoch.grant_version += 1;
+        assert!(grants
+            .bind_backend_grant(&different_epoch, INSTALLATION_ID)
+            .is_err());
+        let mut different_policy = first_response;
+        different_policy.server_policy_state = CloudSessionServerPolicyState::Disabled;
+        assert!(grants
+            .bind_backend_grant(&different_policy, INSTALLATION_ID)
+            .is_err());
         let first_runner = Pages {
             pages: RefCell::new(vec![page("one", None)]),
             calls: Cell::new(0),
@@ -4867,7 +4920,7 @@ mod tests {
 
         let disabled = grants.load().unwrap().unwrap();
         let approved_transport = RevalidationTransport {
-            response: Some(backend_grant(&disabled, "enabled", 2)),
+            response: Some(backend_grant(&disabled, "enabled", 1)),
             revalidation_calls: Cell::new(0),
             send_calls: Cell::new(0),
         };
@@ -4922,6 +4975,83 @@ mod tests {
             checkpoints.load().last_error_category.as_deref(),
             Some("grant_revalidation_unavailable")
         );
+    }
+
+    #[test]
+    fn future_authority_epoch_fails_closed_without_changing_local_binding() {
+        let (grants, checkpoints) = stores("future-authority-epoch");
+        enabled(&grants);
+        let current = grants.load().unwrap().unwrap();
+        let persisted_before = fs::read(grants.path()).unwrap();
+        let future = backend_grant(&current, "enabled", 2);
+        assert!(grants.apply_backend_grant_revalidation(&future).is_err());
+        assert_eq!(fs::read(grants.path()).unwrap(), persisted_before);
+
+        let transport = RevalidationTransport {
+            response: Some(future),
+            revalidation_calls: Cell::new(0),
+            send_calls: Cell::new(0),
+        };
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Failed
+        );
+        assert_eq!(transport.revalidation_calls.get(), 1);
+        assert_eq!(runner.calls.get(), 0);
+        assert_eq!(transport.send_calls.get(), 0);
+        let unchanged = grants.load().unwrap().unwrap();
+        assert_eq!(unchanged.status, CloudSessionGrantStatus::Enabled);
+        assert_eq!(unchanged.backend_binding, current.backend_binding);
+        assert_eq!(
+            checkpoints.load().last_error_category.as_deref(),
+            Some("grant_revalidation_invalid")
+        );
+    }
+
+    #[test]
+    fn runtime_authority_identity_covers_device_tenant_scope_and_epoch() {
+        let (grants, _checkpoints) = stores("runtime-authority-identity");
+        enabled(&grants);
+        let expected = grants.load().unwrap().unwrap();
+        assert!(same_runtime_grant_identity(&expected, &expected));
+
+        for changed in [
+            |grant: &mut CloudSessionGrant| {
+                grant.installation_fingerprint = format!("hmac-sha256:{}", "1".repeat(64));
+            },
+            |grant: &mut CloudSessionGrant| {
+                grant.organization_fingerprint = format!("hmac-sha256:{}", "2".repeat(64));
+            },
+            |grant: &mut CloudSessionGrant| {
+                grant.effective_user_fingerprint = format!("hmac-sha256:{}", "3".repeat(64));
+            },
+            |grant: &mut CloudSessionGrant| {
+                grant.grant_scope_id = format!("hmac-sha256:{}", "4".repeat(64));
+            },
+            |grant: &mut CloudSessionGrant| {
+                grant.account_fingerprint = format!("hmac-sha256:{}", "5".repeat(64));
+            },
+            |grant: &mut CloudSessionGrant| {
+                grant.backend_binding.as_mut().unwrap().grant_version += 1;
+            },
+        ] {
+            let mut mismatched = expected.clone();
+            changed(&mut mismatched);
+            assert!(!same_runtime_grant_identity(&mismatched, &expected));
+        }
+
+        let mut policy_transition = expected.clone();
+        policy_transition
+            .backend_binding
+            .as_mut()
+            .unwrap()
+            .server_policy_state = CloudSessionServerPolicyState::Disabled;
+        assert!(same_runtime_grant_identity(&policy_transition, &expected));
     }
 
     #[test]
@@ -5102,7 +5232,7 @@ mod tests {
     }
 
     #[test]
-    fn server_revocation_stops_provider_and_future_preflights() {
+    fn future_server_revocation_epoch_stops_provider_without_adopting_epoch() {
         let (grants, checkpoints) = stores("server-revocation");
         enabled(&grants);
         let current = grants.load().unwrap().unwrap();
@@ -5118,14 +5248,14 @@ mod tests {
         };
         assert_eq!(
             collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
-            CloudSessionCycleOutcome::Noop
+            CloudSessionCycleOutcome::Failed
         );
         assert_eq!(transport.revalidation_calls.get(), 1);
         assert_eq!(runner.calls.get(), 0);
         assert_eq!(transport.send_calls.get(), 0);
         assert_eq!(
             grants.load().unwrap().unwrap().status,
-            CloudSessionGrantStatus::Revoked
+            CloudSessionGrantStatus::Enabled
         );
         assert_eq!(
             collect_cloud_sessions_once(
@@ -5135,9 +5265,9 @@ mod tests {
                 &transport,
                 now() + TimeDuration::minutes(5),
             ),
-            CloudSessionCycleOutcome::Disabled
+            CloudSessionCycleOutcome::Failed
         );
-        assert_eq!(transport.revalidation_calls.get(), 1);
+        assert_eq!(transport.revalidation_calls.get(), 2);
         assert_eq!(runner.calls.get(), 0);
     }
 
@@ -5160,8 +5290,17 @@ mod tests {
             effective_user_scope: "replacement_user".to_string(),
         };
         assert!(grants.enable(&replacement, now()).is_err());
+        assert_eq!(
+            grants
+                .bind_backend_grant(&response, INSTALLATION_ID)
+                .unwrap()
+                .status,
+            CloudSessionGrantStatus::Revoked
+        );
+        let mut different = response;
+        different.id = "00000000-0000-4000-8000-000000000099".to_string();
         assert!(grants
-            .bind_backend_grant(&response, INSTALLATION_ID)
+            .bind_backend_grant(&different, INSTALLATION_ID)
             .is_err());
         let stopped = grants.load().unwrap().unwrap();
         assert_eq!(stopped.status, CloudSessionGrantStatus::Revoked);
@@ -5205,9 +5344,13 @@ mod tests {
             restarted.grant_create_request(INSTALLATION_ID).unwrap(),
             first
         );
-        assert!(restarted
-            .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-            .is_err());
+        assert_eq!(
+            restarted
+                .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
+                .unwrap()
+                .status,
+            CloudSessionGrantStatus::Revoked
+        );
         let late = restarted.load().unwrap().unwrap();
         assert_eq!(late.status, CloudSessionGrantStatus::Revoked);
         assert!(!late.backend_create_pending);
@@ -5751,9 +5894,15 @@ mod tests {
         use std::io::Write;
         use std::net::TcpListener;
 
-        for (name, authority_status) in [("absent", "404 Not Found"), ("epoch", "409 Conflict")] {
+        for (name, authority_status) in [
+            ("absent", "404 Not Found"),
+            ("epoch", "409 Conflict"),
+            ("future-body", "200 OK"),
+        ] {
             let (grants, checkpoints) = stores(&format!("relay-authority-{name}"));
             enabled(&grants);
+            let grant = grants.load().unwrap().unwrap();
+            let future_body = serde_json::to_string(&backend_grant(&grant, "enabled", 2)).unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let server = thread::spawn(move || {
@@ -5761,15 +5910,16 @@ mod tests {
                     let (mut stream, _) = listener.accept().unwrap();
                     let _request = read_http_request(&mut stream);
                     let (status, body) = if index == 0 {
-                        ("200 OK", r#"{"token":"relay-authority"}"#)
+                        ("200 OK", r#"{"token":"relay-authority"}"#.to_string())
+                    } else if name == "future-body" {
+                        (authority_status, future_body.clone())
                     } else {
-                        (authority_status, r#"{"detail":"redacted"}"#)
+                        (authority_status, r#"{"detail":"redacted"}"#.to_string())
                     };
                     write!(
                         stream,
                         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                        body.len(), body
                     )
                     .unwrap();
                 }

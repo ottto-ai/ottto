@@ -2027,11 +2027,19 @@ fn cloud_sessions_control_with_stores(
         .as_deref()
         .ok_or(LocalApiError::LocalClientNotTrusted)?;
 
+    let backend_grant_allowed = matches!(
+        action,
+        CloudSessionsControlAction::Bind
+            | CloudSessionsControlAction::Revoke
+            | CloudSessionsControlAction::ConfirmRevoked
+    );
     let backend_grant_required = matches!(
         action,
         CloudSessionsControlAction::Bind | CloudSessionsControlAction::ConfirmRevoked
     );
-    if backend_grant_required != backend_grant.is_some() {
+    if (backend_grant_required && backend_grant.is_none())
+        || (!backend_grant_allowed && backend_grant.is_some())
+    {
         return Err(LocalApiError::InvalidRequest(
             "backend_grant presence does not match cloud-session action".to_string(),
         ));
@@ -2081,7 +2089,16 @@ fn cloud_sessions_control_with_stores(
         CloudSessionsControlAction::Revoke => grants
             .revoke(time::OffsetDateTime::now_utc())
             .and_then(|_| checkpoints.wait_for_provider_idle(Duration::from_secs(15)))
-            .and_then(|_| grants.grant_revoke_target())
+            .and_then(|_| {
+                if let Some(response) = backend_grant.as_ref() {
+                    // Completion-safe compensating cleanup: an authenticated
+                    // POST response can arrive after rollout disabled bind.
+                    // Bind only its exact identity into already-revoked local
+                    // state so this action can return the sole DELETE target.
+                    grants.bind_backend_grant(response, &device.device_id)?;
+                }
+                grants.grant_revoke_target()
+            })
             .map(|target| backend_revoke_target = Some(target)),
         CloudSessionsControlAction::ConfirmRevoked => grants
             .apply_backend_revocation(
@@ -12360,6 +12377,124 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn cloud_sessions_rollout_disable_after_post_can_revoke_exact_pending_grant() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("cloud-session-rollout-cleanup");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints =
+            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
+            root.join("control-token-uses.json"),
+        );
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |action: CloudSessionsControlAction,
+                   token_id: &str,
+                   backend_grant: Option<CloudSessionBackendGrantResponseV1>| {
+            let action_slug = cloud_sessions_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            cloud_sessions_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                None,
+                backend_grant,
+                &accounts,
+                &devices,
+                &grants,
+                &checkpoints,
+                &token_uses,
+            )
+        };
+
+        let prepared = run(CloudSessionsControlAction::Prepare, "rollout-prepare", None).unwrap();
+        assert!(prepared.backend_create_request.is_some());
+        let pending = grants.load().unwrap().unwrap();
+        let enabled_response = cloud_control_backend_grant(&pending, device_id, "enabled", 1);
+
+        // The ordinary-browser POST committed, then rollout removal makes the
+        // bind action validation fail before any local token consumption.
+        let bind_action = cloud_sessions_action_slug(&CloudSessionsControlAction::Bind);
+        let disabled_api = cloud_control_validation_rejection_server(bind_action);
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &disabled_api);
+        assert!(matches!(
+            cloud_sessions_control_with_stores(
+                CloudSessionsControlAction::Bind,
+                SecretString::new(test_control_token(bind_action, "codex", 240)),
+                None,
+                Some(enabled_response.clone()),
+                &accounts,
+                &devices,
+                &grants,
+                &checkpoints,
+                &token_uses,
+            ),
+            Err(LocalApiError::LocalClientNotTrusted)
+        ));
+        let still_pending = grants.load().unwrap().unwrap();
+        assert!(still_pending.backend_create_pending);
+        assert!(still_pending.backend_binding.is_none());
+
+        // Revoke remains valid after rollout removal. Supplying the exact POST
+        // response binds identity only after local stop and yields one DELETE
+        // target without permitting collection.
+        let revoked = run(
+            CloudSessionsControlAction::Revoke,
+            "rollout-revoke",
+            Some(enabled_response),
+        )
+        .unwrap();
+        assert_eq!(
+            revoked.backend_revoke_target.unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+        assert_eq!(
+            revoked.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::Revoked
+        );
+        assert!(!revoked.status.provider_cli_invocation_permitted);
+        let locally_revoked = grants.load().unwrap().unwrap();
+        assert!(!locally_revoked.backend_create_pending);
+        assert_eq!(
+            locally_revoked.backend_binding.as_ref().unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+
+        let revoked_response =
+            cloud_control_backend_grant(&locally_revoked, device_id, "revoked", 2);
+        let confirmed = run(
+            CloudSessionsControlAction::ConfirmRevoked,
+            "rollout-confirm",
+            Some(revoked_response),
+        )
+        .unwrap();
+        assert_eq!(
+            confirmed.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::Revoked
+        );
+        assert!(
+            grants
+                .load()
+                .unwrap()
+                .unwrap()
+                .backend_binding
+                .unwrap()
+                .backend_revoked
+        );
+    }
+
+    #[test]
     fn verification_marker_body_has_single_magic_metric() {
         let marker = verification_marker_body(
             &SourceKind::Codex,
@@ -16484,6 +16619,27 @@ log_user_prompt = true
                 "expires_at": "2030-01-01T00:00:00Z"
             });
             write_json_response(&mut stream, 200, "OK", &response.to_string());
+        });
+        format!("http://{address}")
+    }
+
+    fn cloud_control_validation_rejection_server(action: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cloud control backend");
+        let address = listener.local_addr().expect("local address");
+        let action = action.to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept cloud control validation");
+            let request = read_complete_http_request(&mut stream);
+            let body: serde_json::Value =
+                serde_json::from_str(http_request_body(&request)).expect("validation body");
+            assert_eq!(body["source"], "codex");
+            assert_eq!(body["action"], action);
+            write_json_response(
+                &mut stream,
+                403,
+                "Forbidden",
+                r#"{"detail":"Cloud session collection rollout is disabled"}"#,
+            );
         });
         format!("http://{address}")
     }

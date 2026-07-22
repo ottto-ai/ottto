@@ -116,7 +116,15 @@ the connected local account/device, and atomically consumes it before a side
 effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
 the JWT and raw token id are never persisted. Pause/revoke closes provider-call
 admission first and waits for an already admitted bounded subprocess to finish
-before returning the exact backend DELETE target.
+before returning the exact backend DELETE target. Exact bind-response retries
+are local no-ops and cannot change timestamps or resurrect pause/revoke. If an
+authenticated grant POST commits immediately before rollout removal blocks
+bind, the independently permitted revoke action may carry that exact
+credential-free response: local revoke happens first, then only its grant UUID
+and epoch are retained for compensating DELETE. This path cannot enable
+collection. Runtime authority must return the exact requested/local epoch;
+higher as well as lower epochs fail closed without changing the binding or
+invoking the provider.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task

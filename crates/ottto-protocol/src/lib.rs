@@ -3284,6 +3284,22 @@ mod tests {
         assert!(!wire.contains("browser_jwt"));
         assert!(!wire.contains("device_secret"));
         assert!(!wire.contains("provider"));
+
+        let mut cleanup_wire: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        cleanup_wire["request_id"] = serde_json::json!("req_cloud_revoke_cleanup");
+        cleanup_wire["action"] = serde_json::json!("revoke");
+        let cleanup: LocalControlRequest = serde_json::from_value(cleanup_wire).unwrap();
+        assert!(matches!(
+            cleanup.command,
+            LocalControlCommand::CloudSessionsControl {
+                action: CloudSessionsControlAction::Revoke,
+                backend_grant: Some(CloudSessionBackendGrantResponseV1 {
+                    grant_version: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
     }
 
     #[test]

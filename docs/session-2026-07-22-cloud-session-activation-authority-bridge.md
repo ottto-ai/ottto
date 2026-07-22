@@ -115,10 +115,16 @@ from the ordinary-browser backend grant response:
 }
 ```
 
-Pause, revoke, and status omit `backend_grant`. Revoke returns
-`backend_revoke_target: {"grant_id":"<exact UUID>"}`. Confirm uses
-`action: "confirm_revoked"` with the same projection carrying
-`status: "revoked"` and the backend's incremented `grant_version`.
+Pause and status omit `backend_grant`. Normal revoke of an already-bound grant
+also omits it and returns
+`backend_revoke_target: {"grant_id":"<exact UUID>"}`. If the browser POST
+succeeded but rollout removal rejects bind, revoke uses its independently
+allowed `revoke_cloud_sessions` token and includes the exact enabled POST
+response as `backend_grant`. The daemon revokes locally first, then binds that
+identity only for compensating DELETE and returns the exact target; it never
+admits collection. Confirm uses `action: "confirm_revoked"` with the same
+projection carrying `status: "revoked"` and the backend's incremented
+`grant_version`.
 
 The runtime authority wire is exactly:
 
@@ -135,8 +141,16 @@ Authorization: Bearer <source-scoped relay token>
   backend POST outcome retries the unchanged create DTO; it never prepares a
   replacement scope while the first create may have committed.
 - Bind and confirm are retry-safe with a new action token plus the exact prior
-  backend response. A paused bound grant resumes through prepare without a new
-  POST.
+  backend response. An exact bind retry is a byte-stable local no-op: it retains
+  timestamps and current pause/revoke state. A different grant id, epoch,
+  installation, scope/account fingerprint, collector contract, status, or
+  policy is rejected. A paused bound grant resumes through prepare without a
+  new POST.
+- Rollout removal can reject prepare/bind but cannot strand a grant whose POST
+  already committed. Revoke remains action/device-bound and may carry that
+  exact enabled response solely to preserve its DELETE identity after local
+  stop. Exact DELETE plus confirm then completes cleanup; no bind/resume or
+  provider admission occurs.
 - Pause/revoke close provider admission before waiting for the at-most-12-second
   subprocess. Revoke remains local even if browser DELETE fails. The consumer
   exposes cleanup pending and retries exact DELETE then confirm; it does not
@@ -144,7 +158,10 @@ Authorization: Bearer <source-scoped relay token>
 - A local-control timeout is an unknown outcome. The consumer mints a fresh
   `cloud_sessions_status` token and observes local state before repeating any
   backend mutation.
-- Authority absence, auth failure, epoch conflict, disabled/revoked policy,
+- Authority responses must match the requested and locally bound epoch exactly;
+  even a higher valid-looking epoch is rejected without updating local state or
+  invoking the provider. Authority absence, auth failure, epoch conflict,
+  disabled/revoked policy,
   malformed response, timeout, or network failure admits zero provider calls.
   Rollout kill switch plus local pause/revoke are independent stop layers.
 
@@ -154,7 +171,15 @@ Authorization: Bearer <source-scoped relay token>
 - Replay tests cover concurrent consume, restart replay, TTL pruning, hard cap,
   raw-token absence, and 0600 permissions.
 - Race tests prove revoke waits for an admitted call and blocks later admission.
-- HTTP tests prove exact authority path/query/Bearer binding and that 404/409
-  stop before provider invocation.
-- Full cloud-session, control workflow, formatting, check, Clippy, and public
-  export/secret scans are required before merge.
+- Bind tests prove exact-response replay is a no-write success while every
+  changed identity/epoch/policy response fails.
+- HTTP/runtime tests prove exact authority path/query/Bearer binding and that
+  404, 409, or a valid-looking future-epoch 200 response invokes no provider.
+- The rollout-race control test proves POST success followed by bind `403` can
+  still locally revoke, return the exact DELETE target, and confirm cleanup
+  without provider permission.
+- Protocol completed with 36 passed/1 intentionally ignored; the focused
+  cloud-session module completed with 60 passed; both cloud control workflows,
+  formatting, and Clippy with warnings denied passed.
+- Public export, manifest, skeleton, contract, and current/history/staged-output
+  secret scans passed on the final staged repair.
