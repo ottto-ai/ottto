@@ -23,8 +23,10 @@ duplicate local setup or repair logic.
 The loopback `/local-health` endpoint may return the current pseudonymous
 relay-device id to an allowlisted Ottto browser origin so the web app can
 distinguish two macOS users on one physical Mac. Origin-less callers do not
-receive that id. The endpoint never returns the relay secret, account ids, or
-hardware UUID.
+receive that id. The origin allowlist enforces browser CORS; it is not
+authentication for native loopback clients, so the id is treated only as a
+non-secret binding label. The endpoint never returns the relay secret, account
+ids, or hardware UUID.
 
 ## What Stays Local
 

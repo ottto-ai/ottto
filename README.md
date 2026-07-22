@@ -506,8 +506,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   relay-device id inside its canonical health payload only for an allowlisted
   browser origin. This lets the Apps page distinguish separate macOS-user
   installations on one physical Mac without exposing the relay secret,
-  account identifiers, hardware UUID, or exact device identity to
-  origin-less loopback callers. Claude Code setup also installs a local
+  account identifiers, or hardware UUID. The origin gate is a browser CORS
+  boundary, not native-client authentication, so the returned device id is a
+  non-secret pseudonymous binding label and origin-less probes remain redacted.
+  Claude Code setup also installs a local
   `statusLine` wrapper that preserves an existing status line command while
   feeding documented `rate_limits` fields into the local quota cache. The relay
   uses a source header to route shared-port payloads to source-scoped

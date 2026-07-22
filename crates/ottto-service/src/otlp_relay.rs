@@ -4,7 +4,7 @@ use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use ottto_core::FileConnectionStore;
+use ottto_core::{FileConnectionStore, FileDeviceStore};
 use ottto_protocol::{
     LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
 };
@@ -554,14 +554,16 @@ fn handle_local_health_request(
         );
     }
 
-    // Exact installation identity is useful to the signed-in web app, but it
-    // should not be exposed to origin-less loopback callers. Requiring a
-    // validated browser origin preserves the existing curl/native response
-    // while letting the Apps page distinguish two macOS users on one Mac.
+    // Exact installation identity is useful to the Ottto web app, but it
+    // should not be exposed to ordinary origin-less loopback probes. The
+    // validated Origin is a browser CORS boundary, not caller authentication,
+    // so this response must contain only the non-secret pseudonymous device id.
     let device_id = local_health_browser_device_id(origin, || {
-        load_snapshot_device_credentials()
+        FileDeviceStore::default()
+            .load()
             .ok()
-            .map(|(device, _secret)| device.device_id)
+            .flatten()
+            .map(|device| device.device_id)
     });
 
     match local_health_response_payload(daemon, device_id) {
