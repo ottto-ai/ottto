@@ -144,6 +144,7 @@ fn active_session_from_snapshot(
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
         session_display_name: snapshot.session_display_name.clone(),
+        source_started_at: snapshot.source_started_at.clone(),
         source_last_activity_at: snapshot
             .source_last_activity_at
             .clone()
@@ -153,6 +154,17 @@ fn active_session_from_snapshot(
         peak_context_fill_tokens: snapshot.peak_context_fill_tokens,
         compaction_count: snapshot.compaction_count,
         compaction_timestamps,
+        input_tokens: Some(snapshot.input_tokens),
+        cache_read_tokens: Some(snapshot.cache_read_tokens),
+        cache_creation_5m_tokens: Some(snapshot.cache_creation_5m_tokens),
+        cache_creation_1h_tokens: Some(snapshot.cache_creation_1h_tokens),
+        output_tokens: Some(snapshot.output_tokens),
+        reasoning_output_tokens: (snapshot.reasoning_output_tokens > 0)
+            .then_some(snapshot.reasoning_output_tokens),
+        unattributed_total_tokens: (snapshot.unattributed_total_tokens > 0)
+            .then_some(snapshot.unattributed_total_tokens),
+        input_token_scope: snapshot.provenance.input_token_scope.clone(),
+        session_kind: active_session_kind(snapshot),
         account_identifier_hash: attribution
             .as_ref()
             .and_then(|value| value.account_identifier_hash.clone()),
@@ -164,6 +176,23 @@ fn active_session_from_snapshot(
             .and_then(|value| value.subscription_product.clone()),
         account_attribution_source: attribution.map(|value| value.source),
     }
+}
+
+fn active_session_kind(snapshot: &SnapshotItem) -> Option<String> {
+    let origin = snapshot.origin.as_ref();
+    let is_subagent = origin.is_some_and(|value| {
+        value.thread_source.as_deref() == Some("subagent")
+            || value.source_subagent == Some(true)
+            || value.is_sidechain == Some(true)
+            || value.session_kind.as_deref() == Some("bg")
+    });
+    if is_subagent {
+        return Some("subagent".to_string());
+    }
+    if origin.and_then(|value| value.thread_source.as_deref()) == Some("automation") {
+        return Some("automation".to_string());
+    }
+    None
 }
 
 struct AccountAttribution {
@@ -413,6 +442,32 @@ mod tests {
             active.account_attribution_source.as_deref(),
             Some("current_login_at_reconciliation")
         );
+        assert_eq!(
+            active.source_started_at.as_deref(),
+            Some("2026-07-19T09:50:00Z")
+        );
+        assert_eq!(active.input_tokens, Some(100));
+        assert_eq!(active.cache_read_tokens, Some(80));
+        assert_eq!(active.output_tokens, Some(20));
+        assert_eq!(
+            active.input_token_scope.as_deref(),
+            Some("inclusive_cached")
+        );
+    }
+
+    #[test]
+    fn classifies_subagent_for_truthful_title_fallback() {
+        let mut snapshot = test_snapshot("subagent", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name = None;
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            thread_source: Some("subagent".to_string()),
+            ..Default::default()
+        });
+
+        let active = active_session_from_snapshot(&snapshot, None);
+
+        assert_eq!(active.session_display_name, None);
+        assert_eq!(active.session_kind.as_deref(), Some("subagent"));
     }
 
     fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {

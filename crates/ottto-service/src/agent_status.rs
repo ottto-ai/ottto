@@ -2140,11 +2140,13 @@ fn claude_oauth_quota_window(
 fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> ClaudeOAuthUsage {
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
     let cache_is_stale = cache_age > CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS;
+    let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     ClaudeOAuthUsage {
         windows: cache
             .windows
             .into_iter()
             .map(|mut window| {
+                window.observed_at = observed_at.clone();
                 if cache_is_stale {
                     window.status = AgentQuotaWindowStatus::Unknown;
                     window.freshness = AgentQuotaWindowFreshness::Stale;
@@ -2176,6 +2178,7 @@ fn claude_statusline_quota_windows_from_cache(
     let mut windows = Vec::new();
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
     let cache_is_stale = cache_age > CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS;
+    let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     for window in cache.windows {
         if window.resets_at_epoch_seconds <= now {
             continue;
@@ -2201,6 +2204,7 @@ fn claude_statusline_quota_windows_from_cache(
             } else {
                 AgentQuotaWindowFreshness::Fresh
             },
+            observed_at: observed_at.clone(),
             model: None,
             account_label: None,
             window_seconds,
@@ -6674,6 +6678,10 @@ for line in sys.stdin:
         assert_eq!(usage.windows[0].status, AgentQuotaWindowStatus::Ok);
         assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Fresh);
         assert_eq!(usage.windows[0].used_percent, Some(25));
+        assert_eq!(
+            usage.windows[0].observed_at.as_deref(),
+            Some("1970-01-01T00:01:40Z")
+        );
         assert_eq!(usage.credit_balances.len(), 1);
         assert_eq!(
             usage.credit_balances[0].freshness,
@@ -6907,6 +6915,10 @@ for line in sys.stdin:
         assert_eq!(windows[0].used_percent, Some(24));
         assert_eq!(windows[0].left_percent, Some(76));
         assert_eq!(windows[0].window_seconds, Some(5 * 60 * 60));
+        assert_eq!(
+            windows[0].observed_at.as_deref(),
+            Some("1970-01-01T00:01:40Z")
+        );
         assert_eq!(windows[1].name, "weekly");
         assert_eq!(windows[1].status, AgentQuotaWindowStatus::NearLimit);
         assert_eq!(windows[1].window_seconds, Some(7 * 24 * 60 * 60));
