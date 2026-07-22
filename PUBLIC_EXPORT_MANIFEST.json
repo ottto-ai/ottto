@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 253,
-  "content_sha256": "37ed8d81d11f6661ecd1077043ced08fb7375a2f7eb6e166f63ad883497250a6",
+  "candidate_file_count": 254,
+  "content_sha256": "af120a14b945eacfadbff36134e27293afe2e2e665cf33282571a45da6d474e5",
   "files": [
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "1e0ca25de996eb4fd0af6853f167dbea8be4e5f852c5aa175f0b8f40f78fbee3",
-      "size_bytes": 304070
+      "sha256": "905048b9b96af4a1effe5d52ac07b6260f468d10aa1e5b80368ee22ed58eefea",
+      "size_bytes": 304094
     },
     {
       "executable": false,
@@ -748,8 +748,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "1dad812defc6af75bd5ae7c16ed4ff8c9a004ba6145bd7440b6246fa1c146b65",
-      "size_bytes": 24180
+      "sha256": "97aaffced242d3588088c078bfbf58401f5ef4c773dafbaf99054beb26186298",
+      "size_bytes": 26490
     },
     {
       "executable": false,
@@ -785,6 +785,13 @@
       "path": "crates/ottto-service/src/session_attribution.rs",
       "sha256": "c98fd8449c4291e2bba8254388bfd502a2368603b5e38e273a952a45816036f7",
       "size_bytes": 47314
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshot_audit.rs",
+      "sha256": "7d376745b8f5c352e2ea0a454b750b5b59304bb0d5783943a1d14497b4fe17db",
+      "size_bytes": 20163
     },
     {
       "executable": false,
@@ -972,8 +979,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-22-local-semantic-sync-phase-1.md",
-      "sha256": "b0d3896db7e3f8ef28e45087af743627a39cd231806a10d4907e0c12613a56de",
-      "size_bytes": 3562
+      "sha256": "0c911277b89384063c55b36c2a0a24240357d70854bb9ad34dde1fdaf3f94d93",
+      "size_bytes": 4967
     },
     {
       "executable": false,
@@ -1774,9 +1781,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T13:37:40+00:00",
+  "generated_at": "2026-07-22T14:39:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 254,
+  "output_file_count": 255,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1810,5 +1817,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b2108a112cdb8483ea2cbfff84156b5f013ce5e2"
+  "source_commit": "b88f424daa3eec4608287009c24e6ea858e7c970"
 }
