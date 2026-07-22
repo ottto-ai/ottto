@@ -112,6 +112,7 @@ CHECKS = [
     "verify_codex",
     "diagnostics_redaction",
     "update_check",
+    "mixed_owner_app_version_truth",
     "rollback_notes",
     "stable_formula_static",
     "stable_hosted_installer_static",
