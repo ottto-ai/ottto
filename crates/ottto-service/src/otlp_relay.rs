@@ -554,7 +554,17 @@ fn handle_local_health_request(
         );
     }
 
-    match local_health_response_payload(daemon) {
+    // Exact installation identity is useful to the signed-in web app, but it
+    // should not be exposed to origin-less loopback callers. Requiring a
+    // validated browser origin preserves the existing curl/native response
+    // while letting the Apps page distinguish two macOS users on one Mac.
+    let device_id = origin.and_then(|_| {
+        load_snapshot_device_credentials()
+            .ok()
+            .map(|(device, _secret)| device.device_id)
+    });
+
+    match local_health_response_payload(daemon, device_id) {
         Ok(payload) => write_json_response_with_headers(stream, 200, payload, &cors_headers),
         Err(_) => write_json_response_with_headers(
             stream,
@@ -565,11 +575,15 @@ fn handle_local_health_request(
     }
 }
 
-fn local_health_response_payload(daemon: &LocalDaemon) -> Result<serde_json::Value> {
+fn local_health_response_payload(
+    daemon: &LocalDaemon,
+    device_id: Option<String>,
+) -> Result<serde_json::Value> {
     let status = daemon.status_for_trusted_client()?;
     let Some(mut health) = status.canonical_health else {
         return Err(anyhow!("local health is not available"));
     };
+    health.device_id = device_id;
     health.org_id = None;
     health.user_id = None;
     Ok(json!({
@@ -1396,14 +1410,32 @@ mod tests {
             message: None,
         });
 
-        let payload = local_health_response_payload(&daemon).expect("payload");
+        let payload = local_health_response_payload(&daemon, None).expect("payload");
 
         assert_eq!(payload["machine_id"], "machine_test");
         assert_eq!(payload["machine_name"], "Test Mac");
         assert_eq!(payload["health"]["machine_id"], "machine_test");
         assert!(payload["health"].get("user_id").is_none());
         assert!(payload["health"].get("org_id").is_none());
+        assert!(payload["health"].get("device_id").is_none());
         assert_eq!(payload["health"]["account"]["state"], "connected");
+    }
+
+    #[test]
+    fn local_health_response_payload_includes_browser_device_identity() {
+        let daemon = test_daemon();
+
+        let payload =
+            local_health_response_payload(&daemon, Some("device_current_installation".to_string()))
+                .expect("payload");
+
+        assert_eq!(
+            payload["health"]["device_id"],
+            "device_current_installation"
+        );
+        assert!(payload["health"].get("user_id").is_none());
+        assert!(payload["health"].get("org_id").is_none());
+        assert!(payload.get("hardware_uuid").is_none());
     }
 
     #[test]

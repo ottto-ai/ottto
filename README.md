@@ -502,7 +502,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   control endpoint returns the private-network
   CORS header required by Chromium for production `https://ottto.net` to reach
   the loopback daemon, while the frontend marks the request target as
-  `loopback`. Claude Code setup also installs a local
+  `loopback`. The companion `/local-health` endpoint returns the current
+  relay-device id inside its canonical health payload only for an allowlisted
+  browser origin. This lets the Apps page distinguish separate macOS-user
+  installations on one physical Mac without exposing the relay secret,
+  account identifiers, hardware UUID, or exact device identity to
+  origin-less loopback callers. Claude Code setup also installs a local
   `statusLine` wrapper that preserves an existing status line command while
   feeding documented `rate_limits` fields into the local quota cache. The relay
   uses a source header to route shared-port payloads to source-scoped
