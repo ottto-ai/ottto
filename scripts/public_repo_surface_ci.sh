@@ -173,6 +173,7 @@ run_step "test public contract check" bash scripts/test_public_repo_contract_che
 run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
 run_step "test macOS package root resolution" bash scripts/test_macos_package_root_resolution.sh
+run_step "test macOS Sparkle bundle version" bash scripts/test_macos_sparkle_bundle_version.sh
 run_step "test macOS stable release workflow policy" bash scripts/test_macos_stable_release_workflow.sh
 run_step "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
 run_step "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh

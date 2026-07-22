@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/macos_sparkle_bundle_version.sh
+source "$SCRIPT_DIR/macos_sparkle_bundle_version.sh"
 ROOT="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$ROOT" ]]; then
   ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -149,6 +151,7 @@ if [[ "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ]]; then
 fi
 
 COMMIT="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
+BUNDLE_VERSION="$(ottto_sparkle_bundle_version "$VERSION")"
 MIN_PROTOCOL_VERSION="${OTTTO_MIN_PROTOCOL_VERSION:-$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' "$ROOT/crates/ottto-protocol/src/lib.rs" | head -n1)}"
 if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
   echo "Could not determine local protocol version" >&2
@@ -266,7 +269,7 @@ cat > "$APP_CONTENTS/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key>
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>${VERSION}</string>
+  <string>${BUNDLE_VERSION}</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
