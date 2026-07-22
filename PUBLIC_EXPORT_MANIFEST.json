@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 255,
-  "content_sha256": "96129d1956afc1ec42f8b66032d3fe82ab43911e891cbf2af7069414b381b50c",
+  "candidate_file_count": 257,
+  "content_sha256": "ee8c4aa596c3b268316026a7ccf4db80d907c7b56c9f230f4415e4158c24d1a7",
   "files": [
     {
       "executable": false,
@@ -1497,8 +1497,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "7bb1b92fda16db235ec9042d7c247d1805ed1114c8e16d541b31ca0344126d33",
-      "size_bytes": 32344
+      "sha256": "297a45e02451aec888e0416d386370233af95e578167dc85eed7dd60ddcf997d",
+      "size_bytes": 32524
     },
     {
       "executable": true,
@@ -1527,6 +1527,13 @@
       "path": "scripts/macos_signing_readiness.sh",
       "sha256": "e794978b2c10d0269c97cfb91f6928fbc30a647181fe258a4531553a5c0e3c53",
       "size_bytes": 4419
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/macos_sparkle_bundle_version.sh",
+      "sha256": "029f77fb27ce2862057050a81704554e0ceff955bccc9fb0630742b9a18a6d8e",
+      "size_bytes": 605
     },
     {
       "executable": true,
@@ -1609,8 +1616,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "74a323d92f1d5fc130324f6898734543b7582bd42c9f9dfc631b27d376f6b8f0",
-      "size_bytes": 7199
+      "sha256": "110c6d0c8174769cfbc9e692701c7031ad459882fc62f5c1f165efc88335d73d",
+      "size_bytes": 7294
     },
     {
       "executable": true,
@@ -1665,8 +1672,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_package_root_resolution.sh",
-      "sha256": "17da233813c0e0cee22513cf72f57eda14bb807cde4e0db30de337c32689642f",
-      "size_bytes": 1961
+      "sha256": "73c62e9d29030c1de3fa0f1cc3ca9c69edca8357425d9c2aee2bb5313d072bd0",
+      "size_bytes": 2060
     },
     {
       "executable": true,
@@ -1695,6 +1702,13 @@
       "path": "scripts/test_macos_signing_readiness.sh",
       "sha256": "39ed1acf6ccf53ca2e9ea8f89a2c154b597fef6d81970719709418d94905b36f",
       "size_bytes": 2087
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_macos_sparkle_bundle_version.sh",
+      "sha256": "f32d97e1de30294b10ca9e502cebe21094412e9172796e5023dbdc66ca67c475",
+      "size_bytes": 5875
     },
     {
       "executable": true,
@@ -1788,9 +1802,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-22T18:10:28+00:00",
+  "generated_at": "2026-07-22T22:35:22+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 256,
+  "output_file_count": 258,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1824,5 +1838,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "68b4a678adf548796cbfc030c1ff2ebf9a32c3c8"
+  "source_commit": "72db66d5f8a8fa72ea1cd5afe408e910560f4250"
 }
