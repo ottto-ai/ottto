@@ -242,6 +242,12 @@ ottto context --json --all-machines --max-tokens 4000
 ottto costs --json
 ottto costs --json --range today --source codex
 ottto costs --json --all-machines --bucket day
+ottto cloud materials --source vertex --json
+ottto cloud plan --source vertex --config-file connector.json --json
+ottto cloud register --source vertex --config-file connector.json --approve --json
+ottto cloud test --source vertex --config-file connector.json --json
+ottto cloud status --source vertex --json
+ottto cloud sync --source vertex --days 30 --approve --json
 ottto sessions --json
 ottto sessions --json --limit 20 --source codex
 ottto sessions --json --all-machines --sort-by cost --sort-dir desc

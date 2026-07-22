@@ -487,6 +487,48 @@ fn handle_command(
         LocalControlCommand::AgentProviderImpact { query } => {
             agent_provider_impact(daemon, &authorization, query)
         }
+        LocalControlCommand::CloudMaterials { source } => {
+            cloud_command(daemon, &authorization, CloudOperation::Materials { source })
+        }
+        LocalControlCommand::CloudPlan { source, manifest } => cloud_command(
+            daemon,
+            &authorization,
+            CloudOperation::Plan { source, manifest },
+        ),
+        LocalControlCommand::CloudRegister {
+            source,
+            manifest,
+            approved,
+        } => cloud_command(
+            daemon,
+            &authorization,
+            CloudOperation::Register {
+                source,
+                manifest,
+                approved,
+            },
+        ),
+        LocalControlCommand::CloudTest { source, manifest } => cloud_command(
+            daemon,
+            &authorization,
+            CloudOperation::Test { source, manifest },
+        ),
+        LocalControlCommand::CloudSync {
+            source,
+            days,
+            approved,
+        } => cloud_command(
+            daemon,
+            &authorization,
+            CloudOperation::Sync {
+                source,
+                days,
+                approved,
+            },
+        ),
+        LocalControlCommand::CloudStatus { source } => {
+            cloud_command(daemon, &authorization, CloudOperation::Status { source })
+        }
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
@@ -750,6 +792,257 @@ fn agent_provider_impact(
     let (api_base_url, connection, setup_run_token) =
         setup_run_agent_read_context(daemon, authorization, "ottto provider-impact")?;
     get_agent_provider_impact_with_refresh(&api_base_url, &connection, &setup_run_token, &query)
+}
+
+#[derive(Debug, Clone)]
+enum CloudOperation {
+    Materials {
+        source: String,
+    },
+    Plan {
+        source: String,
+        manifest: serde_json::Value,
+    },
+    Register {
+        source: String,
+        manifest: serde_json::Value,
+        approved: bool,
+    },
+    Test {
+        source: String,
+        manifest: Option<serde_json::Value>,
+    },
+    Sync {
+        source: String,
+        days: u8,
+        approved: bool,
+    },
+    Status {
+        source: Option<String>,
+    },
+}
+
+fn cloud_command(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    operation: CloudOperation,
+) -> Result<serde_json::Value, LocalApiError> {
+    validate_cloud_operation(&operation)?;
+    let (api_base_url, connection, setup_run_token) =
+        setup_run_agent_read_context(daemon, authorization, "ottto cloud")?;
+    match cloud_request_with_base(&api_base_url, &connection, &setup_run_token, &operation) {
+        Ok(value) => Ok(value),
+        Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
+            let refreshed = refresh_setup_run_token_via_device_secret(&api_base_url, &connection)?;
+            cloud_request_with_base(
+                &api_base_url,
+                &refreshed.connection,
+                &refreshed.setup_run_token,
+                &operation,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
+    let source = match operation {
+        CloudOperation::Materials { source }
+        | CloudOperation::Plan { source, .. }
+        | CloudOperation::Register { source, .. }
+        | CloudOperation::Test { source, .. }
+        | CloudOperation::Sync { source, .. } => Some(source.as_str()),
+        CloudOperation::Status { source } => source.as_deref(),
+    };
+    if source.is_some_and(|source| !matches!(source, "bedrock" | "vertex")) {
+        return Err(LocalApiError::InvalidRequest(
+            "cloud source must be bedrock or vertex".to_string(),
+        ));
+    }
+    match operation {
+        CloudOperation::Plan { manifest, .. } | CloudOperation::Register { manifest, .. } => {
+            validate_cloud_manifest(manifest)?
+        }
+        CloudOperation::Test {
+            manifest: Some(manifest),
+            ..
+        } => validate_cloud_manifest(manifest)?,
+        _ => {}
+    }
+    if matches!(
+        operation,
+        CloudOperation::Register {
+            approved: false,
+            ..
+        }
+    ) {
+        return Err(LocalApiError::InvalidRequest(
+            "cloud register requires explicit approval".to_string(),
+        ));
+    }
+    if let CloudOperation::Sync { days, approved, .. } = operation {
+        if !approved {
+            return Err(LocalApiError::InvalidRequest(
+                "cloud sync requires explicit approval".to_string(),
+            ));
+        }
+        if !(1..=31).contains(days) {
+            return Err(LocalApiError::InvalidRequest(
+                "cloud sync days must be between 1 and 31".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cloud_manifest(value: &serde_json::Value) -> Result<(), LocalApiError> {
+    fn is_forbidden(key: &str) -> bool {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        matches!(
+            normalized.as_str(),
+            "accesskeyid"
+                | "awsaccesskeyid"
+                | "secretaccesskey"
+                | "awssecretaccesskey"
+                | "sessiontoken"
+                | "awssessiontoken"
+                | "privatekey"
+                | "clientemail"
+        )
+    }
+    fn walk(value: &serde_json::Value) -> Result<(), LocalApiError> {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    if is_forbidden(key) {
+                        return Err(LocalApiError::InvalidRequest(format!(
+                            "cloud manifests cannot contain secret credential field '{key}'"
+                        )));
+                    }
+                    walk(child)?;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    if !value.is_object() {
+        return Err(LocalApiError::InvalidRequest(
+            "cloud manifest must contain one JSON object".to_string(),
+        ));
+    }
+    walk(value)
+}
+
+fn normalized_cloud_manifest(manifest: &serde_json::Value, registering: bool) -> serde_json::Value {
+    let mut normalized = manifest.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.insert(
+            "scope".to_string(),
+            serde_json::Value::String("organization".to_string()),
+        );
+        if registering && !object.contains_key("is_active") {
+            object.insert("is_active".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+    normalized
+}
+
+fn cloud_manifest_summary(manifest: &serde_json::Value) -> serde_json::Value {
+    let keys = |field: &str| {
+        manifest
+            .get(field)
+            .and_then(serde_json::Value::as_object)
+            .map(|object| object.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    serde_json::json!({
+        "scope": "organization",
+        "credential_fields": keys("credentials"),
+        "config_fields": keys("config"),
+        "secret_fields_present": false,
+    })
+}
+
+fn cloud_request_with_base(
+    api_base_url: &str,
+    connection: &LocalConnectionBinding,
+    setup_run_token: &str,
+    operation: &CloudOperation,
+) -> Result<serde_json::Value, LocalApiError> {
+    let header = [("X-Ottto-Setup-Run-Token", setup_run_token)];
+    let root = format!(
+        "/api/v1/setup-runs/{}/local-client/cloud",
+        connection.setup_run_id
+    );
+    match operation {
+        CloudOperation::Materials { source } => {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!("{root}/materials?source={}", form_url_encode(source)),
+            );
+            backend_get_agent_read_json(&url, &header)
+        }
+        CloudOperation::Plan { source, manifest } => {
+            let url = api_url_with_base(
+                api_base_url,
+                &format!("{root}/materials?source={}", form_url_encode(source)),
+            );
+            let materials: serde_json::Value = backend_get_agent_read_json(&url, &header)?;
+            Ok(serde_json::json!({
+                "source": source,
+                "mutation": false,
+                "approval_required_for_register": true,
+                "manifest": cloud_manifest_summary(manifest),
+                "materials": materials,
+            }))
+        }
+        CloudOperation::Register {
+            source, manifest, ..
+        } => {
+            let url = api_url_with_base(api_base_url, &format!("{root}/register/{source}"));
+            backend_post_json(&url, &normalized_cloud_manifest(manifest, true), &header)
+        }
+        CloudOperation::Test { source, manifest } => {
+            let url = api_url_with_base(api_base_url, &format!("{root}/test/{source}"));
+            let body = manifest
+                .as_ref()
+                .map(|manifest| normalized_cloud_manifest(manifest, false))
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "scope": "organization",
+                        "credentials": null,
+                        "config": null,
+                    })
+                });
+            backend_post_json(&url, &body, &header)
+        }
+        CloudOperation::Sync { source, days, .. } => {
+            let url = api_url_with_base(api_base_url, &format!("{root}/sync"));
+            backend_post_json(
+                &url,
+                &serde_json::json!({"source": source, "days": days}),
+                &header,
+            )
+        }
+        CloudOperation::Status { source } => {
+            let suffix = source
+                .as_ref()
+                .map(|source| format!("?source={}", form_url_encode(source)))
+                .unwrap_or_default();
+            let url = api_url_with_base(api_base_url, &format!("{root}/status{suffix}"));
+            backend_get_agent_read_json(&url, &header)
+        }
+    }
 }
 
 fn setup_run_agent_read_context(
@@ -9571,6 +9864,55 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cloud_operation_rejects_secrets_and_unapproved_mutations() {
+        let secret = CloudOperation::Plan {
+            source: "vertex".to_string(),
+            manifest: serde_json::json!({"credentials": {"private_key": "nope"}}),
+        };
+        assert!(matches!(
+            validate_cloud_operation(&secret),
+            Err(LocalApiError::InvalidRequest(message)) if message.contains("private_key")
+        ));
+        let standard_aws_secret = CloudOperation::Test {
+            source: "bedrock".to_string(),
+            manifest: Some(serde_json::json!({
+                "credentials": {"AccessKeyId": "must-not-cross"}
+            })),
+        };
+        assert!(matches!(
+            validate_cloud_operation(&standard_aws_secret),
+            Err(LocalApiError::InvalidRequest(message)) if message.contains("AccessKeyId")
+        ));
+
+        let unapproved = CloudOperation::Register {
+            source: "vertex".to_string(),
+            manifest: serde_json::json!({"credentials": {
+                "service_account_email": "reader@example.iam.gserviceaccount.com",
+                "workload_identity_provider": "projects/123/locations/global/workloadIdentityPools/ottto-cloud/providers/ottto-production"
+            }}),
+            approved: false,
+        };
+        assert!(matches!(
+            validate_cloud_operation(&unapproved),
+            Err(LocalApiError::InvalidRequest(message)) if message.contains("approval")
+        ));
+    }
+
+    #[test]
+    fn cloud_plan_summary_never_echoes_manifest_values() {
+        let manifest = serde_json::json!({
+            "credentials": {"role_arn": "arn:aws:iam::123456789012:role/OtttoRead"},
+            "config": {"region": "us-east-1"}
+        });
+        let summary = cloud_manifest_summary(&manifest);
+        let rendered = summary.to_string();
+        assert!(rendered.contains("role_arn"));
+        assert!(!rendered.contains("123456789012"));
+        assert!(!rendered.contains("us-east-1"));
+        assert_eq!(summary["secret_fields_present"], false);
+    }
     use crate::agent_status::PiRouteClassification;
     use ottto_protocol::{RepairAuthority, RepairAuthorityMode};
 

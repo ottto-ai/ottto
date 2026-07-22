@@ -33,6 +33,22 @@ the local daemon and require this Mac to be connected. `--app
 codex|claude-code|pi` is available as a local app alias, while `--source`
 accepts backend source slugs for local, API, and cloud-provider data.
 
+## Keyless Cloud Connector
+
+```bash
+ottto cloud materials --source vertex --json
+ottto cloud plan --source vertex --config-file connector.json --json
+ottto cloud test --source vertex --config-file connector.json --json
+ottto cloud register --source vertex --config-file connector.json --approve --json
+ottto cloud status --source vertex --json
+ottto cloud sync --source vertex --days 30 --approve --json
+```
+
+`materials`, `plan`, `test`, and `status` do not save configuration or start a
+sync. `register` and `sync` require explicit `--approve`. Connector manifests
+may carry role ARNs, Workload Identity provider names, project metadata, and
+billing-table configuration, but never AWS access keys or Google private keys.
+
 ## Headless Setup
 
 ```bash

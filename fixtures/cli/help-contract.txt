@@ -9,6 +9,7 @@ Commands:
   agent-status     Refresh one source status using the lower-level source noun
   context          Print cloud context for AI agents
   costs            Print cloud cost breakdown for AI agents
+  cloud            Plan, register, test, sync, or inspect cloud connectors
   sessions         Print cloud sessions for AI agents
   recommendations  Print Advisor recommendations for AI agents
   provider-impact  Print staff-only provider-impact events for AI agents
@@ -181,6 +182,111 @@ Options:
           Request account-wide costs instead of this Mac
   -h, --help
           Print help
+### ottto cloud --help
+Plan, register, test, sync, or inspect cloud connectors
+
+Usage: ottto cloud [OPTIONS] <COMMAND>
+
+Commands:
+  materials  Show provider-side setup commands; makes no changes
+  plan       Preview a keyless connector manifest; makes no changes
+  register   Save a tested keyless connector manifest
+  test       Test supplied or already-saved connector settings
+  sync       Run an explicitly approved cloud billing sync
+  status     Show configured cloud connector status; makes no changes
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto cloud materials --help
+Show provider-side setup commands; makes no changes
+
+Usage: ottto cloud materials [OPTIONS] --source <SOURCE>
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  [possible values: bedrock, vertex]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto cloud plan --help
+Preview a keyless connector manifest; makes no changes
+
+Usage: ottto cloud plan [OPTIONS] --source <SOURCE> --config-file <PATH>
+
+Options:
+      --json                Print one final JSON object and no human summary text
+      --socket <SOCKET>     Override the ottto-service Unix socket path
+      --source <SOURCE>     [possible values: bedrock, vertex]
+      --config-file <PATH>  Keyless connector JSON manifest
+      --token <TOKEN>       Override the local-control token for CLI and agent requests
+      --no-autostart        Do not kickstart the standard per-user ottto-service
+      --watch               Emit NDJSON progress events and a final event; requires --json
+  -h, --help                Print help
+### ottto cloud register --help
+Save a tested keyless connector manifest
+
+Usage: ottto cloud register [OPTIONS] --source <SOURCE> --config-file <PATH>
+
+Options:
+      --json                Print one final JSON object and no human summary text
+      --socket <SOCKET>     Override the ottto-service Unix socket path
+      --source <SOURCE>     [possible values: bedrock, vertex]
+      --config-file <PATH>  Keyless connector JSON manifest
+      --token <TOKEN>       Override the local-control token for CLI and agent requests
+      --approve             Approve saving this connector configuration
+      --no-autostart        Do not kickstart the standard per-user ottto-service
+      --watch               Emit NDJSON progress events and a final event; requires --json
+  -h, --help                Print help
+### ottto cloud test --help
+Test supplied or already-saved connector settings
+
+Usage: ottto cloud test [OPTIONS] --source <SOURCE>
+
+Options:
+      --json                Print one final JSON object and no human summary text
+      --socket <SOCKET>     Override the ottto-service Unix socket path
+      --source <SOURCE>     [possible values: bedrock, vertex]
+      --config-file <PATH>  Optional keyless connector JSON manifest
+      --token <TOKEN>       Override the local-control token for CLI and agent requests
+      --no-autostart        Do not kickstart the standard per-user ottto-service
+      --watch               Emit NDJSON progress events and a final event; requires --json
+  -h, --help                Print help
+### ottto cloud sync --help
+Run an explicitly approved cloud billing sync
+
+Usage: ottto cloud sync [OPTIONS] --source <SOURCE>
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  [possible values: bedrock, vertex]
+      --days <DAYS>      [default: 1]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --approve          Approve starting this billable provider query
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
+### ottto cloud status --help
+Show configured cloud connector status; makes no changes
+
+Usage: ottto cloud status [OPTIONS]
+
+Options:
+      --json             Print one final JSON object and no human summary text
+      --socket <SOCKET>  Override the ottto-service Unix socket path
+      --source <SOURCE>  [possible values: bedrock, vertex]
+      --token <TOKEN>    Override the local-control token for CLI and agent requests
+      --no-autostart     Do not kickstart the standard per-user ottto-service
+      --watch            Emit NDJSON progress events and a final event; requires --json
+  -h, --help             Print help
 ### ottto sessions --help
 Print cloud sessions for AI agents
 
