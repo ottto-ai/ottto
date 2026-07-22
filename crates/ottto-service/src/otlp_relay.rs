@@ -558,7 +558,7 @@ fn handle_local_health_request(
     // should not be exposed to origin-less loopback callers. Requiring a
     // validated browser origin preserves the existing curl/native response
     // while letting the Apps page distinguish two macOS users on one Mac.
-    let device_id = origin.and_then(|_| {
+    let device_id = local_health_browser_device_id(origin, || {
         load_snapshot_device_credentials()
             .ok()
             .map(|(device, _secret)| device.device_id)
@@ -573,6 +573,13 @@ fn handle_local_health_request(
             &cors_headers,
         ),
     }
+}
+
+fn local_health_browser_device_id(
+    origin: Option<&str>,
+    load_device_id: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    origin.and_then(|_| load_device_id())
 }
 
 fn local_health_response_payload(
@@ -1436,6 +1443,22 @@ mod tests {
         assert!(payload["health"].get("user_id").is_none());
         assert!(payload["health"].get("org_id").is_none());
         assert!(payload.get("hardware_uuid").is_none());
+    }
+
+    #[test]
+    fn local_health_device_identity_requires_a_validated_browser_origin() {
+        assert_eq!(
+            local_health_browser_device_id(None, || {
+                panic!("origin-less callers must not load device identity")
+            }),
+            None
+        );
+        assert_eq!(
+            local_health_browser_device_id(Some("https://app.ottto.net"), || {
+                Some("device_current_installation".to_string())
+            }),
+            Some("device_current_installation".to_string())
+        );
     }
 
     #[test]
