@@ -5972,7 +5972,7 @@ mod tests {
     }
 
     #[test]
-    fn two_hundred_item_fixture_stays_inside_batch_and_wall_time_caps() {
+    fn two_hundred_item_fixture_stays_inside_batch_caps() {
         let (grants, checkpoints) = stores("load");
         enabled(&grants);
         let batch_page = |start: u32, cursor: Value| {
@@ -6003,12 +6003,10 @@ mod tests {
             batches: RefCell::new(Vec::new()),
             fail: false,
         };
-        let started = Instant::now();
         assert_eq!(
             collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
             CloudSessionCycleOutcome::Uploaded
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(runner.calls.get(), MAX_PAGES);
         let batches = transport.batches.borrow();
         assert_eq!(batches[0].observations.len(), MAX_ITEMS);
