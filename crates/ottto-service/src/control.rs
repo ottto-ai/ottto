@@ -23,11 +23,12 @@ use ottto_core::{
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentProviderImpactQuery,
-    AgentRecommendationsQuery, AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse,
-    AuthResetResponse, AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError,
-    CliErrorCode, CloudSessionBackendGrantResponseV1, CloudSessionsControlAction, ConfigDrift,
-    ControlResult, ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
+    AgentInstallationDetection, AgentProviderImpactQuery, AgentRecommendationsQuery,
+    AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
+    AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError, CliErrorCode,
+    CloudSessionBackendGrantResponseV1, CloudSessionsControlAction, ConfigDrift, ControlResult,
+    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
     DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
     DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
     LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
@@ -36,8 +37,7 @@ use ottto_protocol::{
     RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
     SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
     StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -272,16 +272,15 @@ pub fn handle_request_with_peer(
     peer: Option<LocalClientPeer>,
 ) -> LocalControlResponse {
     let request_id = request.request_id.clone();
-    if request.protocol_version != LOCAL_CONTROL_PROTOCOL_VERSION {
+    if let Err(message) =
+        validate_local_control_protocol_version(request.protocol_version, &request.command)
+    {
         return LocalControlResponse {
             request_id,
             ok: false,
             payload: None,
             error: Some(CliError {
-                message: format!(
-                    "unsupported local control protocol_version {}; expected {}",
-                    request.protocol_version, LOCAL_CONTROL_PROTOCOL_VERSION
-                ),
+                message,
                 retryable: false,
                 code: CliErrorCode::InvalidRequest,
                 details: BTreeMap::new(),
@@ -11514,6 +11513,59 @@ mod tests {
         assert!(error
             .message
             .contains("unsupported local control protocol_version 10"));
+    }
+
+    #[test]
+    fn typed_cloud_sessions_control_rejects_base_protocol_version() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_cloud_v15".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
+                command: LocalControlCommand::CloudSessionsControl {
+                    action: CloudSessionsControlAction::Status,
+                    control_token: SecretString::new("header.payload.signature"),
+                    api_base_url: None,
+                    backend_grant: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error
+            .message
+            .contains("unsupported local control protocol_version 15"));
+        assert!(error.message.contains("expected 16"));
+    }
+
+    #[test]
+    fn typed_status_rejects_cloud_sessions_protocol_version() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_status_v16".to_string(),
+                protocol_version: ottto_protocol::CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error
+            .message
+            .contains("unsupported local control protocol_version 16"));
+        assert!(error.message.contains("expected 15"));
     }
 
     #[test]

@@ -7,8 +7,10 @@ activation without changing public startup.
 
 - Added additive local-control protocol action `cloud_sessions_control` with
   prepare, bind, pause, revoke, confirm-revoked, and status operations. It uses
-  protocol v15 so older daemons reject the unknown command and older clients do
-  not send it.
+  command-scoped protocol v16 so older v15 daemons reject cloud-session
+  activation and direct the UI to update. Every unrelated local-control command
+  and daemon status remains on base protocol v15 for mixed-owner upgrade
+  compatibility.
 - Browser JWTs remain in the browser. The daemon accepts only a short-lived
   backend-signed action token, validates it against a trusted Ottto backend,
   requires exact organization/user/device/source agreement with local account
@@ -71,13 +73,13 @@ activation without changing public startup.
 
 ## Exact local-control wire
 
-Each attempt uses protocol v15 plus a newly minted action token. Prepare has no
-backend grant in its request:
+Each attempt uses command-scoped protocol v16 plus a newly minted action token.
+Prepare has no backend grant in its request:
 
 ```json
 {
   "request_id": "cloud-prepare-1",
-  "protocol_version": 15,
+  "protocol_version": 16,
   "client_kind": "web_ui",
   "command": "cloud_sessions_control",
   "action": "prepare",

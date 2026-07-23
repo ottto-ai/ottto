@@ -6,6 +6,11 @@ change a release version.
 
 ## Official upstream contract
 
+`cloud_sessions_control` alone requires local-control protocol v16. Base
+status, update, socket/XPC, release-manifest, and backend protocol reporting
+remain v15, preserving mixed-owner upgrade compatibility while making a new
+web client fail closed against an old daemon.
+
 The collector now consumes the exact JSON shape emitted by the officially
 documented, upstream-experimental `codex cloud list --json` command:
 
