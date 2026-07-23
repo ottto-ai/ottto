@@ -113,6 +113,7 @@ CHECKS = [
     "diagnostics_redaction",
     "update_check",
     "mixed_owner_app_version_truth",
+    "mixed_owner_sparkle_autonomous_lifecycle",
     "rollback_notes",
     "stable_formula_static",
     "stable_hosted_installer_static",
@@ -191,6 +192,22 @@ evidence = {
         "protocol_version": min_protocol_version,
         "release_manifest_sha256": manifest_sha,
     },
+    "update_lifecycle": {
+        "launch_provenance": "TODO_launchservices_bundle",
+        "user_update_actions": 0,
+        "homebrew_service_reached_target": False,
+        "lower_gui_remained_running_after_homebrew_update": False,
+        "sparkle_terminated_old_process": False,
+        "sparkle_relaunched_target_bundle": False,
+        "process_id_changed": False,
+        "manual_process_termination": True,
+        "manual_app_launch": True,
+        "account_continuity_verified": False,
+        "source_continuity_verified": False,
+        "diagnostics_via_homebrew_socket": False,
+        "verify_via_homebrew_socket": False,
+        "owner_prefix_protocol_schema_version_converged": False,
+    },
     "checks": {check: "not_run" for check in CHECKS},
     "operator_notes": [
         "Fill only redacted pass/fail status facts after running stable-candidate RC QA.",
@@ -202,6 +219,11 @@ evidence = {
         (
             "Set top-level status and every check to passed only after the exact "
             "stable-candidate manifest above passed that check."
+        ),
+        (
+            "The update_lifecycle object must describe one foreground update action "
+            "from a canonical LaunchServices bundle launch. Any manual signal, force "
+            "quit, executable-path launch, or manual reopen fails the gate."
         ),
     ],
 }

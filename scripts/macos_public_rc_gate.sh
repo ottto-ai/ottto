@@ -105,6 +105,7 @@ REQUIRED_CHECKS = [
     "diagnostics_redaction",
     "update_check",
     "mixed_owner_app_version_truth",
+    "mixed_owner_sparkle_autonomous_lifecycle",
     "rollback_notes",
     "stable_formula_static",
     "stable_hosted_installer_static",
@@ -205,6 +206,10 @@ for artifact in macos_artifacts:
 candidate_evidence = require_object(evidence.get("candidate_manifest"), "evidence candidate_manifest")
 environment = require_object(evidence.get("environment"), "evidence environment")
 local_platform = require_object(evidence.get("local_platform"), "evidence local_platform")
+update_lifecycle = require_object(
+    evidence.get("update_lifecycle"),
+    "evidence update_lifecycle",
+)
 checks = require_object(evidence.get("checks"), "evidence checks")
 
 if evidence.get("schema_version") != 1:
@@ -240,6 +245,27 @@ if environment.get("host_kind") not in {"trusted_internal_macos", "clean_macos"}
 if environment.get("arch") not in {"arm64", "x86_64", "universal"}:
     die("evidence arch must be arm64, x86_64, or universal")
 require_string(environment.get("macos_version"), "evidence macos_version")
+
+required_lifecycle_values = {
+    "launch_provenance": "launchservices_bundle",
+    "user_update_actions": 1,
+    "homebrew_service_reached_target": True,
+    "lower_gui_remained_running_after_homebrew_update": True,
+    "sparkle_terminated_old_process": True,
+    "sparkle_relaunched_target_bundle": True,
+    "process_id_changed": True,
+    "manual_process_termination": False,
+    "manual_app_launch": False,
+    "account_continuity_verified": True,
+    "source_continuity_verified": True,
+    "diagnostics_via_homebrew_socket": True,
+    "verify_via_homebrew_socket": True,
+    "owner_prefix_protocol_schema_version_converged": True,
+}
+for field, expected in required_lifecycle_values.items():
+    actual = update_lifecycle.get(field)
+    if type(actual) is not type(expected) or actual != expected:
+        die(f"evidence update_lifecycle.{field} must be {expected!r}")
 
 for check in REQUIRED_CHECKS:
     if checks.get(check) != "passed":
