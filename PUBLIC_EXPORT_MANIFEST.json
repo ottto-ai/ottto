@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 259,
-  "content_sha256": "ae4119b3e4f4971bc6fdde1b5453532d1c2b6ba31e88e3c5c1d6f4ad19b99cdc",
+  "content_sha256": "78df7b40f25a892daca2b664158559f3c622722f44f58f18f9dde19d6bb924b4",
   "files": [
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "e0f46555e00ec21571b57b52770f2fe9d45ddc8aff01c467caf9bd55eed65af8",
-      "size_bytes": 345019
+      "sha256": "3fc25fa1bf82ba1e75d4f96d93fd8702cdfecf7cf95a6f83cd23b605eab2ad45",
+      "size_bytes": 347052
     },
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "0c042a90def19e7ad99c70ce7a778ab33431dc6cb71efdd7030591b721046cf0",
-      "size_bytes": 56887
+      "sha256": "8546998513c51982c6aed21f7b6cf1f9a5235bb34748d29d2e3224fc6f3dc094",
+      "size_bytes": 58107
     },
     {
       "executable": false,
@@ -1007,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-23-cloud-session-contract-and-io-fence.md",
-      "sha256": "d2a1388c6898a810b1abc8de0357ba001d7aad4a4cdafaf526d28b700af622a1",
-      "size_bytes": 3980
+      "sha256": "bb266ea8f41294d64d253281ff3d64d14bd3b4be6607ab7dfd5e408c4869db12",
+      "size_bytes": 4604
     },
     {
       "executable": false,
@@ -1816,7 +1816,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-23T04:32:28+00:00",
+  "generated_at": "2026-07-23T06:26:27+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 260,
   "public_roots": [
@@ -1852,5 +1852,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "52d8002cdbb85f63074f0059b9aa2b2a69c01b53"
+  "source_commit": "e56e7ca8a5761f0aa17e404c6e022438868ca1a2"
 }

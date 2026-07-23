@@ -53,6 +53,13 @@ path. Admitted relay requests are capped at 12 seconds, strictly below the
 15-second local stop wait, while the overall collector cycle remains capped at
 45 seconds. No database, checkpoint, or ingestion work was added.
 
+Cloud-session HTTP agents also reject redirects instead of replaying the
+long-lived device secret or relay bearer token to a redirect target. Every
+response is required to be 2xx before its typed body is parsed. A loopback
+regression proves a relay-token 302 with a valid-looking token body is rejected,
+reaches only the configured backend listener, and never reaches the redirect
+listener.
+
 Deterministic barriers cover revoke after revalidation but before chunk,
 finalize, heartbeat, and failure-health admission. A separate blocking transport
 test proves revoke waits for an already admitted relay chunk, complementing the
@@ -60,8 +67,8 @@ existing provider-subprocess wait coverage.
 
 ## Validation
 
-- `cargo test -p ottto-service cloud_sessions --lib`: 83 passed.
-- `cargo test -p ottto-service`: 859 library tests passed with one pre-existing
+- `cargo test -p ottto-service cloud_sessions --lib`: 85 passed.
+- `cargo test -p ottto-service`: 861 library tests passed with one pre-existing
   ignored test; three binary tests passed.
 - `cargo test -p ottto-protocol`: 36 passed with one pre-existing ignored test.
 - `cargo clippy -p ottto-service --all-targets -- -D warnings`: passed.
@@ -69,6 +76,9 @@ existing provider-subprocess wait coverage.
 - Strict local AutoReview found the stale manifest and a relay/stop timeout
   mismatch. Both were accepted and corrected; the final focused verification
   result is recorded in the implementation handoff.
+- A final strict branch review found that the new relay-token request could
+  inherit ureq's redirect behavior and replay its device-secret header. The
+  cloud-session agent now rejects redirects, with targeted regression coverage.
 
 The private backend still requires the next immutable collector release version
 to be explicitly approved and deployed before demo enrollment. This public

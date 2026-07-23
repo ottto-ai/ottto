@@ -6753,6 +6753,55 @@ mod tests {
     }
 
     #[test]
+    fn relay_token_redirect_never_forwards_the_device_secret() {
+        use std::io::{ErrorKind, Write};
+        use std::net::TcpListener;
+
+        let attacker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_address = attacker.local_addr().unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_address = relay.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = relay.accept().unwrap();
+            *server_captured.lock().unwrap() = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{attacker_address}/capture\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{{\"token\":\"redirect-body-token\"}}"
+            )
+            .unwrap();
+        });
+
+        let transport = RelayCloudSessionTransport::new(
+            format!("http://{relay_address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            },
+            "redirect-guard-secret".to_string(),
+        );
+        let error = transport
+            .token(false, Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        let diagnostics = error
+            .downcast_ref::<crate::snapshot_client::UploadFailureDiagnostics>()
+            .unwrap();
+        assert_eq!(diagnostics.status_family(), "http_3xx");
+        server.join().unwrap();
+        assert!(captured
+            .lock()
+            .unwrap()
+            .contains("X-Ottto-Device-Secret: redirect-guard-secret"));
+        assert!(matches!(
+            attacker.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
     fn relay_transport_revalidates_one_exact_device_bound_grant_epoch() {
         use std::io::Write;
         use std::net::TcpListener;
