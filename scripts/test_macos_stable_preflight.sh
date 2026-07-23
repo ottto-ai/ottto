@@ -61,6 +61,22 @@ jq -n \
       protocol_version: 15,
       release_manifest_sha256: $candidate_sha
     },
+    update_lifecycle: {
+      launch_provenance: "launchservices_bundle",
+      user_update_actions: 1,
+      homebrew_service_reached_target: true,
+      lower_gui_remained_running_after_homebrew_update: true,
+      sparkle_terminated_old_process: true,
+      sparkle_relaunched_target_bundle: true,
+      process_id_changed: true,
+      manual_process_termination: false,
+      manual_app_launch: false,
+      account_continuity_verified: true,
+      source_continuity_verified: true,
+      diagnostics_via_homebrew_socket: true,
+      verify_via_homebrew_socket: true,
+      owner_prefix_protocol_schema_version_converged: true
+    },
     checks: {
       release_gate: "passed",
       public_surface_ci: "passed",
@@ -78,6 +94,7 @@ jq -n \
       diagnostics_redaction: "passed",
       update_check: "passed",
       mixed_owner_app_version_truth: "passed",
+      mixed_owner_sparkle_autonomous_lifecycle: "passed",
       rollback_notes: "passed",
       stable_formula_static: "passed",
       stable_hosted_installer_static: "passed"
@@ -307,6 +324,32 @@ jq --arg evidence "$bad_candidate_rc_runtime" \
   "$stable_manifest" > "$bad_candidate_rc_runtime_manifest"
 if "$PREFLIGHT" --manifest "$bad_candidate_rc_runtime_manifest" --dry-run >/dev/null 2>&1; then
   echo "Expected stable-candidate RC runtime binding mismatch to fail stable preflight" >&2
+  exit 1
+fi
+
+manual_candidate_rc_lifecycle="$TMP_DIR/stable-candidate-rc-manual-lifecycle-qa.json"
+jq '.update_lifecycle.manual_app_launch = true' \
+  "$candidate_rc_evidence" > "$manual_candidate_rc_lifecycle"
+manual_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-manual-lifecycle-manifest.json"
+jq \
+  --arg evidence "$manual_candidate_rc_lifecycle" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$manual_candidate_rc_lifecycle_manifest"
+if "$PREFLIGHT" --manifest "$manual_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected manual Sparkle relaunch assistance to fail stable preflight" >&2
+  exit 1
+fi
+
+wrong_type_candidate_rc_lifecycle="$TMP_DIR/stable-candidate-rc-wrong-type-lifecycle-qa.json"
+jq '.update_lifecycle.user_update_actions = true' \
+  "$candidate_rc_evidence" > "$wrong_type_candidate_rc_lifecycle"
+wrong_type_candidate_rc_lifecycle_manifest="$TMP_DIR/stable-candidate-rc-wrong-type-lifecycle-manifest.json"
+jq \
+  --arg evidence "$wrong_type_candidate_rc_lifecycle" \
+  '.quality_gates.stable_candidate_rc.evidence_path = $evidence' \
+  "$stable_manifest" > "$wrong_type_candidate_rc_lifecycle_manifest"
+if "$PREFLIGHT" --manifest "$wrong_type_candidate_rc_lifecycle_manifest" --dry-run >/dev/null 2>&1; then
+  echo "Expected boolean update-action count to fail stable preflight" >&2
   exit 1
 fi
 

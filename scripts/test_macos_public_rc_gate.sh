@@ -266,7 +266,12 @@ jq -e \
    and .local_platform.version == "0.1.0-stable-candidate.1"
    and .local_platform.release_channel == "stable-candidate"
    and .local_platform.protocol_version == 15
-   and .local_platform.release_manifest_sha256 == $candidate_sha' \
+   and .local_platform.release_manifest_sha256 == $candidate_sha
+   and .update_lifecycle.launch_provenance == "TODO_launchservices_bundle"
+   and .update_lifecycle.manual_process_termination == true
+   and .update_lifecycle.manual_app_launch == true
+   and .checks.mixed_owner_app_version_truth == "not_run"
+   and .checks.mixed_owner_sparkle_autonomous_lifecycle == "not_run"' \
   "$template_evidence" >/dev/null
 expect_failure "unfilled template evidence" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$template_evidence"
@@ -285,6 +290,22 @@ jq \
   '.status = "passed"
    | .environment.macos_version = $macos_version
    | .environment.arch = "arm64"
+   | .update_lifecycle = {
+       launch_provenance: "launchservices_bundle",
+       user_update_actions: 1,
+       homebrew_service_reached_target: true,
+       lower_gui_remained_running_after_homebrew_update: true,
+       sparkle_terminated_old_process: true,
+       sparkle_relaunched_target_bundle: true,
+       process_id_changed: true,
+       manual_process_termination: false,
+       manual_app_launch: false,
+       account_continuity_verified: true,
+       source_continuity_verified: true,
+       diagnostics_via_homebrew_socket: true,
+       verify_via_homebrew_socket: true,
+       owner_prefix_protocol_schema_version_converged: true
+     }
    | .checks |= with_entries(.value = "passed")
    | .operator_notes = ["redacted stable-candidate RC evidence"]' \
   "$template_evidence" > "$passed_evidence"
@@ -386,6 +407,47 @@ jq 'del(.checks.mixed_owner_app_version_truth)' "$passed_evidence" > "$missing_c
 expect_failure "missing mixed-owner app version truth check" \
   "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$missing_check_evidence"
 grep -q "mixed_owner_app_version_truth" /tmp/macos-public-rc-gate.out
+
+missing_lifecycle_evidence="$TMP_DIR/missing-lifecycle-stable-candidate-rc-qa.json"
+jq 'del(.update_lifecycle)' "$passed_evidence" > "$missing_lifecycle_evidence"
+expect_failure "missing autonomous lifecycle evidence" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$missing_lifecycle_evidence"
+grep -q "evidence update_lifecycle must be an object" /tmp/macos-public-rc-gate.out
+
+manual_termination_evidence="$TMP_DIR/manual-termination-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.manual_process_termination = true' \
+  "$passed_evidence" > "$manual_termination_evidence"
+expect_failure "manual process termination rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$manual_termination_evidence"
+grep -q "update_lifecycle.manual_process_termination must be False" /tmp/macos-public-rc-gate.out
+
+manual_launch_evidence="$TMP_DIR/manual-launch-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.manual_app_launch = true' \
+  "$passed_evidence" > "$manual_launch_evidence"
+expect_failure "manual app launch rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$manual_launch_evidence"
+grep -q "update_lifecycle.manual_app_launch must be False" /tmp/macos-public-rc-gate.out
+
+noncanonical_launch_evidence="$TMP_DIR/noncanonical-launch-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.launch_provenance = "executable_path"' \
+  "$passed_evidence" > "$noncanonical_launch_evidence"
+expect_failure "noncanonical launch provenance rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$noncanonical_launch_evidence"
+grep -q "update_lifecycle.launch_provenance must be 'launchservices_bundle'" /tmp/macos-public-rc-gate.out
+
+boolean_action_count_evidence="$TMP_DIR/boolean-action-count-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.user_update_actions = true' \
+  "$passed_evidence" > "$boolean_action_count_evidence"
+expect_failure "boolean action count rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$boolean_action_count_evidence"
+grep -q "update_lifecycle.user_update_actions must be 1" /tmp/macos-public-rc-gate.out
+
+numeric_boolean_evidence="$TMP_DIR/numeric-boolean-stable-candidate-rc-qa.json"
+jq '.update_lifecycle.sparkle_relaunched_target_bundle = 1' \
+  "$passed_evidence" > "$numeric_boolean_evidence"
+expect_failure "numeric boolean rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$numeric_boolean_evidence"
+grep -q "update_lifecycle.sparkle_relaunched_target_bundle must be True" /tmp/macos-public-rc-gate.out
 
 bad_stable_sha="$TMP_DIR/bad-stable-sha-manifest.json"
 write_stable_binding_manifest \
