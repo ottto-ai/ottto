@@ -161,7 +161,7 @@
           "data_source_kind": "integration_connector",
           "default_state": "requires_setup",
           "review_tier": "official",
-          "maturity": "beta",
+          "maturity": "experimental",
           "risk_classes": [
             "auth_adjacent",
             "network_calls"

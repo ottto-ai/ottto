@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 258,
-  "content_sha256": "e29c7dfa210eb9384ce959cd5217261e45f24f2c401c1c596a3fe9322ed3cd3c",
+  "candidate_file_count": 259,
+  "content_sha256": "ce74b020c379778b4321cdadc0a9450209e885650dcdc3324da51d2e2633d8e2",
   "files": [
     {
       "executable": false,
@@ -132,8 +132,8 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/registry.generated.json",
-      "sha256": "51fdf8bbdac17dc2ae2bce24e8a2dfdfc636de03b62bb5860ebb407f0ce29bc4",
-      "size_bytes": 12053
+      "sha256": "c924422d8a3741bc856f389184ed4534010f1bb8c5425e7a36aa045062087802",
+      "size_bytes": 12061
     },
     {
       "executable": false,
@@ -237,22 +237,22 @@
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/POLICY.md",
-      "sha256": "6179da8cb3400d04ce98fa3a7ede421b9f6fa3bcd39bf64c79ff86a27bc52ae5",
-      "size_bytes": 8920
+      "sha256": "4738641173a29da8fdc9ea5497900fe38fd28460fae5d229b8c049449f7dc4bb",
+      "size_bytes": 9439
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/README.md",
-      "sha256": "067e9a863bb500bebecd0c0aa9db1e1b6eccaafe20218d2e81c9c177216385cf",
-      "size_bytes": 3890
+      "sha256": "d58f114f0a3c575665483d5eec6d8b87e5155d969c3cdbbdc81c0abfbf985754",
+      "size_bytes": 4414
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "connectors/sources/codex/collectors/cloud_sessions/collector.toml",
-      "sha256": "acdc7569980bdc5435578b38a5166296f2bfb86b1c1131ff22d585b413a21814",
-      "size_bytes": 570
+      "sha256": "bd1becfd98a7b75b0256055b0c3aa364c4768bdc7132c09b33fc8771a28b2acc",
+      "size_bytes": 578
     },
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "5f414092ac3dcc5a4a32fb262b38cb58b5401f94ce3fde95fc4ab356a39c1c7b",
-      "size_bytes": 318154
+      "sha256": "e0f46555e00ec21571b57b52770f2fe9d45ddc8aff01c467caf9bd55eed65af8",
+      "size_bytes": 345019
     },
     {
       "executable": false,
@@ -706,8 +706,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "815b3e016c0ccdf0af833d8a2ca028899ab0411dc0b2700599e1afd2a1c069a7",
-      "size_bytes": 714689
+      "sha256": "cd9df645775c57e3be56212999c9a17d1bee4de40fea7a7c61e9c62c91ac1046",
+      "size_bytes": 714719
     },
     {
       "executable": false,
@@ -895,8 +895,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "d937d2ae0618ea6a3eae115aba3946af20c1974b90bbaf1d1f584bb553f4c82e",
-      "size_bytes": 13752
+      "sha256": "9ee137f851a138c914c345538f6eb92e96aceab6bacda2fa2737effa33b825b7",
+      "size_bytes": 14178
     },
     {
       "executable": false,
@@ -979,8 +979,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-22-cloud-session-relay-composition.md",
-      "sha256": "92e6add4ec78fbf51de721a01883b549fb2f9a18b913872c0d23adf9af7ee31d",
-      "size_bytes": 5165
+      "sha256": "9de335246bca15ee1df984656f036f8a17f70b8d4102f4326e6b403041791c6d",
+      "size_bytes": 5176
     },
     {
       "executable": false,
@@ -1002,6 +1002,13 @@
       "path": "docs/session-2026-07-22-snapshot-upload-resume-checkpoint.md",
       "sha256": "6cc0e1fd5234b367faf0090e9b28c9f771455fd3bfe0687e6362fdf89ca26bb7",
       "size_bytes": 3535
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-23-cloud-session-contract-and-io-fence.md",
+      "sha256": "d2a1388c6898a810b1abc8de0357ba001d7aad4a4cdafaf526d28b700af622a1",
+      "size_bytes": 3980
     },
     {
       "executable": false,
@@ -1809,9 +1816,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-23T03:38:30+00:00",
+  "generated_at": "2026-07-23T04:32:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 259,
+  "output_file_count": 260,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

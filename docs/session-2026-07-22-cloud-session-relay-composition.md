@@ -62,10 +62,11 @@ instead of relying on process-local activation state, so standalone CLI and
 daemon control responses agree without adding a status heartbeat or database
 write.
 
-Pause and revoke continue to close the process-shared provider admission fence,
-wait boundedly for an already admitted Codex subprocess, and only then return
-the exact backend deletion target. Failed composition or authority validation
-does not rewrite grant identity, advance a scan, or authorize absence.
+Pause and revoke close the process-shared collector-I/O admission fence, wait
+boundedly for every already admitted Codex subprocess or relay write, and only
+then return the exact backend deletion target. Failed composition or authority
+validation does not rewrite grant identity, advance a scan, or authorize
+absence.
 
 ## Validation
 

@@ -51,7 +51,8 @@ a permanently invalid session cannot make the checkpoint grow with every
 historical revision.
 
 The optional Codex Cloud Sessions collector is experimental and disabled by
-default. Its single daemon supervisor starts normally but remains inert until
+default. It uses an officially documented, upstream-experimental Codex CLI
+surface. Its single daemon supervisor starts normally but remains inert until
 the user grants the exact local device/user/organization scope and server
 policy approves that same versioned grant. Newly granted consent activates on
 the next bounded cycle without a daemon restart. The collector invokes only
@@ -70,12 +71,15 @@ ordered chunks of at most 200 observations. The current cursor, raw response,
 and scan inventory exist only in the long-lived collector process; restart
 drops them, creates a new local UUID, and starts again from page zero.
 
-Cursor pagination proves positive observations only. Absence can be considered
-only by the server after a single terminal provider response containing at most
-20 entities; multi-page terminal scans are labeled `unstable_cursor`. Cap,
-cursor churn, malformed/truncated response, timeout, cancellation, or error
-paths can upload bounded positive chunks but never finalize an absence-capable
-epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
+Cursor pagination proves positive observations only. Only explicit official
+`cursor: null` proves terminal enumeration. Absence can be considered only by
+the server after one such response containing at most 20 entities; multi-page
+official terminal scans are labeled `unstable_cursor`. Fieldless objects, root
+arrays, and alias-only nulls may preserve valid nonempty positive facts but
+never finalize or authorize absence; empty ambiguous responses fail closed.
+Cap, cursor churn, malformed/truncated response, timeout, cancellation, or
+error paths can upload bounded positive chunks but never finalize an
+absence-capable epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
 content-free SHA-256 values; semantic digests exclude observation/collection
 time. Identical response-loss retries reuse the exact chunk or finalize body.
 
@@ -103,8 +107,9 @@ subprocess receives no provider API keys and does not start an interactive
 shell.
 
 The uploaded `account_fingerprint` is an opaque local Ottto organization/user
-collector scope, not an OpenAI or Codex provider-account identity. The official
-CLI path currently exposes no sanctioned safe account discriminator; Ottto does
+collector scope, not an OpenAI or Codex provider-account identity. The
+documented upstream-experimental CLI path currently exposes no sanctioned safe
+account discriminator; Ottto does
 not infer one or merge histories across a user-known provider-account switch.
 Such a switch requires explicit local stop, exact backend deletion, and setup
 again. Ottto also refuses logout, account replacement, relay-device rotation,
@@ -147,9 +152,10 @@ action, organization, effective user, Codex relay device, and source. The daemon
 validates it only against a trusted Ottto backend, compares every binding with
 the connected local account/device, and atomically consumes it before a side
 effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
-the JWT and raw token id are never persisted. Pause/revoke closes provider-call
-admission first and waits for an already admitted bounded subprocess to finish
-before returning the exact backend DELETE target. Exact bind-response retries
+the JWT and raw token id are never persisted. Pause/revoke persists stopped
+state to close the shared provider/relay admission fence, then waits for every
+already admitted bounded provider subprocess or chunk/finalize/heartbeat/failure
+write to finish before returning the exact backend DELETE target. Exact bind-response retries
 are local no-ops and cannot change timestamps or resurrect pause/revoke. If an
 authenticated grant POST commits immediately before rollout removal blocks
 bind, the independently permitted revoke action may carry that exact

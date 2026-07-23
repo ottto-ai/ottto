@@ -2207,7 +2207,7 @@ fn cloud_sessions_control_with_stores(
         CloudSessionsControlAction::Pause | CloudSessionsControlAction::Revoke
     ) {
         checkpoints
-            .wait_for_provider_idle(Duration::from_secs(15))
+            .wait_for_collector_io_idle(crate::cloud_sessions::COLLECTOR_IO_STOP_TIMEOUT)
             .map_err(|_| {
                 LocalApiError::LocalOperationFailed(
                     "cloud-session local control failed".to_string(),
@@ -2216,9 +2216,9 @@ fn cloud_sessions_control_with_stores(
     }
 
     if action == CloudSessionsControlAction::Revoke {
-        // Provider-idle waiting happens without the lifecycle lock. Reacquire
-        // it and revalidate exact cleanup authority before binding a raced POST
-        // response or returning the sole DELETE target.
+        // Collector-I/O idle waiting happens without the lifecycle lock.
+        // Reacquire it and revalidate exact cleanup authority before binding a
+        // raced POST response or returning the sole DELETE target.
         let _identity_lifecycle_lock = lock_setup_run_binding();
         let current_account = accounts.load().map_err(|_| LocalApiError::StatePoisoned)?;
         let current_device = devices
@@ -13536,7 +13536,7 @@ mod tests {
                 device_id,
             )
             .unwrap();
-        checkpoints.set_provider_calls_active_for_test(1);
+        checkpoints.set_collector_io_active_for_test(1);
 
         let action = CloudSessionsControlAction::Revoke;
         let action_slug = cloud_sessions_action_slug(&action);
@@ -13587,7 +13587,7 @@ mod tests {
             })
             .unwrap();
         drop(lifecycle_lock);
-        checkpoints.set_provider_calls_active_for_test(0);
+        checkpoints.set_collector_io_active_for_test(0);
 
         assert!(matches!(
             worker.join().unwrap(),
