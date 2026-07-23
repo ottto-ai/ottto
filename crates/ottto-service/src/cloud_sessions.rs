@@ -1072,6 +1072,13 @@ pub fn cloud_session_collector_status(
     let backend_reconciliation_required = stored_grant
         .as_ref()
         .is_some_and(|grant| grant.backend_create_pending);
+    let backend_revocation_confirmation_required = stored_grant.as_ref().is_some_and(|grant| {
+        grant.status == CloudSessionGrantStatus::Revoked
+            && grant
+                .backend_binding
+                .as_ref()
+                .is_some_and(|binding| !binding.backend_revoked)
+    });
     let grant_status = if kill_switch_enabled() {
         CloudSessionGrantStatus::PolicyDisabled
     } else {
@@ -1114,6 +1121,8 @@ pub fn cloud_session_collector_status(
     } else {
         let reason_code = if backend_reconciliation_required {
             "backend_grant_reconciliation_required"
+        } else if backend_revocation_confirmation_required {
+            "backend_revocation_confirmation_required"
         } else if collector_version_rebind_required {
             "collector_version_rebind_required"
         } else {
@@ -6258,6 +6267,10 @@ mod tests {
         assert!(pending.backend_create_pending);
         assert!(pending.pending_backend_create.is_some());
         assert!(pending.backend_binding.is_none());
+        assert_eq!(
+            cloud_session_collector_status(&restarted, &DeferredCloudSessionTransport).reason_code,
+            "backend_grant_reconciliation_required"
+        );
 
         assert!(restarted
             .confirm_backend_grant_absent_after_reconciliation()
@@ -6307,6 +6320,10 @@ mod tests {
         );
         assert!(!retained.backend_binding.as_ref().unwrap().backend_revoked);
         assert_eq!(grants.grant_revoke_target().unwrap().grant_id, GRANT_ID);
+        assert_eq!(
+            cloud_session_collector_status(&grants, &DeferredCloudSessionTransport).reason_code,
+            "backend_revocation_confirmation_required"
+        );
 
         let runner = Pages {
             pages: RefCell::new(vec![page("must-not-run", None)]),
@@ -6328,6 +6345,10 @@ mod tests {
         grants
             .apply_backend_revocation(&backend_grant(&original, "revoked", 2), INSTALLATION_ID)
             .unwrap();
+        assert_eq!(
+            cloud_session_collector_status(&grants, &DeferredCloudSessionTransport).reason_code,
+            "revoked"
+        );
         let prepared = grants.enable(&replacement, now()).unwrap();
         assert_eq!(prepared.status, CloudSessionGrantStatus::ConsentRequired);
         assert!(prepared.backend_binding.is_none());

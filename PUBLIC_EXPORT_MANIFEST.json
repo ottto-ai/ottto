@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 259,
-  "content_sha256": "78df7b40f25a892daca2b664158559f3c622722f44f58f18f9dde19d6bb924b4",
+  "content_sha256": "61e2d91401be1971253c8e5870a27cc0f6a89e9cd097a87babebf9928e57be6a",
   "files": [
     {
       "executable": false,
@@ -664,8 +664,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/cloud_sessions.rs",
-      "sha256": "3fc25fa1bf82ba1e75d4f96d93fd8702cdfecf7cf95a6f83cd23b605eab2ad45",
-      "size_bytes": 347052
+      "sha256": "2f24a5a7655437077c4b22e07c2be27b337ac1266afc41d412a36358db8f7807",
+      "size_bytes": 347989
     },
     {
       "executable": false,
@@ -706,8 +706,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "645ed5ef1429ed088801da487a53c351aa950919c6d72d398438ec4098666a1d",
-      "size_bytes": 718438
+      "sha256": "2f87af3e3eef5298b47a70febb05798c1875d01647323d3c5c43107a3ffeb41b",
+      "size_bytes": 724462
     },
     {
       "executable": false,
@@ -965,8 +965,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-22-cloud-session-activation-authority-bridge.md",
-      "sha256": "bdfd78187e43edd5d481bd61abc3f011894b10935ac594711d21730dc5aab8a1",
-      "size_bytes": 11937
+      "sha256": "02d393a8c1fa3d118079b7b99dd2caa7c81ae2e74746924259638ffbebbbfbee",
+      "size_bytes": 12777
     },
     {
       "executable": false,
@@ -1007,8 +1007,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-23-cloud-session-contract-and-io-fence.md",
-      "sha256": "bb266ea8f41294d64d253281ff3d64d14bd3b4be6607ab7dfd5e408c4869db12",
-      "size_bytes": 4604
+      "sha256": "c887533170d0e90cacc26746ee2b920a995b1ee2527f23f6129bd5f07307b504",
+      "size_bytes": 4980
     },
     {
       "executable": false,
@@ -1816,7 +1816,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-23T06:26:27+00:00",
+  "generated_at": "2026-07-23T06:48:01+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 260,
   "public_roots": [
@@ -1852,5 +1852,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e56e7ca8a5761f0aa17e404c6e022438868ca1a2"
+  "source_commit": "d2388683fe705567c082cd1fb5c0f893ec254bc8"
 }

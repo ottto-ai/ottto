@@ -80,6 +80,12 @@ existing provider-subprocess wait coverage.
   inherit ureq's redirect behavior and replay its device-secret header. The
   cloud-session agent now rejects redirects, with targeted regression coverage.
 
+The authenticated status repair also makes ambiguous activation and cleanup
+states explicit without provider or pipeline work. Pending create reconciliation
+returns the exact persisted create request; locally revoked but backend-active
+bindings report `backend_revocation_confirmation_required` until exact delete
+confirmation, after which status reports ordinary `revoked`.
+
 The private backend still requires the next immutable collector release version
 to be explicitly approved and deployed before demo enrollment. This public
 change intentionally does not alter that cross-repository rollout gate.
