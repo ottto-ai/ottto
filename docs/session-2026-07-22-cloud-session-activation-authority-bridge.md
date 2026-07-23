@@ -7,8 +7,10 @@ activation without changing public startup.
 
 - Added additive local-control protocol action `cloud_sessions_control` with
   prepare, bind, pause, revoke, confirm-revoked, and status operations. It uses
-  protocol v15 so older daemons reject the unknown command and older clients do
-  not send it.
+  command-scoped protocol v16 so older v15 daemons reject cloud-session
+  activation and direct the UI to update. Every unrelated local-control command
+  and daemon status remains on base protocol v15 for mixed-owner upgrade
+  compatibility.
 - Browser JWTs remain in the browser. The daemon accepts only a short-lived
   backend-signed action token, validates it against a trusted Ottto backend,
   requires exact organization/user/device/source agreement with local account
@@ -17,9 +19,12 @@ activation without changing public startup.
   replay ledger persists only SHA-256(token id) and expiry, is atomically locked
   and written with owner-only permissions, prunes by TTL, and is capped at 64
   entries.
-- Prepare returns the credential-free backend create DTO. Bind and
-  confirm-revoked accept only the strict backend grant response. Revoke stops
-  locally and returns one exact grant UUID for ordinary-browser DELETE.
+- Prepare returns the credential-free backend create DTO. Authenticated Status
+  returns that same exact persisted DTO while create reconciliation is pending,
+  including after an exact-version rebind retained an older bound grant for
+  cleanup. Bind and confirm-revoked accept only the strict backend grant
+  response. Revoke stops locally and returns one exact grant UUID for
+  ordinary-browser DELETE.
 - Logout, account switch, same-user organization replacement, relay-device
   rotation, and removal of the Codex device source all fail closed with
   `reason_code: cloud_session_cleanup_required` until exact backend DELETE is
@@ -68,13 +73,13 @@ activation without changing public startup.
 
 ## Exact local-control wire
 
-Each attempt uses protocol v15 plus a newly minted action token. Prepare has no
-backend grant in its request:
+Each attempt uses command-scoped protocol v16 plus a newly minted action token.
+Prepare has no backend grant in its request:
 
 ```json
 {
   "request_id": "cloud-prepare-1",
-  "protocol_version": 15,
+  "protocol_version": 16,
   "client_kind": "web_ui",
   "command": "cloud_sessions_control",
   "action": "prepare",
@@ -148,6 +153,15 @@ admits collection. Confirm uses `action: "confirm_revoked"` with the same
 projection carrying `status: "revoked"` and the backend's incremented
 `grant_version`.
 
+When a Prepare response is lost before the browser POST, authenticated Status
+returns `reason_code: "backend_grant_reconciliation_required"` plus the exact
+tombstoned `backend_create_request`. The browser retries that idempotent POST
+and binds only its exact response; it never reconstructs a request from a
+listed grant or an older local binding. A locally revoked bound grant reports
+`reason_code: "backend_revocation_confirmation_required"` until exact DELETE
+and confirm-revoked mark the binding revoked. It then reports ordinary
+`reason_code: "revoked"`.
+
 The runtime authority wire is exactly:
 
 ```http
@@ -179,7 +193,8 @@ Authorization: Bearer <source-scoped relay token>
   roll local state back or create another grant.
 - A local-control timeout is an unknown outcome. The consumer mints a fresh
   `cloud_sessions_status` token and observes local state before repeating any
-  backend mutation.
+  backend mutation. Pending create recovery uses only the exact
+  `backend_create_request` returned by Status.
 - Logout/account/device-change rejection is retry-safe. The consumer keeps the
   old identity selected, retries exact DELETE and confirm with fresh action
   tokens, then repeats the identity change. Ordinary and `--local-only` logout

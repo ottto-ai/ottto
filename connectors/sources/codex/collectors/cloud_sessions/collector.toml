@@ -8,7 +8,7 @@ data_source_kind = "integration_connector"
 default_state = "requires_setup"
 
 review_tier = "official"
-maturity = "beta"
+maturity = "experimental"
 # The installed Codex CLI authenticates as the effective user and the resulting
 # content-free facts cross the Ottto network boundary. No credentials are read.
 risk_classes = ["auth_adjacent", "network_calls"]

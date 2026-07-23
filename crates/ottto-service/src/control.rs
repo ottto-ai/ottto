@@ -23,11 +23,12 @@ use ottto_core::{
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
-    AgentContextQuery, AgentCostsQuery, AgentInstallationDetection, AgentProviderImpactQuery,
-    AgentRecommendationsQuery, AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse,
-    AuthResetResponse, AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError,
-    CliErrorCode, CloudSessionBackendGrantResponseV1, CloudSessionsControlAction, ConfigDrift,
-    ControlResult, ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
+    validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
+    AgentInstallationDetection, AgentProviderImpactQuery, AgentRecommendationsQuery,
+    AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
+    AuthStartResponse, ClaudeDesktopWebUsagePreferenceState, CliError, CliErrorCode,
+    CloudSessionBackendGrantResponseV1, CloudSessionsControlAction, ConfigDrift, ControlResult,
+    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
     DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
     DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
     LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
@@ -36,8 +37,7 @@ use ottto_protocol::{
     RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
     SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
     StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
-    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, LOCAL_CONTROL_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -272,16 +272,15 @@ pub fn handle_request_with_peer(
     peer: Option<LocalClientPeer>,
 ) -> LocalControlResponse {
     let request_id = request.request_id.clone();
-    if request.protocol_version != LOCAL_CONTROL_PROTOCOL_VERSION {
+    if let Err(message) =
+        validate_local_control_protocol_version(request.protocol_version, &request.command)
+    {
         return LocalControlResponse {
             request_id,
             ok: false,
             payload: None,
             error: Some(CliError {
-                message: format!(
-                    "unsupported local control protocol_version {}; expected {}",
-                    request.protocol_version, LOCAL_CONTROL_PROTOCOL_VERSION
-                ),
+                message,
                 retryable: false,
                 code: CliErrorCode::InvalidRequest,
                 details: BTreeMap::new(),
@@ -2039,7 +2038,7 @@ fn cloud_sessions_control(
     api_base_url: Option<String>,
     backend_grant: Option<CloudSessionBackendGrantResponseV1>,
 ) -> Result<CloudSessionsControlResult, LocalApiError> {
-    cloud_sessions_control_with_stores(
+    let mut result = cloud_sessions_control_with_stores(
         action,
         control_token,
         api_base_url,
@@ -2049,7 +2048,12 @@ fn cloud_sessions_control(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
         &crate::cloud_sessions::CloudSessionCheckpointStore::default(),
         &crate::cloud_sessions::CloudSessionControlTokenUseStore::default(),
-    )
+    )?;
+    // Production control runs inside the daemon, so report the same local
+    // experimental/runtime composition readiness as the standalone status
+    // command. Store-injected tests keep their explicit deferred transport.
+    result.status = crate::cloud_sessions::default_cloud_session_collector_status();
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2165,10 +2169,10 @@ fn cloud_sessions_control_with_stores(
                 time::OffsetDateTime::now_utc(),
             )
             .and_then(|grant| {
-                if grant.backend_binding.is_some() && !grant.backend_create_pending {
-                    Ok(None)
-                } else {
+                if grant.status == crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired {
                     grants.grant_create_request(&device.device_id).map(Some)
+                } else {
+                    Ok(None)
                 }
             })
             .map(|request| backend_create_request = request),
@@ -2195,6 +2199,28 @@ fn cloud_sessions_control_with_stores(
     result.map_err(|_| {
         LocalApiError::LocalOperationFailed("cloud-session local control failed".to_string())
     })?;
+    if action == CloudSessionsControlAction::Status
+        && grants
+            .load()
+            .map_err(|_| {
+                LocalApiError::LocalOperationFailed(
+                    "cloud-session local control failed".to_string(),
+                )
+            })?
+            .is_some_and(|grant| grant.backend_create_pending)
+    {
+        // An authenticated Status after a lost Prepare response must return
+        // the exact persisted create tombstone. The browser retries that
+        // idempotent POST and binds its response; it never guesses a DTO from
+        // the older bound collector version.
+        backend_create_request = Some(grants.grant_create_request(&device.device_id).map_err(
+            |_| {
+                LocalApiError::LocalOperationFailed(
+                    "cloud-session local control failed".to_string(),
+                )
+            },
+        )?);
+    }
     drop(identity_lifecycle_lock);
 
     if matches!(
@@ -2202,7 +2228,7 @@ fn cloud_sessions_control_with_stores(
         CloudSessionsControlAction::Pause | CloudSessionsControlAction::Revoke
     ) {
         checkpoints
-            .wait_for_provider_idle(Duration::from_secs(15))
+            .wait_for_collector_io_idle(crate::cloud_sessions::COLLECTOR_IO_STOP_TIMEOUT)
             .map_err(|_| {
                 LocalApiError::LocalOperationFailed(
                     "cloud-session local control failed".to_string(),
@@ -2211,9 +2237,9 @@ fn cloud_sessions_control_with_stores(
     }
 
     if action == CloudSessionsControlAction::Revoke {
-        // Provider-idle waiting happens without the lifecycle lock. Reacquire
-        // it and revalidate exact cleanup authority before binding a raced POST
-        // response or returning the sole DELETE target.
+        // Collector-I/O idle waiting happens without the lifecycle lock.
+        // Reacquire it and revalidate exact cleanup authority before binding a
+        // raced POST response or returning the sole DELETE target.
         let _identity_lifecycle_lock = lock_setup_run_binding();
         let current_account = accounts.load().map_err(|_| LocalApiError::StatePoisoned)?;
         let current_device = devices
@@ -11490,6 +11516,59 @@ mod tests {
     }
 
     #[test]
+    fn typed_cloud_sessions_control_rejects_base_protocol_version() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_cloud_v15".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: None,
+                client_kind: Some(LocalClientKind::WebUi),
+                client_install_owner: None,
+                command: LocalControlCommand::CloudSessionsControl {
+                    action: CloudSessionsControlAction::Status,
+                    control_token: SecretString::new("header.payload.signature"),
+                    api_base_url: None,
+                    backend_grant: None,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error
+            .message
+            .contains("unsupported local control protocol_version 15"));
+        assert!(error.message.contains("expected 16"));
+    }
+
+    #[test]
+    fn typed_status_rejects_cloud_sessions_protocol_version() {
+        let response = handle_request(
+            &daemon(),
+            LocalControlRequest {
+                request_id: "req_status_v16".to_string(),
+                protocol_version: ottto_protocol::CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::Status {
+                    refresh_agent_status: false,
+                },
+            },
+        );
+
+        assert!(!response.ok);
+        let error = response.error.expect("error");
+        assert_eq!(error.code, CliErrorCode::InvalidRequest);
+        assert!(error
+            .message
+            .contains("unsupported local control protocol_version 16"));
+        assert!(error.message.contains("expected 15"));
+    }
+
+    #[test]
     fn validated_api_base_url_rejects_untrusted_https_origin() {
         assert!(validated_api_base_url(Some("https://attacker.example")).is_err());
     }
@@ -13531,7 +13610,7 @@ mod tests {
                 device_id,
             )
             .unwrap();
-        checkpoints.set_provider_calls_active_for_test(1);
+        checkpoints.set_collector_io_active_for_test(1);
 
         let action = CloudSessionsControlAction::Revoke;
         let action_slug = cloud_sessions_action_slug(&action);
@@ -13582,7 +13661,7 @@ mod tests {
             })
             .unwrap();
         drop(lifecycle_lock);
-        checkpoints.set_provider_calls_active_for_test(0);
+        checkpoints.set_collector_io_active_for_test(0);
 
         assert!(matches!(
             worker.join().unwrap(),
@@ -13695,6 +13774,21 @@ mod tests {
             revoked.backend_revoke_target.unwrap().grant_id,
             "00000000-0000-4000-8000-000000000002"
         );
+        assert_eq!(
+            revoked.status.reason_code,
+            "backend_revocation_confirmation_required"
+        );
+        let cleanup_pending = run(
+            CloudSessionsControlAction::Status,
+            "apps-control-status-pending",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cleanup_pending.status.reason_code,
+            "backend_revocation_confirmation_required"
+        );
+        assert!(cleanup_pending.backend_create_request.is_none());
         let revoked_response =
             cloud_control_backend_grant(&grants.load().unwrap().unwrap(), device_id, "revoked", 2);
         let confirmed = run(
@@ -13707,6 +13801,15 @@ mod tests {
             confirmed.status.runtime_state,
             crate::cloud_sessions::CloudSessionRuntimeState::Revoked
         );
+        assert_eq!(confirmed.status.reason_code, "revoked");
+        let cleanup_complete = run(
+            CloudSessionsControlAction::Status,
+            "apps-control-status-complete",
+            None,
+        )
+        .unwrap();
+        assert_eq!(cleanup_complete.status.reason_code, "revoked");
+        assert!(cleanup_complete.backend_create_request.is_none());
 
         let persisted = fs::read_to_string(token_path).unwrap();
         for raw_id in [
@@ -13715,11 +13818,215 @@ mod tests {
             "apps-control-pause",
             "apps-control-resume",
             "apps-control-revoke",
+            "apps-control-status-pending",
             "apps-control-confirm",
+            "apps-control-status-complete",
         ] {
             assert!(!persisted.contains(raw_id));
         }
         assert!(!persisted.contains("header."));
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_sessions_prepare_rebinds_only_an_outdated_bound_collector() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("cloud-session-control-version-rebind");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints =
+            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
+            root.join("control-token-uses.json"),
+        );
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |action: CloudSessionsControlAction,
+                   token_id: &str,
+                   backend_grant: Option<CloudSessionBackendGrantResponseV1>| {
+            let action_slug = cloud_sessions_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            cloud_sessions_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                None,
+                backend_grant,
+                &accounts,
+                &devices,
+                &grants,
+                &checkpoints,
+                &token_uses,
+            )
+        };
+
+        let initial = run(
+            CloudSessionsControlAction::Prepare,
+            "version-rebind-initial",
+            None,
+        )
+        .unwrap();
+        assert!(initial.backend_create_request.is_some());
+        let pending = grants.load().unwrap().unwrap();
+        grants
+            .bind_backend_grant(
+                &cloud_control_backend_grant(&pending, device_id, "enabled", 1),
+                device_id,
+            )
+            .unwrap();
+
+        let unchanged = run(
+            CloudSessionsControlAction::Prepare,
+            "version-rebind-unchanged",
+            None,
+        )
+        .unwrap();
+        assert!(unchanged.backend_create_request.is_none());
+        assert_eq!(
+            unchanged.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::TransportDeferred
+        );
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(grants.path()).unwrap()).unwrap();
+        persisted["grant"]["collector_version"] = serde_json::Value::String("0.1.89".to_string());
+        fs::write(
+            grants.path(),
+            serde_json::to_vec_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let outdated = run(
+            CloudSessionsControlAction::Prepare,
+            "version-rebind-outdated",
+            None,
+        )
+        .unwrap();
+        let create = outdated.backend_create_request.unwrap();
+        assert_eq!(create.installation_id, device_id);
+        assert_eq!(create.collector_version, compiled_release_version());
+        assert_eq!(create.grant_scope_fingerprint, pending.grant_scope_id);
+        assert_eq!(
+            outdated.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::ConsentRequired
+        );
+        assert!(!outdated.status.provider_cli_invocation_permitted);
+        let rebind = grants.load().unwrap().unwrap();
+        assert!(rebind.backend_create_pending);
+        assert_eq!(rebind.collector_version, "0.1.89");
+        assert_eq!(
+            rebind.backend_binding.as_ref().unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+
+        // Model a lost Prepare response before the browser POST. Authenticated
+        // Status returns the exact persisted create request across retries,
+        // while preserving the old bound grant solely for exact cleanup.
+        let first_status = run(
+            CloudSessionsControlAction::Status,
+            "version-rebind-status-first",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            first_status.status.reason_code,
+            "backend_grant_reconciliation_required"
+        );
+        assert_eq!(first_status.backend_create_request.as_ref(), Some(&create));
+        let second_status = run(
+            CloudSessionsControlAction::Status,
+            "version-rebind-status-second",
+            None,
+        )
+        .unwrap();
+        assert_eq!(second_status.backend_create_request, Some(create.clone()));
+        let kill_switch = EnvVarGuard::set_str("OTTTO_CODEX_CLOUD_SESSIONS_DISABLED", "1");
+        let policy_disabled_status = run(
+            CloudSessionsControlAction::Status,
+            "version-rebind-status-policy-disabled",
+            None,
+        )
+        .unwrap();
+        assert_eq!(policy_disabled_status.status.reason_code, "policy_disabled");
+        assert_eq!(
+            policy_disabled_status.backend_create_request,
+            Some(create.clone())
+        );
+        drop(kill_switch);
+        let still_pending = grants.load().unwrap().unwrap();
+        assert!(still_pending.backend_create_pending);
+        assert_eq!(
+            still_pending
+                .backend_binding
+                .as_ref()
+                .unwrap()
+                .grant_version,
+            1
+        );
+
+        // If local revoke wins just before the recovered POST response is
+        // bound, Bind stays locally revoked and retains only the exact newer
+        // grant epoch needed for compensating DELETE.
+        grants.revoke(time::OffsetDateTime::now_utc()).unwrap();
+        let bind_response = cloud_control_backend_grant(&still_pending, device_id, "enabled", 2);
+        let raced_bind = run(
+            CloudSessionsControlAction::Bind,
+            "version-rebind-bind-after-revoke",
+            Some(bind_response),
+        )
+        .unwrap();
+        assert_eq!(
+            raced_bind.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::Revoked
+        );
+        assert_eq!(
+            raced_bind.status.reason_code,
+            "backend_revocation_confirmation_required"
+        );
+        assert!(raced_bind.backend_create_request.is_none());
+        let rebound = grants.load().unwrap().unwrap();
+        assert!(!rebound.backend_create_pending);
+        assert_eq!(rebound.backend_binding.as_ref().unwrap().grant_version, 2);
+
+        let pending_cleanup = run(
+            CloudSessionsControlAction::Status,
+            "version-rebind-status-cleanup",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            pending_cleanup.status.reason_code,
+            "backend_revocation_confirmation_required"
+        );
+        assert!(pending_cleanup.backend_create_request.is_none());
+
+        let revoke = run(
+            CloudSessionsControlAction::Revoke,
+            "version-rebind-revoke",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            revoke.backend_revoke_target.unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+        let revoked_response = cloud_control_backend_grant(&rebound, device_id, "revoked", 3);
+        let confirmed = run(
+            CloudSessionsControlAction::ConfirmRevoked,
+            "version-rebind-confirm",
+            Some(revoked_response),
+        )
+        .unwrap();
+        assert_eq!(confirmed.status.reason_code, "revoked");
     }
 
     #[test]

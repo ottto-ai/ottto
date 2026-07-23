@@ -408,6 +408,21 @@ pub fn relay_token_request_payload(device: &LocalDeviceBinding, source: &str) ->
     payload
 }
 
+fn require_cloud_session_success(
+    response: ureq::Response,
+    operation: &'static str,
+    endpoint: &'static str,
+) -> Result<ureq::Response> {
+    let status = response.status();
+    if (200..300).contains(&status) {
+        Ok(response)
+    } else {
+        Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+            operation, endpoint, status, &response,
+        )))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotApiClient {
     api_base_url: String,
@@ -475,7 +490,7 @@ impl SnapshotApiClient {
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id
         ));
-        let response: RelayTokenResponse = agent
+        let response = agent
             .post(&url)
             .timeout(timeout)
             .set("Accept", "application/json")
@@ -498,9 +513,11 @@ impl SnapshotApiClient {
                     "relay_token",
                     &other,
                 )),
-            })?
-            .into_json()
-            .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+            })?;
+        let response: RelayTokenResponse =
+            require_cloud_session_success(response, "relay token request", "relay_token")?
+                .into_json()
+                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
     }
 
@@ -721,9 +738,13 @@ impl SnapshotApiClient {
             .send_json(request)
         {
             Ok(response) => {
-                let receipt = response.into_json().map_err(|error| {
-                    anyhow!("parse cloud-session batch response failed: {error}")
-                })?;
+                let receipt = require_cloud_session_success(
+                    response,
+                    "cloud-session upload",
+                    "cloud_session_batch",
+                )?
+                .into_json()
+                .map_err(|error| anyhow!("parse cloud-session batch response failed: {error}"))?;
                 validate_cloud_session_heartbeat_receipt(request, &receipt)?;
                 Ok(receipt)
             }
@@ -776,9 +797,13 @@ impl SnapshotApiClient {
             .set("Authorization", &format!("Bearer {relay_token}"))
             .call()
         {
-            Ok(response) => response
-                .into_json()
-                .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
+            Ok(response) => require_cloud_session_success(
+                response,
+                "cloud-session authority read",
+                "cloud_session_authority",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(CloudSessionAuthorizationRejected {
                     status: code,
@@ -895,9 +920,13 @@ impl SnapshotApiClient {
             .send_json(request)
         {
             Ok(response) => {
-                let receipt = response.into_json().map_err(|error| {
-                    anyhow!("parse cloud-session scan response failed: {error}")
-                })?;
+                let receipt = require_cloud_session_success(
+                    response,
+                    "cloud-session scan upload",
+                    operation,
+                )?
+                .into_json()
+                .map_err(|error| anyhow!("parse cloud-session scan response failed: {error}"))?;
                 validate_cloud_session_scan_receipt(action, request, &receipt)?;
                 Ok(receipt)
             }
@@ -1163,6 +1192,10 @@ fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Durat
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
         .timeout_read(request_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
+        // Cloud-session requests carry either the long-lived device secret or
+        // a relay bearer token. Never let ureq replay either credential to a
+        // redirect target; a 3xx is handled as an ordinary non-success status.
+        .redirects(0)
         .max_idle_connections(0)
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,

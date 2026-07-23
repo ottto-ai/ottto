@@ -50,27 +50,36 @@ daemon prunes accepted hashes that are no longer present in the current scan, so
 a permanently invalid session cannot make the checkpoint grow with every
 historical revision.
 
-The optional Codex Cloud Sessions collector is disabled until explicit local
-setup. It invokes only `codex cloud list --json` as the effective user and
+The optional Codex Cloud Sessions collector is experimental and disabled by
+default. It uses an officially documented, upstream-experimental Codex CLI
+surface. Its single daemon supervisor starts normally but remains inert until
+the user grants the exact local device/user/organization scope and server
+policy approves that same versioned grant. Newly granted consent activates on
+the next bounded cycle without a daemon restart. The collector invokes only
+`codex cloud list --json` as the effective user and
 derives opaque HMAC entity/account keys plus lifecycle, timestamps, attempt
 count, safe environment kind, coverage, and freshness. It never reads
 `~/.codex/auth.json`, calls private provider endpoints, or uploads raw CLI JSON,
 titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths,
 raw provider ids, or cursors. Its local grant is versioned and can be paused or
-revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` prevents runtime
-collection. The collector is isolated from snapshot sync, bounded by page/item/
+revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency
+kill switch and overrides consent and server policy. The collector is isolated
+from snapshot sync, bounded by page/item/
 wall-time limits, and uses semantic no-ops plus circuit-breaking backoff. Active
 full scans are bounded to 2,000 unique entities, 100 provider pages, and ten
 ordered chunks of at most 200 observations. The current cursor, raw response,
 and scan inventory exist only in the long-lived collector process; restart
 drops them, creates a new local UUID, and starts again from page zero.
 
-Cursor pagination proves positive observations only. Absence can be considered
-only by the server after a single terminal provider response containing at most
-20 entities; multi-page terminal scans are labeled `unstable_cursor`. Cap,
-cursor churn, malformed/truncated response, timeout, cancellation, or error
-paths can upload bounded positive chunks but never finalize an absence-capable
-epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
+Cursor pagination proves positive observations only. Only explicit official
+`cursor: null` proves terminal enumeration. Absence can be considered only by
+the server after one such response containing at most 20 entities; multi-page
+official terminal scans are labeled `unstable_cursor`. Fieldless objects, root
+arrays, and alias-only nulls may preserve valid nonempty positive facts but
+never finalize or authorize absence; empty ambiguous responses fail closed.
+Cap, cursor churn, malformed/truncated response, timeout, cancellation, or
+error paths can upload bounded positive chunks but never finalize an
+absence-capable epoch. Chunk identity, semantic, inventory, and ordered epoch digests are
 content-free SHA-256 values; semantic digests exclude observation/collection
 time. Identical response-loss retries reuse the exact chunk or finalize body.
 
@@ -98,8 +107,9 @@ subprocess receives no provider API keys and does not start an interactive
 shell.
 
 The uploaded `account_fingerprint` is an opaque local Ottto organization/user
-collector scope, not an OpenAI or Codex provider-account identity. The official
-CLI path currently exposes no sanctioned safe account discriminator; Ottto does
+collector scope, not an OpenAI or Codex provider-account identity. The
+documented upstream-experimental CLI path currently exposes no sanctioned safe
+account discriminator; Ottto does
 not infer one or merge histories across a user-known provider-account switch.
 Such a switch requires explicit local stop, exact backend deletion, and setup
 again. Ottto also refuses logout, account replacement, relay-device rotation,
@@ -118,27 +128,34 @@ exact local install. Concurrent Cloud-session admission and account/device
 writes fail retryably; the old backend device is never rotated while cleanup is
 pending, and no provider or backend call runs under the lifecycle mutex.
 
-The strict v2 chunk/finalize relay adapters, exact relay authority read, and
-backend DTOs are present for contract testing, but public service startup
-remains hard-wired to deferred transport. It cannot
-invoke Codex or upload until the private backend is deployed and the retention,
-cardinality, prune, and exact-delete-cost gate is approved. Authenticated
-companion/UI code owns backend grant create/delete. Before a create handoff the
-daemon persists only a content-free exact-scope descriptor, never the raw
-installation id. A timeout or restart retries that same idempotent create until
-the backend grant UUID is bound; one intervening list absence cannot clear the
-tombstone or permit replacement while the original POST may still commit. The
-daemon stores only the opaque grant UUID/version/server-policy response and
-rejects stale pre-revoke epochs.
+The strict v2 chunk/finalize relay, exact relay authority read, and backend DTOs
+are composed only in that explicit experimental lane. Before touching Keychain,
+the daemon requires a current enabled or policy-disabled grant and exact HMAC
+matches for the connected local device, organization, and user. It also
+requires the device and persisted connection to share the same machine binding
+and validates the backend destination before reading the relay device secret.
+A loopback destination is accepted only when the daemon process carries the
+exact same developer override. The transport is then kept only in process and
+cannot invoke Codex until the backend revalidates the exact grant UUID/version
+as enabled and policy-approved. No browser JWT crosses this boundary.
+
+Authenticated companion/UI code owns backend grant create/delete. Before a
+create handoff the daemon persists only a content-free exact-scope descriptor,
+never the raw installation id. A timeout or restart retries that same
+idempotent create until the backend grant UUID is bound; one intervening list
+absence cannot clear the tombstone or permit replacement while the original
+POST may still commit. The daemon stores only the opaque grant
+UUID/version/server-policy response and rejects stale pre-revoke epochs.
 
 Browser consent controls use one short-lived backend-signed token bound to the
 action, organization, effective user, Codex relay device, and source. The daemon
 validates it only against a trusted Ottto backend, compares every binding with
 the connected local account/device, and atomically consumes it before a side
 effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
-the JWT and raw token id are never persisted. Pause/revoke closes provider-call
-admission first and waits for an already admitted bounded subprocess to finish
-before returning the exact backend DELETE target. Exact bind-response retries
+the JWT and raw token id are never persisted. Pause/revoke persists stopped
+state to close the shared provider/relay admission fence, then waits for every
+already admitted bounded provider subprocess or chunk/finalize/heartbeat/failure
+write to finish before returning the exact backend DELETE target. Exact bind-response retries
 are local no-ops and cannot change timestamps or resurrect pause/revoke. If an
 authenticated grant POST commits immediately before rollout removal blocks
 bind, the independently permitted revoke action may carry that exact

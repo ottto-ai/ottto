@@ -1,14 +1,20 @@
 //! Supported, metadata-only Codex Cloud session collector.
 //!
 //! The collector invokes only `codex cloud list --json` as the effective user.
-//! It never opens `auth.json`, touches Keychain credentials, or calls provider
-//! endpoints directly. Raw CLI JSON, task titles, URLs, provider ids, and
-//! cursors are used only in memory to derive content-free observations.
+//! It never opens `auth.json`, reads OpenAI credentials, or calls provider
+//! endpoints directly. After exact consent and destination checks, it reads
+//! only Ottto's relay device credential for Ottto backend authentication. Raw
+//! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
+//! memory to derive content-free observations.
 
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
-use ottto_core::{compiled_release_version, default_support_dir, LocalDeviceBinding};
+use ottto_core::{
+    compiled_release_version, default_support_dir, FileAccountStore, FileConnectionStore,
+    FileDeviceStore, LocalDeviceBinding,
+};
+use ottto_protocol::LocalAccountState;
 pub use ottto_protocol::{CloudSessionBackendGrantResponseV1, CloudSessionServerPolicyState};
 use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(test)]
@@ -20,6 +26,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,10 +49,16 @@ const PAGE_LIMIT: usize = 20;
 const MAX_PAGE_OUTPUT_BYTES: u64 = (PAGE_LIMIT * 256 * 1024) as u64;
 const CYCLE_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+const RELAY_IO_TIMEOUT: Duration = COMMAND_TIMEOUT;
+pub(crate) const COLLECTOR_IO_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const HEALTH_HEARTBEAT_INTERVAL: TimeDuration = TimeDuration::hours(1);
 const MAX_JITTER: Duration = Duration::from_secs(20);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
+const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
+
+static COLLECTOR_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -346,6 +359,44 @@ impl CloudSessionGrantStore {
 
     pub fn load(&self) -> Result<Option<CloudSessionGrant>> {
         Ok(self.read()?.map(|state| state.grant))
+    }
+
+    /// Return a collection candidate only when the persisted HMAC scope still
+    /// binds the exact local device, organization, and user. This is read-only:
+    /// a mismatch cannot rewrite consent or make a stale grant current again.
+    fn runtime_candidate_for(
+        &self,
+        setup: &CloudSessionGrantSetup,
+    ) -> Result<Option<CloudSessionGrant>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        if !cloud_grant_preflight_eligible(&state.grant) {
+            return Ok(None);
+        }
+        let key = decode_hex(&state.hmac_key_hex)
+            .filter(|key| key.len() == 32)
+            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
+        let exact_scope = state.grant.installation_fingerprint
+            == opaque_key(&key, &setup.installation_id)
+            && state.grant.organization_fingerprint == opaque_key(&key, &setup.organization_scope)
+            && state.grant.effective_user_fingerprint
+                == opaque_key(&key, &setup.effective_user_scope)
+            && state.grant.account_fingerprint
+                == opaque_key(
+                    &key,
+                    &format!(
+                        "{}\u{0}{}",
+                        setup.organization_scope, setup.effective_user_scope
+                    ),
+                )
+            && state.grant.grant_scope_id == grant_scope_fingerprint(&key, setup);
+        if !exact_scope {
+            return Err(anyhow!(
+                "cloud-session grant does not match the current local identity"
+            ));
+        }
+        Ok(Some(state.grant))
     }
 
     /// Prepare explicit local consent. Scope inputs are converted to HMAC
@@ -1007,8 +1058,8 @@ impl Drop for CloudSessionGrantLock {
 }
 
 /// Build the visible collector state without creating a runner or invoking
-/// Codex. The default service wiring deliberately passes the deferred
-/// transport, which makes provider CLI use impossible in this public slice.
+/// Codex. Runtime readiness is supplied as a credential-free status view;
+/// collection still requires exact grant authority inside the supervisor.
 pub fn cloud_session_collector_status(
     grants: &CloudSessionGrantStore,
     transport: &dyn CloudSessionTransport,
@@ -1021,6 +1072,13 @@ pub fn cloud_session_collector_status(
     let backend_reconciliation_required = stored_grant
         .as_ref()
         .is_some_and(|grant| grant.backend_create_pending);
+    let backend_revocation_confirmation_required = stored_grant.as_ref().is_some_and(|grant| {
+        grant.status == CloudSessionGrantStatus::Revoked
+            && grant
+                .backend_binding
+                .as_ref()
+                .is_some_and(|binding| !binding.backend_revoked)
+    });
     let grant_status = if kill_switch_enabled() {
         CloudSessionGrantStatus::PolicyDisabled
     } else {
@@ -1063,6 +1121,8 @@ pub fn cloud_session_collector_status(
     } else {
         let reason_code = if backend_reconciliation_required {
             "backend_grant_reconciliation_required"
+        } else if backend_revocation_confirmation_required {
+            "backend_revocation_confirmation_required"
         } else if collector_version_rebind_required {
             "collector_version_rebind_required"
         } else {
@@ -1101,10 +1161,39 @@ pub fn cloud_session_collector_status(
 }
 
 pub fn default_cloud_session_collector_status() -> CloudSessionCollectorStatusV1 {
+    let transport_configured = runtime_transport_locally_configured_with(
+        &CloudSessionGrantStore::default(),
+        &FileAccountStore::default(),
+        &FileDeviceStore::default(),
+        &FileConnectionStore::default(),
+        crate::snapshot_client::load_snapshot_device_credentials,
+    );
     cloud_session_collector_status(
         &CloudSessionGrantStore::default(),
-        &DeferredCloudSessionTransport,
+        &RuntimeAvailabilityTransport(transport_configured),
     )
+}
+
+fn runtime_transport_locally_configured_with<F>(
+    grants: &CloudSessionGrantStore,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+    load_credentials: F,
+) -> bool
+where
+    F: FnOnce() -> Result<(LocalDeviceBinding, String)>,
+{
+    !kill_switch_enabled()
+        && load_cloud_session_runtime_binding(grants, accounts, devices, connections)
+            .ok()
+            .flatten()
+            .and_then(|candidate| {
+                load_credentials().ok().map(|(device, secret)| {
+                    device == candidate.binding.device && !secret.trim().is_empty()
+                })
+            })
+            .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1499,6 +1588,10 @@ struct CloudSessionCheckpoint {
     head_semantic_digest: Option<String>,
     #[serde(default)]
     grant_epoch_digest: Option<String>,
+    /// Grant epoch that owns the current circuit-breaker backoff. A new grant
+    /// must not inherit a prior consent epoch's transient failures.
+    #[serde(default)]
+    circuit_grant_epoch_digest: Option<String>,
     consecutive_failures: u32,
     circuit_open_until: Option<String>,
     last_error_category: Option<String>,
@@ -1514,22 +1607,24 @@ pub struct CloudSessionCheckpointStore {
     /// collector instance. Reconstructing the store after restart drops the
     /// cursor and starts a new UUID from page zero.
     runtime: Mutex<CloudSessionScanRuntime>,
-    provider_calls: Arc<CloudSessionProviderCallFence>,
+    collector_io: Arc<CloudSessionIoFence>,
+    #[cfg(test)]
+    relay_admission_barrier: Mutex<Option<TestRelayAdmissionBarrier>>,
 }
 
 #[derive(Default)]
-struct CloudSessionProviderCallFence {
-    active_calls: Mutex<usize>,
+struct CloudSessionIoFence {
+    active_io: Mutex<usize>,
     idle: Condvar,
 }
 
-struct CloudSessionProviderCallLease<'a> {
-    fence: &'a CloudSessionProviderCallFence,
+struct CloudSessionIoLease<'a> {
+    fence: &'a CloudSessionIoFence,
 }
 
-impl Drop for CloudSessionProviderCallLease<'_> {
+impl Drop for CloudSessionIoLease<'_> {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.fence.active_calls.lock() {
+        if let Ok(mut active) = self.fence.active_io.lock() {
             *active = active.saturating_sub(1);
             if *active == 0 {
                 self.fence.idle.notify_all();
@@ -1538,11 +1633,18 @@ impl Drop for CloudSessionProviderCallLease<'_> {
     }
 }
 
-fn default_provider_call_fence() -> Arc<CloudSessionProviderCallFence> {
-    static FENCE: OnceLock<Arc<CloudSessionProviderCallFence>> = OnceLock::new();
+fn default_collector_io_fence() -> Arc<CloudSessionIoFence> {
+    static FENCE: OnceLock<Arc<CloudSessionIoFence>> = OnceLock::new();
     FENCE
-        .get_or_init(|| Arc::new(CloudSessionProviderCallFence::default()))
+        .get_or_init(|| Arc::new(CloudSessionIoFence::default()))
         .clone()
+}
+
+#[cfg(test)]
+struct TestRelayAdmissionBarrier {
+    skip: usize,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
 }
 
 #[derive(Default)]
@@ -1584,64 +1686,105 @@ impl CloudSessionCheckpointStore {
         Self {
             path: path.into(),
             runtime: Mutex::new(CloudSessionScanRuntime::default()),
-            provider_calls: Arc::new(CloudSessionProviderCallFence::default()),
+            collector_io: Arc::new(CloudSessionIoFence::default()),
+            #[cfg(test)]
+            relay_admission_barrier: Mutex::new(None),
         }
     }
 
-    fn begin_provider_call<'a>(
+    fn begin_collector_io<'a>(
         &'a self,
         grants: &CloudSessionGrantStore,
         expected: &CloudSessionGrant,
-    ) -> Result<Option<CloudSessionProviderCallLease<'a>>> {
+    ) -> Result<Option<CloudSessionIoLease<'a>>> {
         let mut active = self
-            .provider_calls
-            .active_calls
+            .collector_io
+            .active_io
             .lock()
-            .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+            .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
         if kill_switch_enabled() || !grant_still_current(grants, expected) {
             return Ok(None);
         }
         *active = active.saturating_add(1);
-        Ok(Some(CloudSessionProviderCallLease {
-            fence: &self.provider_calls,
+        Ok(Some(CloudSessionIoLease {
+            fence: &self.collector_io,
         }))
     }
 
-    /// Wait until every provider subprocess admitted before a local stop has
-    /// returned. Pause/revoke callers must complete this before reporting that
-    /// provider activity is stopped or deleting backend consent.
-    pub fn wait_for_provider_idle(&self, timeout: Duration) -> Result<()> {
+    /// Wait until every provider subprocess or relay write admitted before a
+    /// local stop has returned. Persisted pause/revoke state closes admission;
+    /// callers must then complete this wait before reporting the stop or
+    /// deleting backend consent.
+    pub fn wait_for_collector_io_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut active = self
-            .provider_calls
-            .active_calls
+            .collector_io
+            .active_io
             .lock()
-            .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+            .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
         while *active > 0 {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or_else(|| anyhow!("cloud-session provider call did not stop in time"))?;
-            let (next, timeout_result) =
-                self.provider_calls
-                    .idle
-                    .wait_timeout(active, remaining)
-                    .map_err(|_| anyhow!("cloud-session provider-call fence is unavailable"))?;
+                .ok_or_else(|| anyhow!("cloud-session collector I/O did not stop in time"))?;
+            let (next, timeout_result) = self
+                .collector_io
+                .idle
+                .wait_timeout(active, remaining)
+                .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
             active = next;
             if timeout_result.timed_out() && *active > 0 {
-                return Err(anyhow!("cloud-session provider call did not stop in time"));
+                return Err(anyhow!("cloud-session collector I/O did not stop in time"));
             }
         }
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn set_provider_calls_active_for_test(&self, active_calls: usize) {
-        let mut active = self.provider_calls.active_calls.lock().unwrap();
-        *active = active_calls;
-        if active_calls == 0 {
-            self.provider_calls.idle.notify_all();
+    pub(crate) fn set_collector_io_active_for_test(&self, active_io: usize) {
+        let mut active = self.collector_io.active_io.lock().unwrap();
+        *active = active_io;
+        if active_io == 0 {
+            self.collector_io.idle.notify_all();
         }
     }
+
+    #[cfg(test)]
+    fn set_relay_admission_barrier_for_test(
+        &self,
+        skip: usize,
+        entered: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) {
+        *self.relay_admission_barrier.lock().unwrap() = Some(TestRelayAdmissionBarrier {
+            skip,
+            entered,
+            release,
+        });
+    }
+
+    #[cfg(test)]
+    fn wait_at_relay_admission_barrier_for_test(&self) {
+        let barrier = {
+            let mut configured = self.relay_admission_barrier.lock().unwrap();
+            let Some(barrier) = configured.as_mut() else {
+                return;
+            };
+            if barrier.skip > 0 {
+                barrier.skip -= 1;
+                return;
+            }
+            configured
+                .take()
+                .map(|barrier| (barrier.entered, barrier.release))
+        };
+        if let Some((entered, release)) = barrier {
+            entered.wait();
+            release.wait();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn wait_at_relay_admission_barrier_for_test(&self) {}
     fn load(&self) -> CloudSessionCheckpoint {
         fs::read(&self.path)
             .ok()
@@ -1666,7 +1809,9 @@ impl Default for CloudSessionCheckpointStore {
                 .join("cloud_sessions")
                 .join("checkpoint.json"),
             runtime: Mutex::new(CloudSessionScanRuntime::default()),
-            provider_calls: default_provider_call_fence(),
+            collector_io: default_collector_io_fence(),
+            #[cfg(test)]
+            relay_admission_barrier: Mutex::new(None),
         }
     }
 }
@@ -1768,12 +1913,28 @@ impl CloudSessionTransport for DeferredCloudSessionTransport {
     }
 }
 
-/// Prepared relay transport for the strict backend route. It deliberately is
-/// not used by `spawn_cloud_session_collector`: production activation remains a
-/// separate release/deployment/retention gate. When explicitly composed, it
-/// reuses one in-memory relay token and refreshes it once on 401/403.
-/// Ordinary-user grant revalidation must be supplied separately, so this
-/// adapter alone never reports a collection-ready transport.
+/// Status-only view of the process-local runtime composition. It carries no
+/// credentials and cannot send; collection always uses the relay transport.
+struct RuntimeAvailabilityTransport(bool);
+
+impl CloudSessionTransport for RuntimeAvailabilityTransport {
+    fn is_configured(&self) -> bool {
+        self.0
+    }
+
+    fn supports_grant_revalidation(&self) -> bool {
+        self.0
+    }
+
+    fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+        Err(anyhow!("cloud-session status transport cannot send"))
+    }
+}
+
+/// Relay transport for the strict backend route. The consent-gated experimental
+/// runtime composes it only after exact local identity/grant checks. Collection
+/// then revalidates that exact grant before every provider or upload boundary.
+/// It reuses one in-memory relay token and refreshes it once on 401/403.
 pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
     device: LocalDeviceBinding,
@@ -2179,19 +2340,26 @@ fn collect_cloud_sessions_once_with_budget(
     now: OffsetDateTime,
     cycle_budget: Duration,
 ) -> CloudSessionCycleOutcome {
-    if kill_switch_enabled() || !grant_preflight_eligible(grants) {
-        if let Ok(mut runtime) = checkpoints.runtime.lock() {
-            runtime.active = None;
-            runtime.cancel_requested = runtime.cycle_in_progress;
-        }
+    if kill_switch_enabled() {
+        disable_checkpoint_runtime(checkpoints);
         return CloudSessionCycleOutcome::Disabled;
     }
+    let Some(admitted_grant) = grants
+        .load()
+        .ok()
+        .flatten()
+        .filter(cloud_grant_preflight_eligible)
+    else {
+        disable_checkpoint_runtime(checkpoints);
+        return CloudSessionCycleOutcome::Disabled;
+    };
     if !transport.is_configured() || !transport.supports_grant_revalidation() {
         let _ = grants.record_health("unavailable", "unavailable", Some("transport_unconfigured"));
         return CloudSessionCycleOutcome::Noop;
     }
     let mut checkpoint = checkpoints.load();
-    if circuit_open(&checkpoint, now) {
+    reset_stale_circuit_for_grant(&mut checkpoint, &admitted_grant);
+    if circuit_open_for_grant(&checkpoint, &admitted_grant, now) {
         return CloudSessionCycleOutcome::CircuitOpen;
     }
     let mut runtime = match checkpoints.runtime.lock() {
@@ -2239,6 +2407,7 @@ fn collect_cloud_sessions_once_with_budget(
         Ok(CycleResult::Noop) => {
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_success_at = Some(timestamp(now));
             if !preserve_incomplete_health {
                 checkpoint.last_error_category = None;
@@ -2254,6 +2423,7 @@ fn collect_cloud_sessions_once_with_budget(
         Ok(CycleResult::Heartbeat) => {
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_error_category = None;
             checkpoint.last_success_at = Some(timestamp(now));
             checkpoint.last_health_upload_at = Some(timestamp(now));
@@ -2276,6 +2446,7 @@ fn collect_cloud_sessions_once_with_budget(
             }
             checkpoint.consecutive_failures = 0;
             checkpoint.circuit_open_until = None;
+            checkpoint.circuit_grant_epoch_digest = None;
             checkpoint.last_success_at = Some(timestamp(now));
             checkpoint.last_health_upload_at = Some(timestamp(now));
             if completed_full_scan {
@@ -2296,6 +2467,7 @@ fn collect_cloud_sessions_once_with_budget(
         Err(error) => {
             checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
             checkpoint.last_error_category = Some(error.category.to_string());
+            checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(&admitted_grant));
             checkpoint.circuit_open_until = Some(timestamp(
                 now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
             ));
@@ -2306,6 +2478,13 @@ fn collect_cloud_sessions_once_with_budget(
             let _ = grants.record_health("failing", "stale", Some(error.category));
             CloudSessionCycleOutcome::Failed
         }
+    }
+}
+
+fn disable_checkpoint_runtime(checkpoints: &CloudSessionCheckpointStore) {
+    if let Ok(mut runtime) = checkpoints.runtime.lock() {
+        runtime.active = None;
+        runtime.cancel_requested = runtime.cycle_in_progress;
     }
 }
 
@@ -2395,7 +2574,7 @@ fn collect_enabled_cycle(
         .as_ref()
         .is_some_and(|scan| scan.prepared.is_some())
     {
-        return upload_prepared_scan(grants, runtime, transport, deadline);
+        return upload_prepared_scan(grants, checkpoints, runtime, transport, deadline);
     }
 
     for _ in 0..MAX_PAGES {
@@ -2430,9 +2609,9 @@ fn collect_enabled_cycle(
             return Ok(CycleResult::Deferred);
         };
         let provider_call = checkpoints
-            .begin_provider_call(grants, &expected_grant)
+            .begin_collector_io(grants, &expected_grant)
             .map_err(|_| CycleError {
-                category: "provider_fence_unavailable",
+                category: "collector_io_fence_unavailable",
                 health_uploaded: false,
             })?;
         let Some(provider_call) = provider_call else {
@@ -2465,6 +2644,7 @@ fn collect_enabled_cycle(
                 runtime.active = None;
                 return match report_provider_failure_revalidated(
                     grants,
+                    checkpoints,
                     &expected_grant,
                     transport,
                     now,
@@ -2498,6 +2678,7 @@ fn collect_enabled_cycle(
                 runtime.active = None;
                 return match report_provider_failure_revalidated(
                     grants,
+                    checkpoints,
                     &expected_grant,
                     transport,
                     now,
@@ -2517,7 +2698,8 @@ fn collect_enabled_cycle(
             category: "digest_failed",
             health_uploaded: false,
         })?;
-        let page_terminal = page.next_cursor.is_none();
+        let page_terminal = page.cursor == CloudPageCursor::OfficialTerminal;
+        let page_ambiguous = page.cursor == CloudPageCursor::Ambiguous;
         let page_truncated = page.truncated;
         let scan = runtime.active.as_mut().ok_or(CycleError {
             category: "scan_unavailable",
@@ -2535,11 +2717,22 @@ fn collect_enabled_cycle(
             }
             scan.observations.insert(entity.entity_key.clone(), entity);
         }
-        let cursor_churn = page
-            .next_cursor
+        let next_cursor = match page.cursor {
+            CloudPageCursor::Next(next) => Some(next),
+            CloudPageCursor::OfficialTerminal | CloudPageCursor::Ambiguous => None,
+        };
+        let cursor_churn = next_cursor
             .as_ref()
             .is_some_and(|next| !scan.seen_cursors.insert(next.clone()));
-        scan.cursor = page.next_cursor;
+        scan.cursor = next_cursor;
+
+        // Legacy arrays, fieldless objects, and alias-only nulls can preserve
+        // valid positive facts, but only the official `cursor: null` contract
+        // proves terminal enumeration or healthy absence authority.
+        if page_ambiguous {
+            prepare_active_scan(runtime, now, false)?;
+            break;
+        }
 
         if scan.mode == CloudSessionScanMode::Head {
             if checkpoint.head_semantic_digest.as_deref() == Some(page_digest.as_str()) {
@@ -2551,6 +2744,7 @@ fn collect_enabled_cycle(
                 }
                 return match send_heartbeat_revalidated(
                     grants,
+                    checkpoints,
                     &expected_grant,
                     transport,
                     now,
@@ -2588,7 +2782,7 @@ fn collect_enabled_cycle(
         .as_ref()
         .is_some_and(|scan| scan.prepared.is_some())
     {
-        upload_prepared_scan(grants, runtime, transport, deadline)
+        upload_prepared_scan(grants, checkpoints, runtime, transport, deadline)
     } else {
         Ok(CycleResult::Noop)
     }
@@ -2613,6 +2807,10 @@ fn remaining_budget(deadline: Instant) -> Option<Duration> {
         .filter(|remaining| !remaining.is_zero())
 }
 
+fn remaining_relay_budget(deadline: Instant) -> Option<Duration> {
+    remaining_budget(deadline).map(|remaining| remaining.min(RELAY_IO_TIMEOUT))
+}
+
 fn revalidate_before_io(
     grants: &CloudSessionGrantStore,
     transport: &dyn CloudSessionTransport,
@@ -2622,7 +2820,7 @@ fn revalidate_before_io(
     if kill_switch_enabled() || !grant_still_current(grants, expected) {
         return Ok(RevalidationOutcome::Denied);
     }
-    let Some(timeout) = remaining_budget(deadline) else {
+    let Some(timeout) = remaining_relay_budget(deadline) else {
         return Ok(RevalidationOutcome::BudgetExpired);
     };
     let response = match transport.revalidate_grant_bounded(expected, timeout) {
@@ -2665,7 +2863,7 @@ fn revalidate_scan_start(
     if kill_switch_enabled() || !cloud_grant_preflight_eligible(expected) {
         return Ok(RevalidationOutcome::Denied);
     }
-    let Some(timeout) = remaining_budget(deadline) else {
+    let Some(timeout) = remaining_relay_budget(deadline) else {
         return Ok(RevalidationOutcome::BudgetExpired);
     };
     let response = match transport.revalidate_grant_bounded(expected, timeout) {
@@ -2828,6 +3026,7 @@ fn prepare_active_scan(
 
 fn upload_prepared_scan(
     grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
     runtime: &mut CloudSessionScanRuntime,
     transport: &dyn CloudSessionTransport,
     deadline: Instant,
@@ -2858,10 +3057,23 @@ fn upload_prepared_scan(
             }
             RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
         }
-        let Some(timeout) = remaining_budget(deadline) else {
+        checkpoints.wait_at_relay_admission_barrier_for_test();
+        let relay_io = checkpoints
+            .begin_collector_io(grants, &expected_grant)
+            .map_err(|_| CycleError {
+                category: "collector_io_fence_unavailable",
+                health_uploaded: false,
+            })?;
+        let Some(relay_io) = relay_io else {
+            runtime.active = None;
+            return Ok(CycleResult::Noop);
+        };
+        let Some(timeout) = remaining_relay_budget(deadline) else {
             return Ok(CycleResult::Deferred);
         };
-        if transport.send_scan_chunk_bounded(&chunk, timeout).is_err() {
+        let send_result = transport.send_scan_chunk_bounded(&chunk, timeout);
+        drop(relay_io);
+        if send_result.is_err() {
             if remaining_budget(deadline).is_none() {
                 return Ok(CycleResult::Deferred);
             }
@@ -2902,10 +3114,23 @@ fn upload_prepared_scan(
             }
             RevalidationOutcome::BudgetExpired => return Ok(CycleResult::Deferred),
         }
-        let Some(timeout) = remaining_budget(deadline) else {
+        checkpoints.wait_at_relay_admission_barrier_for_test();
+        let relay_io = checkpoints
+            .begin_collector_io(grants, &expected_grant)
+            .map_err(|_| CycleError {
+                category: "collector_io_fence_unavailable",
+                health_uploaded: false,
+            })?;
+        let Some(relay_io) = relay_io else {
+            runtime.active = None;
+            return Ok(CycleResult::Noop);
+        };
+        let Some(timeout) = remaining_relay_budget(deadline) else {
             return Ok(CycleResult::Deferred);
         };
-        if transport.finalize_scan_bounded(finalize, timeout).is_err() {
+        let send_result = transport.finalize_scan_bounded(finalize, timeout);
+        drop(relay_io);
+        if send_result.is_err() {
             if remaining_budget(deadline).is_none() {
                 return Ok(CycleResult::Deferred);
             }
@@ -2936,6 +3161,7 @@ fn upload_prepared_scan(
 
 fn send_heartbeat_revalidated(
     grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
     expected: &CloudSessionGrant,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
@@ -2955,10 +3181,22 @@ fn send_heartbeat_revalidated(
             error_category: None,
         },
     )?;
-    let Some(timeout) = remaining_budget(deadline) else {
+    checkpoints.wait_at_relay_admission_barrier_for_test();
+    let relay_io = checkpoints
+        .begin_collector_io(grants, expected)
+        .map_err(|_| CycleError {
+            category: "collector_io_fence_unavailable",
+            health_uploaded: false,
+        })?;
+    let Some(relay_io) = relay_io else {
+        return Ok(SendOutcome::NotSent);
+    };
+    let Some(timeout) = remaining_relay_budget(deadline) else {
         return Ok(SendOutcome::BudgetExpired);
     };
-    match transport.send_bounded(&batch, timeout) {
+    let send_result = transport.send_bounded(&batch, timeout);
+    drop(relay_io);
+    match send_result {
         Ok(()) => Ok(SendOutcome::Sent),
         Err(_) if remaining_budget(deadline).is_none() => Ok(SendOutcome::BudgetExpired),
         Err(_) => Err(CycleError {
@@ -2970,6 +3208,7 @@ fn send_heartbeat_revalidated(
 
 fn report_provider_failure_revalidated(
     grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
     expected: &CloudSessionGrant,
     transport: &dyn CloudSessionTransport,
     now: OffsetDateTime,
@@ -2980,15 +3219,34 @@ fn report_provider_failure_revalidated(
         RevalidationOutcome::Denied => return Ok(SendOutcome::NotSent),
         RevalidationOutcome::BudgetExpired => return Ok(SendOutcome::BudgetExpired),
     }
-    report_provider_failure(expected, transport, now, deadline)
+    checkpoints.wait_at_relay_admission_barrier_for_test();
+    let relay_io = checkpoints
+        .begin_collector_io(grants, expected)
+        .map_err(|_| CycleError {
+            category: "collector_io_fence_unavailable",
+            health_uploaded: false,
+        })?;
+    let Some(relay_io) = relay_io else {
+        return Ok(SendOutcome::NotSent);
+    };
+    let result = report_provider_failure(expected, transport, now, deadline);
+    drop(relay_io);
+    result
 }
 
 struct ParsedPage {
     entities: Vec<CloudSessionObservationEntityV1>,
-    next_cursor: Option<String>,
+    cursor: CloudPageCursor,
     source_item_count: usize,
     invalid_required_rows: usize,
     truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CloudPageCursor {
+    OfficialTerminal,
+    Next(String),
+    Ambiguous,
 }
 
 fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Result<ParsedPage> {
@@ -3062,7 +3320,7 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             completed_at = None;
             coverage.retain(|field| field != "timing");
         }
-        let attempt_count = u64_field(object, &["attempt_count", "attempts"])
+        let attempt_count = u64_field(object, &["attempt_total", "attempt_count", "attempts"])
             .filter(|attempts| *attempts <= 100_000);
         if attempt_count.is_some() {
             coverage.push("attempts".to_string());
@@ -3085,24 +3343,62 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             observed_at: timestamp(observed_at),
         });
     }
-    let next_cursor = if root.is_array() {
-        None
+    let cursor = if root.is_array() {
+        CloudPageCursor::Ambiguous
     } else {
-        match root.get("next_cursor").or_else(|| root.get("nextCursor")) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(value)) if !value.is_empty() && value.len() <= 4_096 => {
-                Some(value.clone())
-            }
-            Some(_) => return Err(anyhow!("Codex cloud list cursor is invalid")),
-        }
+        parse_cloud_cursor(&root)?
     };
+    if source_item_count == 0 && cursor == CloudPageCursor::Ambiguous {
+        return Err(anyhow!(
+            "Codex cloud list empty response lacks official terminal proof"
+        ));
+    }
     Ok(ParsedPage {
         entities,
-        next_cursor,
+        cursor,
         source_item_count,
         invalid_required_rows,
         truncated,
     })
+}
+
+fn parse_cloud_cursor(root: &Value) -> Result<CloudPageCursor> {
+    let official = root
+        .get("cursor")
+        .map(parse_cloud_cursor_value)
+        .transpose()?;
+    let mut alias = None;
+    let mut alias_seen = false;
+    for name in ["next_cursor", "nextCursor"] {
+        let Some(raw) = root.get(name) else {
+            continue;
+        };
+        let parsed = parse_cloud_cursor_value(raw)?;
+        if alias_seen && alias != parsed {
+            return Err(anyhow!("Codex cloud list cursor aliases conflict"));
+        }
+        alias = parsed;
+        alias_seen = true;
+    }
+    if official.is_some() && alias_seen && official != Some(alias.clone()) {
+        return Err(anyhow!("Codex cloud list cursor aliases conflict"));
+    }
+    Ok(match official {
+        Some(None) => CloudPageCursor::OfficialTerminal,
+        Some(Some(cursor)) => CloudPageCursor::Next(cursor),
+        None if alias_seen => alias.map_or(CloudPageCursor::Ambiguous, CloudPageCursor::Next),
+        None => CloudPageCursor::Ambiguous,
+    })
+}
+
+fn parse_cloud_cursor_value(raw: &Value) -> Result<Option<String>> {
+    match raw {
+        Value::Null => Ok(None),
+        Value::String(value) if !value.is_empty() && value.len() <= 4_096 => {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(anyhow!("Codex cloud list cursor is invalid")),
+    }
 }
 
 fn string_field<'a>(object: &'a serde_json::Map<String, Value>, names: &[&str]) -> Option<&'a str> {
@@ -3133,9 +3429,13 @@ fn u64_field(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<
 }
 fn lifecycle(value: Option<&str>) -> String {
     match value.unwrap_or_default().to_ascii_lowercase().as_str() {
-        "queued" | "pending" => "queued",
+        "queued" => "queued",
+        // The official CLI collapses provider `pending` and `in_progress`
+        // into this one status, so it cannot truthfully distinguish queued
+        // from running work.
+        "pending" => "unknown",
         "running" | "in_progress" => "running",
-        "completed" | "succeeded" | "success" => "completed",
+        "ready" | "applied" | "completed" | "succeeded" | "success" => "completed",
         "failed" | "error" => "failed",
         "cancelled" | "canceled" => "cancelled",
         _ => "unknown",
@@ -3262,7 +3562,7 @@ fn report_provider_failure(
             error_category: Some("provider_error".to_string()),
         },
     )?;
-    let Some(timeout) = remaining_budget(deadline) else {
+    let Some(timeout) = remaining_relay_budget(deadline) else {
         return Ok(SendOutcome::BudgetExpired);
     };
     match transport.send_bounded(&batch, timeout) {
@@ -3470,18 +3770,45 @@ fn complete_snapshot_due(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTim
     }
 }
 
-fn circuit_open(checkpoint: &CloudSessionCheckpoint, now: OffsetDateTime) -> bool {
-    checkpoint
-        .circuit_open_until
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-        .is_some_and(|until| until > now)
+fn circuit_open_for_grant(
+    checkpoint: &CloudSessionCheckpoint,
+    grant: &CloudSessionGrant,
+    now: OffsetDateTime,
+) -> bool {
+    checkpoint.circuit_grant_epoch_digest.as_deref() == Some(grant_epoch_digest(grant).as_str())
+        && checkpoint
+            .circuit_open_until
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|until| until > now)
+}
+fn reset_stale_circuit_for_grant(
+    checkpoint: &mut CloudSessionCheckpoint,
+    grant: &CloudSessionGrant,
+) {
+    let current_epoch = grant_epoch_digest(grant);
+    let has_circuit_state = checkpoint.consecutive_failures > 0
+        || checkpoint.circuit_open_until.is_some()
+        || checkpoint.circuit_grant_epoch_digest.is_some();
+    if has_circuit_state
+        && checkpoint.circuit_grant_epoch_digest.as_deref() != Some(current_epoch.as_str())
+    {
+        checkpoint.consecutive_failures = 0;
+        checkpoint.circuit_open_until = None;
+        checkpoint.circuit_grant_epoch_digest = None;
+        if checkpoint.last_error_category.as_deref() != Some("scan_incomplete") {
+            checkpoint.last_error_category = None;
+        }
+    }
 }
 fn backoff_seconds(failures: u32) -> u64 {
     60 * (1_u64 << failures.min(6))
 }
 fn kill_switch_enabled() -> bool {
-    std::env::var(KILL_SWITCH_ENV).ok().is_some_and(|value| {
+    truthy_env(KILL_SWITCH_ENV)
+}
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -3667,27 +3994,350 @@ pub enum CloudSessionCollectorStartup {
     Started,
 }
 
-pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
-    // Public builds have no ingest endpoint. Do not register a poller that
-    // merely looks active: deferred transport means no runner is constructed
-    // and no provider CLI process can be started.
-    let transport = DeferredCloudSessionTransport;
-    if !transport.is_configured() || !transport.supports_grant_revalidation() {
-        return Ok(CloudSessionCollectorStartup::DeferredTransport);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudSessionRuntimeBinding {
+    api_base_url: String,
+    device: LocalDeviceBinding,
+    grant_id: String,
+    grant_version: u64,
+    grant_scope_id: String,
+}
+
+struct CloudSessionRuntimeCandidate {
+    binding: CloudSessionRuntimeBinding,
+    grant: CloudSessionGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudSessionRuntimeTransportKey {
+    binding: CloudSessionRuntimeBinding,
+    device_secret_digest: String,
+}
+
+type ActiveCloudSessionTransport = Option<(
+    CloudSessionRuntimeTransportKey,
+    Box<dyn CloudSessionTransport + Send>,
+)>;
+
+fn load_cloud_session_runtime_binding(
+    grants: &CloudSessionGrantStore,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+) -> Result<Option<CloudSessionRuntimeCandidate>> {
+    // The default/off path is intentionally one local grant read. Do not touch
+    // account, connection, device, or Keychain state until consent is capable
+    // of becoming runtime-ready.
+    if !grant_preflight_eligible(grants) {
+        return Ok(None);
     }
-    thread::Builder::new()
+    let account = accounts.load()?;
+    let user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("cloud-session local user binding is unavailable"))?;
+    let organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("cloud-session local organization binding is unavailable"))?;
+    if account.state != LocalAccountState::Connected {
+        return Err(anyhow!("cloud-session local account is not connected"));
+    }
+    let device = devices
+        .load()?
+        .ok_or_else(|| anyhow!("cloud-session relay device binding is unavailable"))?;
+    if !is_uuid(&device.device_id) || !device.sources.iter().any(|source| source == "codex") {
+        return Err(anyhow!(
+            "cloud-session relay device is not exactly Codex-bound"
+        ));
+    }
+    let connection = connections
+        .load()?
+        .ok_or_else(|| anyhow!("cloud-session backend connection is unavailable"))?;
+    if connection.setup_run_id.trim().is_empty() || connection.machine_id != device.machine_id {
+        return Err(anyhow!(
+            "cloud-session backend connection does not match the relay device"
+        ));
+    }
+    // Validate the persisted destination before the caller reads the device
+    // secret. Loopback is accepted only when the daemon process explicitly
+    // carries the exact same developer override.
+    let api_base_url = validated_cloud_session_api_base_url(&connection.api_base_url)?;
+    let setup = CloudSessionGrantSetup {
+        installation_id: device.device_id.clone(),
+        organization_scope: organization_id.to_string(),
+        effective_user_scope: user_id.to_string(),
+    };
+    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
+        return Ok(None);
+    };
+    let backend = grant
+        .backend_binding
+        .as_ref()
+        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
+    Ok(Some(CloudSessionRuntimeCandidate {
+        binding: CloudSessionRuntimeBinding {
+            api_base_url,
+            device,
+            grant_id: backend.grant_id.clone(),
+            grant_version: backend.grant_version,
+            grant_scope_id: grant.grant_scope_id.clone(),
+        },
+        grant,
+    }))
+}
+
+fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
+    let value = raw.trim().trim_end_matches('/');
+    if value.is_empty() || value.contains(['@', '?', '#']) {
+        return Err(anyhow!("cloud-session backend destination is untrusted"));
+    }
+    let production = value == DEFAULT_API_BASE_URL
+        || value == LEGACY_API_BASE_URL
+        || value.starts_with(&format!("{DEFAULT_API_BASE_URL}/"))
+        || value.starts_with(&format!("{LEGACY_API_BASE_URL}/"));
+    let exact_developer_override = std::env::var("OTTTO_API_BASE_URL")
+        .ok()
+        .map(|override_value| override_value.trim().trim_end_matches('/').to_string())
+        .is_some_and(|override_value| override_value == value && is_loopback_http_base(value));
+    if !production && !exact_developer_override {
+        return Err(anyhow!("cloud-session backend destination is untrusted"));
+    }
+    Ok(value.to_string())
+}
+
+fn is_loopback_http_base(value: &str) -> bool {
+    ["http://127.0.0.1", "http://localhost"]
+        .iter()
+        .any(|prefix| {
+            value.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.is_empty()
+                    || suffix.starts_with('/')
+                    || suffix.strip_prefix(':').is_some_and(|port_and_path| {
+                        let port = port_and_path.split('/').next().unwrap_or_default();
+                        !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+        })
+}
+
+fn deactivate_composed_runtime(
+    active_transport: &mut ActiveCloudSessionTransport,
+    checkpoints: &CloudSessionCheckpointStore,
+) {
+    active_transport.take();
+    disable_checkpoint_runtime(checkpoints);
+}
+
+fn collect_composed_cloud_sessions_once(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    runner: &dyn CloudSessionRunner,
+    active_transport: &mut ActiveCloudSessionTransport,
+    now: OffsetDateTime,
+) -> CloudSessionCycleOutcome {
+    let accounts = FileAccountStore::default();
+    let devices = FileDeviceStore::default();
+    let connections = FileConnectionStore::default();
+    collect_composed_cloud_sessions_once_with(
+        grants,
+        checkpoints,
+        runner,
+        active_transport,
+        &accounts,
+        &devices,
+        &connections,
+        crate::snapshot_client::load_snapshot_device_credentials,
+        |api_base_url, device, device_secret| {
+            Box::new(RelayCloudSessionTransport::new(
+                api_base_url,
+                device,
+                device_secret,
+            ))
+        },
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_composed_cloud_sessions_once_with<FLoadCredentials, FComposeTransport>(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    runner: &dyn CloudSessionRunner,
+    active_transport: &mut ActiveCloudSessionTransport,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    connections: &FileConnectionStore,
+    load_credentials: FLoadCredentials,
+    compose_transport: FComposeTransport,
+    now: OffsetDateTime,
+) -> CloudSessionCycleOutcome
+where
+    FLoadCredentials: FnOnce() -> Result<(LocalDeviceBinding, String)>,
+    FComposeTransport:
+        FnOnce(String, LocalDeviceBinding, String) -> Box<dyn CloudSessionTransport + Send>,
+{
+    if kill_switch_enabled() {
+        deactivate_composed_runtime(active_transport, checkpoints);
+        return CloudSessionCycleOutcome::Disabled;
+    }
+    let candidate = match load_cloud_session_runtime_binding(grants, accounts, devices, connections)
+    {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            return CloudSessionCycleOutcome::Disabled;
+        }
+        Err(_) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            let _ =
+                grants.record_health("unavailable", "unavailable", Some("local_binding_invalid"));
+            return CloudSessionCycleOutcome::Failed;
+        }
+    };
+    let mut checkpoint = checkpoints.load();
+    reset_stale_circuit_for_grant(&mut checkpoint, &candidate.grant);
+    if circuit_open_for_grant(&checkpoint, &candidate.grant, now) {
+        return CloudSessionCycleOutcome::CircuitOpen;
+    }
+    let binding = candidate.binding;
+    // `load_cloud_session_runtime_binding` validates the destination first, so
+    // an on-disk URL cannot receive this long-lived secret. Reloading the
+    // device with the secret also closes an identity-change race.
+    let (credential_device, device_secret) = match load_credentials() {
+        Ok(credentials) => credentials,
+        Err(_) => {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            let _ = grants.record_health(
+                "unavailable",
+                "unavailable",
+                Some("relay_credentials_unavailable"),
+            );
+            return CloudSessionCycleOutcome::Failed;
+        }
+    };
+    if credential_device != binding.device || device_secret.trim().is_empty() {
+        deactivate_composed_runtime(active_transport, checkpoints);
+        let _ = grants.record_health("unavailable", "unavailable", Some("local_binding_changed"));
+        return CloudSessionCycleOutcome::Failed;
+    }
+    let key = CloudSessionRuntimeTransportKey {
+        binding: binding.clone(),
+        device_secret_digest: sha256(device_secret.as_bytes()),
+    };
+    let transport_changed = active_transport
+        .as_ref()
+        .map_or(true, |(current, _)| current != &key);
+    if transport_changed {
+        // Scan receipt bookkeeping belongs to one transport instance. Restart
+        // the in-memory scan before dropping that instance so a replacement
+        // never resumes with receipts it cannot prove.
+        deactivate_composed_runtime(active_transport, checkpoints);
+        let transport = compose_transport(binding.api_base_url, credential_device, device_secret);
+        // A candidate transport remains local and unretained until the server
+        // confirms this exact grant epoch. This is a one-time activation read
+        // per identity/credential change; normal polling keeps the established
+        // transport and its relay token.
+        let authority = match transport.revalidate_grant_bounded(&candidate.grant, COMMAND_TIMEOUT)
+        {
+            Ok(authority) => authority,
+            Err(_) => {
+                deactivate_composed_runtime(active_transport, checkpoints);
+                record_runtime_activation_failure(
+                    grants,
+                    checkpoints,
+                    &candidate.grant,
+                    now,
+                    "grant_revalidation_unavailable",
+                );
+                return CloudSessionCycleOutcome::Failed;
+            }
+        };
+        let current = match grants.apply_backend_grant_revalidation(&authority) {
+            Ok(current) => current,
+            Err(_) => {
+                deactivate_composed_runtime(active_transport, checkpoints);
+                record_runtime_activation_failure(
+                    grants,
+                    checkpoints,
+                    &candidate.grant,
+                    now,
+                    "grant_revalidation_invalid",
+                );
+                return CloudSessionCycleOutcome::Failed;
+            }
+        };
+        if !cloud_grant_runtime_ready(&current)
+            || !same_runtime_grant_identity(&current, &candidate.grant)
+        {
+            deactivate_composed_runtime(active_transport, checkpoints);
+            return CloudSessionCycleOutcome::Disabled;
+        }
+        *active_transport = Some((key, transport));
+    }
+    let transport = active_transport
+        .as_ref()
+        .expect("cloud-session transport was just composed")
+        .1
+        .as_ref();
+    // The collector performs exact backend grant authority revalidation before
+    // its first provider subprocess and at every later provider/upload fence.
+    let outcome = collect_cloud_sessions_once(grants, checkpoints, runner, transport, now);
+    if kill_switch_enabled() || !grant_preflight_eligible(grants) {
+        deactivate_composed_runtime(active_transport, checkpoints);
+    }
+    outcome
+}
+
+fn record_runtime_activation_failure(
+    grants: &CloudSessionGrantStore,
+    checkpoints: &CloudSessionCheckpointStore,
+    grant: &CloudSessionGrant,
+    now: OffsetDateTime,
+    category: &'static str,
+) {
+    let mut checkpoint = checkpoints.load();
+    reset_stale_circuit_for_grant(&mut checkpoint, grant);
+    checkpoint.consecutive_failures = checkpoint.consecutive_failures.saturating_add(1);
+    checkpoint.last_error_category = Some(category.to_string());
+    checkpoint.circuit_grant_epoch_digest = Some(grant_epoch_digest(grant));
+    checkpoint.circuit_open_until = Some(timestamp(
+        now + TimeDuration::seconds(backoff_seconds(checkpoint.consecutive_failures) as i64),
+    ));
+    let _ = checkpoints.save(&checkpoint);
+    let _ = grants.record_health("failing", "stale", Some(category));
+}
+
+fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
+    started
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .is_ok()
+}
+
+pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
+    // The supervisor is always available so a newly approved local grant can
+    // activate without restarting the daemon. Each cycle remains inert until
+    // exact local consent and server policy both authorize collection.
+    if !reserve_collector_supervisor(&COLLECTOR_SUPERVISOR_STARTED) {
+        return Ok(CloudSessionCollectorStartup::Started);
+    }
+    let spawned = thread::Builder::new()
         .name("ottto-codex-cloud-sessions".to_string())
         .spawn(|| {
             let grants = CloudSessionGrantStore::default();
             let checkpoints = CloudSessionCheckpointStore::default();
             let runner = CodexCloudCliRunner;
-            let transport = DeferredCloudSessionTransport;
+            let mut active_transport = None;
             loop {
-                let outcome = collect_cloud_sessions_once(
+                let outcome = collect_composed_cloud_sessions_once(
                     &grants,
                     &checkpoints,
                     &runner,
-                    &transport,
+                    &mut active_transport,
                     OffsetDateTime::now_utc(),
                 );
                 if !matches!(
@@ -3698,8 +4348,11 @@ pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
                 }
                 thread::sleep(POLL_INTERVAL + cycle_jitter());
             }
-        })
-        .map_err(|error| anyhow!("spawn Codex cloud-session collector: {error}"))?;
+        });
+    if let Err(error) = spawned {
+        COLLECTOR_SUPERVISOR_STARTED.store(false, AtomicOrdering::Release);
+        return Err(anyhow!("spawn Codex cloud-session collector: {error}"));
+    }
     Ok(CloudSessionCollectorStartup::Started)
 }
 
@@ -3714,7 +4367,7 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -3753,6 +4406,51 @@ mod tests {
         store
             .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
             .unwrap();
+    }
+
+    fn runtime_identity_stores(
+        root: &Path,
+        user_id: &str,
+        organization_id: &str,
+        api_base_url: &str,
+    ) -> (FileAccountStore, FileDeviceStore, FileConnectionStore) {
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        accounts
+            .save(&ottto_protocol::LocalAccountBinding {
+                state: LocalAccountState::Connected,
+                user: Some(ottto_protocol::LocalAccountUser {
+                    id: user_id.to_string(),
+                    email: "runtime@example.com".to_string(),
+                    display_name: None,
+                }),
+                organization: Some(ottto_protocol::LocalAccountOrganization {
+                    id: organization_id.to_string(),
+                    name: "Runtime Org".to_string(),
+                }),
+                connected_at: None,
+                last_refreshed_at: None,
+                message: None,
+            })
+            .unwrap();
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: Some("machine-runtime".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+        let connections = FileConnectionStore::new(root.join("connection.json"));
+        connections
+            .save(&ottto_core::LocalConnectionBinding {
+                setup_run_id: "setup-runtime".to_string(),
+                setup_run_token_expires_at: "2030-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-runtime".to_string()),
+                claim_code: None,
+                api_base_url: api_base_url.to_string(),
+            })
+            .unwrap();
+        (accounts, devices, connections)
     }
 
     #[test]
@@ -3814,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_prevents_new_provider_admission_and_waits_for_inflight_call() {
+    fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
         use std::sync::mpsc;
 
         struct BlockingRunner {
@@ -3873,7 +4571,7 @@ mod tests {
         let waiter_checkpoints = Arc::clone(&checkpoints);
         let (stopped_tx, stopped_rx) = mpsc::channel();
         let waiter = thread::spawn(move || {
-            let result = waiter_checkpoints.wait_for_provider_idle(Duration::from_secs(2));
+            let result = waiter_checkpoints.wait_for_collector_io_idle(Duration::from_secs(2));
             stopped_tx.send(result).unwrap();
         });
         assert!(stopped_rx.recv_timeout(Duration::from_millis(50)).is_err());
@@ -3967,7 +4665,7 @@ mod tests {
             .unwrap();
 
         checkpoints
-            .wait_for_provider_idle(Duration::from_millis(100))
+            .wait_for_collector_io_idle(Duration::from_millis(100))
             .unwrap();
         backend_release_tx.send(()).unwrap();
         assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Failed);
@@ -4318,6 +5016,55 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ThreadRecordingTransport {
+        chunks: AtomicUsize,
+        finalizes: AtomicUsize,
+        v1_sends: AtomicUsize,
+        blocking_chunk: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    }
+
+    impl CloudSessionTransport for ThreadRecordingTransport {
+        fn supports_grant_revalidation(&self) -> bool {
+            true
+        }
+
+        fn revalidate_grant_bounded(
+            &self,
+            grant: &CloudSessionGrant,
+            _timeout: Duration,
+        ) -> Result<CloudSessionBackendGrantResponseV1> {
+            Ok(backend_grant(
+                grant,
+                "enabled",
+                grant
+                    .backend_binding
+                    .as_ref()
+                    .map_or(1, |binding| binding.grant_version),
+            ))
+        }
+
+        fn send_scan_chunk(&self, _chunk: &CloudSessionObservationChunkV2) -> Result<()> {
+            self.chunks.fetch_add(1, Ordering::SeqCst);
+            let barrier = self.blocking_chunk.lock().unwrap().take();
+            if let Some((entered, release)) = barrier {
+                entered.wait();
+                release.wait();
+            }
+            Ok(())
+        }
+
+        fn finalize_scan(&self, _finalize: &CloudSessionScanFinalizeV2) -> Result<()> {
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn send(&self, _batch: &CloudSessionObservationBatchV1) -> Result<()> {
+            self.v1_sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     enum TestPage {
         Json(String),
         Error,
@@ -4345,17 +5092,24 @@ mod tests {
         }
     }
 
-    fn full_page(start: usize, next_cursor: Option<&str>) -> String {
+    fn full_page(start: usize, cursor: Option<&str>) -> String {
         let tasks = (start..start + PAGE_LIMIT)
             .map(|index| {
                 json!({
                     "id": format!("provider-{index:04}"),
-                    "status": "running",
-                    "updated_at": "2026-07-21T11:00:00Z"
+                    "url": format!("https://chatgpt.com/codex/tasks/task-{index:04}"),
+                    "title": format!("private task {index:04}"),
+                    "status": "pending",
+                    "updated_at": "2026-07-21T11:00:00Z",
+                    "environment_id": "env-private",
+                    "environment_label": "Private environment",
+                    "summary": "private summary",
+                    "is_review": false,
+                    "attempt_total": 1
                 })
             })
             .collect::<Vec<_>>();
-        json!({"tasks": tasks, "next_cursor": next_cursor}).to_string()
+        json!({"tasks": tasks, "cursor": cursor}).to_string()
     }
 
     fn run_full_scan_cycles(
@@ -4378,7 +5132,7 @@ mod tests {
         outcome
     }
     fn page(id: &str, cursor: Option<&str>) -> String {
-        json!({"tasks":[{"id":id,"title":"private title","url":"https://example.invalid/private","account_id":"provider-account-private","status":"completed","created_at":"2026-07-21T11:00:00Z","attempt_count":2}], "next_cursor": cursor}).to_string()
+        json!({"tasks":[{"id":id,"url":"https://chatgpt.com/codex/tasks/private","title":"private title","status":"applied","updated_at":"2026-07-21T11:00:00Z","environment_id":"provider-environment-private","environment_label":"Private environment","summary":"private summary","is_review":false,"attempt_total":2}], "cursor": cursor}).to_string()
     }
 
     fn exact_scan_ack(request: &str) -> String {
@@ -4458,6 +5212,174 @@ mod tests {
     }
 
     #[test]
+    fn official_cloud_task_statuses_and_attempt_total_are_normalized_truthfully() {
+        let raw = json!({
+            "tasks": [
+                {
+                    "id": "official-pending",
+                    "url": "https://chatgpt.com/codex/tasks/pending",
+                    "title": "private pending title",
+                    "status": "pending",
+                    "updated_at": "2026-07-21T11:00:00Z",
+                    "environment_id": "env-private",
+                    "environment_label": "Private environment",
+                    "summary": "private summary",
+                    "is_review": false,
+                    "attempt_total": 3
+                },
+                {
+                    "id": "official-ready",
+                    "url": "https://chatgpt.com/codex/tasks/ready",
+                    "title": "private ready title",
+                    "status": "ready",
+                    "updated_at": "2026-07-21T11:00:00Z",
+                    "environment_id": "env-private",
+                    "environment_label": "Private environment",
+                    "summary": "private summary",
+                    "is_review": true,
+                    "attempt_total": 4
+                },
+                {
+                    "id": "official-applied",
+                    "url": "https://chatgpt.com/codex/tasks/applied",
+                    "title": "private applied title",
+                    "status": "applied",
+                    "updated_at": "2026-07-21T11:00:00Z",
+                    "environment_id": "env-private",
+                    "environment_label": "Private environment",
+                    "summary": "private summary",
+                    "is_review": false,
+                    "attempt_total": 5
+                },
+                {
+                    "id": "official-error",
+                    "url": "https://chatgpt.com/codex/tasks/error",
+                    "title": "private error title",
+                    "status": "error",
+                    "updated_at": "2026-07-21T11:00:00Z",
+                    "environment_id": "env-private",
+                    "environment_label": "Private environment",
+                    "summary": "private summary",
+                    "is_review": false,
+                    "attempt_total": 6
+                }
+            ],
+            "cursor": null
+        })
+        .to_string();
+        let parsed = parse_cloud_page(&raw, b"fixture-key", now()).unwrap();
+        assert_eq!(
+            parsed
+                .entities
+                .iter()
+                .map(|row| row.lifecycle.as_str())
+                .collect::<Vec<_>>(),
+            ["unknown", "completed", "completed", "failed"]
+        );
+        assert_eq!(
+            parsed
+                .entities
+                .iter()
+                .map(|row| row.attempt_count)
+                .collect::<Vec<_>>(),
+            [Some(3), Some(4), Some(5), Some(6)]
+        );
+        let encoded = serde_json::to_string(&parsed.entities).unwrap();
+        for secret in [
+            "official-pending",
+            "chatgpt.com",
+            "private pending title",
+            "env-private",
+            "Private environment",
+            "private summary",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+    }
+
+    #[test]
+    fn cursor_contract_separates_official_terminal_pagination_and_ambiguity() {
+        let official_next = parse_cloud_page(
+            &json!({"tasks": [], "cursor": "official-next-page"}).to_string(),
+            b"fixture-key",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            official_next.cursor,
+            CloudPageCursor::Next("official-next-page".to_string())
+        );
+        let official_terminal = parse_cloud_page(
+            &json!({"tasks": [], "cursor": null}).to_string(),
+            b"fixture-key",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(official_terminal.cursor, CloudPageCursor::OfficialTerminal);
+        let alias_next = parse_cloud_page(
+            &json!({
+                "tasks": [{"id": "legacy-next", "status": "running"}],
+                "next_cursor": "legacy-next-page"
+            })
+            .to_string(),
+            b"fixture-key",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            alias_next.cursor,
+            CloudPageCursor::Next("legacy-next-page".to_string())
+        );
+
+        for ambiguous in [
+            json!({"tasks": [{"id": "fieldless", "status": "running"}]}),
+            json!({
+                "tasks": [{"id": "alias-null", "status": "running"}],
+                "next_cursor": null
+            }),
+            json!([{"id": "array-root", "status": "running"}]),
+        ] {
+            assert_eq!(
+                parse_cloud_page(&ambiguous.to_string(), b"fixture-key", now())
+                    .unwrap()
+                    .cursor,
+                CloudPageCursor::Ambiguous
+            );
+        }
+
+        for conflicting in [
+            json!({"tasks": [], "cursor": "official", "next_cursor": "legacy"}),
+            json!({"tasks": [], "cursor": "official", "nextCursor": null}),
+            json!({"tasks": [], "next_cursor": null, "nextCursor": "legacy"}),
+        ] {
+            assert!(parse_cloud_page(&conflicting.to_string(), b"fixture-key", now()).is_err());
+        }
+        assert!(parse_cloud_page(
+            &json!({
+                "tasks": [],
+                "cursor": "same",
+                "next_cursor": "same",
+                "nextCursor": "same"
+            })
+            .to_string(),
+            b"fixture-key",
+            now(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn empty_ambiguous_pages_are_rejected_without_absence_authority() {
+        for ambiguous in [
+            json!({"tasks": []}),
+            json!({"tasks": [], "next_cursor": null}),
+            json!([]),
+        ] {
+            assert!(parse_cloud_page(&ambiguous.to_string(), b"fixture-key", now()).is_err());
+        }
+    }
+
+    #[test]
     fn v2_public_wire_rejects_raw_or_noncanonical_entity_keys_and_open_values() {
         let (grants, checkpoints) = stores("v2-crafted-privacy-boundary");
         enabled(&grants);
@@ -4510,7 +5432,7 @@ mod tests {
                 "created_at": "2026-07-21T11:30:00Z",
                 "started_at": "2026-07-21T11:00:00Z",
                 "updated_at": "2026-07-21T12:30:00Z",
-                "attempt_count": 100_001,
+                "attempt_total": 100_001,
                 "environment": "production"
             }]
         })
@@ -4720,7 +5642,7 @@ mod tests {
         let (grants, checkpoints) = stores("empty-complete-snapshot");
         enabled(&grants);
         let runner = Pages {
-            pages: RefCell::new(vec![json!({"tasks": [], "next_cursor": null}).to_string()]),
+            pages: RefCell::new(vec![json!({"tasks": [], "cursor": null}).to_string()]),
             calls: Cell::new(0),
             revoke: None,
         };
@@ -5345,6 +6267,10 @@ mod tests {
         assert!(pending.backend_create_pending);
         assert!(pending.pending_backend_create.is_some());
         assert!(pending.backend_binding.is_none());
+        assert_eq!(
+            cloud_session_collector_status(&restarted, &DeferredCloudSessionTransport).reason_code,
+            "backend_grant_reconciliation_required"
+        );
 
         assert!(restarted
             .confirm_backend_grant_absent_after_reconciliation()
@@ -5394,6 +6320,10 @@ mod tests {
         );
         assert!(!retained.backend_binding.as_ref().unwrap().backend_revoked);
         assert_eq!(grants.grant_revoke_target().unwrap().grant_id, GRANT_ID);
+        assert_eq!(
+            cloud_session_collector_status(&grants, &DeferredCloudSessionTransport).reason_code,
+            "backend_revocation_confirmation_required"
+        );
 
         let runner = Pages {
             pages: RefCell::new(vec![page("must-not-run", None)]),
@@ -5415,6 +6345,10 @@ mod tests {
         grants
             .apply_backend_revocation(&backend_grant(&original, "revoked", 2), INSTALLATION_ID)
             .unwrap();
+        assert_eq!(
+            cloud_session_collector_status(&grants, &DeferredCloudSessionTransport).reason_code,
+            "revoked"
+        );
         let prepared = grants.enable(&replacement, now()).unwrap();
         assert_eq!(prepared.status, CloudSessionGrantStatus::ConsentRequired);
         assert!(prepared.backend_binding.is_none());
@@ -5837,6 +6771,55 @@ mod tests {
         }
         assert!(requests[3].contains("Authorization: Bearer relay-cloud-new"));
         assert!(requests[4].contains("Authorization: Bearer relay-cloud-new"));
+    }
+
+    #[test]
+    fn relay_token_redirect_never_forwards_the_device_secret() {
+        use std::io::{ErrorKind, Write};
+        use std::net::TcpListener;
+
+        let attacker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_address = attacker.local_addr().unwrap();
+        attacker.set_nonblocking(true).unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_address = relay.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let server_captured = Arc::clone(&captured);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = relay.accept().unwrap();
+            *server_captured.lock().unwrap() = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://{attacker_address}/capture\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{{\"token\":\"redirect-body-token\"}}"
+            )
+            .unwrap();
+        });
+
+        let transport = RelayCloudSessionTransport::new(
+            format!("http://{relay_address}"),
+            LocalDeviceBinding {
+                device_id: INSTALLATION_ID.to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            },
+            "redirect-guard-secret".to_string(),
+        );
+        let error = transport
+            .token(false, Instant::now() + Duration::from_secs(2))
+            .unwrap_err();
+        let diagnostics = error
+            .downcast_ref::<crate::snapshot_client::UploadFailureDiagnostics>()
+            .unwrap();
+        assert_eq!(diagnostics.status_family(), "http_3xx");
+        server.join().unwrap();
+        assert!(captured
+            .lock()
+            .unwrap()
+            .contains("X-Ottto-Device-Secret: redirect-guard-secret"));
+        assert!(matches!(
+            attacker.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
@@ -6466,11 +7449,427 @@ mod tests {
     }
 
     #[test]
-    fn public_startup_remains_hard_deferred() {
+    fn collector_supervisor_has_one_process_owner_under_concurrency() {
+        let started = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let attempts = (0..8)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    reserve_collector_supervisor(&started)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
         assert_eq!(
-            spawn_cloud_session_collector().unwrap(),
-            CloudSessionCollectorStartup::DeferredTransport
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
         );
+    }
+
+    #[test]
+    fn paused_runtime_clears_process_scan_without_provider_or_state_writes() {
+        let (grants, checkpoints) = stores("runtime-paused-clear");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        grants.pause(now()).unwrap();
+        let before_grant = fs::read(grants.path()).unwrap();
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        checkpoints.runtime.lock().unwrap().active = Some(ActiveCloudSessionScan {
+            scan_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            scan_started_at: timestamp(now()),
+            mode: CloudSessionScanMode::Full,
+            grant: grant.clone(),
+            cursor: Some("private-cursor".to_string()),
+            seen_cursors: HashSet::new(),
+            observations: BTreeMap::new(),
+            provider_page_count: 1,
+            head_semantic_digest: None,
+            prepared: None,
+        });
+        let device = LocalDeviceBinding {
+            device_id: INSTALLATION_ID.to_string(),
+            machine_id: Some("machine-runtime".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let mut active_transport: ActiveCloudSessionTransport = Some((
+            CloudSessionRuntimeTransportKey {
+                binding: CloudSessionRuntimeBinding {
+                    api_base_url: DEFAULT_API_BASE_URL.to_string(),
+                    device: device.clone(),
+                    grant_id: GRANT_ID.to_string(),
+                    grant_version: 1,
+                    grant_scope_id: grant.grant_scope_id,
+                },
+                device_secret_digest: sha256(b"device-secret"),
+            },
+            Box::new(RelayCloudSessionTransport::new(
+                DEFAULT_API_BASE_URL,
+                device,
+                "device-secret".into(),
+            )),
+        ));
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(checkpoints.runtime.lock().unwrap().active.is_none());
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+        assert!(!checkpoints.path.exists());
+    }
+
+    #[test]
+    fn no_grant_is_zero_touch_beyond_the_local_grant_read() {
+        let root = temp_dir("runtime-no-grant-zero-touch");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let unreadable_account = root.join("unreadable-account");
+        let unreadable_device = root.join("unreadable-device");
+        let unreadable_connection = root.join("unreadable-connection");
+        fs::create_dir(&unreadable_account).unwrap();
+        fs::create_dir(&unreadable_device).unwrap();
+        fs::create_dir(&unreadable_connection).unwrap();
+        let accounts = FileAccountStore::new(unreadable_account);
+        let devices = FileDeviceStore::new(unreadable_device);
+        let connections = FileConnectionStore::new(unreadable_connection);
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let mut active_transport: ActiveCloudSessionTransport = None;
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || panic!("no grant must not read relay credentials"),
+                |_, _, _| panic!("no grant must not compose or contact the relay"),
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(!grants.path().exists());
+        assert!(!checkpoints.path.exists());
+        assert!(checkpoints.runtime.lock().unwrap().active.is_none());
+    }
+
+    #[test]
+    fn later_consent_activates_the_existing_supervisor_without_restart() {
+        let root = temp_dir("runtime-later-consent");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        let runner = Pages {
+            pages: RefCell::new(vec![page("after-consent", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let credential_reads = Cell::new(0);
+        let transport_compositions = Cell::new(0);
+        let mut active_transport: ActiveCloudSessionTransport = None;
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || panic!("dormant supervisor must not read relay credentials"),
+                |_, _, _| panic!("dormant supervisor must not compose a relay"),
+                now(),
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        assert!(!checkpoints.path.exists());
+
+        // A previous consent epoch's relay/provider failure may have left a
+        // long backoff. New consent must not inherit that stale circuit.
+        checkpoints
+            .save(&CloudSessionCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+                circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+                consecutive_failures: 6,
+                circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+                last_error_category: Some("provider_error".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        enabled(&grants);
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || {
+                    credential_reads.set(credential_reads.get() + 1);
+                    Ok((
+                        devices.load().unwrap().unwrap(),
+                        "device-secret".to_string(),
+                    ))
+                },
+                |_, _, _| {
+                    transport_compositions.set(transport_compositions.get() + 1);
+                    Box::new(V2RecordingTransport::new())
+                },
+                now() + TimeDuration::minutes(5),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert_eq!(credential_reads.get(), 1);
+        assert_eq!(transport_compositions.get(), 1);
+        assert_eq!(runner.calls.get(), 1);
+        assert!(active_transport.is_some());
+        let checkpoint = checkpoints.load();
+        assert!(checkpoint.circuit_open_until.is_none());
+        assert!(checkpoint.circuit_grant_epoch_digest.is_none());
+    }
+
+    #[test]
+    fn new_grant_failure_starts_a_fresh_circuit_epoch() {
+        let root = temp_dir("runtime-new-grant-circuit");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints = CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        checkpoints
+            .save(&CloudSessionCheckpoint {
+                schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+                circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+                consecutive_failures: 6,
+                circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+                last_error_category: Some("provider_error".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let runner = Pages {
+            pages: RefCell::new(vec![page("must-not-run", None)]),
+            calls: Cell::new(0),
+            revoke: None,
+        };
+        let mut active_transport: ActiveCloudSessionTransport = None;
+        let attempt_at = now() + TimeDuration::minutes(5);
+
+        assert_eq!(
+            collect_composed_cloud_sessions_once_with(
+                &grants,
+                &checkpoints,
+                &runner,
+                &mut active_transport,
+                &accounts,
+                &devices,
+                &connections,
+                || Ok((
+                    devices.load().unwrap().unwrap(),
+                    "device-secret".to_string()
+                )),
+                |_, _, _| {
+                    Box::new(RevalidationTransport {
+                        response: None,
+                        revalidation_calls: Cell::new(0),
+                        send_calls: Cell::new(0),
+                    })
+                },
+                attempt_at,
+            ),
+            CloudSessionCycleOutcome::Failed
+        );
+        assert_eq!(runner.calls.get(), 0);
+        assert!(active_transport.is_none());
+        let checkpoint = checkpoints.load();
+        assert_eq!(checkpoint.consecutive_failures, 1);
+        assert_eq!(
+            checkpoint.circuit_grant_epoch_digest.as_deref(),
+            Some(grant_epoch_digest(&grant).as_str())
+        );
+        assert_eq!(
+            checkpoint.circuit_open_until.as_deref(),
+            Some(timestamp(attempt_at + TimeDuration::minutes(2)).as_str())
+        );
+    }
+
+    #[test]
+    fn stale_circuit_reset_preserves_incomplete_scan_health() {
+        let (grants, _) = stores("runtime-circuit-scan-health");
+        enabled(&grants);
+        let grant = grants.load().unwrap().unwrap();
+        let mut checkpoint = CloudSessionCheckpoint {
+            schema_version: CHECKPOINT_SCHEMA_VERSION.to_string(),
+            circuit_grant_epoch_digest: Some(sha256(b"previous-grant-epoch")),
+            consecutive_failures: 6,
+            circuit_open_until: Some(timestamp(now() + TimeDuration::hours(1))),
+            last_error_category: Some("scan_incomplete".to_string()),
+            ..Default::default()
+        };
+
+        reset_stale_circuit_for_grant(&mut checkpoint, &grant);
+
+        assert_eq!(checkpoint.consecutive_failures, 0);
+        assert!(checkpoint.circuit_open_until.is_none());
+        assert!(checkpoint.circuit_grant_epoch_digest.is_none());
+        assert_eq!(
+            checkpoint.last_error_category.as_deref(),
+            Some("scan_incomplete")
+        );
+    }
+
+    #[test]
+    fn runtime_composition_requires_the_exact_local_grant_identity() {
+        let root = temp_dir("runtime-exact-identity");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+
+        let candidate =
+            load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections)
+                .unwrap()
+                .expect("exact local identity should compose");
+        let binding = candidate.binding;
+        assert_eq!(binding.device.device_id, INSTALLATION_ID);
+        assert_eq!(binding.grant_id, GRANT_ID);
+        assert_eq!(binding.grant_version, 1);
+        assert_eq!(binding.api_base_url, DEFAULT_API_BASE_URL);
+
+        let mismatched_accounts = FileAccountStore::new(root.join("mismatch-account.json"));
+        mismatched_accounts
+            .save(&ottto_protocol::LocalAccountBinding {
+                state: LocalAccountState::Connected,
+                user: Some(ottto_protocol::LocalAccountUser {
+                    id: "other-user".to_string(),
+                    email: "other@example.com".to_string(),
+                    display_name: None,
+                }),
+                organization: Some(ottto_protocol::LocalAccountOrganization {
+                    id: "org_fixture".to_string(),
+                    name: "Runtime Org".to_string(),
+                }),
+                connected_at: None,
+                last_refreshed_at: None,
+                message: None,
+            })
+            .unwrap();
+        let before_grant = fs::read(grants.path()).unwrap();
+        assert!(load_cloud_session_runtime_binding(
+            &grants,
+            &mismatched_accounts,
+            &devices,
+            &connections,
+        )
+        .is_err());
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+    }
+
+    #[test]
+    fn status_configuration_is_derived_without_process_local_runtime_state() {
+        let root = temp_dir("runtime-derived-status");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) =
+            runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
+        let credential_reads = Cell::new(0);
+
+        assert!(runtime_transport_locally_configured_with(
+            &grants,
+            &accounts,
+            &devices,
+            &connections,
+            || {
+                credential_reads.set(credential_reads.get() + 1);
+                Ok((
+                    devices.load().unwrap().unwrap(),
+                    "device-secret".to_string(),
+                ))
+            },
+        ));
+        assert_eq!(credential_reads.get(), 1);
+        let no_grant = CloudSessionGrantStore::new(root.join("no-grant.json"));
+        assert!(!runtime_transport_locally_configured_with(
+            &no_grant,
+            &accounts,
+            &devices,
+            &connections,
+            || panic!("status without consent must not read credentials"),
+        ));
+    }
+
+    #[test]
+    fn dormant_grant_short_circuits_before_other_local_state_reads() {
+        let root = temp_dir("runtime-dormant-short-circuit");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        fs::create_dir(root.join("unreadable-account")).unwrap();
+        fs::create_dir(root.join("unreadable-device")).unwrap();
+        fs::create_dir(root.join("unreadable-connection")).unwrap();
+
+        assert!(load_cloud_session_runtime_binding(
+            &grants,
+            &FileAccountStore::new(root.join("unreadable-account")),
+            &FileDeviceStore::new(root.join("unreadable-device")),
+            &FileConnectionStore::new(root.join("unreadable-connection")),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn runtime_rejects_untrusted_destination_without_mutating_grant() {
+        let root = temp_dir("runtime-untrusted-destination");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let (accounts, devices, connections) = runtime_identity_stores(
+            &root,
+            "user_fixture",
+            "org_fixture",
+            "https://attacker.example",
+        );
+        let before_grant = fs::read(grants.path()).unwrap();
+
+        assert!(
+            load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections,)
+                .is_err()
+        );
+        assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+        assert!(validated_cloud_session_api_base_url("http://localhost.evil").is_err());
+        assert!(validated_cloud_session_api_base_url("https://api.ottto.net@evil").is_err());
     }
 
     #[test]
@@ -6523,6 +7922,219 @@ mod tests {
         );
         assert_eq!(runner.calls.get(), 1);
         assert_eq!(transport.calls.get(), 0);
+    }
+
+    #[test]
+    fn revocation_after_chunk_revalidation_closes_relay_admission() {
+        let root = temp_dir("chunk-post-revalidation-race");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let transport = Arc::new(ThreadRecordingTransport::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        checkpoints.set_relay_admission_barrier_for_test(
+            0,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector_transport = Arc::clone(&transport);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &CursorRecordingPages::new(vec![page("chunk-race", None)]),
+                collector_transport.as_ref(),
+                now(),
+            )
+        });
+        entered.wait();
+        grants.revoke(now()).unwrap();
+        release.wait();
+
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+        assert_eq!(transport.chunks.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revocation_after_finalize_revalidation_closes_relay_admission() {
+        let root = temp_dir("finalize-post-revalidation-race");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let transport = Arc::new(ThreadRecordingTransport::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        // Skip the chunk boundary and stop exactly after finalization's
+        // backend authority response but before finalization admission.
+        checkpoints.set_relay_admission_barrier_for_test(
+            1,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector_transport = Arc::clone(&transport);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &CursorRecordingPages::new(vec![page("finalize-race", None)]),
+                collector_transport.as_ref(),
+                now(),
+            )
+        });
+        entered.wait();
+        grants.revoke(now()).unwrap();
+        release.wait();
+
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+        assert_eq!(transport.chunks.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revocation_after_heartbeat_revalidation_closes_relay_admission() {
+        let root = temp_dir("heartbeat-post-revalidation-race");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let seed_transport = V2RecordingTransport::new();
+        assert_eq!(
+            collect_cloud_sessions_once(
+                &grants,
+                &checkpoints,
+                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
+                &seed_transport,
+                now(),
+            ),
+            CloudSessionCycleOutcome::Uploaded
+        );
+
+        let transport = Arc::new(ThreadRecordingTransport::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        checkpoints.set_relay_admission_barrier_for_test(
+            0,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector_transport = Arc::clone(&transport);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &CursorRecordingPages::new(vec![page("stable-heartbeat", None)]),
+                collector_transport.as_ref(),
+                now() + TimeDuration::minutes(61),
+            )
+        });
+        entered.wait();
+        grants.revoke(now()).unwrap();
+        release.wait();
+
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revocation_after_failure_revalidation_closes_relay_admission() {
+        let root = temp_dir("failure-post-revalidation-race");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let transport = Arc::new(ThreadRecordingTransport::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        checkpoints.set_relay_admission_barrier_for_test(
+            0,
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        );
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector_transport = Arc::clone(&transport);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &FailingPages {
+                    calls: Cell::new(0),
+                },
+                collector_transport.as_ref(),
+                now(),
+            )
+        });
+        entered.wait();
+        grants.revoke(now()).unwrap();
+        release.wait();
+
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+        assert_eq!(transport.v1_sends.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revoke_waits_for_an_admitted_relay_chunk_before_returning_idle() {
+        use std::sync::mpsc;
+
+        let root = temp_dir("relay-chunk-io-fence");
+        let grants = CloudSessionGrantStore::new(root.join("grant.json"));
+        enabled(&grants);
+        let checkpoints = Arc::new(CloudSessionCheckpointStore::new(
+            root.join("checkpoint.json"),
+        ));
+        let transport = Arc::new(ThreadRecordingTransport::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *transport.blocking_chunk.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+
+        let collector_grants = grants.clone();
+        let collector_checkpoints = Arc::clone(&checkpoints);
+        let collector_transport = Arc::clone(&transport);
+        let collector = thread::spawn(move || {
+            collect_cloud_sessions_once(
+                &collector_grants,
+                &collector_checkpoints,
+                &CursorRecordingPages::new(vec![page("admitted-chunk", None)]),
+                collector_transport.as_ref(),
+                now(),
+            )
+        });
+        entered.wait();
+        grants.revoke(now()).unwrap();
+        let waiter_checkpoints = Arc::clone(&checkpoints);
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            stopped_tx
+                .send(waiter_checkpoints.wait_for_collector_io_idle(Duration::from_secs(2)))
+                .unwrap();
+        });
+        assert!(stopped_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release.wait();
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(collector.join().unwrap(), CloudSessionCycleOutcome::Noop);
+        assert_eq!(transport.chunks.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.finalizes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -6624,9 +8236,7 @@ mod tests {
             .map(|id| json!({"id": format!("provider-{id}"), "status": "running"}))
             .collect::<Vec<_>>();
         let runner = Pages {
-            pages: RefCell::new(vec![
-                json!({"tasks": tasks, "next_cursor": null}).to_string()
-            ]),
+            pages: RefCell::new(vec![json!({"tasks": tasks, "cursor": null}).to_string()]),
             calls: Cell::new(0),
             revoke: None,
         };
@@ -6688,6 +8298,13 @@ mod tests {
     }
 
     #[test]
+    fn admitted_relay_deadline_fits_inside_local_stop_wait() {
+        let timeout = remaining_relay_budget(Instant::now() + CYCLE_BUDGET).unwrap();
+        assert_eq!(timeout, RELAY_IO_TIMEOUT);
+        assert!(RELAY_IO_TIMEOUT < COLLECTOR_IO_STOP_TIMEOUT);
+    }
+
+    #[test]
     fn deferred_transport_does_not_call_the_provider() {
         let (grants, checkpoints) = stores("deferred");
         enabled(&grants);
@@ -6734,7 +8351,7 @@ mod tests {
                     json!({"id":format!("provider-{id}"),"status":"running","updated_at":"2026-07-21T11:00:00Z"})
                 })
                 .collect::<Vec<_>>();
-            json!({"tasks":tasks,"next_cursor":cursor}).to_string()
+            json!({"tasks":tasks,"cursor":cursor}).to_string()
         };
         let pages = (0..MAX_PAGES)
             .map(|index| {
@@ -7045,12 +8662,12 @@ mod tests {
             json!({"tasks":[
                 {"id":"duplicate","status":"queued"},
                 {"id":"only-first","status":"running"}
-            ],"next_cursor":"cursor-1"})
+            ],"cursor":"cursor-1"})
             .to_string(),
             json!({"tasks":[
                 {"id":"duplicate","status":"completed"},
                 {"id":"only-second","status":"running"}
-            ],"next_cursor":null})
+            ],"cursor":null})
             .to_string(),
         ]);
         let transport = V2RecordingTransport::new();
@@ -7232,6 +8849,107 @@ mod tests {
             finalize.enumeration_consistency,
             CloudSessionEnumerationConsistencyV2::SingleResponse
         );
+    }
+
+    #[test]
+    fn official_cursor_drives_bounded_multi_page_scan_without_absence_authority() {
+        let (grants, checkpoints) = stores("v2-official-cursor");
+        enabled(&grants);
+        let runner = CursorRecordingPages::new(vec![
+            full_page(0, Some("official-page-two")),
+            page("official-terminal", None),
+        ]);
+        let transport = V2RecordingTransport::new();
+        assert_eq!(
+            collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+            CloudSessionCycleOutcome::Uploaded
+        );
+        assert_eq!(
+            runner.cursors.borrow().as_slice(),
+            &[None, Some("official-page-two".to_string())]
+        );
+        let finalizes = transport.finalizes.borrow();
+        assert_eq!(finalizes.len(), 1);
+        let finalize = &finalizes[0];
+        assert_eq!(finalize.provider_page_count, 2);
+        assert_eq!(finalize.unique_entity_count, 21);
+        assert!(finalize.terminal_reached);
+        assert_eq!(
+            finalize.enumeration_consistency,
+            CloudSessionEnumerationConsistencyV2::UnstableCursor
+        );
+        assert_ne!(
+            finalize.enumeration_consistency,
+            CloudSessionEnumerationConsistencyV2::SingleResponse
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_shapes_upload_positive_facts_without_finalize() {
+        for (name, raw) in [
+            (
+                "fieldless",
+                json!({"tasks": [{"id": "fieldless-positive", "status": "running"}]}),
+            ),
+            (
+                "alias-null",
+                json!({
+                    "tasks": [{"id": "alias-null-positive", "status": "running"}],
+                    "next_cursor": null
+                }),
+            ),
+            (
+                "array-root",
+                json!([{"id": "array-positive", "status": "running"}]),
+            ),
+        ] {
+            let (grants, checkpoints) = stores(&format!("ambiguous-positive-{name}"));
+            enabled(&grants);
+            let runner = CursorRecordingPages::new(vec![raw.to_string()]);
+            let transport = V2RecordingTransport::new();
+            assert_eq!(
+                collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+                CloudSessionCycleOutcome::Uploaded,
+                "{name}"
+            );
+            assert_eq!(transport.chunks.borrow().len(), 1, "{name}");
+            assert_eq!(transport.chunks.borrow()[0].observations.len(), 1, "{name}");
+            assert_eq!(
+                transport.chunks.borrow()[0].health.state,
+                "degraded",
+                "{name}"
+            );
+            assert!(transport.finalizes.borrow().is_empty(), "{name}");
+            assert!(
+                checkpoints.load().last_complete_snapshot_at.is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_empty_shapes_fail_without_chunks_or_finalize() {
+        for (name, raw) in [
+            ("fieldless", json!({"tasks": []})),
+            ("alias-null", json!({"tasks": [], "next_cursor": null})),
+            ("array-root", json!([])),
+        ] {
+            let (grants, checkpoints) = stores(&format!("ambiguous-empty-{name}"));
+            enabled(&grants);
+            let runner = CursorRecordingPages::new(vec![raw.to_string()]);
+            let transport = V2RecordingTransport::new();
+            assert_eq!(
+                collect_cloud_sessions_once(&grants, &checkpoints, &runner, &transport, now()),
+                CloudSessionCycleOutcome::Failed,
+                "{name}"
+            );
+            assert!(transport.chunks.borrow().is_empty(), "{name}");
+            assert!(transport.finalizes.borrow().is_empty(), "{name}");
+            assert!(
+                checkpoints.load().last_complete_snapshot_at.is_none(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

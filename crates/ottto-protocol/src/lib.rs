@@ -4,6 +4,7 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u16 = 15;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
+pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
 
@@ -2282,10 +2283,9 @@ pub struct CliError {
     pub details: BTreeMap<String, RedactedValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalControlRequest {
     pub request_id: String,
-    #[serde(deserialize_with = "deserialize_local_control_protocol_version")]
     pub protocol_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -2297,22 +2297,63 @@ pub struct LocalControlRequest {
     pub command: LocalControlCommand,
 }
 
+#[derive(Deserialize)]
+struct LocalControlRequestWire {
+    request_id: String,
+    protocol_version: u16,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    client_kind: Option<LocalClientKind>,
+    #[serde(default)]
+    client_install_owner: Option<InstallOwner>,
+    #[serde(flatten)]
+    command: LocalControlCommand,
+}
+
+impl<'de> Deserialize<'de> for LocalControlRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let request = LocalControlRequestWire::deserialize(deserializer)?;
+        validate_local_control_protocol_version(request.protocol_version, &request.command)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            request_id: request.request_id,
+            protocol_version: request.protocol_version,
+            token: request.token,
+            client_kind: request.client_kind,
+            client_install_owner: request.client_install_owner,
+            command: request.command,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeDesktopWebUsagePreferenceState {
     pub enabled: bool,
 }
 
-fn deserialize_local_control_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let version = u16::deserialize(deserializer)?;
-    if version != LOCAL_CONTROL_PROTOCOL_VERSION {
-        return Err(serde::de::Error::custom(format!(
-            "unsupported local control protocol_version {version}; expected {LOCAL_CONTROL_PROTOCOL_VERSION}"
-        )));
+pub fn expected_local_control_protocol_version(command: &LocalControlCommand) -> u16 {
+    if matches!(command, LocalControlCommand::CloudSessionsControl { .. }) {
+        CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION
+    } else {
+        LOCAL_CONTROL_PROTOCOL_VERSION
     }
-    Ok(version)
+}
+
+pub fn validate_local_control_protocol_version(
+    version: u16,
+    command: &LocalControlCommand,
+) -> Result<(), String> {
+    let expected = expected_local_control_protocol_version(command);
+    if version != expected {
+        return Err(format!(
+            "unsupported local control protocol_version {version}; expected {expected}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3275,7 +3316,7 @@ mod tests {
     fn cloud_sessions_control_command_round_trips_without_browser_credentials() {
         let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
             "request_id": "req_cloud_bind",
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
             "client_kind": "web_ui",
             "command": "cloud_sessions_control",
             "action": "bind",
@@ -4164,18 +4205,67 @@ mod tests {
     }
 
     #[test]
-    fn local_control_request_rejects_stale_protocol_version() {
+    fn local_control_status_accepts_base_protocol_version() {
+        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v15",
+            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect("base local-control status request should be accepted");
+
+        assert_eq!(request.protocol_version, LOCAL_CONTROL_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn cloud_sessions_control_rejects_base_protocol_version() {
         let error = serde_json::from_str::<LocalControlRequest>(
-            r#"{"request_id":"req_stale","protocol_version":10,"command":"status"}"#,
+            r#"{"request_id":"req_cloud_v15","protocol_version":15,"command":"cloud_sessions_control","action":"status","control_token":"header.payload.signature"}"#,
         )
-        .expect_err("stale protocol version should be rejected");
+        .expect_err("cloud-session control must reject the base protocol version");
 
         assert!(error
             .to_string()
-            .contains("unsupported local control protocol_version 10"));
+            .contains("unsupported local control protocol_version 15"));
+        assert!(error.to_string().contains(&format!(
+            "expected {CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION}"
+        )));
+        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(LOCAL_CONTROL_PROTOCOL_VERSION, 15);
+        assert_eq!(CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION, 16);
+    }
+
+    #[test]
+    fn cloud_sessions_control_accepts_command_protocol_version() {
+        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_cloud_v16",
+            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
+            "command": "cloud_sessions_control",
+            "action": "status",
+            "control_token": "header.payload.signature"
+        }))
+        .expect("cloud-session command protocol version should be accepted");
+
+        assert_eq!(
+            request.protocol_version,
+            CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn local_control_status_rejects_cloud_sessions_protocol_version() {
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v16",
+            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect_err("ordinary status must reject the cloud-session protocol version");
+
         assert!(error
             .to_string()
-            .contains(&format!("expected {PROTOCOL_VERSION}")));
+            .contains("unsupported local control protocol_version 16"));
+        assert!(error
+            .to_string()
+            .contains(&format!("expected {LOCAL_CONTROL_PROTOCOL_VERSION}")));
     }
 
     #[test]

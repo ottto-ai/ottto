@@ -96,7 +96,10 @@ after claim approval, uses a six-month default backfill capped at 1000 files per
 app/source, and must not upload raw prompts, raw output, absolute local paths,
 cookies, credentials, or secret material. Live telemetry is source-level
 opt-in, diagnostics upload is explicit-approval-only, and risky collectors are
-excluded from default v1.
+excluded from default v1. Codex Cloud Sessions additionally requires the
+user's versioned grant for the exact local device/user/organization scope plus
+server policy approval; without both, its supervisor remains inert.
+`OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` always wins.
 
 This public repository owns the local runtime, installer/release tooling,
 public docs, tests, redaction, diagnostics, agent adapters, connector
