@@ -2170,10 +2170,10 @@ fn cloud_sessions_control_with_stores(
                 time::OffsetDateTime::now_utc(),
             )
             .and_then(|grant| {
-                if grant.backend_binding.is_some() && !grant.backend_create_pending {
-                    Ok(None)
-                } else {
+                if grant.status == crate::cloud_sessions::CloudSessionGrantStatus::ConsentRequired {
                     grants.grant_create_request(&device.device_id).map(Some)
+                } else {
+                    Ok(None)
                 }
             })
             .map(|request| backend_create_request = request),
@@ -13725,6 +13725,92 @@ mod tests {
             assert!(!persisted.contains(raw_id));
         }
         assert!(!persisted.contains("header."));
+    }
+
+    #[test]
+    #[serial]
+    fn cloud_sessions_prepare_rebinds_only_an_outdated_bound_collector() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("cloud-session-control-version-rebind");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::new(root.join("grant.json"));
+        let checkpoints =
+            crate::cloud_sessions::CloudSessionCheckpointStore::new(root.join("checkpoint.json"));
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
+            root.join("control-token-uses.json"),
+        );
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |token_id: &str| {
+            let action = CloudSessionsControlAction::Prepare;
+            let action_slug = cloud_sessions_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            cloud_sessions_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                None,
+                None,
+                &accounts,
+                &devices,
+                &grants,
+                &checkpoints,
+                &token_uses,
+            )
+        };
+
+        let initial = run("version-rebind-initial").unwrap();
+        assert!(initial.backend_create_request.is_some());
+        let pending = grants.load().unwrap().unwrap();
+        grants
+            .bind_backend_grant(
+                &cloud_control_backend_grant(&pending, device_id, "enabled", 1),
+                device_id,
+            )
+            .unwrap();
+
+        let unchanged = run("version-rebind-unchanged").unwrap();
+        assert!(unchanged.backend_create_request.is_none());
+        assert_eq!(
+            unchanged.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::TransportDeferred
+        );
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(grants.path()).unwrap()).unwrap();
+        persisted["grant"]["collector_version"] = serde_json::Value::String("0.1.89".to_string());
+        fs::write(
+            grants.path(),
+            serde_json::to_vec_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let outdated = run("version-rebind-outdated").unwrap();
+        let create = outdated.backend_create_request.unwrap();
+        assert_eq!(create.installation_id, device_id);
+        assert_eq!(create.collector_version, compiled_release_version());
+        assert_eq!(create.grant_scope_fingerprint, pending.grant_scope_id);
+        assert_eq!(
+            outdated.status.runtime_state,
+            crate::cloud_sessions::CloudSessionRuntimeState::ConsentRequired
+        );
+        assert!(!outdated.status.provider_cli_invocation_permitted);
+        let rebind = grants.load().unwrap().unwrap();
+        assert!(rebind.backend_create_pending);
+        assert_eq!(rebind.collector_version, "0.1.89");
+        assert_eq!(
+            rebind.backend_binding.as_ref().unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
     }
 
     #[test]
