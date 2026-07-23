@@ -504,6 +504,15 @@ fn is_zero_u64(value: &u64) -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanIndex {
     pub files: BTreeMap<String, ScanIndexEntry>,
+    /// Last accepted semantic fingerprint for Codex sessions that exist only
+    /// in the local state database and have no usage-bearing rollout file.
+    ///
+    /// These snapshots are rebuilt every scan from `state_*.sqlite`. Keeping
+    /// their fingerprints beside the file index lets a successful upload
+    /// acknowledge them exactly like file-backed snapshots, without turning
+    /// every later state-database observation into another upload.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2760,14 +2769,14 @@ fn scan_source_roots_with_limit_and_attribution(
         }
     }
     if source == SnapshotSource::Codex {
-        let before_state_only = snapshots.len();
-        append_codex_state_only_snapshots(
+        let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
             &mut snapshots,
             &codex_title_metadata,
             collected_at,
             index,
         );
-        scanned_session_count += snapshots.len().saturating_sub(before_state_only);
+        scanned_session_count += state_only_scanned;
+        semantic_noop_count += state_only_noops;
     }
     Ok(SourceScanResult {
         source,
@@ -2799,8 +2808,8 @@ fn append_codex_state_only_snapshots(
     snapshots: &mut Vec<SnapshotItem>,
     metadata: &CodexTitleMetadata,
     collected_at: &str,
-    index: &ScanIndex,
-) {
+    index: &mut ScanIndex,
+) -> (usize, usize) {
     let covered_session_ids: BTreeSet<String> = snapshots
         .iter()
         .map(|snapshot| snapshot.source_session_id.clone())
@@ -2825,6 +2834,10 @@ fn append_codex_state_only_snapshots(
         .filter(|(_, entry)| entry.last_snapshot_fingerprint.is_some())
         .filter_map(|(path, _)| codex_session_id_from_path(Path::new(path)))
         .collect();
+    let previous_fingerprints = &index.codex_state_only_snapshot_fingerprints;
+    let mut current_fingerprints = BTreeMap::new();
+    let mut scanned_session_count = 0;
+    let mut semantic_noop_count = 0;
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
             || covered_session_ids.contains(source_session_id)
@@ -2832,12 +2845,20 @@ fn append_codex_state_only_snapshots(
         {
             continue;
         }
-        snapshots.push(codex_state_only_snapshot(
-            source_session_id,
-            thread,
-            collected_at,
-        ));
+        let snapshot = codex_state_only_snapshot(source_session_id, thread, collected_at);
+        scanned_session_count += 1;
+        current_fingerprints.insert(
+            source_session_id.clone(),
+            snapshot.snapshot_fingerprint.clone(),
+        );
+        if previous_fingerprints.get(source_session_id) == Some(&snapshot.snapshot_fingerprint) {
+            semantic_noop_count += 1;
+        } else {
+            snapshots.push(snapshot);
+        }
     }
+    index.codex_state_only_snapshot_fingerprints = current_fingerprints;
+    (scanned_session_count, semantic_noop_count)
 }
 
 fn codex_state_only_snapshot(
@@ -5951,6 +5972,7 @@ mod tests {
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
+            ..ScanIndex::default()
         };
         replacement.save(&path).expect("save replacement index");
 
@@ -6004,6 +6026,7 @@ mod tests {
                     scan_identity_version: None,
                 },
             )]),
+            ..ScanIndex::default()
         };
 
         let scan = scan_source_roots(
@@ -6080,6 +6103,7 @@ mod tests {
                     scan_identity_version: None,
                 },
             )]),
+            ..ScanIndex::default()
         };
 
         let scan = scan_source_roots(
@@ -6127,6 +6151,7 @@ mod tests {
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
+            ..ScanIndex::default()
         };
         assert_eq!(
             index.candidate_decision(&candidate),
@@ -6158,6 +6183,7 @@ mod tests {
                     scan_identity_version: None,
                 },
             )]),
+            ..ScanIndex::default()
         };
         assert_eq!(
             index.candidate_decision(&candidate),
@@ -6189,6 +6215,7 @@ mod tests {
                     scan_identity_version: None,
                 },
             )]),
+            ..ScanIndex::default()
         };
         assert_eq!(
             index.candidate_decision(&candidate),
@@ -7420,9 +7447,9 @@ mod tests {
         // Regression guard: a rollout that exists but yields zero usage rows
         // (e.g. only session_meta, or a legacy/unknown token payload) is still
         // recorded in the scan index, but it produced NO split snapshot. Such a
-        // thread must keep surfacing its tokens as a state-only "Other" — both
-        // on the first scan and on incremental re-scans — never be dropped just
-        // because the file was scanned.
+        // thread must surface its tokens as a state-only "Other" once, suppress
+        // identical observations after acknowledgement, and emit again when
+        // the state-backed semantic payload really changes.
         let codex_dir = temp_dir("codex-state-empty-rollout");
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -7483,8 +7510,8 @@ mod tests {
         .expect("first scan");
         assert_state_only("first scan", &first);
 
-        // Incremental re-scan: file skipped, but it never produced a snapshot, so
-        // the tokens must still surface as a state-only Other (not be dropped).
+        // Incremental re-scan: the state-only snapshot is evaluated but its
+        // already-acknowledged semantic identity is not returned for upload.
         let second = scan_source_roots(
             SnapshotSource::Codex,
             &roots,
@@ -7493,7 +7520,54 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("second scan");
-        assert_state_only("incremental re-scan", &second);
+        assert!(second.snapshots.is_empty());
+        assert_eq!(second.scanned_session_count, 1);
+        assert_eq!(second.semantic_noop_count, 1);
+        assert_eq!(index.codex_state_only_snapshot_fingerprints.len(), 1);
+
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("reopen sqlite");
+        connection
+            .execute(
+                concat!(
+                    "UPDATE threads SET tokens_used = ?1, updated_at = ?2, updated_at_ms = ?3 ",
+                    "WHERE id = ?4",
+                ),
+                (
+                    4_322_i64,
+                    1_777_777_200_i64,
+                    1_777_777_200_000_i64,
+                    "019e253c-aaaa-7000-9000-eeeeeeeeeeee",
+                ),
+            )
+            .expect("update semantic state");
+        drop(connection);
+
+        let changed = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T12:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("changed scan");
+        let changed_state = changed
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == "019e253c-aaaa-7000-9000-eeeeeeeeeeee")
+            .expect("changed state-only snapshot");
+        assert_eq!(changed_state.unattributed_total_tokens, 4_322);
+        assert_eq!(changed.semantic_noop_count, 0);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            "2026-05-14T13:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert!(settled.snapshots.is_empty());
+        assert_eq!(settled.semantic_noop_count, 1);
 
         let _ = fs::remove_dir_all(codex_dir);
     }
@@ -7592,6 +7666,7 @@ mod tests {
                 path.to_string_lossy().to_string(),
                 legacy_entry,
             )]),
+            ..ScanIndex::default()
         };
 
         let scan = scan_source_roots(
