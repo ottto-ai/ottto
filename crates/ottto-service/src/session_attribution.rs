@@ -112,10 +112,23 @@ pub struct SessionAttributionGroupingInput<'a> {
 }
 
 impl SessionAttributionContext {
-    /// Short local-only namespace for the incremental scan index. It changes
-    /// when the HMAC key or either scheduler inventory changes, without putting
-    /// raw key/configuration material into the index filename.
-    pub fn cache_namespace(&self) -> String {
+    /// Short local-only identity namespace for the incremental scan index.
+    ///
+    /// Only the HMAC key epoch belongs in checkpoint identity. Scheduler
+    /// inventory is semantic input for sessions parsed after it changes, but an
+    /// unrelated automation definition must not invalidate every transcript
+    /// checkpoint and replay local history. Historical re-evaluation remains an
+    /// explicit backfill/replay operation.
+    pub fn checkpoint_namespace(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"session-attribution-checkpoint:v2");
+        hasher.update(self.key.as_slice());
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    }
+
+    /// Pre-v2 namespace retained only to adopt the exact current legacy index
+    /// during upgrade without forcing a one-time historical replay.
+    pub fn legacy_cache_namespace(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"session-attribution-context:v1");
         hasher.update(self.key.as_slice());
@@ -1123,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_namespace_changes_with_key_and_inventory_without_exposing_material() {
+    fn checkpoint_namespace_changes_only_with_key_epoch() {
         let context = SessionAttributionContext {
             key: Zeroizing::new(vec![1_u8; 32]),
             provider_schedules: ProviderScheduleInventory::default(),
@@ -1148,12 +1161,36 @@ mod tests {
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
         };
 
-        let namespace = context.cache_namespace();
+        let namespace = context.checkpoint_namespace();
         assert_eq!(namespace.len(), 16);
-        assert_ne!(namespace, rotated.cache_namespace());
-        assert_ne!(namespace, changed_inventory.cache_namespace());
+        assert_ne!(namespace, rotated.checkpoint_namespace());
+        assert_eq!(namespace, changed_inventory.checkpoint_namespace());
+    }
+
+    #[test]
+    fn legacy_cache_namespace_still_identifies_exact_upgrade_source() {
+        let context = SessionAttributionContext {
+            key: Zeroizing::new(vec![1_u8; 32]),
+            provider_schedules: ProviderScheduleInventory::default(),
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+        };
+        let changed_inventory = SessionAttributionContext {
+            key: Zeroizing::new(vec![1_u8; 32]),
+            provider_schedules: ProviderScheduleInventory {
+                definitions: vec![ProviderScheduleDefinition {
+                    opaque_id: "hmac-sha256:v1:opaque".to_string(),
+                    prompt_signature: "private schedule prompt material".to_string(),
+                }],
+            },
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+        };
+
+        let namespace = context.legacy_cache_namespace();
+        assert_ne!(namespace, changed_inventory.legacy_cache_namespace());
         assert!(!changed_inventory
-            .cache_namespace()
+            .legacy_cache_namespace()
             .contains("private schedule prompt material"));
     }
 

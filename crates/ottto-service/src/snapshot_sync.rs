@@ -845,14 +845,36 @@ fn sync_source(
             && activity_hint.session_attribution_labels_enabled,
     };
     let upload_destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    let checkpoint_namespace = attribution_context
+        .as_ref()
+        .map(SessionAttributionContext::checkpoint_namespace);
     let policy_index_path = snapshot_index_path(
         support_dir,
         source,
         upload_policy,
-        attribution_context.as_ref(),
+        checkpoint_namespace.as_deref(),
     );
     let index_path =
         snapshot_destination_scoped_index_path(&policy_index_path, &upload_destination_namespace);
+    // Adopt both the scan checkpoint and any in-flight accepted-page ledger
+    // from the exact pre-v2 namespace. This keeps a normal upgrade—and an
+    // upgrade after a partially acknowledged batch—from replaying history.
+    if let Some(legacy_namespace) = attribution_context
+        .as_ref()
+        .map(SessionAttributionContext::legacy_cache_namespace)
+    {
+        let legacy_policy_index_path =
+            snapshot_index_path(support_dir, source, upload_policy, Some(&legacy_namespace));
+        let legacy_index_path = snapshot_destination_scoped_index_path(
+            &legacy_policy_index_path,
+            &upload_destination_namespace,
+        );
+        adopt_legacy_checkpoint_file(&legacy_index_path, &index_path)?;
+        adopt_legacy_checkpoint_file(
+            &snapshot_upload_progress_path(&legacy_index_path),
+            &snapshot_upload_progress_path(&index_path),
+        )?;
+    }
     let upload_progress_path = snapshot_upload_progress_path(&index_path);
     let mut upload_progress =
         SnapshotUploadProgress::load(&upload_progress_path, &upload_destination_namespace)?;
@@ -1721,7 +1743,7 @@ fn snapshot_index_path(
     support_dir: &Path,
     source: SnapshotSource,
     upload_policy: SnapshotUploadPolicy,
-    attribution_context: Option<&SessionAttributionContext>,
+    attribution_checkpoint_namespace: Option<&str>,
 ) -> PathBuf {
     let mut suffixes: Vec<String> = Vec::new();
     if !upload_policy.session_titles_enabled {
@@ -1741,9 +1763,12 @@ fn snapshot_index_path(
     }
     // Attribution is opt-in. A separate index makes a later enablement revisit
     // unchanged transcripts instead of waiting for their next filesystem edit.
+    // The namespace is key-epoch-only: scheduler inventory changes affect
+    // sessions parsed from that point forward and require an explicit replay
+    // for history. They must not silently invalidate every local checkpoint.
     if upload_policy.session_attribution_enabled {
-        let namespace = attribution_context
-            .map(SessionAttributionContext::cache_namespace)
+        let namespace = attribution_checkpoint_namespace
+            .map(str::to_string)
             .unwrap_or_else(|| "pending".to_string());
         suffixes.push(format!("attribution-{namespace}"));
     }
@@ -1763,6 +1788,32 @@ fn snapshot_index_path(
         source.api_slug(),
         policy_suffix
     ))
+}
+
+fn adopt_legacy_checkpoint_file(legacy_path: &Path, stable_path: &Path) -> Result<()> {
+    if legacy_path == stable_path || stable_path.exists() || !legacy_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = stable_path.parent() {
+        std::fs::create_dir_all(parent).context("create stable checkpoint directory")?;
+    }
+    let temp_path = stable_path.with_extension(format!("json.{}.migrate", std::process::id()));
+    let migration = (|| -> Result<()> {
+        let mut source =
+            std::fs::File::open(legacy_path).context("open legacy checkpoint for migration")?;
+        let mut destination =
+            std::fs::File::create(&temp_path).context("create stable checkpoint migration temp")?;
+        std::io::copy(&mut source, &mut destination)
+            .context("copy legacy checkpoint into stable namespace")?;
+        destination
+            .sync_all()
+            .context("sync stable checkpoint migration temp")?;
+        std::fs::rename(&temp_path, stable_path).context("publish stable checkpoint migration")
+    })();
+    if migration.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    migration
 }
 
 fn snapshot_upload_progress_path(index_path: &Path) -> PathBuf {
@@ -2478,6 +2529,54 @@ mod tests {
                 "/support/snapshots/codex-scan-index-attribution-pending-attribution-labels.json"
             )
         );
+    }
+
+    #[test]
+    fn attribution_checkpoint_path_is_inventory_independent() {
+        let root = Path::new("/support");
+        let policy = SnapshotUploadPolicy {
+            session_attribution_enabled: true,
+            session_attribution_labels_enabled: true,
+            ..SnapshotUploadPolicy::default()
+        };
+
+        let path = snapshot_index_path(
+            root,
+            SnapshotSource::Codex,
+            policy,
+            Some("stable-key-epoch"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "/support/snapshots/codex-scan-index-attribution-stable-key-epoch-attribution-labels.json"
+            )
+        );
+    }
+
+    #[test]
+    fn exact_legacy_checkpoint_is_adopted_once_without_overwrite() {
+        let root = test_dir("snapshot-index-legacy-adoption");
+        let legacy = root.join("legacy.json");
+        let stable = root.join("stable").join("index.json");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(&legacy, br#"{"files":{"legacy":{"size_bytes":1,"modified_unix_seconds":2,"source_file_fingerprint":"source","last_snapshot_fingerprint":"snapshot"}}}"#)
+            .expect("write legacy index");
+
+        adopt_legacy_checkpoint_file(&legacy, &stable).expect("adopt exact legacy checkpoint");
+        assert_eq!(
+            std::fs::read(&stable).expect("read stable index"),
+            std::fs::read(&legacy).expect("read legacy index"),
+        );
+
+        std::fs::write(&legacy, b"newer legacy bytes").expect("replace legacy index");
+        adopt_legacy_checkpoint_file(&legacy, &stable).expect("keep stable checkpoint");
+        assert_ne!(
+            std::fs::read(&stable).expect("read stable index"),
+            std::fs::read(&legacy).expect("read replaced legacy index"),
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
