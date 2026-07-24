@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 259,
-  "content_sha256": "a72595577d37164e8e328bbafaa63a5a842d31cc9da41ed9b87e28555f5c7381",
+  "candidate_file_count": 262,
+  "content_sha256": "5964492967ab7b106f8f39f4bce9defc63b50388ad90f475154b03928157f967",
   "files": [
     {
       "executable": false,
@@ -790,8 +790,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "7d376745b8f5c352e2ea0a454b750b5b59304bb0d5783943a1d14497b4fe17db",
-      "size_bytes": 20163
+      "sha256": "184ea60b648a7a94e6a1432645226573b5d3bf175e9f55a411db6efe3ccb6cd9",
+      "size_bytes": 35786
     },
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "d72729c657e40825ba16e47e2e3e1e282b950792f16b40702aa59d915f2f18d3",
-      "size_bytes": 503118
+      "sha256": "aca98ce2f6389dd313f2c5a3e42ef791fdf96d1d9409cd82a158539bbd1050e7",
+      "size_bytes": 503140
     },
     {
       "executable": false,
@@ -1009,6 +1009,13 @@
       "path": "docs/session-2026-07-23-cloud-session-contract-and-io-fence.md",
       "sha256": "6061a670bd1aec6ce93409b3e3de8e07f2da783ba0b04f061f87b896b60f75fe",
       "size_bytes": 5253
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-24-local-snapshot-audit-v2.md",
+      "sha256": "4821cbedc100708ecf84d1fd4bde96d8d314eaa0611cd9b37f0a129520bf01ef",
+      "size_bytes": 2867
     },
     {
       "executable": false,
@@ -1335,6 +1342,20 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "fixtures/snapshot-audit/pi-session.jsonl",
+      "sha256": "9378b57dbc118b8c089d3cfd7c3746235065a47fe2d9586abacf6e1797582225",
+      "size_bytes": 322
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-audit/v2-golden-keys.json",
+      "sha256": "256aae1f201a17e7fec5067669a95efeafc25f9f1c86a0c3ab4401bdaf55bf7b",
+      "size_bytes": 1055
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "fixtures/source-health/codex-needs-repair.json",
       "sha256": "7793a21d37711b56d986f20703b95512fdcde73b88d6cf1c18ff480fb322eadb",
       "size_bytes": 5678
@@ -1497,8 +1518,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_manifest_signature.sh",
-      "sha256": "ac45b4739a921eac43144761e41f0a7cd0c2d1a15f670655a388853b09ad7268",
-      "size_bytes": 4307
+      "sha256": "3253bb56d5eb0d9d0502d3cd7518c4380aeb761c858f81f92473c5a38033f964",
+      "size_bytes": 4449
     },
     {
       "executable": true,
@@ -1816,9 +1837,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-24T09:35:00+00:00",
+  "generated_at": "2026-07-24T16:31:09+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 260,
+  "output_file_count": 263,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1852,5 +1873,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "843bf06a660f8d7c825a78a0f02795312c2171cd"
+  "source_commit": "3da77b62b86aefee1b7635635af7a400c6facbf9"
 }
