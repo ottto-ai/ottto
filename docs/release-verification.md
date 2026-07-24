@@ -45,6 +45,19 @@ A stable release manifest must include:
 
 Do not trust a release where the manifest omits required public-v1 metadata.
 
+## Operator-Waived Manual Stable Release
+
+`release_mode: manual-no-sparkle` is a narrow emergency path for a stable build
+that remains Developer ID signed, notarized, stapled, checksummed, and
+manifest-signed, but is intentionally distributed without a Sparkle appcast.
+It is accepted only when the workflow receives the exact operator approval
+phrase and the manifest records explicit `waived` RC/clean-machine/attestation
+gates plus a `disabled` Sparkle gate with reasons.
+
+This mode is not eligible for automatic in-app upgrades or a claim of complete
+QA/supply-chain verification. Users must install the notarized DMG manually or
+use the published Homebrew formula. Never represent its waived gates as passed.
+
 ## Verify Checksums
 
 Download the artifact and compare against the manifest:

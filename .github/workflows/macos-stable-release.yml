@@ -29,6 +29,19 @@ on:
         type: choice
         options:
           - none
+      release_mode:
+        description: Standard release, or an explicitly approved manual-only stable without QA/Sparkle publication.
+        required: true
+        default: standard
+        type: choice
+        options:
+          - standard
+          - manual-no-sparkle
+      operator_approval:
+        description: Required approval phrase for manual-no-sparkle releases.
+        required: false
+        default: ""
+        type: string
       github_release_mirror:
         description: Mirror the stable build to a public GitHub Release for verification only. Never touches the CDN or channel promotion.
         required: false
@@ -77,6 +90,8 @@ jobs:
           ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
           RELEASE_NOTES: ${{ inputs.release_notes }}
           PUBLISH_INTENT: ${{ inputs.publish_intent }}
+          RELEASE_MODE: ${{ inputs.release_mode }}
+          OPERATOR_APPROVAL: ${{ inputs.operator_approval }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
@@ -101,6 +116,19 @@ jobs:
           fi
           if [[ "$PUBLISH_INTENT" != "none" ]]; then
             echo "The public workflow never publishes or promotes release channels." >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_MODE" == "manual-no-sparkle" ]]; then
+            if [[ "$CHANNEL" != "stable" ]]; then
+              echo "manual-no-sparkle is valid only for a stable release." >&2
+              exit 1
+            fi
+            if [[ "$OPERATOR_APPROVAL" != "RON_APPROVED_FASTLANE_MANUAL_STABLE" ]]; then
+              echo "manual-no-sparkle requires the exact operator approval phrase." >&2
+              exit 1
+            fi
+          elif [[ "$RELEASE_MODE" != "standard" ]]; then
+            echo "Unsupported release_mode: $RELEASE_MODE" >&2
             exit 1
           fi
           if [[ -z "${RELEASE_NOTES//[[:space:]]/}" ]]; then
@@ -169,8 +197,39 @@ jobs:
             --keychain-profile "$OTTTO_NOTARY_PROFILE" \
             --timeout "$OTTTO_NOTARY_WAIT_TIMEOUT"
 
+      - name: Record manual release waiver
+        if: inputs.channel == 'stable' && inputs.release_mode == 'manual-no-sparkle'
+        run: |
+          set -euo pipefail
+          checked_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          jq \
+            --arg checked_at "$checked_at" \
+            '.release_mode = "manual-no-sparkle"
+             | .quality_gates.stable_candidate_rc = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator-approved M4 fast lane; M1 unavailable"
+               }
+             | .quality_gates.stable_clean_machine_qa = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator explicitly waived QA for this manual release"
+               }
+             | .quality_gates.sparkle_appcast = {
+                 status: "disabled",
+                 checked_at: $checked_at,
+                 reason: "Existing Sparkle private key unavailable on the release host"
+               }
+             | .quality_gates.artifact_attestations = {
+                 status: "waived",
+                 checked_at: $checked_at,
+                 reason: "Operator-approved manual release; signed and notarized artifacts remain required"
+               }' \
+            dist/macos/release-manifest.json > dist/macos/release-manifest.json.next
+          mv dist/macos/release-manifest.json.next dist/macos/release-manifest.json
+
       - name: Bind stable-candidate RC evidence
-        if: inputs.channel == 'stable'
+        if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           test -n "$OTTTO_STABLE_CANDIDATE_RC_EVIDENCE" || {
@@ -230,17 +289,20 @@ jobs:
           )
 
       - name: Create provenance attestation
+        if: inputs.release_mode == 'standard'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
 
       - name: Create SBOM attestation
+        if: inputs.release_mode == 'standard'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
           sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
 
       - name: Bind verified attestation metadata
+        if: inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           scripts/macos_attestation_bind.sh \
@@ -250,6 +312,7 @@ jobs:
             --signer-workflow .github/workflows/macos-stable-release.yml
 
       - name: Regenerate checksums for bound manifest
+        if: inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           (
@@ -268,17 +331,20 @@ jobs:
           )
 
       - name: Create final provenance attestation
+        if: inputs.release_mode == 'standard'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
 
       - name: Create final SBOM attestation
+        if: inputs.release_mode == 'standard'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-checksums: dist/macos/subject.checksums.txt
           sbom-path: dist/macos/ottto-local-platform-sbom.cdx.json
 
       - name: Verify final attestations and manifest binding
+        if: inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           scripts/macos_attestation_bind.sh \
@@ -298,7 +364,7 @@ jobs:
             --manifest dist/macos/release-manifest.json
 
       - name: Run stable preflight
-        if: inputs.channel == 'stable'
+        if: inputs.channel == 'stable' && inputs.release_mode == 'standard'
         run: |
           set -euo pipefail
           scripts/macos_stable_preflight.sh \
