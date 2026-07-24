@@ -6,26 +6,30 @@
 //! transcript paths, provider session ids, titles, repository labels, and
 //! transcript content never enter the report.
 
+use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
-    apply_upload_policy, collector_version, scan_source_roots_with_artifacts,
-    snapshot_semantic_component_hashes, ScanIndex, SnapshotBatchRequest, SnapshotItem,
-    SnapshotSource, SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    apply_upload_policy, collector_version, scan_source_roots_with_attribution,
+    snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
+    snapshot_semantic_envelope, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
+    SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha2::Sha256;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v2";
-const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v2";
+const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
 const MIN_AUDIT_KEY_BYTES: usize = 32;
+const MAX_LEGACY_POLICY_CANDIDATES: usize = 24;
 const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
     "usage_accounting",
     "lifecycle_activity",
@@ -40,6 +44,8 @@ pub struct SnapshotAuditOptions {
     pub roots: Vec<PathBuf>,
     pub audit_state_dir: PathBuf,
     pub audit_key_path: PathBuf,
+    pub session_attribution_hmac_key_path: PathBuf,
+    pub attribution_home: Option<PathBuf>,
     pub machine_id: String,
     pub collected_at: String,
     pub backfill_window_days: u64,
@@ -50,6 +56,7 @@ pub struct SnapshotAuditOptions {
 pub struct SnapshotAuditReport {
     pub schema_version: &'static str,
     pub component_contract_version: &'static str,
+    pub revision_contract_version: &'static str,
     pub source: String,
     pub machine_key: String,
     pub upload_policy: SnapshotAuditUploadPolicy,
@@ -73,6 +80,8 @@ pub struct SnapshotAuditSession {
     pub session_key: String,
     pub semantic_key: String,
     pub revision_key: String,
+    pub legacy_revision_proof_available: bool,
+    pub legacy_policy_candidate_semantic_keys: Vec<String>,
     pub policy_neutral_component_keys: BTreeMap<String, String>,
     pub policy_sensitive_component_keys: BTreeMap<String, String>,
     pub status: String,
@@ -105,6 +114,8 @@ impl Default for SnapshotAuditOptions {
             roots: Vec::new(),
             audit_state_dir: PathBuf::new(),
             audit_key_path: PathBuf::new(),
+            session_attribution_hmac_key_path: PathBuf::new(),
+            attribution_home: None,
             machine_id: String::new(),
             collected_at: String::new(),
             backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -135,16 +146,45 @@ pub fn run_snapshot_audit<W: Write>(
         return Err(anyhow!("machine id cannot be empty"));
     }
     let audit_key = read_audit_key(&options.audit_key_path)?;
+    let attribution_home = match options.attribution_home.as_ref() {
+        Some(path) => path.clone(),
+        None => crate::snapshot_sync::home_dir()?,
+    };
+    let encoded_attribution_key = Zeroizing::new(
+        fs::read_to_string(&options.session_attribution_hmac_key_path)
+            .with_context(|| {
+                format!(
+                    "read session attribution HMAC key {}",
+                    options.session_attribution_hmac_key_path.display()
+                )
+            })?
+            .trim()
+            .to_string(),
+    );
+    let attribution_context = SessionAttributionContext::from_activity_hint(
+        options.source,
+        &attribution_home,
+        true,
+        Some(encoded_attribution_key.as_str()),
+        Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "session attribution HMAC key must be the exact 32-byte URL-safe no-pad activity-hint key"
+        )
+    })?;
     let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::load(&index_path)?;
-    let mut scan = scan_source_roots_with_artifacts(
+    let mut scan = scan_source_roots_with_attribution(
         options.source,
         &options.roots,
         &mut index,
         &options.collected_at,
         options.backfill_window_days,
-        false,
+        true,
+        Some(&attribution_context),
     )?;
+    let pre_policy_snapshots = scan.snapshots.clone();
     let upload_policy = SnapshotUploadPolicy {
         session_titles_enabled: false,
         workspace_labels_enabled: false,
@@ -166,8 +206,9 @@ pub fn run_snapshot_audit<W: Write>(
     let mut sessions = scan
         .snapshots
         .iter()
-        .map(|snapshot| {
-            let component_hashes = snapshot_semantic_component_hashes(options.source, snapshot);
+        .zip(pre_policy_snapshots.iter())
+        .map(|(snapshot, pre_policy_snapshot)| {
+            let envelope = snapshot_semantic_envelope(options.source, snapshot, upload_policy);
             SnapshotAuditSession {
                 session_key: keyed_hex(
                     &audit_key,
@@ -186,21 +227,22 @@ pub fn run_snapshot_audit<W: Write>(
                         &snapshot.snapshot_fingerprint,
                     ],
                 ),
-                revision_key: snapshot_revision_key(
+                revision_key: blinded_revision_key(&audit_key, &envelope.revision_hash),
+                legacy_revision_proof_available: false,
+                legacy_policy_candidate_semantic_keys: legacy_policy_candidate_semantic_keys(
                     &audit_key,
                     options.source,
-                    parser_version,
-                    scan_identity_version,
-                    snapshot,
-                ),
+                    pre_policy_snapshot,
+                )
+                .expect("valid upload policies stay within the audited candidate cap"),
                 policy_neutral_component_keys: blinded_component_keys(
                     &audit_key,
-                    &component_hashes,
+                    &envelope.component_hashes,
                     &POLICY_NEUTRAL_COMPONENTS,
                 ),
                 policy_sensitive_component_keys: blinded_component_keys(
                     &audit_key,
-                    &component_hashes,
+                    &envelope.component_hashes,
                     &POLICY_SENSITIVE_COMPONENTS,
                 ),
                 status: snapshot.status.clone(),
@@ -231,6 +273,7 @@ pub fn run_snapshot_audit<W: Write>(
             machine_id: options.machine_id.clone(),
             collector_version: Some(collector_version()),
             snapshots: scan.snapshots.clone(),
+            upload_policy,
         };
         write_private_json(path, &request)?;
     }
@@ -238,6 +281,7 @@ pub fn run_snapshot_audit<W: Write>(
     let report = SnapshotAuditReport {
         schema_version: AUDIT_SCHEMA_VERSION,
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+        revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
         source: options.source.api_slug().to_string(),
         machine_key: keyed_hex(
             &audit_key,
@@ -299,52 +343,81 @@ fn blinded_component_keys(
         .collect()
 }
 
-fn snapshot_revision_key(
-    audit_key: &[u8],
-    source: SnapshotSource,
-    parser_version: &str,
-    scan_identity_version: &str,
-    snapshot: &SnapshotItem,
-) -> String {
-    // This identity deliberately excludes upload-policy fields and collected_at.
-    // It proves the exact local input revision used by the scan without exposing
-    // a transcript fingerprint, path, session id, or state-database value.
-    let component_hashes = snapshot_semantic_component_hashes(source, snapshot);
-    let policy_neutral_component_hashes = POLICY_NEUTRAL_COMPONENTS
-        .iter()
-        .filter_map(|name| {
-            component_hashes
-                .get(name)
-                .map(|component_hash| ((*name).to_string(), component_hash.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let material = serde_json::json!({
-        "source_file_fingerprint": &snapshot.source_file_fingerprint,
-        "source_started_at": &snapshot.source_started_at,
-        "source_ended_at": &snapshot.source_ended_at,
-        "source_last_activity_at": &snapshot.source_last_activity_at,
-        "status": &snapshot.status,
-        "provenance": {
-            "collector": &snapshot.provenance.collector,
-            "source_file_count": snapshot.provenance.source_file_count,
-            "input_token_scope": &snapshot.provenance.input_token_scope,
-            "state_total_tokens": snapshot.provenance.state_total_tokens,
-            "state_archived": snapshot.provenance.state_archived,
-        },
-        "policy_neutral_component_hashes": policy_neutral_component_hashes,
-    })
-    .to_string();
+fn blinded_revision_key(audit_key: &[u8], revision_hash: &str) -> String {
     keyed_hex(
         audit_key,
         &[
             AUDIT_SCHEMA_VERSION,
             "revision",
-            source.api_slug(),
-            parser_version,
-            scan_identity_version,
-            &material,
+            SNAPSHOT_REVISION_CONTRACT_VERSION,
+            revision_hash,
         ],
     )
+}
+
+#[cfg(test)]
+fn snapshot_revision_key(
+    audit_key: &[u8],
+    source: SnapshotSource,
+    snapshot: &SnapshotItem,
+) -> String {
+    let envelope = snapshot_semantic_envelope(source, snapshot, SnapshotUploadPolicy::default());
+    blinded_revision_key(audit_key, &envelope.revision_hash)
+}
+
+pub(crate) fn valid_upload_policies() -> Vec<SnapshotUploadPolicy> {
+    let mut policies = Vec::new();
+    for bits in 0_u8..16 {
+        let session_titles_enabled = bits & 1 != 0;
+        let workspace_labels_enabled = bits & 2 != 0;
+        let session_artifacts_enabled = bits & 4 != 0;
+        let session_attribution_enabled = bits & 8 != 0;
+        for session_attribution_labels_enabled in [false, true] {
+            if session_attribution_labels_enabled
+                && (!session_titles_enabled || !session_attribution_enabled)
+            {
+                continue;
+            }
+            policies.push(SnapshotUploadPolicy {
+                session_titles_enabled,
+                workspace_labels_enabled,
+                session_artifacts_enabled,
+                session_attribution_enabled,
+                session_attribution_labels_enabled,
+            });
+        }
+    }
+    policies
+}
+
+fn legacy_policy_candidate_semantic_keys(
+    audit_key: &[u8],
+    source: SnapshotSource,
+    snapshot: &SnapshotItem,
+) -> Result<Vec<String>> {
+    let mut candidates = BTreeSet::new();
+    for policy in valid_upload_policies() {
+        let mut candidate = snapshot.clone();
+        apply_upload_policy(source, std::slice::from_mut(&mut candidate), policy);
+        let component_hashes = snapshot_semantic_component_hashes(source, &candidate);
+        let fingerprint = snapshot_fingerprint_from_component_hashes(
+            source,
+            &candidate.source_session_id,
+            &component_hashes,
+        );
+        candidates.insert(keyed_hex(
+            audit_key,
+            &[AUDIT_SCHEMA_VERSION, "semantic", &fingerprint],
+        ));
+    }
+    if candidates.len() > MAX_LEGACY_POLICY_CANDIDATES {
+        return Err(anyhow!(
+            "legacy policy candidate count {} exceeds cap {}",
+            candidates.len(),
+            MAX_LEGACY_POLICY_CANDIDATES
+        ));
+    }
+    Ok(candidates.into_iter().collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -522,6 +595,8 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshots::scan_source_roots_with_artifacts;
+    use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -535,6 +610,13 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn attribution_key_file(root: &Path) -> PathBuf {
+        let path = root.join("session-attribution.key");
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        fs::write(&path, encoded).expect("write attribution key");
         path
     }
 
@@ -563,6 +645,8 @@ mod tests {
                 roots: vec![sessions],
                 audit_state_dir: audit_state_dir.clone(),
                 audit_key_path: key_path,
+                session_attribution_hmac_key_path: attribution_key_file(&home),
+                attribution_home: Some(home.clone()),
                 machine_id: "fixture-machine".to_string(),
                 collected_at: "2026-07-22T08:02:00Z".to_string(),
                 backfill_window_days: BACKFILL_WINDOW_DAYS,
@@ -612,6 +696,16 @@ mod tests {
             vec!["artifacts", "attribution", "display_identity"]
         );
         assert_eq!(report.sessions[0].revision_key.len(), 64);
+        assert!(!report.sessions[0].legacy_revision_proof_available);
+        assert!(!report.sessions[0]
+            .legacy_policy_candidate_semantic_keys
+            .is_empty());
+        assert!(
+            report.sessions[0]
+                .legacy_policy_candidate_semantic_keys
+                .len()
+                <= MAX_LEGACY_POLICY_CANDIDATES
+        );
         let golden: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/v2-golden-keys.json"
         ))
@@ -667,6 +761,78 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_candidates_include_pre_policy_artifact_enabled_fingerprint() {
+        let home = temp_dir("legacy-artifact-candidate");
+        let sessions = home.join(".claude").join("projects").join("fixture");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        fs::write(
+            sessions.join("artifact-session.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-05-29T00:00:00Z\",\"sessionId\":\"artifact-scan-session\",\"summary\":\"Artifact scan session\"}\n",
+                "{\"timestamp\":\"2026-05-29T00:01:00Z\",\"sessionId\":\"artifact-scan-session\",\"message\":{\"id\":\"msg_01artifact\",\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-05-29T00:02:00Z\",\"sessionId\":\"artifact-scan-session\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"Opened https://github.com/ottto-ai/repo/pull/42\"}]}]}}\n",
+            ),
+        )
+        .expect("write transcript");
+        let audit_key = b"0123456789abcdef0123456789abcdef";
+        let audit_key_path = home.join("audit.key");
+        fs::write(&audit_key_path, audit_key).expect("write audit key");
+        let attribution_key_path = attribution_key_file(&home);
+        let encoded_attribution_key =
+            Zeroizing::new(fs::read_to_string(&attribution_key_path).expect("read key"));
+        let attribution_context = SessionAttributionContext::from_activity_hint(
+            SnapshotSource::ClaudeCode,
+            &home,
+            true,
+            Some(encoded_attribution_key.trim()),
+            Some(SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .expect("attribution context");
+        let mut expected_index = ScanIndex::default();
+        let expected_scan = scan_source_roots_with_attribution(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&sessions),
+            &mut expected_index,
+            "2026-05-29T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            Some(&attribution_context),
+        )
+        .expect("production-equivalent scan");
+        let expected_snapshot = expected_scan.snapshots.first().expect("snapshot");
+        assert!(!expected_snapshot.session_artifacts.is_empty());
+        let expected_candidate = keyed_hex(
+            audit_key,
+            &[
+                AUDIT_SCHEMA_VERSION,
+                "semantic",
+                &expected_snapshot.snapshot_fingerprint,
+            ],
+        );
+
+        let report = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::ClaudeCode,
+                roots: vec![sessions],
+                audit_state_dir: home.join("audit-state"),
+                audit_key_path,
+                session_attribution_hmac_key_path: attribution_key_path,
+                attribution_home: Some(home.clone()),
+                machine_id: "fixture-machine".to_string(),
+                collected_at: "2026-05-29T00:05:00Z".to_string(),
+                backfill_window_days: BACKFILL_WINDOW_DAYS,
+                private_upload_payload_out: None,
+            },
+            &mut Vec::new(),
+        )
+        .expect("audit");
+        assert!(report.sessions[0]
+            .legacy_policy_candidate_semantic_keys
+            .contains(&expected_candidate));
         let _ = fs::remove_dir_all(home);
     }
 
@@ -754,13 +920,7 @@ mod tests {
 
         assert_eq!(original_neutral, stripped_neutral);
         assert_ne!(original_sensitive, stripped_sensitive);
-        let original_revision = snapshot_revision_key(
-            key,
-            SnapshotSource::Pi,
-            SnapshotSource::Pi.parser_version(),
-            SnapshotSource::Pi.scan_identity_version(),
-            &original,
-        );
+        let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
         let golden: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/v2-golden-keys.json"
         ))
@@ -771,47 +931,19 @@ mod tests {
                 .as_str()
                 .expect("golden revision key")
         );
-        let stripped_revision = snapshot_revision_key(
-            key,
-            SnapshotSource::Pi,
-            SnapshotSource::Pi.parser_version(),
-            SnapshotSource::Pi.scan_identity_version(),
-            &stripped,
-        );
+        let stripped_revision = snapshot_revision_key(key, SnapshotSource::Pi, &stripped);
         assert_eq!(original_revision, stripped_revision);
         let mut later_observation = stripped.clone();
         later_observation.collected_at = "2026-07-22T09:00:00Z".to_string();
         assert_eq!(
-            snapshot_revision_key(
-                key,
-                SnapshotSource::Pi,
-                SnapshotSource::Pi.parser_version(),
-                SnapshotSource::Pi.scan_identity_version(),
-                &later_observation,
-            ),
-            stripped_revision
-        );
-        assert_ne!(
-            snapshot_revision_key(
-                key,
-                SnapshotSource::Pi,
-                "pi_jsonl:future",
-                SnapshotSource::Pi.scan_identity_version(),
-                &stripped,
-            ),
+            snapshot_revision_key(key, SnapshotSource::Pi, &later_observation,),
             stripped_revision
         );
 
         let mut later_revision = stripped;
         later_revision.source_file_fingerprint = Some("changed-input-revision".to_string());
         assert_ne!(
-            snapshot_revision_key(
-                key,
-                SnapshotSource::Pi,
-                SnapshotSource::Pi.parser_version(),
-                SnapshotSource::Pi.scan_identity_version(),
-                &later_revision,
-            ),
+            snapshot_revision_key(key, SnapshotSource::Pi, &later_revision,),
             stripped_revision
         );
         let mut changed_state_only_bucket = original;
@@ -822,13 +954,7 @@ mod tests {
         changed_state_only_bucket.usage_buckets[0].last_activity_at =
             Some("2026-07-22T09:00:00Z".to_string());
         assert_ne!(
-            snapshot_revision_key(
-                key,
-                SnapshotSource::Pi,
-                SnapshotSource::Pi.parser_version(),
-                SnapshotSource::Pi.scan_identity_version(),
-                &changed_state_only_bucket,
-            ),
+            snapshot_revision_key(key, SnapshotSource::Pi, &changed_state_only_bucket,),
             original_revision
         );
         let _ = fs::remove_dir_all(root);
@@ -875,6 +1001,8 @@ mod tests {
                 roots: vec![sessions],
                 audit_state_dir: audit_state_dir.clone(),
                 audit_key_path: key_path,
+                session_attribution_hmac_key_path: attribution_key_file(&root),
+                attribution_home: Some(root.clone()),
                 machine_id: "fixture-machine".to_string(),
                 collected_at: "2026-07-22T08:02:00Z".to_string(),
                 backfill_window_days: BACKFILL_WINDOW_DAYS,

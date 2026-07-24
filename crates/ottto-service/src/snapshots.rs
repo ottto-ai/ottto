@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
@@ -120,6 +121,8 @@ pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v19";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
+pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
+pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -231,13 +234,63 @@ impl SnapshotSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SnapshotBatchRequest {
     pub schema_version: u16,
     pub source: String,
     pub machine_id: String,
     pub collector_version: Option<String>,
     pub snapshots: Vec<SnapshotItem>,
+    pub upload_policy: SnapshotUploadPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotSemanticEnvelope {
+    pub component_contract_version: &'static str,
+    pub revision_contract_version: &'static str,
+    pub upload_policy: SnapshotUploadPolicy,
+    pub component_hashes: BTreeMap<&'static str, String>,
+    pub revision_hash: String,
+}
+
+#[derive(Serialize)]
+struct SnapshotItemWire<'a> {
+    #[serde(flatten)]
+    snapshot: &'a SnapshotItem,
+    semantic_envelope: SnapshotSemanticEnvelope,
+}
+
+impl Serialize for SnapshotBatchRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let source = snapshot_source_from_api_slug(&self.source)
+            .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
+        let snapshots = self
+            .snapshots
+            .iter()
+            .map(|snapshot| {
+                let semantic_envelope =
+                    snapshot_semantic_envelope(source, snapshot, self.upload_policy);
+                let encoded =
+                    serde_json::to_vec(&semantic_envelope).map_err(serde::ser::Error::custom)?;
+                if encoded.len() > MAX_SEMANTIC_ENVELOPE_BYTES {
+                    return Err(serde::ser::Error::custom(format!(
+                        "semantic_envelope exceeds {MAX_SEMANTIC_ENVELOPE_BYTES} bytes"
+                    )));
+                }
+                Ok(SnapshotItemWire {
+                    snapshot,
+                    semantic_envelope,
+                })
+            })
+            .collect::<Result<Vec<_>, S::Error>>()?;
+        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 5)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("machine_id", &self.machine_id)?;
+        state.serialize_field("collector_version", &self.collector_version)?;
+        state.serialize_field("snapshots", &snapshots)?;
+        state.end()
+    }
 }
 
 // Hoisted onto each SnapshotModelUsage row in v6: these participate in the
@@ -544,7 +597,7 @@ pub struct SourceScanResult {
     pub snapshots: Vec<SnapshotItem>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct SnapshotUploadPolicy {
     pub session_titles_enabled: bool,
     pub workspace_labels_enabled: bool,
@@ -554,6 +607,15 @@ pub struct SnapshotUploadPolicy {
     /// choice. It is not a separate user setting and defaults off for older
     /// backends that do not advertise the additive private-label contract.
     pub session_attribution_labels_enabled: bool,
+}
+
+pub(crate) fn snapshot_source_from_api_slug(value: &str) -> Option<SnapshotSource> {
+    match value {
+        "codex" => Some(SnapshotSource::Codex),
+        "claude_code" => Some(SnapshotSource::ClaudeCode),
+        "pi" => Some(SnapshotSource::Pi),
+        _ => None,
+    }
 }
 
 impl Default for SnapshotUploadPolicy {
@@ -987,16 +1049,91 @@ pub(crate) fn snapshot_semantic_component_hashes(
     components
 }
 
-fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
-    let component_hashes = snapshot_semantic_component_hashes(source, item);
+pub(crate) fn snapshot_fingerprint_from_component_hashes(
+    source: SnapshotSource,
+    source_session_id: &str,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> String {
     let component_payload = serde_json::to_string(&component_hashes)
         .expect("snapshot semantic component hashes serialize");
     sha256_hex(&[
         SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
         source.api_slug(),
-        &item.source_session_id,
+        source_session_id,
         &component_payload,
     ])
+}
+
+fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
+    snapshot_fingerprint_from_component_hashes(
+        source,
+        &item.source_session_id,
+        &snapshot_semantic_component_hashes(source, item),
+    )
+}
+
+fn snapshot_revision_material(
+    item: &SnapshotItem,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> Value {
+    let policy_neutral_component_hashes = [
+        "usage_accounting",
+        "lifecycle_activity",
+        "latency",
+        "context_posture",
+    ]
+    .iter()
+    .filter_map(|name| {
+        component_hashes
+            .get(name)
+            .map(|value| ((*name).to_string(), value.clone()))
+    })
+    .collect::<BTreeMap<_, _>>();
+    json!({
+        "source_file_fingerprint": &item.source_file_fingerprint,
+        "source_started_at": &item.source_started_at,
+        "source_ended_at": &item.source_ended_at,
+        "source_last_activity_at": &item.source_last_activity_at,
+        "status": &item.status,
+        "provenance": {
+            "collector": &item.provenance.collector,
+            "source_file_count": item.provenance.source_file_count,
+            "input_token_scope": &item.provenance.input_token_scope,
+            "state_total_tokens": item.provenance.state_total_tokens,
+            "state_archived": item.provenance.state_archived,
+        },
+        "policy_neutral_component_hashes": policy_neutral_component_hashes,
+    })
+}
+
+pub(crate) fn snapshot_revision_hash(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> String {
+    let material = snapshot_revision_material(item, component_hashes).to_string();
+    sha256_hex(&[
+        SNAPSHOT_REVISION_CONTRACT_VERSION,
+        source.api_slug(),
+        source.parser_version(),
+        source.scan_identity_version(),
+        &material,
+    ])
+}
+
+pub(crate) fn snapshot_semantic_envelope(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    upload_policy: SnapshotUploadPolicy,
+) -> SnapshotSemanticEnvelope {
+    let component_hashes = snapshot_semantic_component_hashes(source, item);
+    SnapshotSemanticEnvelope {
+        component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+        revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
+        upload_policy,
+        revision_hash: snapshot_revision_hash(source, item, &component_hashes),
+        component_hashes,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1183,8 +1320,30 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
     if request.snapshots.is_empty() {
         return Err("snapshots must not be empty".to_string());
     }
+    let source = snapshot_source_from_api_slug(&request.source)
+        .ok_or_else(|| "unsupported snapshot source".to_string())?;
     for (index, item) in request.snapshots.iter().enumerate() {
         validate_snapshot_item(index, item)?;
+        let component_hashes = snapshot_semantic_component_hashes(source, item);
+        let expected_fingerprint = snapshot_fingerprint_from_component_hashes(
+            source,
+            &item.source_session_id,
+            &component_hashes,
+        );
+        if item.snapshot_fingerprint != expected_fingerprint {
+            return Err(format!(
+                "snapshot[{index}] fingerprint does not match semantic components"
+            ));
+        }
+        let envelope = snapshot_semantic_envelope(source, item, request.upload_policy);
+        let envelope_size = serde_json::to_vec(&envelope)
+            .map_err(|error| format!("snapshot[{index}] semantic_envelope: {error}"))?
+            .len();
+        if envelope_size > MAX_SEMANTIC_ENVELOPE_BYTES {
+            return Err(format!(
+                "snapshot[{index}] semantic_envelope is {envelope_size} bytes; maximum is {MAX_SEMANTIC_ENVELOPE_BYTES}"
+            ));
+        }
     }
     Ok(())
 }
@@ -11521,6 +11680,7 @@ mod tests {
         const ALLOWED_ITEM_FIELDS: &[&str] = &[
             "source_session_id",
             "snapshot_fingerprint",
+            "semantic_envelope",
             "status",
             "input_tokens",
             "output_tokens",
@@ -11663,7 +11823,7 @@ mod tests {
             cache_read_cost_usd: None,
             cache_creation_cost_usd: None,
         };
-        let item = SnapshotItem {
+        let mut item = SnapshotItem {
             source_session_id: "claude-vertex-session-1".to_string(),
             snapshot_fingerprint: "a".repeat(32),
             status: "final".to_string(),
@@ -11718,12 +11878,14 @@ mod tests {
             originator: None,
             attribution_facts: Vec::new(),
         };
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: SnapshotSource::ClaudeCode.api_slug().to_string(),
             machine_id: "machine-contract-0001".to_string(),
             collector_version: Some("local-enriched/1".to_string()),
             snapshots: vec![item],
+            upload_policy: SnapshotUploadPolicy::default(),
         };
         validate_snapshot_batch_request(&request).expect("canonical v6 batch passes preflight");
         let value = serde_json::to_value(&request).expect("serialize v6 batch");
@@ -11960,6 +12122,89 @@ mod tests {
                 originator: None,
                 attribution_facts: Vec::new(),
             }],
+            upload_policy: SnapshotUploadPolicy::default(),
         }
+    }
+
+    #[test]
+    fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
+        let mut base = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        base.source_session_id = "session-שלום-東京-null".to_string();
+        base.session_display_name = Some("כותרת 東京".to_string());
+        base.session_display_name_source = Some("fixture".to_string());
+        base.workspace_display_label = Some("workspace-é".to_string());
+        base.workspace_label_source = Some("fixture".to_string());
+        base.repository_label = Some("repo-東京".to_string());
+        base.repository_label_source = Some("fixture".to_string());
+        base.session_artifacts = vec![SessionArtifact {
+            kind: "pull_request".to_string(),
+            value: "https://github.com/example/repo/pull/7".to_string(),
+        }];
+        base.origin = Some(SnapshotOrigin {
+            thread_source: Some("subagent".to_string()),
+            originator: Some("codex_work_desktop".to_string()),
+            ..SnapshotOrigin::default()
+        });
+
+        let mut cases = Vec::new();
+        for source in [
+            SnapshotSource::Pi,
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+        ] {
+            for policy in crate::snapshot_audit::valid_upload_policies() {
+                let mut item = base.clone();
+                apply_upload_policy(source, std::slice::from_mut(&mut item), policy);
+                let component_hashes = snapshot_semantic_component_hashes(source, &item);
+                item.snapshot_fingerprint = snapshot_fingerprint_from_component_hashes(
+                    source,
+                    &item.source_session_id,
+                    &component_hashes,
+                );
+                let envelope = snapshot_semantic_envelope(source, &item, policy);
+                cases.push(json!({
+                    "source": source.api_slug(),
+                    "source_session_id": item.source_session_id,
+                    "upload_policy": policy,
+                    "component_hashes": envelope.component_hashes,
+                    "snapshot_fingerprint": item.snapshot_fingerprint,
+                    "revision_hash": envelope.revision_hash,
+                    "envelope_bytes": serde_json::to_vec(&envelope).expect("serialize envelope").len(),
+                }));
+            }
+        }
+        let actual = json!({
+            "schema_version": "semantic_envelope_golden:v1",
+            "component_contract_version": SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+            "revision_contract_version": SNAPSHOT_REVISION_CONTRACT_VERSION,
+            "cases": cases,
+        });
+        if std::env::var_os("UPDATE_SEMANTIC_ENVELOPE_GOLDEN").is_some() {
+            fs::write(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/snapshot-audit/semantic-envelope-golden.json"),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&actual).expect("serialize golden")
+                ),
+            )
+            .expect("write semantic envelope golden");
+        }
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/semantic-envelope-golden.json"
+        ))
+        .expect("parse semantic envelope golden");
+        assert_eq!(actual, expected);
+        assert_eq!(actual["cases"].as_array().expect("cases").len(), 60);
+        assert!(actual["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .all(|case| case["envelope_bytes"].as_u64().expect("size")
+                <= MAX_SEMANTIC_ENVELOPE_BYTES as u64));
     }
 }

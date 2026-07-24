@@ -71,6 +71,13 @@ enum Command {
         /// File containing at least 32 bytes used to blind audit identifiers.
         #[arg(long)]
         audit_key_file: PathBuf,
+        /// Private file containing the exact URL-safe no-pad attribution HMAC key
+        /// from the activity hint. Required to reconstruct every legacy policy.
+        #[arg(long)]
+        session_attribution_hmac_key_file: PathBuf,
+        /// Home used to resolve local scheduler attribution inputs.
+        #[arg(long)]
+        attribution_home: Option<PathBuf>,
         /// Machine id used by the normal upload contract; never printed raw.
         #[arg(long)]
         machine_id: String,
@@ -154,6 +161,8 @@ fn main() -> Result<()> {
             roots,
             audit_state_dir,
             audit_key_file,
+            session_attribution_hmac_key_file,
+            attribution_home,
             machine_id,
             collected_at,
             backfill_window_days,
@@ -168,6 +177,8 @@ fn main() -> Result<()> {
                     roots,
                     audit_state_dir,
                     audit_key_path: audit_key_file,
+                    session_attribution_hmac_key_path: session_attribution_hmac_key_file,
+                    attribution_home,
                     machine_id,
                     collected_at: collected_at
                         .unwrap_or_else(ottto_service::current_rfc3339_timestamp),
