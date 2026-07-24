@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 259,
-  "content_sha256": "910f393a46d2783983866e864b391301b79e2eb06fe34c176fa5263b1a5ab417",
+  "content_sha256": "a72595577d37164e8e328bbafaa63a5a842d31cc9da41ed9b87e28555f5c7381",
   "files": [
     {
       "executable": false,
@@ -27,8 +27,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/macos-stable-release.yml",
-      "sha256": "1b49adfca3b286181fa04c3f766f035e1c48e91e3443ac1a0740f688ad15426f",
-      "size_bytes": 18024
+      "sha256": "fe9872af624fe1f8e1ba8f2f1fa43b51d171b34acd8493adeef9271bd9b407df",
+      "size_bytes": 19098
     },
     {
       "executable": false,
@@ -1816,7 +1816,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-24T09:16:26+00:00",
+  "generated_at": "2026-07-24T09:35:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 260,
   "public_roots": [
@@ -1852,5 +1852,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ca8af0871f17bfc45b36204f1d1035f12273f67d"
+  "source_commit": "843bf06a660f8d7c825a78a0f02795312c2171cd"
 }
