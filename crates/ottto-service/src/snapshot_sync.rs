@@ -1027,6 +1027,7 @@ fn sync_source(
                 machine_id: machine_id.to_string(),
                 collector_version: Some(collector_version()),
                 snapshots,
+                upload_policy,
             };
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
