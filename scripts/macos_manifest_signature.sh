@@ -18,7 +18,7 @@ and is signed by the expected Developer ID identity.
 Options:
   --signature <path>  Signature path. Default: <manifest>.sig
   --identity <name>   Expected Developer ID Application identity for signing and verification.
-  --keychain <path>   Optional keychain passed to security cms.
+  --keychain <path>   Optional keychain used by security cms/find-certificate.
   -h, --help          Show help.
 USAGE
 }
@@ -89,7 +89,9 @@ security_common_args=(cms)
 security_find_args=(find-certificate)
 if [[ -n "$KEYCHAIN" ]]; then
   security_common_args+=(-k "$KEYCHAIN")
-  security_find_args+=(-k "$KEYCHAIN")
+  # `security cms` accepts `-k <keychain>`, while `security
+  # find-certificate` accepts keychains only as positional arguments.
+  security_find_args+=("$KEYCHAIN")
 fi
 
 validate_developer_id_identity() {
