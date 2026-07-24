@@ -119,7 +119,7 @@ pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v22";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v19";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
-const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
+pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -899,7 +899,7 @@ fn semantic_usage_buckets(item: &SnapshotItem) -> Vec<Value> {
         .collect()
 }
 
-fn snapshot_semantic_component_hashes(
+pub(crate) fn snapshot_semantic_component_hashes(
     source: SnapshotSource,
     item: &SnapshotItem,
 ) -> BTreeMap<&'static str, String> {

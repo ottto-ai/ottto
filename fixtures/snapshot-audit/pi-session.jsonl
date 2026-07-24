@@ -1,0 +1,2 @@
+{"type":"session","session_id":"fixture-session-019e2700-1111-7000-9000-111111111111","cwd":"/private/work","timestamp":"2026-07-22T08:00:00Z"}
+{"type":"message_end","message":{"provider":"openai","model":"gpt-5.4","api":"responses","timestamp":1784707201000,"usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0}}}
