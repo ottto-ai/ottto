@@ -8066,8 +8066,7 @@ fn scan_source(source: &SourceKind) -> SetupScanSource {
             let telemetry_installed = config_body
                 .as_deref()
                 .is_some_and(telemetry_config_installed);
-            let managed_config =
-                managed_config_preview("~/.codex/config.toml", config_body.as_deref());
+            let managed_config = codex_managed_config_preview(config_body.as_deref());
             let mut scan_entry = setup_scan_source(
                 source,
                 "codex",
@@ -8267,6 +8266,57 @@ fn claude_managed_config_preview(body: Option<&str>) -> Option<serde_json::Value
     }
     Some(json!({
         "path": "~/.claude/settings.json",
+        "exists": true,
+        "captured_at": current_rfc3339(),
+        "lines": lines,
+    }))
+}
+
+/// Redacted preview of the Ottto-managed region in `~/.codex/config.toml`.
+/// Handles both on-disk shapes: the legacy `# ottto:start/end` fenced block,
+/// and the current unfenced managed `otel` table (dotted `otel.*` keys or
+/// `[otel]`/`[otel.*]` sections) that `patch_existing_codex_otel_table`
+/// maintains. Returns `None` when the file is missing or holds no managed
+/// region.
+fn codex_managed_config_preview(body: Option<&str>) -> Option<serde_json::Value> {
+    let body = body?;
+    if let Some(preview) = managed_config_preview("~/.codex/config.toml", Some(body)) {
+        return Some(preview);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut inside_otel_section = false;
+    for line in body.lines() {
+        if lines.len() >= MANAGED_CONFIG_PREVIEW_MAX_LINES {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            let name = trimmed
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+                .trim_matches('"');
+            inside_otel_section = name == "otel" || name.starts_with("otel.");
+            if !inside_otel_section {
+                continue;
+            }
+        } else if !inside_otel_section && !trimmed.starts_with("otel.") {
+            continue;
+        }
+        if trimmed.is_empty() {
+            continue;
+        }
+        let capped: String = line
+            .chars()
+            .take(MANAGED_CONFIG_PREVIEW_MAX_LINE_LENGTH)
+            .collect();
+        lines.push(redact_managed_config_line(&capped));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "path": "~/.codex/config.toml",
         "exists": true,
         "captured_at": current_rfc3339(),
         "lines": lines,
@@ -10391,6 +10441,62 @@ mod tests {
         assert!(!joined.contains("top_level"));
         assert!(!joined.contains("trailing"));
         assert!(joined.contains("…redacted…"));
+    }
+
+    #[test]
+    fn codex_managed_config_preview_extracts_unfenced_otel_table() {
+        // The 0.1.9x upgrades rewrote configs without the legacy fence; the
+        // managed region is the bare otel table. Mirrors a real on-disk file.
+        let body = concat!(
+            "model = \"gpt-5.2\"\n",
+            "otel.environment = \"prod\"\n",
+            "otel.log_user_prompt = false\n",
+            "otel.exporter.\"otlp-http\" = { endpoint = \"http://127.0.0.1:44621/v1/logs\" }\n",
+            "\n",
+            "[profiles.fast]\n",
+            "model_reasoning_effort = \"low\"\n",
+        );
+        let preview = super::codex_managed_config_preview(Some(body))
+            .expect("unfenced otel table yields a preview");
+        assert_eq!(preview["path"], "~/.codex/config.toml");
+        let lines: Vec<String> = preview["lines"]
+            .as_array()
+            .expect("lines array")
+            .iter()
+            .map(|line| line.as_str().expect("line string").to_string())
+            .collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("otel.environment = \"prod\""));
+        assert!(joined.contains("http://127.0.0.1:44621/v1/logs"));
+        // Only the managed region is reported — user config never leaks.
+        assert!(!joined.contains("model = \"gpt-5.2\""));
+        assert!(!joined.contains("profiles.fast"));
+    }
+
+    #[test]
+    fn codex_managed_config_preview_extracts_otel_section_and_fence() {
+        let sectioned = "[otel]\nenvironment = \"prod\"\n\n[other]\nkey = 1\n";
+        let preview = super::codex_managed_config_preview(Some(sectioned))
+            .expect("otel section yields a preview");
+        let joined = preview["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .map(|line| line.as_str().expect("str"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("[otel]"));
+        assert!(joined.contains("environment = \"prod\""));
+        assert!(!joined.contains("[other]"));
+
+        // Legacy fenced files still delegate to the fence extractor.
+        let fenced = "# ottto:start\n[otel]\nenvironment = \"prod\"\n# ottto:end\n";
+        let preview = super::codex_managed_config_preview(Some(fenced))
+            .expect("fenced body yields a preview");
+        assert_eq!(preview["lines"][0], "# ottto:start");
+
+        assert!(super::codex_managed_config_preview(None).is_none());
+        assert!(super::codex_managed_config_preview(Some("plain = true\n")).is_none());
     }
 
     #[test]
