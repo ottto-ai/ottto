@@ -728,15 +728,7 @@ pub fn direct_provider_facts(
                 _ => {}
             }
 
-            let provider_surface = if origin.originator.as_deref() == Some("Codex Desktop") {
-                Some("codex_desktop")
-            } else {
-                match origin.source.as_deref() {
-                    Some("cli") => Some("codex_cli"),
-                    Some("exec") => Some("codex_exec"),
-                    _ => None,
-                }
-            };
+            let provider_surface = provider_surface(SnapshotSource::Codex, Some(&origin));
             if let Some(value) = provider_surface {
                 push_fact(
                     &mut facts,
@@ -769,12 +761,7 @@ pub fn direct_provider_facts(
                     &evidence_context,
                 );
             }
-            let provider_surface = match origin.entrypoint.as_deref() {
-                Some("claude-desktop") => Some("claude_desktop"),
-                Some("cli") => Some("claude_cli"),
-                Some("sdk-cli") => Some("claude_sdk"),
-                _ => None,
-            };
+            let provider_surface = provider_surface(SnapshotSource::ClaudeCode, Some(&origin));
             if let Some(value) = provider_surface {
                 push_fact(
                     &mut facts,
@@ -836,6 +823,58 @@ pub fn direct_provider_facts(
 
     enforce_fact_limits(&mut facts);
     facts
+}
+
+pub(crate) fn provider_surface(
+    source: SnapshotSource,
+    origin: Option<&SnapshotOrigin>,
+) -> Option<&'static str> {
+    match source {
+        SnapshotSource::Codex => origin.and_then(codex_provider_surface),
+        SnapshotSource::ClaudeCode => match origin.and_then(|value| value.entrypoint.as_deref()) {
+            Some("claude-desktop") => Some("claude_desktop"),
+            Some("cli") => Some("claude_cli"),
+            Some("sdk-cli") => Some("claude_sdk"),
+            _ => None,
+        },
+        SnapshotSource::Pi => Some("pi_cli"),
+    }
+}
+
+fn codex_provider_surface(origin: &SnapshotOrigin) -> Option<&'static str> {
+    let originator = origin.originator.as_deref().map(str::trim);
+    if originator.is_some_and(|value| {
+        value.eq_ignore_ascii_case("Codex Desktop")
+            || value.eq_ignore_ascii_case("codex_work_desktop")
+            || value.eq_ignore_ascii_case("codex_desktop")
+    }) {
+        return Some("codex_desktop");
+    }
+    if originator.is_some_and(|value| {
+        value.eq_ignore_ascii_case("codex_cli_rs")
+            || value.eq_ignore_ascii_case("codex-tui")
+            || value.eq_ignore_ascii_case("codex_tui")
+    }) {
+        return Some("codex_cli");
+    }
+    if originator.is_some_and(|value| value.eq_ignore_ascii_case("codex_exec")) {
+        return Some("codex_exec");
+    }
+    match origin.source.as_deref().map(str::trim) {
+        Some(value)
+            if value.eq_ignore_ascii_case("cli")
+                || value.eq_ignore_ascii_case("codex_cli")
+                || value.eq_ignore_ascii_case("codex_cli_rs") =>
+        {
+            Some("codex_cli")
+        }
+        Some(value)
+            if value.eq_ignore_ascii_case("exec") || value.eq_ignore_ascii_case("codex_exec") =>
+        {
+            Some("codex_exec")
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn enforce_fact_limits(facts: &mut Vec<SessionAttributionFact>) {
@@ -1031,6 +1070,32 @@ mod tests {
         );
         assert!(!facts.iter().any(|fact| fact.field == "provider_surface"));
         assert!(!facts.iter().any(|fact| fact.field == "origin_kind"));
+    }
+
+    #[test]
+    fn codex_provider_surface_recognizes_current_desktop_cli_and_exec_markers() {
+        let cases = [
+            ("codex_work_desktop", None, "codex_desktop"),
+            ("codex_cli_rs", Some("vscode"), "codex_cli"),
+            ("codex_exec", None, "codex_exec"),
+        ];
+        for (originator, source, expected) in cases {
+            let mut origin = origin();
+            origin.originator = Some(originator.to_string());
+            origin.source = source.map(str::to_string);
+            let facts = direct_provider_facts(
+                SnapshotSource::Codex,
+                Some(&origin),
+                "surface-session",
+                "2026-07-19T00:00:00Z",
+                "codex_jsonl:v21",
+            );
+            assert!(facts.iter().any(|fact| {
+                fact.field == "provider_surface"
+                    && fact.value == expected
+                    && fact.evidence.strength == "direct"
+            }));
+        }
     }
 
     #[test]

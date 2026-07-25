@@ -725,6 +725,10 @@ pub struct ActiveSession {
     /// `subagent` or `automation`, when no provider title exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>,
+    /// Canonical provider client that ran the session, when direct transcript
+    /// evidence proves it (for example `codex_desktop` or `codex_cli`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_surface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4347,6 +4351,7 @@ mod tests {
                 unattributed_total_tokens: None,
                 input_token_scope: Some("inclusive_cached".to_string()),
                 session_kind: Some("subagent".to_string()),
+                provider_surface: Some("codex_desktop".to_string()),
                 account_identifier_hash: Some("account-hash".to_string()),
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
@@ -4364,6 +4369,7 @@ mod tests {
         );
         assert_eq!(value["sessions"][0]["input_tokens"], 1_000);
         assert_eq!(value["sessions"][0]["session_kind"], "subagent");
+        assert_eq!(value["sessions"][0]["provider_surface"], "codex_desktop");
         assert_eq!(
             value["sessions"][0]["compaction_timestamps"][1],
             "2026-07-19T17:50:00Z"
