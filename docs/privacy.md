@@ -38,6 +38,20 @@ Local usage snapshots use derived and redacted fields such as session ids,
 timestamps, usage totals, model usage, hashed workspace identity, and
 display-safe account or plan evidence.
 
+Agent status collection also reports display-safe runtime defaults read from an
+agent's own configuration files: Codex `config.toml`, and Claude Code's
+`settings.json`, `settings.local.json`, and macOS managed-policy settings. Only
+specifically named cost-relevant keys are read — model, service tier or fast
+mode, approval or permission mode, reasoning effort where the agent persists
+one, and sandbox mode — together with a label naming which file supplied each
+value. Environment blocks, credential helpers, status-line commands, permission
+allow/ask/deny rules, and sandbox filesystem or credential rules are never read.
+Values must be short scalars; anything long, quoted, path-like, or URL-like is
+dropped rather than uploaded, and Claude Code's `bypassPermissions` mode is
+treated as a local safety posture and never reported. Configuration that sets
+none of these keys uploads no defaults at all rather than an empty record, so
+"not configured" stays distinguishable from "not readable".
+
 When a scan needs multiple uploads, `ottto-service` stores a temporary local
 resume checkpoint containing only the semantic hashes of snapshots the backend
 already accepted and a one-way hash that binds the checkpoint to its relay
