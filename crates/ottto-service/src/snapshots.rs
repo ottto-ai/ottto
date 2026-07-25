@@ -5449,12 +5449,14 @@ const MAX_CLAUDE_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
 /// provenance of the file that won, so the UI can name the file each value came
 /// from instead of implying one global config.
 ///
-/// `reasoning_effort` is deliberately absent. Claude Code chooses reasoning
-/// effort per session, so there is no durable machine default to report; see
-/// `claude_runtime_defaults_never_report_reasoning_effort`.
+/// `reasoning_effort` comes from Claude Code's durable `effortLevel` setting,
+/// which `/effort` writes into the settings file. The value is reported exactly
+/// as configured; nothing is normalized and no default is invented when the key
+/// is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeConfigDefaults {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub approval_policy: Option<String>,
     pub fast_mode_enabled: Option<bool>,
     pub sandbox_mode: Option<String>,
@@ -5492,6 +5494,7 @@ pub(crate) struct ClaudeSettingsScope<'a> {
 #[derive(Debug, Clone, Default)]
 struct ClaudeSettingsRaw {
     model: Option<(String, String)>,
+    effort_level: Option<(String, String)>,
     permission_mode: Option<(String, String)>,
     fast_mode: Option<(bool, String)>,
     fast_mode_per_session_opt_in: Option<(bool, String)>,
@@ -5503,12 +5506,14 @@ struct ClaudeSettingsRaw {
 ///
 /// `scopes` must be ordered lowest precedence first; each readable file
 /// overwrites the keys it sets, so the highest-precedence file wins per key.
-/// Only four specifically-named keys are ever read (`model`,
+/// Only specifically-named keys are ever read: `model`, `effortLevel`,
 /// `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
-/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`). `env`,
+/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`. `env`,
 /// `permissions.allow`/`ask`/`deny`, `apiKeyHelper`, `statusLine`,
 /// `sandbox.credentials`, and `sandbox.filesystem` are never read, so no path,
-/// environment value, token, or permission rule can ride along.
+/// environment value, token, or permission rule can ride along. Environment
+/// variables are never consulted either, so `CLAUDE_CODE_EFFORT_LEVEL` cannot
+/// leak in through this path.
 pub(crate) fn load_claude_settings_defaults(
     scopes: &[ClaudeSettingsScope<'_>],
 ) -> ClaudeConfigDefaultsOutcome {
@@ -5536,6 +5541,15 @@ pub(crate) fn load_claude_settings_defaults(
     if let Some((model, source)) = raw.model.clone() {
         insert(&mut defaults, "model", model.clone(), &source);
         defaults.model = Some(model);
+    }
+    // Reported exactly as configured. `low`/`medium`/`high`/`xhigh` persist
+    // across sessions; `max` is session-only unless the environment sets it, but
+    // if the settings file says `max` then that is what the file says, and the
+    // Configuration tab's contract is to show the config file. Normalizing or
+    // dropping a value here would misreport the customer's own config.
+    if let Some((effort, source)) = raw.effort_level.clone() {
+        insert(&mut defaults, "reasoning_effort", effort.clone(), &source);
+        defaults.reasoning_effort = Some(effort);
     }
     if let Some((mode, source)) = raw.permission_mode.clone() {
         insert(&mut defaults, "approval_policy", mode.clone(), &source);
@@ -5608,6 +5622,13 @@ fn apply_claude_settings_scope(raw: &mut ClaudeSettingsRaw, label: &str, documen
         .and_then(display_safe_config_scalar)
     {
         raw.model = Some((model, format!("{label}.model")));
+    }
+    if let Some(effort) = document
+        .get("effortLevel")
+        .and_then(Value::as_str)
+        .and_then(display_safe_config_scalar)
+    {
+        raw.effort_level = Some((effort, format!("{label}.effortLevel")));
     }
     if let Some(mode) = document
         .get("permissions")
@@ -9611,6 +9632,7 @@ mod tests {
             concat!(
                 "{\n",
                 "  \"model\": \"claude-opus-4-7\",\n",
+                "  \"effortLevel\": \"high\",\n",
                 "  \"fastMode\": true,\n",
                 "  \"permissions\": {\"defaultMode\": \"acceptEdits\"},\n",
                 "  \"sandbox\": {\"enabled\": true}\n",
@@ -9624,6 +9646,14 @@ mod tests {
             panic!("expected configured Claude defaults");
         };
         assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings.effortLevel")
+        );
         assert_eq!(defaults.approval_policy.as_deref(), Some("acceptEdits"));
         assert_eq!(defaults.fast_mode_enabled, Some(true));
         // `sandbox.enabled` with no `autoAllowBashIfSandboxed` override is
@@ -9658,18 +9688,18 @@ mod tests {
         fs::create_dir_all(&claude_dir).expect("create .claude");
         fs::write(
             claude_dir.join("settings.json"),
-            "{\"model\": \"claude-haiku-4-5\", \"fastMode\": true, \"permissions\": {\"defaultMode\": \"acceptEdits\"}}\n",
+            "{\"model\": \"claude-haiku-4-5\", \"effortLevel\": \"low\", \"fastMode\": true, \"permissions\": {\"defaultMode\": \"acceptEdits\"}}\n",
         )
         .expect("write user settings");
         fs::write(
             claude_dir.join("settings.local.json"),
-            "{\"model\": \"claude-sonnet-4-5\", \"permissions\": {\"defaultMode\": \"plan\"}}\n",
+            "{\"model\": \"claude-sonnet-4-5\", \"effortLevel\": \"medium\", \"permissions\": {\"defaultMode\": \"plan\"}}\n",
         )
         .expect("write local settings");
         let managed = root.join("managed-settings.json");
         fs::write(
             &managed,
-            "{\"model\": \"claude-opus-4-7\", \"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": false}}\n",
+            "{\"model\": \"claude-opus-4-7\", \"effortLevel\": \"xhigh\", \"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": false}}\n",
         )
         .expect("write managed settings");
 
@@ -9677,11 +9707,19 @@ mod tests {
         let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
             panic!("expected configured Claude defaults");
         };
-        // Managed settings win outright for the key they set.
+        // Managed settings win outright for the keys they set.
         assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(
             defaults.selector_sources.get("model").map(String::as_str),
             Some("claude_code.managed_settings.model")
+        );
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.managed_settings.effortLevel")
         );
         // Local settings win over user settings for a key managed does not set.
         assert_eq!(defaults.approval_policy.as_deref(), Some("plan"));
@@ -9705,6 +9743,98 @@ mod tests {
             defaults.sandbox_mode.as_deref(),
             Some("regular_permissions")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_prefer_local_effort_level_over_user() {
+        let root = temp_dir("claude-settings-effort-precedence");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"low\"}\n",
+        )
+        .expect("write user settings");
+        fs::write(
+            claude_dir.join("settings.local.json"),
+            "{\"effortLevel\": \"high\"}\n",
+        )
+        .expect("write local settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings_local.effortLevel")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The Configuration tab's contract is "what your config file says", so an
+    /// effort value is forwarded verbatim rather than normalized against a
+    /// known-value list. `max` is session-only in Claude Code unless the
+    /// environment sets it, but if the settings file says `max` then that is
+    /// what the file says.
+    #[test]
+    fn claude_settings_defaults_report_effort_level_verbatim() {
+        let root = temp_dir("claude-settings-effort-verbatim");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"max\"}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("max"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_reject_unsafe_effort_level_values() {
+        let root = temp_dir("claude-settings-effort-unsafe");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        // A path-shaped effort value fails the display-safe scalar guard, so it
+        // is dropped while a sibling key still resolves.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"/Users/someone/.claude/effort-profile\", \"model\": \"claude-opus-4-7\"}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort, None);
+        assert!(!defaults.selector_context.contains_key("reasoning_effort"));
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+
+        // A non-string effort value is also ignored rather than coerced.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": 4, \"model\": \"claude-opus-4-7\"}\n",
+        )
+        .expect("rewrite settings");
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort, None);
 
         let _ = fs::remove_dir_all(root);
     }

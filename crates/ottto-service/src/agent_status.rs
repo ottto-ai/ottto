@@ -521,11 +521,10 @@ fn claude_runtime_defaults_from_paths(
                     speed_mode: None,
                     fast_mode_enabled: defaults.fast_mode_enabled,
                     priority_enabled: None,
-                    // Intentionally never set for Claude Code: reasoning effort
-                    // is chosen per session, so there is no durable machine
-                    // default to report and inventing one would misstate what
-                    // the customer configured.
-                    reasoning_effort: None,
+                    // Claude Code's durable `effortLevel` setting, which
+                    // `/effort` writes. Reported exactly as configured; absent
+                    // means absent, never an invented default.
+                    reasoning_effort: defaults.reasoning_effort,
                     approval_policy: defaults.approval_policy,
                     sandbox_mode: defaults.sandbox_mode,
                     selector_context: defaults.selector_context,
@@ -543,7 +542,7 @@ fn claude_runtime_defaults_from_paths(
                 defaults: None,
                 capability: unsupported_capability(
                     "runtime_defaults",
-                    "Claude Code settings were read, but none set a display-safe default (model, permission mode, fast mode, or sandbox).",
+                    "Claude Code settings were read, but none set a display-safe default (model, effort level, permission mode, fast mode, or sandbox).",
                 ),
                 diagnostic: Some(AgentStatusDiagnostic::source(
                     "claude_runtime_defaults_not_configured",
@@ -7562,35 +7561,68 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Claude Code picks reasoning effort per session, so there is no durable
-    /// machine default to report. Emitting one would misstate what the customer
-    /// configured, so this field must stay unset for Claude Code no matter what
-    /// the settings files contain.
+    /// Claude Code's `effortLevel` is durable: `/effort` writes it to the
+    /// settings file and it persists across sessions. It maps straight through
+    /// to `reasoning_effort`.
     #[test]
-    fn claude_runtime_defaults_never_report_reasoning_effort() {
+    fn claude_runtime_defaults_report_configured_effort_level() {
         let (root, paths) = claude_settings_fixture(
-            "no-effort",
+            "effort-level",
+            "{\"model\": \"claude-opus-4-7\", \"effortLevel\": \"xhigh\"}\n",
+        );
+
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
+        let defaults = capture.defaults.expect("runtime defaults present");
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings.effortLevel")
+        );
+        // The Codex-shaped tier fields Claude's settings have no equivalent for
+        // stay unset.
+        assert_eq!(defaults.service_tier, None);
+        assert_eq!(defaults.speed_mode, None);
+        assert_eq!(defaults.priority_enabled, None);
+
+        // The emitted effort value must survive the backend-facing guard.
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-07-25T10:00:00Z".to_string(),
+            "2026-07-25T10:05:00Z".to_string(),
+        );
+        snapshot.runtime_defaults = Some(defaults);
+        let survived = snapshot
+            .redacted_for_backend()
+            .runtime_defaults
+            .expect("survives redaction");
+        assert_eq!(survived.reasoning_effort.as_deref(), Some("xhigh"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Absent `effortLevel` must stay absent. Claude Code's own default is not
+    /// ours to invent, and an unset field is what tells the UI "not configured".
+    #[test]
+    fn claude_runtime_defaults_leave_effort_unset_when_not_configured() {
+        let (root, paths) = claude_settings_fixture(
+            "no-effort-level",
             concat!(
                 "{\"model\": \"claude-opus-4-7\",\n",
-                " \"effortLevel\": \"xhigh\",\n",
                 " \"alwaysThinkingEnabled\": true,\n",
-                " \"reasoning_effort\": \"high\",\n",
                 " \"env\": {\"MAX_THINKING_TOKENS\": \"32000\"}}\n"
             ),
         );
 
         let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
         let defaults = capture.defaults.expect("runtime defaults present");
-        assert_eq!(
-            defaults.reasoning_effort, None,
-            "Claude Code has no durable reasoning-effort default"
-        );
+        assert_eq!(defaults.reasoning_effort, None);
         assert!(!defaults.selector_context.contains_key("reasoning_effort"));
         assert!(!defaults.selector_sources.contains_key("reasoning_effort"));
-        // Nor any of the other Codex-shaped tier fields Claude config lacks.
-        assert_eq!(defaults.service_tier, None);
-        assert_eq!(defaults.speed_mode, None);
-        assert_eq!(defaults.priority_enabled, None);
 
         let _ = std::fs::remove_dir_all(root);
     }

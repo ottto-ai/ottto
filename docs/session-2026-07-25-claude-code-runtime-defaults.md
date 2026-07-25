@@ -13,7 +13,8 @@ keys it pins while a lower scope still supplies the rest. Project-scoped
 `.claude/settings*.json` files stay out of scope: the daemon has no single
 project cwd, and a checked-out repository's settings are not a machine default.
 
-Four keys are mapped. `model` becomes `model`. `permissions.defaultMode` becomes
+`model` becomes `model`. `effortLevel` becomes `reasoning_effort`.
+`permissions.defaultMode` becomes
 `approval_policy`, canonicalizing the `manual` alias to `default`.
 `fastMode` becomes `fast_mode_enabled`, with `fastModePerSessionOptIn: true`
 forcing the durable default to off because Fast then never persists across
@@ -25,16 +26,27 @@ stays quiet rather than inferring a mode from the auto-allow flag alone.
 carries the `claude_code.<scope>.<json key path>` provenance of the file that
 won, so the UI can name the file each value came from.
 
-`reasoning_effort` is never reported for Claude Code. Claude Code chooses
-reasoning effort per session, so there is no durable machine default that a
-config read can honestly claim, and inventing one would misstate what the
-customer configured. Claude Code does persist an `effortLevel` key that `/effort`
-writes, but treating it as the machine default is a separate product decision
-and is deliberately not made here; a unit test pins the field to unset. The
-Codex-shaped `service_tier`, `speed_mode`, and `priority_enabled` fields stay
-unset too, because Claude Code's settings carry no equivalent.
+`effortLevel` is durable: `/effort` writes it into the settings file and
+`low`/`medium`/`high`/`xhigh` persist across sessions, so it is a real machine
+default and maps to `reasoning_effort`. The value is forwarded exactly as
+configured rather than normalized against a known-value list, because the
+Configuration surface's contract is to show what the config file says; `max` is
+session-only in Claude Code unless the environment sets it, but a settings file
+that says `max` is still saying `max`. An absent `effortLevel` leaves
+`reasoning_effort` unset — Claude Code's own default is not ours to invent.
+Environment variables are never read, so `CLAUDE_CODE_EFFORT_LEVEL` cannot enter
+through this path.
 
-Redaction is allowlist-shaped rather than filter-shaped: only the four named
+The Codex-shaped `service_tier`, `speed_mode`, and `priority_enabled` fields stay
+unset, because Claude Code's settings carry no equivalent.
+
+`model` and `effortLevel` are in Claude Code's official settings reference.
+`permissions.defaultMode`, `sandbox.enabled`, and
+`sandbox.autoAllowBashIfSandboxed` are documented in the permission-mode and
+sandboxing guides but are not listed in that reference, so they are mapped
+best-effort: when absent, nothing is emitted for the field.
+
+Redaction is allowlist-shaped rather than filter-shaped: only the named
 keys are read, so `env`, `apiKeyHelper`, `statusLine`, `permissions.allow`/`ask`/
 `deny`, `sandbox.filesystem`, and `sandbox.credentials` are never touched and
 cannot ride along. Free-form config text additionally has to survive a scalar
@@ -53,12 +65,16 @@ have not configured anything" from "we could not read it".
 
 Validation:
 
-- fixture settings file mapping model, permission mode, fast mode, and sandbox;
+- fixture settings file mapping model, effort level, permission mode, fast mode,
+  and sandbox;
 - managed-over-local-over-user precedence per key, including a key only the
-  lowest scope sets;
+  lowest scope sets, and local-over-user precedence for `effortLevel`;
 - per-session Fast opt-in resolving to a durable default of off;
-- `reasoning_effort` unset even when `effortLevel`, `alwaysThinkingEnabled`, and
-  a `reasoning_effort` key are all present;
+- `effortLevel` forwarded verbatim, including `max`;
+- unsafe `effortLevel` values (path-shaped, non-string) rejected while a sibling
+  key still resolves;
+- `reasoning_effort` unset when `effortLevel` is absent, even alongside
+  `alwaysThinkingEnabled` and a `MAX_THINKING_TOKENS` env entry;
 - nothing-configured and unreadable outcomes kept apart from each other;
 - redaction case proving paths, secrets, permission rules, and
   `bypassPermissions` never reach `selector_context`/`selector_sources`;
