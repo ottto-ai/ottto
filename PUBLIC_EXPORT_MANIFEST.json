@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 264,
-  "content_sha256": "e344e3cc869da4b0a2246b24528552c5d541193bf450284c42aef453066d0e64",
+  "content_sha256": "f3531aa291520b5ad337d0ff5e4cc5b049bb08e72705c53cd86e4fe084f8ace8",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "3bb46d41a048055646c1e29e6f2654ab171fe0787cb8c0f7dfd4a81d517946dd",
-      "size_bytes": 289897
+      "sha256": "ccec708c1e3a3cb6d697b7b94a1a56dc693da0e0f29a8588d38386860c269dda",
+      "size_bytes": 291163
     },
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "94fff0c23d57618696cc8c58e9557c3c96bd97772a8bc91cb1ce79421b56b305",
-      "size_bytes": 535193
+      "sha256": "a7467a33a37a359155441d272569bc3c7b78e396b3b9917a1c8f93030c5924ec",
+      "size_bytes": 540928
     },
     {
       "executable": false,
@@ -895,7 +895,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "3fe1ddd741f5968bb2eedb5721aceb44e4e43abbdc88c0181ab8ae6b28188013",
+      "sha256": "5269aad5efa1b16e276c7aa3a762007f4ce104f953a31f0140d84b9cf973ffb1",
       "size_bytes": 15179
     },
     {
@@ -1021,8 +1021,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-25-claude-code-runtime-defaults.md",
-      "sha256": "7727e2cf5a54285239c4ffc4cef74776bde251ab84d19cf8a20105f51b776154",
-      "size_bytes": 4341
+      "sha256": "573a3f02f6b7b447880ad97d26c10503c029fe59f48c0963ee8b7cca18e79600",
+      "size_bytes": 5178
     },
     {
       "executable": false,
@@ -1851,7 +1851,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-25T17:39:20+00:00",
+  "generated_at": "2026-07-25T18:04:32+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 265,
   "public_roots": [
@@ -1887,5 +1887,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "551ec565fd2e7017fbf92c876ec99ec9fae2cb63"
+  "source_commit": "078458b441d05e76214df70fc0d6986c148032da"
 }
