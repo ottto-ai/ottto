@@ -82,7 +82,7 @@ pub fn reconcile_active_sessions(
         {
             changed.insert(
                 snapshot.source_session_id.clone(),
-                active_session_from_snapshot(snapshot, agent_status),
+                active_session_from_snapshot(source, snapshot, agent_status),
             );
         }
         if advanced {
@@ -135,6 +135,7 @@ pub fn reconcile_active_sessions(
 }
 
 fn active_session_from_snapshot(
+    source: SnapshotSource,
     snapshot: &SnapshotItem,
     agent_status: Option<&AgentStatusSnapshot>,
 ) -> ActiveSession {
@@ -165,6 +166,7 @@ fn active_session_from_snapshot(
             .then_some(snapshot.unattributed_total_tokens),
         input_token_scope: snapshot.provenance.input_token_scope.clone(),
         session_kind: active_session_kind(snapshot),
+        provider_surface: active_session_provider_surface(source, snapshot),
         account_identifier_hash: attribution
             .as_ref()
             .and_then(|value| value.account_identifier_hash.clone()),
@@ -176,6 +178,34 @@ fn active_session_from_snapshot(
             .and_then(|value| value.subscription_product.clone()),
         account_attribution_source: attribution.map(|value| value.source),
     }
+}
+
+fn active_session_provider_surface(
+    source: SnapshotSource,
+    snapshot: &SnapshotItem,
+) -> Option<String> {
+    snapshot
+        .attribution_facts
+        .iter()
+        .find(|fact| {
+            fact.field == "provider_surface"
+                && fact.evidence.strength == "direct"
+                && matches!(
+                    fact.value.as_str(),
+                    "codex_desktop"
+                        | "codex_cli"
+                        | "codex_exec"
+                        | "claude_desktop"
+                        | "claude_cli"
+                        | "claude_sdk"
+                        | "pi_cli"
+                )
+        })
+        .map(|fact| fact.value.clone())
+        .or_else(|| {
+            crate::session_attribution::provider_surface(source, snapshot.origin.as_ref())
+                .map(str::to_string)
+        })
 }
 
 fn active_session_kind(snapshot: &SnapshotItem) -> Option<String> {
@@ -434,6 +464,7 @@ mod tests {
             confidence: AgentStatusConfidence::High,
         });
         let active = active_session_from_snapshot(
+            SnapshotSource::Codex,
             &test_snapshot("s1", "2026-07-19T10:04:00Z"),
             Some(&status),
         );
@@ -464,10 +495,25 @@ mod tests {
             ..Default::default()
         });
 
-        let active = active_session_from_snapshot(&snapshot, None);
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
 
         assert_eq!(active.session_display_name, None);
         assert_eq!(active.session_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn carries_provider_surface_when_upload_policy_strips_attribution_facts() {
+        let mut snapshot = test_snapshot("desktop", "2026-07-19T10:04:00Z");
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            originator: Some("codex_work_desktop".to_string()),
+            source: Some("vscode".to_string()),
+            ..Default::default()
+        });
+        snapshot.attribution_facts.clear();
+
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
+
+        assert_eq!(active.provider_surface.as_deref(), Some("codex_desktop"));
     }
 
     fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {
