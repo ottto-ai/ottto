@@ -431,6 +431,12 @@ fn start_builtin_relays(daemon: &LocalDaemon) {
         }
         Err(error) => eprintln!("Codex cloud-session collector unavailable: {error}"),
     }
+    match ottto_service::provider_daily_reference::spawn_codex_daily_aggregate_collector() {
+        Ok(ottto_service::provider_daily_reference::CollectorStartup::Started) => {
+            eprintln!("serving Codex daily aggregates collector")
+        }
+        Err(error) => eprintln!("Codex daily aggregates collector unavailable: {error}"),
+    }
     match ottto_service::snapshot_sync::spawn_local_health_projection_sync(daemon.clone()) {
         Ok(()) => eprintln!("serving local health projection sync"),
         Err(error) => eprintln!("local health projection sync unavailable: {error}"),
