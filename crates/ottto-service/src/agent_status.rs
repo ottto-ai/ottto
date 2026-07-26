@@ -101,6 +101,20 @@ struct CodexUsageProbe {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaudeOAuthUsageCache {
     schema_version: u16,
+    /// Which Claude account the cached numbers belong to, as the same
+    /// `billing_identity_hash` this collector uses everywhere else. Empty when
+    /// the local account metadata could not name an account at write time.
+    ///
+    /// This file lives at one machine-global path, but the Claude Code CLI
+    /// credential store holds exactly ONE account: `/login` as a second account
+    /// overwrites the first, and `~/.claude.json` `oauthAccount` switches with
+    /// it. Without this field the cache served whichever account was active at
+    /// write time under whichever account is logged in now -- observed live on
+    /// 2026-07-26, where a personal Max account's weekly window rendered under
+    /// a work Team subscription. Mirrors `ClaudeDesktopWebUsageCache`, which
+    /// keys the Claude Desktop usage cache the same way.
+    #[serde(default)]
+    account_identifier_hash: String,
     observed_at_epoch_seconds: u64,
     next_refresh_after_epoch_seconds: u64,
     windows: Vec<AgentQuotaWindow>,
@@ -135,7 +149,11 @@ struct ClaudeDesktopWebSession {
     organization_identifier_hash: String,
 }
 
-const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 2;
+/// v3 adds `account_identifier_hash`. Version-2 caches carry no account
+/// identity at all, so they are discarded wholesale on upgrade rather than
+/// treated as belonging to the account that happens to be logged in now --
+/// the same precedent v1 set.
+const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 3;
 
 /// Everything the Claude OAuth usage endpoint yields in one fetch.
 #[derive(Debug, Clone, Default)]
@@ -1811,7 +1829,11 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
 
 fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsage, String> {
     let now = current_unix_seconds();
-    if let Some(cache) = read_claude_oauth_usage_cache() {
+    // Resolve the account BEFORE consulting the cache: every read below is
+    // scoped to whoever owns the credential right now, so an account switch
+    // discards the previous account's payload instead of serving it.
+    let account_identifier_hash = claude_oauth_account_identifier_hash();
+    if let Some(cache) = read_claude_oauth_usage_cache(&account_identifier_hash) {
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -1841,13 +1863,20 @@ fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsag
         Ok(response) => response,
         Err(ureq::Error::Status(429, response)) => {
             let retry_after = claude_oauth_retry_after_epoch_seconds(&response, now);
-            let mut cache = read_claude_oauth_usage_cache().unwrap_or(ClaudeOAuthUsageCache {
-                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-                observed_at_epoch_seconds: now,
-                next_refresh_after_epoch_seconds: retry_after,
-                windows: Vec::new(),
-                credit_balances: Vec::new(),
-            });
+            // A cache belonging to another account is not merely skipped here:
+            // `unwrap_or` replaces it with an empty cache for the current
+            // account, so the write below also clears the stale payload off
+            // disk instead of leaving it to be reconsidered next tick.
+            let mut cache = read_claude_oauth_usage_cache(&account_identifier_hash).unwrap_or(
+                ClaudeOAuthUsageCache {
+                    schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                    account_identifier_hash: account_identifier_hash.clone(),
+                    observed_at_epoch_seconds: now,
+                    next_refresh_after_epoch_seconds: retry_after,
+                    windows: Vec::new(),
+                    credit_balances: Vec::new(),
+                },
+            );
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
             if !cache.windows.is_empty()
@@ -1859,7 +1888,7 @@ fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsag
             return Err("Claude OAuth usage endpoint is rate limited.".to_string());
         }
         Err(error) => {
-            if let Some(cache) = read_claude_oauth_usage_cache() {
+            if let Some(cache) = read_claude_oauth_usage_cache(&account_identifier_hash) {
                 if !cache.windows.is_empty()
                     && now.saturating_sub(cache.observed_at_epoch_seconds)
                         <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -1880,6 +1909,7 @@ fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsag
     if !usage.windows.is_empty() {
         let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account_identifier_hash.clone(),
             observed_at_epoch_seconds: now,
             next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
             windows: usage.windows.clone(),
@@ -1945,16 +1975,78 @@ fn claude_oauth_usage_cache_path() -> PathBuf {
     default_support_dir().join(CLAUDE_OAUTH_USAGE_CACHE_FILE)
 }
 
-fn read_claude_oauth_usage_cache() -> Option<ClaudeOAuthUsageCache> {
+/// Identify the Claude account that currently owns the local Claude Code
+/// credential, as a `billing_identity_hash`. Empty when `~/.claude.json` names
+/// no account.
+///
+/// Deliberately NOT a hash of the access token: the token rotates on refresh
+/// while the account does not, so a token fingerprint would discard a valid
+/// same-account cache on every rotation -- extra fetches against an endpoint
+/// that rate-limits, and no cache left to fall back on when it answers 429.
+/// `oauthAccount` is rewritten by Claude Code itself on every profile refresh,
+/// so it tracks the credential without inheriting its rotation.
+fn claude_oauth_account_identifier_hash() -> String {
+    read_claude_cli_oauth_account(&claude_cli_config_path())
+        .as_ref()
+        .map(claude_oauth_account_identifier_hash_for)
+        .unwrap_or_default()
+}
+
+fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> String {
+    // Same preference order the subscription grouping uses: provider account
+    // id, then organization, then email.
+    account
+        .account_uuid
+        .as_deref()
+        .and_then(|uuid| billing_identity_hash("anthropic", "account", uuid))
+        .or_else(|| {
+            account
+                .organization_uuid
+                .as_deref()
+                .and_then(|uuid| billing_identity_hash("anthropic", "organization", uuid))
+        })
+        .or_else(|| {
+            account
+                .email_address
+                .as_deref()
+                .and_then(|email| billing_identity_hash("anthropic", "email", email))
+        })
+        .unwrap_or_default()
+}
+
+fn read_claude_oauth_usage_cache(account_identifier_hash: &str) -> Option<ClaudeOAuthUsageCache> {
     let path = claude_oauth_usage_cache_path();
     let body = fs::read_to_string(path).ok()?;
     let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
     if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
-        // Older cache layouts (v1: windows only) are discarded so the next
-        // tick refetches and repopulates the credit balances.
+        // Older cache layouts (v1: windows only; v2: no account identity) are
+        // discarded so the next tick refetches under a known account.
+        return None;
+    }
+    if !claude_oauth_usage_cache_belongs_to_account(&cache, account_identifier_hash) {
         return None;
     }
     Some(cache)
+}
+
+/// Whether a cached OAuth usage payload may be served for the account that
+/// currently owns the credential.
+///
+/// Exact match, both directions. A cache written under account A is never
+/// served once account B holds the credential -- including on the 429 and
+/// transport fallback paths, where another account's quota is worse than no
+/// quota at all, because the fallback window is 24h and 429s on this endpoint
+/// are routine.
+///
+/// Two empty hashes DO match: if the local account metadata named no account
+/// when the cache was written and still names none now, nothing changed that we
+/// can observe. Refusing there would drop every cache hit on such machines and
+/// turn each status tick into another request to a rate-limited endpoint.
+fn claude_oauth_usage_cache_belongs_to_account(
+    cache: &ClaudeOAuthUsageCache,
+    account_identifier_hash: &str,
+) -> bool {
+    cache.account_identifier_hash == account_identifier_hash
 }
 
 fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
@@ -3790,6 +3882,7 @@ fn claude_billing_channel(api_provider: Option<&str>, plan_type: Option<&str>) -
 /// Claude Desktop config and statusLine caches this collector already reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ClaudeCliOauthAccount {
+    account_uuid: Option<String>,
     email_address: Option<String>,
     organization_uuid: Option<String>,
     organization_type: Option<String>,
@@ -3818,6 +3911,7 @@ fn parse_claude_cli_oauth_account(value: &Value) -> Option<ClaudeCliOauthAccount
             .map(str::to_string)
     };
     Some(ClaudeCliOauthAccount {
+        account_uuid: field("accountUuid"),
         email_address: field("emailAddress"),
         organization_uuid: field("organizationUuid"),
         organization_type: field("organizationType"),
@@ -6767,6 +6861,7 @@ for line in sys.stdin:
     fn claude_oauth_usage_cache_keeps_fresh_windows() {
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-a".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -6815,6 +6910,7 @@ for line in sys.stdin:
     fn claude_oauth_usage_cache_marks_old_windows_stale() {
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-a".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -6868,6 +6964,197 @@ for line in sys.stdin:
             cache.schema_version,
             CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_discards_v2_schema() {
+        // Version-2 caches predate `account_identifier_hash`: their numbers
+        // cannot be attributed to any account, so they must be discarded on
+        // upgrade rather than adopted by whoever is logged in now.
+        let v2 = serde_json::json!({
+            "schema_version": 2,
+            "observed_at_epoch_seconds": 100,
+            "next_refresh_after_epoch_seconds": 400,
+            "windows": [],
+            "credit_balances": []
+        });
+        let cache: ClaudeOAuthUsageCache = serde_json::from_value(v2).unwrap();
+        assert!(cache.account_identifier_hash.is_empty());
+        assert_ne!(
+            cache.schema_version,
+            CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn claude_oauth_account_identifier_hash_prefers_account_uuid() {
+        let account_a = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-a".to_string()),
+            email_address: Some("a@example.test".to_string()),
+            organization_uuid: Some("org-shared".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        let account_b = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-b".to_string()),
+            email_address: Some("b@example.test".to_string()),
+            organization_uuid: Some("org-shared".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        let hash_a = claude_oauth_account_identifier_hash_for(&account_a);
+        let hash_b = claude_oauth_account_identifier_hash_for(&account_b);
+
+        assert_eq!(
+            hash_a,
+            billing_identity_hash("anthropic", "account", "acct-a").expect("account hash")
+        );
+        // Two accounts inside one organization must still separate.
+        assert_ne!(hash_a, hash_b);
+
+        // Falls back to organization, then email, then gives up.
+        let org_only = ClaudeCliOauthAccount {
+            organization_uuid: Some("org-shared".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert_eq!(
+            claude_oauth_account_identifier_hash_for(&org_only),
+            billing_identity_hash("anthropic", "organization", "org-shared")
+                .expect("organization hash")
+        );
+        let email_only = ClaudeCliOauthAccount {
+            email_address: Some("a@example.test".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert_eq!(
+            claude_oauth_account_identifier_hash_for(&email_only),
+            billing_identity_hash("anthropic", "email", "a@example.test").expect("email hash")
+        );
+        assert!(
+            claude_oauth_account_identifier_hash_for(&ClaudeCliOauthAccount::default()).is_empty()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_oauth_usage_cache_is_not_served_across_accounts() {
+        // Regression, observed live 2026-07-26 on Ottto 0.1.96: the Claude Code
+        // CLI credential store is single-slot, so `/login` as a second account
+        // replaces the first while this machine-global cache keeps the first
+        // account's numbers. Account A's weekly window rendered under account
+        // B's Team subscription, complete with A's reset boundary.
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-usage-cache-account-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+
+        let account_a = claude_oauth_account_identifier_hash_for(&ClaudeCliOauthAccount {
+            account_uuid: Some("acct-a".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        });
+        let account_b = claude_oauth_account_identifier_hash_for(&ClaudeCliOauthAccount {
+            account_uuid: Some("acct-b".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        });
+        assert_ne!(account_a, account_b);
+
+        let now = 10_000;
+        write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account_a.clone(),
+            observed_at_epoch_seconds: now,
+            next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+            windows: vec![AgentQuotaWindow {
+                name: "weekly".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                window_seconds: Some(7 * 24 * 60 * 60),
+                // Account A's reset boundary -- the tell that made the live
+                // misattribution unambiguous.
+                resets_at: Some("2026-08-01T05:00:00Z".to_string()),
+                used_percent: Some(44),
+                left_percent: Some(56),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        })
+        .expect("write cache");
+
+        // The account that wrote it still reads it.
+        let served = read_claude_oauth_usage_cache(&account_a).expect("own account is served");
+        assert_eq!(served.windows[0].used_percent, Some(44));
+
+        // The replacing account must not.
+        assert!(
+            read_claude_oauth_usage_cache(&account_b).is_none(),
+            "cache written under account A was served to account B"
+        );
+        // Nor may an unidentifiable credential inherit a named account's cache.
+        assert!(read_claude_oauth_usage_cache("").is_none());
+
+        // Same guard on the 429 / transport fallback path, where the 24h max
+        // age applies and serving another account's numbers is worse than
+        // serving none. This mirrors the `unwrap_or` in
+        // `collect_claude_oauth_usage`'s 429 arm.
+        let retry_after = now + CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS;
+        let fallback = read_claude_oauth_usage_cache(&account_b).unwrap_or(ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account_b.clone(),
+            observed_at_epoch_seconds: now,
+            next_refresh_after_epoch_seconds: retry_after,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        });
+        assert!(
+            fallback.windows.is_empty(),
+            "429 fallback served account A's windows to account B"
+        );
+        assert_eq!(fallback.account_identifier_hash, account_b);
+        // Writing that empty cache back is what clears A's payload off disk.
+        write_claude_oauth_usage_cache(&fallback).expect("write fallback cache");
+        assert!(read_claude_oauth_usage_cache(&account_a).is_none());
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_account_match_is_exact_both_ways() {
+        let cache = |hash: &str| ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: hash.to_string(),
+            observed_at_epoch_seconds: 0,
+            next_refresh_after_epoch_seconds: 0,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        };
+
+        assert!(claude_oauth_usage_cache_belongs_to_account(
+            &cache("account-a"),
+            "account-a"
+        ));
+        assert!(!claude_oauth_usage_cache_belongs_to_account(
+            &cache("account-a"),
+            "account-b"
+        ));
+        // A named cache is not served to an unidentifiable credential, and an
+        // unattributed cache is not adopted by a named account.
+        assert!(!claude_oauth_usage_cache_belongs_to_account(
+            &cache("account-a"),
+            ""
+        ));
+        assert!(!claude_oauth_usage_cache_belongs_to_account(
+            &cache(""),
+            "account-a"
+        ));
+        // Nothing observable changed: keep serving rather than hammering a
+        // rate-limited endpoint every tick.
+        assert!(claude_oauth_usage_cache_belongs_to_account(&cache(""), ""));
     }
 
     #[test]
