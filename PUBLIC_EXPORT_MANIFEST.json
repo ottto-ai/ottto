@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 280,
-  "content_sha256": "f54394fdb53d8a3268e1d5ead3af0d7613e584cc52037e540242fa96f3b1238e",
+  "content_sha256": "a4605e55d453631655a3760dc4c69a3d63314433f54b66a2925fba92d94f15f0",
   "files": [
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/provider_daily_reference.rs",
-      "sha256": "81551b343c5ed296219d404716ca375e1af15b4c2acb80534d6049e94d8c94d7",
-      "size_bytes": 145982
+      "sha256": "d060f946abcb0d6439daa6b962dc1a3f1b9a6cdc9505574b89242978dcc9a315",
+      "size_bytes": 148481
     },
     {
       "executable": false,
@@ -1119,8 +1119,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-27-codex-daily-aggregates-collector.md",
-      "sha256": "b1fafc7bd94c3e5c9bf67b0a41cc18f404880564101993d57a1846fc75e186cf",
-      "size_bytes": 13234
+      "sha256": "150ef07eb545c63979c77b2ef1f46c1f93d7bb29b3480920786d305d41471300",
+      "size_bytes": 13673
     },
     {
       "executable": false,
@@ -1963,7 +1963,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T22:39:02+00:00",
+  "generated_at": "2026-07-26T22:45:11+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 281,
   "public_roots": [
@@ -1999,5 +1999,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "5905047ac5f9a15503ce3e7175ce674e0f5ea32d"
+  "source_commit": "7d50735d8846de58dbf7daee7010cbfe97945132"
 }

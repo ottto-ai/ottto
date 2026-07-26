@@ -1065,19 +1065,19 @@ fn base64_url_decode(value: &str) -> Option<Vec<u8>> {
 /// unrecognized id becomes `other`), so their rows have to combine. `None`
 /// means the provider did not report the counter, so it contributes nothing
 /// and never turns a reported value back into "not reported".
-fn merge_counter(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+fn merge_counter(left: Option<u64>, right: Option<u64>, max: u64) -> Option<u64> {
     match (left, right) {
         (None, None) => None,
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value.min(max)),
+        (Some(left), Some(right)) => Some(left.saturating_add(right).min(max)),
     }
 }
 
 fn merge_credits(left: Option<f64>, right: Option<f64>) -> Option<f64> {
     match (left, right) {
         (None, None) => None,
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value.min(MAX_CREDITS)),
+        (Some(left), Some(right)) => Some((left + right).min(MAX_CREDITS)),
     }
 }
 
@@ -1095,14 +1095,21 @@ struct Counters {
 impl Counters {
     fn merge(&mut self, other: &Counters) {
         self.credits_used = merge_credits(self.credits_used, other.credits_used);
-        self.uncached_input_tokens =
-            merge_counter(self.uncached_input_tokens, other.uncached_input_tokens);
-        self.cached_input_tokens =
-            merge_counter(self.cached_input_tokens, other.cached_input_tokens);
-        self.output_tokens = merge_counter(self.output_tokens, other.output_tokens);
-        self.total_tokens = merge_counter(self.total_tokens, other.total_tokens);
-        self.thread_count = merge_counter(self.thread_count, other.thread_count);
-        self.turn_count = merge_counter(self.turn_count, other.turn_count);
+        self.uncached_input_tokens = merge_counter(
+            self.uncached_input_tokens,
+            other.uncached_input_tokens,
+            MAX_TOKEN_COUNTER,
+        );
+        self.cached_input_tokens = merge_counter(
+            self.cached_input_tokens,
+            other.cached_input_tokens,
+            MAX_TOKEN_COUNTER,
+        );
+        self.output_tokens =
+            merge_counter(self.output_tokens, other.output_tokens, MAX_TOKEN_COUNTER);
+        self.total_tokens = merge_counter(self.total_tokens, other.total_tokens, MAX_TOKEN_COUNTER);
+        self.thread_count = merge_counter(self.thread_count, other.thread_count, MAX_EVENT_COUNTER);
+        self.turn_count = merge_counter(self.turn_count, other.turn_count, MAX_EVENT_COUNTER);
     }
 
     fn is_empty(&self) -> bool {
@@ -1110,22 +1117,34 @@ impl Counters {
     }
 }
 
+/// Contract ceilings. A value above these is not a large number, it is a
+/// payload we have misread - and sending it would 422 the whole batch for
+/// every day in the window, permanently.
+const MAX_TOKEN_COUNTER: u64 = 1_000_000_000_000_000;
+const MAX_EVENT_COUNTER: u64 = 1_000_000_000;
+const MAX_CREDITS: f64 = 1e9;
+
 /// Read a non-negative integer counter, only when the provider actually
-/// reported it. A present-but-unreadable value stays `None` rather than
-/// becoming `0`.
-fn counter_at(value: &Value, keys: &[&str]) -> Option<u64> {
+/// reported it and only when it fits the contract.
+///
+/// A present-but-unreadable or out-of-range value stays `None` rather than
+/// becoming `0`: "not reported" is the honest answer for a number we cannot
+/// represent, and `0` would manufacture a reconciliation delta.
+fn counter_at(value: &Value, keys: &[&str], max: u64) -> Option<u64> {
     let raw = keys.iter().find_map(|key| value.get(*key))?;
     match raw {
         Value::Number(number) => number
             .as_u64()
-            .or_else(|| number.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64)),
+            .or_else(|| number.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64))
+            .filter(|counter| *counter <= max),
         _ => None,
     }
 }
 
 fn credits_at(value: &Value, keys: &[&str]) -> Option<f64> {
     let raw = keys.iter().find_map(|key| value.get(*key))?;
-    raw.as_f64().filter(|value| *value >= 0.0)
+    raw.as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0 && *value <= MAX_CREDITS)
 }
 
 fn counters_at(value: &Value, include_credits: bool) -> Counters {
@@ -1136,15 +1155,25 @@ fn counters_at(value: &Value, include_credits: bool) -> Counters {
         uncached_input_tokens: counter_at(
             value,
             &["uncached_text_input_tokens", "uncached_input_tokens"],
+            MAX_TOKEN_COUNTER,
         ),
         cached_input_tokens: counter_at(
             value,
             &["cached_text_input_tokens", "cached_input_tokens"],
+            MAX_TOKEN_COUNTER,
         ),
-        output_tokens: counter_at(value, &["text_output_tokens", "output_tokens"]),
-        total_tokens: counter_at(value, &["text_total_tokens", "total_tokens"]),
-        thread_count: counter_at(value, &["threads", "thread_count"]),
-        turn_count: counter_at(value, &["turns", "turn_count"]),
+        output_tokens: counter_at(
+            value,
+            &["text_output_tokens", "output_tokens"],
+            MAX_TOKEN_COUNTER,
+        ),
+        total_tokens: counter_at(
+            value,
+            &["text_total_tokens", "total_tokens"],
+            MAX_TOKEN_COUNTER,
+        ),
+        thread_count: counter_at(value, &["threads", "thread_count"], MAX_EVENT_COUNTER),
+        turn_count: counter_at(value, &["turns", "turn_count"], MAX_EVENT_COUNTER),
     }
 }
 
@@ -3055,6 +3084,36 @@ mod tests {
             normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
         assert_eq!(normalized.rows.len(), 1);
         assert_eq!(normalized.rows[0].provider_day, "2026-07-26");
+    }
+
+    #[test]
+    fn a_counter_outside_the_contract_ceiling_reads_as_not_reported() {
+        // Not a large number - a payload we have misread. Sending it would 422
+        // the whole batch for every day in the window, permanently.
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "credits": 1.5,
+                    "text_total_tokens": 9_000_000_000_000_000_u64,
+                    "threads": 9_000_000_000_u64,
+                    "turns": 4
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let row = row_at(&normalized.rows, "2026-07-26", "codex_web", "__all__").expect("row");
+        assert_eq!(row.total_tokens, None, "over the token ceiling");
+        assert_eq!(row.thread_count, None, "over the event ceiling");
+        // The counters we can represent are untouched, and an unrepresentable
+        // one never becomes zero.
+        assert_eq!(row.turn_count, Some(4));
+        assert_eq!(row.credits_used.as_deref(), Some("1.500000"));
+        let batch = serde_json::to_string(row).expect("encode");
+        assert!(!batch.contains("total_tokens"));
+        assert!(!batch.contains("thread_count"));
     }
 
     #[test]

@@ -55,6 +55,12 @@ Two contract rules that shape the code more than they look:
 - **Per-model rows carry no credits.** The provider returns `0.0` for
   `models[].credits`, which is not an attribution. Model rows carry tokens,
   threads and turns; the surface row carries the metered credits.
+- **A counter outside the contract's ceiling reads as not reported.** The
+  bounds (1e15 tokens, 1e9 events, 1e9 credits) sit so far above reality that a
+  value above them is a payload we have misread, not a large number - and
+  forwarding it would `422` the whole batch, for every day in the window,
+  permanently. `None` is the honest answer for a number the contract cannot
+  express; `0` would manufacture a delta.
 
 ## The `client_id` map
 
@@ -218,10 +224,10 @@ rather than relying on review to notice.
 
 ## Tests
 
-45 unit tests in `provider_daily_reference.rs`, all parallel-safe: every store
+46 unit tests in `provider_daily_reference.rs`, all parallel-safe: every store
 takes an explicit path and no test mutates process environment. Coverage:
 the closed surface map and slug bounds; the must-not-persist proof and the
-injected-free-text rejections; `null` versus `0`; per-model credits omission;
+injected-free-text rejections; `null` versus `0`; contract ceilings; per-model credits omission;
 unknown-id merging and grain uniqueness; window and day-span arithmetic across
 month, leap-year and year boundaries; batch packing bounds, contiguity and the
 refusal case; exact window abutment across idle days; consent lifecycle, epoch advancement, response mismatch, and
@@ -231,7 +237,7 @@ threshold, class isolation, transient exemption, scoping and cool-down; the
 not-admitted and epoch-conflict upload answers; the credential's account scope
 surviving a token rotation; and the honest User-Agent.
 
-`cargo test --workspace` is green (1017 service tests), as is the connector
+`cargo test --workspace` is green (1018 service tests), as is the connector
 workspace, `cargo fmt --all --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.
 
