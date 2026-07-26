@@ -3081,6 +3081,7 @@ mod tests {
                 arch: "arm64".to_string(),
                 local_platform_version: "0.1.35".to_string(),
                 hardware_uuid: None,
+                account_scope: None,
             },
             ControlToken::new("token").expect("valid token"),
             "2026-06-16T10:00:00Z",

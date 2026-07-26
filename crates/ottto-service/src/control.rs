@@ -3112,6 +3112,7 @@ fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json
         "machine_id": machine.machine_id,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
+        "account_scope": machine.account_scope,
         "machine_name": machine.display_name,
         "platform": "macos",
         "client_nonce": nonce,
@@ -3162,6 +3163,7 @@ fn setup_claim_complete_body(
         "machine_id": machine.machine_id,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
+        "account_scope": machine.account_scope,
         "machine_name": machine.display_name,
         "platform": "macos",
     })
@@ -4374,6 +4376,7 @@ fn setup_run_attach_body(machine: &MachineIdentity) -> serde_json::Value {
         "machine_id": machine.machine_id,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
+        "account_scope": machine.account_scope,
         "machine_name": machine.display_name,
         "platform": operating_system_slug(&machine.os),
         "metadata": {
@@ -6068,6 +6071,7 @@ fn telemetry_device_register_body(
         "machine_id": machine.machine_id,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
+        "account_scope": machine.account_scope,
     })
 }
 
@@ -11438,6 +11442,55 @@ mod tests {
                 Some("install_test")
             );
         }
+    }
+
+    /// Every backend payload that already carries install-scoped identity must
+    /// also carry `account_scope`, or the product cannot tell two installs on
+    /// one Mac apart (each macOS user account has its own agent config).
+    #[test]
+    #[serial]
+    fn account_binding_payloads_include_the_account_scope_discriminator() {
+        let machine = test_machine();
+        let claim = PendingAuthClaim {
+            claim_code: "claim_account_scope".to_string(),
+            claim_token: "token_account_scope".to_string(),
+            nonce: "nonce_account_scope".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_account_scope".to_string(),
+            expires_at: "2026-05-05T09:30:00Z".to_string(),
+        };
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install_session_account_scope".to_string(),
+            install_session_token: "install_token_account_scope".to_string(),
+        };
+
+        for payload in [
+            setup_claim_create_body(&machine, &claim.nonce),
+            setup_claim_complete_body(&claim, &machine),
+            setup_run_attach_body(&machine),
+            telemetry_device_register_body(&install_session, &machine),
+        ] {
+            assert_eq!(
+                payload
+                    .get("account_scope")
+                    .and_then(serde_json::Value::as_str),
+                Some(TEST_ACCOUNT_SCOPE)
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn account_binding_payloads_send_null_account_scope_when_unknown() {
+        let machine = MachineIdentity {
+            account_scope: None,
+            ..test_machine()
+        };
+
+        assert_eq!(
+            setup_run_attach_body(&machine).get("account_scope"),
+            Some(&serde_json::Value::Null),
+            "an unknown account scope must be explicit, never a fabricated value"
+        );
     }
 
     #[test]
@@ -18687,6 +18740,10 @@ log_user_prompt = true
     /// instead uses the mock backend wired through OTTTO_API_BASE_URL.
     const ATTACKER_LOOPBACK_API_BASE_URL: &str = "http://127.0.0.1:1";
 
+    /// Fixed stand-in for `MachineIdentity::account_scope`. Shaped like the real
+    /// derivation (`otu_` + 32 hex) but not derived from any real uid.
+    const TEST_ACCOUNT_SCOPE: &str = "otu_00112233445566778899aabbccddeeff";
+
     fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
         let mut request = Vec::new();
@@ -18824,6 +18881,7 @@ log_user_prompt = true
             arch: "arm64".to_string(),
             local_platform_version: "0.1.0".to_string(),
             hardware_uuid: None,
+            account_scope: Some(TEST_ACCOUNT_SCOPE.to_string()),
         }
     }
 }

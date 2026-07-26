@@ -82,6 +82,29 @@ pub struct MachineIdentity {
     /// `machine_id` differs across reinstalls (ioreg-fallback vs. canonical).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardware_uuid: Option<String>,
+    /// Privacy-safe discriminator for the OS account this install runs under.
+    ///
+    /// WHY IT EXISTS: `machine_id` is per-Mac (`sha256("macos:<IOPlatformUUID>")`),
+    /// so several installs on one Mac share it — each macOS user account keeps
+    /// its own agent config (e.g. its own `~/.codex/config.toml`). Without this
+    /// field a product surface cannot tell "a different macOS user account on
+    /// this Mac" apart from "the same account after a reinstall".
+    ///
+    /// WHAT IT IS: `otu_` + the first 32 hex characters of
+    /// `sha256("account:<machine_id>:<posix uid>")`, so it is display-safe.
+    ///
+    /// WHAT IT IS NOT: not a username, not a home directory, not a path, not
+    /// the uid — the uid is digest input only and never appears in the value.
+    /// The derivation is one-way, so the value is not reversible to a person.
+    ///
+    /// GUARANTEE: identical for the same OS account on the same machine across
+    /// daemon restarts AND across reinstalls, because it is derived rather than
+    /// generated-and-stored (that is what `installation_id` already does);
+    /// distinct for a different OS account on the same machine; distinct for
+    /// the same uid on a different machine. `None` when no POSIX uid can be
+    /// determined — never a fabricated value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3687,6 +3710,54 @@ mod tests {
         // The rest of the context payload is untouched.
         assert_eq!(context.max_tokens, Some(1_000_000));
         assert_eq!(context.used_percent, Some(12));
+    }
+
+    fn machine_identity_sample() -> MachineIdentity {
+        MachineIdentity {
+            machine_id: "otm_00000000000000000000000000000001".to_string(),
+            installation_id: "oti_00000000000000000000000000000002".to_string(),
+            display_name: "Test Mac".to_string(),
+            hostname: "test-mac.local".to_string(),
+            os: OperatingSystem::Macos,
+            arch: "arm64".to_string(),
+            local_platform_version: "0.1.0".to_string(),
+            hardware_uuid: None,
+            account_scope: None,
+        }
+    }
+
+    /// Older daemons never send `account_scope`, and newer daemons omit it when
+    /// no POSIX uid is available. Both must serialize to the pre-existing shape
+    /// so peers on either side of the change stay compatible.
+    #[test]
+    fn machine_identity_omits_account_scope_when_absent() {
+        let value = serde_json::to_value(machine_identity_sample()).expect("serialize identity");
+
+        assert!(value.get("account_scope").is_none());
+
+        let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
+        assert_eq!(decoded.account_scope, None);
+    }
+
+    #[test]
+    fn machine_identity_round_trips_account_scope_when_present() {
+        let scope = "otu_d8b0c573acd0c2b5f822065edfd4ec58";
+        let identity = MachineIdentity {
+            account_scope: Some(scope.to_string()),
+            ..machine_identity_sample()
+        };
+
+        let value = serde_json::to_value(&identity).expect("serialize identity");
+        assert_eq!(
+            value
+                .get("account_scope")
+                .and_then(serde_json::Value::as_str),
+            Some(scope)
+        );
+
+        let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.account_scope.as_deref(), Some(scope));
     }
 
     #[test]
