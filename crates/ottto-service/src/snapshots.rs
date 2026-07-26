@@ -5515,6 +5515,271 @@ pub(crate) fn load_codex_config_defaults(path: &Path) -> Option<CodexConfigDefau
     })
 }
 
+/// Defensive size ceiling for a Claude Code settings file. Real settings files
+/// are a few KiB; anything larger is not a config file we should be parsing.
+const MAX_CLAUDE_SETTINGS_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Display-safe Claude Code runtime defaults resolved across the settings chain.
+///
+/// The Codex sibling is `CodexConfigDefaults`; the same rules apply. These are
+/// configured defaults, not evidence a session actually ran with them.
+/// `selector_context` carries the resolved value per field and
+/// `selector_sources` carries the `claude_code.<scope>.<json key path>`
+/// provenance of the file that won, so the UI can name the file each value came
+/// from instead of implying one global config.
+///
+/// `reasoning_effort` comes from Claude Code's durable `effortLevel` setting,
+/// which `/effort` writes into the settings file. The value is reported exactly
+/// as configured; nothing is normalized and no default is invented when the key
+/// is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeConfigDefaults {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub approval_policy: Option<String>,
+    pub fast_mode_enabled: Option<bool>,
+    pub sandbox_mode: Option<String>,
+    pub selector_context: BTreeMap<String, String>,
+    pub selector_sources: BTreeMap<String, String>,
+}
+
+/// Result of reading the Claude Code settings chain.
+///
+/// `NothingConfigured` and `Unreadable` are kept apart on purpose: the UI must
+/// be able to say "you have not configured a default" rather than implying
+/// Ottto failed to look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeConfigDefaultsOutcome {
+    /// At least one display-safe default is configured somewhere in the chain.
+    Configured(ClaudeConfigDefaults),
+    /// A settings file parsed cleanly, but none of the mapped keys are set.
+    NothingConfigured,
+    /// No settings file in the chain could be read and parsed.
+    Unreadable,
+}
+
+/// One Claude Code settings file in precedence order.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaudeSettingsScope<'a> {
+    /// `selector_sources` prefix identifying the file, e.g. `claude_code.settings`.
+    pub label: &'a str,
+    pub path: &'a Path,
+}
+
+/// Raw per-key capture with the scope label that supplied it. Kept separate from
+/// `ClaudeConfigDefaults` so a higher-precedence file that sets only one half of
+/// a derived pair (for example `sandbox.autoAllowBashIfSandboxed` without
+/// `sandbox.enabled`) still wins for the key it actually sets.
+#[derive(Debug, Clone, Default)]
+struct ClaudeSettingsRaw {
+    model: Option<(String, String)>,
+    effort_level: Option<(String, String)>,
+    permission_mode: Option<(String, String)>,
+    fast_mode: Option<(bool, String)>,
+    fast_mode_per_session_opt_in: Option<(bool, String)>,
+    sandbox_enabled: Option<(bool, String)>,
+    sandbox_auto_allow_bash: Option<(bool, String)>,
+}
+
+/// Resolve display-safe Claude Code defaults from the settings chain.
+///
+/// `scopes` must be ordered lowest precedence first; each readable file
+/// overwrites the keys it sets, so the highest-precedence file wins per key.
+/// Only specifically-named keys are ever read: `model`, `effortLevel`,
+/// `permissions.defaultMode`, `fastMode`/`fastModePerSessionOptIn`, and
+/// `sandbox.enabled`/`sandbox.autoAllowBashIfSandboxed`. `env`,
+/// `permissions.allow`/`ask`/`deny`, `apiKeyHelper`, `statusLine`,
+/// `sandbox.credentials`, and `sandbox.filesystem` are never read, so no path,
+/// environment value, token, or permission rule can ride along. Environment
+/// variables are never consulted either, so `CLAUDE_CODE_EFFORT_LEVEL` cannot
+/// leak in through this path.
+pub(crate) fn load_claude_settings_defaults(
+    scopes: &[ClaudeSettingsScope<'_>],
+) -> ClaudeConfigDefaultsOutcome {
+    let mut raw = ClaudeSettingsRaw::default();
+    let mut any_readable = false;
+    for scope in scopes {
+        let Some(document) = load_claude_settings_document(scope.path) else {
+            continue;
+        };
+        any_readable = true;
+        apply_claude_settings_scope(&mut raw, scope.label, &document);
+    }
+    if !any_readable {
+        return ClaudeConfigDefaultsOutcome::Unreadable;
+    }
+
+    let mut defaults = ClaudeConfigDefaults::default();
+    let insert = |defaults: &mut ClaudeConfigDefaults, field: &str, value: String, source: &str| {
+        defaults.selector_context.insert(field.to_string(), value);
+        defaults
+            .selector_sources
+            .insert(field.to_string(), source.to_string());
+    };
+
+    if let Some((model, source)) = raw.model.clone() {
+        insert(&mut defaults, "model", model.clone(), &source);
+        defaults.model = Some(model);
+    }
+    // Reported exactly as configured. `low`/`medium`/`high`/`xhigh` persist
+    // across sessions; `max` is session-only unless the environment sets it, but
+    // if the settings file says `max` then that is what the file says, and the
+    // Configuration tab's contract is to show the config file. Normalizing or
+    // dropping a value here would misreport the customer's own config.
+    if let Some((effort, source)) = raw.effort_level.clone() {
+        insert(&mut defaults, "reasoning_effort", effort.clone(), &source);
+        defaults.reasoning_effort = Some(effort);
+    }
+    if let Some((mode, source)) = raw.permission_mode.clone() {
+        insert(&mut defaults, "approval_policy", mode.clone(), &source);
+        defaults.approval_policy = Some(mode);
+    }
+    // `fastModePerSessionOptIn` means Fast never persists across sessions, so
+    // the durable default is off regardless of a stored `fastMode` flag. This
+    // mirrors how Codex's `fast_default_opt_out` overrides `[features].fast_mode`.
+    let fast_mode = match (&raw.fast_mode_per_session_opt_in, &raw.fast_mode) {
+        (Some((true, source)), _) => Some((false, source.clone())),
+        (_, Some((enabled, source))) => Some((*enabled, source.clone())),
+        _ => None,
+    };
+    if let Some((enabled, source)) = fast_mode {
+        insert(
+            &mut defaults,
+            "fast_mode_enabled",
+            enabled.to_string(),
+            &source,
+        );
+        defaults.fast_mode_enabled = Some(enabled);
+    }
+    // `autoAllowBashIfSandboxed` only means something once the sandbox is on,
+    // so an unset `sandbox.enabled` stays quiet rather than guessing a mode.
+    let sandbox_mode = match &raw.sandbox_enabled {
+        Some((false, source)) => Some(("disabled", source.clone())),
+        Some((true, source)) => match &raw.sandbox_auto_allow_bash {
+            Some((false, auto_allow_source)) => {
+                Some(("regular_permissions", auto_allow_source.clone()))
+            }
+            // Auto-allow is Claude Code's default once the sandbox is enabled.
+            _ => Some(("auto_allow", source.clone())),
+        },
+        None => None,
+    };
+    if let Some((mode, source)) = sandbox_mode {
+        insert(&mut defaults, "sandbox_mode", mode.to_string(), &source);
+        defaults.sandbox_mode = Some(mode.to_string());
+    }
+
+    if defaults.selector_context.is_empty() {
+        return ClaudeConfigDefaultsOutcome::NothingConfigured;
+    }
+    ClaudeConfigDefaultsOutcome::Configured(defaults)
+}
+
+/// Read one Claude Code settings file into JSON.
+///
+/// Read line-by-line to satisfy the streaming guard (no whole-file reads in this
+/// module); settings files are small, so the accumulated string is fine.
+fn load_claude_settings_document(path: &Path) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_SETTINGS_FILE_BYTES {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let mut raw = String::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        raw.push_str(line.as_str());
+        raw.push('\n');
+    }
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
+fn apply_claude_settings_scope(raw: &mut ClaudeSettingsRaw, label: &str, document: &Value) {
+    if let Some(model) = document
+        .get("model")
+        .and_then(Value::as_str)
+        .and_then(display_safe_config_scalar)
+    {
+        raw.model = Some((model, format!("{label}.model")));
+    }
+    if let Some(effort) = document
+        .get("effortLevel")
+        .and_then(Value::as_str)
+        .and_then(display_safe_config_scalar)
+    {
+        raw.effort_level = Some((effort, format!("{label}.effortLevel")));
+    }
+    if let Some(mode) = document
+        .get("permissions")
+        .and_then(|permissions| permissions.get("defaultMode"))
+        .and_then(Value::as_str)
+        .and_then(claude_permission_mode_default)
+    {
+        raw.permission_mode = Some((mode, format!("{label}.permissions.defaultMode")));
+    }
+    if let Some(fast_mode) = document.get("fastMode").and_then(Value::as_bool) {
+        raw.fast_mode = Some((fast_mode, format!("{label}.fastMode")));
+    }
+    if let Some(opt_in) = document
+        .get("fastModePerSessionOptIn")
+        .and_then(Value::as_bool)
+    {
+        raw.fast_mode_per_session_opt_in =
+            Some((opt_in, format!("{label}.fastModePerSessionOptIn")));
+    }
+    if let Some(sandbox) = document.get("sandbox") {
+        if let Some(enabled) = sandbox.get("enabled").and_then(Value::as_bool) {
+            raw.sandbox_enabled = Some((enabled, format!("{label}.sandbox.enabled")));
+        }
+        if let Some(auto_allow) = sandbox
+            .get("autoAllowBashIfSandboxed")
+            .and_then(Value::as_bool)
+        {
+            raw.sandbox_auto_allow_bash = Some((
+                auto_allow,
+                format!("{label}.sandbox.autoAllowBashIfSandboxed"),
+            ));
+        }
+    }
+}
+
+/// Canonical display value for `permissions.defaultMode`.
+///
+/// `bypassPermissions` is a local safety posture, never a cost-relevant default,
+/// so it is dropped rather than uploaded. Unknown values are dropped too: a
+/// future mode name is not something we should forward blind.
+fn claude_permission_mode_default(value: &str) -> Option<String> {
+    match value.trim() {
+        // `manual` is the CLI alias for the canonical `default` config value.
+        "default" | "manual" => Some("default".to_string()),
+        "acceptEdits" => Some("acceptEdits".to_string()),
+        "plan" => Some("plan".to_string()),
+        "auto" => Some("auto".to_string()),
+        "dontAsk" => Some("dontAsk".to_string()),
+        _ => None,
+    }
+}
+
+/// Accept only short, scalar, display-safe config text.
+///
+/// Anything path-like, URL-like, quoted, whitespace-bearing, or long is dropped
+/// instead of forwarded, so free-form settings text can never leak a path, an
+/// environment value, or a credential through a config-defaults field. The
+/// backend-facing `redacted_for_backend` guard is the second line of defence.
+fn display_safe_config_scalar(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 fn insert_codex_sidecar_title(
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
     id: String,
@@ -9595,6 +9860,400 @@ mod tests {
         .expect("write config");
 
         assert!(load_codex_config_defaults(&codex_dir.join("config.toml")).is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Build the ordered Claude Code settings chain for a fake home directory.
+    fn claude_settings_chain(claude_dir: &Path, managed: &Path) -> Vec<(String, PathBuf)> {
+        vec![
+            (
+                "claude_code.settings".to_string(),
+                claude_dir.join("settings.json"),
+            ),
+            (
+                "claude_code.settings_local".to_string(),
+                claude_dir.join("settings.local.json"),
+            ),
+            (
+                "claude_code.managed_settings".to_string(),
+                managed.to_path_buf(),
+            ),
+        ]
+    }
+
+    fn load_claude_defaults(paths: &[(String, PathBuf)]) -> ClaudeConfigDefaultsOutcome {
+        let scopes: Vec<ClaudeSettingsScope<'_>> = paths
+            .iter()
+            .map(|(label, path)| ClaudeSettingsScope {
+                label: label.as_str(),
+                path: path.as_path(),
+            })
+            .collect();
+        load_claude_settings_defaults(&scopes)
+    }
+
+    #[test]
+    fn claude_settings_defaults_capture_model_permission_mode_fast_and_sandbox() {
+        let root = temp_dir("claude-settings-defaults");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            concat!(
+                "{\n",
+                "  \"model\": \"claude-opus-4-7\",\n",
+                "  \"effortLevel\": \"high\",\n",
+                "  \"fastMode\": true,\n",
+                "  \"permissions\": {\"defaultMode\": \"acceptEdits\"},\n",
+                "  \"sandbox\": {\"enabled\": true}\n",
+                "}\n"
+            ),
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings.effortLevel")
+        );
+        assert_eq!(defaults.approval_policy.as_deref(), Some("acceptEdits"));
+        assert_eq!(defaults.fast_mode_enabled, Some(true));
+        // `sandbox.enabled` with no `autoAllowBashIfSandboxed` override is
+        // Claude Code's auto-allow default.
+        assert_eq!(defaults.sandbox_mode.as_deref(), Some("auto_allow"));
+        assert_eq!(
+            defaults.selector_sources.get("model").map(String::as_str),
+            Some("claude_code.settings.model")
+        );
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("approval_policy")
+                .map(String::as_str),
+            Some("claude_code.settings.permissions.defaultMode")
+        );
+        assert_eq!(
+            defaults
+                .selector_context
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_prefer_local_then_managed_scope() {
+        let root = temp_dir("claude-settings-precedence");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"model\": \"claude-haiku-4-5\", \"effortLevel\": \"low\", \"fastMode\": true, \"permissions\": {\"defaultMode\": \"acceptEdits\"}}\n",
+        )
+        .expect("write user settings");
+        fs::write(
+            claude_dir.join("settings.local.json"),
+            "{\"model\": \"claude-sonnet-4-5\", \"effortLevel\": \"medium\", \"permissions\": {\"defaultMode\": \"plan\"}}\n",
+        )
+        .expect("write local settings");
+        let managed = root.join("managed-settings.json");
+        fs::write(
+            &managed,
+            "{\"model\": \"claude-opus-4-7\", \"effortLevel\": \"xhigh\", \"sandbox\": {\"enabled\": true, \"autoAllowBashIfSandboxed\": false}}\n",
+        )
+        .expect("write managed settings");
+
+        let paths = claude_settings_chain(&claude_dir, &managed);
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        // Managed settings win outright for the keys they set.
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            defaults.selector_sources.get("model").map(String::as_str),
+            Some("claude_code.managed_settings.model")
+        );
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.managed_settings.effortLevel")
+        );
+        // Local settings win over user settings for a key managed does not set.
+        assert_eq!(defaults.approval_policy.as_deref(), Some("plan"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("approval_policy")
+                .map(String::as_str),
+            Some("claude_code.settings_local.permissions.defaultMode")
+        );
+        // A key only the lowest scope sets still survives.
+        assert_eq!(defaults.fast_mode_enabled, Some(true));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("claude_code.settings.fastMode")
+        );
+        assert_eq!(
+            defaults.sandbox_mode.as_deref(),
+            Some("regular_permissions")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_prefer_local_effort_level_over_user() {
+        let root = temp_dir("claude-settings-effort-precedence");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"low\"}\n",
+        )
+        .expect("write user settings");
+        fs::write(
+            claude_dir.join("settings.local.json"),
+            "{\"effortLevel\": \"high\"}\n",
+        )
+        .expect("write local settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings_local.effortLevel")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The Configuration tab's contract is "what your config file says", so an
+    /// effort value is forwarded verbatim rather than normalized against a
+    /// known-value list. `max` is session-only in Claude Code unless the
+    /// environment sets it, but if the settings file says `max` then that is
+    /// what the file says.
+    #[test]
+    fn claude_settings_defaults_report_effort_level_verbatim() {
+        let root = temp_dir("claude-settings-effort-verbatim");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"max\"}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("max"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_reject_unsafe_effort_level_values() {
+        let root = temp_dir("claude-settings-effort-unsafe");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        // A path-shaped effort value fails the display-safe scalar guard, so it
+        // is dropped while a sibling key still resolves.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": \"/Users/someone/.claude/effort-profile\", \"model\": \"claude-opus-4-7\"}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort, None);
+        assert!(!defaults.selector_context.contains_key("reasoning_effort"));
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+
+        // A non-string effort value is also ignored rather than coerced.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"effortLevel\": 4, \"model\": \"claude-opus-4-7\"}\n",
+        )
+        .expect("rewrite settings");
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.reasoning_effort, None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_treat_per_session_fast_opt_in_as_off() {
+        let root = temp_dir("claude-settings-fast-opt-in");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"fastMode\": true, \"fastModePerSessionOptIn\": true}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        // Fast does not persist across sessions, so the durable default is off.
+        assert_eq!(defaults.fast_mode_enabled, Some(false));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("fast_mode_enabled")
+                .map(String::as_str),
+            Some("claude_code.settings.fastModePerSessionOptIn")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_report_nothing_configured_and_unreadable_apart() {
+        let root = temp_dir("claude-settings-empty");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+
+        // No settings file at all: we could not look, which is not the same as
+        // "nothing configured".
+        assert_eq!(
+            load_claude_defaults(&paths),
+            ClaudeConfigDefaultsOutcome::Unreadable
+        );
+
+        // Unparseable settings are also "we could not read it".
+        fs::write(claude_dir.join("settings.json"), "not json\n").expect("write settings");
+        assert_eq!(
+            load_claude_defaults(&paths),
+            ClaudeConfigDefaultsOutcome::Unreadable
+        );
+
+        // Readable settings that configure none of the mapped keys.
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"agentPushNotifEnabled\": true, \"cleanupPeriodDays\": 30}\n",
+        )
+        .expect("write settings");
+        assert_eq!(
+            load_claude_defaults(&paths),
+            ClaudeConfigDefaultsOutcome::NothingConfigured
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_never_emit_paths_secrets_or_bypass_permissions() {
+        let root = temp_dir("claude-settings-redaction");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            concat!(
+                "{\n",
+                "  \"model\": \"claude-opus-4-7\",\n",
+                "  \"apiKeyHelper\": \"/Users/someone/bin/print-key.sh\",\n",
+                "  \"env\": {\"ANTHROPIC_API_KEY\": \"sk-ant-secret-value\",\n",
+                "            \"OTEL_EXPORTER_OTLP_HEADERS\": \"Authorization=Bearer otsi_secret\"},\n",
+                "  \"statusLine\": {\"type\": \"command\", \"command\": \"/Users/someone/.claude/statusline.sh\"},\n",
+                "  \"permissions\": {\n",
+                "    \"defaultMode\": \"bypassPermissions\",\n",
+                "    \"allow\": [\"Read(~/.zshrc)\", \"Bash(aws s3 *)\"],\n",
+                "    \"deny\": [\"Read(./.env)\"]\n",
+                "  },\n",
+                "  \"sandbox\": {\n",
+                "    \"enabled\": true,\n",
+                "    \"filesystem\": {\"allowWrite\": [\"/Users/someone/.kube\"]},\n",
+                "    \"credentials\": {\"envVars\": [{\"name\": \"GH_TOKEN\", \"mode\": \"deny\"}],\n",
+                "                     \"files\": [{\"path\": \"~/.aws/credentials\", \"mode\": \"deny\"}]}\n",
+                "  }\n",
+                "}\n"
+            ),
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        // Only the four mapped keys are read; the sandbox contributes its mode
+        // and nothing from filesystem/credentials.
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(defaults.sandbox_mode.as_deref(), Some("auto_allow"));
+        // `bypassPermissions` is a local safety posture, never uploaded.
+        assert_eq!(defaults.approval_policy, None);
+        assert!(!defaults.selector_context.contains_key("approval_policy"));
+        assert_eq!(
+            defaults.selector_context.keys().collect::<Vec<_>>(),
+            vec!["model", "sandbox_mode"]
+        );
+
+        let leaked = defaults
+            .selector_context
+            .values()
+            .chain(defaults.selector_sources.values())
+            .find(|value| {
+                let lowered = value.to_ascii_lowercase();
+                lowered.contains('/')
+                    || lowered.contains("sk-")
+                    || lowered.contains("bearer")
+                    || lowered.contains("token")
+                    || lowered.contains("credential")
+                    || lowered.contains("bypass")
+            });
+        assert_eq!(leaked, None, "no path or secret text may ride along");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_settings_defaults_reject_path_shaped_model_values() {
+        let root = temp_dir("claude-settings-model-path");
+        let claude_dir = root.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("create .claude");
+        fs::write(
+            claude_dir.join("settings.json"),
+            "{\"model\": \"/Users/someone/models/local.gguf\", \"fastMode\": false}\n",
+        )
+        .expect("write settings");
+
+        let paths = claude_settings_chain(&claude_dir, &root.join("managed-settings.json"));
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        assert_eq!(defaults.model, None);
+        assert_eq!(defaults.fast_mode_enabled, Some(false));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -451,6 +451,121 @@ fn build_codex_runtime_defaults(captured_at: &str) -> Option<AgentRuntimeDefault
     })
 }
 
+/// macOS enterprise/MDM policy settings for Claude Code. Highest precedence in
+/// Claude Code's own chain and not overridable by a developer, so it is applied
+/// last.
+const CLAUDE_MANAGED_SETTINGS_PATH: &str =
+    "/Library/Application Support/ClaudeCode/managed-settings.json";
+
+/// Claude Code settings files, lowest precedence first.
+///
+/// Claude Code's own order is user settings, then project settings, then local
+/// project settings, then managed settings on top. Project-scoped
+/// `.claude/settings*.json` files are intentionally out of scope here: the daemon
+/// has no single project cwd, and a checked-out repository's settings are not a
+/// machine default. `~/.claude/settings.local.json` is included because the
+/// local MCP inventory already treats it as an override of `~/.claude/settings.json`.
+fn claude_settings_paths() -> Vec<(String, PathBuf)> {
+    vec![
+        (
+            "claude_code.settings".to_string(),
+            home_path(".claude/settings.json"),
+        ),
+        (
+            "claude_code.settings_local".to_string(),
+            home_path(".claude/settings.local.json"),
+        ),
+        (
+            "claude_code.managed_settings".to_string(),
+            PathBuf::from(CLAUDE_MANAGED_SETTINGS_PATH),
+        ),
+    ]
+}
+
+/// Claude Code runtime defaults plus the honest marker for what we found.
+struct ClaudeRuntimeDefaultsCapture {
+    defaults: Option<AgentRuntimeDefaults>,
+    capability: AgentCapabilityGap,
+    diagnostic: Option<AgentStatusDiagnostic>,
+}
+
+/// Assemble display-safe Claude Code runtime defaults from the local settings
+/// chain for the agent-status upload. The backend overwrites `machine_id` from
+/// the stored snapshot, so it is left unset here.
+fn build_claude_runtime_defaults(captured_at: &str) -> ClaudeRuntimeDefaultsCapture {
+    claude_runtime_defaults_from_paths(captured_at, &claude_settings_paths())
+}
+
+fn claude_runtime_defaults_from_paths(
+    captured_at: &str,
+    paths: &[(String, PathBuf)],
+) -> ClaudeRuntimeDefaultsCapture {
+    let scopes: Vec<crate::snapshots::ClaudeSettingsScope<'_>> = paths
+        .iter()
+        .map(|(label, path)| crate::snapshots::ClaudeSettingsScope {
+            label: label.as_str(),
+            path: path.as_path(),
+        })
+        .collect();
+    match crate::snapshots::load_claude_settings_defaults(&scopes) {
+        crate::snapshots::ClaudeConfigDefaultsOutcome::Configured(defaults) => {
+            ClaudeRuntimeDefaultsCapture {
+                defaults: Some(AgentRuntimeDefaults {
+                    captured_at: Some(captured_at.to_string()),
+                    provenance: Some("config_file".to_string()),
+                    machine_id: None,
+                    model: defaults.model,
+                    // Claude Code has no config-file service tier or speed mode;
+                    // Fast is the only tier-shaped default it persists.
+                    service_tier: None,
+                    speed_mode: None,
+                    fast_mode_enabled: defaults.fast_mode_enabled,
+                    priority_enabled: None,
+                    // Claude Code's durable `effortLevel` setting, which
+                    // `/effort` writes. Reported exactly as configured; absent
+                    // means absent, never an invented default.
+                    reasoning_effort: defaults.reasoning_effort,
+                    approval_policy: defaults.approval_policy,
+                    sandbox_mode: defaults.sandbox_mode,
+                    selector_context: defaults.selector_context,
+                    selector_sources: defaults.selector_sources,
+                }),
+                capability: supported_capability(
+                    "runtime_defaults",
+                    "Read display-safe Claude Code defaults from the local settings chain.",
+                ),
+                diagnostic: None,
+            }
+        }
+        crate::snapshots::ClaudeConfigDefaultsOutcome::NothingConfigured => {
+            ClaudeRuntimeDefaultsCapture {
+                defaults: None,
+                capability: unsupported_capability(
+                    "runtime_defaults",
+                    "Claude Code settings were read, but none set a display-safe default (model, effort level, permission mode, fast mode, or sandbox).",
+                ),
+                diagnostic: Some(AgentStatusDiagnostic::source(
+                    "claude_runtime_defaults_not_configured",
+                    AgentDiagnosticSeverity::Info,
+                    "Claude Code settings parsed cleanly and configure none of the defaults Ottto displays.",
+                )),
+            }
+        }
+        crate::snapshots::ClaudeConfigDefaultsOutcome::Unreadable => ClaudeRuntimeDefaultsCapture {
+            defaults: None,
+            capability: unsupported_capability(
+                "runtime_defaults",
+                "No readable Claude Code settings file was found on this Mac.",
+            ),
+            diagnostic: Some(AgentStatusDiagnostic::source(
+                "claude_runtime_defaults_unreadable",
+                AgentDiagnosticSeverity::Info,
+                "No Claude Code settings file in the local chain could be read and parsed.",
+            )),
+        },
+    }
+}
+
 fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
     // Presence is decided by the canonical detector, which requires the `claude`
     // binary. A lone `~/.claude/settings.json` — which Ottto's own relay-base
@@ -618,6 +733,8 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
             OffsetDateTime::now_utc(),
         );
     }
+    let runtime_defaults = build_claude_runtime_defaults(&snapshot.captured_at);
+    snapshot.runtime_defaults = runtime_defaults.defaults;
     snapshot.capabilities = vec![
         supported_capability(
             "account_status",
@@ -625,7 +742,11 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         ),
         quota_capability,
         context_capability,
+        runtime_defaults.capability,
     ];
+    if let Some(diagnostic) = runtime_defaults.diagnostic {
+        snapshot.diagnostics.push(diagnostic);
+    }
     if version.command_found && version.success {
         snapshot.diagnostics.push(AgentStatusDiagnostic::source(
             "claude_version_detected",
@@ -7371,5 +7492,167 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             gateway.gateway_provider.as_deref(),
             Some("vercel_ai_gateway")
         );
+    }
+
+    fn claude_settings_fixture(name: &str, body: &str) -> (PathBuf, Vec<(String, PathBuf)>) {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-runtime-defaults-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create .claude");
+        if !body.is_empty() {
+            std::fs::write(claude_dir.join("settings.json"), body).expect("write settings");
+        }
+        let paths = vec![
+            (
+                "claude_code.settings".to_string(),
+                claude_dir.join("settings.json"),
+            ),
+            (
+                "claude_code.settings_local".to_string(),
+                claude_dir.join("settings.local.json"),
+            ),
+            (
+                "claude_code.managed_settings".to_string(),
+                root.join("managed-settings.json"),
+            ),
+        ];
+        (root, paths)
+    }
+
+    #[test]
+    fn claude_runtime_defaults_carry_config_file_provenance() {
+        let (root, paths) = claude_settings_fixture(
+            "provenance",
+            "{\"model\": \"claude-opus-4-7\", \"permissions\": {\"defaultMode\": \"plan\"}}\n",
+        );
+
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
+        let defaults = capture.defaults.expect("runtime defaults present");
+        assert_eq!(defaults.provenance.as_deref(), Some("config_file"));
+        // The backend fills machine_id from the stored snapshot.
+        assert_eq!(defaults.machine_id, None);
+        assert_eq!(
+            defaults.captured_at.as_deref(),
+            Some("2026-07-25T10:00:00Z")
+        );
+        assert_eq!(defaults.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(defaults.approval_policy.as_deref(), Some("plan"));
+        assert_eq!(capture.capability.capability, "runtime_defaults");
+        assert_eq!(capture.capability.status, AgentCapabilityStatus::Supported);
+        assert!(capture.diagnostic.is_none());
+
+        // The strict backend schema must accept what we emit unchanged.
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-07-25T10:00:00Z".to_string(),
+            "2026-07-25T10:05:00Z".to_string(),
+        );
+        snapshot.runtime_defaults = Some(defaults);
+        let redacted = snapshot.redacted_for_backend();
+        let survived = redacted.runtime_defaults.expect("survives redaction");
+        assert_eq!(survived.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(survived.approval_policy.as_deref(), Some("plan"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Claude Code's `effortLevel` is durable: `/effort` writes it to the
+    /// settings file and it persists across sessions. It maps straight through
+    /// to `reasoning_effort`.
+    #[test]
+    fn claude_runtime_defaults_report_configured_effort_level() {
+        let (root, paths) = claude_settings_fixture(
+            "effort-level",
+            "{\"model\": \"claude-opus-4-7\", \"effortLevel\": \"xhigh\"}\n",
+        );
+
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
+        let defaults = capture.defaults.expect("runtime defaults present");
+        assert_eq!(defaults.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            defaults
+                .selector_sources
+                .get("reasoning_effort")
+                .map(String::as_str),
+            Some("claude_code.settings.effortLevel")
+        );
+        // The Codex-shaped tier fields Claude's settings have no equivalent for
+        // stay unset.
+        assert_eq!(defaults.service_tier, None);
+        assert_eq!(defaults.speed_mode, None);
+        assert_eq!(defaults.priority_enabled, None);
+
+        // The emitted effort value must survive the backend-facing guard.
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-07-25T10:00:00Z".to_string(),
+            "2026-07-25T10:05:00Z".to_string(),
+        );
+        snapshot.runtime_defaults = Some(defaults);
+        let survived = snapshot
+            .redacted_for_backend()
+            .runtime_defaults
+            .expect("survives redaction");
+        assert_eq!(survived.reasoning_effort.as_deref(), Some("xhigh"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Absent `effortLevel` must stay absent. Claude Code's own default is not
+    /// ours to invent, and an unset field is what tells the UI "not configured".
+    #[test]
+    fn claude_runtime_defaults_leave_effort_unset_when_not_configured() {
+        let (root, paths) = claude_settings_fixture(
+            "no-effort-level",
+            concat!(
+                "{\"model\": \"claude-opus-4-7\",\n",
+                " \"alwaysThinkingEnabled\": true,\n",
+                " \"env\": {\"MAX_THINKING_TOKENS\": \"32000\"}}\n"
+            ),
+        );
+
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &paths);
+        let defaults = capture.defaults.expect("runtime defaults present");
+        assert_eq!(defaults.reasoning_effort, None);
+        assert!(!defaults.selector_context.contains_key("reasoning_effort"));
+        assert!(!defaults.selector_sources.contains_key("reasoning_effort"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_runtime_defaults_absent_marks_not_configured_and_unreadable_apart() {
+        let (configured_root, configured_paths) =
+            claude_settings_fixture("not-configured", "{\"agentPushNotifEnabled\": true}\n");
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &configured_paths);
+        assert!(
+            capture.defaults.is_none(),
+            "an empty struct must not be attached when nothing is configured"
+        );
+        assert_eq!(
+            capture.capability.status,
+            AgentCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            capture.diagnostic.as_ref().map(|entry| entry.code.as_str()),
+            Some("claude_runtime_defaults_not_configured")
+        );
+        let _ = std::fs::remove_dir_all(configured_root);
+
+        let (missing_root, missing_paths) = claude_settings_fixture("unreadable", "");
+        let capture = claude_runtime_defaults_from_paths("2026-07-25T10:00:00Z", &missing_paths);
+        assert!(capture.defaults.is_none());
+        assert_eq!(
+            capture.diagnostic.as_ref().map(|entry| entry.code.as_str()),
+            Some("claude_runtime_defaults_unreadable")
+        );
+        let _ = std::fs::remove_dir_all(missing_root);
     }
 }
