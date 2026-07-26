@@ -48,11 +48,19 @@ otherwise stop collection with every health signal green.
 
 1. **The local floor (5 min)** — a hard guarantee. No tier, no server directive,
    and no filesystem event can produce more than one scan per interval.
-2. **`recommended_scan_after`** — may only ask for *less* frequent scanning than
-   the local tier decided. It is a cost directive, not a freshness lever; a server
-   that could shorten it would be asking the fleet to pay for the server's own
-   load. Unparsable values leave the previous directive alone rather than
-   inventing one.
+2. **`recommended_scan_after`** — a minimum interval **between scans**, anchored
+   to the last scan, and it may only ask for *less* frequent scanning than the
+   local tier decided. It is a cost directive, not a freshness lever; a server that
+   could shorten it would be asking the fleet to pay for the server's own load.
+   Unparsable values leave the previous directive alone rather than inventing one.
+
+   The anchoring is load-bearing, not stylistic. Treated as a *countdown* instead,
+   a directive re-read at the top of every cycle would push its own deadline
+   forward on every tick: a server that always says "come back in five minutes"
+   would stop the scan permanently, on a healthy machine, with nothing looking
+   wrong. Anchored to the last scan, the same repeated directive simply means "one
+   scan per five minutes" — and the wait strictly decreases as time passes, which
+   is a test.
 3. **The ceiling (30 min)** — bounds everything, including a server directive that
    would otherwise silence a source for a day.
 

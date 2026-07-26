@@ -249,72 +249,50 @@ fn with_source_cadence<T>(
 
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
 ///
-/// Three inputs, in this order of authority. The local floor wins over
-/// everything, always — it is the guarantee that no tier, no server directive and
-/// no filesystem event can produce more than one cycle per interval. The server's
-/// `recommended_scan_after` may only ever ask for *less* frequent scanning than
-/// the local tier decided (it is a cost directive, not a freshness lever, and a
-/// server that asked for more would be asking the fleet to pay for its own load).
-/// The 6-hour sweep deadline caps the result unconditionally.
-fn negotiated_wait(
-    cadence: &SourceCadence,
-    server_directive: Option<Duration>,
-    now: Instant,
-) -> Duration {
-    let tier = cadence.next_scan_after(now);
-    let requested = match server_directive {
-        Some(directive) => tier.max(directive),
-        None => tier,
-    };
-    requested.clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
+/// The tier arithmetic — including the server's requested minimum interval — lives
+/// in [`SourceCadence`], anchored to the last scan. That anchoring is load-bearing:
+/// a *relative* directive re-read on every cycle would push its own deadline
+/// forward forever and the scan would never run again, silently, on a healthy
+/// machine. All that remains here is the ceiling, which bounds a directive that
+/// would otherwise silence a source for a day.
+fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
+    cadence
+        .next_scan_after(now)
+        .clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
 }
 
 /// Remaining wait for `source`, or `None` when it is due now.
 fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
     let now = Instant::now();
-    let wait = with_source_cadence(source, |cadence| {
-        negotiated_wait(cadence, cached_server_scan_directive(source), now)
-    })
-    .unwrap_or(Duration::ZERO);
+    let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
+        .unwrap_or(Duration::ZERO);
     (!wait.is_zero()).then_some(wait)
 }
 
-/// The last `recommended_scan_after` the server sent, as a delay.
-static SOURCE_SCAN_DIRECTIVES: OnceLock<Mutex<BTreeMap<&'static str, Duration>>> = OnceLock::new();
-
-fn source_scan_directives() -> &'static Mutex<BTreeMap<&'static str, Duration>> {
-    SOURCE_SCAN_DIRECTIVES.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
+/// Fold the server's `recommended_scan_after` into the source's cadence as a
+/// minimum interval between scans.
+///
+/// An unparsable value leaves the previous directive alone rather than inventing
+/// one, and a value in the past means "no minimum", not a negative wait.
 fn record_server_scan_directive(source: SnapshotSource, recommended_scan_after: &str) {
     let Ok(recommended) = OffsetDateTime::parse(recommended_scan_after, &Rfc3339) else {
         return;
     };
     let delay = recommended - OffsetDateTime::now_utc();
-    let delay = if delay.is_negative() {
+    let requested = if delay.is_negative() {
         Duration::ZERO
     } else {
-        Duration::from_secs(delay.whole_seconds().unsigned_abs())
+        Duration::from_secs(delay.whole_seconds().unsigned_abs()).min(MAX_CYCLE_INTERVAL)
     };
-    if let Ok(mut directives) = source_scan_directives().lock() {
-        directives.insert(source.api_slug(), delay.min(MAX_CYCLE_INTERVAL));
-    }
-}
-
-fn cached_server_scan_directive(source: SnapshotSource) -> Option<Duration> {
-    source_scan_directives()
-        .lock()
-        .ok()
-        .and_then(|directives| directives.get(source.api_slug()).copied())
+    with_source_cadence(source, |cadence| {
+        cadence.set_server_min_interval(Some(requested))
+    });
 }
 
 #[cfg(test)]
 fn clear_cadence_state_for_test() {
     if let Ok(mut cadences) = source_cadences().lock() {
         cadences.clear();
-    }
-    if let Ok(mut directives) = source_scan_directives().lock() {
-        directives.clear();
     }
 }
 
@@ -3024,16 +3002,13 @@ mod tests {
         // A server directive may only ask for LESS frequent scanning. A directive
         // shorter than the tier cannot buy a faster scan, or the fleet would be
         // paying for the server's own load.
-        assert_eq!(
-            negotiated_wait(&cadence, Some(Duration::from_secs(1)), start),
-            floor
-        );
-        assert_eq!(negotiated_wait(&cadence, Some(floor * 2), start), floor * 2);
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(negotiated_wait(&cadence, start), floor);
+        cadence.set_server_min_interval(Some(floor * 2));
+        assert_eq!(negotiated_wait(&cadence, start), floor * 2);
         // And it cannot silence a source past the ceiling.
-        assert_eq!(
-            negotiated_wait(&cadence, Some(Duration::from_secs(24 * 60 * 60)), start),
-            MAX_CYCLE_INTERVAL
-        );
+        cadence.set_server_min_interval(Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(negotiated_wait(&cadence, start), MAX_CYCLE_INTERVAL);
         // The ceiling is stricter than the 6-hour sweep, so a full scan of the
         // window happens at least every 30 minutes whatever the watcher does.
         assert!(MAX_CYCLE_INTERVAL < CadenceConfig::cost_first(floor).full_sweep_interval);
@@ -3053,7 +3028,7 @@ mod tests {
         cadence.record_scan_success(start, 0);
         let later = start + Duration::from_secs(20 * 60);
         cadence.record_scan_success(later, 0);
-        let idle_wait = negotiated_wait(&cadence, None, later);
+        let idle_wait = negotiated_wait(&cadence, later);
         assert!(idle_wait > floor);
         assert!(idle_wait <= MAX_CYCLE_INTERVAL);
 
@@ -3062,36 +3037,63 @@ mod tests {
         for offset in 0..50 {
             cadence.record_file_event(later + Duration::from_secs(offset));
         }
-        assert_eq!(negotiated_wait(&cadence, None, later), floor);
-        assert!(negotiated_wait(&cadence, None, later + Duration::from_secs(1)) > Duration::ZERO);
+        assert_eq!(negotiated_wait(&cadence, later), floor);
+        assert!(negotiated_wait(&cadence, later + Duration::from_secs(1)) > Duration::ZERO);
         clear_cadence_state_for_test();
     }
 
     #[test]
     #[serial(source_cadences)]
-    fn a_server_scan_directive_is_read_and_bounded() {
+    fn a_server_scan_directive_is_read_bounded_and_cannot_starve_the_scan() {
         clear_cadence_state_for_test();
-        assert!(cached_server_scan_directive(SnapshotSource::Codex).is_none());
+        let wait_for = |source, now| {
+            with_source_cadence(source, |cadence| negotiated_wait(cadence, now)).expect("cadence")
+        };
 
-        // A directive in the past is "scan now", not a negative wait.
+        // A directive in the past is "no minimum", not a negative wait.
         record_server_scan_directive(SnapshotSource::Codex, "2020-01-01T00:00:00Z");
         assert_eq!(
-            cached_server_scan_directive(SnapshotSource::Codex),
-            Some(Duration::ZERO)
+            wait_for(SnapshotSource::Codex, Instant::now()),
+            Duration::ZERO
         );
-        // An unparsable directive leaves the previous value alone rather than
-        // inventing one.
-        record_server_scan_directive(SnapshotSource::Codex, "soon");
-        assert_eq!(
-            cached_server_scan_directive(SnapshotSource::Codex),
-            Some(Duration::ZERO)
-        );
-        // A far-future directive is bounded by the ceiling.
+
+        // A far-future directive is bounded by the ceiling: a server cannot
+        // silence a source for a day.
+        let scanned_at = Instant::now();
+        with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.record_scan_success(scanned_at, 1)
+        });
         record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
         assert_eq!(
-            cached_server_scan_directive(SnapshotSource::Codex),
-            Some(MAX_CYCLE_INTERVAL)
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
         );
+
+        // An unparsable directive leaves the previous one alone rather than
+        // inventing a value.
+        record_server_scan_directive(SnapshotSource::Codex, "soon");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
+        );
+
+        // The starvation case: re-reading a directive on every cycle must not push
+        // its own deadline forward. Anchored to the last scan, the wait strictly
+        // decreases as time passes — otherwise the scan would never run again, on a
+        // machine where nothing looks wrong.
+        let mut previous = MAX_CYCLE_INTERVAL + Duration::from_secs(1);
+        for elapsed in [0u64, 60, 600] {
+            record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+            let wait = wait_for(
+                SnapshotSource::Codex,
+                scanned_at + Duration::from_secs(elapsed),
+            );
+            assert!(
+                wait < previous,
+                "a refreshed directive must never extend its own deadline"
+            );
+            previous = wait;
+        }
         clear_cadence_state_for_test();
     }
 

@@ -68,6 +68,7 @@ pub struct SourceCadence {
     last_full_sweep_at: Option<Instant>,
     consecutive_failures: usize,
     disabled: bool,
+    server_min_interval: Option<Duration>,
 }
 
 impl SourceCadence {
@@ -80,7 +81,19 @@ impl SourceCadence {
             last_full_sweep_at: None,
             consecutive_failures: 0,
             disabled: false,
+            server_min_interval: None,
         }
+    }
+
+    /// A server-requested minimum interval **between scans**, not a countdown.
+    ///
+    /// The distinction is the whole safety property. A relative "come back in five
+    /// minutes" that is re-read on every cycle never elapses — each cycle would
+    /// push the deadline another five minutes out and the scan would never run
+    /// again, silently, on a healthy machine. Anchored to the last scan instead,
+    /// the same repeated directive simply means "one scan per five minutes".
+    pub fn set_server_min_interval(&mut self, interval: Option<Duration>) {
+        self.server_min_interval = interval;
     }
 
     pub fn state(&self) -> LocalCollectorState {
@@ -157,13 +170,20 @@ impl SourceCadence {
         if self.disabled {
             return self.config.cold_interval;
         }
-        let interval = match self.state {
+        let tier = match self.state {
             LocalCollectorState::Hot => self.config.hot_min_interval,
             LocalCollectorState::Warm => self.config.warm_interval,
             LocalCollectorState::Idle => self.config.idle_interval,
             LocalCollectorState::Cold => self.config.cold_interval,
             LocalCollectorState::Failing => self.failure_backoff(),
             LocalCollectorState::Disabled => self.config.cold_interval,
+        };
+        // The server may ask for a longer gap between scans, never a shorter one:
+        // it is a cost directive, and a server that could shorten it would be
+        // asking the fleet to pay for the server's own load.
+        let interval = match self.server_min_interval {
+            Some(requested) => tier.max(requested),
+            None => tier,
         };
         let since_scan = self
             .last_scan_at
@@ -306,6 +326,39 @@ mod tests {
         assert_eq!(
             cadence.next_scan_after(start + Duration::from_secs(70)),
             Duration::from_secs(110)
+        );
+    }
+
+    #[test]
+    fn a_repeated_server_directive_cannot_starve_the_scan() {
+        // The regression this guards: a relative directive re-read every cycle
+        // pushes its own deadline forward forever, so the scan never runs again
+        // and nothing looks wrong. Anchored to the last scan, a repeated
+        // "come back in 10 minutes" just means one scan per 10 minutes.
+        let start = Instant::now();
+        let interval = Duration::from_secs(10 * 60);
+        let mut cadence =
+            SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(5 * 60)));
+        cadence.record_scan_success(start, 1);
+
+        for elapsed in [0u64, 60, 300, 599] {
+            cadence.set_server_min_interval(Some(interval));
+            let now = start + Duration::from_secs(elapsed);
+            assert_eq!(
+                cadence.next_scan_after(now),
+                interval - Duration::from_secs(elapsed),
+                "the directive must count down from the last scan"
+            );
+        }
+        cadence.set_server_min_interval(Some(interval));
+        assert_eq!(cadence.next_scan_after(start + interval), Duration::ZERO);
+
+        // And it can only lengthen: a directive shorter than the tier is ignored.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(
+            cadence.next_scan_after(start),
+            Duration::from_secs(5 * 60),
+            "a short directive must not buy a faster scan"
         );
     }
 
