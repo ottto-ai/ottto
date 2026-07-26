@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 269,
-  "content_sha256": "e7f87e8dd425c174ccfff5de85fdf0c938b18ec10420c0952077231b38d84071",
+  "candidate_file_count": 270,
+  "content_sha256": "5e27cbcaff0f3095bc9e123533b373a7ed61c85aa06eafd82d7f9d77b5836bb1",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "82153a763e2c6635d81d92abd1183b72ebf91dd025ad7973b6c34f32f6072c7f",
-      "size_bytes": 319502
+      "sha256": "bf36b1fa719b18e1f374d3bfbbe446de3506fa07151a0186b3a7bac996015262",
+      "size_bytes": 326727
     },
     {
       "executable": false,
@@ -1030,6 +1030,13 @@
       "path": "docs/session-2026-07-25-claude-code-runtime-defaults.md",
       "sha256": "573a3f02f6b7b447880ad97d26c10503c029fe59f48c0963ee8b7cca18e79600",
       "size_bytes": 5178
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-claude-max-tier-refinement.md",
+      "sha256": "cba78708af61ade6cf003936ce104b10d136c235b82a2d981a1f520252d2ab9a",
+      "size_bytes": 1536
     },
     {
       "executable": false,
@@ -1886,9 +1893,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T17:27:27+00:00",
+  "generated_at": "2026-07-26T18:54:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 270,
+  "output_file_count": 271,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1922,5 +1929,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e24b88114e8c09ba01a815f9ed2159420bd4649d"
+  "source_commit": "135591fa91c65d3da77700942653edc6950c53e0"
 }
