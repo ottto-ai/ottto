@@ -697,7 +697,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 }
             }
         };
-    match collect_claude_oauth_usage(&version) {
+    match collect_claude_oauth_usage() {
         Ok(usage) if !usage.windows.is_empty() => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = usage.windows;
@@ -1988,7 +1988,7 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
     Ok(claude_statusline_context_from_cache(cache, history))
 }
 
-fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsage, String> {
+fn collect_claude_oauth_usage() -> Result<ClaudeOAuthUsage, String> {
     let now = current_unix_seconds();
     // Resolve the account BEFORE consulting the cache: every read below is
     // scoped to whoever owns the credential right now, so an account switch
@@ -2011,7 +2011,7 @@ fn collect_claude_oauth_usage(version: &CommandOutput) -> Result<ClaudeOAuthUsag
     let token = read_claude_oauth_access_token()
         .ok_or_else(|| "Claude OAuth credentials were not available locally.".to_string())?;
     let authorization = format!("Bearer {token}");
-    let user_agent = claude_code_user_agent(version);
+    let user_agent = ottto_user_agent();
     let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
         .set("Accept", "application/json")
         .set("Content-Type", "application/json")
@@ -2218,19 +2218,15 @@ fn claude_oauth_retry_after_epoch_seconds(response: &ureq::Response, now: u64) -
         .saturating_add(now)
 }
 
-fn claude_code_user_agent(version: &CommandOutput) -> String {
-    let version = if version.command_found && version.success {
-        version
-            .stdout
-            .split_whitespace()
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("2.1.0")
-    } else {
-        "2.1.0"
-    };
-    format!("claude-code/{version}")
+fn ottto_user_agent() -> String {
+    // Honest identification: Ottto reads the user's own aggregate usage and
+    // says so. Never present a claude-* client identity from an
+    // Ottto-originated request (recorded provider-endpoints posture,
+    // 2026-07-26).
+    format!(
+        "ottto/{} (subscription-usage-reader; +https://ottto.net)",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn claude_oauth_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
@@ -8250,5 +8246,19 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             Some("claude_runtime_defaults_unreadable")
         );
         let _ = std::fs::remove_dir_all(missing_root);
+    }
+
+    #[test]
+    fn ottto_user_agent_identifies_honestly() {
+        let user_agent = ottto_user_agent();
+        assert!(
+            user_agent.starts_with("ottto/"),
+            "usage reads must identify as ottto, got {user_agent}"
+        );
+        assert!(user_agent.contains("subscription-usage-reader"));
+        assert!(
+            !user_agent.to_ascii_lowercase().contains("claude"),
+            "never present a claude-* client identity: {user_agent}"
+        );
     }
 }

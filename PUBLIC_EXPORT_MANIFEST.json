@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 269,
-  "content_sha256": "e7f87e8dd425c174ccfff5de85fdf0c938b18ec10420c0952077231b38d84071",
+  "candidate_file_count": 270,
+  "content_sha256": "37e821185d858b90af33b140dd43be0f7c5cefdc7856f236b63c5856ef9605c1",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "82153a763e2c6635d81d92abd1183b72ebf91dd025ad7973b6c34f32f6072c7f",
-      "size_bytes": 319502
+      "sha256": "b60132d804c100fdfafddb16f80464abe264e4254d2a86b3b17f7fd127ed4018",
+      "size_bytes": 319932
     },
     {
       "executable": false,
@@ -1051,6 +1051,13 @@
       "path": "docs/session-2026-07-26-claude-subagent-session-attribution.md",
       "sha256": "7fe463012a02bfa69087702f5ff8774faf98ba5d6294176fcbf680ff8121570c",
       "size_bytes": 6891
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-honest-user-agent.md",
+      "sha256": "2f17746d4a01ccffac66edfb69994e378a177a2eba98b47668c2b969c7f1f4f5",
+      "size_bytes": 1250
     },
     {
       "executable": false,
@@ -1886,9 +1893,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T17:27:27+00:00",
+  "generated_at": "2026-07-26T18:54:00+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 270,
+  "output_file_count": 271,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1922,5 +1929,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e24b88114e8c09ba01a815f9ed2159420bd4649d"
+  "source_commit": "135591fa91c65d3da77700942653edc6950c53e0"
 }
