@@ -119,6 +119,7 @@ mod tests {
                 arch: "arm64".to_string(),
                 local_platform_version: "0.1.0".to_string(),
                 hardware_uuid: None,
+                account_scope: None,
             },
             "2026-05-05T00:00:00Z",
         );
