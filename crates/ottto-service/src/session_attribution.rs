@@ -728,15 +728,7 @@ pub fn direct_provider_facts(
                 _ => {}
             }
 
-            let provider_surface = if origin.originator.as_deref() == Some("Codex Desktop") {
-                Some("codex_desktop")
-            } else {
-                match origin.source.as_deref() {
-                    Some("cli") => Some("codex_cli"),
-                    Some("exec") => Some("codex_exec"),
-                    _ => None,
-                }
-            };
+            let provider_surface = provider_surface(SnapshotSource::Codex, Some(&origin));
             if let Some(value) = provider_surface {
                 push_fact(
                     &mut facts,
@@ -769,12 +761,7 @@ pub fn direct_provider_facts(
                     &evidence_context,
                 );
             }
-            let provider_surface = match origin.entrypoint.as_deref() {
-                Some("claude-desktop") => Some("claude_desktop"),
-                Some("cli") => Some("claude_cli"),
-                Some("sdk-cli") => Some("claude_sdk"),
-                _ => None,
-            };
+            let provider_surface = provider_surface(SnapshotSource::ClaudeCode, Some(&origin));
             if let Some(value) = provider_surface {
                 push_fact(
                     &mut facts,
@@ -838,15 +825,204 @@ pub fn direct_provider_facts(
     facts
 }
 
+/// Local subagent-tree descriptor for a Claude Code transcript, derived from the
+/// transcript's path plus its provider-written `*.meta.json` sidecar.
+///
+/// Every field is a provider-native identifier or an integer. No prompt text, no
+/// agent description, and no local filesystem path reaches this struct.
+pub struct ClaudeSubagentAttribution<'a> {
+    /// The top-level human session that owns the whole subagent tree, always the
+    /// raw session UUID regardless of nesting depth. This is the rollup key.
+    pub root_session_ref: &'a str,
+    /// `agentType` from the sidecar, e.g. `workflow-subagent`, `Explore`.
+    pub agent_kind: Option<&'a str>,
+    /// The provider agent id (transcript file stem with `agent-` stripped).
+    pub agent_ref: Option<&'a str>,
+    /// `spawnDepth` from the sidecar, stringified.
+    pub spawn_depth: Option<&'a str>,
+    /// The `wf_*` workflow directory when the agent ran under the Workflow tool.
+    pub workflow_ref: Option<&'a str>,
+}
+
+/// Fixed-name attribution facts for one Claude Code subagent session.
+///
+/// The field names here are a contract shared with the backend session
+/// attribution reader (`root_session_ref`, `agent_kind`, `agent_ref`,
+/// `spawn_depth`, `workflow_ref`); the DIRECT parent edge is emitted separately
+/// as `parent_session_ref` by `direct_provider_facts` from
+/// `SnapshotOrigin::parent_session_ref`. Facts are ordered most- to
+/// least-load-bearing because the caller trims from the tail to stay inside the
+/// bounded payload budget.
+pub fn claude_subagent_facts(
+    attribution: &ClaudeSubagentAttribution<'_>,
+    source_session_id: &str,
+    observed_at: &str,
+    source_version: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version,
+    };
+    push_fact(
+        &mut facts,
+        "root_session_ref",
+        attribution.root_session_ref,
+        "provider_native",
+        "direct",
+        &evidence_context,
+    );
+    // The sidecar is provider-written metadata rather than a transcript record,
+    // so it is evidence of kind `provider_artifact` -- same classification the
+    // workflow-orchestration footprint already uses.
+    if let Some(agent_kind) = attribution.agent_kind {
+        push_fact(
+            &mut facts,
+            "agent_kind",
+            agent_kind,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(agent_ref) = attribution.agent_ref {
+        push_fact(
+            &mut facts,
+            "agent_ref",
+            agent_ref,
+            "provider_native",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(workflow_ref) = attribution.workflow_ref {
+        push_fact(
+            &mut facts,
+            "workflow_ref",
+            workflow_ref,
+            "provider_native",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(spawn_depth) = attribution.spawn_depth {
+        push_fact(
+            &mut facts,
+            "spawn_depth",
+            spawn_depth,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    facts
+}
+
+pub(crate) fn provider_surface(
+    source: SnapshotSource,
+    origin: Option<&SnapshotOrigin>,
+) -> Option<&'static str> {
+    match source {
+        SnapshotSource::Codex => origin.and_then(codex_provider_surface),
+        SnapshotSource::ClaudeCode => match origin.and_then(|value| value.entrypoint.as_deref()) {
+            Some("claude-desktop") => Some("claude_desktop"),
+            Some("cli") => Some("claude_cli"),
+            Some("sdk-cli") => Some("claude_sdk"),
+            _ => None,
+        },
+        SnapshotSource::Pi => Some("pi_cli"),
+    }
+}
+
+fn codex_provider_surface(origin: &SnapshotOrigin) -> Option<&'static str> {
+    let originator = origin.originator.as_deref().map(str::trim);
+    if originator.is_some_and(|value| {
+        value.eq_ignore_ascii_case("Codex Desktop")
+            || value.eq_ignore_ascii_case("codex_work_desktop")
+            || value.eq_ignore_ascii_case("codex_desktop")
+    }) {
+        return Some("codex_desktop");
+    }
+    if originator.is_some_and(|value| {
+        value.eq_ignore_ascii_case("codex_cli_rs")
+            || value.eq_ignore_ascii_case("codex-tui")
+            || value.eq_ignore_ascii_case("codex_tui")
+    }) {
+        return Some("codex_cli");
+    }
+    if originator.is_some_and(|value| value.eq_ignore_ascii_case("codex_exec")) {
+        return Some("codex_exec");
+    }
+    match origin.source.as_deref().map(str::trim) {
+        Some(value)
+            if value.eq_ignore_ascii_case("cli")
+                || value.eq_ignore_ascii_case("codex_cli")
+                || value.eq_ignore_ascii_case("codex_cli_rs") =>
+        {
+            Some("codex_cli")
+        }
+        Some(value)
+            if value.eq_ignore_ascii_case("exec") || value.eq_ignore_ascii_case("codex_exec") =>
+        {
+            Some("codex_exec")
+        }
+        _ => None,
+    }
+}
+
+/// Bound a fact list to the wire contract, reporting anything dropped.
+///
+/// Truncation is real attribution loss, so it must never be silent. The byte
+/// budget binds long before the fact-count cap: one fact carries a mandatory
+/// `sha256:` evidence reference and costs roughly 300 bytes, so about six fit
+/// inside the budget while the count cap allows `MAX_SESSION_ATTRIBUTION_FACTS`.
+/// Facts are dropped from the tail, which is exactly where grouping evidence
+/// (`template_group_id`, `schedule_definition_id`, `skill_id`) is appended after
+/// the direct provider facts, so a skill-heavy session loses its grouping
+/// signals first.
+///
+/// Only field names and counts are reported. Fact values carry opaque
+/// org-keyed identifiers and never belong in a log line.
 pub(crate) fn enforce_fact_limits(facts: &mut Vec<SessionAttributionFact>) {
-    facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    let before = facts.len();
+    let mut dropped_fields: Vec<String> = Vec::new();
+
+    if facts.len() > MAX_SESSION_ATTRIBUTION_FACTS {
+        dropped_fields.extend(
+            facts[MAX_SESSION_ATTRIBUTION_FACTS..]
+                .iter()
+                .map(|fact| fact.field.clone()),
+        );
+        facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    }
+    let over_count_cap = before - facts.len();
+
     while facts.len() > 1
         && serde_json::to_vec(facts)
             .map(|payload| payload.len() > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES)
             .unwrap_or(true)
     {
-        facts.pop();
+        if let Some(fact) = facts.pop() {
+            dropped_fields.push(fact.field);
+        }
     }
+
+    let dropped = before - facts.len();
+    if dropped == 0 {
+        return;
+    }
+    dropped_fields.sort();
+    dropped_fields.dedup();
+    eprintln!(
+        "ottto-service: dropped {dropped} attribution fact(s) to fit the wire contract \
+         ({over_count_cap} over the {MAX_SESSION_ATTRIBUTION_FACTS}-fact cap, {} over the \
+         {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES}-byte budget); kept {}; affected fields: {}. \
+         Session attribution for this session is incomplete.",
+        dropped - over_count_cap,
+        facts.len(),
+        dropped_fields.join(", "),
+    );
 }
 
 pub(crate) fn strip_display_labels(facts: &mut [SessionAttributionFact]) -> bool {
@@ -1031,6 +1207,32 @@ mod tests {
         );
         assert!(!facts.iter().any(|fact| fact.field == "provider_surface"));
         assert!(!facts.iter().any(|fact| fact.field == "origin_kind"));
+    }
+
+    #[test]
+    fn codex_provider_surface_recognizes_current_desktop_cli_and_exec_markers() {
+        let cases = [
+            ("codex_work_desktop", None, "codex_desktop"),
+            ("codex_cli_rs", Some("vscode"), "codex_cli"),
+            ("codex_exec", None, "codex_exec"),
+        ];
+        for (originator, source, expected) in cases {
+            let mut origin = origin();
+            origin.originator = Some(originator.to_string());
+            origin.source = source.map(str::to_string);
+            let facts = direct_provider_facts(
+                SnapshotSource::Codex,
+                Some(&origin),
+                "surface-session",
+                "2026-07-19T00:00:00Z",
+                "codex_jsonl:v21",
+            );
+            assert!(facts.iter().any(|fact| {
+                fact.field == "provider_surface"
+                    && fact.value == expected
+                    && fact.evidence.strength == "direct"
+            }));
+        }
     }
 
     #[test]
@@ -1348,5 +1550,85 @@ status = "ACTIVE"
             .starts_with("hmac-sha256:v1:"));
         assert!(!inventory.definitions[0].opaque_id.contains("schedule-1"));
         fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    fn budget_fact(field: &str) -> SessionAttributionFact {
+        SessionAttributionFact {
+            field: field.to_string(),
+            value: "b".repeat(32),
+            display_label: None,
+            display_label_source: None,
+            evidence: SessionFieldEvidence {
+                kind: "provider_native".to_string(),
+                strength: "direct".to_string(),
+                observed_at: "2026-07-26T07:20:49Z".to_string(),
+                source_version: "claude_code_jsonl:v19".to_string(),
+                evidence_ref: format!("sha256:{}", "a".repeat(64)),
+            },
+        }
+    }
+
+    fn fits_wire_budget(facts: &[SessionAttributionFact]) -> bool {
+        serde_json::to_vec(facts).expect("serialize").len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+    }
+
+    #[test]
+    fn enforce_fact_limits_keeps_a_within_budget_list_intact() {
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+        ];
+        assert!(fits_wire_budget(&facts));
+
+        enforce_fact_limits(&mut facts);
+
+        assert_eq!(facts.len(), 3);
+        assert!(fits_wire_budget(&facts));
+    }
+
+    #[test]
+    fn enforce_fact_limits_drops_trailing_grouping_facts_over_the_byte_budget() {
+        // The byte budget binds well before the fact-count cap, and facts are
+        // dropped from the tail, so a skill-heavy session loses the grouping
+        // evidence appended after its direct provider facts.
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+            budget_fact("template_group_id"),
+        ];
+        facts.extend((0..8).map(|_| budget_fact("skill_id")));
+        let before = facts.len();
+        assert!(before < MAX_SESSION_ATTRIBUTION_FACTS);
+        assert!(!fits_wire_budget(&facts));
+
+        enforce_fact_limits(&mut facts);
+
+        assert!(facts.len() < before);
+        assert!(fits_wire_budget(&facts));
+        // Truncation is tail-first, so the leading direct provider facts survive
+        // intact while the trailing skill evidence is what actually gets lost.
+        assert_eq!(facts[0].field, "origin_kind");
+        assert_eq!(facts[1].field, "provider_surface");
+        assert_eq!(facts[2].field, "execution_mode");
+        assert_eq!(facts[3].field, "template_group_id");
+        let surviving_skills = facts.iter().filter(|fact| fact.field == "skill_id").count();
+        assert!(
+            surviving_skills < 8,
+            "expected skill evidence to be dropped"
+        );
+    }
+
+    #[test]
+    fn enforce_fact_limits_applies_the_count_cap_before_the_byte_budget() {
+        let mut facts: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS + 5)
+            .map(|_| budget_fact("skill_id"))
+            .collect();
+
+        enforce_fact_limits(&mut facts);
+
+        assert!(facts.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
+        assert!(fits_wire_budget(&facts));
     }
 }

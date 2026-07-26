@@ -21,6 +21,8 @@ CLI and `ottto-service` daemon, not private development scripts.
   testing, status, and explicit sync through the local daemon.
 - [Agent Adapters](agent-adapters.md): Codex and Claude Code lifecycle adapter
   boundaries, Pi CLI usage, and the public-v1 MCP deferral.
+- [Active Session Surfaces](session-surfaces.md): canonical Desktop, CLI,
+  exec, and SDK provenance in local active-session status.
 - [Release Verification](release-verification.md): checksums, signing,
   notarization, SBOM, and provenance checks.
 - [Troubleshooting](troubleshooting.md): common exit codes and recovery steps.

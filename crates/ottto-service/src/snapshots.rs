@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -108,16 +108,44 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // v22/v19/v10: activate the backend-gated session-attribution wire contract.
 // Facts join the fingerprint only when present, and all three versions advance
 // atomically so already-indexed history is revisited once.
+// claude_code v20: complete the v13 subagent re-key. v13 only recognized a
+// subagent transcript whose IMMEDIATE parent directory is `subagents`, which is
+// true for a Task-tool agent (`<sessionId>/subagents/agent-<id>.jsonl`) but NOT
+// for a Workflow-tool agent, whose transcript sits one or two levels deeper at
+// `<sessionId>/subagents/workflows/<wfId>/agent-<id>.jsonl`. Those files carry
+// the PARENT's `sessionId` on every line just like the Task-tool ones, so they
+// kept collapsing onto the human parent session: an arbitrary workflow agent's
+// slice (its model, its totals, `isSidechain=true` -> ai_agent, its context
+// watermark) overwrote the real orchestrator session under last-writer-wins
+// promotion. The subagent test is now "ANY ancestor directory is `subagents`",
+// the parent session id is read from the PATH (the directory whose child is
+// `subagents`) rather than from the in-file `sessionId`, and the workflow
+// journal (`.../subagents/workflows/<wfId>/journal.jsonl`) is excluded from
+// snapshot emission outright: it carries no `message.usage` and no `sessionId`,
+// and its `journal` file stem is not unique across the workflow directories of
+// one parent session. The bump re-walks every Claude transcript once so already
+// scanned workflow-agent files re-emit under their own
+// `<parentSessionId>_agent-<agentId>` id instead of over their parent.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v19";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v20";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
 // by the 0.1.91 baseline so upgrading to semantic sync does not itself select
 // every indexed transcript. Advance only for a reviewed scan-index derivation
 // change, never for ordinary parser implementation work.
+//
+// claude_code v20 IS such a change and is the reason this constant moves with
+// the parser version here: the scan index skips a transcript whose bytes and
+// mtime are unchanged, so a parser-version bump alone (which no longer feeds
+// `scan_file_fingerprint_with_context`) would leave every already-indexed
+// workflow-agent file permanently skipped and the fix inert on existing
+// installs. The derivation that changed is which SESSION a file maps to, which
+// is scan identity, not parser provenance. Cost of the one-time revisit stays
+// bounded: an unchanged session re-parses to the same semantic fingerprint and
+// is suppressed as a semantic no-op instead of being re-uploaded.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v19";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v20";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
@@ -2123,10 +2151,11 @@ impl SnapshotAccumulator {
         let Some(session_id) = session_id else {
             return;
         };
-        // A Task-tool subagent transcript carries its PARENT's sessionId on
-        // every line (re-keyed later in into_items); never hand a subagent
-        // session its parent's desktop title.
-        if claude_subagent_source_session_id(path, &session_id).is_some() {
+        // A subagent transcript (Task tool or Workflow tool, at any nesting
+        // depth under `subagents/`) carries its PARENT's sessionId on every line
+        // and is re-keyed later in into_items; never hand a subagent session its
+        // parent's desktop title.
+        if claude_subagent_identity(path).is_some() {
             return;
         }
         let Some(candidate) = metadata.titles.get(session_id.as_str()) else {
@@ -2306,6 +2335,14 @@ impl SnapshotAccumulator {
         source_file_fingerprint: String,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> Vec<SnapshotItem> {
+        // Defence in depth: the scan already refuses to collect the Workflow
+        // journal, but the parse entry points are public, so nothing downstream
+        // may mint a `<parentSessionId>_journal` session either.
+        if self.source == SnapshotSource::ClaudeCode
+            && claude_transcript_excluded_from_snapshots(path)
+        {
+            return Vec::new();
+        }
         let Some(source_session_id) = self
             .source_session_id
             .clone()
@@ -2322,15 +2359,37 @@ impl SnapshotAccumulator {
         else {
             return Vec::new();
         };
-        // A Claude Code Task-tool subagent transcript shares its parent's
-        // `sessionId`; re-key it to a distinct id so it ingests as its own
-        // `isSidechain=true` (ai_agent) session instead of collapsing into the
-        // human parent. Top-level transcripts are unchanged.
-        let source_session_id = if self.source == SnapshotSource::ClaudeCode {
-            claude_subagent_source_session_id(path, &source_session_id).unwrap_or(source_session_id)
-        } else {
-            source_session_id
+        // A Claude Code subagent transcript (Task tool or Workflow tool) shares
+        // its parent's `sessionId`; re-key it from its PATH to a distinct id so
+        // it ingests as its own `isSidechain=true` (ai_agent) session instead of
+        // collapsing into -- and overwriting -- the human parent. Top-level
+        // transcripts are unchanged.
+        let claude_subagent = (self.source == SnapshotSource::ClaudeCode)
+            .then(|| claude_subagent_identity(path))
+            .flatten();
+        let source_session_id = match claude_subagent.as_ref() {
+            Some(identity) => identity.source_session_id(),
+            None => source_session_id,
         };
+        // Subagent tree position, read from the provider's own sidecar. Absent
+        // or malformed metadata simply leaves the derived facts absent.
+        let claude_agent_meta = claude_subagent
+            .as_ref()
+            .map(|_| read_claude_agent_meta(path))
+            .unwrap_or_default();
+        if let Some(identity) = claude_subagent.as_ref() {
+            // DIRECT parent: the top-level session for a depth-1 agent, or the
+            // spawning agent's own re-keyed session id when the provider records
+            // a `parentAgentId`, so the tree edge is exact rather than flattened
+            // onto the root.
+            self.origin.parent_session_ref =
+                Some(match claude_agent_meta.parent_agent_id.as_deref() {
+                    Some(parent_agent_id) => {
+                        format!("{}_agent-{parent_agent_id}", identity.root_session_id)
+                    }
+                    None => identity.root_session_id.clone(),
+                });
+        }
         // Claude Code dynamic workflow orchestration (the Workflow tool, e.g.
         // `ultracode`) leaves a local manifest at
         // `<projectDir>/<sessionId>/workflows/wf_*.json` -- a sibling directory
@@ -2353,6 +2412,24 @@ impl SnapshotAccumulator {
             collected_at,
             self.source.parser_version(),
         );
+        // Subagent identity rides immediately behind the direct provider facts
+        // and ahead of the grouping facts: `enforce_fact_limits` trims from the
+        // tail, so the tree edges and the agent identity outrank the derived
+        // grouping ids inside the bounded payload budget.
+        if let Some(identity) = claude_subagent.as_ref() {
+            attribution_facts.extend(crate::session_attribution::claude_subagent_facts(
+                &crate::session_attribution::ClaudeSubagentAttribution {
+                    root_session_ref: &identity.root_session_id,
+                    agent_kind: claude_agent_meta.agent_kind.as_deref(),
+                    agent_ref: identity.agent_ref(),
+                    spawn_depth: claude_agent_meta.spawn_depth.as_deref(),
+                    workflow_ref: identity.workflow_ref.as_deref(),
+                },
+                &source_session_id,
+                collected_at,
+                self.source.parser_version(),
+            ));
+        }
         if let Some(context) = attribution_context {
             attribution_facts.extend(
                 context.grouping_facts(
@@ -2372,8 +2449,12 @@ impl SnapshotAccumulator {
                     },
                 ),
             );
-            crate::session_attribution::enforce_fact_limits(&mut attribution_facts);
         }
+        // Unconditional: `direct_provider_facts` bounds only its own output, so
+        // anything appended after it (subagent identity, grouping ids) has to be
+        // re-bounded here or an item could exceed the payload budget the backend
+        // schema rejects.
+        crate::session_attribution::enforce_fact_limits(&mut attribution_facts);
         let collector = match self.source {
             SnapshotSource::Codex => "codex_jsonl".to_string(),
             SnapshotSource::ClaudeCode => "claude_code_jsonl".to_string(),
@@ -2823,13 +2904,11 @@ fn scan_source_roots_with_limit_and_attribution(
                 })
                 .unwrap_or_default(),
             SnapshotSource::ClaudeCode => {
-                let is_subagent = candidate
-                    .path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|value| value.to_str())
-                    == Some("subagents");
-                if is_subagent {
+                // A subagent transcript at any depth under `subagents/` has no
+                // desktop-store entry of its own: its file stem is an agent id,
+                // never a session id, so looking one up would either miss or
+                // (worse) collide with an unrelated session.
+                if claude_subagent_identity(&candidate.path).is_some() {
                     String::new()
                 } else {
                     candidate
@@ -5772,6 +5851,12 @@ fn collect_recent_jsonl_files(
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
             continue;
         }
+        // Claude's Workflow-tool journal is bookkeeping, never a session. Drop
+        // it before it can be fingerprinted, indexed, or parsed.
+        if source == SnapshotSource::ClaudeCode && claude_transcript_excluded_from_snapshots(&path)
+        {
+            continue;
+        }
         let modified_unix_seconds = metadata
             .modified()
             .ok()
@@ -6236,28 +6321,214 @@ fn codex_session_id_from_path(path: &Path) -> Option<String> {
     None
 }
 
-/// Claude Code Task-tool subagents write their transcript to
-/// `<projectDir>/<parentSessionId>/subagents/agent-<agentId>.jsonl`, and every
-/// line inside is stamped with the *parent's* `sessionId`. Left alone, the
-/// subagent's `source_session_id` therefore equals the parent's and it collapses
-/// into the human-started parent session -- so its `isSidechain=true` origin
-/// never stands up as its own (ai_agent) session on the backend.
+/// Where a Claude Code subagent transcript sits inside its parent session's
+/// on-disk tree.
 ///
-/// Detect the subagent transcript by its enclosing `subagents` directory and
-/// mint a distinct session id `<parentSessionId>_<agentFileStem>`. The id must
-/// stay URL-path-safe: the backend uses `source_session_id` verbatim as its
-/// `Session.session_id`, which rides in `/sessions/{session_id}/...` routes, so
-/// the join uses `_` (never `/`) and every component is already lowercase.
-/// Ordinary top-level transcripts return `None` and keep their raw `sessionId`.
-fn claude_subagent_source_session_id(path: &Path, parent_session_id: &str) -> Option<String> {
-    if path.parent()?.file_name()?.to_str()? != "subagents" {
+/// Claude Code writes exactly four JSONL layouts under `~/.claude/projects`:
+///
+/// 1. `<projectDir>/<sessionId>.jsonl` — the human top-level session.
+/// 2. `<projectDir>/<sessionId>/subagents/agent-<agentId>.jsonl` — Task tool.
+/// 3. `<projectDir>/<sessionId>/subagents/workflows/<wfId>/agent-<agentId>.jsonl`
+///    — Workflow tool (dynamic multi-agent orchestration).
+/// 4. `<projectDir>/<sessionId>/subagents/workflows/<wfId>/journal.jsonl` — the
+///    Workflow tool's bookkeeping log (no usage rows; excluded from snapshots,
+///    see `claude_transcript_excluded_from_snapshots`).
+///
+/// Every line of layouts 2-4 is stamped with the *parent's* `sessionId`, so the
+/// path -- not the file contents -- is the authority on which session a
+/// transcript belongs to. `root_session_id` is therefore read from the directory
+/// whose child is `subagents`; the in-file `sessionId` is corroboration only and
+/// is deliberately never used to build the id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeSubagentIdentity {
+    /// Directory name of the top-level session that owns this `subagents` tree.
+    /// Always the raw human-session UUID, at any nesting depth.
+    root_session_id: String,
+    /// The transcript's file stem, e.g. `agent-a4d1585d310070d0f`. Stems are
+    /// unique within one parent session across all of its subagent directories.
+    file_stem: String,
+    /// The `wf_*` directory name when the transcript sits under a `workflows/`
+    /// directory inside the `subagents` tree (layout 3), else `None`.
+    workflow_ref: Option<String>,
+}
+
+impl ClaudeSubagentIdentity {
+    /// The re-keyed `source_session_id`, `<parentSessionId>_<fileStem>`.
+    ///
+    /// The id must stay URL-path-safe: the backend uses `source_session_id`
+    /// verbatim as its `Session.session_id`, which rides in
+    /// `/sessions/{session_id}/...` routes, so the join uses `_` (never `/`).
+    /// The scheme is unchanged from v13 so ids already minted for layout 2 keep
+    /// resolving to the same backend session.
+    fn source_session_id(&self) -> String {
+        format!("{}_{}", self.root_session_id, self.file_stem)
+    }
+
+    /// The bare provider agent id (`agent-` prefix stripped), when the stem
+    /// carries one.
+    fn agent_ref(&self) -> Option<&str> {
+        self.file_stem
+            .strip_prefix("agent-")
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Resolve a Claude Code transcript path to its subagent identity.
+///
+/// Fires when ANY ancestor directory (not merely the immediate parent) is named
+/// `subagents`, which is what separates this from the v13 behaviour: layouts 3
+/// and 4 nest one or two directories deeper and were previously left keyed on
+/// their parent's `sessionId`. Ordinary top-level transcripts return `None` and
+/// keep their raw in-file `sessionId`.
+pub(crate) fn claude_subagent_identity(path: &Path) -> Option<ClaudeSubagentIdentity> {
+    let file_stem = path.file_stem()?.to_str()?;
+    if file_stem.is_empty() {
         return None;
     }
-    let agent_file_stem = path.file_stem()?.to_str()?;
-    if agent_file_stem.is_empty() {
+    let directories: Vec<&str> = path
+        .parent()?
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    // Nearest enclosing `subagents` directory wins, so a project directory that
+    // happens to contain the word higher up cannot capture the transcript.
+    let marker = directories
+        .iter()
+        .rposition(|value| *value == "subagents")?;
+    let root_session_id = *directories.get(marker.checked_sub(1)?)?;
+    if root_session_id.is_empty() {
         return None;
     }
-    Some(format!("{parent_session_id}_{agent_file_stem}"))
+    // Segments BETWEEN `subagents` and the file. Layout 2 has none; layout 3/4
+    // has `workflows/<wfId>`.
+    let nested = &directories[marker + 1..];
+    let workflow_ref = nested
+        .iter()
+        .position(|value| *value == "workflows")
+        .and_then(|index| nested.get(index + 1))
+        .filter(|value| !value.is_empty())
+        .map(|value| (*value).to_string());
+    Some(ClaudeSubagentIdentity {
+        root_session_id: root_session_id.to_string(),
+        file_stem: file_stem.to_string(),
+        workflow_ref,
+    })
+}
+
+/// Convenience wrapper: the re-keyed `source_session_id` for a subagent
+/// transcript, or `None` for an ordinary top-level transcript. The production
+/// path uses `claude_subagent_identity` directly because it also needs the
+/// workflow and agent references.
+#[cfg(test)]
+fn claude_subagent_source_session_id(path: &Path) -> Option<String> {
+    claude_subagent_identity(path).map(|identity| identity.source_session_id())
+}
+
+/// Claude transcripts that must never produce a snapshot.
+///
+/// The Workflow tool's `journal.jsonl` (layout 4) is bookkeeping, not a
+/// transcript: it has no `message.usage` rows and no `sessionId` field at all,
+/// and its `journal` file stem is NOT unique within a parent session -- a
+/// session with two workflow directories has two `journal.jsonl` files that
+/// would both re-key to `<parentSessionId>_journal` and fight over one backend
+/// session. Excluding it at collection time keeps that id from ever existing.
+fn claude_transcript_excluded_from_snapshots(path: &Path) -> bool {
+    path.file_name().and_then(|value| value.to_str()) == Some("journal.jsonl")
+        && claude_subagent_identity(path).is_some()
+}
+
+/// Upper bound for a subagent `*.meta.json` sidecar read. The observed files are
+/// a few hundred bytes; the cap only stops a pathological local file from being
+/// slurped into the per-user daemon.
+const MAX_CLAUDE_AGENT_META_BYTES: u64 = 64 * 1024;
+
+/// Provider-written sidecar describing one Claude Code subagent, read from
+/// `<transcript>.meta.json` (e.g. `agent-a4d15....meta.json`).
+///
+/// Only the fields that are safe to forward are retained. `description`,
+/// `worktreePath`, and `worktreeBranch` are deliberately NOT read: they carry
+/// user prompt material and local filesystem paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeAgentMeta {
+    /// `agentType`, e.g. `workflow-subagent`, `Explore`, `general-purpose`.
+    agent_kind: Option<String>,
+    /// `spawnDepth` rendered as a string (1 for a directly spawned agent).
+    spawn_depth: Option<String>,
+    /// `parentAgentId` when this agent was spawned by another agent rather than
+    /// by the top-level session.
+    parent_agent_id: Option<String>,
+}
+
+/// Best-effort read of a subagent's `*.meta.json` sidecar.
+///
+/// Every failure mode (absent file, oversized file, unreadable bytes, invalid
+/// JSON, unexpected value types, unsafe characters) degrades to an absent field.
+/// A malformed sidecar must never drop or fail the session it describes.
+fn read_claude_agent_meta(transcript_path: &Path) -> ClaudeAgentMeta {
+    let meta_path = transcript_path.with_extension("meta.json");
+    let Ok(metadata) = fs::metadata(&meta_path) else {
+        return ClaudeAgentMeta::default();
+    };
+    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_AGENT_META_BYTES {
+        return ClaudeAgentMeta::default();
+    }
+    let Ok(file) = File::open(&meta_path) else {
+        return ClaudeAgentMeta::default();
+    };
+    // Bounded read, never a slurp: the same streaming discipline the transcript
+    // reader uses, so a sidecar that grew pathologically cannot be materialized
+    // whole in the per-user daemon.
+    let mut raw = Vec::new();
+    if file
+        .take(MAX_CLAUDE_AGENT_META_BYTES)
+        .read_to_end(&mut raw)
+        .is_err()
+    {
+        return ClaudeAgentMeta::default();
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
+        return ClaudeAgentMeta::default();
+    };
+    ClaudeAgentMeta {
+        agent_kind: string_at(&value, &["agentType"]).and_then(safe_attribution_token),
+        spawn_depth: value
+            .get("spawnDepth")
+            .and_then(Value::as_u64)
+            .map(|depth| depth.to_string()),
+        parent_agent_id: string_at(&value, &["parentAgentId"]).and_then(safe_attribution_token),
+    }
+}
+
+/// Path-like fragments the backend fact validator rejects outright. One
+/// rejected fact fails the WHOLE upload batch, so a provider-supplied token that
+/// would trip the remote check is dropped locally instead. Kept in sync with
+/// `_ARTIFACT_FORBIDDEN_FRAGMENTS` in the backend snapshot schema; the
+/// separator-bearing entries there are unreachable through the character
+/// allowlist below.
+const ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS: [&str; 4] =
+    [".codex", ".claude", "workspace_path", "transcript_path"];
+
+/// Conservative allowlist for provider-supplied identifiers that become
+/// attribution fact values. Anything outside `[A-Za-z0-9._:-]`, or longer than
+/// 64 characters, is dropped rather than sanitized: a value that does not look
+/// like a provider identifier is not one, and no local path can survive this.
+fn safe_attribution_token(value: String) -> Option<String> {
+    if value.is_empty() || value.len() > 64 {
+        return None;
+    }
+    if !value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '-')
+    }) {
+        return None;
+    }
+    let lowered = value.to_ascii_lowercase();
+    ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS
+        .iter()
+        .all(|fragment| !lowered.contains(fragment))
+        .then_some(value)
 }
 
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
@@ -10363,20 +10634,747 @@ mod tests {
     }
 
     #[test]
-    fn claude_subagent_source_session_id_discriminates_by_subagents_dir() {
-        // Helper contract: only transcripts whose immediate parent directory is
-        // `subagents` are re-keyed; everything else returns None (raw id kept).
-        let sub = Path::new("/p/proj/PARENT/subagents/agent-abc123.jsonl");
+    fn claude_subagent_source_session_id_discriminates_by_subagents_ancestor() {
+        // Helper contract (v20): a transcript is a subagent transcript when ANY
+        // ancestor directory is `subagents`, and the parent session id comes
+        // from the PATH -- the directory whose child is `subagents` -- never
+        // from the in-file `sessionId`.
+
+        // Layout 2, Task tool: immediate parent is `subagents`. The v13 id
+        // scheme is preserved byte-for-byte so ids already minted for these
+        // files keep resolving to the same backend session.
+        let task_agent = Path::new("/p/proj/PARENT/subagents/agent-abc123.jsonl");
         assert_eq!(
-            claude_subagent_source_session_id(sub, "PARENT").as_deref(),
+            claude_subagent_source_session_id(task_agent).as_deref(),
             Some("PARENT_agent-abc123")
         );
-        // Top-level transcript -> None.
+
+        // Layout 3, Workflow tool: two directories deeper. This is the case v19
+        // returned None for, which is what let workflow agents overwrite their
+        // human parent session.
+        let workflow_agent =
+            Path::new("/p/proj/PARENT/subagents/workflows/wf_ffe2de5a-c85/agent-abc123.jsonl");
+        assert_eq!(
+            claude_subagent_source_session_id(workflow_agent).as_deref(),
+            Some("PARENT_agent-abc123")
+        );
+        let identity = claude_subagent_identity(workflow_agent).expect("workflow identity");
+        assert_eq!(identity.root_session_id, "PARENT");
+        assert_eq!(identity.workflow_ref.as_deref(), Some("wf_ffe2de5a-c85"));
+        assert_eq!(identity.agent_ref(), Some("abc123"));
+
+        // Layout 4, the Workflow journal, resolves as a subagent path (so the
+        // exclusion below can key off it) but is never emitted.
+        let journal = Path::new("/p/proj/PARENT/subagents/workflows/wf_ffe2de5a-c85/journal.jsonl");
+        assert_eq!(
+            claude_subagent_source_session_id(journal).as_deref(),
+            Some("PARENT_journal")
+        );
+        assert!(claude_transcript_excluded_from_snapshots(journal));
+
+        // Arbitrarily deep nesting still resolves to the session directory that
+        // owns the `subagents` tree, not to an intermediate directory.
+        let deep = Path::new("/p/proj/PARENT/subagents/workflows/wf_a/inner/deeper/agent-z9.jsonl");
+        assert_eq!(
+            claude_subagent_source_session_id(deep).as_deref(),
+            Some("PARENT_agent-z9")
+        );
+        assert_eq!(
+            claude_subagent_identity(deep)
+                .expect("deep identity")
+                .workflow_ref
+                .as_deref(),
+            Some("wf_a")
+        );
+
+        // Layout 1, top-level transcript -> None (raw in-file id kept).
         let top = Path::new("/p/proj/PARENT.jsonl");
-        assert_eq!(claude_subagent_source_session_id(top, "PARENT"), None);
-        // A nested but non-`subagents` sibling dir -> None.
+        assert_eq!(claude_subagent_source_session_id(top), None);
+        assert!(!claude_transcript_excluded_from_snapshots(top));
+
+        // A nested but non-`subagents` sibling dir -> None. `workflows/` under
+        // the SESSION directory holds wf_*.json manifests, not transcripts.
         let other = Path::new("/p/proj/PARENT/workflows/wf.jsonl");
-        assert_eq!(claude_subagent_source_session_id(other, "PARENT"), None);
+        assert_eq!(claude_subagent_source_session_id(other), None);
+        // A `journal.jsonl` outside any `subagents` tree is an ordinary file and
+        // must not be swept up by the exclusion.
+        let unrelated_journal = Path::new("/p/proj/PARENT/journal.jsonl");
+        assert!(!claude_transcript_excluded_from_snapshots(
+            unrelated_journal
+        ));
+
+        // `subagents` with no owning session directory above it cannot name a
+        // parent, so it is not treated as a subagent transcript.
+        let orphan = Path::new("subagents/agent-abc123.jsonl");
+        assert_eq!(claude_subagent_source_session_id(orphan), None);
+    }
+
+    #[test]
+    fn claude_workflow_subagent_rekeys_off_its_parent_and_carries_tree_facts() {
+        // The live bug: a Workflow-tool agent transcript nested under
+        // `subagents/workflows/<wfId>/` carries the PARENT's sessionId on every
+        // line, so before v20 it uploaded a snapshot claiming to BE the parent
+        // human session and overwrote it under last-writer-wins promotion.
+        let root = temp_dir("claude-workflow-subagent");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let workflow_dir = root
+            .join(parent_session)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_ffe2de5a-c85");
+        fs::create_dir_all(&workflow_dir).expect("create workflow dir");
+        let path = workflow_dir.join("agent-a4d1585d310070d0f.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-24T09:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"1338a80a-f36e-4cbc-a5bb-50fc66430ba5\",\"agentId\":\"a4d1585d310070d0f\",\"isSidechain\":true,\"entrypoint\":\"cli\",\"message\":{\"role\":\"user\",\"content\":\"research\"}}\n",
+                "{\"timestamp\":\"2026-07-24T09:00:09.000Z\",\"type\":\"assistant\",\"sessionId\":\"1338a80a-f36e-4cbc-a5bb-50fc66430ba5\",\"agentId\":\"a4d1585d310070d0f\",\"isSidechain\":true,\"requestId\":\"req_W\",\"message\":{\"id\":\"msg_W\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":120,\"output_tokens\":30}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        fs::write(
+            workflow_dir.join("agent-a4d1585d310070d0f.meta.json"),
+            "{\"agentType\":\"workflow-subagent\",\"spawnDepth\":1,\"model\":\"opus\"}",
+        )
+        .expect("write sidecar");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-07-24T09:10:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(
+            item.source_session_id,
+            "1338a80a-f36e-4cbc-a5bb-50fc66430ba5_agent-a4d1585d310070d0f"
+        );
+        assert_ne!(item.source_session_id, parent_session);
+        assert!(!item.source_session_id.contains('/'));
+        // The subagent's own tokens, counted once under its own session.
+        assert_eq!(item.input_tokens, 120);
+        assert_eq!(item.output_tokens, 30);
+
+        let fact = |field: &str| {
+            item.attribution_facts
+                .iter()
+                .find(|fact| fact.field == field)
+                .map(|fact| fact.value.clone())
+        };
+        // Depth-1 agent: the direct parent IS the root human session.
+        assert_eq!(fact("parent_session_ref").as_deref(), Some(parent_session));
+        assert_eq!(fact("root_session_ref").as_deref(), Some(parent_session));
+        assert_eq!(fact("agent_kind").as_deref(), Some("workflow-subagent"));
+        assert_eq!(fact("agent_ref").as_deref(), Some("a4d1585d310070d0f"));
+        assert_eq!(fact("workflow_ref").as_deref(), Some("wf_ffe2de5a-c85"));
+        assert_eq!(fact("origin_kind").as_deref(), Some("subagent"));
+        // Bounded-payload contract still holds with the full fact set present.
+        crate::session_attribution::validate_fact_limits(&item.attribution_facts)
+            .expect("subagent facts stay inside the bounded payload budget");
+        // The dark parent id must not widen the v6 origin wire object.
+        let wire = serde_json::to_value(&item).expect("serialize");
+        assert!(wire
+            .get("origin")
+            .and_then(|origin| origin.get("parent_session_ref"))
+            .is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_nested_subagent_parent_ref_points_at_the_spawning_agent() {
+        // spawnDepth>1 with a recorded `parentAgentId`: the DIRECT parent is the
+        // spawning agent's own re-keyed session, while the root stays the human
+        // session so the rollup key is unambiguous.
+        let root = temp_dir("claude-nested-subagent");
+        let parent_session = "abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1";
+        let subagents_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        let path = subagents_dir.join("agent-abadf13e89f0b1c4c.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-24T10:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1\",\"isSidechain\":true,\"entrypoint\":\"cli\",\"message\":{\"role\":\"user\",\"content\":\"trace\"}}\n",
+                "{\"timestamp\":\"2026-07-24T10:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1\",\"isSidechain\":true,\"requestId\":\"req_N\",\"message\":{\"id\":\"msg_N\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        fs::write(
+            subagents_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
+            "{\"agentType\":\"Explore\",\"spawnDepth\":2,\"parentAgentId\":\"a665ed7d7731771a8\"}",
+        )
+        .expect("write sidecar");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-07-24T10:10:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        let fact = |field: &str| {
+            item.attribution_facts
+                .iter()
+                .find(|fact| fact.field == field)
+                .map(|fact| fact.value.clone())
+        };
+        assert_eq!(
+            fact("parent_session_ref").as_deref(),
+            Some("abeeabab-6bc0-4bc3-8a95-e5d967c6e9a1_agent-a665ed7d7731771a8")
+        );
+        assert_eq!(fact("root_session_ref").as_deref(), Some(parent_session));
+        assert_eq!(fact("agent_kind").as_deref(), Some("Explore"));
+        assert_eq!(fact("spawn_depth").as_deref(), Some("2"));
+        // Not under `workflows/`, so no workflow edge is claimed.
+        assert_eq!(fact("workflow_ref"), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_subagent_without_meta_sidecar_degrades_to_path_facts() {
+        // A missing or malformed sidecar must leave the derived facts absent and
+        // never drop the session.
+        let root = temp_dir("claude-subagent-no-meta");
+        let parent_session = "52c34dcb-44e4-428f-8def-979dd43b7259";
+        let subagents_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        let missing = subagents_dir.join("agent-a35bc3648272bc00c.jsonl");
+        let malformed = subagents_dir.join("agent-b11111111111111c.jsonl");
+        for (path, agent) in [
+            (&missing, "a35bc3648272bc00c"),
+            (&malformed, "b11111111111111c"),
+        ] {
+            fs::write(
+                path,
+                format!(
+                    "{{\"timestamp\":\"2026-07-24T11:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{agent}\",\"message\":{{\"id\":\"msg_{agent}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":5,\"output_tokens\":1}}}}}}\n"
+                ),
+            )
+            .expect("write fixture");
+        }
+        fs::write(
+            subagents_dir.join("agent-b11111111111111c.meta.json"),
+            "{not json at all",
+        )
+        .expect("write malformed sidecar");
+
+        for (path, agent) in [
+            (&missing, "a35bc3648272bc00c"),
+            (&malformed, "b11111111111111c"),
+        ] {
+            let item = parse_claude_code_jsonl_file(path, "2026-07-24T11:10:00Z", "fp".to_string())
+                .expect("parse")
+                .into_iter()
+                .next()
+                .expect("snapshot");
+            assert_eq!(
+                item.source_session_id,
+                format!("{parent_session}_agent-{agent}")
+            );
+            let fact = |field: &str| {
+                item.attribution_facts
+                    .iter()
+                    .find(|fact| fact.field == field)
+                    .map(|fact| fact.value.clone())
+            };
+            // Path-derived facts survive; sidecar-derived ones are simply absent.
+            assert_eq!(fact("parent_session_ref").as_deref(), Some(parent_session));
+            assert_eq!(fact("root_session_ref").as_deref(), Some(parent_session));
+            assert_eq!(fact("agent_ref").as_deref(), Some(agent));
+            assert_eq!(fact("agent_kind"), None);
+            assert_eq!(fact("spawn_depth"), None);
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_workflow_journal_is_never_collected_or_emitted() {
+        // `journal.jsonl` has no usage rows and no `sessionId`, and its stem
+        // collides across the workflow directories of one parent session. It
+        // must be dropped at collection time and refused by the parser.
+        let root = temp_dir("claude-workflow-journal");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let session_dir = root.join(parent_session);
+        let first = session_dir
+            .join("subagents")
+            .join("workflows")
+            .join("wf_ffe2de5a-c85");
+        let second = session_dir
+            .join("subagents")
+            .join("workflows")
+            .join("wf_73e1a9d2-065");
+        fs::create_dir_all(&first).expect("create first workflow dir");
+        fs::create_dir_all(&second).expect("create second workflow dir");
+        for dir in [&first, &second] {
+            fs::write(
+                dir.join("journal.jsonl"),
+                "{\"type\":\"started\",\"key\":\"v2:abc\",\"agentId\":\"a1\"}\n{\"type\":\"result\"}\n",
+            )
+            .expect("write journal");
+        }
+        fs::write(
+            first.join("agent-a1f7743a82e5fe4e9.jsonl"),
+            format!(
+                "{{\"timestamp\":\"2026-07-24T12:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_J\",\"message\":{{\"id\":\"msg_J\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":4,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write agent transcript");
+
+        let mut files = Vec::new();
+        collect_recent_jsonl_files(SnapshotSource::ClaudeCode, &root, &mut files, u64::MAX)
+            .expect("collect");
+        assert!(
+            files.iter().all(|candidate| candidate
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some("journal.jsonl")),
+            "workflow journals must not become scan candidates"
+        );
+        assert_eq!(files.len(), 1, "only the agent transcript is a candidate");
+
+        // Even through the public parse entry point the journal yields nothing,
+        // so `<parent>_journal` can never exist.
+        assert!(parse_claude_code_jsonl_file(
+            &first.join("journal.jsonl"),
+            "2026-07-24T12:10:00Z",
+            "fp".to_string(),
+        )
+        .expect("parse journal")
+        .is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// READ-ONLY audit of the v20 keying against this machine's real
+    /// `~/.claude/projects` tree.
+    ///
+    /// Ignored by default because it depends on local state that CI does not
+    /// have. It opens nothing, writes nothing, uploads nothing, and never
+    /// touches the daemon: it walks directory entries and classifies each
+    /// transcript path. Run it with:
+    ///
+    /// ```text
+    /// cargo test -p ottto-service --lib claude_real_tree_rekey_audit -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "reads the developer's real ~/.claude/projects tree"]
+    fn claude_real_tree_rekey_audit() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            eprintln!("no HOME; skipping");
+            return;
+        };
+        let root = home.join(".claude").join("projects");
+        if !root.exists() {
+            eprintln!("no {} ; skipping", root.display());
+            return;
+        }
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                match entry.metadata() {
+                    Ok(metadata) if metadata.is_dir() => walk(&path, out),
+                    Ok(metadata)
+                        if metadata.is_file()
+                            && path.extension().and_then(|value| value.to_str())
+                                == Some("jsonl") =>
+                    {
+                        out.push(path)
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+
+        let (mut layout1, mut layout2, mut layout3, mut layout4) = (0usize, 0usize, 0usize, 0usize);
+        let mut excluded = 0usize;
+        // re-keyed id -> the paths that produced it, so any collision is visible.
+        let mut ids: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        let mut top_level_ids: BTreeSet<String> = BTreeSet::new();
+        let mut meta_present = 0usize;
+        let mut meta_agent_kind = 0usize;
+        let mut nested_parent_refs = 0usize;
+
+        for path in &files {
+            if claude_transcript_excluded_from_snapshots(path) {
+                excluded += 1;
+                layout4 += 1;
+                continue;
+            }
+            match claude_subagent_identity(path) {
+                None => {
+                    layout1 += 1;
+                    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                        top_level_ids.insert(stem.to_string());
+                    }
+                }
+                Some(identity) => {
+                    if identity.workflow_ref.is_some() {
+                        layout3 += 1;
+                    } else {
+                        layout2 += 1;
+                    }
+                    let meta = read_claude_agent_meta(path);
+                    if meta != ClaudeAgentMeta::default() {
+                        meta_present += 1;
+                    }
+                    if meta.agent_kind.is_some() {
+                        meta_agent_kind += 1;
+                    }
+                    if meta.parent_agent_id.is_some() {
+                        nested_parent_refs += 1;
+                    }
+                    ids.entry(identity.source_session_id())
+                        .or_default()
+                        .push(path.clone());
+                }
+            }
+        }
+
+        // Blast radius of the v19 bug: every layout 3/4 file uploaded a snapshot
+        // claiming to BE its parent human session. Count the distinct parents
+        // that were therefore overwritable.
+        let mut poisoned_parents: BTreeSet<String> = BTreeSet::new();
+        let mut previously_miskeyed = 0usize;
+        for path in &files {
+            if claude_transcript_excluded_from_snapshots(path) {
+                // Journals carry no usage rows, so they never overwrote anything
+                // even under v19; they are excluded here to keep the blast
+                // radius honest.
+                continue;
+            }
+            let Some(identity) = claude_subagent_identity(path) else {
+                continue;
+            };
+            let immediate_parent_is_subagents = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|value| value.to_str())
+                == Some("subagents");
+            if !immediate_parent_is_subagents {
+                previously_miskeyed += 1;
+                poisoned_parents.insert(identity.root_session_id.clone());
+            }
+        }
+
+        let collisions: Vec<_> = ids.iter().filter(|(_, paths)| paths.len() > 1).collect();
+        let overlap: Vec<_> = ids
+            .keys()
+            .filter(|id| top_level_ids.contains(id.as_str()))
+            .collect();
+
+        println!("--- v20 re-key audit over {} ---", root.display());
+        println!("total .jsonl files:            {}", files.len());
+        println!("layout 1 (top-level session):  {layout1}");
+        println!("layout 2 (task subagent):      {layout2}");
+        println!("layout 3 (workflow subagent):  {layout3}");
+        println!("layout 4 (workflow journal):   {layout4} (excluded: {excluded})");
+        println!("re-keyed subagent sessions:    {}", ids.len());
+        println!("  with a readable meta.json:   {meta_present}");
+        println!("  with agentType:              {meta_agent_kind}");
+        println!("  with parentAgentId (nested): {nested_parent_refs}");
+        println!("v19 mis-keyed onto a parent:   {previously_miskeyed}");
+        println!("distinct parents overwritable: {}", poisoned_parents.len());
+        println!("re-keyed id collisions:        {}", collisions.len());
+        println!("re-key vs top-level id clash:  {}", overlap.len());
+        for (id, paths) in &collisions {
+            println!("  COLLISION {id}: {paths:?}");
+        }
+
+        // The canonical case from the incident.
+        let canonical = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let family: Vec<_> = ids
+            .keys()
+            .filter(|id| id.starts_with(&format!("{canonical}_")))
+            .collect();
+        if !family.is_empty() {
+            println!("canonical parent {canonical}: {} children", family.len());
+            for id in &family {
+                println!("  {id}");
+            }
+            assert!(
+                top_level_ids.contains(canonical),
+                "the canonical parent must still key to itself"
+            );
+            assert!(
+                !ids.contains_key(canonical),
+                "no child may re-key onto the parent's own id"
+            );
+        }
+
+        assert!(
+            collisions.is_empty(),
+            "two transcripts re-keyed to one session id"
+        );
+        assert!(
+            overlap.is_empty(),
+            "a re-keyed subagent id collided with a real top-level session id"
+        );
+        assert_eq!(
+            excluded, layout4,
+            "every workflow journal must be excluded from emission"
+        );
+    }
+
+    #[test]
+    fn claude_subagent_fact_names_are_the_agreed_backend_contract() {
+        // These names are a FIXED contract with the backend session-attribution
+        // reader (`SessionAttributionField` in
+        // backend/app/domain/telemetry/session_attribution.py). The backend enum
+        // rejects unknown field names, and one rejected fact fails the WHOLE
+        // upload batch, so the enum must carry every name below BEFORE a daemon
+        // emitting `claude_code_jsonl:v20` reaches users. Renaming anything here
+        // is a coordinated cross-repo change, never a local rename.
+        let facts = crate::session_attribution::claude_subagent_facts(
+            &crate::session_attribution::ClaudeSubagentAttribution {
+                root_session_ref: "1338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+                agent_kind: Some("workflow-subagent"),
+                agent_ref: Some("a4d1585d310070d0f"),
+                spawn_depth: Some("1"),
+                workflow_ref: Some("wf_ffe2de5a-c85"),
+            },
+            "1338a80a-f36e-4cbc-a5bb-50fc66430ba5_agent-a4d1585d310070d0f",
+            "2026-07-24T09:10:00Z",
+            "claude_code_jsonl:v20",
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.field.as_str())
+                .collect::<Vec<_>>(),
+            // Ordered most- to least-load-bearing: the caller trims from the
+            // tail to stay inside the bounded payload budget.
+            vec![
+                "root_session_ref",
+                "agent_kind",
+                "agent_ref",
+                "workflow_ref",
+                "spawn_depth",
+            ]
+        );
+        // Every value is a bounded provider identifier, never free text.
+        assert!(facts
+            .iter()
+            .all(|fact| fact.evidence.strength == "direct" && fact.display_label.is_none()));
+    }
+
+    #[test]
+    fn claude_subagent_facts_fit_the_bounded_payload_budget() {
+        // The backend budget is a hard 2 KiB over the serialized fact list and
+        // one oversized item 422s the whole batch, so the daemon must trim. At
+        // ~269 bytes per fact only seven fit. Pin exactly which seven survive
+        // for the single layout that carries all eight -- a WORKFLOW agent --
+        // so the trim can never silently move onto a fact that is not
+        // recoverable from the others.
+        let root = temp_dir("claude-subagent-budget");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let workflow_dir = root
+            .join(parent_session)
+            .join("subagents")
+            .join("workflows")
+            .join("wf_ffe2de5a-c85");
+        fs::create_dir_all(&workflow_dir).expect("create workflow dir");
+        let path = workflow_dir.join("agent-a4d1585d310070d0f.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-24T09:00:09.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"entrypoint\":\"cli\",\"requestId\":\"req_B\",\"message\":{{\"id\":\"msg_B\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":9,\"output_tokens\":3}}}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        fs::write(
+            workflow_dir.join("agent-a4d1585d310070d0f.meta.json"),
+            "{\"agentType\":\"workflow-subagent\",\"spawnDepth\":1}",
+        )
+        .expect("write sidecar");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-07-24T09:10:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(
+            item.attribution_facts
+                .iter()
+                .map(|fact| fact.field.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "origin_kind",
+                "provider_surface",
+                "parent_session_ref",
+                "root_session_ref",
+                "agent_kind",
+                "agent_ref",
+                "workflow_ref",
+            ]
+        );
+        // `spawn_depth` is the one trimmed, and it is the only one that is
+        // lossless to trim HERE: every observed workflow agent is depth 1, which
+        // `parent_session_ref == root_session_ref` already states. Task-tool
+        // agents -- the layout that actually nests, to depth 2 and 3 -- carry no
+        // `workflow_ref`, so their `spawn_depth` fits and is asserted by
+        // `claude_nested_subagent_parent_ref_points_at_the_spawning_agent`.
+        assert!(
+            serde_json::to_vec(&item.attribution_facts)
+                .expect("serialize facts")
+                .len()
+                <= crate::session_attribution::MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+        );
+        crate::session_attribution::validate_fact_limits(&item.attribution_facts)
+            .expect("bounded payload");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_subagent_file_stems_are_unique_within_a_parent_session() {
+        // The `<parentSessionId>_<fileStem>` scheme is only collision-free
+        // because Claude mints agent ids that are unique across ALL of one
+        // parent session's subagent directories. Pin that assumption: the same
+        // stem is never expected in two workflow directories, and two DIFFERENT
+        // stems in different workflow directories must stay distinct.
+        let a = Path::new("/p/proj/S/subagents/agent-a1.jsonl");
+        let b = Path::new("/p/proj/S/subagents/workflows/wf_x/agent-a2.jsonl");
+        let c = Path::new("/p/proj/S/subagents/workflows/wf_y/agent-a3.jsonl");
+        let ids: BTreeSet<String> = [a, b, c]
+            .into_iter()
+            .map(|path| claude_subagent_source_session_id(path).expect("subagent id"))
+            .collect();
+        assert_eq!(ids.len(), 3);
+        // The workflow directory deliberately does NOT enter the id: an agent id
+        // is already unique per parent session, and folding the directory in
+        // would have changed every id already minted for layout 2.
+        assert_eq!(
+            claude_subagent_source_session_id(b).as_deref(),
+            Some("S_agent-a2")
+        );
+    }
+
+    #[test]
+    fn claude_agent_meta_sidecar_rejects_unsafe_values() {
+        // Provider identifiers only. Anything that could smuggle a local path or
+        // free text into an attribution fact is dropped, not sanitized.
+        let dir = temp_dir("claude-agent-meta-safety");
+        fs::create_dir_all(&dir).expect("create dir");
+        let transcript = dir.join("agent-a1.jsonl");
+        fs::write(
+            dir.join("agent-a1.meta.json"),
+            "{\"agentType\":\"/Users/someone/secret agent\",\"spawnDepth\":\"2\",\"description\":\"do not leak me\",\"worktreePath\":\"/Users/someone/wt\"}",
+        )
+        .expect("write sidecar");
+        let meta = read_claude_agent_meta(&transcript);
+        assert_eq!(meta.agent_kind, None, "unsafe agentType is dropped");
+        // spawnDepth must be an integer; a string is not silently accepted.
+        assert_eq!(meta.spawn_depth, None);
+        assert_eq!(meta.parent_agent_id, None);
+
+        // Fragments the BACKEND fact validator rejects are dropped locally too:
+        // one rejected fact fails the whole upload batch.
+        for hostile in [".claude", "x.codex", "workspace_path", "transcript_path"] {
+            fs::write(
+                dir.join("agent-a1.meta.json"),
+                format!("{{\"agentType\":\"{hostile}\"}}"),
+            )
+            .expect("rewrite sidecar");
+            assert_eq!(
+                read_claude_agent_meta(&transcript).agent_kind,
+                None,
+                "{hostile} must not reach an attribution fact"
+            );
+        }
+
+        fs::write(
+            dir.join("agent-a1.meta.json"),
+            "{\"agentType\":\"pr-review-toolkit:code-reviewer\",\"spawnDepth\":3}",
+        )
+        .expect("rewrite sidecar");
+        let meta = read_claude_agent_meta(&transcript);
+        assert_eq!(
+            meta.agent_kind.as_deref(),
+            Some("pr-review-toolkit:code-reviewer")
+        );
+        assert_eq!(meta.spawn_depth.as_deref(), Some("3"));
+        // The common real values must survive the allowlist unchanged.
+        for allowed in [
+            "workflow-subagent",
+            "Explore",
+            "general-purpose",
+            "claude",
+            "claude-code-guide",
+            "wait-poller",
+            "feature-dev:code-explorer",
+        ] {
+            fs::write(
+                dir.join("agent-a1.meta.json"),
+                format!("{{\"agentType\":\"{allowed}\"}}"),
+            )
+            .expect("rewrite sidecar");
+            assert_eq!(
+                read_claude_agent_meta(&transcript).agent_kind.as_deref(),
+                Some(allowed)
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_subagent_never_inherits_the_parent_desktop_title() {
+        // The desktop title store is keyed by CLI session id. A subagent
+        // transcript's file stem is an agent id, so a lookup would either miss
+        // or hand the subagent its parent's title. Both layouts must refuse.
+        let root = temp_dir("claude-subagent-title");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let task_dir = root.join(parent_session).join("subagents");
+        let workflow_dir = task_dir.join("workflows").join("wf_ffe2de5a-c85");
+        fs::create_dir_all(&workflow_dir).expect("create dirs");
+        let mut metadata = ClaudeTitleMetadata::default();
+        metadata.titles.insert(
+            parent_session.to_string(),
+            ClaudeTitleCandidate {
+                title: "Parent orchestrator session".to_string(),
+                user_set: true,
+            },
+        );
+
+        for path in [
+            task_dir.join("agent-a1f7743a82e5fe4e9.jsonl"),
+            workflow_dir.join("agent-a4d1585d310070d0f.jsonl"),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_T\",\"message\":{{\"id\":\"msg_T\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
+                ),
+            )
+            .expect("write fixture");
+            let item = parse_claude_code_jsonl_file_with_title_metadata(
+                &path,
+                "2026-07-24T13:10:00Z",
+                "fp".to_string(),
+                &metadata,
+                true,
+            )
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+            assert_ne!(
+                item.session_display_name.as_deref(),
+                Some("Parent orchestrator session"),
+                "{} inherited its parent's desktop title",
+                path.display()
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
