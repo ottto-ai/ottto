@@ -31,7 +31,15 @@ pub const MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES: usize = 32;
 pub const MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES: usize = 32;
-pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 2_048;
+/// Wire budget for one session's attribution facts.
+///
+/// Raised 2,048 → 4,096. The old budget was the binding constraint, not the
+/// 24-fact cap: a skill-heavy session hit the byte ceiling at ~13 facts and the
+/// tail — which is exactly where the grouping evidence lives — was silently
+/// dropped. The backend accepts the wider budget FIRST; this constant must not
+/// reach an installed base before that acceptance is deployed, or every
+/// attribution-carrying batch from an upgraded daemon 422s.
+pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 4_096;
 pub const SESSION_ATTRIBUTION_HMAC_KEY_VERSION: &str = "hmac-sha256:v1";
 
 const MAX_TEMPLATE_MATERIAL_CHARS: usize = 4_096;
@@ -1589,18 +1597,26 @@ status = "ACTIVE"
 
     #[test]
     fn enforce_fact_limits_drops_trailing_grouping_facts_over_the_byte_budget() {
-        // The byte budget binds well before the fact-count cap, and facts are
-        // dropped from the tail, so a skill-heavy session loses the grouping
-        // evidence appended after its direct provider facts.
+        // The byte budget still binds before the fact-count cap even at 4 KiB,
+        // and facts are dropped from the tail, so a skill-heavy session loses
+        // the grouping evidence appended after its direct provider facts. The
+        // list grows to the first over-budget length rather than a hardcoded
+        // count so the test keeps testing the byte budget when it next moves.
         let mut facts = vec![
             budget_fact("origin_kind"),
             budget_fact("provider_surface"),
             budget_fact("execution_mode"),
             budget_fact("template_group_id"),
         ];
-        facts.extend((0..8).map(|_| budget_fact("skill_id")));
+        while fits_wire_budget(&facts) && facts.len() < MAX_SESSION_ATTRIBUTION_FACTS {
+            facts.push(budget_fact("skill_id"));
+        }
+        let skills_before = facts.iter().filter(|fact| fact.field == "skill_id").count();
         let before = facts.len();
-        assert!(before < MAX_SESSION_ATTRIBUTION_FACTS);
+        assert!(
+            before < MAX_SESSION_ATTRIBUTION_FACTS,
+            "the byte budget must bind before the {MAX_SESSION_ATTRIBUTION_FACTS}-fact cap"
+        );
         assert!(!fits_wire_budget(&facts));
 
         enforce_fact_limits(&mut facts);
@@ -1615,9 +1631,127 @@ status = "ACTIVE"
         assert_eq!(facts[3].field, "template_group_id");
         let surviving_skills = facts.iter().filter(|fact| fact.field == "skill_id").count();
         assert!(
-            surviving_skills < 8,
+            surviving_skills < skills_before,
             "expected skill evidence to be dropped"
         );
+    }
+
+    /// The near-limit attribution case of the two-language fixture corpus.
+    ///
+    /// This is the exact shape that produced the 422 at the old 2 KiB budget, so
+    /// it is the one case both implementations must agree on byte-for-byte: the
+    /// daemon must emit it and the backend must accept it. The facts are carried
+    /// verbatim (synthetic values only) so the other language can replay the
+    /// payload instead of reconstructing a guess at it.
+    #[test]
+    fn attribution_budget_corpus_pins_the_near_limit_payload() {
+        const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
+        fn case(facts: &[SessionAttributionFact]) -> serde_json::Value {
+            let payload = serde_json::to_vec(facts).expect("serialize");
+            let mut digest = Sha256::new();
+            digest.update(&payload);
+            serde_json::json!({
+                "fact_count": facts.len(),
+                "payload_bytes": payload.len(),
+                "payload_sha256": format!("{:x}", digest.finalize()),
+                "accepted_by_retired_budget":
+                    payload.len() <= RETIRED_PAYLOAD_BUDGET_BYTES,
+                "accepted_by_current_budget":
+                    payload.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+                "facts": facts,
+            })
+        }
+
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+            budget_fact("template_group_id"),
+        ];
+        // First list that the retired 2 KiB budget refused: the regression the
+        // raise fixes.
+        while serde_json::to_vec(&facts).expect("serialize").len() <= RETIRED_PAYLOAD_BUDGET_BYTES {
+            facts.push(budget_fact("skill_id"));
+        }
+        let over_retired = facts.clone();
+        // Largest list the current budget still accepts: the acceptance
+        // boundary. One more fact must 422, and that is the whole value of the
+        // case — a budget nobody probes at its edge is a budget nobody agrees on.
+        let mut near_limit = facts.clone();
+        loop {
+            let mut candidate = near_limit.clone();
+            candidate.push(budget_fact("skill_id"));
+            if serde_json::to_vec(&candidate).expect("serialize").len()
+                > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+            {
+                break;
+            }
+            near_limit = candidate;
+        }
+        let mut over_current = near_limit.clone();
+        over_current.push(budget_fact("skill_id"));
+
+        let actual = serde_json::json!({
+            "schema_version": "attribution_budget_golden:v1",
+            "attribution_schema_version": SESSION_ATTRIBUTION_SCHEMA_VERSION,
+            "max_payload_bytes": MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            "retired_max_payload_bytes": RETIRED_PAYLOAD_BUDGET_BYTES,
+            "max_facts": MAX_SESSION_ATTRIBUTION_FACTS,
+            "over_retired_budget_case": case(&over_retired),
+            "near_limit_case": case(&near_limit),
+            "over_current_budget_case": case(&over_current),
+        });
+        if std::env::var_os("UPDATE_ATTRIBUTION_BUDGET_GOLDEN").is_some() {
+            fs::write(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/snapshot-audit/attribution-budget-golden.json"),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&actual).expect("serialize golden")
+                ),
+            )
+            .expect("write attribution budget golden");
+        }
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/attribution-budget-golden.json"
+        ))
+        .expect("parse attribution budget golden");
+        assert_eq!(actual, expected);
+        assert!(near_limit.len() > over_retired.len());
+        assert!(near_limit.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
+        validate_fact_limits(&over_retired).expect("over-retired payload is valid now");
+        validate_fact_limits(&near_limit).expect("near-limit payload is valid");
+        assert!(
+            validate_fact_limits(&over_current).is_err(),
+            "one fact past the budget must be refused locally, not by the backend"
+        );
+    }
+
+    #[test]
+    fn the_raised_byte_budget_keeps_a_list_the_old_budget_would_have_trimmed() {
+        // The regression the raise fixes: a fact list between the old 2 KiB
+        // ceiling and the new 4 KiB one used to lose its tail. Nothing is
+        // trimmed now, and the near-limit shape is the one the two-language
+        // fixture corpus carries as its 422 boundary case.
+        const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+            budget_fact("template_group_id"),
+        ];
+        while serde_json::to_vec(&facts).expect("serialize").len() <= RETIRED_PAYLOAD_BUDGET_BYTES {
+            facts.push(budget_fact("skill_id"));
+        }
+        let payload_bytes = serde_json::to_vec(&facts).expect("serialize").len();
+        assert!(payload_bytes > RETIRED_PAYLOAD_BUDGET_BYTES);
+        assert!(payload_bytes <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
+        let before = facts.len();
+
+        enforce_fact_limits(&mut facts);
+
+        assert_eq!(facts.len(), before);
+        validate_fact_limits(&facts).expect("near-limit list is valid");
     }
 
     #[test]

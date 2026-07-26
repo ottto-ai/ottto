@@ -152,6 +152,31 @@ pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 
+/// Hash epoch of the policy-neutral `content_hash`.
+///
+/// It is deliberately independent of `SNAPSHOT_SCHEMA_VERSION` and of the
+/// parser versions: a new wire field, a parser fix, or a new semantic component
+/// is invisible to `content_hash` until this epoch moves. Moving it re-mints
+/// every session's content identity fleet-wide, so it moves only as a
+/// deliberate, announced change — never as a side effect of shipping a field.
+pub const SNAPSHOT_CONTENT_HASH_EPOCH: u16 = 1;
+
+/// The semantic components that survive every upload policy and every org
+/// display toggle. `content_hash` is computed over exactly these, which is what
+/// makes a privacy flip (titles, workspace labels, artifacts, attribution) a
+/// change in *content* rather than a change in *identity*.
+pub(crate) const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
+    "usage_accounting",
+    "lifecycle_activity",
+    "latency",
+    "context_posture",
+];
+
+/// Contract label folded into the scan-index manifest hash. It names both the
+/// fold and the entity grain, so a change to either changes the hash instead of
+/// silently changing its meaning.
+pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v1";
+
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
 /// context)" window enabled — the regular Claude context cap is 200K tokens.
@@ -270,6 +295,10 @@ pub struct SnapshotBatchRequest {
     pub collector_version: Option<String>,
     pub snapshots: Vec<SnapshotItem>,
     pub upload_policy: SnapshotUploadPolicy,
+    /// Daemon-side loss accounting since the last acknowledged batch. Always
+    /// present, including its zeros: an absent counter cannot distinguish "no
+    /// losses" from "not reporting".
+    pub client_report: crate::client_report::ClientReport,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -279,6 +308,15 @@ pub struct SnapshotSemanticEnvelope {
     pub upload_policy: SnapshotUploadPolicy,
     pub component_hashes: BTreeMap<&'static str, String>,
     pub revision_hash: String,
+    /// Policy-neutral content identity: SHA-256 over the RFC 8785 canonical
+    /// bytes of `snapshot_content_identity_body`. Write-only for now — the
+    /// server stores it and does not key on it until its own cutover — which is
+    /// exactly why it ships in this release rather than waiting for the server
+    /// side to be ready: the daemon release train is the long pole.
+    pub content_hash: String,
+    /// The epoch `content_hash` was computed at. Present on every item so the
+    /// server never has to guess which projection produced a hash.
+    pub hash_epoch: u16,
 }
 
 #[derive(Serialize)]
@@ -311,12 +349,13 @@ impl Serialize for SnapshotBatchRequest {
                 })
             })
             .collect::<Result<Vec<_>, S::Error>>()?;
-        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 5)?;
+        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 6)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("source", &self.source)?;
         state.serialize_field("machine_id", &self.machine_id)?;
         state.serialize_field("collector_version", &self.collector_version)?;
         state.serialize_field("snapshots", &snapshots)?;
+        state.serialize_field("client_report", &self.client_report)?;
         state.end()
     }
 }
@@ -609,6 +648,16 @@ pub struct ScanIndexEntry {
     /// when transcript size and mtime are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_identity_version: Option<String>,
+}
+
+/// `{source, entity_count, rolling_hash}` — the scan-index manifest triple
+/// carried on collector check-ins. See [`ScanIndex::manifest`] for the fold and
+/// the entity grain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotSourceManifest {
+    pub source: String,
+    pub entity_count: u64,
+    pub rolling_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1100,23 +1149,85 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     )
 }
 
+/// The policy-neutral component hashes, in canonical order.
+pub(crate) fn policy_neutral_component_hashes(
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> BTreeMap<String, String> {
+    POLICY_NEUTRAL_COMPONENTS
+        .iter()
+        .filter_map(|name| {
+            component_hashes
+                .get(name)
+                .map(|value| ((*name).to_string(), value.clone()))
+        })
+        .collect()
+}
+
+/// The body `content_hash` is computed over.
+///
+/// It carries the content identity scope (source + session id) and the
+/// policy-neutral semantic components, and nothing else. Every field of
+/// `snapshot_revision_material` that is NOT here is excluded because it is
+/// implementation state, mutable inventory, or wall-clock, and identity may not
+/// depend on any of those:
+///
+/// * `source_file_fingerprint` — scan/inventory state; the same content read
+///   from a rotated or recopied transcript is the same content.
+/// * parser version and scan-identity version — a parser fix must not re-mint
+///   every session's identity (they stay in `revision_hash`, which is the
+///   *re-upload* trigger, not the identity).
+/// * `provenance.collector` / `provenance.source_file_count` — implementation
+///   state and mutable inventory.
+/// * the lifecycle scalars (`status`, the three `source_*_at` timestamps,
+///   `state_total_tokens`, `state_archived`) — already inside the
+///   `lifecycle_activity` component hash, so restating them would double-count
+///   without adding coverage.
+///
+/// Excluded by construction rather than by filter: the policy-scoped components
+/// (`display_identity`, `attribution`, `artifacts`), which is what keeps an org
+/// display toggle from re-minting identity for every session.
+pub(crate) fn snapshot_content_identity_body(
+    source: SnapshotSource,
+    source_session_id: &str,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> Value {
+    json!({
+        "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+        "components": policy_neutral_component_hashes(component_hashes),
+        "hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
+        "source": source.api_slug(),
+        "source_session_id": source_session_id,
+    })
+}
+
+/// SHA-256 over the RFC 8785 canonical bytes of the policy-neutral body.
+///
+/// SHA-256, not a faster hash: every component hash in this daemon is already
+/// SHA-256, the backend has it everywhere, and a second cross-language hash
+/// implementation would be a second thing to keep byte-identical for no
+/// measurable gain at this item volume.
+pub(crate) fn snapshot_content_hash(
+    source: SnapshotSource,
+    source_session_id: &str,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> String {
+    let body = snapshot_content_identity_body(source, source_session_id, component_hashes);
+    // Infallible by construction: the body is strings, one integer, and one
+    // string-to-string map. `content_identity_body_stays_canonicalizable`
+    // enforces that mechanically, so this is a proof obligation with a test
+    // behind it rather than an assumption.
+    let canonical = crate::canonical_json::canonicalize(&body)
+        .expect("policy-neutral content identity body is canonicalizable");
+    let mut digest = Sha256::new();
+    digest.update(&canonical);
+    format!("{:x}", digest.finalize())
+}
+
 fn snapshot_revision_material(
     item: &SnapshotItem,
     component_hashes: &BTreeMap<&'static str, String>,
 ) -> Value {
-    let policy_neutral_component_hashes = [
-        "usage_accounting",
-        "lifecycle_activity",
-        "latency",
-        "context_posture",
-    ]
-    .iter()
-    .filter_map(|name| {
-        component_hashes
-            .get(name)
-            .map(|value| ((*name).to_string(), value.clone()))
-    })
-    .collect::<BTreeMap<_, _>>();
+    let policy_neutral_component_hashes = policy_neutral_component_hashes(component_hashes);
     json!({
         "source_file_fingerprint": &item.source_file_fingerprint,
         "source_started_at": &item.source_started_at,
@@ -1160,6 +1271,8 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
         upload_policy,
         revision_hash: snapshot_revision_hash(source, item, &component_hashes),
+        content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
+        hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
         component_hashes,
     }
 }
@@ -5988,6 +6101,48 @@ impl ScanIndex {
             .with_context(|| format!("replace scan index {}", path.display()))
     }
 
+    /// The scan-index manifest for `source`: how many entities this machine
+    /// believes the server holds, and one hash that summarises which.
+    ///
+    /// This is the only independent witness the server has that its own entity
+    /// set matches the machine's before the multiplexed sync cycle exists: it
+    /// can recompute the same fold over the fingerprints it stored for this
+    /// (user, machine, source) and compare. It is also the denominator a
+    /// backfill-progress reading needs, because "how many entities exist
+    /// locally" is not derivable from anything the server already receives.
+    ///
+    /// Grain, stated precisely because a consumer cannot infer it: one entity
+    /// per indexed transcript that produced a snapshot, plus one per Codex
+    /// state-only session. A transcript that parses into several snapshots
+    /// contributes its LAST fingerprint, which is the same value the index uses
+    /// for no-op suppression.
+    ///
+    /// No local path, session id, title, or byte offset participates: the fold
+    /// is over semantic fingerprints only, which are already on the wire.
+    pub fn manifest(&self, source: SnapshotSource) -> SnapshotSourceManifest {
+        let fingerprints = self
+            .files
+            .values()
+            .filter_map(|entry| entry.last_snapshot_fingerprint.as_deref())
+            .chain(
+                self.codex_state_only_snapshot_fingerprints
+                    .values()
+                    .map(String::as_str),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, SNAPSHOT_MANIFEST_CONTRACT_VERSION.as_bytes());
+        update_length_prefixed(&mut digest, source.api_slug().as_bytes());
+        for fingerprint in &fingerprints {
+            update_length_prefixed(&mut digest, fingerprint.as_bytes());
+        }
+        SnapshotSourceManifest {
+            source: source.api_slug().to_string(),
+            entity_count: fingerprints.len() as u64,
+            rolling_hash: format!("{:x}", digest.finalize()),
+        }
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
         let Some(entry) = self.files.get(&key) else {
@@ -6605,6 +6760,16 @@ fn sha256_hex(parts: &[&str]) -> String {
         digest.update([0]);
     }
     format!("{:x}", digest.finalize())
+}
+
+/// Feed `bytes` into `digest` behind a 4-byte big-endian length.
+///
+/// The length prefix is the whole point: a bare concatenation of variable-length
+/// fields lets two different field splits produce identical bytes, so the fold
+/// would not actually pin the set it claims to summarise.
+fn update_length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u32).to_be_bytes());
+    digest.update(bytes);
 }
 
 fn sha256_hex_owned(parts: &[String]) -> String {
@@ -11167,12 +11332,13 @@ mod tests {
 
     #[test]
     fn claude_subagent_facts_fit_the_bounded_payload_budget() {
-        // The backend budget is a hard 2 KiB over the serialized fact list and
+        // The budget is a hard byte ceiling over the serialized fact list and
         // one oversized item 422s the whole batch, so the daemon must trim. At
-        // ~269 bytes per fact only seven fit. Pin exactly which seven survive
-        // for the single layout that carries all eight -- a WORKFLOW agent --
-        // so the trim can never silently move onto a fact that is not
-        // recoverable from the others.
+        // ~269 bytes per fact the old 2 KiB budget fit only seven and dropped
+        // `spawn_depth`; the 4 KiB budget fits all eight, which is the whole
+        // point of the raise. Pin the full set for the single layout that
+        // carries every fact -- a WORKFLOW agent -- so a future trim cannot
+        // silently move back onto one of them.
         let root = temp_dir("claude-subagent-budget");
         let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let workflow_dir = root
@@ -11213,14 +11379,9 @@ mod tests {
                 "agent_kind",
                 "agent_ref",
                 "workflow_ref",
+                "spawn_depth",
             ]
         );
-        // `spawn_depth` is the one trimmed, and it is the only one that is
-        // lossless to trim HERE: every observed workflow agent is depth 1, which
-        // `parent_session_ref == root_session_ref` already states. Task-tool
-        // agents -- the layout that actually nests, to depth 2 and 3 -- carry no
-        // `workflow_ref`, so their `spawn_depth` fits and is asserted by
-        // `claude_nested_subagent_parent_ref_points_at_the_spawning_agent`.
         assert!(
             serde_json::to_vec(&item.attribution_facts)
                 .expect("serialize facts")
@@ -13543,6 +13704,7 @@ mod tests {
             collector_version: Some("local-enriched/1".to_string()),
             snapshots: vec![item],
             upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
         };
         validate_snapshot_batch_request(&request).expect("canonical v6 batch passes preflight");
         let value = serde_json::to_value(&request).expect("serialize v6 batch");
@@ -13780,6 +13942,7 @@ mod tests {
                 attribution_facts: Vec::new(),
             }],
             upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
         }
     }
 
@@ -13823,21 +13986,39 @@ mod tests {
                     &component_hashes,
                 );
                 let envelope = snapshot_semantic_envelope(source, &item, policy);
+                let content_body = snapshot_content_identity_body(
+                    source,
+                    &item.source_session_id,
+                    &envelope.component_hashes,
+                );
+                let canonical_bytes = crate::canonical_json::canonicalize(&content_body)
+                    .expect("canonicalize content identity body");
                 cases.push(json!({
                     "source": source.api_slug(),
                     "source_session_id": item.source_session_id,
                     "upload_policy": policy,
                     "component_hashes": envelope.component_hashes,
+                    // The `content_hash` inputs travel with the expected hash so
+                    // the other language recomputes the canonicalization from
+                    // the same material instead of trusting a copied digest.
+                    "policy_neutral_component_hashes":
+                        policy_neutral_component_hashes(&envelope.component_hashes),
                     "snapshot_fingerprint": item.snapshot_fingerprint,
                     "revision_hash": envelope.revision_hash,
+                    "content_hash": envelope.content_hash,
+                    "hash_epoch": envelope.hash_epoch,
+                    "content_canonical_bytes": canonical_bytes.len(),
                     "envelope_bytes": serde_json::to_vec(&envelope).expect("serialize envelope").len(),
                 }));
             }
         }
         let actual = json!({
-            "schema_version": "semantic_envelope_golden:v1",
+            "schema_version": "semantic_envelope_golden:v2",
             "component_contract_version": SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
             "revision_contract_version": SNAPSHOT_REVISION_CONTRACT_VERSION,
+            "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+            "content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
+            "policy_neutral_components": POLICY_NEUTRAL_COMPONENTS,
             "cases": cases,
         });
         if std::env::var_os("UPDATE_SEMANTIC_ENVELOPE_GOLDEN").is_some() {
@@ -13863,5 +14044,356 @@ mod tests {
             .iter()
             .all(|case| case["envelope_bytes"].as_u64().expect("size")
                 <= MAX_SEMANTIC_ENVELOPE_BYTES as u64));
+        // The policy toggles are what the corpus sweeps, so the corpus itself
+        // is the strongest available statement that identity survives them: for
+        // each source, all twenty policies must agree on `content_hash` while
+        // the full component set does not.
+        for source in ["pi", "codex", "claude_code"] {
+            let per_source = actual["cases"]
+                .as_array()
+                .expect("cases")
+                .iter()
+                .filter(|case| case["source"] == source)
+                .collect::<Vec<_>>();
+            assert_eq!(per_source.len(), 20);
+            let content_hashes = per_source
+                .iter()
+                .map(|case| case["content_hash"].as_str().expect("content hash"))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                content_hashes.len(),
+                1,
+                "content_hash must not depend on upload policy"
+            );
+            let fingerprints = per_source
+                .iter()
+                .map(|case| case["snapshot_fingerprint"].as_str().expect("fingerprint"))
+                .collect::<BTreeSet<_>>();
+            assert!(
+                fingerprints.len() > 1,
+                "the policy-scoped fingerprint must still move with policy"
+            );
+        }
+    }
+
+    #[test]
+    fn content_hash_ignores_scan_state_parser_provenance_and_display_policy() {
+        // The exclusion list from the identity contract, one mutation each. Any
+        // of these changing `content_hash` would re-mint every session's
+        // identity on a scan, a parser bump, or a privacy toggle.
+        let source = SnapshotSource::ClaudeCode;
+        let base = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        let content_hash = |item: &SnapshotItem| {
+            snapshot_content_hash(
+                source,
+                &item.source_session_id,
+                &snapshot_semantic_component_hashes(source, item),
+            )
+        };
+        let expected = content_hash(&base);
+
+        let mut scan_time = base.clone();
+        scan_time.collected_at = "2027-01-01T00:00:00Z".to_string();
+        assert_eq!(content_hash(&scan_time), expected, "scan time");
+
+        let mut fingerprint = base.clone();
+        fingerprint.source_file_fingerprint = Some("f".repeat(32));
+        assert_eq!(content_hash(&fingerprint), expected, "file fingerprint");
+        assert_ne!(
+            snapshot_revision_hash(
+                source,
+                &fingerprint,
+                &snapshot_semantic_component_hashes(source, &fingerprint)
+            ),
+            snapshot_revision_hash(
+                source,
+                &base,
+                &snapshot_semantic_component_hashes(source, &base)
+            ),
+            "the revision hash — the re-upload trigger — must still move"
+        );
+
+        let mut collector = base.clone();
+        collector.provenance.collector = "some_other_collector".to_string();
+        collector.provenance.source_file_count = 41;
+        assert_eq!(content_hash(&collector), expected, "collector provenance");
+
+        let mut display = base.clone();
+        display.session_display_name = Some("a title".to_string());
+        display.session_display_name_source = Some("fixture".to_string());
+        display.workspace_display_label = Some("a workspace".to_string());
+        display.workspace_label_source = Some("fixture".to_string());
+        display.session_artifacts = vec![SessionArtifact {
+            kind: "pull_request".to_string(),
+            value: "https://github.com/example/repo/pull/7".to_string(),
+        }];
+        assert_eq!(content_hash(&display), expected, "display identity");
+        let mut suppressed = display.clone();
+        apply_upload_policy(
+            source,
+            std::slice::from_mut(&mut suppressed),
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                workspace_labels_enabled: false,
+                session_artifacts_enabled: false,
+                session_attribution_enabled: false,
+                session_attribution_labels_enabled: false,
+            },
+        );
+        assert_eq!(content_hash(&suppressed), expected, "policy suppression");
+
+        // Parser and scan-identity versions are compile-time constants, so the
+        // statement that they are outside identity is made structurally: the
+        // canonical body carries neither, and it carries exactly five keys.
+        let body = snapshot_content_identity_body(
+            source,
+            &base.source_session_id,
+            &snapshot_semantic_component_hashes(source, &base),
+        );
+        assert_eq!(
+            body.as_object()
+                .expect("body object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "canonicalization",
+                "components",
+                "hash_epoch",
+                "source",
+                "source_session_id",
+            ])
+        );
+        let encoded = body.to_string();
+        for excluded in [
+            source.parser_version(),
+            source.scan_identity_version(),
+            &base.collected_at,
+        ] {
+            assert!(
+                !encoded.contains(excluded),
+                "identity body must not carry {excluded}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_hash_moves_with_every_policy_neutral_component() {
+        let source = SnapshotSource::ClaudeCode;
+        let base = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        let content_hash = |item: &SnapshotItem| {
+            snapshot_content_hash(
+                source,
+                &item.source_session_id,
+                &snapshot_semantic_component_hashes(source, item),
+            )
+        };
+        let expected = content_hash(&base);
+
+        let mut usage = base.clone();
+        usage.input_tokens += 1;
+        assert_ne!(content_hash(&usage), expected, "usage_accounting");
+
+        let mut lifecycle = base.clone();
+        lifecycle.status = "completed".to_string();
+        assert_ne!(content_hash(&lifecycle), expected, "lifecycle_activity");
+
+        let mut latency = base.clone();
+        latency.avg_duration_ms = Some(4_321);
+        assert_ne!(content_hash(&latency), expected, "latency");
+
+        let mut posture = base.clone();
+        posture.peak_context_fill_tokens = Some(123_456);
+        assert_ne!(content_hash(&posture), expected, "context_posture");
+
+        let mut session = base.clone();
+        session.source_session_id = "another-session".to_string();
+        assert_ne!(content_hash(&session), expected, "session scope");
+        assert_ne!(
+            snapshot_content_hash(
+                SnapshotSource::Codex,
+                &base.source_session_id,
+                &snapshot_semantic_component_hashes(source, &base)
+            ),
+            expected,
+            "source scope"
+        );
+    }
+
+    fn manifest_index_entry(fingerprint: Option<&str>) -> ScanIndexEntry {
+        ScanIndexEntry {
+            size_bytes: 1,
+            modified_unix_seconds: 2,
+            modified_unix_nanos: Some(3),
+            source_file_fingerprint: "source".to_string(),
+            last_snapshot_fingerprint: fingerprint.map(str::to_string),
+            scan_identity_version: Some("semantic_sync:v1".to_string()),
+        }
+    }
+
+    #[test]
+    fn scan_index_manifest_counts_entities_and_folds_their_fingerprints() {
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert("a.jsonl".to_string(), manifest_index_entry(Some("aa")));
+        index
+            .files
+            .insert("b.jsonl".to_string(), manifest_index_entry(Some("bb")));
+        // A scanned file that produced no snapshot is not an entity the server
+        // could hold, so it must not inflate the denominator.
+        index
+            .files
+            .insert("c.jsonl".to_string(), manifest_index_entry(None));
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-1".to_string(), "cc".to_string());
+
+        let manifest = index.manifest(SnapshotSource::Codex);
+        assert_eq!(manifest.source, "codex");
+        assert_eq!(manifest.entity_count, 3);
+        assert_eq!(manifest.rolling_hash.len(), 64);
+        assert!(manifest
+            .rolling_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(manifest, index.manifest(SnapshotSource::Codex));
+    }
+
+    #[test]
+    fn scan_index_manifest_ignores_paths_and_insertion_order() {
+        // The fold is over fingerprints only. That is what makes it something
+        // the server can recompute — it has the fingerprints and never sees a
+        // local path — and it is also why no path can leak through the hash.
+        let mut left = ScanIndex::default();
+        left.files
+            .insert("/one/a.jsonl".to_string(), manifest_index_entry(Some("aa")));
+        left.files
+            .insert("/one/b.jsonl".to_string(), manifest_index_entry(Some("bb")));
+        let mut right = ScanIndex::default();
+        right.files.insert(
+            "/other/z.jsonl".to_string(),
+            manifest_index_entry(Some("bb")),
+        );
+        right.files.insert(
+            "/other/y.jsonl".to_string(),
+            manifest_index_entry(Some("aa")),
+        );
+
+        assert_eq!(
+            left.manifest(SnapshotSource::Codex),
+            right.manifest(SnapshotSource::Codex)
+        );
+    }
+
+    #[test]
+    fn scan_index_manifest_is_scoped_to_its_source_and_moves_with_content() {
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert("a.jsonl".to_string(), manifest_index_entry(Some("aa")));
+        let codex = index.manifest(SnapshotSource::Codex);
+        assert_ne!(
+            codex.rolling_hash,
+            index.manifest(SnapshotSource::ClaudeCode).rolling_hash
+        );
+
+        index
+            .files
+            .insert("a.jsonl".to_string(), manifest_index_entry(Some("ab")));
+        assert_ne!(
+            codex.rolling_hash,
+            index.manifest(SnapshotSource::Codex).rolling_hash
+        );
+        assert_eq!(index.manifest(SnapshotSource::Codex).entity_count, 1);
+    }
+
+    #[test]
+    fn scan_index_manifest_length_prefixes_defeat_fingerprint_splitting() {
+        // Two entities "aa"+"bb" and one entity "aabb" are different sets, so a
+        // bare concatenation would be a real collision, not a theoretical one.
+        let mut split = ScanIndex::default();
+        split
+            .files
+            .insert("a".to_string(), manifest_index_entry(Some("aa")));
+        split
+            .files
+            .insert("b".to_string(), manifest_index_entry(Some("bb")));
+        let mut joined = ScanIndex::default();
+        joined
+            .files
+            .insert("a".to_string(), manifest_index_entry(Some("aabb")));
+
+        assert_ne!(
+            split.manifest(SnapshotSource::Codex).rolling_hash,
+            joined.manifest(SnapshotSource::Codex).rolling_hash
+        );
+    }
+
+    #[test]
+    fn batch_request_carries_the_client_report_with_its_zeros() {
+        let request = valid_v6_batch_request();
+        let value = serde_json::to_value(&request).expect("serialize batch");
+        let report = &value["client_report"];
+        assert_eq!(report["schema_version"], 1);
+        let entries = report["entries"].as_array().expect("entries");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["reason"].as_str().expect("reason"))
+                .collect::<Vec<_>>(),
+            vec![
+                "queue_overflow",
+                "ratelimit_backoff",
+                "network_error",
+                "poisoned"
+            ]
+        );
+        assert!(entries
+            .iter()
+            .all(|entry| entry["quantity"].as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn wire_envelope_carries_the_content_hash_and_its_epoch() {
+        let request = valid_v6_batch_request();
+        let value = serde_json::to_value(&request).expect("serialize batch");
+        let envelope = &value["snapshots"][0]["semantic_envelope"];
+        let content_hash = envelope["content_hash"].as_str().expect("content hash");
+        assert_eq!(content_hash.len(), 64);
+        assert!(content_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(envelope["hash_epoch"], SNAPSHOT_CONTENT_HASH_EPOCH);
+    }
+
+    #[test]
+    fn content_identity_body_stays_canonicalizable() {
+        // Guards the `expect` inside `snapshot_content_hash`: if a future field
+        // brings a fractional number into the identity body, this fails here
+        // instead of panicking on a customer's machine.
+        for source in [
+            SnapshotSource::Pi,
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+        ] {
+            let item = valid_v6_batch_request()
+                .snapshots
+                .into_iter()
+                .next()
+                .expect("fixture snapshot");
+            let body = snapshot_content_identity_body(
+                source,
+                &item.source_session_id,
+                &snapshot_semantic_component_hashes(source, &item),
+            );
+            assert!(crate::canonical_json::is_canonicalizable(&body));
+        }
     }
 }

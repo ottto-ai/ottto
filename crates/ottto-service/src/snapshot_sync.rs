@@ -17,8 +17,8 @@ use crate::snapshot_client::{
 use crate::snapshots::{
     apply_upload_policy, collector_version, scan_source_roots_with_attribution,
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -27,7 +27,7 @@ use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, Loc
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -153,6 +153,41 @@ fn is_snapshot_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Last computed scan-index manifest per source.
+///
+/// The check-in heartbeat runs on its own clock and does not know which
+/// policy/attribution/destination-scoped index path the sync cycle chose, so it
+/// cannot load the index itself. The sync cycle publishes the manifest it
+/// already computed from the index it already had open, and both receipt shapes
+/// read it from here. Missing means "no scan has completed in this process
+/// yet", which is reported as an absent manifest rather than a zeroed one.
+static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<&'static str, SnapshotSourceManifest>>> =
+    OnceLock::new();
+
+fn source_manifests() -> &'static Mutex<BTreeMap<&'static str, SnapshotSourceManifest>> {
+    SOURCE_MANIFESTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn publish_source_manifest(source: SnapshotSource, manifest: SnapshotSourceManifest) {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        manifests.insert(source.api_slug(), manifest);
+    }
+}
+
+fn cached_source_manifest(source: SnapshotSource) -> Option<SnapshotSourceManifest> {
+    source_manifests()
+        .lock()
+        .ok()
+        .and_then(|manifests| manifests.get(source.api_slug()).cloned())
+}
+
+#[cfg(test)]
+fn clear_source_manifests_for_test() {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        manifests.clear();
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     backfill_window_days: u64,
@@ -162,6 +197,7 @@ struct SyncCounts {
     scan_cap_hit: bool,
     scanned_file_count: u64,
     scanned_session_count: u64,
+    semantic_noop_count: u64,
     uploaded_count: u64,
 }
 
@@ -183,6 +219,7 @@ impl SyncCounts {
             scan_cap_hit: scan_result.scan_cap_hit,
             scanned_file_count: scan_result.scanned_file_count as u64,
             scanned_session_count: scan_result.scanned_session_count as u64,
+            semantic_noop_count: scan_result.semantic_noop_count as u64,
             uploaded_count,
         }
     }
@@ -910,6 +947,11 @@ fn sync_source(
         }
     };
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    // Publish the manifest from the index this scan just advanced, before any
+    // upload outcome is known. It is the machine's own entity denominator, so
+    // it must not wait on acceptance: a machine mid-backfill is exactly when the
+    // server needs to see that its entity set is behind.
+    publish_source_manifest(source, index.manifest(source));
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
@@ -1021,6 +1063,7 @@ fn sync_source(
             // history and retroactive backfill before the first upload. Relay
             // tokens are intentionally short-lived, so mint them at the network
             // boundary instead of reusing the pre-scan activity-hint token.
+            let client_report = crate::client_report::take();
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: source.api_slug().to_string(),
@@ -1028,6 +1071,7 @@ fn sync_source(
                 collector_version: Some(collector_version()),
                 snapshots,
                 upload_policy,
+                client_report: client_report.clone(),
             };
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -1035,7 +1079,12 @@ fn sync_source(
                 }));
             }
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            client.upload_batch(&upload_relay_token, &request)
+            let response = client.upload_batch(&upload_relay_token, &request)?;
+            // Clear only what this accepted request carried. A failed upload
+            // leaves the counters in place so the losses are reported on the
+            // next batch instead of vanishing with the request that died.
+            crate::client_report::commit(&client_report);
+            Ok(response)
         },
         |progress| progress.save(&upload_progress_path),
     )
@@ -1145,6 +1194,10 @@ fn sync_source(
                     "backend rejected snapshot batch payload validation",
                 )
             } else {
+                crate::client_report::record(
+                    crate::client_report::ClientReportReason::NetworkError,
+                    1,
+                );
                 (
                     CollectorState::Error {
                         code: "network_error",
@@ -1436,6 +1489,10 @@ where
                 // every valid sibling is accepted and checkpointed exactly
                 // once. The caller still reports the cycle as failed and does
                 // not commit the final scan index.
+                crate::client_report::record(
+                    crate::client_report::ClientReportReason::Poisoned,
+                    indices.len() as u64,
+                );
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
@@ -1553,10 +1610,12 @@ fn report_status(
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
         last_scan_cap_hit: status.counts.scan_cap_hit,
+        last_semantic_noop_count: status.counts.semantic_noop_count,
         consecutive_failures,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
+        manifest: cached_source_manifest(status.source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1605,10 +1664,16 @@ fn report_checkin_status(
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
         last_scan_cap_hit: false,
+        last_semantic_noop_count: 0,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(source.parser_version().to_string()),
+        // The liveness-only shape carries the manifest deliberately: it is the
+        // cheapest cadence the server gets it on, and a check-in that says
+        // "alive" while the entity sets disagree is exactly the state the
+        // manifest exists to expose.
+        manifest: cached_source_manifest(source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -2029,6 +2094,65 @@ mod tests {
         assert!(chunk_lengths.iter().all(|length| *length <= 20));
         assert_eq!(accepted, 45);
         assert_eq!(result, ResumableUploadResult::Completed);
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn poisoned_items_are_counted_for_the_client_report() {
+        use crate::client_report::{reset_for_test, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(3);
+        let poison = items[1].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            move |batch| {
+                if batch.contains(&poison) {
+                    return Err(anyhow::Error::new(BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(
+                            r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                        ),
+                    }));
+                }
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("a poison item still fails the cycle");
+
+        assert!(is_item_specific_validation_failure(&error));
+        // One item was lost and it is reported as exactly one item, so the
+        // server can tell this apart from an empty scan.
+        assert_eq!(
+            crate::client_report::take().quantity(ClientReportReason::Poisoned),
+            1
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn an_unacknowledged_client_report_survives_to_the_next_batch() {
+        use crate::client_report::{commit, record, reset_for_test, take, ClientReportReason};
+        reset_for_test();
+        record(ClientReportReason::NetworkError, 2);
+        let reported = take();
+
+        // The upload died: nothing is committed, so the losses are still owed.
+        assert_eq!(take().quantity(ClientReportReason::NetworkError), 2);
+
+        // The retry carries them and is acknowledged.
+        let acknowledged = take();
+        commit(&acknowledged);
+        assert_eq!(take().quantity(ClientReportReason::NetworkError), 0);
+        assert_eq!(reported.quantity(ClientReportReason::NetworkError), 2);
+        reset_for_test();
     }
 
     #[test]
@@ -3001,6 +3125,86 @@ mod tests {
         assert!(requests[1].contains("\"last_scan_finished_at\":null"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
+        clear_source_manifests_for_test();
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+
+        // Before any scan completes the manifest is absent, not zeroed: a
+        // fabricated `entity_count: 0` would read as "this machine has nothing",
+        // which is a different and wrong statement.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in before any scan");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+
+        let mut index =
+            ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-1".to_string(), "a".repeat(64));
+        let manifest = index.manifest(SnapshotSource::Codex);
+        publish_source_manifest(SnapshotSource::Codex, manifest.clone());
+
+        for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+            report_checkin_status_with_fresh_relay_token(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                scan_started_at,
+            )
+            .expect("report check-in after a scan");
+            let requests = captured.lock().expect("captured requests").clone();
+            assert!(requests[1].contains("\"entity_count\":1"));
+            assert!(
+                requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash))
+            );
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let mut counts = SyncCounts::for_policy(30);
+        counts.semantic_noop_count = 718;
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report terminal status");
+        let requests = captured.lock().expect("captured requests").clone();
+        // The suppression count is the difference between "nothing changed" and
+        // "the collector dropped what changed".
+        assert!(requests[1].contains("\"last_semantic_noop_count\":718"));
+        assert!(requests[1].contains("\"entity_count\":1"));
+        clear_source_manifests_for_test();
     }
 
     #[test]
