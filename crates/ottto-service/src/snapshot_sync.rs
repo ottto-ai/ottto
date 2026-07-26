@@ -286,6 +286,53 @@ fn cadence_phase_offset(client_id: &str, interval: Duration) -> Duration {
     Duration::from_secs(u64::from_be_bytes(bytes) % seconds)
 }
 
+/// Consecutive sheds per source, so the no-`Retry-After` ladder actually climbs.
+///
+/// Without it every shed draws from `random(0, 30s)`, which the five-minute cycle
+/// has already outlived by the next tick — a ladder that never leaves its first
+/// rung is not backoff, it is a rounding error on the normal cadence. Reset by any
+/// completed upload.
+static SOURCE_SHED_STREAKS: OnceLock<Mutex<BTreeMap<&'static str, u32>>> = OnceLock::new();
+
+fn source_shed_streaks() -> &'static Mutex<BTreeMap<&'static str, u32>> {
+    SOURCE_SHED_STREAKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Count this shed and return the wait to honour.
+fn note_shed_and_backoff(source: SnapshotSource, retry_after: Option<Duration>) -> Duration {
+    let attempt = match source_shed_streaks().lock() {
+        Ok(mut streaks) => {
+            let streak = streaks.entry(source.api_slug()).or_insert(0);
+            let attempt = *streak;
+            *streak = streak.saturating_add(1);
+            attempt
+        }
+        Err(_) => 0,
+    };
+    match retry_after {
+        // The server named a time. Its number wins over our ladder — it knows
+        // when it will be ready and we do not.
+        Some(retry_after) => shed_backoff(Some(retry_after)),
+        None => full_jitter_backoff(attempt),
+    }
+}
+
+fn clear_shed_streak(source: SnapshotSource) {
+    if let Ok(mut streaks) = source_shed_streaks().lock() {
+        streaks.remove(source.api_slug());
+    }
+}
+
+#[cfg(test)]
+fn shed_streak_for_test(source: SnapshotSource) -> u32 {
+    source_shed_streaks()
+        .lock()
+        .expect("shed streaks")
+        .get(source.api_slug())
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Per-source "do not upload before" deadlines, set by an honoured shed.
 static SOURCE_UPLOAD_DEADLINES: OnceLock<Mutex<BTreeMap<&'static str, Instant>>> = OnceLock::new();
 
@@ -315,6 +362,9 @@ fn source_upload_backoff_remaining(source: SnapshotSource) -> Option<Duration> {
 fn clear_source_upload_deadlines_for_test() {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
         deadlines.clear();
+    }
+    if let Ok(mut streaks) = source_shed_streaks().lock() {
+        streaks.clear();
     }
 }
 
@@ -1338,8 +1388,9 @@ fn sync_source(
     });
 
     match upload_result {
-        Ok(ResumableUploadResult::Completed) => {}
+        Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
         Ok(ResumableUploadResult::Shed { retry_after }) => {
+            let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
             // Commit what the server demonstrably holds. Committing everything
             // would drop the pages it never received; committing nothing means
@@ -1571,8 +1622,12 @@ enum ResumableUploadResult {
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
     /// checkpointed; this is a "come back later", not a failure.
+    ///
+    /// Carries the server's own `Retry-After` verbatim (absent when it sent
+    /// none). Turning that into a wait needs the per-source shed history, which
+    /// the caller owns, not this pass.
     Shed {
-        retry_after: Duration,
+        retry_after: Option<Duration>,
     },
 }
 
@@ -1810,7 +1865,7 @@ where
                 // far is already checkpointed, so the retry resumes instead of
                 // restarting.
                 return Ok(ResumableUploadResult::Shed {
-                    retry_after: shed_backoff(shed.retry_after),
+                    retry_after: shed.retry_after,
                 });
             }
             Err(error) => return Err(error),
@@ -2630,10 +2685,14 @@ mod tests {
         assert_eq!(progress.accepted_fingerprints.len(), SNAPSHOT_BATCH_LIMIT);
         match result {
             ResumableUploadResult::Shed { retry_after } => {
+                // The pass reports the server's own number; turning it into a
+                // wait belongs to the caller, which owns the shed history.
+                assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                let honoured = note_shed_and_backoff(SnapshotSource::Pi, retry_after);
                 // Retry-After x uniform(1.0, 1.2): never before the server's 60s,
                 // never more than 20% late.
-                assert!(retry_after >= Duration::from_secs(60));
-                assert!(retry_after <= Duration::from_secs(72));
+                assert!(honoured >= Duration::from_secs(60));
+                assert!(honoured <= Duration::from_secs(72));
             }
             other => panic!("expected a shed result, got {other:?}"),
         }
@@ -2681,6 +2740,43 @@ mod tests {
             full_jitter_backoff(30) <= crate::snapshot_client::MAX_HONOURED_RETRY_AFTER,
             "the ladder must saturate, not overflow"
         );
+    }
+
+    #[test]
+    #[serial(source_upload_deadlines)]
+    fn a_sustained_shed_climbs_the_ladder_and_a_success_resets_it() {
+        clear_source_upload_deadlines_for_test();
+        // A shed with no Retry-After must back off further each time. Without a
+        // streak every shed draws from random(0, 30s), which the five-minute cycle
+        // has already outlived by the next tick — no backoff at all under
+        // sustained overload.
+        let mut ceilings = Vec::new();
+        for expected_attempt in 0..4 {
+            assert_eq!(
+                shed_streak_for_test(SnapshotSource::Codex),
+                expected_attempt
+            );
+            let wait = note_shed_and_backoff(SnapshotSource::Codex, None);
+            ceilings.push(wait);
+        }
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 4);
+        // Full jitter means any single draw can be small, so the property to
+        // assert is the ceiling, not the sample: the fourth rung may exceed the
+        // first rung's ceiling, and the first never can.
+        assert!(ceilings[0] <= SHED_BACKOFF_BASE);
+        assert!(ceilings[3] <= SHED_BACKOFF_BASE * 8);
+
+        // A server-named wait wins over the local ladder and still counts the shed.
+        let named = note_shed_and_backoff(SnapshotSource::Codex, Some(Duration::from_secs(120)));
+        assert!(named >= Duration::from_secs(120));
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 5);
+
+        // A completed upload clears it: the next shed starts at the first rung.
+        clear_shed_streak(SnapshotSource::Codex);
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 0);
+        // The streak is per source, like the deadline.
+        assert_eq!(shed_streak_for_test(SnapshotSource::ClaudeCode), 0);
+        clear_source_upload_deadlines_for_test();
     }
 
     #[test]

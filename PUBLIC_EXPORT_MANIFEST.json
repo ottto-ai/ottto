@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 271,
-  "content_sha256": "7ccf01685842996b68d3746c718e48b330c338ec4b078c4971c5f7943b84e82d",
+  "content_sha256": "15c52b3a7b6ea3077b6eab402db91a31b9e4bd833bae7a7a29699dbeacd1490e",
   "files": [
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "02a69216f407bf2307903a2308a37244927da51ef9b9c6d99d6aa08220ba7055",
-      "size_bytes": 166911
+      "sha256": "da4780a7cd26b323470322723dea24a991e16b47f1bea3839c036b4f1a38717e",
+      "size_bytes": 171148
     },
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-26-snapshot-upload-backoff-and-compression.md",
-      "sha256": "a69b12a3ffe2122efd0399e19630ba5ecd5fa18541179971c202045360e12f68",
-      "size_bytes": 5745
+      "sha256": "3fd755d6e77be4ee7611624efbcc9a0c2843cfc81f4b6bd005eb709d2f784720",
+      "size_bytes": 6061
     },
     {
       "executable": false,
@@ -1900,7 +1900,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T14:37:28+00:00",
+  "generated_at": "2026-07-26T14:58:37+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 272,
   "public_roots": [
@@ -1936,5 +1936,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "281daa50844bfe18bc28a7ea0e5078c8e2a6464b"
+  "source_commit": "19beb083cd4db37d66c9a1e1754b5cedbb7ff120"
 }

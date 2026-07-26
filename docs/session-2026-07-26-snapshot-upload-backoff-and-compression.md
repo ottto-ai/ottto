@@ -40,9 +40,12 @@ The wait is then jittered:
   the shed was protecting against. (The architecture note specifies
   `uniform(0.8, 1.2)`; the lower half is dropped for that reason.)
 * **Without** one: full jitter over an exponential ladder,
-  `random(0, min(cap, base·2ⁿ))` with a 30 s base. Full jitter — not
-  "exponential plus a little noise" — is the form that actually decorrelates
-  retries.
+  `random(0, min(cap, base·2ⁿ))` with a 30 s base, where `n` is that source's
+  consecutive-shed count. Full jitter — not "exponential plus a little noise" — is
+  the form that actually decorrelates retries, and the streak is what makes it a
+  ladder: pinned at `n = 0` every shed draws from `random(0, 30 s)`, which the
+  five-minute cycle has already outlived by the next tick, so sustained overload
+  would get no backoff at all. Any completed upload resets the streak.
 
 A shed sets a per-source deadline. While it is outstanding the sync loop skips
 that source entirely rather than re-scanning and re-deriving pages the server
