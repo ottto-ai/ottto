@@ -17,8 +17,8 @@ use crate::snapshot_client::{
 use crate::snapshots::{
     apply_upload_policy, collector_version, scan_source_roots_with_attribution,
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -27,7 +27,7 @@ use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, Loc
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -153,6 +153,102 @@ fn is_snapshot_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Last computed scan-index manifest per (upload destination, source).
+///
+/// The check-in heartbeat runs on its own clock and does not know which
+/// policy/attribution/destination-scoped index path the sync cycle chose, so it
+/// cannot load the index itself. The sync cycle publishes the manifest it
+/// already computed from the index it already had open, and both receipt shapes
+/// read it from here. Missing means "no scan has completed in this process yet
+/// for this destination", which is reported as an absent manifest rather than a
+/// zeroed one.
+///
+/// The destination is part of the key, not an afterthought: a setup or account
+/// switch replaces the relay binding without restarting the daemon (which is why
+/// `ensure_snapshot_destination_current` exists), and a manifest keyed by source
+/// alone would report the previous account's entity count and rolling hash to the
+/// new one — a wrong witness and a disclosure of the previous account's local
+/// session set.
+static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>> =
+    OnceLock::new();
+
+type SourceManifestCache = Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>;
+
+fn source_manifests() -> &'static SourceManifestCache {
+    SOURCE_MANIFESTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn publish_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+    manifest: SnapshotSourceManifest,
+) {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        // One destination at a time: a machine that has moved is never coming
+        // back to the old binding with the same secret, so retaining its
+        // manifests would only risk reporting them.
+        manifests.retain(|(namespace, _), _| namespace == destination_namespace);
+        manifests.insert(
+            (destination_namespace.to_string(), source.api_slug()),
+            manifest,
+        );
+    }
+}
+
+fn cached_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+) -> Option<SnapshotSourceManifest> {
+    source_manifests().lock().ok().and_then(|manifests| {
+        manifests
+            .get(&(destination_namespace.to_string(), source.api_slug()))
+            .cloned()
+    })
+}
+
+#[cfg(test)]
+fn clear_source_manifests_for_test() {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        manifests.clear();
+    }
+}
+
+/// Entity fingerprints already counted as a client-report poison loss.
+///
+/// The server has no per-entity rejection vocabulary yet, so a permanently
+/// invalid entity is re-attempted every cycle. Counting each attempt would make
+/// one broken session look like an unbounded stream of losses — and if the
+/// source has no valid sibling, no request ever succeeds, so nothing commits the
+/// report and the number only grows. One entity is one loss until the per-entity
+/// ACK contract lands and the daemon can mark it durably poisoned.
+///
+/// Pruned to the current scan on every upload pass, exactly like the accepted
+/// fingerprint ledger, so it stays O(current scan) rather than O(all history).
+static COUNTED_POISON_FINGERPRINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn counted_poison_fingerprints() -> &'static Mutex<BTreeSet<String>> {
+    COUNTED_POISON_FINGERPRINTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn retain_counted_poison_fingerprints(current: &BTreeSet<String>) {
+    if let Ok(mut counted) = counted_poison_fingerprints().lock() {
+        counted.retain(|value| current.contains(value));
+    }
+}
+
+/// Record one poison loss for `fingerprint`, at most once per entity.
+fn record_poison_loss_once(fingerprint: &str) {
+    let first_time = match counted_poison_fingerprints().lock() {
+        Ok(mut counted) => counted.insert(fingerprint.to_string()),
+        // A poisoned lock must not silently stop the accounting; over-reporting
+        // a loss is recoverable, losing the signal is not.
+        Err(_) => true,
+    };
+    if first_time {
+        crate::client_report::record(crate::client_report::ClientReportReason::Poisoned, 1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     backfill_window_days: u64,
@@ -162,6 +258,7 @@ struct SyncCounts {
     scan_cap_hit: bool,
     scanned_file_count: u64,
     scanned_session_count: u64,
+    semantic_noop_count: u64,
     uploaded_count: u64,
 }
 
@@ -183,6 +280,7 @@ impl SyncCounts {
             scan_cap_hit: scan_result.scan_cap_hit,
             scanned_file_count: scan_result.scanned_file_count as u64,
             scanned_session_count: scan_result.scanned_session_count as u64,
+            semantic_noop_count: scan_result.semantic_noop_count as u64,
             uploaded_count,
         }
     }
@@ -810,6 +908,7 @@ fn sync_source(
         report_status(
             client,
             &relay_token,
+            &snapshot_upload_destination_namespace(device, device_secret),
             CollectorStatus {
                 source,
                 machine_id,
@@ -910,6 +1009,18 @@ fn sync_source(
         }
     };
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    // Publish the manifest from the index this scan just advanced, before any
+    // upload outcome is known. It is the machine's own entity denominator, so
+    // it must not wait on acceptance: a machine mid-backfill is exactly when the
+    // server needs to see that its entity set is behind. The window travels with
+    // it because the index only holds what the window discovers — the historical
+    // bootstrap below scans from a throwaway index and its older entities are
+    // deliberately outside this count.
+    publish_source_manifest(
+        &upload_destination_namespace,
+        source,
+        index.manifest(source, activity_hint.backfill_window_days),
+    );
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
@@ -1021,6 +1132,10 @@ fn sync_source(
             // history and retroactive backfill before the first upload. Relay
             // tokens are intentionally short-lived, so mint them at the network
             // boundary instead of reusing the pre-scan activity-hint token.
+            // Leased, not read: exactly one in-flight batch may claim the
+            // counters, and dropping the lease on any failure below leaves the
+            // losses owed instead of stranded.
+            let client_report = crate::client_report::lease();
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: source.api_slug().to_string(),
@@ -1028,6 +1143,7 @@ fn sync_source(
                 collector_version: Some(collector_version()),
                 snapshots,
                 upload_policy,
+                client_report: client_report.report().clone(),
             };
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -1035,7 +1151,12 @@ fn sync_source(
                 }));
             }
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            client.upload_batch(&upload_relay_token, &request)
+            let response = client.upload_batch(&upload_relay_token, &request)?;
+            // Clear only what this accepted request carried. A failed upload
+            // leaves the counters in place so the losses are reported on the
+            // next batch instead of vanishing with the request that died.
+            client_report.commit();
+            Ok(response)
         },
         |progress| progress.save(&upload_progress_path),
     )
@@ -1145,6 +1266,20 @@ fn sync_source(
                     "backend rejected snapshot batch payload validation",
                 )
             } else {
+                // A shed request is not a network failure. 429 is unambiguous in
+                // the redacted diagnostics today; 503 joins it with the typed
+                // `Retry-After` handling, which is where the backoff itself
+                // lives. The collector status code stays `network_error` — that
+                // string is a backend contract, and only the loss category is
+                // being classified here.
+                crate::client_report::record(
+                    if is_shed_failure(&error) {
+                        crate::client_report::ClientReportReason::RatelimitBackoff
+                    } else {
+                        crate::client_report::ClientReportReason::NetworkError
+                    },
+                    1,
+                );
                 (
                     CollectorState::Error {
                         code: "network_error",
@@ -1312,6 +1447,13 @@ fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
         })
 }
 
+/// True when the backend shed this request rather than failing it.
+fn is_shed_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
+}
+
 fn is_timeout_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
@@ -1349,6 +1491,7 @@ where
     progress
         .accepted_fingerprints
         .retain(|value| current_fingerprints.contains(value));
+    retain_counted_poison_fingerprints(&current_fingerprints);
     if progress.accepted_fingerprints.len() != progress_len_before_prune {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
@@ -1436,6 +1579,9 @@ where
                 // every valid sibling is accepted and checkpointed exactly
                 // once. The caller still reports the cycle as failed and does
                 // not commit the final scan index.
+                for index in &indices {
+                    record_poison_loss_once(fingerprint(&items[*index]));
+                }
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
@@ -1519,6 +1665,7 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 fn report_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let finished_at = current_rfc3339();
@@ -1553,10 +1700,12 @@ fn report_status(
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
         last_scan_cap_hit: status.counts.scan_cap_hit,
+        last_semantic_noop_count: status.counts.semantic_noop_count,
         consecutive_failures,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
+        manifest: cached_source_manifest(destination_namespace, status.source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1570,7 +1719,8 @@ fn report_status_with_fresh_relay_token(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_status(client, &relay_token, status)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_status(client, &relay_token, &destination_namespace, status)
 }
 
 /// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
@@ -1582,6 +1732,7 @@ fn report_status_with_fresh_relay_token(
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
@@ -1605,10 +1756,16 @@ fn report_checkin_status(
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
         last_scan_cap_hit: false,
+        last_semantic_noop_count: 0,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(source.parser_version().to_string()),
+        // The liveness-only shape carries the manifest deliberately: it is the
+        // cheapest cadence the server gets it on, and a check-in that says
+        // "alive" while the entity sets disagree is exactly the state the
+        // manifest exists to expose.
+        manifest: cached_source_manifest(destination_namespace, source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1623,7 +1780,15 @@ fn report_checkin_status_with_fresh_relay_token(
     scan_started_at: Option<&str>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_checkin_status(client, &relay_token, source, machine_id, scan_started_at)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_checkin_status(
+        client,
+        &relay_token,
+        &destination_namespace,
+        source,
+        machine_id,
+        scan_started_at,
+    )
 }
 
 /// Spawn the periodic non-terminal collector check-in heartbeat.
@@ -2029,6 +2194,154 @@ mod tests {
         assert!(chunk_lengths.iter().all(|length| *length <= 20));
         assert_eq!(accepted, 45);
         assert_eq!(result, ResumableUploadResult::Completed);
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn poisoned_items_are_counted_for_the_client_report() {
+        use crate::client_report::{reset_for_test, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(3);
+        let poison = items[1].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            move |batch| {
+                if batch.contains(&poison) {
+                    return Err(anyhow::Error::new(BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(
+                            r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                        ),
+                    }));
+                }
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("a poison item still fails the cycle");
+
+        assert!(is_item_specific_validation_failure(&error));
+        // One item was lost and it is reported as exactly one item, so the
+        // server can tell this apart from an empty scan.
+        assert_eq!(
+            crate::client_report::observe().quantity(ClientReportReason::Poisoned),
+            1
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn a_permanently_poisoned_item_is_counted_once_not_once_per_cycle() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(1);
+        let poison = items[0].clone();
+        let upload = |batch: Vec<String>| {
+            assert!(batch.contains(&poison));
+            Err(anyhow::Error::new(BatchRejected {
+                status: 422,
+                body_excerpt: Some(
+                    r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                ),
+            }))
+        };
+
+        // Three cycles over the same permanently invalid entity. Nothing ever
+        // succeeds, so nothing ever commits the report; if each attempt counted,
+        // one broken session would look like a growing stream of losses.
+        for _ in 0..3 {
+            let mut progress = test_upload_progress();
+            let mut accepted = 0;
+            upload_resumable_batches(
+                &items,
+                &mut progress,
+                &mut accepted,
+                String::as_str,
+                upload,
+                |_| Ok(()),
+            )
+            .expect_err("a poison item fails the cycle");
+        }
+
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
+
+        // A later scan that no longer carries the entity prunes the ledger, so
+        // it stays bounded by the current scan rather than by all history.
+        let other_items = test_fingerprints(2)[1..].to_vec();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        upload_resumable_batches(
+            &other_items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| Ok(accepted_batch(batch.len())),
+            |_| Ok(()),
+        )
+        .expect("valid scan succeeds");
+        assert!(counted_poison_fingerprints()
+            .lock()
+            .expect("poison ledger")
+            .is_empty());
+        reset_for_test();
+    }
+
+    #[test]
+    fn a_shed_upload_is_counted_as_backoff_not_as_a_network_error() {
+        let shed = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_429",
+            true,
+            false,
+        ));
+        assert!(is_shed_failure(&shed));
+        let server_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&server_error));
+        let offline = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&offline));
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn an_unacknowledged_client_report_survives_to_the_next_batch() {
+        use crate::client_report::{lease, observe, record, reset_for_test, ClientReportReason};
+        reset_for_test();
+        record(ClientReportReason::NetworkError, 2);
+        {
+            // The upload died: the lease drops unacknowledged, so the losses stay
+            // owed rather than vanishing with the request.
+            let reported = lease();
+            assert_eq!(
+                reported.report().quantity(ClientReportReason::NetworkError),
+                2
+            );
+        }
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 2);
+
+        // The retry carries them and is acknowledged.
+        lease().commit();
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 0);
+        reset_for_test();
     }
 
     #[test]
@@ -3001,6 +3314,127 @@ mod tests {
         assert!(requests[1].contains("\"last_scan_finished_at\":null"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
+        clear_source_manifests_for_test();
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let destination_namespace =
+            &snapshot_upload_destination_namespace(&device, "device-secret");
+
+        // Before any scan completes the manifest is absent, not zeroed: a
+        // fabricated `entity_count: 0` would read as "this machine has nothing",
+        // which is a different and wrong statement.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in before any scan");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+
+        let mut index =
+            ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-1".to_string(), "a".repeat(64));
+        let manifest = index.manifest(SnapshotSource::Codex, 183);
+        publish_source_manifest(
+            destination_namespace,
+            SnapshotSource::Codex,
+            manifest.clone(),
+        );
+
+        for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+            report_checkin_status_with_fresh_relay_token(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                scan_started_at,
+            )
+            .expect("report check-in after a scan");
+            let requests = captured.lock().expect("captured requests").clone();
+            assert!(requests[1].contains("\"entity_count\":1"));
+            assert!(
+                requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash))
+            );
+            // The scope and window travel with the count. Without them a
+            // consumer would compare this against its whole stored set and
+            // report a mismatch for every session the historical bootstrap
+            // uploaded from outside the scan window.
+            assert!(requests[1].contains("\"scope\":\"live_scan_window\""));
+            assert!(requests[1].contains("\"window_days\":183"));
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let mut counts = SyncCounts::for_policy(30);
+        counts.semantic_noop_count = 718;
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report terminal status");
+        let requests = captured.lock().expect("captured requests").clone();
+        // The suppression count is the difference between "nothing changed" and
+        // "the collector dropped what changed".
+        assert!(requests[1].contains("\"last_semantic_noop_count\":718"));
+        assert!(requests[1].contains("\"entity_count\":1"));
+
+        // An account switch replaces the relay binding without restarting the
+        // daemon. The new destination must not receive the previous account's
+        // entity count and rolling hash — that is both a false witness and a
+        // disclosure of the previous account's local session set.
+        let switched = LocalDeviceBinding {
+            device_id: "device_switched".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &switched,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in after an account switch");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+        assert!(!requests[1].contains(&manifest.rolling_hash));
+
+        // Publishing for the new destination retires the old one outright.
+        let new_namespace = snapshot_upload_destination_namespace(&switched, "device-secret");
+        publish_source_manifest(&new_namespace, SnapshotSource::Codex, manifest.clone());
+        assert!(cached_source_manifest(destination_namespace, SnapshotSource::Codex).is_none());
+        clear_source_manifests_for_test();
     }
 
     #[test]

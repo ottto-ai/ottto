@@ -1,4 +1,4 @@
-use crate::snapshots::{SnapshotBatchRequest, SnapshotSource};
+use crate::snapshots::{SnapshotBatchRequest, SnapshotSource, SnapshotSourceManifest};
 use anyhow::{anyhow, Result};
 use ottto_core::{
     compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
@@ -353,10 +353,19 @@ pub struct SnapshotStatusRequest {
     pub last_discovered_file_count: u64,
     pub last_skipped_file_count_due_to_limit: u64,
     pub last_scan_cap_hit: bool,
+    /// Sessions the local semantic fuse classified as no-ops and therefore did
+    /// not upload. Without it, "the collector suppressed 718 unchanged
+    /// sessions" and "the collector did nothing" are the same receipt.
+    pub last_semantic_noop_count: u64,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
     pub parser_version: Option<String>,
+    /// `{source, entity_count, rolling_hash}` over this source's scan index, as
+    /// of the most recent completed scan on this machine. Absent before the
+    /// first scan of the process; never fabricated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<SnapshotSourceManifest>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1531,10 +1540,18 @@ mod tests {
             last_discovered_file_count: 1_100,
             last_skipped_file_count_due_to_limit: 100,
             last_scan_cap_hit: true,
+            last_semantic_noop_count: 7,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            manifest: Some(SnapshotSourceManifest {
+                source: "codex".to_string(),
+                entity_count: 3,
+                rolling_hash: "b".repeat(64),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
+                window_days: 183,
+            }),
         };
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));

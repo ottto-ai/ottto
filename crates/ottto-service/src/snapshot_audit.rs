@@ -274,6 +274,9 @@ pub fn run_snapshot_audit<W: Write>(
             collector_version: Some(collector_version()),
             snapshots: scan.snapshots.clone(),
             upload_policy,
+            // The audit is an offline reproduction of one upload, so it reports
+            // no losses of its own; the live counters belong to the sync loop.
+            client_report: crate::client_report::ClientReport::empty(),
         };
         write_private_json(path, &request)?;
     }
