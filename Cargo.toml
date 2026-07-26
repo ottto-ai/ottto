@@ -19,6 +19,7 @@ aes = "0.8"
 base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 cc = "1"
+flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 hmac = "0.12"

@@ -783,6 +783,7 @@ dependencies = [
  "cbc",
  "cc",
  "clap",
+ "flate2",
  "getrandom 0.3.4",
  "hmac",
  "libc",
