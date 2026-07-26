@@ -762,6 +762,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

@@ -1,4 +1,5 @@
 pub mod account_store;
+pub mod claude_account;
 pub mod claude_statusline;
 pub mod lifecycle;
 pub mod local_client;
@@ -14,6 +15,11 @@ pub use account_store::{
     FileAccountStore, FileConnectionStore, FileDeviceStore, FileMachineStore, FileSourceStateStore,
     LocalConnectionBinding, LocalDeviceBinding, LocalMachineBinding, LocalSourceState,
 };
+pub use claude_account::{
+    billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,
+    claude_cli_account_identifier_hash_at, claude_cli_account_identifier_hash_from_config,
+    default_claude_cli_config_path, CLAUDE_CLI_CONFIG_FILE_NAME,
+};
 pub use claude_statusline::{
     append_claude_statusline_context_history, claude_statusline_cache_path,
     claude_statusline_context_cache_path, claude_statusline_context_history_path,
@@ -27,6 +33,7 @@ pub use claude_statusline::{
     CLAUDE_STATUSLINE_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CACHE_SCHEMA_VERSION,
     CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME,
     CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES,
+    CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
 };
 pub use lifecycle::{
     execute_local_uninstall, launch_agent_path, launchd_target, local_lifecycle_home_dir,
