@@ -188,6 +188,42 @@ fn clear_source_manifests_for_test() {
     }
 }
 
+/// Entity fingerprints already counted as a client-report poison loss.
+///
+/// The server has no per-entity rejection vocabulary yet, so a permanently
+/// invalid entity is re-attempted every cycle. Counting each attempt would make
+/// one broken session look like an unbounded stream of losses — and if the
+/// source has no valid sibling, no request ever succeeds, so nothing commits the
+/// report and the number only grows. One entity is one loss until the per-entity
+/// ACK contract lands and the daemon can mark it durably poisoned.
+///
+/// Pruned to the current scan on every upload pass, exactly like the accepted
+/// fingerprint ledger, so it stays O(current scan) rather than O(all history).
+static COUNTED_POISON_FINGERPRINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+
+fn counted_poison_fingerprints() -> &'static Mutex<BTreeSet<String>> {
+    COUNTED_POISON_FINGERPRINTS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn retain_counted_poison_fingerprints(current: &BTreeSet<String>) {
+    if let Ok(mut counted) = counted_poison_fingerprints().lock() {
+        counted.retain(|value| current.contains(value));
+    }
+}
+
+/// Record one poison loss for `fingerprint`, at most once per entity.
+fn record_poison_loss_once(fingerprint: &str) {
+    let first_time = match counted_poison_fingerprints().lock() {
+        Ok(mut counted) => counted.insert(fingerprint.to_string()),
+        // A poisoned lock must not silently stop the accounting; over-reporting
+        // a loss is recoverable, losing the signal is not.
+        Err(_) => true,
+    };
+    if first_time {
+        crate::client_report::record(crate::client_report::ClientReportReason::Poisoned, 1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     backfill_window_days: u64,
@@ -950,8 +986,14 @@ fn sync_source(
     // Publish the manifest from the index this scan just advanced, before any
     // upload outcome is known. It is the machine's own entity denominator, so
     // it must not wait on acceptance: a machine mid-backfill is exactly when the
-    // server needs to see that its entity set is behind.
-    publish_source_manifest(source, index.manifest(source));
+    // server needs to see that its entity set is behind. The window travels with
+    // it because the index only holds what the window discovers — the historical
+    // bootstrap below scans from a throwaway index and its older entities are
+    // deliberately outside this count.
+    publish_source_manifest(
+        source,
+        index.manifest(source, activity_hint.backfill_window_days),
+    );
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
@@ -1194,8 +1236,18 @@ fn sync_source(
                     "backend rejected snapshot batch payload validation",
                 )
             } else {
+                // A shed request is not a network failure. 429 is unambiguous in
+                // the redacted diagnostics today; 503 joins it with the typed
+                // `Retry-After` handling, which is where the backoff itself
+                // lives. The collector status code stays `network_error` — that
+                // string is a backend contract, and only the loss category is
+                // being classified here.
                 crate::client_report::record(
-                    crate::client_report::ClientReportReason::NetworkError,
+                    if is_shed_failure(&error) {
+                        crate::client_report::ClientReportReason::RatelimitBackoff
+                    } else {
+                        crate::client_report::ClientReportReason::NetworkError
+                    },
                     1,
                 );
                 (
@@ -1365,6 +1417,13 @@ fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
         })
 }
 
+/// True when the backend shed this request rather than failing it.
+fn is_shed_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
+}
+
 fn is_timeout_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
@@ -1402,6 +1461,7 @@ where
     progress
         .accepted_fingerprints
         .retain(|value| current_fingerprints.contains(value));
+    retain_counted_poison_fingerprints(&current_fingerprints);
     if progress.accepted_fingerprints.len() != progress_len_before_prune {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
@@ -1489,10 +1549,9 @@ where
                 // every valid sibling is accepted and checkpointed exactly
                 // once. The caller still reports the cycle as failed and does
                 // not commit the final scan index.
-                crate::client_report::record(
-                    crate::client_report::ClientReportReason::Poisoned,
-                    indices.len() as u64,
-                );
+                for index in &indices {
+                    record_poison_loss_once(fingerprint(&items[*index]));
+                }
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
@@ -2134,6 +2193,91 @@ mod tests {
             1
         );
         reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn a_permanently_poisoned_item_is_counted_once_not_once_per_cycle() {
+        use crate::client_report::{reset_for_test, take, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(1);
+        let poison = items[0].clone();
+        let upload = |batch: Vec<String>| {
+            assert!(batch.contains(&poison));
+            Err(anyhow::Error::new(BatchRejected {
+                status: 422,
+                body_excerpt: Some(
+                    r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                ),
+            }))
+        };
+
+        // Three cycles over the same permanently invalid entity. Nothing ever
+        // succeeds, so nothing ever commits the report; if each attempt counted,
+        // one broken session would look like a growing stream of losses.
+        for _ in 0..3 {
+            let mut progress = test_upload_progress();
+            let mut accepted = 0;
+            upload_resumable_batches(
+                &items,
+                &mut progress,
+                &mut accepted,
+                String::as_str,
+                upload,
+                |_| Ok(()),
+            )
+            .expect_err("a poison item fails the cycle");
+        }
+
+        assert_eq!(take().quantity(ClientReportReason::Poisoned), 1);
+
+        // A later scan that no longer carries the entity prunes the ledger, so
+        // it stays bounded by the current scan rather than by all history.
+        let other_items = test_fingerprints(2)[1..].to_vec();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        upload_resumable_batches(
+            &other_items,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| Ok(accepted_batch(batch.len())),
+            |_| Ok(()),
+        )
+        .expect("valid scan succeeds");
+        assert!(counted_poison_fingerprints()
+            .lock()
+            .expect("poison ledger")
+            .is_empty());
+        reset_for_test();
+    }
+
+    #[test]
+    fn a_shed_upload_is_counted_as_backoff_not_as_a_network_error() {
+        let shed = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_429",
+            true,
+            false,
+        ));
+        assert!(is_shed_failure(&shed));
+        let server_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&server_error));
+        let offline = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&offline));
     }
 
     #[test]
@@ -3159,7 +3303,7 @@ mod tests {
         index
             .codex_state_only_snapshot_fingerprints
             .insert("session-1".to_string(), "a".repeat(64));
-        let manifest = index.manifest(SnapshotSource::Codex);
+        let manifest = index.manifest(SnapshotSource::Codex, 183);
         publish_source_manifest(SnapshotSource::Codex, manifest.clone());
 
         for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
@@ -3179,6 +3323,12 @@ mod tests {
             assert!(
                 requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash))
             );
+            // The scope and window travel with the count. Without them a
+            // consumer would compare this against its whole stored set and
+            // report a mismatch for every session the historical bootstrap
+            // uploaded from outside the scan window.
+            assert!(requests[1].contains("\"scope\":\"live_scan_window\""));
+            assert!(requests[1].contains("\"window_days\":183"));
         }
 
         let captured = Arc::new(Mutex::new(Vec::new()));

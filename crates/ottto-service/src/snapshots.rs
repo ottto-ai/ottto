@@ -177,6 +177,17 @@ pub(crate) const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
 /// silently changing its meaning.
 pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v1";
 
+/// What the manifest counts, declared on the wire rather than assumed.
+///
+/// The live scan index only ever holds transcripts inside the authorized scan
+/// window. The one-time historical bootstrap uploads older sessions from a
+/// throwaway index that is never persisted, so those entities are on the server
+/// and permanently absent from this manifest. A consumer that compared this
+/// count against its whole stored set would therefore report a mismatch on a
+/// perfectly healthy machine — so the scope and the window travel with the
+/// count, and the comparison is the consumer's to scope.
+pub const SNAPSHOT_MANIFEST_SCOPE: &str = "live_scan_window";
+
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
 /// context)" window enabled — the regular Claude context cap is 200K tokens.
@@ -651,13 +662,16 @@ pub struct ScanIndexEntry {
 }
 
 /// `{source, entity_count, rolling_hash}` — the scan-index manifest triple
-/// carried on collector check-ins. See [`ScanIndex::manifest`] for the fold and
-/// the entity grain.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// carried on collector check-ins, plus the two fields that make the triple
+/// comparable: what it covers and over how long. See [`ScanIndex::manifest`] for
+/// the fold, the entity grain, and the scope.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotSourceManifest {
     pub source: String,
     pub entity_count: u64,
     pub rolling_hash: String,
+    pub scope: &'static str,
+    pub window_days: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -6117,9 +6131,14 @@ impl ScanIndex {
     /// contributes its LAST fingerprint, which is the same value the index uses
     /// for no-op suppression.
     ///
+    /// Scope, equally explicit: entities inside `window_days`, the scan window
+    /// this cycle was authorized for. Sessions older than the window were
+    /// uploaded once by the historical bootstrap from an index that is never
+    /// persisted, so they are NOT counted here (see [`SNAPSHOT_MANIFEST_SCOPE`]).
+    ///
     /// No local path, session id, title, or byte offset participates: the fold
     /// is over semantic fingerprints only, which are already on the wire.
-    pub fn manifest(&self, source: SnapshotSource) -> SnapshotSourceManifest {
+    pub fn manifest(&self, source: SnapshotSource, window_days: u64) -> SnapshotSourceManifest {
         let fingerprints = self
             .files
             .values()
@@ -6132,6 +6151,7 @@ impl ScanIndex {
             .collect::<BTreeSet<_>>();
         let mut digest = Sha256::new();
         update_length_prefixed(&mut digest, SNAPSHOT_MANIFEST_CONTRACT_VERSION.as_bytes());
+        update_length_prefixed(&mut digest, SNAPSHOT_MANIFEST_SCOPE.as_bytes());
         update_length_prefixed(&mut digest, source.api_slug().as_bytes());
         for fingerprint in &fingerprints {
             update_length_prefixed(&mut digest, fingerprint.as_bytes());
@@ -6140,6 +6160,8 @@ impl ScanIndex {
             source: source.api_slug().to_string(),
             entity_count: fingerprints.len() as u64,
             rolling_hash: format!("{:x}", digest.finalize()),
+            scope: SNAPSHOT_MANIFEST_SCOPE,
+            window_days,
         }
     }
 
@@ -14257,15 +14279,25 @@ mod tests {
             .codex_state_only_snapshot_fingerprints
             .insert("session-1".to_string(), "cc".to_string());
 
-        let manifest = index.manifest(SnapshotSource::Codex);
+        let manifest = index.manifest(SnapshotSource::Codex, 183);
         assert_eq!(manifest.source, "codex");
         assert_eq!(manifest.entity_count, 3);
+        // The scope and window are reported, never folded into the hash: two
+        // machines holding the same entity set must agree on the fold even if
+        // their authorized windows differ, and the window is what lets a
+        // consumer scope its own set before comparing.
+        assert_eq!(manifest.scope, SNAPSHOT_MANIFEST_SCOPE);
+        assert_eq!(manifest.window_days, 183);
+        assert_eq!(
+            manifest.rolling_hash,
+            index.manifest(SnapshotSource::Codex, 730).rolling_hash
+        );
         assert_eq!(manifest.rolling_hash.len(), 64);
         assert!(manifest
             .rolling_hash
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(manifest, index.manifest(SnapshotSource::Codex));
+        assert_eq!(manifest, index.manifest(SnapshotSource::Codex, 183));
     }
 
     #[test]
@@ -14289,8 +14321,8 @@ mod tests {
         );
 
         assert_eq!(
-            left.manifest(SnapshotSource::Codex),
-            right.manifest(SnapshotSource::Codex)
+            left.manifest(SnapshotSource::Codex, 183),
+            right.manifest(SnapshotSource::Codex, 183)
         );
     }
 
@@ -14300,10 +14332,10 @@ mod tests {
         index
             .files
             .insert("a.jsonl".to_string(), manifest_index_entry(Some("aa")));
-        let codex = index.manifest(SnapshotSource::Codex);
+        let codex = index.manifest(SnapshotSource::Codex, 183);
         assert_ne!(
             codex.rolling_hash,
-            index.manifest(SnapshotSource::ClaudeCode).rolling_hash
+            index.manifest(SnapshotSource::ClaudeCode, 183).rolling_hash
         );
 
         index
@@ -14311,9 +14343,9 @@ mod tests {
             .insert("a.jsonl".to_string(), manifest_index_entry(Some("ab")));
         assert_ne!(
             codex.rolling_hash,
-            index.manifest(SnapshotSource::Codex).rolling_hash
+            index.manifest(SnapshotSource::Codex, 183).rolling_hash
         );
-        assert_eq!(index.manifest(SnapshotSource::Codex).entity_count, 1);
+        assert_eq!(index.manifest(SnapshotSource::Codex, 183).entity_count, 1);
     }
 
     #[test]
@@ -14333,8 +14365,8 @@ mod tests {
             .insert("a".to_string(), manifest_index_entry(Some("aabb")));
 
         assert_ne!(
-            split.manifest(SnapshotSource::Codex).rolling_hash,
-            joined.manifest(SnapshotSource::Codex).rolling_hash
+            split.manifest(SnapshotSource::Codex, 183).rolling_hash,
+            joined.manifest(SnapshotSource::Codex, 183).rolling_hash
         );
     }
 

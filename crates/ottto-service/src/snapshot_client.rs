@@ -1549,6 +1549,8 @@ mod tests {
                 source: "codex".to_string(),
                 entity_count: 3,
                 rolling_hash: "b".repeat(64),
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
+                window_days: 183,
             }),
         };
         let serialized = serde_json::to_string(&status).expect("serialize");

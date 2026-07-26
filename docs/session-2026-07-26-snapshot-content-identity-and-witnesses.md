@@ -91,9 +91,23 @@ Two disciplines matter more than the shape:
   only after the server accepts the batch, so a failed upload re-reports its
   losses instead of erasing them.
 
-`network_error` and `poisoned` have live writers in this release.
-`ratelimit_backoff` is wired with the `Retry-After` handling, and
-`queue_overflow` when the durable outbox lands; both report 0 until then.
+`network_error`, `poisoned`, and `ratelimit_backoff` have live writers in this
+release. `queue_overflow` reports 0 until the durable outbox lands.
+
+Two classification rules are worth stating because getting them wrong makes the
+report actively misleading:
+
+* **A shed request is not a network failure.** HTTP 429 is counted as
+  `ratelimit_backoff`; 503 joins it with the typed `Retry-After` handling, which
+  is where the backoff itself lives (the redacted diagnostics currently expose
+  429 distinctly and fold 503 in with every other 5xx).
+* **One poisoned entity is one loss, not one loss per cycle.** The server has no
+  per-entity rejection vocabulary yet, so a permanently invalid entity is
+  re-attempted every cycle — and if the source has no valid sibling, no request
+  ever succeeds, so nothing commits the report and the number would only grow.
+  Counted fingerprints are therefore deduplicated, and the ledger is pruned to
+  the current scan exactly like the accepted-fingerprint ledger. Durable poison
+  marking arrives with the per-entity ACK contract.
 
 ## Scan-index manifest on check-ins
 
@@ -104,9 +118,22 @@ scan index the sync cycle already had open:
   per Codex state-only session. A transcript that parses into several snapshots
   contributes its last fingerprint — the same value the index uses for no-op
   suppression.
+* **Scope, declared on the wire** as `scope: "live_scan_window"` plus
+  `window_days`. The live scan index only holds transcripts inside the authorized
+  scan window; the one-time historical bootstrap uploads older sessions from a
+  throwaway index that is never persisted, so those entities are on the server
+  and permanently absent here. A consumer that compared this count against its
+  whole stored set would report a mismatch on a perfectly healthy machine, so the
+  scoping is the consumer's job and the manifest states what it can see. Making
+  the count cover all history means persisting the bootstrap's index into the
+  live one — a change to emission bookkeeping, deliberately not folded into this
+  release.
+  `scope` and `window_days` are reported but **not** folded into `rolling_hash`:
+  two machines holding the same entity set must agree on the fold even if their
+  authorized windows differ.
 * **`rolling_hash`:** SHA-256 over the length-prefixed concatenation of the
-  manifest contract version, the source slug, and then each distinct entity
-  fingerprint in ascending byte order. Length prefixes are load-bearing: without
+  manifest contract version, the scope, the source slug, and then each distinct
+  entity fingerprint in ascending byte order. Length prefixes are load-bearing: without
   them two different fingerprint splits can produce identical bytes. Sorting
   makes the fold order-independent, so the server can recompute it from its own
   stored fingerprints for this (user, machine, source).

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 270,
-  "content_sha256": "213a89eb4db1a12f7b1e6a6b454f58f190e5544b46a656f123ddabe0f95835d6",
+  "content_sha256": "b521300732258451904ccf61f202181cdee452b074384e580481e700a006920d",
   "files": [
     {
       "executable": false,
@@ -811,15 +811,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_client.rs",
-      "sha256": "bcc2ddacda8b52c6aa52daf4bd232893d6b35e4fd5b570a13ef11df4b59dcc18",
-      "size_bytes": 58942
+      "sha256": "a3aee6b6a5688b913713737a72e1dd8723ce821fe2ea8853ee7f60e571245c7c",
+      "size_bytes": 59042
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "f5e2a667bca088457a0e6864aa3f06c038369397804381380491cd5ebf989b04",
-      "size_bytes": 139792
+      "sha256": "dc47ebd25a544abcfdcc86c68a7e7504e9b209e40465c99c221371a8dce384f8",
+      "size_bytes": 146079
     },
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "da2b796db8fef5fb7eb32bb0d4d892986d30e0b5ee70587c63dad92b9e3e3f3a",
-      "size_bytes": 609936
+      "sha256": "1dfaf1685a9493296a18a1e8b26349eb6dbeeca0c9573636fca0fc56694d2c25",
+      "size_bytes": 611818
     },
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-26-snapshot-content-identity-and-witnesses.md",
-      "sha256": "9a43945e483fd4a3bbee463736947d561173620bf2d7134bbb2ad6d63d4d2a56",
-      "size_bytes": 7899
+      "sha256": "cb7af5d787c05cabee3bfa712a4d66a27768cd7f3b24b27e16c2518608ca26d0",
+      "size_bytes": 9687
     },
     {
       "executable": false,
@@ -1893,7 +1893,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T13:50:44+00:00",
+  "generated_at": "2026-07-26T13:50:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 271,
   "public_roots": [
@@ -1929,5 +1929,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "323cdc5f52f66be6b951f4f75f671fcea4c76108"
+  "source_commit": "9d5174ab0157f3c5b4436599bf5e4c5c9bb98431"
 }
