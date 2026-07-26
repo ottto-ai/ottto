@@ -173,12 +173,27 @@ and uploading it would publish a number that is knowably short. The lookback is
 200-day bound.
 
 Rows are packed into contract-legal batches (≤1000 rows, ≤200 days), days are
-never split, and batches go oldest first so each abuts the previous and the
-backend's coverage envelope grows contiguously without ever being credited with
-days it did not observe. An idle window still uploads an empty batch declaring
-its coverage: a genuinely idle account is complete, not missing, and the
-backend distinguishes the two. A single day that alone exceeds the row bound is
-refused rather than truncated - a silently partial day is a manufactured delta.
+never split, and batches go oldest first.
+
+The subtle part is that consecutive windows must **abut exactly**. The
+backend's coverage envelope is one contiguous span, and a window that neither
+overlaps nor abuts the stored one *replaces* it rather than extending it. If a
+closed batch ended on the last day that happened to carry rows, a run of idle
+days before the next observed day would leave a hole, and the following batch
+would silently discard the coverage already uploaded. So a batch is closed on
+the day *before* the next one opens, which is also the honest statement: Ottto
+asked the provider about those days and the provider reported nothing for them.
+`batch_windows_abut_exactly_across_a_run_of_idle_days` pins it with observed
+days deliberately weeks apart.
+
+For the same reason an idle window still uploads an empty batch declaring its
+coverage: a genuinely idle account is complete, not missing, and the backend
+distinguishes the two. A single day that alone exceeds the row bound is refused
+rather than truncated - a silently partial day is a manufactured delta.
+
+Day arithmetic goes through `time::Date`, so `provider_day` accepts only real
+calendar days: `2026-02-30` is rejected at normalization rather than uploaded
+as a provider fact.
 
 ## Content safety
 
@@ -203,20 +218,20 @@ rather than relying on review to notice.
 
 ## Tests
 
-44 unit tests in `provider_daily_reference.rs`, all parallel-safe: every store
+45 unit tests in `provider_daily_reference.rs`, all parallel-safe: every store
 takes an explicit path and no test mutates process environment. Coverage:
 the closed surface map and slug bounds; the must-not-persist proof and the
 injected-free-text rejections; `null` versus `0`; per-model credits omission;
 unknown-id merging and grain uniqueness; window and day-span arithmetic across
 month, leap-year and year boundaries; batch packing bounds, contiguity and the
-refusal case; consent lifecycle, epoch advancement, response mismatch, and
+refusal case; exact window abutment across idle days; consent lifecycle, epoch advancement, response mismatch, and
 revoked-grant health; each gate proven with a reader and a transport that panic
 if contacted; the cadence band and its stability; each breaker class at its own
 threshold, class isolation, transient exemption, scoping and cool-down; the
 not-admitted and epoch-conflict upload answers; the credential's account scope
 surviving a token rotation; and the honest User-Agent.
 
-`cargo test --workspace` is green (1016 service tests), as is the connector
+`cargo test --workspace` is green (1017 service tests), as is the connector
 workspace, `cargo fmt --all --check`, and
 `cargo clippy --workspace --all-targets -- -D warnings`.
 

@@ -1179,11 +1179,7 @@ fn provider_day(raw: &str) -> Option<String> {
         return None;
     }
     // Reject an impossible day rather than uploading it as a provider fact.
-    let month: u8 = day[5..7].parse().ok()?;
-    let dom: u8 = day[8..10].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&dom) {
-        return None;
-    }
+    parse_day(day)?;
     Some(day.to_string())
 }
 
@@ -1364,16 +1360,23 @@ pub fn collection_window(now: OffsetDateTime) -> (String, String) {
 
 /// Split normalized rows into contract-legal batches.
 ///
-/// Days are never split across batches and batches are emitted oldest first,
-/// so each one abuts the previous and the backend's coverage envelope grows
-/// contiguously. A single day that alone exceeds the row bound is refused
-/// rather than truncated: a silently partial day is a manufactured delta.
+/// Three properties matter for the backend's coverage envelope, which is one
+/// contiguous span: batches go oldest first, consecutive windows **abut
+/// exactly** (a closed window ends the day before the next one starts, so a
+/// stretch of idle days between two observed days is still declared covered
+/// rather than left as a hole), and no day is split across batches. A window
+/// that neither overlaps nor abuts the stored envelope would *replace* it, so a
+/// hole here would silently discard already-uploaded coverage.
+///
+/// A single day that alone exceeds the row bound is refused rather than
+/// truncated: a silently partial day is a manufactured delta.
 fn pack_batches(
     rows: Vec<DailyReferenceRow>,
     window_start: &str,
     window_end: &str,
 ) -> Result<Vec<(String, String, Vec<DailyReferenceRow>)>> {
     if rows.is_empty() {
+        // A genuinely idle account still declares the window it observed.
         return Ok(vec![(
             window_start.to_string(),
             window_end.to_string(),
@@ -1399,64 +1402,51 @@ fn pack_batches(
 
     let mut batches = Vec::new();
     let mut current: Vec<DailyReferenceRow> = Vec::new();
-    let mut current_start: Option<String> = None;
-    let mut current_first_day: Option<String> = None;
-    let mut current_last_day: Option<String> = None;
+    // The first batch owns the declared window start, so no day Ottto asked
+    // about sits outside the envelope it claims to have covered.
+    let mut start = window_start.to_string();
 
     for (day, group) in by_day {
-        let would_overflow_rows = current.len() + group.len() > MAX_ROWS_PER_BATCH;
-        let would_overflow_days = current_first_day.as_ref().is_some_and(
-            |first| !matches!(day_span(first, &day), Some(span) if span <= MAX_COVERAGE_DAYS),
-        );
-        if !current.is_empty() && (would_overflow_rows || would_overflow_days) {
-            let start = current_start
-                .take()
-                .unwrap_or_else(|| current_first_day.clone().unwrap_or_else(|| day.clone()));
-            let end = current_last_day.clone().unwrap_or_else(|| start.clone());
+        let overflow_rows = !current.is_empty() && current.len() + group.len() > MAX_ROWS_PER_BATCH;
+        // Measured from the declared start, not the first observed day, because
+        // the declared window is what the bound applies to.
+        let overflow_days = !current.is_empty()
+            && !matches!(day_span(&start, &day), Some(span) if span <= MAX_COVERAGE_DAYS);
+        if overflow_rows || overflow_days {
+            let end = day_before(&day).ok_or_else(|| {
+                anyhow!("could not close a coverage window immediately before {day}")
+            })?;
             batches.push((start, end, std::mem::take(&mut current)));
-            current_first_day = None;
+            start = day.clone();
         }
-        if current.is_empty() {
-            // The first batch owns the declared window start so no observed day
-            // sits outside the envelope Ottto claims to have covered.
-            current_start = Some(if batches.is_empty() {
-                window_start.to_string()
-            } else {
-                day.clone()
-            });
-            current_first_day = Some(day.clone());
-        }
-        current_last_day = Some(day.clone());
         current.extend(group);
     }
-
-    if !current.is_empty() {
-        let start = current_start
-            .take()
-            .unwrap_or_else(|| window_start.to_string());
-        batches.push((start, window_end.to_string(), current));
-    }
+    batches.push((start, window_end.to_string(), current));
     Ok(batches)
 }
 
+fn parse_day(value: &str) -> Option<time::Date> {
+    let year: i32 = value.get(0..4)?.parse().ok()?;
+    let month: u8 = value.get(5..7)?.parse().ok()?;
+    let day: u8 = value.get(8..10)?.parse().ok()?;
+    time::Date::from_calendar_date(year, time::Month::try_from(month).ok()?, day).ok()
+}
+
 /// Inclusive day span between two `YYYY-MM-DD` days, or `None` when either is
-/// unparseable.
+/// not a real calendar day.
 fn day_span(start: &str, end: &str) -> Option<i64> {
-    let parse = |value: &str| -> Option<i64> {
-        let year: i64 = value.get(0..4)?.parse().ok()?;
-        let month: i64 = value.get(5..7)?.parse().ok()?;
-        let day: i64 = value.get(8..10)?.parse().ok()?;
-        // Days-from-civil (Howard Hinnant). Exact for the proleptic Gregorian
-        // calendar and free of any timezone notion, which is what a UTC day
-        // arithmetic needs.
-        let year = if month <= 2 { year - 1 } else { year };
-        let era = if year >= 0 { year } else { year - 399 } / 400;
-        let year_of_era = year - era * 400;
-        let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-        Some(era * 146_097 + day_of_era - 719_468)
-    };
-    Some(parse(end)? - parse(start)? + 1)
+    Some((parse_day(end)? - parse_day(start)?).whole_days() + 1)
+}
+
+fn day_before(value: &str) -> Option<String> {
+    parse_day(value)?.previous_day().map(|date| {
+        format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3057,7 +3047,8 @@ mod tests {
                 {"date": "2026-07-26", "clients": [{"client_id": "CODEX_WEB", "credits": 1.0}]},
                 {"date": "2020-01-01", "clients": [{"client_id": "CODEX_WEB", "credits": 5.0}]},
                 {"date": "not-a-day", "clients": [{"client_id": "CODEX_WEB", "credits": 7.0}]},
-                {"date": "2026-13-45", "clients": [{"client_id": "CODEX_WEB", "credits": 9.0}]}
+                {"date": "2026-13-45", "clients": [{"client_id": "CODEX_WEB", "credits": 9.0}]},
+                {"date": "2026-02-30", "clients": [{"client_id": "CODEX_WEB", "credits": 11.0}]}
             ]
         });
         let normalized =
@@ -3109,25 +3100,39 @@ mod tests {
         assert_eq!(day_span("2025-12-31", "2026-01-01"), Some(2));
     }
 
+    fn day_offset(base: &str, offset: i64) -> String {
+        let date = parse_day(base).expect("base day") + TimeDuration::days(offset);
+        format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        )
+    }
+
+    fn rows_on(day: &str, count: usize) -> Vec<DailyReferenceRow> {
+        (0..count)
+            .map(|index| DailyReferenceRow {
+                provider_day: day.to_string(),
+                surface: "codex_web",
+                model: format!("model-{index}"),
+                credits_used: None,
+                uncached_input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(1),
+                thread_count: None,
+                turn_count: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn batches_are_bounded_contiguous_and_oldest_first() {
         let mut rows = Vec::new();
         // 40 days x 30 rows = 1200 rows, past the per-batch bound.
-        for day in 1..=40 {
-            for index in 0..30 {
-                rows.push(DailyReferenceRow {
-                    provider_day: format!("2026-06-{day:02}"),
-                    surface: "codex_web",
-                    model: format!("model-{index}"),
-                    credits_used: None,
-                    uncached_input_tokens: None,
-                    cached_input_tokens: None,
-                    output_tokens: None,
-                    total_tokens: Some(1),
-                    thread_count: None,
-                    turn_count: None,
-                });
-            }
+        for offset in 0..40 {
+            rows.extend(rows_on(&day_offset("2026-06-01", offset), 30));
         }
         let batches = pack_batches(rows, "2026-06-01", "2026-07-10").expect("pack");
         assert!(batches.len() > 1);
@@ -3164,21 +3169,36 @@ mod tests {
 
     #[test]
     fn a_single_day_beyond_the_row_bound_is_refused_not_truncated() {
-        let rows = (0..MAX_ROWS_PER_BATCH + 1)
-            .map(|index| DailyReferenceRow {
-                provider_day: "2026-07-26".to_string(),
-                surface: "codex_web",
-                model: format!("model-{index}"),
-                credits_used: None,
-                uncached_input_tokens: None,
-                cached_input_tokens: None,
-                output_tokens: None,
-                total_tokens: Some(1),
-                thread_count: None,
-                turn_count: None,
-            })
-            .collect();
+        let rows = rows_on("2026-07-26", MAX_ROWS_PER_BATCH + 1);
         assert!(pack_batches(rows, "2026-07-26", "2026-07-26").is_err());
+    }
+
+    #[test]
+    fn batch_windows_abut_exactly_across_a_run_of_idle_days() {
+        // Observed days are deliberately far apart. The backend's coverage
+        // envelope is one contiguous span, and a window that neither overlaps
+        // nor abuts the stored one *replaces* it - so a hole between two
+        // batches would silently discard already-uploaded coverage.
+        let mut rows = rows_on("2026-06-01", 600);
+        rows.extend(rows_on("2026-06-20", 600));
+        rows.extend(rows_on("2026-07-05", 600));
+        let batches = pack_batches(rows, "2026-06-01", "2026-07-10").expect("pack");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].0, "2026-06-01");
+        // Closed the day before the next window opens, not on the last day that
+        // happened to carry rows.
+        assert_eq!(batches[0].1, "2026-06-19");
+        assert_eq!(batches[1].0, "2026-06-20");
+        assert_eq!(batches[1].1, "2026-07-04");
+        assert_eq!(batches[2].0, "2026-07-05");
+        assert_eq!(batches[2].1, "2026-07-10");
+        for pair in batches.windows(2) {
+            assert_eq!(
+                day_span(&pair[0].1, &pair[1].0),
+                Some(2),
+                "consecutive coverage windows must abut exactly"
+            );
+        }
     }
 
     // -- consent ----------------------------------------------------------
