@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 277,
-  "content_sha256": "133ad46c5dd627ede2afcc79206c560641832c59f9b035c6c0354fb9cbce4fb5",
+  "candidate_file_count": 278,
+  "content_sha256": "55b50af3a05777d1cef5985dd74d95ba272135f6ade7d482e0c5e8f643f535e0",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "03858c95155b2f7a601615fc05f3d82123016df443252bd502f1792dbf2a2080",
-      "size_bytes": 327422
+      "sha256": "965f6f6f0ef67411baa4929abf2d4ae83470931b124a470b549b71f08413d3c4",
+      "size_bytes": 362249
     },
     {
       "executable": false,
@@ -1086,6 +1086,13 @@
       "path": "docs/session-2026-07-26-honest-user-agent.md",
       "sha256": "d1339613550d12731c0c6937591036c5be601fc6a250a647dbc9f3d88cfaf096",
       "size_bytes": 1384
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-oauth-cadence-breaker.md",
+      "sha256": "98cbb20eb52631f272f88e50eebc84dd28f9e39fcfc156f1de0c27de840d9e8f",
+      "size_bytes": 5295
     },
     {
       "executable": false,
@@ -1942,9 +1949,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T19:21:07+00:00",
+  "generated_at": "2026-07-26T20:00:29+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 278,
+  "output_file_count": 279,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1978,5 +1985,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ef05b66aa1045af372c173ef7d34e83bfd2de64c"
+  "source_commit": "97bbfccbf06beec73722c6b1fae302c814055f6e"
 }

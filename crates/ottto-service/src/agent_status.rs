@@ -45,10 +45,40 @@ const CLAUDE_OAUTH_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const CLAUDE_OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 const CLAUDE_OAUTH_USAGE_CACHE_FILE: &str = "claude-code-oauth-usage-cache.json";
+/// Display fallback only: how long a cached payload may still be rendered (as
+/// `Stale`) when the endpoint cannot be reached. Not a refresh cadence.
 const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
-const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
+/// Base refresh cadence: ~1 fetch per hour per machine (~24/day), down from the
+/// former 15-minute gate (~96/day). Sparse polling is half of the recorded
+/// provider-endpoints posture (identify honestly, poll sparsely, circuit-break
+/// instead of adapting).
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS: u64 = 60 * 60;
+/// Half-width of the deterministic spread applied to the base cadence, giving
+/// an effective gate in the 55-65 minute range.
+const CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_REFRESH_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
+/// Off-switch sentinel: while this file exists in the daemon support dir the
+/// Claude OAuth usage endpoint is never contacted and quota comes from the
+/// sanctioned local statusLine surface only. The name is a fixed contract with
+/// the macOS Companion toggle - do not rename it.
+const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str = "claude-oauth-usage-network-disabled";
+const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
+const CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION: u16 = 1;
+/// How long the breaker stays open once tripped. Long on purpose: an open
+/// breaker means we believe further calls could be unwelcome or useless, and a
+/// short cool-down would just re-probe the same wall.
+const CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
+/// Consecutive 401/403 responses before the breaker opens. Low: an auth/scope
+/// rejection that survives a retry is structural, not transient.
+const CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD: u32 = 3;
+/// Consecutive unreadable/unrecognised 200 bodies (or a vanished endpoint)
+/// before the breaker opens.
+const CLAUDE_OAUTH_USAGE_BREAKER_SHAPE_THRESHOLD: u32 = 3;
+/// Consecutive 429s before the breaker opens. Higher than the other classes:
+/// a single 429 is routine here and is already handled by the retry-after
+/// backoff; this catches the sustained case that backoff never clears.
+const CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD: u32 = 5;
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 const CLAUDE_DESKTOP_SAFE_STORAGE_SERVICE: &str = "Claude Safe Storage";
@@ -161,6 +191,86 @@ const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 3;
 struct ClaudeOAuthUsage {
     windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+}
+
+/// A collection attempt plus anything the snapshot should say about *why* the
+/// endpoint was or was not contacted. Diagnostics travel back to the caller
+/// rather than being logged locally because they are the alerting channel:
+/// snapshot diagnostics ride the agent-status upload to the backend (see
+/// `AgentStatusSnapshot::redacted_for_backend`, which preserves `code` and
+/// `message`), so an open breaker is visible server-side without a second
+/// telemetry path.
+#[derive(Debug)]
+struct ClaudeOAuthUsageOutcome {
+    result: Result<ClaudeOAuthUsage, String>,
+    diagnostics: Vec<AgentStatusDiagnostic>,
+}
+
+/// The failure classes that count toward opening the breaker. Everything else
+/// (transport errors, 5xx, a single 429 already covered by retry-after) is
+/// transient and deliberately does not accumulate: the breaker exists to stop
+/// calling when the *endpoint's answer* says stop, not when the user's Wi-Fi
+/// drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeOAuthUsageFailure {
+    /// 401/403 - the OAuth token is rejected or lacks the scope.
+    AuthRejected,
+    /// A 200 body we cannot read, a 200 body with none of the expected quota
+    /// fields, or a 404/410 saying the endpoint no longer exists in this shape.
+    ResponseShape,
+    /// 429 that keeps coming back after the retry-after backoff.
+    RateLimited,
+}
+
+impl ClaudeOAuthUsageFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::AuthRejected => "auth_rejected",
+            Self::ResponseShape => "response_shape_changed",
+            Self::RateLimited => "rate_limited",
+        }
+    }
+
+    fn threshold(self) -> u32 {
+        match self {
+            Self::AuthRejected => CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD,
+            Self::ResponseShape => CLAUDE_OAUTH_USAGE_BREAKER_SHAPE_THRESHOLD,
+            Self::RateLimited => CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD,
+        }
+    }
+}
+
+/// Persisted breaker state for the Claude OAuth usage read.
+///
+/// Lives beside the usage cache in the support dir and follows the same
+/// account-keying rule: counters and an open verdict belong to the account
+/// whose credential produced them, so an account switch starts clean rather
+/// than inheriting the previous account's rejections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeOAuthUsageBreaker {
+    schema_version: u16,
+    #[serde(default)]
+    account_identifier_hash: String,
+    /// Fingerprint of the call's own configuration (endpoint, headers, honest
+    /// User-Agent, sentinel state). Changing any of them means the thing that
+    /// was failing is not the thing we would call next, so the breaker resets.
+    #[serde(default)]
+    config_fingerprint: String,
+    #[serde(default)]
+    auth_failures: u32,
+    #[serde(default)]
+    shape_failures: u32,
+    #[serde(default)]
+    rate_limit_failures: u32,
+    #[serde(default)]
+    opened_at_epoch_seconds: u64,
+    /// Cool-down expiry. `0` means the breaker has never opened; the breaker is
+    /// open while `now < reopen_after_epoch_seconds`.
+    #[serde(default)]
+    reopen_after_epoch_seconds: u64,
+    /// Which failure class opened it, for the diagnostic message.
+    #[serde(default)]
+    opened_by: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -711,7 +821,13 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 }
             }
         };
-    match collect_claude_oauth_usage() {
+    let oauth_outcome = collect_claude_oauth_usage();
+    // Pushed before the quota branch below so the reason the endpoint was or
+    // was not called rides the snapshot regardless of which source ends up
+    // serving quota. These diagnostics are the alert channel for the circuit
+    // breaker: they travel to the backend with the agent-status upload.
+    snapshot.diagnostics.extend(oauth_outcome.diagnostics);
+    match oauth_outcome.result {
         Ok(usage) if !usage.windows.is_empty() => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
             snapshot.quota_windows = usage.windows;
@@ -2002,28 +2118,65 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
     Ok(claude_statusline_context_from_cache(cache, history))
 }
 
-fn collect_claude_oauth_usage() -> Result<ClaudeOAuthUsage, String> {
+fn collect_claude_oauth_usage() -> ClaudeOAuthUsageOutcome {
     let now = current_unix_seconds();
     // Resolve the account BEFORE consulting the cache: every read below is
     // scoped to whoever owns the credential right now, so an account switch
     // discards the previous account's payload instead of serving it.
     let account_identifier_hash = claude_oauth_account_identifier_hash();
+
+    // Off-switch first, ahead of the cache: the sentinel turns this whole data
+    // path off, not just the socket. Serving a previously fetched payload while
+    // the user has switched the endpoint off would still be serving endpoint
+    // data, so the cached copy is dropped from disk too and quota falls back to
+    // Claude Code's own local statusLine surface.
+    if claude_oauth_usage_network_disabled() {
+        let _ = fs::remove_file(claude_oauth_usage_cache_path());
+        return ClaudeOAuthUsageOutcome {
+            result: Err(
+                "Claude OAuth usage endpoint is switched off on this machine.".to_string(),
+            ),
+            diagnostics: vec![AgentStatusDiagnostic::source(
+                "claude_oauth_usage_network_disabled",
+                AgentDiagnosticSeverity::Info,
+                "Claude subscription quota is read from Claude Code's local statusLine only: the Claude OAuth usage network read is switched off on this machine.",
+            )],
+        };
+    }
+
+    let config_fingerprint = claude_oauth_usage_config_fingerprint();
+    if let Some(breaker) =
+        read_claude_oauth_usage_breaker(&account_identifier_hash, &config_fingerprint)
+    {
+        if claude_oauth_usage_breaker_is_open(&breaker, now) {
+            return ClaudeOAuthUsageOutcome {
+                result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
+                diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
+            };
+        }
+    }
+
     if let Some(cache) = read_claude_oauth_usage_cache(&account_identifier_hash) {
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-            && (cache_age <= CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS
+            && (cache_age <= claude_oauth_usage_fresh_age_seconds(&account_identifier_hash)
                 || now < cache.next_refresh_after_epoch_seconds)
         {
-            return Ok(claude_oauth_usage_from_cache(cache, now));
+            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)));
         }
         if now < cache.next_refresh_after_epoch_seconds {
-            return Err("Claude OAuth usage endpoint is rate limited.".to_string());
+            return ClaudeOAuthUsageOutcome::from(Err(
+                "Claude OAuth usage endpoint is rate limited.".to_string(),
+            ));
         }
     }
 
-    let token = read_claude_oauth_access_token()
-        .ok_or_else(|| "Claude OAuth credentials were not available locally.".to_string())?;
+    let Some(token) = read_claude_oauth_access_token() else {
+        return ClaudeOAuthUsageOutcome::from(Err(
+            "Claude OAuth credentials were not available locally.".to_string(),
+        ));
+    };
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
     let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
@@ -2054,44 +2207,296 @@ fn collect_claude_oauth_usage() -> Result<ClaudeOAuthUsage, String> {
             );
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
+            // The retry-after backoff above still handles the transient case
+            // unchanged; the breaker only fires once 429s outlive it.
+            let diagnostics = record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::RateLimited,
+                &account_identifier_hash,
+                &config_fingerprint,
+                now,
+            );
             if !cache.windows.is_empty()
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
                     <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
             {
-                return Ok(claude_oauth_usage_from_cache(cache, now));
+                return ClaudeOAuthUsageOutcome {
+                    result: Ok(claude_oauth_usage_from_cache(cache, now)),
+                    diagnostics,
+                };
             }
-            return Err("Claude OAuth usage endpoint is rate limited.".to_string());
+            return ClaudeOAuthUsageOutcome {
+                result: Err("Claude OAuth usage endpoint is rate limited.".to_string()),
+                diagnostics,
+            };
         }
         Err(error) => {
+            let diagnostics = match claude_oauth_usage_failure_class(&error) {
+                Some(failure) => record_claude_oauth_usage_failure(
+                    failure,
+                    &account_identifier_hash,
+                    &config_fingerprint,
+                    now,
+                ),
+                None => Vec::new(),
+            };
             if let Some(cache) = read_claude_oauth_usage_cache(&account_identifier_hash) {
                 if !cache.windows.is_empty()
                     && now.saturating_sub(cache.observed_at_epoch_seconds)
                         <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
                 {
-                    return Ok(claude_oauth_usage_from_cache(cache, now));
+                    return ClaudeOAuthUsageOutcome {
+                        result: Ok(claude_oauth_usage_from_cache(cache, now)),
+                        diagnostics,
+                    };
                 }
             }
-            return Err(claude_oauth_usage_error(error));
+            return ClaudeOAuthUsageOutcome {
+                result: Err(claude_oauth_usage_error(error)),
+                diagnostics,
+            };
         }
     };
-    let value: Value = response
-        .into_json()
-        .map_err(|_| "Claude OAuth usage endpoint returned an unreadable response.".to_string())?;
+    let Ok(value) = response.into_json::<Value>() else {
+        return ClaudeOAuthUsageOutcome {
+            result: Err("Claude OAuth usage endpoint returned an unreadable response.".to_string()),
+            diagnostics: record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::ResponseShape,
+                &account_identifier_hash,
+                &config_fingerprint,
+                now,
+            ),
+        };
+    };
     let usage = ClaudeOAuthUsage {
         windows: claude_oauth_quota_windows(&value),
         credit_balances: claude_oauth_credit_balances(&value),
     };
-    if !usage.windows.is_empty() {
-        let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: account_identifier_hash.clone(),
-            observed_at_epoch_seconds: now,
-            next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
-            windows: usage.windows.clone(),
-            credit_balances: usage.credit_balances.clone(),
-        });
+    if usage.windows.is_empty() {
+        // A 200 that carries none of the expected quota fields is a shape
+        // change, not an empty account: every plan this endpoint answers for
+        // reports at least one window.
+        return ClaudeOAuthUsageOutcome {
+            result: Ok(usage),
+            diagnostics: record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::ResponseShape,
+                &account_identifier_hash,
+                &config_fingerprint,
+                now,
+            ),
+        };
     }
-    Ok(usage)
+    let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+        account_identifier_hash: account_identifier_hash.clone(),
+        observed_at_epoch_seconds: now,
+        next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+        windows: usage.windows.clone(),
+        credit_balances: usage.credit_balances.clone(),
+    });
+    // One clean answer clears the accumulated failure counters: the thresholds
+    // below are about *consecutive* failures.
+    clear_claude_oauth_usage_breaker();
+    ClaudeOAuthUsageOutcome::from(Ok(usage))
+}
+
+impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
+    fn from(result: Result<ClaudeOAuthUsage, String>) -> Self {
+        Self {
+            result,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// Effective freshness gate for the Claude OAuth usage read: the ~60-minute
+/// base cadence spread deterministically across a 55-65 minute band.
+///
+/// The spread is load-spreading across OUR OWN users - it stops every Ottto
+/// install from refreshing on the same wall-clock minute. It is explicitly NOT
+/// evasion and hides nothing: the request carries an honest
+/// `ottto/<version> (subscription-usage-reader; ...)` User-Agent, and a
+/// timer-driven daemon is identifiable from its behaviour regardless of phase.
+/// Recorded provider-endpoints posture, 2026-07-26.
+///
+/// Derived from the account hash rather than a random draw so the gate is
+/// stable for a machine: a per-tick random offset would make the cadence
+/// jitter around every refresh instead of holding one steady phase.
+fn claude_oauth_usage_fresh_age_seconds(seed: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-usage-cadence:");
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let span = CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS * 2 + 1;
+    let offset = u64::from_be_bytes(bytes) % span;
+    CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS + offset
+        - CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_JITTER_SECONDS
+}
+
+/// Whether the off-switch sentinel is present in the daemon support dir.
+///
+/// Same directory mechanics as the Claude Desktop usage sentinel. Absent file
+/// means enabled, which keeps the default behaviour unchanged.
+fn claude_oauth_usage_network_disabled() -> bool {
+    default_support_dir()
+        .join(CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE)
+        .is_file()
+}
+
+fn claude_oauth_usage_breaker_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_OAUTH_USAGE_BREAKER_FILE)
+}
+
+/// Fingerprint of everything about the call that could make a past failure
+/// irrelevant: the endpoint, the beta header, the User-Agent we identify with,
+/// and whether the off-switch is engaged. When any of them changes - a daemon
+/// upgrade, or the user toggling the sentinel off and back on - the breaker
+/// resets rather than holding a verdict about a call we no longer make.
+fn claude_oauth_usage_config_fingerprint() -> String {
+    claude_oauth_usage_config_fingerprint_for(
+        CLAUDE_OAUTH_USAGE_ENDPOINT,
+        CLAUDE_OAUTH_BETA_HEADER,
+        &ottto_user_agent(),
+        claude_oauth_usage_network_disabled(),
+    )
+}
+
+fn claude_oauth_usage_config_fingerprint_for(
+    endpoint: &str,
+    beta_header: &str,
+    user_agent: &str,
+    network_disabled: bool,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-usage-config:");
+    hasher.update(endpoint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(beta_header.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(user_agent.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(if network_disabled { "off" } else { "on" }.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+fn read_claude_oauth_usage_breaker(
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+) -> Option<ClaudeOAuthUsageBreaker> {
+    let body = fs::read_to_string(claude_oauth_usage_breaker_path()).ok()?;
+    let breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
+    if breaker.schema_version != CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
+        || breaker.account_identifier_hash != account_identifier_hash
+        || breaker.config_fingerprint != config_fingerprint
+    {
+        return None;
+    }
+    Some(breaker)
+}
+
+fn write_claude_oauth_usage_breaker(breaker: &ClaudeOAuthUsageBreaker) -> std::io::Result<()> {
+    let path = claude_oauth_usage_breaker_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
+    fs::write(path, body)
+}
+
+fn clear_claude_oauth_usage_breaker() {
+    let _ = fs::remove_file(claude_oauth_usage_breaker_path());
+}
+
+fn claude_oauth_usage_breaker_is_open(breaker: &ClaudeOAuthUsageBreaker, now: u64) -> bool {
+    // Reset by expiry: once the cool-down passes the breaker is closed again
+    // and the next tick re-probes with the counters it carries.
+    now < breaker.reopen_after_epoch_seconds
+}
+
+/// Fold one failure into the persisted breaker state. Pure so the thresholds
+/// and the cool-down can be exercised without touching disk or the network.
+fn claude_oauth_usage_breaker_after_failure(
+    previous: Option<ClaudeOAuthUsageBreaker>,
+    failure: ClaudeOAuthUsageFailure,
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+    now: u64,
+) -> ClaudeOAuthUsageBreaker {
+    let mut breaker = previous.unwrap_or_default();
+    breaker.schema_version = CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION;
+    breaker.account_identifier_hash = account_identifier_hash.to_string();
+    breaker.config_fingerprint = config_fingerprint.to_string();
+    let counter = match failure {
+        ClaudeOAuthUsageFailure::AuthRejected => &mut breaker.auth_failures,
+        ClaudeOAuthUsageFailure::ResponseShape => &mut breaker.shape_failures,
+        ClaudeOAuthUsageFailure::RateLimited => &mut breaker.rate_limit_failures,
+    };
+    *counter = counter.saturating_add(1);
+    if *counter >= failure.threshold() && !claude_oauth_usage_breaker_is_open(&breaker, now) {
+        breaker.opened_at_epoch_seconds = now;
+        breaker.reopen_after_epoch_seconds = now + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS;
+        breaker.opened_by = failure.code().to_string();
+    }
+    breaker
+}
+
+fn record_claude_oauth_usage_failure(
+    failure: ClaudeOAuthUsageFailure,
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+    now: u64,
+) -> Vec<AgentStatusDiagnostic> {
+    let previous = read_claude_oauth_usage_breaker(account_identifier_hash, config_fingerprint);
+    let was_open = previous
+        .as_ref()
+        .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
+    let breaker = claude_oauth_usage_breaker_after_failure(
+        previous,
+        failure,
+        account_identifier_hash,
+        config_fingerprint,
+        now,
+    );
+    let _ = write_claude_oauth_usage_breaker(&breaker);
+    if !was_open && claude_oauth_usage_breaker_is_open(&breaker, now) {
+        return vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)];
+    }
+    Vec::new()
+}
+
+/// The alert itself. Snapshot diagnostics are uploaded with the agent-status
+/// snapshot, so this reaches the backend on the next sync without a separate
+/// telemetry channel.
+fn claude_oauth_usage_circuit_open_diagnostic(
+    breaker: &ClaudeOAuthUsageBreaker,
+    now: u64,
+) -> AgentStatusDiagnostic {
+    let reason = if breaker.opened_by.is_empty() {
+        "repeated failures".to_string()
+    } else {
+        breaker.opened_by.replace('_', " ")
+    };
+    let remaining_minutes = breaker.reopen_after_epoch_seconds.saturating_sub(now) / 60;
+    AgentStatusDiagnostic::source(
+        "claude_oauth_usage_circuit_open",
+        AgentDiagnosticSeverity::Warning,
+        format!(
+            "Stopped calling the Claude OAuth usage endpoint after {reason}; quota falls back to Claude Code's local statusLine for the next {remaining_minutes} minute(s)."
+        ),
+    )
+}
+
+/// Which failure class, if any, a transport-level error counts as. `None` means
+/// transient: transport errors and server-side 5xx say nothing about whether we
+/// should keep calling.
+fn claude_oauth_usage_failure_class(error: &ureq::Error) -> Option<ClaudeOAuthUsageFailure> {
+    match error {
+        ureq::Error::Status(401 | 403, _) => Some(ClaudeOAuthUsageFailure::AuthRejected),
+        // The endpoint answering "gone" is a shape change by another name.
+        ureq::Error::Status(404 | 410, _) => Some(ClaudeOAuthUsageFailure::ResponseShape),
+        _ => None,
+    }
 }
 
 fn read_claude_oauth_access_token() -> Option<String> {
@@ -2516,7 +2921,10 @@ fn claude_oauth_quota_window(
 
 fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> ClaudeOAuthUsage {
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
-    let cache_is_stale = cache_age > CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS;
+    // Same jittered gate the refresh decision uses, seeded from the account the
+    // cache belongs to: a payload served as fresh must not be labelled stale.
+    let cache_is_stale =
+        cache_age > claude_oauth_usage_fresh_age_seconds(&cache.account_identifier_hash);
     let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     ClaudeOAuthUsage {
         windows: cache
@@ -7250,9 +7658,10 @@ for line in sys.stdin:
             }],
         };
 
+        // Past the account's own jittered gate, not the bare base constant.
         let usage = claude_oauth_usage_from_cache(
             cache,
-            100 + CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS + 1,
+            100 + claude_oauth_usage_fresh_age_seconds("account-a") + 1,
         );
 
         assert_eq!(usage.windows.len(), 1);
@@ -7469,6 +7878,423 @@ for line in sys.stdin:
         // Nothing observable changed: keep serving rather than hammering a
         // rate-limited endpoint every tick.
         assert!(claude_oauth_usage_cache_belongs_to_account(&cache(""), ""));
+    }
+
+    #[test]
+    fn claude_oauth_usage_cadence_is_hourly_within_a_five_minute_spread() {
+        // The spread is load-spreading across our own installs, so it must be
+        // bounded and deterministic -- never an open-ended random delay.
+        for seed in [
+            "",
+            "account-a",
+            "account-b",
+            "9f1c0c1a4b5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
+        ] {
+            let gate = claude_oauth_usage_fresh_age_seconds(seed);
+            assert!(
+                (55 * 60..=65 * 60).contains(&gate),
+                "gate for {seed:?} out of the 55-65 minute band: {gate}"
+            );
+            assert_eq!(
+                gate,
+                claude_oauth_usage_fresh_age_seconds(seed),
+                "gate must be stable for a given account, not redrawn per call"
+            );
+        }
+        // Different accounts land on different phases; that is the whole point.
+        assert_ne!(
+            claude_oauth_usage_fresh_age_seconds("account-a"),
+            claude_oauth_usage_fresh_age_seconds("account-b")
+        );
+        // Sanity on the base cadence itself: ~24 calls/day, not ~96.
+        assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 60 * 60);
+        // The 24h max age stays a display fallback, well clear of the gate.
+        assert!(
+            CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+                > claude_oauth_usage_fresh_age_seconds("account-a")
+        );
+    }
+
+    #[test]
+    fn claude_oauth_usage_breaker_opens_on_each_trigger_class() {
+        for (failure, threshold, code) in [
+            (
+                ClaudeOAuthUsageFailure::AuthRejected,
+                CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD,
+                "auth_rejected",
+            ),
+            (
+                ClaudeOAuthUsageFailure::ResponseShape,
+                CLAUDE_OAUTH_USAGE_BREAKER_SHAPE_THRESHOLD,
+                "response_shape_changed",
+            ),
+            (
+                ClaudeOAuthUsageFailure::RateLimited,
+                CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD,
+                "rate_limited",
+            ),
+        ] {
+            let mut breaker = None;
+            for attempt in 1..=threshold {
+                breaker = Some(claude_oauth_usage_breaker_after_failure(
+                    breaker,
+                    failure,
+                    "account-a",
+                    "fingerprint-a",
+                    1_000,
+                ));
+                let current = breaker.as_ref().expect("breaker");
+                let open = claude_oauth_usage_breaker_is_open(current, 1_000);
+                assert_eq!(
+                    open,
+                    attempt >= threshold,
+                    "{code} opened at attempt {attempt} of {threshold}"
+                );
+            }
+            let opened = breaker.expect("breaker");
+            assert_eq!(opened.opened_by, code);
+            assert_eq!(opened.opened_at_epoch_seconds, 1_000);
+            assert_eq!(
+                opened.reopen_after_epoch_seconds,
+                1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
+            );
+        }
+    }
+
+    #[test]
+    fn claude_oauth_usage_breaker_counts_failure_classes_separately() {
+        // One 429 plus one 401 must not add up to a trip: a mixed dribble of
+        // unrelated transient failures is not the structural signal.
+        let mut breaker = None;
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
+            breaker = Some(claude_oauth_usage_breaker_after_failure(
+                breaker,
+                ClaudeOAuthUsageFailure::RateLimited,
+                "account-a",
+                "fingerprint-a",
+                1_000,
+            ));
+        }
+        let breaker = breaker.expect("breaker");
+        assert!(!claude_oauth_usage_breaker_is_open(&breaker, 1_000));
+        assert_eq!(breaker.auth_failures, 0);
+        assert_eq!(breaker.shape_failures, 0);
+    }
+
+    #[test]
+    fn claude_oauth_usage_breaker_closes_after_cooldown() {
+        let mut breaker = None;
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
+            breaker = Some(claude_oauth_usage_breaker_after_failure(
+                breaker,
+                ClaudeOAuthUsageFailure::AuthRejected,
+                "account-a",
+                "fingerprint-a",
+                1_000,
+            ));
+        }
+        let breaker = breaker.expect("breaker");
+        assert!(claude_oauth_usage_breaker_is_open(&breaker, 1_000));
+        assert!(claude_oauth_usage_breaker_is_open(
+            &breaker,
+            1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS - 1
+        ));
+        assert!(!claude_oauth_usage_breaker_is_open(
+            &breaker,
+            1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS
+        ));
+    }
+
+    #[test]
+    fn claude_oauth_usage_config_fingerprint_tracks_the_call_it_governs() {
+        let baseline = claude_oauth_usage_config_fingerprint_for(
+            "https://api.anthropic.com/api/oauth/usage",
+            "oauth-2025-04-20",
+            "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
+            false,
+        );
+        assert_eq!(
+            baseline,
+            claude_oauth_usage_config_fingerprint_for(
+                "https://api.anthropic.com/api/oauth/usage",
+                "oauth-2025-04-20",
+                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
+                false,
+            )
+        );
+        for changed in [
+            claude_oauth_usage_config_fingerprint_for(
+                "https://api.anthropic.com/api/oauth/usage/v2",
+                "oauth-2025-04-20",
+                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
+                false,
+            ),
+            claude_oauth_usage_config_fingerprint_for(
+                "https://api.anthropic.com/api/oauth/usage",
+                "oauth-2026-01-01",
+                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
+                false,
+            ),
+            claude_oauth_usage_config_fingerprint_for(
+                "https://api.anthropic.com/api/oauth/usage",
+                "oauth-2025-04-20",
+                "ottto/1.2.4 (subscription-usage-reader; +https://ottto.net)",
+                false,
+            ),
+            // Toggling the off-switch resets the breaker: the sentinel is part
+            // of the configuration the verdict was about.
+            claude_oauth_usage_config_fingerprint_for(
+                "https://api.anthropic.com/api/oauth/usage",
+                "oauth-2025-04-20",
+                "ottto/1.2.3 (subscription-usage-reader; +https://ottto.net)",
+                true,
+            ),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn claude_oauth_usage_breaker_state_is_scoped_and_resettable() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-breaker-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+
+        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-a").is_none());
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
+            record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::AuthRejected,
+                "account-a",
+                "fingerprint-a",
+                1_000,
+            );
+        }
+        let stored =
+            read_claude_oauth_usage_breaker("account-a", "fingerprint-a").expect("stored breaker");
+        assert!(claude_oauth_usage_breaker_is_open(&stored, 1_000));
+        // Account-keyed and config-keyed, exactly like the usage cache: a
+        // different account or a changed call configuration starts clean.
+        assert!(read_claude_oauth_usage_breaker("account-b", "fingerprint-a").is_none());
+        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-b").is_none());
+
+        clear_claude_oauth_usage_breaker();
+        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-a").is_none());
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_oauth_usage_breaker_alerts_once_and_then_skips_the_network() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-breaker-alert-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        // Pin the account to "unidentifiable" (no `~/.claude.json` under this
+        // HOME) so the state this test writes is the state
+        // `collect_claude_oauth_usage` reads back, on any machine.
+        let _home_guard = EnvVarGuard::set_os("HOME", support_dir.as_os_str().to_os_string());
+        let account = claude_oauth_account_identifier_hash();
+        let fingerprint = claude_oauth_usage_config_fingerprint();
+        let now = current_unix_seconds();
+
+        let mut emitted = Vec::new();
+        for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD {
+            emitted.extend(record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::RateLimited,
+                &account,
+                &fingerprint,
+                now,
+            ));
+        }
+        assert_eq!(
+            emitted.len(),
+            1,
+            "the breaker alerts on the transition, not on every failure"
+        );
+        assert_eq!(emitted[0].code, "claude_oauth_usage_circuit_open");
+        assert_eq!(emitted[0].severity, AgentDiagnosticSeverity::Warning);
+        assert!(emitted[0].message.contains("rate limited"));
+        // Further failures while open must not re-alert.
+        assert!(record_claude_oauth_usage_failure(
+            ClaudeOAuthUsageFailure::RateLimited,
+            &account,
+            &fingerprint,
+            now + 100,
+        )
+        .is_empty());
+
+        // While open, the collector never reaches the network: it returns the
+        // breaker error plus the alert without a token read or a request.
+        let outcome = collect_claude_oauth_usage();
+        assert!(outcome.result.is_err());
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "claude_oauth_usage_circuit_open"));
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    fn claude_oauth_usage_transient_errors_do_not_count_toward_the_breaker() {
+        assert_eq!(
+            claude_oauth_usage_failure_class(&ureq::Error::Status(
+                401,
+                ureq::Response::new(401, "Unauthorized", "{}").expect("response")
+            )),
+            Some(ClaudeOAuthUsageFailure::AuthRejected)
+        );
+        assert_eq!(
+            claude_oauth_usage_failure_class(&ureq::Error::Status(
+                403,
+                ureq::Response::new(403, "Forbidden", "{}").expect("response")
+            )),
+            Some(ClaudeOAuthUsageFailure::AuthRejected)
+        );
+        assert_eq!(
+            claude_oauth_usage_failure_class(&ureq::Error::Status(
+                404,
+                ureq::Response::new(404, "Not Found", "{}").expect("response")
+            )),
+            Some(ClaudeOAuthUsageFailure::ResponseShape)
+        );
+        // A 5xx is the vendor having a bad day, not a signal to stop asking.
+        assert_eq!(
+            claude_oauth_usage_failure_class(&ureq::Error::Status(
+                503,
+                ureq::Response::new(503, "Unavailable", "{}").expect("response")
+            )),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_oauth_usage_sentinel_disables_the_network_read() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-off-switch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+
+        // Default (no sentinel) is enabled -- unchanged behaviour.
+        assert!(!claude_oauth_usage_network_disabled());
+
+        // A previously fetched payload that the sentinel must retire.
+        write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: String::new(),
+            observed_at_epoch_seconds: current_unix_seconds(),
+            next_refresh_after_epoch_seconds: current_unix_seconds() + 60,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                status: AgentQuotaWindowStatus::Ok,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                used_percent: Some(25),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        })
+        .expect("write cache fixture");
+
+        // The exact filename is a contract with the macOS Companion toggle.
+        std::fs::write(
+            support_dir.join("claude-oauth-usage-network-disabled"),
+            b"disabled\n",
+        )
+        .expect("write sentinel");
+        assert!(claude_oauth_usage_network_disabled());
+
+        let outcome = collect_claude_oauth_usage();
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.diagnostics.len(), 1);
+        assert_eq!(
+            outcome.diagnostics[0].code,
+            "claude_oauth_usage_network_disabled"
+        );
+        assert_eq!(
+            outcome.diagnostics[0].severity,
+            AgentDiagnosticSeverity::Info
+        );
+        assert!(
+            !claude_oauth_usage_cache_path().exists(),
+            "the off-switch retires the endpoint's cached payload too"
+        );
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    fn claude_oauth_usage_diagnostics_survive_the_backend_upload_redaction() {
+        // The circuit-breaker alert reaches our servers by riding the
+        // agent-status snapshot upload; `redacted_for_backend` is the only
+        // transform between the collector and the wire.
+        let breaker = ClaudeOAuthUsageBreaker {
+            schema_version: CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION,
+            account_identifier_hash: "account-a".to_string(),
+            config_fingerprint: "fingerprint-a".to_string(),
+            auth_failures: CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD,
+            opened_at_epoch_seconds: 1_000,
+            reopen_after_epoch_seconds: 1_000 + CLAUDE_OAUTH_USAGE_BREAKER_COOLDOWN_SECONDS,
+            opened_by: "auth_rejected".to_string(),
+            ..Default::default()
+        };
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::StatusLine,
+            "2026-07-26T00:00:00Z".to_string(),
+            "2026-07-26T00:30:00Z".to_string(),
+        );
+        snapshot
+            .diagnostics
+            .push(claude_oauth_usage_circuit_open_diagnostic(&breaker, 1_000));
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "claude_oauth_usage_network_disabled",
+            AgentDiagnosticSeverity::Info,
+            "Claude subscription quota is read from Claude Code's local statusLine only: the Claude OAuth usage network read is switched off on this machine.",
+        ));
+
+        let uploaded = snapshot.redacted_for_backend();
+        let codes: Vec<&str> = uploaded
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                "claude_oauth_usage_circuit_open",
+                "claude_oauth_usage_network_disabled"
+            ]
+        );
+        // Codes and messages must survive intact -- a redacted message would
+        // reach the backend as "diagnostic redacted" and the alert would be
+        // useless.
+        assert!(uploaded.diagnostics.iter().all(|diagnostic| {
+            diagnostic.message != "diagnostic redacted" && diagnostic.code != "redacted"
+        }));
     }
 
     #[test]
