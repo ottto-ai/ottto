@@ -6165,6 +6165,68 @@ impl ScanIndex {
         }
     }
 
+    /// The subset of this scan's index that is safe to commit when the upload
+    /// did not finish.
+    ///
+    /// Committing the whole index after a partial upload would drop every entity
+    /// the server never received: the next scan skips an unchanged transcript, so
+    /// its snapshot would never be re-derived. Committing nothing is the current
+    /// behaviour and is just as wrong in the other direction — a shed request
+    /// today means the entire cycle replays, forever, every five minutes.
+    ///
+    /// An entry is safe when the server demonstrably holds its content:
+    ///
+    /// * it produced no snapshot at all (nothing to lose), or
+    /// * its snapshot was accepted in this pass, or
+    /// * its fingerprint is unchanged from the committed index, which is what
+    ///   "semantic no-op" means — the server already has that exact content.
+    ///
+    /// Anything else keeps its previously committed entry, so the next scan
+    /// re-parses it and re-uploads. `previous` is the index as loaded from disk,
+    /// before this scan mutated it.
+    pub fn committable_subset(
+        &self,
+        previous: &ScanIndex,
+        accepted: &BTreeSet<String>,
+    ) -> ScanIndex {
+        let safe = |key: &String, fingerprint: Option<&str>| match fingerprint {
+            None => true,
+            Some(fingerprint) => {
+                accepted.contains(fingerprint)
+                    || previous
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.as_deref())
+                        == Some(fingerprint)
+            }
+        };
+        let mut files = BTreeMap::new();
+        for (key, entry) in &self.files {
+            if safe(key, entry.last_snapshot_fingerprint.as_deref()) {
+                files.insert(key.clone(), entry.clone());
+            } else if let Some(committed) = previous.files.get(key) {
+                files.insert(key.clone(), committed.clone());
+            }
+        }
+        let mut codex_state_only_snapshot_fingerprints = BTreeMap::new();
+        for (session_id, fingerprint) in &self.codex_state_only_snapshot_fingerprints {
+            let committed = previous
+                .codex_state_only_snapshot_fingerprints
+                .get(session_id);
+            if accepted.contains(fingerprint) || committed == Some(fingerprint) {
+                codex_state_only_snapshot_fingerprints
+                    .insert(session_id.clone(), fingerprint.clone());
+            } else if let Some(committed) = committed {
+                codex_state_only_snapshot_fingerprints
+                    .insert(session_id.clone(), committed.clone());
+            }
+        }
+        ScanIndex {
+            files,
+            codex_state_only_snapshot_fingerprints,
+        }
+    }
+
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
         let Some(entry) = self.files.get(&key) else {
@@ -14259,6 +14321,108 @@ mod tests {
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
             scan_identity_version: Some("semantic_sync:v1".to_string()),
         }
+    }
+
+    #[test]
+    fn committable_subset_commits_only_what_the_server_holds() {
+        let mut committed = ScanIndex::default();
+        committed.files.insert(
+            "unchanged.jsonl".to_string(),
+            manifest_index_entry(Some("aa")),
+        );
+        committed.files.insert(
+            "pending.jsonl".to_string(),
+            manifest_index_entry(Some("old")),
+        );
+
+        let mut scanned = committed.clone();
+        // A semantic no-op: same fingerprint as the committed entry, so the
+        // server already holds this content even though nothing was uploaded.
+        scanned.files.insert(
+            "unchanged.jsonl".to_string(),
+            ScanIndexEntry {
+                size_bytes: 42,
+                ..manifest_index_entry(Some("aa"))
+            },
+        );
+        // Changed and accepted this pass.
+        scanned.files.insert(
+            "accepted.jsonl".to_string(),
+            manifest_index_entry(Some("bb")),
+        );
+        // Changed and NOT accepted: committing it would drop the entity, because
+        // the next scan skips an unchanged transcript.
+        scanned.files.insert(
+            "pending.jsonl".to_string(),
+            manifest_index_entry(Some("cc")),
+        );
+        // Parsed to nothing at all: there is no entity to lose.
+        scanned
+            .files
+            .insert("empty.jsonl".to_string(), manifest_index_entry(None));
+
+        let accepted = BTreeSet::from(["bb".to_string()]);
+        let committable = scanned.committable_subset(&committed, &accepted);
+
+        assert_eq!(
+            committable.files["unchanged.jsonl"].size_bytes, 42,
+            "a semantic no-op advances: the server already has that content"
+        );
+        assert!(committable.files.contains_key("accepted.jsonl"));
+        assert!(committable.files.contains_key("empty.jsonl"));
+        assert_eq!(
+            committable.files["pending.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old"),
+            "an unaccepted entity keeps its committed entry so the next scan retries it"
+        );
+
+        // A first-time file that was not accepted has no committed entry to fall
+        // back to, so it must not appear at all.
+        let mut fresh = ScanIndex::default();
+        fresh
+            .files
+            .insert("new.jsonl".to_string(), manifest_index_entry(Some("dd")));
+        let committable = fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new());
+        assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn committable_subset_applies_the_same_rule_to_codex_state_only_entities() {
+        let mut committed = ScanIndex::default();
+        committed
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-noop".to_string(), "aa".to_string());
+        committed
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-pending".to_string(), "old".to_string());
+
+        let mut scanned = ScanIndex::default();
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-noop".to_string(), "aa".to_string());
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-pending".to_string(), "cc".to_string());
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-accepted".to_string(), "bb".to_string());
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-new".to_string(), "dd".to_string());
+
+        let committable =
+            scanned.committable_subset(&committed, &BTreeSet::from(["bb".to_string()]));
+
+        assert_eq!(
+            committable.codex_state_only_snapshot_fingerprints,
+            BTreeMap::from([
+                ("session-noop".to_string(), "aa".to_string()),
+                ("session-pending".to_string(), "old".to_string()),
+                ("session-accepted".to_string(), "bb".to_string()),
+            ])
+        );
     }
 
     #[test]

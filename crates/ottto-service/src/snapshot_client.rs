@@ -1,5 +1,7 @@
 use crate::snapshots::{SnapshotBatchRequest, SnapshotSource, SnapshotSourceManifest};
 use anyhow::{anyhow, Result};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use ottto_core::{
     compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
     KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
@@ -7,6 +9,8 @@ use ottto_core::{
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -47,6 +51,131 @@ impl std::fmt::Display for BatchRejected {
 }
 
 impl std::error::Error for BatchRejected {}
+
+/// Whether snapshot batch bodies are gzip-encoded.
+///
+/// Default OFF, deliberately. Response compression is universal, but nothing
+/// decompresses a *request* body unless a route opts in, and the batch route does
+/// not yet — the OTLP route is the only one in the estate with a request
+/// decompression path. Shipping this enabled would 4xx every upload from an
+/// upgraded daemon against today's server.
+///
+/// So the encoder ships now (the release train is the long pole) behind
+/// `OTTTO_SNAPSHOT_UPLOAD_GZIP=1`, and the default flips in the release AFTER the
+/// batch route decompresses. The refusal fallback below means a premature flip
+/// degrades to identity encoding instead of stopping sync.
+static SNAPSHOT_UPLOAD_GZIP: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_UPLOAD_GZIP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn snapshot_upload_gzip_enabled() -> bool {
+    if !SNAPSHOT_UPLOAD_GZIP_INITIALIZED.swap(true, Ordering::Relaxed) {
+        let enabled = std::env::var("OTTTO_SNAPSHOT_UPLOAD_GZIP")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        SNAPSHOT_UPLOAD_GZIP.store(enabled, Ordering::Relaxed);
+    }
+    SNAPSHOT_UPLOAD_GZIP.load(Ordering::Relaxed)
+}
+
+fn disable_snapshot_upload_gzip() {
+    SNAPSHOT_UPLOAD_GZIP_INITIALIZED.store(true, Ordering::Relaxed);
+    if SNAPSHOT_UPLOAD_GZIP.swap(false, Ordering::Relaxed) {
+        eprintln!(
+            "ottto-service: snapshot upload gzip disabled for this process — the backend refused \
+             the encoded body; falling back to identity encoding."
+        );
+    }
+}
+
+/// gzip `body`, or `None` if the encoder failed (in which case the caller sends
+/// identity encoding rather than nothing).
+fn gzip(body: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).ok()?;
+    encoder.finish().ok()
+}
+
+/// A rejection that means "I could not read your encoding", as opposed to "your
+/// payload is wrong". A server without request decompression cannot parse the
+/// body at all, so it answers 400 (unreadable JSON) or 415 (unsupported media
+/// type) — never 422, which requires having parsed the body first.
+fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
+    matches!(outcome, Err(ureq::Error::Status(400 | 415, _)))
+}
+
+/// The backend shed this request instead of failing it: 429 or 503, with the
+/// server's `Retry-After` when it sent one.
+///
+/// This is a distinct class from every other upload error on purpose. A shed
+/// request is not a validation failure (the payload is fine), not an auth
+/// failure, and not a network failure (the server answered). Treating it as any
+/// of those produces an identical re-upload on the next tick, forever, which is
+/// exactly what the deployed daemon does today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadShed {
+    pub status: u16,
+    pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for UploadShed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.retry_after {
+            Some(retry_after) => write!(
+                f,
+                "backend shed the snapshot upload: HTTP {} retry_after={}s",
+                self.status,
+                retry_after.as_secs()
+            ),
+            None => write!(f, "backend shed the snapshot upload: HTTP {}", self.status),
+        }
+    }
+}
+
+impl std::error::Error for UploadShed {}
+
+/// Ceiling on an honoured `Retry-After`. A server that asks for a day off is
+/// still asking for freshness the product promises in minutes, so the daemon
+/// caps the wait and keeps reporting instead of going silent.
+pub const MAX_HONOURED_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+
+/// Parse a `Retry-After` header value: delta-seconds or an HTTP-date.
+///
+/// Both forms are in the spec and real load balancers send both. An unparsable
+/// or absent value returns `None`, which the caller turns into its own jittered
+/// backoff rather than retrying immediately.
+pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_HONOURED_RETRY_AFTER));
+    }
+    // IMF-fixdate, the only date form HTTP requires a client to produce and the
+    // one every proxy in this path emits. RFC 2822 parsing covers it; the
+    // `GMT` zone name is the one difference, so normalise it to the numeric
+    // offset RFC 2822 expects rather than hand-rolling a second date parser.
+    let normalized = value.strip_suffix("GMT").map(|head| format!("{head}+0000"));
+    let deadline = OffsetDateTime::parse(
+        normalized.as_deref().unwrap_or(value),
+        &time::format_description::well_known::Rfc2822,
+    )
+    .ok()?;
+    let delta = deadline - now;
+    if delta.is_negative() {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
+}
+
+fn shed_from_response(status: u16, response: &ureq::Response) -> UploadShed {
+    UploadShed {
+        status,
+        retry_after: response
+            .header("Retry-After")
+            .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc())),
+    }
+}
 
 /// The backend refused a snapshot batch before payload validation because the
 /// relay authorization was missing, stale, or not permitted for this device.
@@ -562,16 +691,45 @@ impl SnapshotApiClient {
         relay_token: &str,
         request: &SnapshotBatchRequest,
     ) -> Result<SnapshotBatchResponse> {
-        match self
-            .batch_agent
-            .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {relay_token}"))
-            .send_json(request)
-        {
+        let body = serde_json::to_vec(request)
+            .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+        let compressed = snapshot_upload_gzip_enabled()
+            .then(|| gzip(&body))
+            .flatten();
+        let request_builder = || {
+            self.batch_agent
+                .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
+                .set("Accept", "application/json")
+                .set("Content-Type", "application/json")
+                .set("Authorization", &format!("Bearer {relay_token}"))
+        };
+        // Sent inline rather than through a closure: a closure returning
+        // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
+        // the duplication here is two lines.
+        let mut outcome = match compressed.as_ref() {
+            Some(encoded) => request_builder()
+                .set("Content-Encoding", "gzip")
+                .send_bytes(encoded),
+            None => request_builder().send_bytes(&body),
+        };
+        // A server that does not decompress request bodies cannot tell us so in
+        // advance; it just fails to parse. Fall back to identity encoding once,
+        // remember it for the process, and let the batch through instead of
+        // stalling every upload behind a capability mismatch.
+        if compressed.is_some() && encoding_was_refused(&outcome) {
+            disable_snapshot_upload_gzip();
+            outcome = request_builder().send_bytes(&body);
+        }
+        match outcome {
             Ok(response) => response
                 .into_json()
                 .map_err(|error| anyhow!("parse snapshot batch response failed: {error}")),
+            // A shed request is not a failed request. Keep it typed and carry the
+            // server's own backoff so the caller can honour it instead of
+            // re-uploading identical bytes on the next tick.
+            Err(ureq::Error::Status(code @ (429 | 503), response)) => {
+                Err(anyhow::Error::new(shed_from_response(code, &response)))
+            }
             // 401/403 means relay authorization failed, not schema drift.
             // Keep it typed and body-free so the caller can surface an auth
             // diagnostic without leaking backend details or token-adjacent text.
@@ -1306,6 +1464,7 @@ pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)
 mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
+    use std::io::Read;
 
     fn activity_hint_json(extra: &str) -> String {
         format!(
@@ -1517,6 +1676,73 @@ mod tests {
         assert!(excerpt.contains("[path]"));
         assert!(!excerpt.contains("/Users/ron"));
         assert!(excerpt.chars().count() <= 503);
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_dates() {
+        let now = OffsetDateTime::parse("2026-07-26T10:00:00Z", &Rfc3339).expect("now");
+        assert_eq!(
+            parse_retry_after("120", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after("  30 ", now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 26 Jul 2026 10:02:00 GMT", now),
+            Some(Duration::from_secs(120))
+        );
+        // A date already in the past means "now", not a negative wait.
+        assert_eq!(
+            parse_retry_after("Sun, 26 Jul 2026 09:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        // An absurd wait is capped rather than obeyed: the product promises
+        // freshness in minutes, so going silent for a day is not an option.
+        assert_eq!(
+            parse_retry_after("86400", now),
+            Some(MAX_HONOURED_RETRY_AFTER)
+        );
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("later", now), None);
+    }
+
+    #[test]
+    fn gzip_round_trips_and_shrinks_a_repetitive_body() {
+        // Snapshot batches repeat identical selector maps per hour bucket, which
+        // is exactly the shape a deflate window exploits.
+        let body = r#"{"selector_context":{"auth_mode":"subscription"}}"#.repeat(64);
+        let compressed = gzip(body.as_bytes()).expect("gzip");
+        assert!(compressed.len() * 4 < body.len());
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .expect("gunzip");
+        assert_eq!(decoded, body.as_bytes());
+    }
+
+    #[test]
+    fn only_unreadable_encodings_trigger_the_identity_fallback() {
+        // 422 means the server parsed the body and disliked its contents, so the
+        // encoding worked; falling back would hide a real validation failure.
+        // 400/415 are the answers a server without request decompression gives.
+        assert!(encoding_was_refused(&Err(ureq::Error::Status(
+            400,
+            ureq::Response::new(400, "Bad Request", "{}").expect("response")
+        ))));
+        assert!(encoding_was_refused(&Err(ureq::Error::Status(
+            415,
+            ureq::Response::new(415, "Unsupported Media Type", "{}").expect("response")
+        ))));
+        assert!(!encoding_was_refused(&Err(ureq::Error::Status(
+            422,
+            ureq::Response::new(422, "Unprocessable", "{}").expect("response")
+        ))));
+        assert!(!encoding_was_refused(&Ok(ureq::Response::new(
+            200, "OK", "{}"
+        )
+        .expect("response"))));
     }
 
     #[test]
