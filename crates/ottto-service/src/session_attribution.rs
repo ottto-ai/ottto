@@ -971,15 +971,58 @@ fn codex_provider_surface(origin: &SnapshotOrigin) -> Option<&'static str> {
     }
 }
 
+/// Bound a fact list to the wire contract, reporting anything dropped.
+///
+/// Truncation is real attribution loss, so it must never be silent. The byte
+/// budget binds long before the fact-count cap: one fact carries a mandatory
+/// `sha256:` evidence reference and costs roughly 300 bytes, so about six fit
+/// inside the budget while the count cap allows `MAX_SESSION_ATTRIBUTION_FACTS`.
+/// Facts are dropped from the tail, which is exactly where grouping evidence
+/// (`template_group_id`, `schedule_definition_id`, `skill_id`) is appended after
+/// the direct provider facts, so a skill-heavy session loses its grouping
+/// signals first.
+///
+/// Only field names and counts are reported. Fact values carry opaque
+/// org-keyed identifiers and never belong in a log line.
 pub(crate) fn enforce_fact_limits(facts: &mut Vec<SessionAttributionFact>) {
-    facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    let before = facts.len();
+    let mut dropped_fields: Vec<String> = Vec::new();
+
+    if facts.len() > MAX_SESSION_ATTRIBUTION_FACTS {
+        dropped_fields.extend(
+            facts[MAX_SESSION_ATTRIBUTION_FACTS..]
+                .iter()
+                .map(|fact| fact.field.clone()),
+        );
+        facts.truncate(MAX_SESSION_ATTRIBUTION_FACTS);
+    }
+    let over_count_cap = before - facts.len();
+
     while facts.len() > 1
         && serde_json::to_vec(facts)
             .map(|payload| payload.len() > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES)
             .unwrap_or(true)
     {
-        facts.pop();
+        if let Some(fact) = facts.pop() {
+            dropped_fields.push(fact.field);
+        }
     }
+
+    let dropped = before - facts.len();
+    if dropped == 0 {
+        return;
+    }
+    dropped_fields.sort();
+    dropped_fields.dedup();
+    eprintln!(
+        "ottto-service: dropped {dropped} attribution fact(s) to fit the wire contract \
+         ({over_count_cap} over the {MAX_SESSION_ATTRIBUTION_FACTS}-fact cap, {} over the \
+         {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES}-byte budget); kept {}; affected fields: {}. \
+         Session attribution for this session is incomplete.",
+        dropped - over_count_cap,
+        facts.len(),
+        dropped_fields.join(", "),
+    );
 }
 
 pub(crate) fn strip_display_labels(facts: &mut [SessionAttributionFact]) -> bool {
@@ -1507,5 +1550,85 @@ status = "ACTIVE"
             .starts_with("hmac-sha256:v1:"));
         assert!(!inventory.definitions[0].opaque_id.contains("schedule-1"));
         fs::remove_dir_all(home).expect("cleanup");
+    }
+
+    fn budget_fact(field: &str) -> SessionAttributionFact {
+        SessionAttributionFact {
+            field: field.to_string(),
+            value: "b".repeat(32),
+            display_label: None,
+            display_label_source: None,
+            evidence: SessionFieldEvidence {
+                kind: "provider_native".to_string(),
+                strength: "direct".to_string(),
+                observed_at: "2026-07-26T07:20:49Z".to_string(),
+                source_version: "claude_code_jsonl:v19".to_string(),
+                evidence_ref: format!("sha256:{}", "a".repeat(64)),
+            },
+        }
+    }
+
+    fn fits_wire_budget(facts: &[SessionAttributionFact]) -> bool {
+        serde_json::to_vec(facts).expect("serialize").len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+    }
+
+    #[test]
+    fn enforce_fact_limits_keeps_a_within_budget_list_intact() {
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+        ];
+        assert!(fits_wire_budget(&facts));
+
+        enforce_fact_limits(&mut facts);
+
+        assert_eq!(facts.len(), 3);
+        assert!(fits_wire_budget(&facts));
+    }
+
+    #[test]
+    fn enforce_fact_limits_drops_trailing_grouping_facts_over_the_byte_budget() {
+        // The byte budget binds well before the fact-count cap, and facts are
+        // dropped from the tail, so a skill-heavy session loses the grouping
+        // evidence appended after its direct provider facts.
+        let mut facts = vec![
+            budget_fact("origin_kind"),
+            budget_fact("provider_surface"),
+            budget_fact("execution_mode"),
+            budget_fact("template_group_id"),
+        ];
+        facts.extend((0..8).map(|_| budget_fact("skill_id")));
+        let before = facts.len();
+        assert!(before < MAX_SESSION_ATTRIBUTION_FACTS);
+        assert!(!fits_wire_budget(&facts));
+
+        enforce_fact_limits(&mut facts);
+
+        assert!(facts.len() < before);
+        assert!(fits_wire_budget(&facts));
+        // Truncation is tail-first, so the leading direct provider facts survive
+        // intact while the trailing skill evidence is what actually gets lost.
+        assert_eq!(facts[0].field, "origin_kind");
+        assert_eq!(facts[1].field, "provider_surface");
+        assert_eq!(facts[2].field, "execution_mode");
+        assert_eq!(facts[3].field, "template_group_id");
+        let surviving_skills = facts.iter().filter(|fact| fact.field == "skill_id").count();
+        assert!(
+            surviving_skills < 8,
+            "expected skill evidence to be dropped"
+        );
+    }
+
+    #[test]
+    fn enforce_fact_limits_applies_the_count_cap_before_the_byte_budget() {
+        let mut facts: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS + 5)
+            .map(|_| budget_fact("skill_id"))
+            .collect();
+
+        enforce_fact_limits(&mut facts);
+
+        assert!(facts.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
+        assert!(fits_wire_budget(&facts));
     }
 }
