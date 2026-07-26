@@ -703,24 +703,23 @@ impl SnapshotApiClient {
                 .set("Content-Type", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
         };
-        let send = |encoded: Option<&Vec<u8>>| match encoded {
+        // Sent inline rather than through a closure: a closure returning
+        // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
+        // the duplication here is two lines.
+        let mut outcome = match compressed.as_ref() {
             Some(encoded) => request_builder()
                 .set("Content-Encoding", "gzip")
                 .send_bytes(encoded),
             None => request_builder().send_bytes(&body),
         };
-        let mut sent_compressed = compressed.is_some();
-        let mut outcome = send(compressed.as_ref());
         // A server that does not decompress request bodies cannot tell us so in
         // advance; it just fails to parse. Fall back to identity encoding once,
         // remember it for the process, and let the batch through instead of
         // stalling every upload behind a capability mismatch.
-        if sent_compressed && encoding_was_refused(&outcome) {
+        if compressed.is_some() && encoding_was_refused(&outcome) {
             disable_snapshot_upload_gzip();
-            sent_compressed = false;
-            outcome = send(None);
+            outcome = request_builder().send_bytes(&body);
         }
-        let _ = sent_compressed;
         match outcome {
             Ok(response) => response
                 .into_json()
