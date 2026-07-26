@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 266,
-  "content_sha256": "8f9c95f783a44e5707e17aa8ba11caddd537fcd51cd6f7521fdcd99f7683e40c",
+  "candidate_file_count": 267,
+  "content_sha256": "e5237067153f1694f329a2e69373c220d1b100c5f2dfff417ee679cd52fdc4ad",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "ccec708c1e3a3cb6d697b7b94a1a56dc693da0e0f29a8588d38386860c269dda",
-      "size_bytes": 291163
+      "sha256": "dbb71fc0961bc843b79bc4b58948839443b7803f7c21408af4c28a15e492a1e1",
+      "size_bytes": 304478
     },
     {
       "executable": false,
@@ -1023,6 +1023,13 @@
       "path": "docs/session-2026-07-25-claude-code-runtime-defaults.md",
       "sha256": "573a3f02f6b7b447880ad97d26c10503c029fe59f48c0963ee8b7cca18e79600",
       "size_bytes": 5178
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-claude-oauth-usage-cache-account-key.md",
+      "sha256": "a67afd294902a38055b1abff9cb9ecadc45057fc8d9fc7ee3e66c601c9e35585",
+      "size_bytes": 5113
     },
     {
       "executable": false,
@@ -1865,9 +1872,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T15:11:20+00:00",
+  "generated_at": "2026-07-26T15:42:31+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 267,
+  "output_file_count": 268,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1901,5 +1908,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "84391d24a75ee44e28866acc5d92d3e0c2d44361"
+  "source_commit": "8a286ed77f2d429753c3091e8335eb6354061930"
 }
