@@ -32,6 +32,33 @@ impl Default for CadenceConfig {
     }
 }
 
+impl CadenceConfig {
+    /// The cost-first tiers, which is the posture the snapshot sync loop uses.
+    ///
+    /// The difference from [`CadenceConfig::default`] is the point of the whole
+    /// exercise: the **idle and cold tiers are the win** (a machine nobody is
+    /// coding on today gets scanned every 30 minutes instead of every 5), while
+    /// the hot 10-second freshness tier is deliberately NOT enabled. Freshness is
+    /// already inside the product promise at the five-minute floor, and a
+    /// ten-second tier multiplies request volume against a server whose accept
+    /// path is the thing being redesigned.
+    ///
+    /// `hot_min_interval` and `warm_interval` are therefore both pinned to
+    /// `floor`, so file activity restores the existing cadence and never beats it.
+    /// The floor is a hard guarantee, not a default: it is what makes a 2-second
+    /// filesystem debounce incapable of producing a per-event upload.
+    pub fn cost_first(floor: Duration) -> Self {
+        let default = Self::default();
+        Self {
+            hot_min_interval: floor,
+            warm_interval: floor,
+            idle_interval: default.idle_interval.max(floor),
+            cold_interval: default.cold_interval.max(floor),
+            ..default
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceCadence {
     config: CadenceConfig,
@@ -41,6 +68,7 @@ pub struct SourceCadence {
     last_full_sweep_at: Option<Instant>,
     consecutive_failures: usize,
     disabled: bool,
+    server_min_interval: Option<Duration>,
 }
 
 impl SourceCadence {
@@ -53,7 +81,19 @@ impl SourceCadence {
             last_full_sweep_at: None,
             consecutive_failures: 0,
             disabled: false,
+            server_min_interval: None,
         }
+    }
+
+    /// A server-requested minimum interval **between scans**, not a countdown.
+    ///
+    /// The distinction is the whole safety property. A relative "come back in five
+    /// minutes" that is re-read on every cycle never elapses — each cycle would
+    /// push the deadline another five minutes out and the scan would never run
+    /// again, silently, on a healthy machine. Anchored to the last scan instead,
+    /// the same repeated directive simply means "one scan per five minutes".
+    pub fn set_server_min_interval(&mut self, interval: Option<Duration>) {
+        self.server_min_interval = interval;
     }
 
     pub fn state(&self) -> LocalCollectorState {
@@ -130,13 +170,20 @@ impl SourceCadence {
         if self.disabled {
             return self.config.cold_interval;
         }
-        let interval = match self.state {
+        let tier = match self.state {
             LocalCollectorState::Hot => self.config.hot_min_interval,
             LocalCollectorState::Warm => self.config.warm_interval,
             LocalCollectorState::Idle => self.config.idle_interval,
             LocalCollectorState::Cold => self.config.cold_interval,
             LocalCollectorState::Failing => self.failure_backoff(),
             LocalCollectorState::Disabled => self.config.cold_interval,
+        };
+        // The server may ask for a longer gap between scans, never a shorter one:
+        // it is a cost directive, and a server that could shorten it would be
+        // asking the fleet to pay for the server's own load.
+        let interval = match self.server_min_interval {
+            Some(requested) => tier.max(requested),
+            None => tier,
         };
         let since_scan = self
             .last_scan_at
@@ -186,6 +233,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cost_first_disables_the_hot_tier_and_keeps_the_cheap_ones() {
+        let floor = Duration::from_secs(5 * 60);
+        let config = CadenceConfig::cost_first(floor);
+        // No tier may ever ask for a cycle more often than the floor.
+        assert_eq!(config.hot_min_interval, floor);
+        assert_eq!(config.warm_interval, floor);
+        assert!(config.idle_interval >= floor);
+        assert!(config.cold_interval >= floor);
+        // The cheap tiers are where the saving is, so they must stay LONGER than
+        // the floor or this buys nothing.
+        assert!(config.idle_interval > floor);
+        assert!(config.cold_interval > config.idle_interval);
+        // The sweep is untouched by the cost posture.
+        assert_eq!(
+            config.full_sweep_interval,
+            CadenceConfig::default().full_sweep_interval
+        );
+    }
+
+    #[test]
+    fn cost_first_file_activity_restores_the_floor_and_never_beats_it() {
+        let floor = Duration::from_secs(5 * 60);
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+
+        // An inactive source falls to the cheap tiers.
+        let quiet = start + Duration::from_secs(20 * 60);
+        cadence.record_scan_success(start, 0);
+        cadence.record_scan_success(quiet, 0);
+        assert_eq!(cadence.state(), LocalCollectorState::Idle);
+        assert_eq!(
+            cadence.next_scan_after(quiet),
+            CadenceConfig::cost_first(floor).idle_interval
+        );
+
+        // A burst of filesystem events makes it hot — and hot still means the
+        // floor, so no debounce can turn a busy transcript into per-event uploads.
+        for offset in 0..50 {
+            cadence.record_file_event(quiet + Duration::from_secs(offset));
+        }
+        assert_eq!(cadence.state(), LocalCollectorState::Hot);
+        assert_eq!(
+            cadence.next_scan_after(quiet + Duration::from_secs(60)),
+            floor - Duration::from_secs(60),
+            "a hot source is due at the floor, not before it"
+        );
+    }
+
+    #[test]
     fn file_events_make_source_hot_then_success_warms_it() {
         let start = Instant::now();
         let mut cadence = SourceCadence::new(CadenceConfig::default());
@@ -230,6 +326,39 @@ mod tests {
         assert_eq!(
             cadence.next_scan_after(start + Duration::from_secs(70)),
             Duration::from_secs(110)
+        );
+    }
+
+    #[test]
+    fn a_repeated_server_directive_cannot_starve_the_scan() {
+        // The regression this guards: a relative directive re-read every cycle
+        // pushes its own deadline forward forever, so the scan never runs again
+        // and nothing looks wrong. Anchored to the last scan, a repeated
+        // "come back in 10 minutes" just means one scan per 10 minutes.
+        let start = Instant::now();
+        let interval = Duration::from_secs(10 * 60);
+        let mut cadence =
+            SourceCadence::new(CadenceConfig::cost_first(Duration::from_secs(5 * 60)));
+        cadence.record_scan_success(start, 1);
+
+        for elapsed in [0u64, 60, 300, 599] {
+            cadence.set_server_min_interval(Some(interval));
+            let now = start + Duration::from_secs(elapsed);
+            assert_eq!(
+                cadence.next_scan_after(now),
+                interval - Duration::from_secs(elapsed),
+                "the directive must count down from the last scan"
+            );
+        }
+        cadence.set_server_min_interval(Some(interval));
+        assert_eq!(cadence.next_scan_after(start + interval), Duration::ZERO);
+
+        // And it can only lengthen: a directive shorter than the tier is ignored.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(
+            cadence.next_scan_after(start),
+            Duration::from_secs(5 * 60),
+            "a short directive must not buy a faster scan"
         );
     }
 

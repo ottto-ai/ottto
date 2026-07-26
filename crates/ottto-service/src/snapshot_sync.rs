@@ -1,3 +1,4 @@
+use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::collect_agent_status;
 use crate::backfill::{
     apply_backfill_cutoff, load_backfill_state, mark_backfill_complete_for_destination,
@@ -210,6 +211,88 @@ fn cached_source_manifest(
 fn clear_source_manifests_for_test() {
     if let Ok(mut manifests) = source_manifests().lock() {
         manifests.clear();
+    }
+}
+
+/// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
+///
+/// The cost tiers are allowed to stretch a quiet source out to here and no
+/// further, and the 6-hour full sweep is unconditional on top of it: neither the
+/// filesystem watcher nor a server directive can suppress a sweep, because a
+/// watcher that silently stops delivering events would otherwise stop collection
+/// with every health signal green.
+const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// How long the loop is willing to sit inside one wait before re-deciding.
+/// Filesystem events shorten a wait to the next tier boundary; they never
+/// shorten it below the floor, which is what makes a 2-second debounce incapable
+/// of producing a per-event upload.
+const CADENCE_WAIT_SLICE: Duration = Duration::from_secs(30);
+
+/// Per-source adaptive cadence state.
+static SOURCE_CADENCES: OnceLock<Mutex<BTreeMap<&'static str, SourceCadence>>> = OnceLock::new();
+
+fn source_cadences() -> &'static Mutex<BTreeMap<&'static str, SourceCadence>> {
+    SOURCE_CADENCES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn with_source_cadence<T>(
+    source: SnapshotSource,
+    apply: impl FnOnce(&mut SourceCadence) -> T,
+) -> Option<T> {
+    let mut cadences = source_cadences().lock().ok()?;
+    let cadence = cadences
+        .entry(source.api_slug())
+        .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
+    Some(apply(cadence))
+}
+
+/// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
+///
+/// The tier arithmetic — including the server's requested minimum interval — lives
+/// in [`SourceCadence`], anchored to the last scan. That anchoring is load-bearing:
+/// a *relative* directive re-read on every cycle would push its own deadline
+/// forward forever and the scan would never run again, silently, on a healthy
+/// machine. All that remains here is the ceiling, which bounds a directive that
+/// would otherwise silence a source for a day.
+fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
+    cadence
+        .next_scan_after(now)
+        .clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
+}
+
+/// Remaining wait for `source`, or `None` when it is due now.
+fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
+    let now = Instant::now();
+    let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
+        .unwrap_or(Duration::ZERO);
+    (!wait.is_zero()).then_some(wait)
+}
+
+/// Fold the server's `recommended_scan_after` into the source's cadence as a
+/// minimum interval between scans.
+///
+/// An unparsable value leaves the previous directive alone rather than inventing
+/// one, and a value in the past means "no minimum", not a negative wait.
+fn record_server_scan_directive(source: SnapshotSource, recommended_scan_after: &str) {
+    let Ok(recommended) = OffsetDateTime::parse(recommended_scan_after, &Rfc3339) else {
+        return;
+    };
+    let delay = recommended - OffsetDateTime::now_utc();
+    let requested = if delay.is_negative() {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(delay.whole_seconds().unsigned_abs()).min(MAX_CYCLE_INTERVAL)
+    };
+    with_source_cadence(source, |cadence| {
+        cadence.set_server_min_interval(Some(requested))
+    });
+}
+
+#[cfg(test)]
+fn clear_cadence_state_for_test() {
+    if let Ok(mut cadences) = source_cadences().lock() {
+        cadences.clear();
     }
 }
 
@@ -491,6 +574,17 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             // cycle. Otherwise phase is set by install or restart time, and every
             // fleet-wide event re-aligns every machine onto the same tick.
             std::thread::sleep(phase_offset);
+            // Best effort, and deliberately so: the loop below is driven by the
+            // cadence tiers and the unconditional sweep, and the watcher only ever
+            // shortens a wait. A machine that cannot watch its transcripts (no
+            // permission, exhausted descriptors, a root that does not exist yet)
+            // collects on exactly the schedule it does today.
+            let watcher = watch_snapshot_source_roots(&home);
+            if watcher.is_none() {
+                eprintln!(
+                    "local snapshot sync: filesystem watch unavailable; cadence follows the scan tiers only"
+                );
+            }
             loop {
                 match sync_once(&home, &support_dir, &daemon) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
@@ -499,11 +593,71 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         crate::net_resilience::handle_sync_failure(&daemon);
                     }
                 }
-                std::thread::sleep(SNAPSHOT_SYNC_INTERVAL);
+                // The cycle cadence itself is unchanged. What the tiers gate is the
+                // expensive part — the local transcript scan and its upload — while
+                // agent-status/quota freshness keeps the cycle it already had.
+                collect_file_activity_for(SNAPSHOT_SYNC_INTERVAL, watcher.as_ref());
             }
         })
         .context("spawn local snapshot sync")?;
     Ok(())
+}
+
+/// Watch every enabled source's transcript roots, if the platform allows it.
+fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
+    let roots = [
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .flat_map(|source| {
+        source
+            .default_roots(home)
+            .into_iter()
+            .map(move |root| (source, root))
+    })
+    .collect::<Vec<_>>();
+    crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
+}
+
+/// Sleep for `wait`, folding any filesystem activity into the cadence tiers.
+///
+/// This is where the watcher earns its place, and it is deliberately the only
+/// thing it does: an event **promotes a tier**, it never triggers a scan. A
+/// promoted source becomes due at its floor on a later tick, so a transcript being
+/// written continuously cannot produce an upload per event — and a machine whose
+/// watcher never fires still collects on the tiers and the ceiling.
+fn collect_file_activity_for(
+    wait: Duration,
+    watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
+) {
+    let Some(watcher) = watcher else {
+        std::thread::sleep(wait);
+        return;
+    };
+    let deadline = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let slice = (deadline - now).min(CADENCE_WAIT_SLICE);
+        match watcher.events.recv_timeout(slice) {
+            Ok(event) => {
+                with_source_cadence(event.source, |cadence| {
+                    cadence.record_file_event(Instant::now())
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // The watcher thread is gone. Keep waiting plainly rather than
+            // spinning: collection is not gated on the watcher.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return;
+            }
+        }
+    }
 }
 
 /// This machine's cadence phase offset inside `interval`.
@@ -1076,6 +1230,18 @@ fn sync_source(
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    // The server's scan directive was parsed and discarded before this. It is a
+    // cost lever, so it may only lengthen the local cadence (see
+    // `negotiated_wait`), never shorten it.
+    record_server_scan_directive(source, &activity_hint.recommended_scan_after);
+    with_source_cadence(source, |cadence| {
+        cadence.record_backend_hint(
+            Instant::now(),
+            activity_hint.record_count_15m,
+            false,
+            activity_hint.local_usage_reconciliation_enabled,
+        )
+    });
     // Cache the workspace reconciliation policy so the daemon can surface it on
     // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
     // only error path and is not worth aborting the sync over.
@@ -1129,6 +1295,20 @@ fn sync_source(
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
         )?;
+        return Ok(());
+    }
+
+    // Everything above this line keeps the cycle it already had: quota and
+    // agent-status freshness, the reconciliation policy cache, and the
+    // active-session projection are all cheap and all product-visible. The
+    // negotiated cadence gates what is actually expensive — the local transcript
+    // scan below, which re-reads every changed transcript on this machine.
+    if let Some(remaining) = source_cadence_wait(source) {
+        eprintln!(
+            "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence",
+            source.api_slug(),
+            remaining.as_secs()
+        );
         return Ok(());
     }
 
@@ -1543,6 +1723,9 @@ fn sync_source(
                     "upload local snapshots",
                 )
             };
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_failure(Instant::now())
+            });
             let _ = report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -1561,6 +1744,15 @@ fn sync_source(
     }
 
     index.save(&index_path)?;
+    // A completed cycle is what moves the tier: uploads keep a source warm, a
+    // quiet cycle lets it fall to idle and then cold. The sweep marker is stamped
+    // on the same event, which is what keeps the 6-hour full sweep independent of
+    // the watcher.
+    with_source_cadence(source, |cadence| {
+        let now = Instant::now();
+        cadence.record_scan_success(now, accepted);
+        cadence.record_full_sweep(now);
+    });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
     // reads for the Companion's "Detected Uses" panel. The scan is incremental,
@@ -2796,6 +2988,158 @@ mod tests {
         defer_source_uploads(SnapshotSource::Codex, Duration::ZERO);
         assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
         clear_source_upload_deadlines_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn the_negotiated_cadence_respects_the_floor_the_ceiling_and_the_directive() {
+        clear_cadence_state_for_test();
+        let floor = SNAPSHOT_SYNC_INTERVAL;
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+        cadence.record_scan_success(start, 1);
+
+        // A server directive may only ask for LESS frequent scanning. A directive
+        // shorter than the tier cannot buy a faster scan, or the fleet would be
+        // paying for the server's own load.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(negotiated_wait(&cadence, start), floor);
+        cadence.set_server_min_interval(Some(floor * 2));
+        assert_eq!(negotiated_wait(&cadence, start), floor * 2);
+        // And it cannot silence a source past the ceiling.
+        cadence.set_server_min_interval(Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(negotiated_wait(&cadence, start), MAX_CYCLE_INTERVAL);
+        // The ceiling is stricter than the 6-hour sweep, so a full scan of the
+        // window happens at least every 30 minutes whatever the watcher does.
+        assert!(MAX_CYCLE_INTERVAL < CadenceConfig::cost_first(floor).full_sweep_interval);
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn a_quiet_source_stretches_and_file_activity_brings_it_back_to_the_floor() {
+        clear_cadence_state_for_test();
+        let floor = SNAPSHOT_SYNC_INTERVAL;
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+
+        // Two quiet cycles: the source falls to the idle tier and is scanned less
+        // often. That saving is the entire point of the wiring.
+        cadence.record_scan_success(start, 0);
+        let later = start + Duration::from_secs(20 * 60);
+        cadence.record_scan_success(later, 0);
+        let idle_wait = negotiated_wait(&cadence, later);
+        assert!(idle_wait > floor);
+        assert!(idle_wait <= MAX_CYCLE_INTERVAL);
+
+        // A filesystem event promotes the tier back to the floor — and only to the
+        // floor. Fifty events in a second cannot buy fifty scans.
+        for offset in 0..50 {
+            cadence.record_file_event(later + Duration::from_secs(offset));
+        }
+        assert_eq!(negotiated_wait(&cadence, later), floor);
+        assert!(negotiated_wait(&cadence, later + Duration::from_secs(1)) > Duration::ZERO);
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn a_server_scan_directive_is_read_bounded_and_cannot_starve_the_scan() {
+        clear_cadence_state_for_test();
+        let wait_for = |source, now| {
+            with_source_cadence(source, |cadence| negotiated_wait(cadence, now)).expect("cadence")
+        };
+
+        // A directive in the past is "no minimum", not a negative wait.
+        record_server_scan_directive(SnapshotSource::Codex, "2020-01-01T00:00:00Z");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, Instant::now()),
+            Duration::ZERO
+        );
+
+        // A far-future directive is bounded by the ceiling: a server cannot
+        // silence a source for a day.
+        let scanned_at = Instant::now();
+        with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.record_scan_success(scanned_at, 1)
+        });
+        record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
+        );
+
+        // An unparsable directive leaves the previous one alone rather than
+        // inventing a value.
+        record_server_scan_directive(SnapshotSource::Codex, "soon");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
+        );
+
+        // The starvation case: re-reading a directive on every cycle must not push
+        // its own deadline forward. Anchored to the last scan, the wait strictly
+        // decreases as time passes — otherwise the scan would never run again, on a
+        // machine where nothing looks wrong.
+        let mut previous = MAX_CYCLE_INTERVAL + Duration::from_secs(1);
+        for elapsed in [0u64, 60, 600] {
+            record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+            let wait = wait_for(
+                SnapshotSource::Codex,
+                scanned_at + Duration::from_secs(elapsed),
+            );
+            assert!(
+                wait < previous,
+                "a refreshed directive must never extend its own deadline"
+            );
+            previous = wait;
+        }
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn the_cadence_tier_never_reaches_the_wire_or_any_identity() {
+        clear_cadence_state_for_test();
+        // The cadence tier and the scan trigger are implementation state. If either
+        // entered an identity, every session on a machine would re-mint its content
+        // hash the moment the machine went idle.
+        with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.record_file_event(Instant::now())
+        });
+        record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in while a tier is hot");
+        let requests = captured.lock().expect("captured requests").clone();
+        for forbidden in [
+            "cadence",
+            "scan_trigger",
+            "recommended_scan_after",
+            "\"hot\"",
+            "\"idle\"",
+            "\"cold\"",
+        ] {
+            assert!(
+                !requests[1].contains(forbidden),
+                "{forbidden} must not travel on a receipt"
+            );
+        }
+        clear_cadence_state_for_test();
     }
 
     #[test]

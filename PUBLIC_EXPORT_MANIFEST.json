@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 274,
-  "content_sha256": "39bd0789900ffec6cbac1d22d64b58fae5cd9557194521c247a75bab699b12c5",
+  "candidate_file_count": 275,
+  "content_sha256": "6bd81f00ab000a6d486dfd9f710a22e43a8db218ac1dc8c59a68ce5511f9eb61",
   "files": [
     {
       "executable": false,
@@ -608,8 +608,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/adaptive_collector.rs",
-      "sha256": "da2dd803c347ba12ef3b59dbaad18d74f316da8f80192b43e979cd64635d198a",
-      "size_bytes": 7940
+      "sha256": "16529077c5b4576c2bf69debb198f111857e22ba1c15bf1cf769161229a66a45",
+      "size_bytes": 13887
     },
     {
       "executable": false,
@@ -825,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "52782aa063e7929de74451d3292a8b6f3cc352bb1c6a1805bfab231a095e6b43",
-      "size_bytes": 171185
+      "sha256": "360db16061f578ac090980911b2f87221941cde3ccccaf2ad600fbff894f5165",
+      "size_bytes": 186055
     },
     {
       "executable": false,
@@ -1044,6 +1044,13 @@
       "path": "docs/session-2026-07-25-claude-code-runtime-defaults.md",
       "sha256": "573a3f02f6b7b447880ad97d26c10503c029fe59f48c0963ee8b7cca18e79600",
       "size_bytes": 5178
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-adaptive-scan-cadence.md",
+      "sha256": "327dd365e0d04370c1e209fadf8c84d9bc1dfd8473a20e9f9ac4a2e98aa1fb33",
+      "size_bytes": 4181
     },
     {
       "executable": false,
@@ -1921,9 +1928,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T18:54:10+00:00",
+  "generated_at": "2026-07-26T18:55:20+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 275,
+  "output_file_count": 276,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1957,5 +1964,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "46ceef018bfb1c8b3bcc8f584488727fabd20c7b"
+  "source_commit": "c2c41cf19673f8ef137085aa356a3d0b8fb1690d"
 }
