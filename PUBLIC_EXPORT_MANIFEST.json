@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 276,
-  "content_sha256": "02587ac445394ca54c92e9afaf66b6dba9a56a12e41ff9e05e1687243a77e05f",
+  "candidate_file_count": 277,
+  "content_sha256": "133ad46c5dd627ede2afcc79206c560641832c59f9b035c6c0354fb9cbce4fb5",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "aa26942757e70dc863f47307b5d3288f476fbf18f58de2ef94d33c6133a76297",
-      "size_bytes": 320129
+      "sha256": "03858c95155b2f7a601615fc05f3d82123016df443252bd502f1792dbf2a2080",
+      "size_bytes": 327422
     },
     {
       "executable": false,
@@ -1051,6 +1051,13 @@
       "path": "docs/session-2026-07-26-adaptive-scan-cadence.md",
       "sha256": "327dd365e0d04370c1e209fadf8c84d9bc1dfd8473a20e9f9ac4a2e98aa1fb33",
       "size_bytes": 4181
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-26-claude-max-tier-refinement.md",
+      "sha256": "cba78708af61ade6cf003936ce104b10d136c235b82a2d981a1f520252d2ab9a",
+      "size_bytes": 1536
     },
     {
       "executable": false,
@@ -1935,9 +1942,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T19:09:13+00:00",
+  "generated_at": "2026-07-26T19:21:07+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 277,
+  "output_file_count": 278,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -1971,5 +1978,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b17f31523c054ac06629f124690d404e03d9c239"
+  "source_commit": "ef05b66aa1045af372c173ef7d34e83bfd2de64c"
 }

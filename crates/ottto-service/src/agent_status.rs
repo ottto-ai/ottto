@@ -609,8 +609,13 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
         if let Ok(json) = serde_json::from_str::<Value>(&auth.stdout) {
             let mut account = parse_claude_auth_json(&json);
-            let refined_seat_plan = read_claude_cli_oauth_account(&claude_cli_config_path())
-                .and_then(|oauth| refine_claude_team_seat_plan(&mut account, &oauth));
+            let mut refined_seat_plan = None;
+            let mut refined_max_plan = None;
+            if let Some(oauth) = read_claude_cli_oauth_account(&claude_cli_config_path()) {
+                // Mutually exclusive by plan_type gate (`team` vs `max`).
+                refined_seat_plan = refine_claude_team_seat_plan(&mut account, &oauth);
+                refined_max_plan = refine_claude_max_rate_limit_plan(&mut account, &oauth);
+            }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
             if let Some(seat_plan) = refined_seat_plan {
@@ -619,6 +624,15 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                     AgentDiagnosticSeverity::Info,
                     format!(
                         "Claude Team seat tier resolved to {seat_plan} from local Claude Code account metadata."
+                    ),
+                ));
+            }
+            if let Some(max_plan) = refined_max_plan {
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    "claude_max_rate_limit_tier_detected",
+                    AgentDiagnosticSeverity::Info,
+                    format!(
+                        "Claude Max tier resolved to {max_plan} from local Claude Code account metadata."
                     ),
                 ));
             }
@@ -4110,6 +4124,54 @@ fn refine_claude_team_seat_plan(
     Some(seat_plan)
 }
 
+/// Refine a generic Claude `max` plan into `max_5x` / `max_20x` when the local
+/// Claude Code account metadata carries an explicit rate-limit tier. Mirrors
+/// `refine_claude_team_seat_plan`: explicit collector evidence only, never a
+/// guess — `claude auth status` reports bare `max` for BOTH Max tiers, so an
+/// absent or unrecognized signal leaves the generic plan untouched (the
+/// backend prices that as the conservative lower bound). Max is an individual
+/// plan, so the organization-level rate-limit tier speaks for the account;
+/// the user-level tier is accepted as a same-shaped fallback.
+fn refine_claude_max_rate_limit_plan(
+    account: &mut AgentAccountStatus,
+    oauth: &ClaudeCliOauthAccount,
+) -> Option<&'static str> {
+    if account.plan_type.as_deref() != Some("max") {
+        return None;
+    }
+    // Identity guard: `~/.claude.json` can lag behind `claude auth status`
+    // after an account switch. Refuse to mix metadata across accounts.
+    let mismatch = |ours: &Option<String>, theirs: &Option<String>| match (ours, theirs) {
+        (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    };
+    if mismatch(&account.email, &oauth.email_address)
+        || mismatch(&account.organization_id, &oauth.organization_uuid)
+    {
+        return None;
+    }
+    if let Some(organization_type) = oauth.organization_type.as_deref() {
+        if normalize_plan_type(organization_type.to_string()) != "claude_max" {
+            return None;
+        }
+    }
+    let tier_signal = |value: &Option<String>| -> Option<&'static str> {
+        let normalized = value.clone().map(normalize_plan_type)?;
+        if normalized.ends_with("max_5x") {
+            Some("max_5x")
+        } else if normalized.ends_with("max_20x") {
+            Some("max_20x")
+        } else {
+            None
+        }
+    };
+    let refined = tier_signal(&oauth.organization_rate_limit_tier)
+        .or_else(|| tier_signal(&oauth.user_rate_limit_tier))?;
+    account.plan_type = Some(refined.to_string());
+    account.subscription_product = Some(format!("claude_{refined}"));
+    Some(refined)
+}
+
 fn parse_codex_text_model(text: &str) -> Option<AgentModelStatus> {
     let model = text.lines().find_map(|line| {
         let lower = line.to_ascii_lowercase();
@@ -6592,6 +6654,121 @@ for line in sys.stdin:
             refine_claude_team_seat_plan(&mut team_account, &stale_oauth),
             None
         );
+    }
+
+    fn max_auth_account(email: &str) -> AgentAccountStatus {
+        parse_claude_auth_json(&serde_json::json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": email,
+            "subscriptionType": "max"
+        }))
+    }
+
+    #[test]
+    fn claude_max_tier_refines_20x_from_organization_rate_limit_tier() {
+        let mut account = max_auth_account("user@example.com");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            organization_type: Some("claude_max".to_string()),
+            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        let refined = refine_claude_max_rate_limit_plan(&mut account, &oauth);
+
+        assert_eq!(refined, Some("max_20x"));
+        assert_eq!(account.plan_type.as_deref(), Some("max_20x"));
+        assert_eq!(
+            account.subscription_product.as_deref(),
+            Some("claude_max_20x")
+        );
+    }
+
+    #[test]
+    fn claude_max_tier_refines_5x_from_user_rate_limit_tier_fallback() {
+        let mut account = max_auth_account("user@example.com");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut account, &oauth),
+            Some("max_5x")
+        );
+        assert_eq!(account.plan_type.as_deref(), Some("max_5x"));
+        assert_eq!(
+            account.subscription_product.as_deref(),
+            Some("claude_max_5x")
+        );
+    }
+
+    #[test]
+    fn claude_max_tier_left_generic_without_explicit_signal() {
+        // Bare `max` is emitted for BOTH Max tiers: no recognized rate-limit
+        // tier means no refinement, never a guess.
+        let mut account = max_auth_account("user@example.com");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            organization_rate_limit_tier: Some("claude_max".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut account, &oauth),
+            None
+        );
+        assert_eq!(account.plan_type.as_deref(), Some("max"));
+        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
+    }
+
+    #[test]
+    fn claude_max_tier_ignores_mismatched_account_metadata() {
+        // `~/.claude.json` lagging behind an account switch must not leak a
+        // different account's tier onto the signed-in account.
+        let mut account = max_auth_account("user@example.com");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("someone.else@example.com".to_string()),
+            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut account, &oauth),
+            None
+        );
+        assert_eq!(account.plan_type.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn claude_max_tier_ignores_non_max_plans_and_orgs() {
+        // Team plan: the max refinement never fires.
+        let mut team_account = team_auth_account("ron.s@singular.net", "org-1");
+        let oauth = ClaudeCliOauthAccount {
+            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut team_account, &oauth),
+            None
+        );
+
+        // A stale non-max organizationType blocks refinement even when the
+        // auth status says max.
+        let mut max_account = max_auth_account("user@example.com");
+        let stale_oauth = ClaudeCliOauthAccount {
+            organization_type: Some("claude_team".to_string()),
+            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut max_account, &stale_oauth),
+            None
+        );
+        assert_eq!(max_account.plan_type.as_deref(), Some("max"));
     }
 
     #[test]
