@@ -825,6 +825,100 @@ pub fn direct_provider_facts(
     facts
 }
 
+/// Local subagent-tree descriptor for a Claude Code transcript, derived from the
+/// transcript's path plus its provider-written `*.meta.json` sidecar.
+///
+/// Every field is a provider-native identifier or an integer. No prompt text, no
+/// agent description, and no local filesystem path reaches this struct.
+pub struct ClaudeSubagentAttribution<'a> {
+    /// The top-level human session that owns the whole subagent tree, always the
+    /// raw session UUID regardless of nesting depth. This is the rollup key.
+    pub root_session_ref: &'a str,
+    /// `agentType` from the sidecar, e.g. `workflow-subagent`, `Explore`.
+    pub agent_kind: Option<&'a str>,
+    /// The provider agent id (transcript file stem with `agent-` stripped).
+    pub agent_ref: Option<&'a str>,
+    /// `spawnDepth` from the sidecar, stringified.
+    pub spawn_depth: Option<&'a str>,
+    /// The `wf_*` workflow directory when the agent ran under the Workflow tool.
+    pub workflow_ref: Option<&'a str>,
+}
+
+/// Fixed-name attribution facts for one Claude Code subagent session.
+///
+/// The field names here are a contract shared with the backend session
+/// attribution reader (`root_session_ref`, `agent_kind`, `agent_ref`,
+/// `spawn_depth`, `workflow_ref`); the DIRECT parent edge is emitted separately
+/// as `parent_session_ref` by `direct_provider_facts` from
+/// `SnapshotOrigin::parent_session_ref`. Facts are ordered most- to
+/// least-load-bearing because the caller trims from the tail to stay inside the
+/// bounded payload budget.
+pub fn claude_subagent_facts(
+    attribution: &ClaudeSubagentAttribution<'_>,
+    source_session_id: &str,
+    observed_at: &str,
+    source_version: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version,
+    };
+    push_fact(
+        &mut facts,
+        "root_session_ref",
+        attribution.root_session_ref,
+        "provider_native",
+        "direct",
+        &evidence_context,
+    );
+    // The sidecar is provider-written metadata rather than a transcript record,
+    // so it is evidence of kind `provider_artifact` -- same classification the
+    // workflow-orchestration footprint already uses.
+    if let Some(agent_kind) = attribution.agent_kind {
+        push_fact(
+            &mut facts,
+            "agent_kind",
+            agent_kind,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(agent_ref) = attribution.agent_ref {
+        push_fact(
+            &mut facts,
+            "agent_ref",
+            agent_ref,
+            "provider_native",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(workflow_ref) = attribution.workflow_ref {
+        push_fact(
+            &mut facts,
+            "workflow_ref",
+            workflow_ref,
+            "provider_native",
+            "direct",
+            &evidence_context,
+        );
+    }
+    if let Some(spawn_depth) = attribution.spawn_depth {
+        push_fact(
+            &mut facts,
+            "spawn_depth",
+            spawn_depth,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    facts
+}
+
 pub(crate) fn provider_surface(
     source: SnapshotSource,
     origin: Option<&SnapshotOrigin>,
