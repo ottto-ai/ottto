@@ -6719,7 +6719,10 @@ for line in sys.stdin:
             ..ClaudeCliOauthAccount::default()
         };
 
-        assert_eq!(refine_claude_max_rate_limit_plan(&mut account, &oauth), None);
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut account, &oauth),
+            None
+        );
         assert_eq!(account.plan_type.as_deref(), Some("max"));
         assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
     }
@@ -6735,7 +6738,10 @@ for line in sys.stdin:
             ..ClaudeCliOauthAccount::default()
         };
 
-        assert_eq!(refine_claude_max_rate_limit_plan(&mut account, &oauth), None);
+        assert_eq!(
+            refine_claude_max_rate_limit_plan(&mut account, &oauth),
+            None
+        );
         assert_eq!(account.plan_type.as_deref(), Some("max"));
     }
 
