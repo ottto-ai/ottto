@@ -510,10 +510,12 @@ fn local_machine() -> MachineIdentity {
             let _ = FileMachineStore::default().save(&binding);
         }
     }
+    let account_scope = local_account_scope(&binding.machine_id);
     MachineIdentity {
         machine_id: binding.machine_id,
         installation_id: binding.installation_id,
         hardware_uuid: binding.hardware_uuid,
+        account_scope,
         display_name: hostname.clone(),
         hostname,
         os: current_os(),
@@ -561,12 +563,55 @@ fn fallback_installation_id() -> String {
 }
 
 fn stable_machine_id_from_seed(seed: &str) -> String {
+    prefixed_sha256_id("otm", seed)
+}
+
+/// Privacy-safe discriminator for the OS account this install runs under; see
+/// `MachineIdentity::account_scope` for the contract. Derived from the POSIX
+/// uid on every call, so it survives daemon restarts and reinstalls without
+/// persisting anything about the account.
+fn local_account_scope(machine_id: &str) -> Option<String> {
+    account_scope_from_uid(machine_id, current_account_uid())
+}
+
+/// Hash-only half of `local_account_scope`, split out so tests can pin the
+/// stability and distinctness guarantees without depending on whichever account
+/// runs them. The uid is digest input only; it never appears in the output, and
+/// neither does the username, the home directory, nor any path.
+fn account_scope_from_uid(machine_id: &str, uid: Option<u32>) -> Option<String> {
+    let uid = uid?;
+    Some(prefixed_sha256_id(
+        "otu",
+        &format!("account:{machine_id}:{uid}"),
+    ))
+}
+
+/// The POSIX uid the daemon runs as. `getuid` cannot fail on unix. Non-unix
+/// targets have no POSIX uid, so they report `None` instead of a placeholder
+/// that would collapse distinct accounts onto one scope.
+fn current_account_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // `libc::uid_t` is `u32` on every supported unix target.
+        Some(unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// `<prefix>_` + the first 32 hex characters of the seed's SHA-256 digest. The
+/// shared shape behind `machine_id` (`otm_`) and `account_scope` (`otu_`); each
+/// caller owns its own prefix so the two can never be confused for each other
+/// or for the randomly minted `installation_id` (`oti_`).
+fn prefixed_sha256_id(prefix: &str, seed: &str) -> String {
     let digest = Sha256::digest(seed.as_bytes());
     let hex = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("otm_{}", &hex[..32])
+    format!("{prefix}_{}", &hex[..32])
 }
 
 fn platform_machine_id() -> Option<String> {
@@ -710,6 +755,101 @@ mod tests {
                 plan.bootstrap_command,
             ],
         );
+    }
+
+    /// Fixed derivation vectors for `account_scope`. Recomputed from
+    /// `sha256("account:<machine_id>:<uid>")`, so a change here is a change to
+    /// the wire contract: the backend keys sibling installs off these values,
+    /// and re-deriving them differently would orphan every existing install.
+    const ALPHA_UID_501: &str = "otu_d8b0c573acd0c2b5f822065edfd4ec58";
+    const ALPHA_UID_502: &str = "otu_2bc221830d52dafb982c36c3450123b8";
+    const BETA_UID_501: &str = "otu_94a43be990de1c2d7e47cfc8b23bb612";
+
+    #[test]
+    fn account_scope_is_identical_for_the_same_account_on_the_same_machine() {
+        // Two independent computations with nothing persisted in between: this
+        // is the "survives daemon restarts and reinstalls" guarantee, since a
+        // reinstall re-derives `machine_id` from the same IOPlatformUUID.
+        let first = account_scope_from_uid("otm_machine_alpha", Some(501));
+        let second = account_scope_from_uid("otm_machine_alpha", Some(501));
+
+        assert_eq!(first, second);
+        assert_eq!(first.as_deref(), Some(ALPHA_UID_501));
+    }
+
+    #[test]
+    fn account_scope_differs_between_accounts_on_one_machine() {
+        // The whole point of the field: two macOS user accounts on one Mac share
+        // a `machine_id` but must not share an `account_scope`.
+        assert_ne!(ALPHA_UID_501, ALPHA_UID_502);
+        assert_eq!(
+            account_scope_from_uid("otm_machine_alpha", Some(502)).as_deref(),
+            Some(ALPHA_UID_502)
+        );
+    }
+
+    #[test]
+    fn account_scope_differs_for_the_same_account_on_another_machine() {
+        assert_ne!(ALPHA_UID_501, BETA_UID_501);
+        assert_eq!(
+            account_scope_from_uid("otm_machine_beta", Some(501)).as_deref(),
+            Some(BETA_UID_501)
+        );
+    }
+
+    #[test]
+    fn account_scope_is_a_bare_prefixed_digest() {
+        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).expect("scope");
+        let digest = scope.strip_prefix("otu_").expect("otu_ prefix");
+
+        assert_eq!(scope.len(), 36);
+        assert_eq!(digest.len(), 32);
+        assert!(digest
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f')));
+        // Nothing but the digest is emitted: no uid, no seed material, no path.
+        assert!(!scope.contains("501"));
+        assert!(!scope.contains("machine_alpha"));
+        assert!(!scope.contains('/'));
+    }
+
+    #[test]
+    fn account_scope_never_collides_with_the_machine_id_namespace() {
+        let scope = account_scope_from_uid("otm_machine_alpha", Some(501)).expect("scope");
+        let machine_style = stable_machine_id_from_seed("account:otm_machine_alpha:501");
+
+        assert!(scope.starts_with("otu_"));
+        assert!(machine_style.starts_with("otm_"));
+        assert_ne!(scope, machine_style);
+    }
+
+    #[test]
+    fn account_scope_is_absent_when_no_posix_uid_is_available() {
+        assert_eq!(account_scope_from_uid("otm_machine_alpha", None), None);
+    }
+
+    #[test]
+    fn local_account_scope_leaks_no_account_identifying_text() {
+        let Some(scope) = local_account_scope("otm_machine_alpha") else {
+            // Non-unix targets have no POSIX uid; `None` is the correct answer.
+            assert!(current_account_uid().is_none());
+            return;
+        };
+
+        assert!(scope.starts_with("otu_"));
+        assert_eq!(scope.len(), 36);
+        assert!(scope[4..]
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, 'a'..='f')));
+        for key in ["USER", "LOGNAME", "HOME"] {
+            let value = std::env::var(key).unwrap_or_default();
+            if value.len() >= 3 {
+                assert!(
+                    !scope.contains(&value),
+                    "account scope must not carry ${key}"
+                );
+            }
+        }
     }
 
     #[test]

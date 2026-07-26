@@ -131,6 +131,12 @@ fn is_machine_identifier_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
     normalized == "machine_id"
         || normalized == "installation_id"
+        // `MachineIdentity::account_scope`: a non-reversible per-OS-account
+        // discriminator. Classified with its machine/install siblings so a
+        // free-text diagnostic renders it as an identifier rather than as a
+        // credential. This does NOT touch the structured backend payloads,
+        // which carry the value verbatim.
+        || normalized == "account_scope"
         || normalized == "device_id"
         || normalized == "hardware_uuid"
         || normalized == "serial"
@@ -487,6 +493,12 @@ mod tests {
         );
         assert_eq!(
             redact_key_value("hardware_uuid", "A1B2C3D4-E5F6-7890-ABCD-1234567890AB"),
+            RedactedValue::String("[machine_id]".to_string())
+        );
+        // `account_scope` is an identifier, not a credential: diagnostics label
+        // it like its machine/install siblings instead of `[REDACTED]`.
+        assert_eq!(
+            redact_key_value("account_scope", "otu_d8b0c573acd0c2b5f822065edfd4ec58"),
             RedactedValue::String("[machine_id]".to_string())
         );
         assert_eq!(
