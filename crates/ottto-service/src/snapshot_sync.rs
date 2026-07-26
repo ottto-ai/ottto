@@ -1,3 +1,4 @@
+use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::collect_agent_status;
 use crate::backfill::{
     apply_backfill_cutoff, load_backfill_state, mark_backfill_complete_for_destination,
@@ -12,13 +13,13 @@ use crate::snapshot_client::{
     AgentStatusSnapshotUploadResponse, BatchAuthorizationRejected, BatchRejected,
     LocalHealthAuthorizationRejected, LocalHealthProjectionRejected,
     RelayTokenAuthorizationRejected, SnapshotApiClient, SnapshotStatusRequest,
-    UploadFailureDiagnostics,
+    UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
     apply_upload_policy, collector_version, scan_source_roots_with_attribution,
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
+    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -27,12 +28,12 @@ use ottto_core::{default_support_dir, FileConnectionStore, FileMachineStore, Loc
 use ottto_protocol::{AgentStatusSnapshot, DetectedUse, SourceKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use zeroize::Zeroize;
 
@@ -153,6 +154,362 @@ fn is_snapshot_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Last computed scan-index manifest per (upload destination, source).
+///
+/// The check-in heartbeat runs on its own clock and does not know which
+/// policy/attribution/destination-scoped index path the sync cycle chose, so it
+/// cannot load the index itself. The sync cycle publishes the manifest it
+/// already computed from the index it already had open, and both receipt shapes
+/// read it from here. Missing means "no scan has completed in this process yet
+/// for this destination", which is reported as an absent manifest rather than a
+/// zeroed one.
+///
+/// The destination is part of the key, not an afterthought: a setup or account
+/// switch replaces the relay binding without restarting the daemon (which is why
+/// `ensure_snapshot_destination_current` exists), and a manifest keyed by source
+/// alone would report the previous account's entity count and rolling hash to the
+/// new one — a wrong witness and a disclosure of the previous account's local
+/// session set.
+static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>> =
+    OnceLock::new();
+
+type SourceManifestCache = Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>;
+
+fn source_manifests() -> &'static SourceManifestCache {
+    SOURCE_MANIFESTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn publish_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+    manifest: SnapshotSourceManifest,
+) {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        // One destination at a time: a machine that has moved is never coming
+        // back to the old binding with the same secret, so retaining its
+        // manifests would only risk reporting them.
+        manifests.retain(|(namespace, _), _| namespace == destination_namespace);
+        manifests.insert(
+            (destination_namespace.to_string(), source.api_slug()),
+            manifest,
+        );
+    }
+}
+
+fn cached_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+) -> Option<SnapshotSourceManifest> {
+    source_manifests().lock().ok().and_then(|manifests| {
+        manifests
+            .get(&(destination_namespace.to_string(), source.api_slug()))
+            .cloned()
+    })
+}
+
+#[cfg(test)]
+fn clear_source_manifests_for_test() {
+    if let Ok(mut manifests) = source_manifests().lock() {
+        manifests.clear();
+    }
+}
+
+/// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
+///
+/// The cost tiers are allowed to stretch a quiet source out to here and no
+/// further, and the 6-hour full sweep is unconditional on top of it: neither the
+/// filesystem watcher nor a server directive can suppress a sweep, because a
+/// watcher that silently stops delivering events would otherwise stop collection
+/// with every health signal green.
+const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// How long the loop is willing to sit inside one wait before re-deciding.
+/// Filesystem events shorten a wait to the next tier boundary; they never
+/// shorten it below the floor, which is what makes a 2-second debounce incapable
+/// of producing a per-event upload.
+const CADENCE_WAIT_SLICE: Duration = Duration::from_secs(30);
+
+/// Per-source adaptive cadence state.
+static SOURCE_CADENCES: OnceLock<Mutex<BTreeMap<&'static str, SourceCadence>>> = OnceLock::new();
+
+fn source_cadences() -> &'static Mutex<BTreeMap<&'static str, SourceCadence>> {
+    SOURCE_CADENCES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn with_source_cadence<T>(
+    source: SnapshotSource,
+    apply: impl FnOnce(&mut SourceCadence) -> T,
+) -> Option<T> {
+    let mut cadences = source_cadences().lock().ok()?;
+    let cadence = cadences
+        .entry(source.api_slug())
+        .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
+    Some(apply(cadence))
+}
+
+/// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
+///
+/// The tier arithmetic — including the server's requested minimum interval — lives
+/// in [`SourceCadence`], anchored to the last scan. That anchoring is load-bearing:
+/// a *relative* directive re-read on every cycle would push its own deadline
+/// forward forever and the scan would never run again, silently, on a healthy
+/// machine. All that remains here is the ceiling, which bounds a directive that
+/// would otherwise silence a source for a day.
+fn negotiated_wait(cadence: &SourceCadence, now: Instant) -> Duration {
+    cadence
+        .next_scan_after(now)
+        .clamp(Duration::ZERO, MAX_CYCLE_INTERVAL)
+}
+
+/// Remaining wait for `source`, or `None` when it is due now.
+fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
+    let now = Instant::now();
+    let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
+        .unwrap_or(Duration::ZERO);
+    (!wait.is_zero()).then_some(wait)
+}
+
+/// Fold the server's `recommended_scan_after` into the source's cadence as a
+/// minimum interval between scans.
+///
+/// An unparsable value leaves the previous directive alone rather than inventing
+/// one, and a value in the past means "no minimum", not a negative wait.
+fn record_server_scan_directive(source: SnapshotSource, recommended_scan_after: &str) {
+    let Ok(recommended) = OffsetDateTime::parse(recommended_scan_after, &Rfc3339) else {
+        return;
+    };
+    let delay = recommended - OffsetDateTime::now_utc();
+    let requested = if delay.is_negative() {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(delay.whole_seconds().unsigned_abs()).min(MAX_CYCLE_INTERVAL)
+    };
+    with_source_cadence(source, |cadence| {
+        cadence.set_server_min_interval(Some(requested))
+    });
+}
+
+#[cfg(test)]
+fn clear_cadence_state_for_test() {
+    if let Ok(mut cadences) = source_cadences().lock() {
+        cadences.clear();
+    }
+}
+
+/// Base of the local backoff ladder used when the server sheds without saying
+/// for how long.
+const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
+
+/// Uniform random in `[0, span]`, from the OS entropy source already used for
+/// token material. Jitter that is not random is not jitter.
+fn uniform_duration(span: Duration) -> Duration {
+    if span.is_zero() {
+        return Duration::ZERO;
+    }
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        // Entropy is not available. Half the span is a poor sample but a correct
+        // wait; refusing to wait would be the actual bug.
+        return span / 2;
+    }
+    let fraction = u64::from_le_bytes(bytes) as f64 / u64::MAX as f64;
+    Duration::from_secs_f64(span.as_secs_f64() * fraction)
+}
+
+/// The wait after a shed request.
+///
+/// With a server-supplied `Retry-After`, wait `Retry-After × uniform(1.0, 1.2)`.
+/// The jitter is one-sided on purpose: the whole fleet was told the same number,
+/// so obeying it exactly re-synchronises every machine onto the same instant —
+/// which is how a shed becomes a thundering herd — but jittering *below* it
+/// returns before the server said it would be ready, which is the overload the
+/// shed was protecting against. Never early, sometimes late.
+///
+/// Without a `Retry-After`, full jitter over an exponential ladder: `random(0,
+/// min(cap, base·2^n))`, which is the form that actually decorrelates retries,
+/// not the "exponential plus a little noise" form.
+///
+/// The result is capped like a parsed `Retry-After` is, so the upper jitter
+/// cannot push a wait past the longest silence the freshness promise tolerates.
+fn shed_backoff(retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(retry_after) => (retry_after + uniform_duration(retry_after.mul_f64(0.2)))
+            .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER),
+        None => full_jitter_backoff(0),
+    }
+}
+
+/// `random(0, min(cap, base·2^attempt))` — full jitter, capped.
+fn full_jitter_backoff(attempt: u32) -> Duration {
+    let ceiling = SHED_BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER);
+    uniform_duration(ceiling)
+}
+
+/// A deterministic per-machine offset inside `interval`.
+///
+/// Cycle phase is otherwise set by install or restart time, so any fleet-wide
+/// event — a deploy, a shed, a network partition healing — re-aligns every
+/// machine onto the same tick and keeps them aligned. The offset is derived from
+/// the client id so it is stable across restarts (a random offset would
+/// re-scatter on every launch, which is worse for the freshness promise than
+/// being predictable).
+fn cadence_phase_offset(client_id: &str, interval: Duration) -> Duration {
+    let seconds = interval.as_secs();
+    if seconds == 0 {
+        return Duration::ZERO;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"ottto.cadence.phase:v1");
+    digest.update(client_id.as_bytes());
+    let hash = digest.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash[..8]);
+    Duration::from_secs(u64::from_be_bytes(bytes) % seconds)
+}
+
+/// Consecutive sheds per source, so the no-`Retry-After` ladder actually climbs.
+///
+/// Without it every shed draws from `random(0, 30s)`, which the five-minute cycle
+/// has already outlived by the next tick — a ladder that never leaves its first
+/// rung is not backoff, it is a rounding error on the normal cadence. Reset by any
+/// completed upload.
+static SOURCE_SHED_STREAKS: OnceLock<Mutex<BTreeMap<&'static str, u32>>> = OnceLock::new();
+
+fn source_shed_streaks() -> &'static Mutex<BTreeMap<&'static str, u32>> {
+    SOURCE_SHED_STREAKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Count this shed and return the wait to honour.
+fn note_shed_and_backoff(source: SnapshotSource, retry_after: Option<Duration>) -> Duration {
+    let attempt = match source_shed_streaks().lock() {
+        Ok(mut streaks) => {
+            let streak = streaks.entry(source.api_slug()).or_insert(0);
+            let attempt = *streak;
+            *streak = streak.saturating_add(1);
+            attempt
+        }
+        Err(_) => 0,
+    };
+    match retry_after {
+        // The server named a time. Its number wins over our ladder — it knows
+        // when it will be ready and we do not.
+        Some(retry_after) => shed_backoff(Some(retry_after)),
+        None => full_jitter_backoff(attempt),
+    }
+}
+
+fn clear_shed_streak(source: SnapshotSource) {
+    if let Ok(mut streaks) = source_shed_streaks().lock() {
+        streaks.remove(source.api_slug());
+    }
+}
+
+#[cfg(test)]
+fn shed_streak_for_test(source: SnapshotSource) -> u32 {
+    source_shed_streaks()
+        .lock()
+        .expect("shed streaks")
+        .get(source.api_slug())
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Per-source "do not upload before" deadlines, set by an honoured shed.
+static SOURCE_UPLOAD_DEADLINES: OnceLock<Mutex<BTreeMap<&'static str, Instant>>> = OnceLock::new();
+
+fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> {
+    SOURCE_UPLOAD_DEADLINES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
+    if let Ok(mut deadlines) = source_upload_deadlines().lock() {
+        deadlines.insert(source.api_slug(), Instant::now() + retry_after);
+    }
+}
+
+/// Remaining backoff for `source`, or `None` when it may upload now.
+fn source_upload_backoff_remaining(source: SnapshotSource) -> Option<Duration> {
+    let mut deadlines = source_upload_deadlines().lock().ok()?;
+    let deadline = *deadlines.get(source.api_slug())?;
+    let now = Instant::now();
+    if deadline <= now {
+        deadlines.remove(source.api_slug());
+        return None;
+    }
+    Some(deadline - now)
+}
+
+#[cfg(test)]
+fn clear_source_upload_deadlines_for_test() {
+    if let Ok(mut deadlines) = source_upload_deadlines().lock() {
+        deadlines.clear();
+    }
+    if let Ok(mut streaks) = source_shed_streaks().lock() {
+        streaks.clear();
+    }
+}
+
+/// Entity fingerprints already counted as a client-report poison loss.
+///
+/// The server has no per-entity rejection vocabulary yet, so a permanently
+/// invalid entity is re-attempted every cycle. Counting each attempt would make
+/// one broken session look like an unbounded stream of losses — and if the
+/// source has no valid sibling, no request ever succeeds, so nothing commits the
+/// report and the number only grows. One entity is one loss until the per-entity
+/// ACK contract lands and the daemon can mark it durably poisoned.
+///
+/// Pruned to the current scan on every upload pass, exactly like the accepted
+/// fingerprint ledger, so it stays O(current scan) rather than O(all history).
+///
+/// Keyed by upload scope (the source) because the prune is per scan: a Codex pass
+/// must not prune Claude's ledger, or the next Claude cycle would count its
+/// already-counted poison a second time.
+static COUNTED_POISON_FINGERPRINTS: OnceLock<Mutex<BTreeMap<String, BTreeSet<String>>>> =
+    OnceLock::new();
+
+fn counted_poison_fingerprints() -> &'static Mutex<BTreeMap<String, BTreeSet<String>>> {
+    COUNTED_POISON_FINGERPRINTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn retain_counted_poison_fingerprints(scope: &str, current: &BTreeSet<String>) {
+    if let Ok(mut counted) = counted_poison_fingerprints().lock() {
+        if let Some(ledger) = counted.get_mut(scope) {
+            ledger.retain(|value| current.contains(value));
+            if ledger.is_empty() {
+                counted.remove(scope);
+            }
+        }
+    }
+}
+
+/// Record one poison loss for `fingerprint`, at most once per entity per scope.
+fn record_poison_loss_once(scope: &str, fingerprint: &str) {
+    let first_time = match counted_poison_fingerprints().lock() {
+        Ok(mut counted) => counted
+            .entry(scope.to_string())
+            .or_default()
+            .insert(fingerprint.to_string()),
+        // A poisoned lock must not silently stop the accounting; over-reporting
+        // a loss is recoverable, losing the signal is not.
+        Err(_) => true,
+    };
+    if first_time {
+        crate::client_report::record(crate::client_report::ClientReportReason::Poisoned, 1);
+    }
+}
+
+#[cfg(test)]
+fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<String> {
+    counted_poison_fingerprints()
+        .lock()
+        .expect("poison ledger")
+        .get(scope)
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct SyncCounts {
     backfill_window_days: u64,
@@ -162,6 +519,7 @@ struct SyncCounts {
     scan_cap_hit: bool,
     scanned_file_count: u64,
     scanned_session_count: u64,
+    semantic_noop_count: u64,
     uploaded_count: u64,
 }
 
@@ -183,6 +541,7 @@ impl SyncCounts {
             scan_cap_hit: scan_result.scan_cap_hit,
             scanned_file_count: scan_result.scanned_file_count as u64,
             scanned_session_count: scan_result.scanned_session_count as u64,
+            semantic_noop_count: scan_result.semantic_noop_count as u64,
             uploaded_count,
         }
     }
@@ -207,20 +566,112 @@ struct CollectorStatus<'a> {
 pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     let home = home_dir()?;
     let support_dir = default_support_dir();
+    let phase_offset = local_cadence_phase_offset(SNAPSHOT_SYNC_INTERVAL);
     std::thread::Builder::new()
         .name("ottto-snapshot-sync".to_string())
-        .spawn(move || loop {
-            match sync_once(&home, &support_dir, &daemon) {
-                Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
-                Err(error) => {
-                    eprintln!("local snapshot sync skipped: {}", safe_error(&error));
-                    crate::net_resilience::handle_sync_failure(&daemon);
-                }
+        .spawn(move || {
+            // Spread the fleet's cycle phase deterministically before the first
+            // cycle. Otherwise phase is set by install or restart time, and every
+            // fleet-wide event re-aligns every machine onto the same tick.
+            std::thread::sleep(phase_offset);
+            // Best effort, and deliberately so: the loop below is driven by the
+            // cadence tiers and the unconditional sweep, and the watcher only ever
+            // shortens a wait. A machine that cannot watch its transcripts (no
+            // permission, exhausted descriptors, a root that does not exist yet)
+            // collects on exactly the schedule it does today.
+            let watcher = watch_snapshot_source_roots(&home);
+            if watcher.is_none() {
+                eprintln!(
+                    "local snapshot sync: filesystem watch unavailable; cadence follows the scan tiers only"
+                );
             }
-            std::thread::sleep(SNAPSHOT_SYNC_INTERVAL);
+            loop {
+                match sync_once(&home, &support_dir, &daemon) {
+                    Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
+                    Err(error) => {
+                        eprintln!("local snapshot sync skipped: {}", safe_error(&error));
+                        crate::net_resilience::handle_sync_failure(&daemon);
+                    }
+                }
+                // The cycle cadence itself is unchanged. What the tiers gate is the
+                // expensive part — the local transcript scan and its upload — while
+                // agent-status/quota freshness keeps the cycle it already had.
+                collect_file_activity_for(SNAPSHOT_SYNC_INTERVAL, watcher.as_ref());
+            }
         })
         .context("spawn local snapshot sync")?;
     Ok(())
+}
+
+/// Watch every enabled source's transcript roots, if the platform allows it.
+fn watch_snapshot_source_roots(home: &Path) -> Option<crate::snapshot_watcher::SnapshotWatcher> {
+    let roots = [
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Pi,
+    ]
+    .into_iter()
+    .flat_map(|source| {
+        source
+            .default_roots(home)
+            .into_iter()
+            .map(move |root| (source, root))
+    })
+    .collect::<Vec<_>>();
+    crate::snapshot_watcher::watch_snapshot_roots(roots).ok()
+}
+
+/// Sleep for `wait`, folding any filesystem activity into the cadence tiers.
+///
+/// This is where the watcher earns its place, and it is deliberately the only
+/// thing it does: an event **promotes a tier**, it never triggers a scan. A
+/// promoted source becomes due at its floor on a later tick, so a transcript being
+/// written continuously cannot produce an upload per event — and a machine whose
+/// watcher never fires still collects on the tiers and the ceiling.
+fn collect_file_activity_for(
+    wait: Duration,
+    watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
+) {
+    let Some(watcher) = watcher else {
+        std::thread::sleep(wait);
+        return;
+    };
+    let deadline = Instant::now() + wait;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let slice = (deadline - now).min(CADENCE_WAIT_SLICE);
+        match watcher.events.recv_timeout(slice) {
+            Ok(event) => {
+                with_source_cadence(event.source, |cadence| {
+                    cadence.record_file_event(Instant::now())
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // The watcher thread is gone. Keep waiting plainly rather than
+            // spinning: collection is not gated on the watcher.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return;
+            }
+        }
+    }
+}
+
+/// This machine's cadence phase offset inside `interval`.
+///
+/// Derived from the durable machine id when there is one. A machine that has not
+/// been claimed yet has no stable id, and inventing a random one would re-scatter
+/// the phase on every launch — so an unclaimed machine simply starts on time.
+fn local_cadence_phase_offset(interval: Duration) -> Duration {
+    match FileMachineStore::default().load() {
+        Ok(Some(machine)) if !machine.machine_id.is_empty() => {
+            cadence_phase_offset(&machine.machine_id, interval)
+        }
+        _ => Duration::ZERO,
+    }
 }
 
 pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
@@ -763,9 +1214,34 @@ fn sync_source(
     daemon: &LocalDaemon,
     transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
 ) -> Result<()> {
+    if let Some(remaining) = source_upload_backoff_remaining(source) {
+        // The server asked for room and we said yes. Re-running the cycle now
+        // would scan, re-derive and re-POST the same pages it just shed, which is
+        // precisely the loop the backoff exists to break. No status receipt: the
+        // last one still describes reality, and the check-in heartbeat keeps
+        // freshness alive on its own clock.
+        eprintln!(
+            "local snapshot sync deferred for {}: backend backoff has {}s remaining",
+            source.api_slug(),
+            remaining.as_secs()
+        );
+        return Ok(());
+    }
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    // The server's scan directive was parsed and discarded before this. It is a
+    // cost lever, so it may only lengthen the local cadence (see
+    // `negotiated_wait`), never shorten it.
+    record_server_scan_directive(source, &activity_hint.recommended_scan_after);
+    with_source_cadence(source, |cadence| {
+        cadence.record_backend_hint(
+            Instant::now(),
+            activity_hint.record_count_15m,
+            false,
+            activity_hint.local_usage_reconciliation_enabled,
+        )
+    });
     // Cache the workspace reconciliation policy so the daemon can surface it on
     // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
     // only error path and is not worth aborting the sync over.
@@ -810,6 +1286,7 @@ fn sync_source(
         report_status(
             client,
             &relay_token,
+            &snapshot_upload_destination_namespace(device, device_secret),
             CollectorStatus {
                 source,
                 machine_id,
@@ -818,6 +1295,20 @@ fn sync_source(
                 state: CollectorState::Disabled(Some("disabled_by_admin".to_string())),
             },
         )?;
+        return Ok(());
+    }
+
+    // Everything above this line keeps the cycle it already had: quota and
+    // agent-status freshness, the reconciliation policy cache, and the
+    // active-session projection are all cheap and all product-visible. The
+    // negotiated cadence gates what is actually expensive — the local transcript
+    // scan below, which re-reads every changed transcript on this machine.
+    if let Some(remaining) = source_cadence_wait(source) {
+        eprintln!(
+            "local snapshot scan deferred for {}: next scan in {}s on the negotiated cadence",
+            source.api_slug(),
+            remaining.as_secs()
+        );
         return Ok(());
     }
 
@@ -879,6 +1370,10 @@ fn sync_source(
     let mut upload_progress =
         SnapshotUploadProgress::load(&upload_progress_path, &upload_destination_namespace)?;
     let mut index = ScanIndex::load(&index_path)?;
+    // The committed state, before the scan advances it. A partial commit needs
+    // both: which entries this scan produced, and which ones the server was
+    // already known to hold.
+    let committed_index = index.clone();
     let mut scan_result = match scan_source_roots_with_attribution(
         source,
         &roots,
@@ -910,6 +1405,18 @@ fn sync_source(
         }
     };
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+    // Publish the manifest from the index this scan just advanced, before any
+    // upload outcome is known. It is the machine's own entity denominator, so
+    // it must not wait on acceptance: a machine mid-backfill is exactly when the
+    // server needs to see that its entity set is behind. The window travels with
+    // it because the index only holds what the window discovers — the historical
+    // bootstrap below scans from a throwaway index and its older entities are
+    // deliberately outside this count.
+    publish_source_manifest(
+        &upload_destination_namespace,
+        source,
+        index.manifest(source, activity_hint.backfill_window_days),
+    );
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
@@ -1013,6 +1520,7 @@ fn sync_source(
     let mut accepted = 0;
     let upload_result = upload_resumable_batches(
         &scan_result.snapshots,
+        source.api_slug(),
         &mut upload_progress,
         &mut accepted,
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
@@ -1021,6 +1529,10 @@ fn sync_source(
             // history and retroactive backfill before the first upload. Relay
             // tokens are intentionally short-lived, so mint them at the network
             // boundary instead of reusing the pre-scan activity-hint token.
+            // Leased, not read: exactly one in-flight batch may claim the
+            // counters, and dropping the lease on any failure below leaves the
+            // losses owed instead of stranded.
+            let client_report = crate::client_report::lease();
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: source.api_slug().to_string(),
@@ -1028,6 +1540,7 @@ fn sync_source(
                 collector_version: Some(collector_version()),
                 snapshots,
                 upload_policy,
+                client_report: client_report.report().clone(),
             };
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -1035,12 +1548,17 @@ fn sync_source(
                 }));
             }
             let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            client.upload_batch(&upload_relay_token, &request)
+            let response = client.upload_batch(&upload_relay_token, &request)?;
+            // Clear only what this accepted request carried. A failed upload
+            // leaves the counters in place so the losses are reported on the
+            // next batch instead of vanishing with the request that died.
+            client_report.commit();
+            Ok(response)
         },
         |progress| progress.save(&upload_progress_path),
     )
     .and_then(|result| {
-        if result == ResumableUploadResult::Completed {
+        if matches!(result, ResumableUploadResult::Completed) {
             // A setup/account switch can replace the relay binding while a
             // long historical scan is uploading. Never commit destination A's
             // delivery cursor after the machine has moved to destination B.
@@ -1050,7 +1568,45 @@ fn sync_source(
     });
 
     match upload_result {
-        Ok(ResumableUploadResult::Completed) => {}
+        Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
+        Ok(ResumableUploadResult::Shed { retry_after }) => {
+            let retry_after = note_shed_and_backoff(source, retry_after);
+            defer_source_uploads(source, retry_after);
+            // Commit what the server demonstrably holds. Committing everything
+            // would drop the pages it never received; committing nothing means
+            // the next cycle replays the whole scan, which is today's behaviour
+            // and the reason a shed request produces an identical re-upload every
+            // five minutes forever.
+            let accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
+            let committable = index.committable_subset(&committed_index, &accepted_fingerprints);
+            if let Err(error) = committable.save(&index_path) {
+                eprintln!(
+                    "local snapshot partial scan checkpoint failed for {}: {}",
+                    source.api_slug(),
+                    safe_error(&error)
+                );
+            }
+            report_status_with_fresh_relay_token(
+                client,
+                device,
+                device_secret,
+                source,
+                CollectorStatus {
+                    source,
+                    machine_id,
+                    scan_started_at: &scan_started_at,
+                    counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                    // `server_error` is the closest code the receipt contract
+                    // carries; the loss report is where the shed is named
+                    // precisely.
+                    state: CollectorState::Error {
+                        code: "server_error",
+                        message: "backend shed the snapshot upload; honouring backoff",
+                    },
+                },
+            )?;
+            return Ok(());
+        }
         Ok(ResumableUploadResult::Disabled(disabled_reason)) => {
             report_status_with_fresh_relay_token(
                 client,
@@ -1145,6 +1701,20 @@ fn sync_source(
                     "backend rejected snapshot batch payload validation",
                 )
             } else {
+                // A shed request is not a network failure. 429 is unambiguous in
+                // the redacted diagnostics today; 503 joins it with the typed
+                // `Retry-After` handling, which is where the backoff itself
+                // lives. The collector status code stays `network_error` — that
+                // string is a backend contract, and only the loss category is
+                // being classified here.
+                crate::client_report::record(
+                    if is_shed_failure(&error) {
+                        crate::client_report::ClientReportReason::RatelimitBackoff
+                    } else {
+                        crate::client_report::ClientReportReason::NetworkError
+                    },
+                    1,
+                );
                 (
                     CollectorState::Error {
                         code: "network_error",
@@ -1153,6 +1723,9 @@ fn sync_source(
                     "upload local snapshots",
                 )
             };
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_failure(Instant::now())
+            });
             let _ = report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -1171,6 +1744,15 @@ fn sync_source(
     }
 
     index.save(&index_path)?;
+    // A completed cycle is what moves the tier: uploads keep a source warm, a
+    // quiet cycle lets it fall to idle and then cold. The sweep marker is stamped
+    // on the same event, which is what keeps the 6-hour full sweep independent of
+    // the watcher.
+    with_source_cadence(source, |cadence| {
+        let now = Instant::now();
+        cadence.record_scan_success(now, accepted);
+        cadence.record_full_sweep(now);
+    });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
     // reads for the Companion's "Detected Uses" panel. The scan is incremental,
@@ -1230,6 +1812,15 @@ fn sync_source(
 enum ResumableUploadResult {
     Completed,
     Disabled(Option<String>),
+    /// The backend shed a page. Every earlier page is accepted and
+    /// checkpointed; this is a "come back later", not a failure.
+    ///
+    /// Carries the server's own `Retry-After` verbatim (absent when it sent
+    /// none). Turning that into a wait needs the per-source shed history, which
+    /// the caller owns, not this pass.
+    Shed {
+        retry_after: Option<Duration>,
+    },
 }
 
 #[derive(Debug)]
@@ -1312,6 +1903,13 @@ fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
         })
 }
 
+/// True when the backend shed this request rather than failing it.
+fn is_shed_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
+}
+
 fn is_timeout_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
@@ -1325,6 +1923,7 @@ fn is_timeout_failure(error: &anyhow::Error) -> bool {
 /// so an outage or broad contract mismatch cannot fan out into unbounded calls.
 fn upload_resumable_batches<T, Fingerprint, Upload, Persist>(
     items: &[T],
+    poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     accepted: &mut u64,
     fingerprint: Fingerprint,
@@ -1349,6 +1948,7 @@ where
     progress
         .accepted_fingerprints
         .retain(|value| current_fingerprints.contains(value));
+    retain_counted_poison_fingerprints(poison_scope, &current_fingerprints);
     if progress.accepted_fingerprints.len() != progress_len_before_prune {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
@@ -1436,9 +2036,29 @@ where
                 // every valid sibling is accepted and checkpointed exactly
                 // once. The caller still reports the cycle as failed and does
                 // not commit the final scan index.
+                for index in &indices {
+                    record_poison_loss_once(poison_scope, fingerprint(&items[*index]));
+                }
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
+            }
+            Err(error) if error.downcast_ref::<UploadShed>().is_some() => {
+                let shed = error
+                    .downcast_ref::<UploadShed>()
+                    .copied()
+                    .expect("shed diagnostics");
+                crate::client_report::record(
+                    crate::client_report::ClientReportReason::RatelimitBackoff,
+                    1,
+                );
+                // Stop the pass here rather than hammering the remaining pages
+                // at a server that just asked for room. Everything accepted so
+                // far is already checkpointed, so the retry resumes instead of
+                // restarting.
+                return Ok(ResumableUploadResult::Shed {
+                    retry_after: shed.retry_after,
+                });
             }
             Err(error) => return Err(error),
         }
@@ -1519,6 +2139,7 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 fn report_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let finished_at = current_rfc3339();
@@ -1553,10 +2174,12 @@ fn report_status(
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
         last_scan_cap_hit: status.counts.scan_cap_hit,
+        last_semantic_noop_count: status.counts.semantic_noop_count,
         consecutive_failures,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
+        manifest: cached_source_manifest(destination_namespace, status.source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1570,7 +2193,8 @@ fn report_status_with_fresh_relay_token(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_status(client, &relay_token, status)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_status(client, &relay_token, &destination_namespace, status)
 }
 
 /// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
@@ -1582,6 +2206,7 @@ fn report_status_with_fresh_relay_token(
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
@@ -1605,10 +2230,16 @@ fn report_checkin_status(
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
         last_scan_cap_hit: false,
+        last_semantic_noop_count: 0,
         consecutive_failures: 0,
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(source.parser_version().to_string()),
+        // The liveness-only shape carries the manifest deliberately: it is the
+        // cheapest cadence the server gets it on, and a check-in that says
+        // "alive" while the entity sets disagree is exactly the state the
+        // manifest exists to expose.
+        manifest: cached_source_manifest(destination_namespace, source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1623,7 +2254,15 @@ fn report_checkin_status_with_fresh_relay_token(
     scan_started_at: Option<&str>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_checkin_status(client, &relay_token, source, machine_id, scan_started_at)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_checkin_status(
+        client,
+        &relay_token,
+        &destination_namespace,
+        source,
+        machine_id,
+        scan_started_at,
+    )
 }
 
 /// Spawn the periodic non-terminal collector check-in heartbeat.
@@ -1637,15 +2276,19 @@ fn report_checkin_status_with_fresh_relay_token(
 /// so the server-received check-in stays comfortably inside that promise even
 /// during a multi-hour backlog drain.
 pub fn spawn_collector_checkin_heartbeat() -> Result<()> {
+    let phase_offset = local_cadence_phase_offset(COLLECTOR_CHECKIN_INTERVAL);
     std::thread::Builder::new()
         .name("ottto-collector-checkin".to_string())
-        .spawn(move || loop {
-            if let Err(error) = collector_checkin_once() {
-                if !collector_checkin_can_wait_quietly(&error) {
-                    eprintln!("collector check-in skipped: {}", safe_error(&error));
+        .spawn(move || {
+            std::thread::sleep(phase_offset);
+            loop {
+                if let Err(error) = collector_checkin_once() {
+                    if !collector_checkin_can_wait_quietly(&error) {
+                        eprintln!("collector check-in skipped: {}", safe_error(&error));
+                    }
                 }
+                std::thread::sleep(COLLECTOR_CHECKIN_INTERVAL);
             }
-            std::thread::sleep(COLLECTOR_CHECKIN_INTERVAL);
         })
         .context("spawn collector check-in heartbeat")?;
     Ok(())
@@ -1990,6 +2633,17 @@ mod tests {
         (0..count).map(|index| format!("{index:064x}")).collect()
     }
 
+    static TEST_POISON_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A unique poison-ledger scope per call, so tests that run in parallel
+    /// cannot prune each other's ledgers.
+    fn unique_poison_scope() -> String {
+        format!(
+            "test-scope-{}",
+            TEST_POISON_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
     fn test_upload_progress() -> SnapshotUploadProgress {
         SnapshotUploadProgress::new(format!("{:064x}", 99))
     }
@@ -2006,6 +2660,7 @@ mod tests {
 
     #[test]
     fn snapshot_upload_batches_bound_reconciliation_work() {
+        let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(45);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
@@ -2013,6 +2668,7 @@ mod tests {
 
         let result = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2032,13 +2688,490 @@ mod tests {
     }
 
     #[test]
+    #[serial(client_report)]
+    fn poisoned_items_are_counted_for_the_client_report() {
+        let poison_scope = &unique_poison_scope();
+        use crate::client_report::{reset_for_test, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(3);
+        let poison = items[1].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            move |batch| {
+                if batch.contains(&poison) {
+                    return Err(anyhow::Error::new(BatchRejected {
+                        status: 422,
+                        body_excerpt: Some(
+                            r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                        ),
+                    }));
+                }
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("a poison item still fails the cycle");
+
+        assert!(is_item_specific_validation_failure(&error));
+        // One item was lost and it is reported as exactly one item, so the
+        // server can tell this apart from an empty scan.
+        assert_eq!(
+            crate::client_report::observe().quantity(ClientReportReason::Poisoned),
+            1
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn a_permanently_poisoned_item_is_counted_once_not_once_per_cycle() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+        let poison_scope = &unique_poison_scope();
+        reset_for_test();
+        let items = test_fingerprints(1);
+        let poison = items[0].clone();
+        let upload = |batch: Vec<String>| {
+            assert!(batch.contains(&poison));
+            Err(anyhow::Error::new(BatchRejected {
+                status: 422,
+                body_excerpt: Some(
+                    r#"{"errors":[{"loc":["body","snapshots",0,"field"]}]}"#.to_string(),
+                ),
+            }))
+        };
+
+        // Three cycles over the same permanently invalid entity. Nothing ever
+        // succeeds, so nothing ever commits the report; if each attempt counted,
+        // one broken session would look like a growing stream of losses.
+        for _ in 0..3 {
+            let mut progress = test_upload_progress();
+            let mut accepted = 0;
+            upload_resumable_batches(
+                &items,
+                poison_scope,
+                &mut progress,
+                &mut accepted,
+                String::as_str,
+                upload,
+                |_| Ok(()),
+            )
+            .expect_err("a poison item fails the cycle");
+        }
+
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
+
+        // A later scan that no longer carries the entity prunes the ledger, so
+        // it stays bounded by the current scan rather than by all history.
+        let other_items = test_fingerprints(2)[1..].to_vec();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        upload_resumable_batches(
+            &other_items,
+            poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| Ok(accepted_batch(batch.len())),
+            |_| Ok(()),
+        )
+        .expect("valid scan succeeds");
+        assert!(counted_poison_fingerprints_for_test(poison_scope).is_empty());
+        reset_for_test();
+    }
+
+    #[test]
+    fn a_shed_upload_is_counted_as_backoff_not_as_a_network_error() {
+        let shed = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_429",
+            true,
+            false,
+        ));
+        assert!(is_shed_failure(&shed));
+        let server_error = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "http_5xx",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&server_error));
+        let offline = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert!(!is_shed_failure(&offline));
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn an_unacknowledged_client_report_survives_to_the_next_batch() {
+        use crate::client_report::{lease, observe, record, reset_for_test, ClientReportReason};
+        reset_for_test();
+        record(ClientReportReason::NetworkError, 2);
+        {
+            // The upload died: the lease drops unacknowledged, so the losses stay
+            // owed rather than vanishing with the request.
+            let reported = lease();
+            assert_eq!(
+                reported.report().quantity(ClientReportReason::NetworkError),
+                2
+            );
+        }
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 2);
+
+        // The retry carries them and is acknowledged.
+        lease().commit();
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 0);
+        reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
+        let poison_scope = &unique_poison_scope();
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+        reset_for_test();
+        let items = test_fingerprints(45);
+        let first_page = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut attempts = 0usize;
+
+        let result = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                attempts += 1;
+                if batch == first_page {
+                    Ok(accepted_batch(batch.len()))
+                } else {
+                    Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(60)),
+                    }))
+                }
+            },
+            |_| Ok(()),
+        )
+        .expect("a shed page is not a cycle failure");
+
+        // The shed page stops the pass instead of driving the remaining pages at
+        // a server that just asked for room.
+        assert_eq!(attempts, 2);
+        assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
+        assert_eq!(progress.accepted_fingerprints.len(), SNAPSHOT_BATCH_LIMIT);
+        match result {
+            ResumableUploadResult::Shed { retry_after } => {
+                // The pass reports the server's own number; turning it into a
+                // wait belongs to the caller, which owns the shed history.
+                assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                let honoured = note_shed_and_backoff(SnapshotSource::Pi, retry_after);
+                // Retry-After x uniform(1.0, 1.2): never before the server's 60s,
+                // never more than 20% late.
+                assert!(honoured >= Duration::from_secs(60));
+                assert!(honoured <= Duration::from_secs(72));
+            }
+            other => panic!("expected a shed result, got {other:?}"),
+        }
+        assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
+        reset_for_test();
+    }
+
+    #[test]
+    fn an_honoured_retry_after_is_never_shortened_by_jitter() {
+        // Jitter that can fire early is not jitter, it is an early retry against
+        // a server that just said it was not ready.
+        let requested = Duration::from_secs(45);
+        for _ in 0..64 {
+            let wait = shed_backoff(Some(requested));
+            assert!(wait >= requested, "{wait:?} is earlier than {requested:?}");
+            assert!(wait <= requested.mul_f64(1.2));
+        }
+        let waits = (0..24)
+            .map(|_| shed_backoff(Some(requested)))
+            .collect::<BTreeSet<_>>();
+        assert!(waits.len() > 1, "a constant wait re-synchronises the fleet");
+
+        // The cap survives the upper jitter.
+        assert_eq!(
+            shed_backoff(Some(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER)),
+            crate::snapshot_client::MAX_HONOURED_RETRY_AFTER
+        );
+    }
+
+    #[test]
+    fn a_shed_without_retry_after_uses_full_jitter_not_a_fixed_wait() {
+        // Full jitter means random(0, ceiling): the point is that two machines
+        // shed at the same instant do not come back at the same instant.
+        let waits = (0..24).map(|_| shed_backoff(None)).collect::<BTreeSet<_>>();
+        assert!(
+            waits.len() > 1,
+            "a constant backoff re-synchronises the fleet it is meant to spread"
+        );
+        assert!(waits.iter().all(|wait| *wait <= SHED_BACKOFF_BASE));
+
+        // The ladder is exponential in its ceiling and capped.
+        assert!(full_jitter_backoff(0) <= SHED_BACKOFF_BASE);
+        assert!(full_jitter_backoff(3) <= SHED_BACKOFF_BASE * 8);
+        assert!(
+            full_jitter_backoff(30) <= crate::snapshot_client::MAX_HONOURED_RETRY_AFTER,
+            "the ladder must saturate, not overflow"
+        );
+    }
+
+    #[test]
+    #[serial(source_upload_deadlines)]
+    fn a_sustained_shed_climbs_the_ladder_and_a_success_resets_it() {
+        clear_source_upload_deadlines_for_test();
+        // A shed with no Retry-After must back off further each time. Without a
+        // streak every shed draws from random(0, 30s), which the five-minute cycle
+        // has already outlived by the next tick — no backoff at all under
+        // sustained overload.
+        let mut ceilings = Vec::new();
+        for expected_attempt in 0..4 {
+            assert_eq!(
+                shed_streak_for_test(SnapshotSource::Codex),
+                expected_attempt
+            );
+            let wait = note_shed_and_backoff(SnapshotSource::Codex, None);
+            ceilings.push(wait);
+        }
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 4);
+        // Full jitter means any single draw can be small, so the property to
+        // assert is the ceiling, not the sample: the fourth rung may exceed the
+        // first rung's ceiling, and the first never can.
+        assert!(ceilings[0] <= SHED_BACKOFF_BASE);
+        assert!(ceilings[3] <= SHED_BACKOFF_BASE * 8);
+
+        // A server-named wait wins over the local ladder and still counts the shed.
+        let named = note_shed_and_backoff(SnapshotSource::Codex, Some(Duration::from_secs(120)));
+        assert!(named >= Duration::from_secs(120));
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 5);
+
+        // A completed upload clears it: the next shed starts at the first rung.
+        clear_shed_streak(SnapshotSource::Codex);
+        assert_eq!(shed_streak_for_test(SnapshotSource::Codex), 0);
+        // The streak is per source, like the deadline.
+        assert_eq!(shed_streak_for_test(SnapshotSource::ClaudeCode), 0);
+        clear_source_upload_deadlines_for_test();
+    }
+
+    #[test]
+    #[serial(source_upload_deadlines)]
+    fn an_honoured_backoff_defers_the_source_until_it_expires() {
+        clear_source_upload_deadlines_for_test();
+        assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
+
+        defer_source_uploads(SnapshotSource::Codex, Duration::from_secs(60));
+        let remaining =
+            source_upload_backoff_remaining(SnapshotSource::Codex).expect("codex is deferred");
+        assert!(remaining <= Duration::from_secs(60));
+        // The backoff is per source: one shed source must not silence the others.
+        assert!(source_upload_backoff_remaining(SnapshotSource::ClaudeCode).is_none());
+
+        // An expired deadline clears itself rather than deferring forever.
+        defer_source_uploads(SnapshotSource::Codex, Duration::ZERO);
+        assert!(source_upload_backoff_remaining(SnapshotSource::Codex).is_none());
+        clear_source_upload_deadlines_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn the_negotiated_cadence_respects_the_floor_the_ceiling_and_the_directive() {
+        clear_cadence_state_for_test();
+        let floor = SNAPSHOT_SYNC_INTERVAL;
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+        cadence.record_scan_success(start, 1);
+
+        // A server directive may only ask for LESS frequent scanning. A directive
+        // shorter than the tier cannot buy a faster scan, or the fleet would be
+        // paying for the server's own load.
+        cadence.set_server_min_interval(Some(Duration::from_secs(1)));
+        assert_eq!(negotiated_wait(&cadence, start), floor);
+        cadence.set_server_min_interval(Some(floor * 2));
+        assert_eq!(negotiated_wait(&cadence, start), floor * 2);
+        // And it cannot silence a source past the ceiling.
+        cadence.set_server_min_interval(Some(Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(negotiated_wait(&cadence, start), MAX_CYCLE_INTERVAL);
+        // The ceiling is stricter than the 6-hour sweep, so a full scan of the
+        // window happens at least every 30 minutes whatever the watcher does.
+        assert!(MAX_CYCLE_INTERVAL < CadenceConfig::cost_first(floor).full_sweep_interval);
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn a_quiet_source_stretches_and_file_activity_brings_it_back_to_the_floor() {
+        clear_cadence_state_for_test();
+        let floor = SNAPSHOT_SYNC_INTERVAL;
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+
+        // Two quiet cycles: the source falls to the idle tier and is scanned less
+        // often. That saving is the entire point of the wiring.
+        cadence.record_scan_success(start, 0);
+        let later = start + Duration::from_secs(20 * 60);
+        cadence.record_scan_success(later, 0);
+        let idle_wait = negotiated_wait(&cadence, later);
+        assert!(idle_wait > floor);
+        assert!(idle_wait <= MAX_CYCLE_INTERVAL);
+
+        // A filesystem event promotes the tier back to the floor — and only to the
+        // floor. Fifty events in a second cannot buy fifty scans.
+        for offset in 0..50 {
+            cadence.record_file_event(later + Duration::from_secs(offset));
+        }
+        assert_eq!(negotiated_wait(&cadence, later), floor);
+        assert!(negotiated_wait(&cadence, later + Duration::from_secs(1)) > Duration::ZERO);
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn a_server_scan_directive_is_read_bounded_and_cannot_starve_the_scan() {
+        clear_cadence_state_for_test();
+        let wait_for = |source, now| {
+            with_source_cadence(source, |cadence| negotiated_wait(cadence, now)).expect("cadence")
+        };
+
+        // A directive in the past is "no minimum", not a negative wait.
+        record_server_scan_directive(SnapshotSource::Codex, "2020-01-01T00:00:00Z");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, Instant::now()),
+            Duration::ZERO
+        );
+
+        // A far-future directive is bounded by the ceiling: a server cannot
+        // silence a source for a day.
+        let scanned_at = Instant::now();
+        with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.record_scan_success(scanned_at, 1)
+        });
+        record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
+        );
+
+        // An unparsable directive leaves the previous one alone rather than
+        // inventing a value.
+        record_server_scan_directive(SnapshotSource::Codex, "soon");
+        assert_eq!(
+            wait_for(SnapshotSource::Codex, scanned_at),
+            MAX_CYCLE_INTERVAL
+        );
+
+        // The starvation case: re-reading a directive on every cycle must not push
+        // its own deadline forward. Anchored to the last scan, the wait strictly
+        // decreases as time passes — otherwise the scan would never run again, on a
+        // machine where nothing looks wrong.
+        let mut previous = MAX_CYCLE_INTERVAL + Duration::from_secs(1);
+        for elapsed in [0u64, 60, 600] {
+            record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+            let wait = wait_for(
+                SnapshotSource::Codex,
+                scanned_at + Duration::from_secs(elapsed),
+            );
+            assert!(
+                wait < previous,
+                "a refreshed directive must never extend its own deadline"
+            );
+            previous = wait;
+        }
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    #[serial(source_cadences)]
+    fn the_cadence_tier_never_reaches_the_wire_or_any_identity() {
+        clear_cadence_state_for_test();
+        // The cadence tier and the scan trigger are implementation state. If either
+        // entered an identity, every session on a machine would re-mint its content
+        // hash the moment the machine went idle.
+        with_source_cadence(SnapshotSource::Codex, |cadence| {
+            cadence.record_file_event(Instant::now())
+        });
+        record_server_scan_directive(SnapshotSource::Codex, "2099-01-01T00:00:00Z");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in while a tier is hot");
+        let requests = captured.lock().expect("captured requests").clone();
+        for forbidden in [
+            "cadence",
+            "scan_trigger",
+            "recommended_scan_after",
+            "\"hot\"",
+            "\"idle\"",
+            "\"cold\"",
+        ] {
+            assert!(
+                !requests[1].contains(forbidden),
+                "{forbidden} must not travel on a receipt"
+            );
+        }
+        clear_cadence_state_for_test();
+    }
+
+    #[test]
+    fn the_cadence_phase_offset_is_stable_per_machine_and_inside_the_interval() {
+        let interval = Duration::from_secs(5 * 60);
+        let first = cadence_phase_offset("otm_aaaa", interval);
+        assert_eq!(first, cadence_phase_offset("otm_aaaa", interval));
+        assert!(first < interval);
+        let offsets = ["otm_a", "otm_b", "otm_c", "otm_d", "otm_e", "otm_f"]
+            .into_iter()
+            .map(|id| cadence_phase_offset(id, interval))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            offsets.len() > 1,
+            "the offset must actually spread machines apart"
+        );
+        assert_eq!(
+            cadence_phase_offset("otm_a", Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn checkpoint_persist_failure_is_local_state_not_transport() {
+        let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(1);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
 
         let error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2058,12 +3191,14 @@ mod tests {
 
     #[test]
     fn accepted_count_mismatch_is_backend_response_not_transport() {
+        let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(1);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
 
         let error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2082,6 +3217,7 @@ mod tests {
 
     #[test]
     fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
+        let poison_scope = &unique_poison_scope();
         let root = test_dir("snapshot-upload-resume-timeout");
         let path = root.join("codex-scan-index-attribution-test-upload-progress.json");
         let items = test_fingerprints(45);
@@ -2091,6 +3227,7 @@ mod tests {
 
         let first_error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2121,6 +3258,7 @@ mod tests {
         let mut resumed_items = Vec::new();
         let result = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut resumed,
             &mut resumed_accepted,
             String::as_str,
@@ -2142,7 +3280,11 @@ mod tests {
     }
 
     #[test]
+    // Records client-report poison losses into process-global counters,
+    // so it shares the serial group with the tests that assert on them.
+    #[serial(client_report)]
     fn item_specific_422_isolates_poison_and_checkpoints_valid_siblings() {
+        let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(25);
         let poison = items[19].clone();
         let mut progress = test_upload_progress();
@@ -2152,6 +3294,7 @@ mod tests {
 
         let error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2189,6 +3332,7 @@ mod tests {
         let mut retry_attempts = Vec::new();
         let retry_error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut retry_accepted,
             String::as_str,
@@ -2212,7 +3356,11 @@ mod tests {
     }
 
     #[test]
+    // Records client-report poison losses into process-global counters,
+    // so it shares the serial group with the tests that assert on them.
+    #[serial(client_report)]
     fn broad_item_validation_failure_caps_adaptive_requests() {
+        let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(45);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
@@ -2220,6 +3368,7 @@ mod tests {
 
         let error = upload_resumable_batches(
             &items,
+            poison_scope,
             &mut progress,
             &mut accepted,
             String::as_str,
@@ -2247,7 +3396,11 @@ mod tests {
     }
 
     #[test]
+    // Records client-report poison losses into process-global counters,
+    // so it shares the serial group with the tests that assert on them.
+    #[serial(client_report)]
     fn permanent_poison_prunes_old_revisions_from_progress() {
+        let poison_scope = &unique_poison_scope();
         let poison = format!("{:064x}", 9000);
         let mut progress = test_upload_progress();
 
@@ -2257,6 +3410,7 @@ mod tests {
             let mut accepted = 0;
             let error = upload_resumable_batches(
                 &items,
+                poison_scope,
                 &mut progress,
                 &mut accepted,
                 String::as_str,
@@ -3001,6 +4155,127 @@ mod tests {
         assert!(requests[1].contains("\"last_scan_finished_at\":null"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
+        clear_source_manifests_for_test();
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let destination_namespace =
+            &snapshot_upload_destination_namespace(&device, "device-secret");
+
+        // Before any scan completes the manifest is absent, not zeroed: a
+        // fabricated `entity_count: 0` would read as "this machine has nothing",
+        // which is a different and wrong statement.
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in before any scan");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+
+        let mut index =
+            ScanIndex::load(Path::new("/nonexistent/scan-index.json")).expect("empty scan index");
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("session-1".to_string(), "a".repeat(64));
+        let manifest = index.manifest(SnapshotSource::Codex, 183);
+        publish_source_manifest(
+            destination_namespace,
+            SnapshotSource::Codex,
+            manifest.clone(),
+        );
+
+        for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+            report_checkin_status_with_fresh_relay_token(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                scan_started_at,
+            )
+            .expect("report check-in after a scan");
+            let requests = captured.lock().expect("captured requests").clone();
+            assert!(requests[1].contains("\"entity_count\":1"));
+            assert!(
+                requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash))
+            );
+            // The scope and window travel with the count. Without them a
+            // consumer would compare this against its whole stored set and
+            // report a mismatch for every session the historical bootstrap
+            // uploaded from outside the scan window.
+            assert!(requests[1].contains("\"scope\":\"live_scan_window\""));
+            assert!(requests[1].contains("\"window_days\":183"));
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let mut counts = SyncCounts::for_policy(30);
+        counts.semantic_noop_count = 718;
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Codex,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report terminal status");
+        let requests = captured.lock().expect("captured requests").clone();
+        // The suppression count is the difference between "nothing changed" and
+        // "the collector dropped what changed".
+        assert!(requests[1].contains("\"last_semantic_noop_count\":718"));
+        assert!(requests[1].contains("\"entity_count\":1"));
+
+        // An account switch replaces the relay binding without restarting the
+        // daemon. The new destination must not receive the previous account's
+        // entity count and rolling hash — that is both a false witness and a
+        // disclosure of the previous account's local session set.
+        let switched = LocalDeviceBinding {
+            device_id: "device_switched".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &switched,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in after an account switch");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+        assert!(!requests[1].contains(&manifest.rolling_hash));
+
+        // Publishing for the new destination retires the old one outright.
+        let new_namespace = snapshot_upload_destination_namespace(&switched, "device-secret");
+        publish_source_manifest(&new_namespace, SnapshotSource::Codex, manifest.clone());
+        assert!(cached_source_manifest(destination_namespace, SnapshotSource::Codex).is_none());
+        clear_source_manifests_for_test();
     }
 
     #[test]
