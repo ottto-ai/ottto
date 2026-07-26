@@ -2637,11 +2637,13 @@ fn claude_oauth_retry_after_epoch_seconds(response: &ureq::Response, now: u64) -
         .saturating_add(now)
 }
 
-fn ottto_user_agent() -> String {
+pub(crate) fn ottto_user_agent() -> String {
     // Honest identification: Ottto reads the user's own aggregate usage and
     // says so. Never present a claude-* client identity from an
     // Ottto-originated request (recorded provider-endpoints posture,
-    // 2026-07-26). compiled_release_version(), not CARGO_PKG_VERSION: the
+    // 2026-07-26). Shared by every Ottto-originated provider read, so one
+    // identity change moves them all together.
+    // compiled_release_version(), not CARGO_PKG_VERSION: the
     // crate manifest carries the 0.1.0 placeholder and real release versions
     // are injected via OTTTO_RELEASE_VERSION at package time.
     format!(

@@ -233,6 +233,47 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
+/// The provider-daily-reference ingest route refused the principal or the
+/// build. Kept typed and distinct from a contract rejection because
+/// "this collector version is not admitted yet" is the expected steady state
+/// until a reviewed server change admits a shipped build - it must not read as
+/// a provider fault or count against any circuit breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderDailyReferenceUploadRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderDailyReferenceUploadRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend refused provider daily reference upload: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for ProviderDailyReferenceUploadRejected {}
+
+/// The provider-daily-reference ingest route rejected the batch as shaped. A
+/// `409` specifically means the declared consent epoch is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderDailyReferenceContractRejected {
+    pub status: u16,
+}
+
+impl std::fmt::Display for ProviderDailyReferenceContractRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend rejected provider daily reference contract: HTTP {}",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for ProviderDailyReferenceContractRejected {}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CloudSessionHeartbeatAckV1 {
@@ -1206,6 +1247,61 @@ impl SnapshotApiClient {
                 }))
             }
             Err(error) => Err(anyhow!("upload local health projection failed: {error}")),
+        }
+    }
+
+    /// Upload one bounded batch of provider-reported day aggregates.
+    ///
+    /// Relay-device authentication only: the route refuses an ordinary ingest
+    /// API key, and the declared `installation_id` must be this device. The
+    /// same one-shot deadline agent as the other credential-bearing calls is
+    /// used so a blocked resolver cannot outlive the caller's budget and so a
+    /// redirect can never replay the bearer token.
+    pub fn upload_provider_daily_reference_batch_with_timeout(
+        &self,
+        relay_token: &str,
+        request: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
+        let url = self.api_url("/api/v1/provider-daily-reference/batches");
+        match agent
+            .post(&url)
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(request)
+        {
+            Ok(response) => require_cloud_session_success(
+                response,
+                "provider daily reference upload",
+                "provider_daily_reference_batch",
+            )?
+            .into_json()
+            .map_err(|error| anyhow!("parse provider daily reference response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(ProviderDailyReferenceUploadRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
+                Err(anyhow::Error::new(ProviderDailyReferenceContractRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                Err(anyhow::Error::new(UploadFailureDiagnostics::http(
+                    "provider daily reference upload",
+                    "provider_daily_reference_batch",
+                    code,
+                    &response,
+                )))
+            }
+            Err(error) => Err(anyhow::Error::new(UploadFailureDiagnostics::transport(
+                "provider daily reference upload",
+                "provider_daily_reference_batch",
+                &error,
+            ))),
         }
     }
 
