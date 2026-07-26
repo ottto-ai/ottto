@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 270,
-  "content_sha256": "37e821185d858b90af33b140dd43be0f7c5cefdc7856f236b63c5856ef9605c1",
+  "content_sha256": "d724123b5141459a18de7d62b805d03fc4c02a8b4015b7da619dbb66f04db14c",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "b60132d804c100fdfafddb16f80464abe264e4254d2a86b3b17f7fd127ed4018",
-      "size_bytes": 319932
+      "sha256": "aa26942757e70dc863f47307b5d3288f476fbf18f58de2ef94d33c6133a76297",
+      "size_bytes": 320129
     },
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-26-honest-user-agent.md",
-      "sha256": "2f17746d4a01ccffac66edfb69994e378a177a2eba98b47668c2b969c7f1f4f5",
-      "size_bytes": 1250
+      "sha256": "d1339613550d12731c0c6937591036c5be601fc6a250a647dbc9f3d88cfaf096",
+      "size_bytes": 1384
     },
     {
       "executable": false,
@@ -1893,7 +1893,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-26T18:54:00+00:00",
+  "generated_at": "2026-07-26T19:02:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 271,
   "public_roots": [
@@ -1929,5 +1929,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "135591fa91c65d3da77700942653edc6950c53e0"
+  "source_commit": "93eab58144b81e0cff6b99b9f02f302521f85a8e"
 }

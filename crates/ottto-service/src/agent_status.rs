@@ -2222,10 +2222,12 @@ fn ottto_user_agent() -> String {
     // Honest identification: Ottto reads the user's own aggregate usage and
     // says so. Never present a claude-* client identity from an
     // Ottto-originated request (recorded provider-endpoints posture,
-    // 2026-07-26).
+    // 2026-07-26). compiled_release_version(), not CARGO_PKG_VERSION: the
+    // crate manifest carries the 0.1.0 placeholder and real release versions
+    // are injected via OTTTO_RELEASE_VERSION at package time.
     format!(
         "ottto/{} (subscription-usage-reader; +https://ottto.net)",
-        env!("CARGO_PKG_VERSION")
+        compiled_release_version()
     )
 }
 

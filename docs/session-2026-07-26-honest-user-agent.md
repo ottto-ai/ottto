@@ -14,8 +14,10 @@ is: be trivially identifiable and trivially benign - never spoof.
 The call now sends
 `ottto/<daemon-version> (subscription-usage-reader; +https://ottto.net)`.
 `claude_code_user_agent(version)` became `ottto_user_agent()` (daemon version
-via `CARGO_PKG_VERSION`), and `collect_claude_oauth_usage` dropped its now
-unused `version` parameter. A unit test pins the posture: the UA must start
+via `compiled_release_version()` - the crate manifest is a 0.1.0 placeholder
+and real release versions arrive through `OTTTO_RELEASE_VERSION` at package
+time), and `collect_claude_oauth_usage` dropped its now unused `version`
+parameter. A unit test pins the posture: the UA must start
 with `ottto/` and must never contain `claude`.
 
 Deliberately unchanged: the Claude Desktop cookie collector's browser UA
