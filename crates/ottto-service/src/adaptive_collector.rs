@@ -32,6 +32,33 @@ impl Default for CadenceConfig {
     }
 }
 
+impl CadenceConfig {
+    /// The cost-first tiers, which is the posture the snapshot sync loop uses.
+    ///
+    /// The difference from [`CadenceConfig::default`] is the point of the whole
+    /// exercise: the **idle and cold tiers are the win** (a machine nobody is
+    /// coding on today gets scanned every 30 minutes instead of every 5), while
+    /// the hot 10-second freshness tier is deliberately NOT enabled. Freshness is
+    /// already inside the product promise at the five-minute floor, and a
+    /// ten-second tier multiplies request volume against a server whose accept
+    /// path is the thing being redesigned.
+    ///
+    /// `hot_min_interval` and `warm_interval` are therefore both pinned to
+    /// `floor`, so file activity restores the existing cadence and never beats it.
+    /// The floor is a hard guarantee, not a default: it is what makes a 2-second
+    /// filesystem debounce incapable of producing a per-event upload.
+    pub fn cost_first(floor: Duration) -> Self {
+        let default = Self::default();
+        Self {
+            hot_min_interval: floor,
+            warm_interval: floor,
+            idle_interval: default.idle_interval.max(floor),
+            cold_interval: default.cold_interval.max(floor),
+            ..default
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SourceCadence {
     config: CadenceConfig,
@@ -184,6 +211,55 @@ fn remaining_after(interval: Duration, elapsed: Option<Duration>) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_first_disables_the_hot_tier_and_keeps_the_cheap_ones() {
+        let floor = Duration::from_secs(5 * 60);
+        let config = CadenceConfig::cost_first(floor);
+        // No tier may ever ask for a cycle more often than the floor.
+        assert_eq!(config.hot_min_interval, floor);
+        assert_eq!(config.warm_interval, floor);
+        assert!(config.idle_interval >= floor);
+        assert!(config.cold_interval >= floor);
+        // The cheap tiers are where the saving is, so they must stay LONGER than
+        // the floor or this buys nothing.
+        assert!(config.idle_interval > floor);
+        assert!(config.cold_interval > config.idle_interval);
+        // The sweep is untouched by the cost posture.
+        assert_eq!(
+            config.full_sweep_interval,
+            CadenceConfig::default().full_sweep_interval
+        );
+    }
+
+    #[test]
+    fn cost_first_file_activity_restores_the_floor_and_never_beats_it() {
+        let floor = Duration::from_secs(5 * 60);
+        let start = Instant::now();
+        let mut cadence = SourceCadence::new(CadenceConfig::cost_first(floor));
+
+        // An inactive source falls to the cheap tiers.
+        let quiet = start + Duration::from_secs(20 * 60);
+        cadence.record_scan_success(start, 0);
+        cadence.record_scan_success(quiet, 0);
+        assert_eq!(cadence.state(), LocalCollectorState::Idle);
+        assert_eq!(
+            cadence.next_scan_after(quiet),
+            CadenceConfig::cost_first(floor).idle_interval
+        );
+
+        // A burst of filesystem events makes it hot — and hot still means the
+        // floor, so no debounce can turn a busy transcript into per-event uploads.
+        for offset in 0..50 {
+            cadence.record_file_event(quiet + Duration::from_secs(offset));
+        }
+        assert_eq!(cadence.state(), LocalCollectorState::Hot);
+        assert_eq!(
+            cadence.next_scan_after(quiet + Duration::from_secs(60)),
+            floor - Duration::from_secs(60),
+            "a hot source is due at the floor, not before it"
+        );
+    }
 
     #[test]
     fn file_events_make_source_hot_then_success_warms_it() {
