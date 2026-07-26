@@ -867,8 +867,19 @@ fn run_claude_code_statusline(json: bool) -> i32 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    match ingest_claude_statusline_payload(&ottto_core::default_support_dir(), &input, observed_at)
-    {
+    // Stamp the account the local Claude Code credential names right now. It is
+    // not proof of whose numbers these are -- any Claude Code surface on the
+    // machine, terminal or the Desktop app's "Code" tab, pipes into this one
+    // wrapper and the payload names no account. It closes the login-switch hole
+    // only; `ottto-service` refuses to serve a sample when a second Claude
+    // account is observable.
+    let observed_under_account_identifier_hash = ottto_core::claude_cli_account_identifier_hash();
+    match ingest_claude_statusline_payload(
+        &ottto_core::default_support_dir(),
+        &input,
+        observed_at,
+        &observed_under_account_identifier_hash,
+    ) {
         Ok(result) => {
             if json {
                 println!(
