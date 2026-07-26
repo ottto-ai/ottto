@@ -235,18 +235,23 @@ fn uniform_duration(span: Duration) -> Duration {
 
 /// The wait after a shed request.
 ///
-/// With a server-supplied `Retry-After`, honour it multiplied by `uniform(0.8,
-/// 1.2)`: the whole fleet was told the same number, and obeying it exactly
-/// re-synchronises every machine onto the same instant — which is how a shed
-/// turns into a thundering herd. Without one, full jitter over an exponential
-/// ladder, which is the form that actually decorrelates retries (`random(0,
-/// min(cap, base·2^n))`), not the "exponential plus a little noise" form.
+/// With a server-supplied `Retry-After`, wait `Retry-After × uniform(1.0, 1.2)`.
+/// The jitter is one-sided on purpose: the whole fleet was told the same number,
+/// so obeying it exactly re-synchronises every machine onto the same instant —
+/// which is how a shed becomes a thundering herd — but jittering *below* it
+/// returns before the server said it would be ready, which is the overload the
+/// shed was protecting against. Never early, sometimes late.
+///
+/// Without a `Retry-After`, full jitter over an exponential ladder: `random(0,
+/// min(cap, base·2^n))`, which is the form that actually decorrelates retries,
+/// not the "exponential plus a little noise" form.
+///
+/// The result is capped like a parsed `Retry-After` is, so the upper jitter
+/// cannot push a wait past the longest silence the freshness promise tolerates.
 fn shed_backoff(retry_after: Option<Duration>) -> Duration {
     match retry_after {
-        Some(retry_after) => {
-            let span = retry_after.mul_f64(0.4);
-            retry_after.mul_f64(0.8) + uniform_duration(span)
-        }
+        Some(retry_after) => (retry_after + uniform_duration(retry_after.mul_f64(0.2)))
+            .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER),
         None => full_jitter_backoff(0),
     }
 }
@@ -2589,7 +2594,7 @@ mod tests {
     #[serial(client_report)]
     fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
         let poison_scope = &unique_poison_scope();
-        use crate::client_report::{reset_for_test, take, ClientReportReason};
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
         reset_for_test();
         let items = test_fingerprints(45);
         let first_page = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
@@ -2625,14 +2630,37 @@ mod tests {
         assert_eq!(progress.accepted_fingerprints.len(), SNAPSHOT_BATCH_LIMIT);
         match result {
             ResumableUploadResult::Shed { retry_after } => {
-                // Retry-After x uniform(0.8, 1.2) around the server's 60s.
-                assert!(retry_after >= Duration::from_secs(48));
+                // Retry-After x uniform(1.0, 1.2): never before the server's 60s,
+                // never more than 20% late.
+                assert!(retry_after >= Duration::from_secs(60));
                 assert!(retry_after <= Duration::from_secs(72));
             }
             other => panic!("expected a shed result, got {other:?}"),
         }
-        assert_eq!(take().quantity(ClientReportReason::RatelimitBackoff), 1);
+        assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
         reset_for_test();
+    }
+
+    #[test]
+    fn an_honoured_retry_after_is_never_shortened_by_jitter() {
+        // Jitter that can fire early is not jitter, it is an early retry against
+        // a server that just said it was not ready.
+        let requested = Duration::from_secs(45);
+        for _ in 0..64 {
+            let wait = shed_backoff(Some(requested));
+            assert!(wait >= requested, "{wait:?} is earlier than {requested:?}");
+            assert!(wait <= requested.mul_f64(1.2));
+        }
+        let waits = (0..24)
+            .map(|_| shed_backoff(Some(requested)))
+            .collect::<BTreeSet<_>>();
+        assert!(waits.len() > 1, "a constant wait re-synchronises the fleet");
+
+        // The cap survives the upper jitter.
+        assert_eq!(
+            shed_backoff(Some(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER)),
+            crate::snapshot_client::MAX_HONOURED_RETRY_AFTER
+        );
     }
 
     #[test]

@@ -32,9 +32,13 @@ the product promises in minutes.
 
 The wait is then jittered:
 
-* **With** a server-supplied value: `Retry-After × uniform(0.8, 1.2)`. The whole
-  fleet was told the same number; obeying it exactly re-synchronises every
-  machine onto the same instant, which is how a shed becomes a thundering herd.
+* **With** a server-supplied value: `Retry-After × uniform(1.0, 1.2)`, capped.
+  The whole fleet was told the same number; obeying it exactly re-synchronises
+  every machine onto the same instant, which is how a shed becomes a thundering
+  herd. The jitter is deliberately one-sided — never early, sometimes late —
+  because returning *before* the server said it would be ready is the overload
+  the shed was protecting against. (The architecture note specifies
+  `uniform(0.8, 1.2)`; the lower half is dropped for that reason.)
 * **Without** one: full jitter over an exponential ladder,
   `random(0, min(cap, base·2ⁿ))` with a 30 s base. Full jitter — not
   "exponential plus a little noise" — is the form that actually decorrelates
