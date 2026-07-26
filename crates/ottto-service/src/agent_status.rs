@@ -2,10 +2,11 @@ use aes::Aes128;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use ottto_core::{
-    compiled_release_version, default_support_dir, read_claude_statusline_cache,
-    read_claude_statusline_context_cache, read_claude_statusline_context_history,
-    ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
-    ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache,
+    billing_identity_hash, claude_account_identifier_hash, compiled_release_version,
+    default_support_dir, read_claude_statusline_cache, read_claude_statusline_context_cache,
+    read_claude_statusline_context_history, ClaudeStatusLineContextWindowCache,
+    ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
+    ClaudeStatusLineRateLimitCache,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -645,6 +646,57 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         "quota_windows",
         "Claude Code rate-limit windows have not been observed from local OAuth usage or statusLine yet.",
     );
+    // Resolved once, before any statusLine read: the statusLine cache is shared
+    // by every Claude Code surface on this machine and names no account, so
+    // serving it needs both the account that owns the credential now and the set
+    // of other Claude accounts that could have written it. Desktop observations
+    // are computed here rather than at their append site further down so the
+    // gate and the snapshot agree and the session buckets are only scanned once.
+    let claude_account_identifier_hash = claude_oauth_account_identifier_hash();
+    let desktop_plan_observations =
+        claude_desktop_plan_observations_from_root(&claude_desktop_root, &snapshot.captured_at);
+    let observable_account_identifier_hashes =
+        claude_account_identifier_hashes_from_observations(&desktop_plan_observations);
+    let apply_statusline_quota =
+        |snapshot: &mut AgentStatusSnapshot, quota_capability: &mut AgentCapabilityGap| -> bool {
+            match collect_claude_statusline_quota_windows(
+                &claude_account_identifier_hash,
+                &observable_account_identifier_hashes,
+            ) {
+                Ok(ClaudeStatusLineQuota::Windows(windows)) if !windows.is_empty() => {
+                    snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+                    snapshot.quota_windows = windows;
+                    *quota_capability = supported_capability(
+                        "quota_windows",
+                        "Collected from Claude Code's local statusLine rate_limits payload.",
+                    );
+                    true
+                }
+                Ok(ClaudeStatusLineQuota::Unattributable(reason)) => {
+                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                    *quota_capability = unsupported_capability("quota_windows", reason.detail());
+                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                        reason.code(),
+                        AgentDiagnosticSeverity::Warning,
+                        reason.detail(),
+                    ));
+                    false
+                }
+                Ok(_) => {
+                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                    false
+                }
+                Err(message) => {
+                    snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+                    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                        "claude_statusline_cache_unavailable",
+                        AgentDiagnosticSeverity::Warning,
+                        message,
+                    ));
+                    false
+                }
+            }
+        };
     match collect_claude_oauth_usage(&version) {
         Ok(usage) if !usage.windows.is_empty() => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
@@ -655,45 +707,18 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 "Collected from Claude Code's local OAuth usage endpoint.",
             );
         }
-        Ok(_) => match collect_claude_statusline_quota_windows() {
-            Ok(windows) if !windows.is_empty() => {
-                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
-                snapshot.quota_windows = windows;
-                quota_capability = supported_capability(
-                    "quota_windows",
-                    "Collected from Claude Code's local statusLine rate_limits payload.",
-                );
-            }
-            Ok(_) => {
-                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-            }
-            Err(message) => {
-                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
-                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
-                    "claude_statusline_cache_unavailable",
-                    AgentDiagnosticSeverity::Warning,
-                    message,
-                ));
-            }
-        },
-        Err(message) => match collect_claude_statusline_quota_windows() {
-            Ok(windows) if !windows.is_empty() => {
-                snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
-                snapshot.quota_windows = windows;
-                quota_capability = supported_capability(
-                    "quota_windows",
-                    "Collected from Claude Code's local statusLine rate_limits payload.",
-                );
-            }
-            Ok(_) | Err(_) => {
-                snapshot.quota_windows = vec![unsupported_quota_window("usage")];
+        Ok(_) => {
+            apply_statusline_quota(&mut snapshot, &mut quota_capability);
+        }
+        Err(message) => {
+            if !apply_statusline_quota(&mut snapshot, &mut quota_capability) {
                 snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                     "claude_oauth_usage_unavailable",
                     AgentDiagnosticSeverity::Warning,
                     message,
                 ));
             }
-        },
+        }
     }
     let mut context_capability = unsupported_capability(
         "active_context",
@@ -774,7 +799,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     }
     append_current_plan_observation(&mut snapshot);
     let desktop_observation_count =
-        append_claude_desktop_plan_observations(&mut snapshot, &claude_desktop_root);
+        append_claude_desktop_plan_observations(&mut snapshot, desktop_plan_observations);
     if desktop_observation_count > 0 {
         if snapshot.status == AgentStatusState::Degraded {
             snapshot.status = AgentStatusState::Available;
@@ -833,12 +858,13 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     snapshot
 }
 
+/// Takes the observations rather than recomputing them: the statusLine
+/// attribution gate above needs the same set, and scanning the Desktop session
+/// buckets twice per status tick would be pure waste.
 fn append_claude_desktop_plan_observations(
     snapshot: &mut AgentStatusSnapshot,
-    desktop_root: &Path,
+    observations: Vec<AgentStatusPlanObservation>,
 ) -> usize {
-    let observations =
-        claude_desktop_plan_observations_from_root(desktop_root, &snapshot.captured_at);
     let count = observations.len();
     snapshot.plan_observations.extend(observations);
     count
@@ -1781,21 +1807,156 @@ fn file_modified_epoch_seconds(path: &Path) -> Option<i64> {
     i64::try_from(duration.as_secs()).ok()
 }
 
-fn collect_claude_statusline_quota_windows() -> Result<Vec<AgentQuotaWindow>, String> {
+/// What the statusLine rate-limit cache can offer the currently-resolved
+/// account. `NotObserved` (nothing usable on disk) and `Unattributable`
+/// (something on disk that is not provably ours) are deliberately distinct:
+/// they read identically on the surface but mean opposite things about whether
+/// collection is working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeStatusLineQuota {
+    Windows(Vec<AgentQuotaWindow>),
+    NotObserved,
+    Unattributable(ClaudeStatusLineUnattributable),
+}
+
+/// Why a cached statusLine sample may not be served as the current account's
+/// quota. Each variant is a distinct thing an operator can act on, so they stay
+/// separate rather than collapsing into "unavailable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeStatusLineUnattributable {
+    /// Written while a different Claude Code credential was signed in -- the
+    /// `/login` switch case, the same defect `ClaudeOAuthUsageCache` fixes.
+    CredentialReplaced,
+    /// A second Claude account is observable on this machine, so no statusLine
+    /// sample can be tied to one of them.
+    MultipleAccounts,
+    /// Nothing on this machine names the account that wrote the sample, or the
+    /// account reading it.
+    AccountUnknown,
+}
+
+impl ClaudeStatusLineUnattributable {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::CredentialReplaced => "claude_statusline_cache_credential_replaced",
+            Self::MultipleAccounts => "claude_statusline_cache_multiple_accounts",
+            Self::AccountUnknown => "claude_statusline_cache_account_unknown",
+        }
+    }
+
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::CredentialReplaced => {
+                "Claude Code statusLine quota is not currently observable for this account: the cached sample was written while a different Claude account was signed in."
+            }
+            Self::MultipleAccounts => {
+                "Claude Code statusLine quota is not currently observable for this account: more than one Claude account is present on this machine, and statusLine samples carry no account identity."
+            }
+            Self::AccountUnknown => {
+                "Claude Code statusLine quota is not currently observable for this account: the local Claude account could not be identified."
+            }
+        }
+    }
+}
+
+/// Read the statusLine rate-limit cache, but only serve it as `account`'s quota
+/// when it can actually be proven to be `account`'s.
+///
+/// `statusLine` is a Claude *Code* mechanism, not a Claude Desktop one. It is
+/// configured once in `~/.claude/settings.json` and invoked by whichever Claude
+/// Code surface renders -- the terminal CLI and the Claude Desktop app's "Code"
+/// tab pipe to the same Ottto wrapper and overwrite the same machine-global
+/// file. The payload names no account. So unlike `ClaudeOAuthUsageCache`, where
+/// the daemon fetched the numbers itself and the writer's account key IS proof,
+/// here the key records only which credential was visible at write time. Taken
+/// alone it would launder a wrong attribution into a confident one: during the
+/// live 2026-07-26 repro the CLI credential was the work Team account both when
+/// the sample was written and when it was read, while the numbers belonged to
+/// the personal Max account rendering in Desktop.
+///
+/// Proof therefore needs both halves:
+///
+/// 1. the sample was written under the credential that owns the machine now, and
+/// 2. no *other* Claude account is observable on the machine at all.
+///
+/// Desktop plan observations already carry `account_identifier_hash` derived
+/// without any decrypt, which is what makes (2) answerable today; the caller
+/// passes them through `claude_account_identifier_hashes_from_observations`.
+/// When either half fails the caller falls through to the typed unsupported
+/// window rather than rendering another account's numbers.
+fn collect_claude_statusline_quota_windows(
+    account_identifier_hash: &str,
+    observable_account_identifier_hashes: &[String],
+) -> Result<ClaudeStatusLineQuota, String> {
     let cache = read_claude_statusline_cache(&default_support_dir())
         .map_err(|_| "Claude Code statusLine cache could not be read safely.".to_string())?;
     let Some(cache) = cache else {
-        return Ok(Vec::new());
+        return Ok(ClaudeStatusLineQuota::NotObserved);
     };
     let now = current_unix_seconds();
     if cache.observed_at_epoch_seconds > now.saturating_add(60)
         || now.saturating_sub(cache.observed_at_epoch_seconds)
             > CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS
     {
-        return Ok(Vec::new());
+        return Ok(ClaudeStatusLineQuota::NotObserved);
+    }
+    if let Some(reason) = claude_statusline_attribution_failure(
+        &cache.observed_under_account_identifier_hash,
+        account_identifier_hash,
+        observable_account_identifier_hashes,
+    ) {
+        // Refusing to attribute is not an error -- the cache is intact, it just
+        // is not ours to serve.
+        return Ok(ClaudeStatusLineQuota::Unattributable(reason));
     }
 
-    Ok(claude_statusline_quota_windows_from_cache(cache, now))
+    Ok(ClaudeStatusLineQuota::Windows(
+        claude_statusline_quota_windows_from_cache(cache, now),
+    ))
+}
+
+/// Every Claude account this machine can show us, as billing identity hashes.
+/// Anything in here other than the signed-in account is another writer of the
+/// shared statusLine cache.
+fn claude_account_identifier_hashes_from_observations(
+    observations: &[AgentStatusPlanObservation],
+) -> Vec<String> {
+    observations
+        .iter()
+        .filter_map(|observation| observation.account_identifier_hash.as_deref())
+        .filter(|hash| !hash.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// `None` when the sample provably belongs to the account that owns the local
+/// Claude Code credential now.
+fn claude_statusline_attribution_failure(
+    observed_under_account_identifier_hash: &str,
+    account_identifier_hash: &str,
+    observable_account_identifier_hashes: &[String],
+) -> Option<ClaudeStatusLineUnattributable> {
+    // An unnamed account cannot be matched against anything. Unlike the OAuth
+    // cache -- where two empty hashes are allowed to match, because there the
+    // daemon fetched the numbers itself and an unidentifiable machine would
+    // otherwise lose every cache hit against a rate-limited endpoint -- there is
+    // no such cost here: statusLine is free to re-observe on the next render.
+    if account_identifier_hash.is_empty() || observed_under_account_identifier_hash.is_empty() {
+        return Some(ClaudeStatusLineUnattributable::AccountUnknown);
+    }
+    if observed_under_account_identifier_hash != account_identifier_hash {
+        return Some(ClaudeStatusLineUnattributable::CredentialReplaced);
+    }
+    // Half two: any other Claude account on this machine can render a Claude
+    // Code surface into the same cache, so its mere presence makes every sample
+    // ambiguous -- including one whose write-time credential matches.
+    let has_other_account = observable_account_identifier_hashes
+        .iter()
+        .any(|hash| hash != account_identifier_hash);
+    if has_other_account {
+        return Some(ClaudeStatusLineUnattributable::MultipleAccounts);
+    }
+    None
 }
 
 fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, String> {
@@ -1994,24 +2155,15 @@ fn claude_oauth_account_identifier_hash() -> String {
 
 fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> String {
     // Same preference order the subscription grouping uses: provider account
-    // id, then organization, then email.
-    account
-        .account_uuid
-        .as_deref()
-        .and_then(|uuid| billing_identity_hash("anthropic", "account", uuid))
-        .or_else(|| {
-            account
-                .organization_uuid
-                .as_deref()
-                .and_then(|uuid| billing_identity_hash("anthropic", "organization", uuid))
-        })
-        .or_else(|| {
-            account
-                .email_address
-                .as_deref()
-                .and_then(|email| billing_identity_hash("anthropic", "email", email))
-        })
-        .unwrap_or_default()
+    // id, then organization, then email. It lives in `ottto-core` because the
+    // CLI's statusLine writer stamps the same hash and the two must agree
+    // exactly -- a divergence would read as "foreign cache" and quota would
+    // silently vanish rather than fail loudly.
+    claude_account_identifier_hash(
+        account.account_uuid.as_deref(),
+        account.organization_uuid.as_deref(),
+        account.email_address.as_deref(),
+    )
 }
 
 fn read_claude_oauth_usage_cache(account_identifier_hash: &str) -> Option<ClaudeOAuthUsageCache> {
@@ -2817,22 +2969,6 @@ fn collection_method_key(method: &AgentStatusCollectionMethod) -> &'static str {
         AgentStatusCollectionMethod::ManualFallback => "manual_fallback",
         AgentStatusCollectionMethod::Unsupported => "unsupported",
     }
-}
-
-fn billing_identity_hash(provider: &str, kind: &str, value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let material = format!(
-        "{}:{}:{}",
-        provider.trim().to_ascii_lowercase(),
-        kind.trim().to_ascii_lowercase(),
-        value.to_ascii_lowercase()
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(material.as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn billing_identity_evidence_for(
@@ -5546,7 +5682,10 @@ fn home_path(relative: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ottto_core::ClaudeStatusLineRateLimitWindow;
+    use ottto_core::{
+        write_claude_statusline_cache, ClaudeStatusLineRateLimitWindow,
+        CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+    };
     use serial_test::serial;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
@@ -7295,10 +7434,178 @@ for line in sys.stdin:
         assert_eq!(windows[0].remaining_cents, Some(1900));
     }
 
+    /// The hash a Claude Desktop plan observation would carry for `account_uuid`
+    /// -- the same `billing_identity_hash` shape
+    /// `claude_desktop_builder_plan_observation` produces.
+    fn observable_account_hashes(account_uuids: &[&str]) -> Vec<String> {
+        account_uuids
+            .iter()
+            .filter_map(|uuid| billing_identity_hash("anthropic", "account", uuid))
+            .collect()
+    }
+
+    #[test]
+    fn claude_statusline_sample_is_attributed_only_to_the_account_that_owns_the_credential() {
+        let account_a = claude_account_identifier_hash(Some("acct-a"), None, None);
+        let account_b = claude_account_identifier_hash(Some("acct-b"), None, None);
+        assert_ne!(account_a, account_b);
+
+        // Same account, nothing else on the machine: provable, so serve it.
+        assert_eq!(
+            claude_statusline_attribution_failure(&account_a, &account_a, &[]),
+            None
+        );
+        // A Desktop observation for the SAME account is not a second account.
+        assert_eq!(
+            claude_statusline_attribution_failure(
+                &account_a,
+                &account_a,
+                &observable_account_hashes(&["acct-a"])
+            ),
+            None
+        );
+
+        // Written under a credential that has since been replaced.
+        assert_eq!(
+            claude_statusline_attribution_failure(&account_a, &account_b, &[]),
+            Some(ClaudeStatusLineUnattributable::CredentialReplaced)
+        );
+
+        // An unnamed account on either side matches nothing. Unlike the OAuth
+        // cache, two empty hashes must NOT match here: statusLine re-observes on
+        // the next render, so refusing costs nothing.
+        assert_eq!(
+            claude_statusline_attribution_failure("", &account_a, &[]),
+            Some(ClaudeStatusLineUnattributable::AccountUnknown)
+        );
+        assert_eq!(
+            claude_statusline_attribution_failure(&account_a, "", &[]),
+            Some(ClaudeStatusLineUnattributable::AccountUnknown)
+        );
+        assert_eq!(
+            claude_statusline_attribution_failure("", "", &[]),
+            Some(ClaudeStatusLineUnattributable::AccountUnknown)
+        );
+    }
+
+    #[test]
+    fn claude_statusline_sample_is_refused_when_a_second_claude_account_exists() {
+        // The live 2026-07-26 repro, which plain account-keying does NOT catch:
+        // the CLI credential was the work Team account both when the sample was
+        // written and when it was read, so the write-time key matched -- while
+        // the numbers came from the personal Max account rendering in the Claude
+        // Desktop app's "Code" tab, through the same wrapper, into the same
+        // machine-global file.
+        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
+
+        assert_eq!(
+            claude_statusline_attribution_failure(
+                &team,
+                &team,
+                &observable_account_hashes(&["acct-max"])
+            ),
+            Some(ClaudeStatusLineUnattributable::MultipleAccounts),
+            "a matching write-time key is not proof while a second Claude account can write this cache"
+        );
+
+        // Observations that name no account cannot establish a second one --
+        // `claude_account_identifier_hashes_from_observations` drops them.
+        assert!(claude_account_identifier_hashes_from_observations(&[]).is_empty());
+        assert_eq!(
+            claude_statusline_attribution_failure(&team, &team, &[]),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_statusline_quota_is_not_served_across_accounts() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-statusline-account-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&support_dir);
+        std::fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+
+        let account_a = claude_account_identifier_hash(Some("acct-a"), None, None);
+        let account_b = claude_account_identifier_hash(Some("acct-b"), None, None);
+        let now = current_unix_seconds();
+        write_claude_statusline_cache(
+            &support_dir,
+            &ClaudeStatusLineRateLimitCache {
+                schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+                observed_under_account_identifier_hash: account_a.clone(),
+                observed_at_epoch_seconds: now,
+                windows: vec![ClaudeStatusLineRateLimitWindow {
+                    name: "seven_day".to_string(),
+                    used_percent: 44,
+                    resets_at_epoch_seconds: now + 7 * 24 * 60 * 60,
+                }],
+            },
+        )
+        .expect("write cache");
+
+        // Its own account, alone on the machine: served.
+        match collect_claude_statusline_quota_windows(&account_a, &[]).expect("collect") {
+            ClaudeStatusLineQuota::Windows(windows) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].used_percent, Some(44));
+            }
+            other => panic!("own account was not served: {other:?}"),
+        }
+
+        // The replacing account must not be shown account A's 44%.
+        assert_eq!(
+            collect_claude_statusline_quota_windows(&account_b, &[]).expect("collect"),
+            ClaudeStatusLineQuota::Unattributable(
+                ClaudeStatusLineUnattributable::CredentialReplaced
+            )
+        );
+
+        // Nor may a matching key be served while a second Claude account can
+        // write the same file.
+        assert_eq!(
+            collect_claude_statusline_quota_windows(
+                &account_a,
+                &observable_account_hashes(&["acct-max"])
+            )
+            .expect("collect"),
+            ClaudeStatusLineQuota::Unattributable(ClaudeStatusLineUnattributable::MultipleAccounts)
+        );
+
+        // A pre-fix (v1) cache carries no account identity and is discarded
+        // outright rather than adopted by whoever is signed in now.
+        std::fs::write(
+            support_dir.join("claude-code-rate-limits.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "observed_at_epoch_seconds": now,
+                "windows": [{
+                    "name": "seven_day",
+                    "used_percent": 44,
+                    "resets_at_epoch_seconds": now + 7 * 24 * 60 * 60
+                }]
+            }))
+            .expect("serialize v1"),
+        )
+        .expect("write v1 cache");
+        assert_eq!(
+            collect_claude_statusline_quota_windows(&account_a, &[]).expect("collect"),
+            ClaudeStatusLineQuota::NotObserved
+        );
+
+        let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
     #[test]
     fn claude_statusline_cache_maps_fresh_windows() {
         let cache = ClaudeStatusLineRateLimitCache {
-            schema_version: 1,
+            schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+            observed_under_account_identifier_hash: "account-a".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
                 ClaudeStatusLineRateLimitWindow {
@@ -7335,7 +7642,8 @@ for line in sys.stdin:
     #[test]
     fn claude_statusline_cache_skips_expired_and_unknown_windows() {
         let cache = ClaudeStatusLineRateLimitCache {
-            schema_version: 1,
+            schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+            observed_under_account_identifier_hash: "account-a".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
                 ClaudeStatusLineRateLimitWindow {
@@ -7367,7 +7675,8 @@ for line in sys.stdin:
     #[test]
     fn claude_statusline_cache_marks_old_windows_stale() {
         let cache = ClaudeStatusLineRateLimitCache {
-            schema_version: 1,
+            schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+            observed_under_account_identifier_hash: "account-a".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![ClaudeStatusLineRateLimitWindow {
                 name: "five_hour".to_string(),
