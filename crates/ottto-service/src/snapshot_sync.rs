@@ -153,32 +153,57 @@ fn is_snapshot_fingerprint(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Last computed scan-index manifest per source.
+/// Last computed scan-index manifest per (upload destination, source).
 ///
 /// The check-in heartbeat runs on its own clock and does not know which
 /// policy/attribution/destination-scoped index path the sync cycle chose, so it
 /// cannot load the index itself. The sync cycle publishes the manifest it
 /// already computed from the index it already had open, and both receipt shapes
-/// read it from here. Missing means "no scan has completed in this process
-/// yet", which is reported as an absent manifest rather than a zeroed one.
-static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<&'static str, SnapshotSourceManifest>>> =
+/// read it from here. Missing means "no scan has completed in this process yet
+/// for this destination", which is reported as an absent manifest rather than a
+/// zeroed one.
+///
+/// The destination is part of the key, not an afterthought: a setup or account
+/// switch replaces the relay binding without restarting the daemon (which is why
+/// `ensure_snapshot_destination_current` exists), and a manifest keyed by source
+/// alone would report the previous account's entity count and rolling hash to the
+/// new one — a wrong witness and a disclosure of the previous account's local
+/// session set.
+static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>> =
     OnceLock::new();
 
-fn source_manifests() -> &'static Mutex<BTreeMap<&'static str, SnapshotSourceManifest>> {
+type SourceManifestCache = Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>;
+
+fn source_manifests() -> &'static SourceManifestCache {
     SOURCE_MANIFESTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn publish_source_manifest(source: SnapshotSource, manifest: SnapshotSourceManifest) {
+fn publish_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+    manifest: SnapshotSourceManifest,
+) {
     if let Ok(mut manifests) = source_manifests().lock() {
-        manifests.insert(source.api_slug(), manifest);
+        // One destination at a time: a machine that has moved is never coming
+        // back to the old binding with the same secret, so retaining its
+        // manifests would only risk reporting them.
+        manifests.retain(|(namespace, _), _| namespace == destination_namespace);
+        manifests.insert(
+            (destination_namespace.to_string(), source.api_slug()),
+            manifest,
+        );
     }
 }
 
-fn cached_source_manifest(source: SnapshotSource) -> Option<SnapshotSourceManifest> {
-    source_manifests()
-        .lock()
-        .ok()
-        .and_then(|manifests| manifests.get(source.api_slug()).cloned())
+fn cached_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+) -> Option<SnapshotSourceManifest> {
+    source_manifests().lock().ok().and_then(|manifests| {
+        manifests
+            .get(&(destination_namespace.to_string(), source.api_slug()))
+            .cloned()
+    })
 }
 
 #[cfg(test)]
@@ -883,6 +908,7 @@ fn sync_source(
         report_status(
             client,
             &relay_token,
+            &snapshot_upload_destination_namespace(device, device_secret),
             CollectorStatus {
                 source,
                 machine_id,
@@ -991,6 +1017,7 @@ fn sync_source(
     // bootstrap below scans from a throwaway index and its older entities are
     // deliberately outside this count.
     publish_source_manifest(
+        &upload_destination_namespace,
         source,
         index.manifest(source, activity_hint.backfill_window_days),
     );
@@ -1105,7 +1132,10 @@ fn sync_source(
             // history and retroactive backfill before the first upload. Relay
             // tokens are intentionally short-lived, so mint them at the network
             // boundary instead of reusing the pre-scan activity-hint token.
-            let client_report = crate::client_report::take();
+            // Leased, not read: exactly one in-flight batch may claim the
+            // counters, and dropping the lease on any failure below leaves the
+            // losses owed instead of stranded.
+            let client_report = crate::client_report::lease();
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: source.api_slug().to_string(),
@@ -1113,7 +1143,7 @@ fn sync_source(
                 collector_version: Some(collector_version()),
                 snapshots,
                 upload_policy,
-                client_report: client_report.clone(),
+                client_report: client_report.report().clone(),
             };
             if let Err(reason) = validate_snapshot_batch_request(&request) {
                 return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -1125,7 +1155,7 @@ fn sync_source(
             // Clear only what this accepted request carried. A failed upload
             // leaves the counters in place so the losses are reported on the
             // next batch instead of vanishing with the request that died.
-            crate::client_report::commit(&client_report);
+            client_report.commit();
             Ok(response)
         },
         |progress| progress.save(&upload_progress_path),
@@ -1635,6 +1665,7 @@ fn source_kind(source: SnapshotSource) -> SourceKind {
 fn report_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let finished_at = current_rfc3339();
@@ -1674,7 +1705,7 @@ fn report_status(
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
-        manifest: cached_source_manifest(status.source),
+        manifest: cached_source_manifest(destination_namespace, status.source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1688,7 +1719,8 @@ fn report_status_with_fresh_relay_token(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_status(client, &relay_token, status)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_status(client, &relay_token, &destination_namespace, status)
 }
 
 /// Post a non-terminal collector check-in receipt. `last_scan_finished_at` is
@@ -1700,6 +1732,7 @@ fn report_status_with_fresh_relay_token(
 fn report_checkin_status(
     client: &SnapshotApiClient,
     relay_token: &str,
+    destination_namespace: &str,
     source: SnapshotSource,
     machine_id: &str,
     scan_started_at: Option<&str>,
@@ -1732,7 +1765,7 @@ fn report_checkin_status(
         // cheapest cadence the server gets it on, and a check-in that says
         // "alive" while the entity sets disagree is exactly the state the
         // manifest exists to expose.
-        manifest: cached_source_manifest(source),
+        manifest: cached_source_manifest(destination_namespace, source),
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -1747,7 +1780,15 @@ fn report_checkin_status_with_fresh_relay_token(
     scan_started_at: Option<&str>,
 ) -> Result<()> {
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
-    report_checkin_status(client, &relay_token, source, machine_id, scan_started_at)
+    let destination_namespace = snapshot_upload_destination_namespace(device, device_secret);
+    report_checkin_status(
+        client,
+        &relay_token,
+        &destination_namespace,
+        source,
+        machine_id,
+        scan_started_at,
+    )
 }
 
 /// Spawn the periodic non-terminal collector check-in heartbeat.
@@ -2189,7 +2230,7 @@ mod tests {
         // One item was lost and it is reported as exactly one item, so the
         // server can tell this apart from an empty scan.
         assert_eq!(
-            crate::client_report::take().quantity(ClientReportReason::Poisoned),
+            crate::client_report::observe().quantity(ClientReportReason::Poisoned),
             1
         );
         reset_for_test();
@@ -2198,7 +2239,7 @@ mod tests {
     #[test]
     #[serial(client_report)]
     fn a_permanently_poisoned_item_is_counted_once_not_once_per_cycle() {
-        use crate::client_report::{reset_for_test, take, ClientReportReason};
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
         reset_for_test();
         let items = test_fingerprints(1);
         let poison = items[0].clone();
@@ -2229,7 +2270,7 @@ mod tests {
             .expect_err("a poison item fails the cycle");
         }
 
-        assert_eq!(take().quantity(ClientReportReason::Poisoned), 1);
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
 
         // A later scan that no longer carries the entity prunes the ledger, so
         // it stays bounded by the current scan rather than by all history.
@@ -2283,19 +2324,23 @@ mod tests {
     #[test]
     #[serial(client_report)]
     fn an_unacknowledged_client_report_survives_to_the_next_batch() {
-        use crate::client_report::{commit, record, reset_for_test, take, ClientReportReason};
+        use crate::client_report::{lease, observe, record, reset_for_test, ClientReportReason};
         reset_for_test();
         record(ClientReportReason::NetworkError, 2);
-        let reported = take();
-
-        // The upload died: nothing is committed, so the losses are still owed.
-        assert_eq!(take().quantity(ClientReportReason::NetworkError), 2);
+        {
+            // The upload died: the lease drops unacknowledged, so the losses stay
+            // owed rather than vanishing with the request.
+            let reported = lease();
+            assert_eq!(
+                reported.report().quantity(ClientReportReason::NetworkError),
+                2
+            );
+        }
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 2);
 
         // The retry carries them and is acknowledged.
-        let acknowledged = take();
-        commit(&acknowledged);
-        assert_eq!(take().quantity(ClientReportReason::NetworkError), 0);
-        assert_eq!(reported.quantity(ClientReportReason::NetworkError), 2);
+        lease().commit();
+        assert_eq!(observe().quantity(ClientReportReason::NetworkError), 0);
         reset_for_test();
     }
 
@@ -3280,6 +3325,8 @@ mod tests {
             machine_id: Some("otm_test".to_string()),
             sources: vec!["codex".to_string()],
         };
+        let destination_namespace =
+            &snapshot_upload_destination_namespace(&device, "device-secret");
 
         // Before any scan completes the manifest is absent, not zeroed: a
         // fabricated `entity_count: 0` would read as "this machine has nothing",
@@ -3304,7 +3351,11 @@ mod tests {
             .codex_state_only_snapshot_fingerprints
             .insert("session-1".to_string(), "a".repeat(64));
         let manifest = index.manifest(SnapshotSource::Codex, 183);
-        publish_source_manifest(SnapshotSource::Codex, manifest.clone());
+        publish_source_manifest(
+            destination_namespace,
+            SnapshotSource::Codex,
+            manifest.clone(),
+        );
 
         for scan_started_at in [None, Some("2026-06-01T10:00:00Z")] {
             let captured = Arc::new(Mutex::new(Vec::new()));
@@ -3354,6 +3405,35 @@ mod tests {
         // "the collector dropped what changed".
         assert!(requests[1].contains("\"last_semantic_noop_count\":718"));
         assert!(requests[1].contains("\"entity_count\":1"));
+
+        // An account switch replaces the relay binding without restarting the
+        // daemon. The new destination must not receive the previous account's
+        // entity count and rolling hash — that is both a false witness and a
+        // disclosure of the previous account's local session set.
+        let switched = LocalDeviceBinding {
+            device_id: "device_switched".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        report_checkin_status_with_fresh_relay_token(
+            &client,
+            &switched,
+            "device-secret",
+            SnapshotSource::Codex,
+            "otm_test",
+            None,
+        )
+        .expect("report check-in after an account switch");
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(!requests[1].contains("\"manifest\""));
+        assert!(!requests[1].contains(&manifest.rolling_hash));
+
+        // Publishing for the new destination retires the old one outright.
+        let new_namespace = snapshot_upload_destination_namespace(&switched, "device-secret");
+        publish_source_manifest(&new_namespace, SnapshotSource::Codex, manifest.clone());
+        assert!(cached_source_manifest(destination_namespace, SnapshotSource::Codex).is_none());
         clear_source_manifests_for_test();
     }
 

@@ -87,9 +87,14 @@ Two disciplines matter more than the shape:
 
 * **Every reason is emitted every time, including the zeros.** A counter that
   appears only when non-zero cannot distinguish "healthy" from "not reporting".
-* **Counters are reported before they are cleared.** The report is subtracted
-  only after the server accepts the batch, so a failed upload re-reports its
-  losses instead of erasing them.
+* **Counters are reported before they are cleared, once.** The report is
+  subtracted only after the server accepts the batch, so a failed upload
+  re-reports its losses instead of erasing them. Exactly one lease is live at a
+  time: a second concurrent claim carries an empty report rather than the same
+  numbers, because two batches reporting the same losses would have the server
+  count them twice and the second acknowledgement could clear losses the first
+  already cleared. The lease releases on drop, so an upload that fails anywhere
+  between claiming and acknowledging cannot strand the counters.
 
 `network_error`, `poisoned`, and `ratelimit_backoff` have live writers in this
 release. `queue_overflow` reports 0 until the durable outbox lands.
@@ -142,6 +147,12 @@ scan index the sync cycle already had open:
 * Absent before the first completed scan of a process — absent, not zeroed. A
   fabricated `entity_count: 0` would read as "this machine has nothing", which is
   a different and wrong statement.
+* **Keyed by upload destination, not just source.** A setup or account switch
+  replaces the relay binding without restarting the daemon, and a cache keyed by
+  source alone would report the previous account's entity count and rolling hash
+  to the new one — a false witness and a disclosure of the previous account's
+  local session set. Publishing for a new destination retires the old entries
+  outright.
 
 Check-ins carry it deliberately, including the liveness-only shape: a receipt
 that says "alive" while the entity sets disagree is exactly the state the
