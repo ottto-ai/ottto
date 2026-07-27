@@ -296,14 +296,10 @@ pub enum GrantStatus {
 
 /// Server policy for this grant. Defaults closed so a binding written before
 /// the field existed can never be read as approval.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServerPolicyState {
-    Approved,
-    #[default]
-    Disabled,
-    RolloutDisabled,
-}
+///
+/// Lives in the protocol crate because the same value crosses the local control
+/// socket; the on-disk and on-wire representations are one type on purpose.
+pub use ottto_protocol::ProviderDailyReferenceServerPolicyState as ServerPolicyState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendGrantBinding {
@@ -371,23 +367,17 @@ pub struct GrantCreateRequest {
     pub consent: bool,
 }
 
-/// The subset of the backend grant response the daemon binds against.
+/// The subset of the backend grant response the daemon binds against. Shared
+/// with the local control socket, so the app hands the daemon exactly this
+/// projection of the ordinary-browser response and nothing else.
+pub use ottto_protocol::ProviderDailyReferenceBackendGrantResponseV1 as GrantResponse;
+
+/// The exact `DELETE /api/v1/provider-daily-reference/grants/{grant_id}` target
+/// retained after a local revoke, so the companion/UI finishes revocation with
+/// ordinary user auth instead of guessing an id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrantResponse {
-    pub id: String,
-    pub installation_id: String,
-    pub source: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub release_lane: String,
-    pub disclosure_version: String,
-    pub grant_scope_fingerprint: String,
-    pub account_fingerprint: String,
-    pub status: String,
-    pub grant_version: u64,
-    #[serde(default)]
-    pub server_policy_state: ServerPolicyState,
+pub struct GrantRevokeTarget {
+    pub grant_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +557,7 @@ impl GrantStore {
             ));
         }
         let revoked = response.status == "revoked";
+        let local_status = state.grant.status;
         state.grant.collector_version = response.collector_version.clone();
         state.grant.backend_binding = Some(BackendGrantBinding {
             grant_id: response.id.clone(),
@@ -575,6 +566,17 @@ impl GrantStore {
             server_policy_state: response.server_policy_state,
         });
         state.grant.backend_create_pending = false;
+        if local_status == GrantStatus::Revoked {
+            // A create can commit at the backend just before local revoke. Keep
+            // only its exact identity, so the compensating DELETE has a target;
+            // local revoked state keeps blocking every provider admission and
+            // binding never resurrects withdrawn consent.
+            state.grant.status = GrantStatus::Revoked;
+            state.grant.last_success_at = None;
+            state.grant.last_error_category = None;
+            atomic_json_write(&self.path, &state)?;
+            return Ok(state.grant);
+        }
         state.grant.status = if revoked {
             GrantStatus::Revoked
         } else {
@@ -598,6 +600,73 @@ impl GrantStore {
             binding.backend_revoked = true;
         }
         atomic_json_write(&self.path, &state)
+    }
+
+    /// The exact backend grant to DELETE after a local revoke.
+    ///
+    /// A grant whose create was never reconciled has no id to delete, and
+    /// guessing one is worse than reporting that there is nothing to delete.
+    pub fn grant_revoke_target(&self) -> Result<GrantRevokeTarget> {
+        let grant = self
+            .load()?
+            .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
+        let binding = grant
+            .backend_binding
+            .ok_or_else(|| anyhow!("backend codex daily aggregates grant is unbound"))?;
+        Ok(GrantRevokeTarget {
+            grant_id: binding.grant_id,
+        })
+    }
+
+    /// Apply the server's exact DELETE response after a local revoke.
+    ///
+    /// Separate from [`GrantStore::bind_backend_grant`] because revocation is
+    /// the one transition that must accept an unchanged epoch: the backend's
+    /// DELETE is idempotent, so a retried delete answers with the same
+    /// `grant_version` it first returned. The epoch is still retained
+    /// monotonically, so re-consent has to bind a newer one.
+    pub fn apply_backend_revocation(
+        &self,
+        response: &GrantResponse,
+        expected_installation_id: &str,
+    ) -> Result<DailyReferenceGrant> {
+        let mut state = self
+            .read()?
+            .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
+        let key = decode_hex(&state.hmac_key_hex)
+            .ok_or_else(|| anyhow!("stored grant key is invalid"))?;
+        if opaque_key(&key, expected_installation_id) != state.grant.installation_fingerprint {
+            return Err(anyhow!(
+                "installation id does not match the recorded consent"
+            ));
+        }
+        validate_grant_response(&state.grant, response, expected_installation_id)?;
+        let existing = state
+            .grant
+            .backend_binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("backend codex daily aggregates grant is unbound"))?;
+        if response.status != "revoked"
+            || response.id != existing.grant_id
+            || response.grant_version < existing.grant_version
+        {
+            return Err(anyhow!(
+                "backend codex daily aggregates revocation does not match"
+            ));
+        }
+        state.grant.backend_binding = Some(BackendGrantBinding {
+            grant_id: response.id.clone(),
+            grant_version: response.grant_version,
+            backend_revoked: true,
+            server_policy_state: response.server_policy_state,
+        });
+        state.grant.backend_create_pending = false;
+        state.grant.status = GrantStatus::Revoked;
+        state.grant.revoked_at = Some(timestamp(OffsetDateTime::now_utc()));
+        state.grant.last_success_at = None;
+        state.grant.last_error_category = None;
+        atomic_json_write(&self.path, &state)?;
+        Ok(state.grant)
     }
 
     /// Record collector health. Never resurrects a non-enabled grant.
@@ -658,6 +727,139 @@ pub fn grant_runtime_ready(grant: &DailyReferenceGrant) -> bool {
                 && binding.server_policy_state == ServerPolicyState::Approved
                 && binding.grant_version >= 1
         })
+}
+
+// ---------------------------------------------------------------------------
+// Operator/UI status view
+// ---------------------------------------------------------------------------
+
+/// Schema of the credential-free status view served over the control socket.
+pub const COLLECTOR_STATUS_SCHEMA_VERSION: &str = "provider_daily_reference_collector_status.v1";
+
+/// What the capability is actually doing right now, as opposed to what the
+/// stored grant says. `grant_status` is the persisted consent record;
+/// `runtime_state` folds in the local off-switch, server policy, and the
+/// per-build admission rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeState {
+    /// No consent record exists.
+    Off,
+    /// A consent record exists but cannot collect yet.
+    ConsentRequired,
+    /// Every gate passes; the collector may read on its next tick.
+    Enabled,
+    /// Consent was withdrawn locally, at the server, or both.
+    Revoked,
+    /// The server has not approved this grant (or has rolled the build back).
+    PolicyDisabled,
+    /// The local off-switch sentinel is present.
+    NetworkDisabled,
+}
+
+/// Credential-free status view. Building it reads one local file and never
+/// touches the account, device, connection, credential, or provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorStatusV1 {
+    pub schema_version: String,
+    pub source: String,
+    pub collector_id: String,
+    pub grant_status: GrantStatus,
+    pub runtime_state: RuntimeState,
+    /// True only when all five collection gates would pass right now. It is
+    /// never an assertion that a read is in flight.
+    pub provider_read_permitted: bool,
+    /// The local off-switch sentinel.
+    pub network_disabled: bool,
+    /// True while a create was handed out but its backend response has not
+    /// been bound. The UI must retry the idempotent POST and bind its answer.
+    pub backend_create_pending: bool,
+    pub reason_code: String,
+}
+
+/// Build the status view for a given store and off-switch state.
+///
+/// `network_disabled` is a parameter rather than a read so tests can pin both
+/// sides of the off-switch without touching the real support directory.
+pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> CollectorStatusV1 {
+    let stored = grants.load().ok().flatten();
+    let grant_status = stored
+        .as_ref()
+        .map(|grant| grant.status)
+        .unwrap_or(GrantStatus::Off);
+    let backend_create_pending = stored
+        .as_ref()
+        .is_some_and(|grant| grant.backend_create_pending);
+    let policy_blocked = stored.as_ref().is_some_and(|grant| {
+        grant.status == GrantStatus::Enabled
+            && grant.backend_binding.as_ref().is_some_and(|binding| {
+                binding.backend_revoked
+                    || binding.server_policy_state != ServerPolicyState::Approved
+            })
+    });
+    let version_rebind_required = stored.as_ref().is_some_and(|grant| {
+        grant.status == GrantStatus::Enabled
+            && !grant.backend_create_pending
+            && grant.collector_version != compiled_release_version()
+    });
+    let runtime_ready = stored.as_ref().is_some_and(grant_runtime_ready);
+    let provider_read_permitted = runtime_ready && !network_disabled;
+
+    // Order matters: the most restrictive true statement wins, so a status can
+    // never read as "enabled" while something above it is stopping collection.
+    let (runtime_state, reason_code) = if network_disabled {
+        (RuntimeState::NetworkDisabled, "network_disabled")
+    } else if grant_status == GrantStatus::Revoked {
+        (RuntimeState::Revoked, "revoked")
+    } else if policy_blocked {
+        (RuntimeState::PolicyDisabled, "policy_disabled")
+    } else if backend_create_pending {
+        (
+            RuntimeState::ConsentRequired,
+            "backend_grant_reconciliation_required",
+        )
+    } else if version_rebind_required {
+        (
+            RuntimeState::ConsentRequired,
+            "collector_version_rebind_required",
+        )
+    } else if runtime_ready {
+        (RuntimeState::Enabled, "enabled")
+    } else if stored.is_some() {
+        (RuntimeState::ConsentRequired, "consent_required")
+    } else {
+        (RuntimeState::Off, "setup_required")
+    };
+
+    CollectorStatusV1 {
+        schema_version: COLLECTOR_STATUS_SCHEMA_VERSION.to_string(),
+        source: SOURCE.to_string(),
+        collector_id: COLLECTOR_ID.to_string(),
+        grant_status,
+        runtime_state,
+        provider_read_permitted,
+        network_disabled,
+        backend_create_pending,
+        reason_code: reason_code.to_string(),
+    }
+}
+
+/// The status view for the real support directory.
+pub fn default_collector_status() -> CollectorStatusV1 {
+    collector_status(&GrantStore::default(), network_disabled())
+}
+
+/// Replay ledger for this capability's one-time control tokens.
+///
+/// It reuses the audited cloud-sessions ledger mechanics under its own file:
+/// the ledger fails closed at capacity, so a burst on one capability must not
+/// be able to lock the other one out.
+pub fn control_token_use_store() -> crate::cloud_sessions::CloudSessionControlTokenUseStore {
+    crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
+        default_support_dir()
+            .join(GRANT_DIR)
+            .join("control-token-uses.json"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3381,6 +3583,169 @@ mod tests {
         let mut revoked = grant;
         revoked.status = GrantStatus::Revoked;
         assert!(!grant_runtime_ready(&revoked));
+    }
+
+    #[test]
+    fn binding_a_raced_create_never_resurrects_a_revoked_grant() {
+        let collector = collector("revoked-race-bind");
+        let local = collector.grants().enable(&setup(), now()).expect("enable");
+        collector.grants().revoke(now()).expect("revoke");
+
+        // The POST committed at the backend just before the local revoke. Its
+        // identity is retained so the compensating DELETE has a target, but
+        // consent stays withdrawn.
+        let bound = collector
+            .grants()
+            .bind_backend_grant(&grant_response(&local, "enabled", 1), INSTALLATION_ID)
+            .expect("bind raced create");
+
+        assert_eq!(bound.status, GrantStatus::Revoked);
+        assert!(!grant_runtime_ready(&bound));
+        assert_eq!(
+            collector.grants().grant_revoke_target().expect("target"),
+            GrantRevokeTarget {
+                grant_id: GRANT_ID.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreconciled_create_has_no_delete_target() {
+        let collector = collector("revoke-target-unbound");
+        collector.grants().enable(&setup(), now()).expect("enable");
+
+        assert!(collector.grants().grant_revoke_target().is_err());
+    }
+
+    #[test]
+    fn backend_revocation_binds_the_exact_delete_response() {
+        let collector = collector("backend-revocation");
+        let grant = enabled(&collector);
+        collector.grants().revoke(now()).expect("revoke");
+
+        // Wrong id, wrong status, and a regressed epoch are all refused.
+        let mut wrong_id = grant_response(&grant, "revoked", 2);
+        wrong_id.id = "00000000-0000-4000-8000-0000000000ff".to_string();
+        assert!(collector
+            .grants()
+            .apply_backend_revocation(&wrong_id, INSTALLATION_ID)
+            .is_err());
+        assert!(collector
+            .grants()
+            .apply_backend_revocation(&grant_response(&grant, "enabled", 2), INSTALLATION_ID)
+            .is_err());
+        assert!(collector
+            .grants()
+            .apply_backend_revocation(&grant_response(&grant, "revoked", 0), INSTALLATION_ID)
+            .is_err());
+        assert!(collector
+            .grants()
+            .apply_backend_revocation(&grant_response(&grant, "revoked", 2), GRANT_ID)
+            .is_err());
+
+        // The backend's DELETE is idempotent, so an unchanged epoch is accepted
+        // where `bind_backend_grant` would require an advance.
+        let confirmed = collector
+            .grants()
+            .apply_backend_revocation(&grant_response(&grant, "revoked", 1), INSTALLATION_ID)
+            .expect("confirm revocation");
+
+        assert_eq!(confirmed.status, GrantStatus::Revoked);
+        let binding = confirmed.backend_binding.expect("binding");
+        assert!(binding.backend_revoked);
+        assert_eq!(binding.grant_version, 1);
+    }
+
+    #[test]
+    fn collector_status_reports_every_stop_before_it_reports_enabled() {
+        let collector = collector("collector-status");
+        assert_eq!(
+            collector_status(collector.grants(), false).reason_code,
+            "setup_required"
+        );
+
+        collector.grants().enable(&setup(), now()).expect("enable");
+        let pending = collector_status(collector.grants(), false);
+        assert_eq!(pending.runtime_state, RuntimeState::ConsentRequired);
+        assert_eq!(pending.reason_code, "backend_grant_reconciliation_required");
+        assert!(pending.backend_create_pending);
+        assert!(!pending.provider_read_permitted);
+
+        let local = collector.grants().load().expect("load").expect("grant");
+        collector
+            .grants()
+            .bind_backend_grant(&grant_response(&local, "enabled", 1), INSTALLATION_ID)
+            .expect("bind");
+        let live = collector_status(collector.grants(), false);
+        assert_eq!(live.runtime_state, RuntimeState::Enabled);
+        assert_eq!(live.reason_code, "enabled");
+        assert!(live.provider_read_permitted);
+        assert_eq!(live.schema_version, COLLECTOR_STATUS_SCHEMA_VERSION);
+        assert_eq!(live.source, SOURCE);
+        assert_eq!(live.collector_id, COLLECTOR_ID);
+
+        // The local off-switch outranks a live grant.
+        let switched_off = collector_status(collector.grants(), true);
+        assert_eq!(switched_off.runtime_state, RuntimeState::NetworkDisabled);
+        assert_eq!(switched_off.reason_code, "network_disabled");
+        assert!(!switched_off.provider_read_permitted);
+        assert_eq!(switched_off.grant_status, GrantStatus::Enabled);
+
+        collector.grants().revoke(now()).expect("revoke");
+        let revoked = collector_status(collector.grants(), false);
+        assert_eq!(revoked.runtime_state, RuntimeState::Revoked);
+        assert_eq!(revoked.reason_code, "revoked");
+        assert!(!revoked.provider_read_permitted);
+    }
+
+    #[test]
+    fn collector_status_separates_policy_from_build_admission() {
+        let collector = collector("collector-status-policy");
+        let grant = enabled(&collector);
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
+                .expect("decode");
+        persisted["grant"]["backend_binding"]["server_policy_state"] =
+            serde_json::Value::String("rollout_disabled".to_string());
+        fs::write(
+            collector.grants().path(),
+            serde_json::to_vec_pretty(&persisted).expect("encode"),
+        )
+        .expect("write");
+        let policy = collector_status(collector.grants(), false);
+        assert_eq!(policy.runtime_state, RuntimeState::PolicyDisabled);
+        assert_eq!(policy.reason_code, "policy_disabled");
+        assert!(!policy.provider_read_permitted);
+
+        // An upgraded daemon needs re-consent, and says so distinctly.
+        persisted["grant"]["backend_binding"]["server_policy_state"] =
+            serde_json::Value::String("approved".to_string());
+        persisted["grant"]["collector_version"] = serde_json::Value::String("0.0.1".to_string());
+        fs::write(
+            collector.grants().path(),
+            serde_json::to_vec_pretty(&persisted).expect("encode"),
+        )
+        .expect("write");
+        let rebind = collector_status(collector.grants(), false);
+        assert_eq!(rebind.runtime_state, RuntimeState::ConsentRequired);
+        assert_eq!(rebind.reason_code, "collector_version_rebind_required");
+        assert!(!rebind.provider_read_permitted);
+        assert_eq!(grant.status, GrantStatus::Enabled);
+    }
+
+    #[test]
+    fn collector_status_is_content_free() {
+        let collector = collector("collector-status-content-free");
+        enabled(&collector);
+
+        let encoded =
+            serde_json::to_string(&collector_status(collector.grants(), false)).expect("encode");
+
+        for secret in [INSTALLATION_ID, ORG_SCOPE, USER_SCOPE, ACCOUNT_SCOPE] {
+            assert!(!encoded.contains(secret), "status leaked {secret}");
+        }
+        assert!(!encoded.contains("hmac-sha256:"));
     }
 
     #[test]
