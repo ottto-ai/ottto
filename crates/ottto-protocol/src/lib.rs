@@ -5,6 +5,11 @@ use std::fmt;
 pub const PROTOCOL_VERSION: u16 = 15;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
+/// Command-scoped version for `provider_daily_reference_control`. Older daemons
+/// reject it outright, so a UI that can drive this consent is told to update
+/// rather than silently doing nothing. Every unrelated command stays on the
+/// base version for mixed-owner upgrade compatibility.
+pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 17;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
 
@@ -1260,6 +1265,18 @@ pub struct AgentAccountStatus {
     pub plan_type: Option<String>,
     pub subscription_product: Option<String>,
     pub billing_channel: Option<String>,
+    /// Reported boundaries of the account's current subscription period.
+    ///
+    /// Provider-neutral on purpose: any provider that publishes real period
+    /// boundaries fills these same two fields rather than growing a
+    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire
+    /// payload byte-identical when the provider reports nothing, and the
+    /// backend contract is "reported or absent" - a producer never
+    /// substitutes `now`, a calendar month, or a first-seen date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_start: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_end: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2363,10 +2380,12 @@ pub struct ClaudeDesktopWebUsagePreferenceState {
 }
 
 pub fn expected_local_control_protocol_version(command: &LocalControlCommand) -> u16 {
-    if matches!(command, LocalControlCommand::CloudSessionsControl { .. }) {
-        CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION
-    } else {
-        LOCAL_CONTROL_PROTOCOL_VERSION
+    match command {
+        LocalControlCommand::CloudSessionsControl { .. } => CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
+        LocalControlCommand::ProviderDailyReferenceControl { .. } => {
+            PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
+        }
+        _ => LOCAL_CONTROL_PROTOCOL_VERSION,
     }
 }
 
@@ -2639,6 +2658,20 @@ pub enum LocalControlCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_grant: Option<CloudSessionBackendGrantResponseV1>,
     },
+    /// One short-lived, backend-authorized mutation/read of the local Codex
+    /// daily-aggregates (`provider_daily_reference.v1`) consent state.
+    ///
+    /// It packages consent the operator explicitly asked for in the UI; it
+    /// never creates consent on its own, and it changes none of the five
+    /// collection gates. Browser JWTs never cross this boundary.
+    ProviderDailyReferenceControl {
+        action: ProviderDailyReferenceControlAction,
+        control_token: SecretString,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+    },
     Repair {
         source: SourceKind,
         dry_run: bool,
@@ -2691,6 +2724,50 @@ pub enum CloudSessionServerPolicyState {
     Approved,
     #[default]
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDailyReferenceControlAction {
+    Prepare,
+    Bind,
+    Revoke,
+    ConfirmRevoked,
+    Status,
+}
+
+/// Server policy for one `provider_daily_reference` grant.
+///
+/// Defaults closed, so a binding written before the field existed - or a
+/// response that omits it - can never be read as approval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDailyReferenceServerPolicyState {
+    Approved,
+    #[default]
+    Disabled,
+    RolloutDisabled,
+}
+
+/// Strict identity-bearing subset of the backend's
+/// `provider_daily_reference` grant response that the daemon binds against.
+/// Provider content and credentials are never represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDailyReferenceBackendGrantResponseV1 {
+    pub id: String,
+    pub installation_id: String,
+    pub source: String,
+    pub collector_id: String,
+    pub schema_version: String,
+    pub collector_version: String,
+    pub release_lane: String,
+    pub disclosure_version: String,
+    pub grant_scope_fingerprint: String,
+    pub account_fingerprint: String,
+    pub status: String,
+    pub grant_version: u64,
+    #[serde(default)]
+    pub server_policy_state: ProviderDailyReferenceServerPolicyState,
 }
 
 /// Strict identity-bearing subset needed to bind an ordinary-browser grant
@@ -3422,6 +3499,8 @@ mod tests {
                 plan_type: Some("individual".to_string()),
                 subscription_product: Some("ChatGPT Pro".to_string()),
                 billing_channel: Some("subscription".to_string()),
+                subscription_period_start: None,
+                subscription_period_end: None,
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
                 credential_fingerprint_hash: None,
@@ -4307,6 +4386,128 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 15);
         assert_eq!(LOCAL_CONTROL_PROTOCOL_VERSION, 15);
         assert_eq!(CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION, 16);
+    }
+
+    #[test]
+    fn provider_daily_reference_control_command_round_trips_without_credentials() {
+        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_pdr_bind",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "web_ui",
+            "command": "provider_daily_reference_control",
+            "action": "bind",
+            "control_token": "header.payload.signature",
+            "api_base_url": "https://api.ottto.net",
+            "backend_grant": {
+                "id": "00000000-0000-4000-8000-000000000002",
+                "installation_id": "00000000-0000-4000-8000-000000000001",
+                "source": "codex",
+                "collector_id": "provider_daily_reference",
+                "schema_version": "provider_daily_reference.v1",
+                "collector_version": "0.1.98",
+                "release_lane": "supported",
+                "disclosure_version": "provider_daily_reference_disclosure.v1",
+                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+                "status": "enabled",
+                "grant_version": 1,
+                "server_policy_state": "approved"
+            }
+        }))
+        .expect("provider daily reference bind control request");
+
+        assert!(matches!(
+            request.command,
+            LocalControlCommand::ProviderDailyReferenceControl {
+                action: ProviderDailyReferenceControlAction::Bind,
+                backend_grant: Some(ProviderDailyReferenceBackendGrantResponseV1 {
+                    grant_version: 1,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("header.payload.signature"));
+        assert!(debug.contains("<redacted>"));
+
+        let mut confirm_wire: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        confirm_wire["request_id"] = serde_json::json!("req_pdr_confirm");
+        confirm_wire["action"] = serde_json::json!("confirm_revoked");
+        confirm_wire["backend_grant"]["status"] = serde_json::json!("revoked");
+        let confirm: LocalControlRequest = serde_json::from_value(confirm_wire).unwrap();
+        assert!(matches!(
+            confirm.command,
+            LocalControlCommand::ProviderDailyReferenceControl {
+                action: ProviderDailyReferenceControlAction::ConfirmRevoked,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_daily_reference_server_policy_defaults_closed() {
+        let response: ProviderDailyReferenceBackendGrantResponseV1 =
+            serde_json::from_value(serde_json::json!({
+                "id": "00000000-0000-4000-8000-000000000002",
+                "installation_id": "00000000-0000-4000-8000-000000000001",
+                "source": "codex",
+                "collector_id": "provider_daily_reference",
+                "schema_version": "provider_daily_reference.v1",
+                "collector_version": "0.1.98",
+                "release_lane": "supported",
+                "disclosure_version": "provider_daily_reference_disclosure.v1",
+                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
+                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
+                "status": "enabled",
+                "grant_version": 1
+            }))
+            .expect("policy-less grant response");
+
+        assert_eq!(
+            response.server_policy_state,
+            ProviderDailyReferenceServerPolicyState::Disabled
+        );
+    }
+
+    #[test]
+    fn provider_daily_reference_control_is_scoped_to_its_own_protocol_version() {
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_pdr_v15",
+            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "command": "provider_daily_reference_control",
+            "action": "status",
+            "control_token": "header.payload.signature"
+        }))
+        .expect_err("provider daily reference control must reject the base protocol version");
+        assert!(error.to_string().contains(&format!(
+            "expected {PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION}"
+        )));
+
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v17",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect_err("ordinary status must reject the provider daily reference version");
+        assert!(error.to_string().contains(&format!(
+            "unsupported local control protocol_version {PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION}"
+        )));
+
+        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_pdr_v17",
+            "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+            "command": "provider_daily_reference_control",
+            "action": "status",
+            "control_token": "header.payload.signature"
+        }))
+        .expect("command protocol version should be accepted");
+        assert_eq!(
+            request.protocol_version,
+            PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
+        );
+        assert_eq!(PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION, 17);
     }
 
     #[test]
