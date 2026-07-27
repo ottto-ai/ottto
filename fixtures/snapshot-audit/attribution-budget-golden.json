@@ -1,11 +1,13 @@
 {
   "attribution_schema_version": "session_attribution.v1",
+  "max_fact_value_bytes": 128,
   "max_facts": 24,
-  "max_payload_bytes": 4096,
+  "max_payload_bytes": 8192,
   "near_limit_case": {
     "accepted_by_current_budget": true,
+    "accepted_by_previous_budget": false,
     "accepted_by_retired_budget": false,
-    "fact_count": 14,
+    "fact_count": 21,
     "facts": [
       {
         "evidence": {
@@ -16,7 +18,7 @@
           "strength": "direct"
         },
         "field": "origin_kind",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -27,7 +29,7 @@
           "strength": "direct"
         },
         "field": "provider_surface",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -38,7 +40,7 @@
           "strength": "direct"
         },
         "field": "execution_mode",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -49,7 +51,7 @@
           "strength": "direct"
         },
         "field": "template_group_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -60,7 +62,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -71,7 +73,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -82,7 +84,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -93,7 +95,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -104,7 +106,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -115,7 +117,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -126,7 +128,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -137,7 +139,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -148,7 +150,7 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       },
       {
         "evidence": {
@@ -159,14 +161,344 @@
           "strength": "direct"
         },
         "field": "skill_id",
-        "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
       }
     ],
-    "payload_bytes": 4073,
-    "payload_sha256": "6103b0915841cb801c5cba407289f23db09f74022c11179830d501c53348e746"
+    "payload_bytes": 8112,
+    "payload_sha256": "d5d2e2a51a6d82f8869a9f1aaf71c2474fc3c9ea81edca48fecc526b778962d1"
   },
   "over_current_budget_case": {
     "accepted_by_current_budget": false,
+    "accepted_by_previous_budget": false,
+    "accepted_by_retired_budget": false,
+    "fact_count": 22,
+    "facts": [
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "origin_kind",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "provider_surface",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "execution_mode",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "template_group_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      },
+      {
+        "evidence": {
+          "evidence_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "kind": "provider_native",
+          "observed_at": "2026-07-26T07:20:49Z",
+          "source_version": "claude_code_jsonl:v19",
+          "strength": "direct"
+        },
+        "field": "skill_id",
+        "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+      }
+    ],
+    "payload_bytes": 8497,
+    "payload_sha256": "1a75f6fc5efb5db31d4936821ea45f0516d44e201b35d459a2f7fa6da191605d"
+  },
+  "over_previous_budget_case": {
+    "accepted_by_current_budget": true,
+    "accepted_by_previous_budget": false,
     "accepted_by_retired_budget": false,
     "fact_count": 15,
     "facts": [
@@ -341,6 +673,7 @@
   },
   "over_retired_budget_case": {
     "accepted_by_current_budget": true,
+    "accepted_by_previous_budget": true,
     "accepted_by_retired_budget": false,
     "fact_count": 7,
     "facts": [
@@ -425,6 +758,7 @@
     "payload_bytes": 2050,
     "payload_sha256": "8d4573da0496f1a8e21e0121b9a7b2e80f798fe8cbdafd7f4ed0f87cc6eb6f4c"
   },
+  "previous_max_payload_bytes": 4096,
   "retired_max_payload_bytes": 2048,
-  "schema_version": "attribution_budget_golden:v1"
+  "schema_version": "attribution_budget_golden:v2"
 }

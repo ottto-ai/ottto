@@ -33,13 +33,20 @@ pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES: usize = 96;
 pub const MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES: usize = 32;
 /// Wire budget for one session's attribution facts.
 ///
-/// Raised 2,048 → 4,096. The old budget was the binding constraint, not the
-/// 24-fact cap: a skill-heavy session hit the byte ceiling at ~13 facts and the
-/// tail — which is exactly where the grouping evidence lives — was silently
-/// dropped. The backend accepts the wider budget FIRST; this constant must not
-/// reach an installed base before that acceptance is deployed, or every
-/// attribution-carrying batch from an upgraded daemon 422s.
-pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 4_096;
+/// Raised 2,048 → 4,096 → 8,192. This number and the backend's
+/// `MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES` are one contract and must be equal:
+/// a daemon budget BELOW the backend's silently trims facts the backend would
+/// have accepted, and a daemon budget ABOVE it converts that silent trim into a
+/// hard 422 on the whole batch. So the backend always moves first — it is
+/// already deployed at 8,192, which is why this side may follow.
+///
+/// The intended ordering at 8 KiB is that the 24-fact count cap binds first and
+/// the byte budget only stops pathological values. An ordinary fact carries a
+/// mandatory `sha256:` evidence reference and costs ~290 bytes, so a full
+/// 24-fact list lands near 7 KiB and fits; only facts near the
+/// `MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES` ceiling can still reach the byte
+/// budget before the count cap.
+pub const MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES: usize = 8_192;
 pub const SESSION_ATTRIBUTION_HMAC_KEY_VERSION: &str = "hmac-sha256:v1";
 
 const MAX_TEMPLATE_MATERIAL_CHARS: usize = 4_096;
@@ -981,14 +988,16 @@ fn codex_provider_surface(origin: &SnapshotOrigin) -> Option<&'static str> {
 
 /// Bound a fact list to the wire contract, reporting anything dropped.
 ///
-/// Truncation is real attribution loss, so it must never be silent. The byte
-/// budget binds long before the fact-count cap: one fact carries a mandatory
-/// `sha256:` evidence reference and costs roughly 300 bytes, so about six fit
-/// inside the budget while the count cap allows `MAX_SESSION_ATTRIBUTION_FACTS`.
-/// Facts are dropped from the tail, which is exactly where grouping evidence
+/// Truncation is real attribution loss, so it must never be silent. At the
+/// 8 KiB budget the `MAX_SESSION_ATTRIBUTION_FACTS` count cap is what normally
+/// binds: one fact carries a mandatory `sha256:` evidence reference and costs
+/// roughly 290 bytes, so a full 24-fact list lands near 7 KiB and fits. The byte
+/// budget now only catches lists whose values crowd the
+/// `MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES` ceiling. Under both caps facts are
+/// dropped from the tail, which is exactly where grouping evidence
 /// (`template_group_id`, `schedule_definition_id`, `skill_id`) is appended after
-/// the direct provider facts, so a skill-heavy session loses its grouping
-/// signals first.
+/// the direct provider and subagent-identity facts, so a skill-heavy session
+/// loses its grouping signals first.
 ///
 /// Only field names and counts are reported. Fact values carry opaque
 /// org-keyed identifiers and never belong in a log line.
@@ -1576,8 +1585,52 @@ status = "ACTIVE"
         }
     }
 
+    /// A fact whose value sits exactly on the per-value ceiling.
+    ///
+    /// At 8 KiB an ordinary `budget_fact` can no longer reach the byte budget
+    /// before the 24-fact count cap does — that ordering is the point of the
+    /// raise. Probing the byte budget therefore needs the widest fact the
+    /// contract still accepts, which is the only shape that can still exhaust
+    /// the payload budget inside the count cap.
+    fn wide_budget_fact(field: &str) -> SessionAttributionFact {
+        SessionAttributionFact {
+            value: "w".repeat(MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES),
+            ..budget_fact(field)
+        }
+    }
+
     fn fits_wire_budget(facts: &[SessionAttributionFact]) -> bool {
         serde_json::to_vec(facts).expect("serialize").len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+    }
+
+    /// The count cap binds before the byte budget for ordinary facts.
+    ///
+    /// This is the invariant the 8 KiB budget is chosen to produce, and the
+    /// reason several tests below must use `wide_budget_fact` to reach the byte
+    /// budget at all. Pinned once here so a future budget change that quietly
+    /// reverses the ordering fails loudly instead of turning the count-cap tests
+    /// into byte-budget tests.
+    #[test]
+    fn the_fact_count_cap_binds_before_the_byte_budget_for_ordinary_facts() {
+        let full: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
+            .map(|_| budget_fact("skill_id"))
+            .collect();
+
+        assert!(
+            fits_wire_budget(&full),
+            "a full {MAX_SESSION_ATTRIBUTION_FACTS}-fact list of ordinary facts must fit in \
+             {MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES} bytes"
+        );
+        // The byte budget must still be reachable by pathological values, or it
+        // would be dead code rather than a backstop.
+        let wide: Vec<SessionAttributionFact> = (0..MAX_SESSION_ATTRIBUTION_FACTS)
+            .map(|_| wide_budget_fact("skill_id"))
+            .collect();
+        assert!(
+            !fits_wire_budget(&wide),
+            "values at the {MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES}-byte ceiling must still be \
+             able to exhaust the payload budget"
+        );
     }
 
     #[test]
@@ -1597,19 +1650,21 @@ status = "ACTIVE"
 
     #[test]
     fn enforce_fact_limits_drops_trailing_grouping_facts_over_the_byte_budget() {
-        // The byte budget still binds before the fact-count cap even at 4 KiB,
-        // and facts are dropped from the tail, so a skill-heavy session loses
-        // the grouping evidence appended after its direct provider facts. The
-        // list grows to the first over-budget length rather than a hardcoded
-        // count so the test keeps testing the byte budget when it next moves.
+        // When the byte budget does bind, facts are dropped from the tail, so a
+        // skill-heavy session loses the grouping evidence appended after its
+        // direct provider facts. At 8 KiB only values at the per-value ceiling
+        // can reach the byte budget inside the 24-fact cap, so the list is built
+        // from `wide_budget_fact`. It grows to the first over-budget length
+        // rather than a hardcoded count so the test keeps testing the byte
+        // budget when it next moves.
         let mut facts = vec![
-            budget_fact("origin_kind"),
-            budget_fact("provider_surface"),
-            budget_fact("execution_mode"),
-            budget_fact("template_group_id"),
+            wide_budget_fact("origin_kind"),
+            wide_budget_fact("provider_surface"),
+            wide_budget_fact("execution_mode"),
+            wide_budget_fact("template_group_id"),
         ];
         while fits_wire_budget(&facts) && facts.len() < MAX_SESSION_ATTRIBUTION_FACTS {
-            facts.push(budget_fact("skill_id"));
+            facts.push(wide_budget_fact("skill_id"));
         }
         let skills_before = facts.iter().filter(|fact| fact.field == "skill_id").count();
         let before = facts.len();
@@ -1646,6 +1701,7 @@ status = "ACTIVE"
     #[test]
     fn attribution_budget_corpus_pins_the_near_limit_payload() {
         const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
+        const PREVIOUS_PAYLOAD_BUDGET_BYTES: usize = 4_096;
         fn case(facts: &[SessionAttributionFact]) -> serde_json::Value {
             let payload = serde_json::to_vec(facts).expect("serialize");
             let mut digest = Sha256::new();
@@ -1656,6 +1712,8 @@ status = "ACTIVE"
                 "payload_sha256": format!("{:x}", digest.finalize()),
                 "accepted_by_retired_budget":
                     payload.len() <= RETIRED_PAYLOAD_BUDGET_BYTES,
+                "accepted_by_previous_budget":
+                    payload.len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES,
                 "accepted_by_current_budget":
                     payload.len() <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
                 "facts": facts,
@@ -1668,19 +1726,33 @@ status = "ACTIVE"
             budget_fact("execution_mode"),
             budget_fact("template_group_id"),
         ];
-        // First list that the retired 2 KiB budget refused: the regression the
-        // raise fixes.
+        // First list that the retired 2 KiB budget refused: the original
+        // regression, and still accepted today.
         while serde_json::to_vec(&facts).expect("serialize").len() <= RETIRED_PAYLOAD_BUDGET_BYTES {
             facts.push(budget_fact("skill_id"));
         }
         let over_retired = facts.clone();
+        // First list the superseded 4 KiB budget refused: the band this raise
+        // newly admits, and the one the deployed backend already accepts.
+        while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES
+        {
+            facts.push(budget_fact("skill_id"));
+        }
+        let over_previous = facts.clone();
         // Largest list the current budget still accepts: the acceptance
         // boundary. One more fact must 422, and that is the whole value of the
-        // case — a budget nobody probes at its edge is a budget nobody agrees on.
-        let mut near_limit = facts.clone();
+        // case — a budget nobody probes at its edge is a budget nobody agrees
+        // on. Ordinary facts can no longer reach that edge inside the 24-fact
+        // cap, so the boundary cases carry values at the per-value ceiling.
+        let mut near_limit = vec![
+            wide_budget_fact("origin_kind"),
+            wide_budget_fact("provider_surface"),
+            wide_budget_fact("execution_mode"),
+            wide_budget_fact("template_group_id"),
+        ];
         loop {
             let mut candidate = near_limit.clone();
-            candidate.push(budget_fact("skill_id"));
+            candidate.push(wide_budget_fact("skill_id"));
             if serde_json::to_vec(&candidate).expect("serialize").len()
                 > MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
             {
@@ -1689,15 +1761,18 @@ status = "ACTIVE"
             near_limit = candidate;
         }
         let mut over_current = near_limit.clone();
-        over_current.push(budget_fact("skill_id"));
+        over_current.push(wide_budget_fact("skill_id"));
 
         let actual = serde_json::json!({
-            "schema_version": "attribution_budget_golden:v1",
+            "schema_version": "attribution_budget_golden:v2",
             "attribution_schema_version": SESSION_ATTRIBUTION_SCHEMA_VERSION,
             "max_payload_bytes": MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            "previous_max_payload_bytes": PREVIOUS_PAYLOAD_BUDGET_BYTES,
             "retired_max_payload_bytes": RETIRED_PAYLOAD_BUDGET_BYTES,
             "max_facts": MAX_SESSION_ATTRIBUTION_FACTS,
+            "max_fact_value_bytes": MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES,
             "over_retired_budget_case": case(&over_retired),
+            "over_previous_budget_case": case(&over_previous),
             "near_limit_case": case(&near_limit),
             "over_current_budget_case": case(&over_current),
         });
@@ -1717,34 +1792,46 @@ status = "ACTIVE"
         ))
         .expect("parse attribution budget golden");
         assert_eq!(actual, expected);
-        assert!(near_limit.len() > over_retired.len());
+        assert!(over_previous.len() > over_retired.len());
         assert!(near_limit.len() <= MAX_SESSION_ATTRIBUTION_FACTS);
         validate_fact_limits(&over_retired).expect("over-retired payload is valid now");
+        validate_fact_limits(&over_previous).expect("over-previous payload is valid now");
         validate_fact_limits(&near_limit).expect("near-limit payload is valid");
+        // The refusal must come from the byte budget, not the count cap, or the
+        // corpus would stop describing the budget it claims to pin.
         assert!(
-            validate_fact_limits(&over_current).is_err(),
-            "one fact past the budget must be refused locally, not by the backend"
+            over_current.len() <= MAX_SESSION_ATTRIBUTION_FACTS,
+            "the over-budget case must stay inside the fact-count cap"
+        );
+        let refusal =
+            validate_fact_limits(&over_current).expect_err("one fact past the budget must fail");
+        assert!(
+            refusal.contains(&MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES.to_string()),
+            "expected a byte-budget refusal, got: {refusal}"
         );
     }
 
     #[test]
     fn the_raised_byte_budget_keeps_a_list_the_old_budget_would_have_trimmed() {
-        // The regression the raise fixes: a fact list between the old 2 KiB
-        // ceiling and the new 4 KiB one used to lose its tail. Nothing is
-        // trimmed now, and the near-limit shape is the one the two-language
-        // fixture corpus carries as its 422 boundary case.
+        // The regression each raise fixes: a fact list above a superseded
+        // ceiling used to lose its tail. Grown past the most recent superseded
+        // budget (4 KiB), so it also covers the older 2 KiB one. Nothing is
+        // trimmed now.
         const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
+        const PREVIOUS_PAYLOAD_BUDGET_BYTES: usize = 4_096;
         let mut facts = vec![
             budget_fact("origin_kind"),
             budget_fact("provider_surface"),
             budget_fact("execution_mode"),
             budget_fact("template_group_id"),
         ];
-        while serde_json::to_vec(&facts).expect("serialize").len() <= RETIRED_PAYLOAD_BUDGET_BYTES {
+        while serde_json::to_vec(&facts).expect("serialize").len() <= PREVIOUS_PAYLOAD_BUDGET_BYTES
+        {
             facts.push(budget_fact("skill_id"));
         }
         let payload_bytes = serde_json::to_vec(&facts).expect("serialize").len();
         assert!(payload_bytes > RETIRED_PAYLOAD_BUDGET_BYTES);
+        assert!(payload_bytes > PREVIOUS_PAYLOAD_BUDGET_BYTES);
         assert!(payload_bytes <= MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES);
         let before = facts.len();
 
