@@ -187,7 +187,37 @@ sbom_expected_sha="$(jq -r '.supply_chain.sbom.sha256 // empty' "$MANIFEST")"
 sbom_attested="$(jq -r '.supply_chain.sbom.attested // false' "$MANIFEST")"
 sbom_verified="$(jq -r '.supply_chain.sbom.verified // false' "$MANIFEST")"
 sbom_verification_command="$(jq -r '.supply_chain.sbom.verification_command // empty' "$MANIFEST")"
+material_count="$(jq '.supply_chain.materials // [] | length' "$MANIFEST")"
+public_material_kind="$(jq -r '.supply_chain.materials[0].kind // empty' "$MANIFEST")"
+public_material_repository="$(jq -r '.supply_chain.materials[0].repository // empty' "$MANIFEST")"
+public_material_commit="$(jq -r '.supply_chain.materials[0].commit // empty' "$MANIFEST")"
+app_material_kind="$(jq -r '.supply_chain.materials[1].kind // empty' "$MANIFEST")"
+app_material_repository="$(jq -r '.supply_chain.materials[1].repository // empty' "$MANIFEST")"
+app_material_commit="$(jq -r '.supply_chain.materials[1].commit // empty' "$MANIFEST")"
+app_material_path="$(jq -r '.supply_chain.materials[1].path // empty' "$MANIFEST")"
+app_material_tree="$(jq -r '.supply_chain.materials[1].tree // empty' "$MANIFEST")"
+app_material_clean="$(jq -r '.supply_chain.materials[1].clean // false' "$MANIFEST")"
 
+if [[ "$material_count" != "2" ]]; then
+  echo "Release manifest supply_chain.materials must bind exactly the public repository and private app subtree" >&2
+  exit 1
+fi
+if [[ "$public_material_kind" != "git_repository" || "$public_material_repository" != "ottto-ai/ottto" ]]; then
+  echo "Release manifest public source material is invalid" >&2
+  exit 1
+fi
+if [[ ! "$public_material_commit" =~ ^[0-9a-f]{40}$ || "${public_material_commit:0:12}" != "$(jq -r '.commit // empty' "$MANIFEST")" ]]; then
+  echo "Release manifest public source material commit does not match manifest commit" >&2
+  exit 1
+fi
+if [[ "$app_material_kind" != "git_subtree" || "$app_material_repository" != "ottto-ai/coding-agents-observability" ]]; then
+  echo "Release manifest private app source material is invalid" >&2
+  exit 1
+fi
+if [[ ! "$app_material_commit" =~ ^[0-9a-f]{40}$ || "$app_material_path" != "tools/ottto-macos-app" || ! "$app_material_tree" =~ ^[0-9a-f]{40}$ || "$app_material_clean" != "true" ]]; then
+  echo "Release manifest private app source material binding is incomplete" >&2
+  exit 1
+fi
 if [[ "$slsa_spec_version" != "1.2" ]]; then
   echo "Release manifest supply_chain.slsa_build.spec_version must be 1.2" >&2
   exit 1

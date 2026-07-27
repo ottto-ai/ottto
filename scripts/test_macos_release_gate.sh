@@ -25,6 +25,9 @@ jq -e '
   and (.properties.rollback.properties.preserve_failed_version.const == true)
   and (.properties.channel.enum | index("stable-candidate"))
   and (.properties.quality_gates.properties.stable_candidate_rc.required | index("candidate_manifest_sha256"))
+  and (.properties.supply_chain.required | index("materials"))
+  and (.properties.supply_chain.properties.materials.items.properties.commit.pattern == "^[0-9a-f]{40}$")
+  and (.properties.supply_chain.properties.materials.items.properties.tree.pattern == "^[0-9a-f]{40}$")
   and (.properties.supply_chain.properties.slsa_build.properties.predicate_type.const == "https://slsa.dev/provenance/v1")
   and (.properties.supply_chain.properties.sbom.properties.predicate_type.const == "https://cyclonedx.org/bom")
 ' "$SCHEMA" >/dev/null
@@ -114,6 +117,21 @@ write_manifest() {
         }
       },
       supply_chain: {
+        materials: [
+          {
+            kind: "git_repository",
+            repository: "ottto-ai/ottto",
+            commit: "abcdef123456abcdef123456abcdef123456abcd"
+          },
+          {
+            kind: "git_subtree",
+            repository: "ottto-ai/coding-agents-observability",
+            commit: "123456abcdef123456abcdef123456abcdef1234",
+            path: "tools/ottto-macos-app",
+            tree: "fedcba654321fedcba654321fedcba654321fedc",
+            clean: true
+          }
+        ],
         slsa_build: {
           spec_version: "1.2",
           level: "build_l1",
@@ -196,6 +214,21 @@ missing_supply_chain_manifest="$TMP_DIR/missing-supply-chain-manifest.json"
 jq 'del(.supply_chain)' "$dev_manifest" > "$missing_supply_chain_manifest"
 if "$GATE" --manifest "$missing_supply_chain_manifest" >/dev/null 2>&1; then
   echo "Expected manifest without supply-chain metadata to fail" >&2
+  exit 1
+fi
+
+missing_materials_manifest="$TMP_DIR/missing-materials-manifest.json"
+jq 'del(.supply_chain.materials)' "$dev_manifest" > "$missing_materials_manifest"
+if "$GATE" --manifest "$missing_materials_manifest" >/dev/null 2>&1; then
+  echo "Expected manifest without source materials to fail" >&2
+  exit 1
+fi
+
+spoofed_app_material_manifest="$TMP_DIR/spoofed-app-material-manifest.json"
+jq '.supply_chain.materials[1].repository = "evil.invalid/ottto-ai/coding-agents-observability"' \
+  "$dev_manifest" > "$spoofed_app_material_manifest"
+if "$GATE" --manifest "$spoofed_app_material_manifest" >/dev/null 2>&1; then
+  echo "Expected manifest with spoofed private app source material to fail" >&2
   exit 1
 fi
 
@@ -334,6 +367,21 @@ PLIST
         }
       },
       supply_chain: {
+        materials: [
+          {
+            kind: "git_repository",
+            repository: "ottto-ai/ottto",
+            commit: "abcdef123456abcdef123456abcdef123456abcd"
+          },
+          {
+            kind: "git_subtree",
+            repository: "ottto-ai/coding-agents-observability",
+            commit: "123456abcdef123456abcdef123456abcdef1234",
+            path: "tools/ottto-macos-app",
+            tree: "fedcba654321fedcba654321fedcba654321fedc",
+            clean: true
+          }
+        ],
         slsa_build: {
           spec_version: "1.2",
           level: "build_l1",

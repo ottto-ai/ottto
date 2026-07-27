@@ -146,6 +146,28 @@ git -C "$repo" config user.email "sparkle-version-test@example.invalid"
 git -C "$repo" config user.name "Sparkle Version Test"
 git -C "$repo" add .
 git -C "$repo" commit -qm "fixture"
+private_repo="$TMP_DIR/private-repo"
+mkdir -p "$private_repo/tools"
+mv "$app_root" "$private_repo/tools/ottto-macos-app"
+app_root="$private_repo/tools/ottto-macos-app"
+git -C "$private_repo" init -q
+git -C "$private_repo" config user.email "sparkle-version-test@example.invalid"
+git -C "$private_repo" config user.name "Sparkle Version Test"
+git -C "$private_repo" remote add origin git@github.com:ottto-ai/coding-agents-observability.git
+git -C "$private_repo" add .
+git -C "$private_repo" commit -qm "app fixture"
+private_commit="$(git -C "$private_repo" rev-parse HEAD)"
+private_tree="$(git -C "$private_repo" rev-parse HEAD:tools/ottto-macos-app)"
+cat > "$mock_bin/gh" <<GH
+#!/usr/bin/env bash
+set -euo pipefail
+case "\$*" in
+  *repos/singular-labs/coding-agents-observability*) exit 1 ;;
+  *repos/ottto-ai/coding-agents-observability/commits/master*) printf '%s\\n' "$private_commit" ;;
+  *) echo "unexpected gh fixture invocation: \$*" >&2; exit 2 ;;
+esac
+GH
+chmod +x "$mock_bin/gh"
 
 PATH="$mock_bin:$PATH" \
 OTTTO_MACOS_APP_ROOT="$app_root" \
@@ -170,8 +192,47 @@ fi
 if ! jq -e '
   .quality_gates.packaged_app_launch.bundle_short_version == "0.1.92-rc2"
   and .quality_gates.packaged_app_launch.bundle_version == "0.1.92fc2"
+  and (.supply_chain.materials | length) == 2
 ' "$output_dir/release-manifest.json" >/dev/null; then
   echo "Release manifest launch evidence did not preserve both bundle versions" >&2
+  exit 1
+fi
+if ! jq -e \
+  --arg public_commit "$(git -C "$repo" rev-parse HEAD)" \
+  --arg private_commit "$private_commit" \
+  --arg private_tree "$private_tree" \
+  '
+    .supply_chain.materials[0] == {
+      kind: "git_repository",
+      repository: "ottto-ai/ottto",
+      commit: $public_commit
+    }
+    and .supply_chain.materials[1] == {
+      kind: "git_subtree",
+      repository: "ottto-ai/coding-agents-observability",
+      commit: $private_commit,
+      path: "tools/ottto-macos-app",
+      tree: $private_tree,
+      clean: true
+    }
+  ' "$output_dir/release-manifest.json" >/dev/null; then
+  echo "Release manifest did not bind the exact public and private app Git materials" >&2
+  exit 1
+fi
+printf '// dirty fixture\n' >> "$app_root/Package.swift"
+if PATH="$mock_bin:$PATH" \
+  OTTTO_MACOS_APP_ROOT="$app_root" \
+  bash "$repo/scripts/macos_package.sh" \
+    --version "0.1.92-rc3" \
+    --channel stable-candidate \
+    --release-notes "Dirty provenance fixture" \
+    --output-dir "$TMP_DIR/dirty-output" \
+    --skip-build >"$TMP_DIR/dirty.out" 2>&1; then
+  echo "Expected packaging to reject a dirty private app source" >&2
+  exit 1
+fi
+if ! grep -Fq "macOS app source subtree has tracked changes" "$TMP_DIR/dirty.out"; then
+  echo "Dirty private app rejection did not report the expected provenance failure" >&2
   exit 1
 fi
 

@@ -1,7 +1,6 @@
 {
   "candidate_file_count": 284,
-  "content_sha256": "ab8c6e2c35ac4fc759ce9c1a0e57ea3f865c3723e64c94d1c672228e5d8e7f0a",
-  "file_count": 284,
+  "content_sha256": "387ca2fc832d6face92147db2c855d916db5ef30909786c6a22f34c510c0916d",
   "files": [
     {
       "executable": false,
@@ -1575,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "release/manifest.schema.json",
-      "sha256": "6067e2741daa0cd2dcbfc51cfadfa8a23f3c8a769749bc71a33032aa622e3583",
-      "size_bytes": 9661
+      "sha256": "bd10fc68510e923937e2ad4737d57058864012cfa7ae2bd873bffcd2fd4f6e77",
+      "size_bytes": 11330
     },
     {
       "executable": false,
@@ -1687,8 +1686,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "297a45e02451aec888e0416d386370233af95e578167dc85eed7dd60ddcf997d",
-      "size_bytes": 32524
+      "sha256": "2fb93c2a382dcba785a819fd0e9f575a55ef8be9920c30bf719c21b5c0e76c59",
+      "size_bytes": 36212
     },
     {
       "executable": true,
@@ -1708,8 +1707,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_release_gate.sh",
-      "sha256": "e4ee6750775e22bf2505c0b575bb4608310de46765ee3a6253d0125ac4c30174",
-      "size_bytes": 17987
+      "sha256": "b22f2bcc302e1d22a98fb3e610cd84f99c114a54f1bc41e673ca1c2bcb3e4396",
+      "size_bytes": 19950
     },
     {
       "executable": true,
@@ -1834,8 +1833,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_attestation_bind.sh",
-      "sha256": "7ccb5ead191f851b68bfa7d72c5f10767508101404f1ca2284f45de68d0aca95",
-      "size_bytes": 7697
+      "sha256": "3cfb4f0de1ec6bd90abc90e9ff2c12658cb4f14b7cb5fbb040e25edb13bc079f",
+      "size_bytes": 8414
     },
     {
       "executable": true,
@@ -1869,15 +1868,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_public_rc_gate.sh",
-      "sha256": "69bb099ad46ee3129567112abd1071037851269811479cae9879d6179322f570",
-      "size_bytes": 19589
+      "sha256": "5a7cc9a24ed601a0a3bfd6d57cf633308416394ec7f42d146e2ca5d2f59edc83",
+      "size_bytes": 20101
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_release_gate.sh",
-      "sha256": "6d09ac74f063279fdce6fdf3316bad5336af3b139e8175583ad5c42b3414ed2e",
-      "size_bytes": 15712
+      "sha256": "e26ea0109e7cce873dac0cd613c5eac21758c8bbde6665da2f634aa1b5e27151",
+      "size_bytes": 17710
     },
     {
       "executable": true,
@@ -1897,29 +1896,29 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_sparkle_bundle_version.sh",
-      "sha256": "f32d97e1de30294b10ca9e502cebe21094412e9172796e5023dbdc66ca67c475",
-      "size_bytes": 5875
+      "sha256": "96b1bdf72ae56e3e1b4232f067489ce70ae74a7edb1ab664650afbcff28bc398",
+      "size_bytes": 8245
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_closeout_gate.sh",
-      "sha256": "dc958168458d91bbf120c12f3aff974c69e412b913700e32c5178b6a164d8647",
-      "size_bytes": 14604
+      "sha256": "5501b3763887d837e98fb386204abd5496d91a2c820c94be9b8c65b5608897df",
+      "size_bytes": 15116
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_preflight.sh",
-      "sha256": "ae0d7be3338760c09acd9fc633fc7e8633d9f4d3718317c88cb3230357636126",
-      "size_bytes": 15097
+      "sha256": "ee63fd7fc469c8828a9754f0f3ace93dab41da0d9c50b0105cd87f2fef735bdd",
+      "size_bytes": 15609
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_stable_qa_evidence_template.sh",
-      "sha256": "87a1df9026e2eca3b02dc530bf18b097b4a189cb850f675ef052ed5b340f57dc",
-      "size_bytes": 10735
+      "sha256": "824b4d4064ad9ccdcb624eb796433728f5a60934f8209facef8e771010e9e020",
+      "size_bytes": 11217
     },
     {
       "executable": true,
@@ -1992,7 +1991,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-27T10:46:40+00:00",
+  "generated_at": "2026-07-27T16:31:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 285,
   "public_roots": [
@@ -2028,5 +2027,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7d4e4543d02d823dee83206575b13130705679ea"
+  "source_commit": "ca14b9139bfc6fb6acb7ee8af819de00b55224f2"
 }
