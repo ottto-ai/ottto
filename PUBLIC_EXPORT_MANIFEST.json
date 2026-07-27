@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 281,
-  "content_sha256": "95244d31078fd50717be18c7631a5dcf02fc7ffce67485bebe9472229feef924",
+  "candidate_file_count": 282,
+  "content_sha256": "0447559b938313fcef795cb291e7ec3fed08517ba0bbd3700689476054448217",
   "files": [
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "94e336a0ee5a80c18676cb6840de5fd7bd24e2c459f037418b545496b8ac977c",
-      "size_bytes": 620181
+      "sha256": "c9f8a4c5242b936ca503bf3a7135f99db3282b86f63421980320b10cdc8344ff",
+      "size_bytes": 649501
     },
     {
       "executable": false,
@@ -1128,6 +1128,13 @@
       "path": "docs/session-2026-07-27-codex-daily-aggregates-collector.md",
       "sha256": "150ef07eb545c63979c77b2ef1f46c1f93d7bb29b3480920786d305d41471300",
       "size_bytes": 13673
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-27-subagent-session-display-names.md",
+      "sha256": "b711c38cf003f2b6252e2bc0a008803a00d3d48820deaee498d5303cb9c746cd",
+      "size_bytes": 3647
     },
     {
       "executable": false,
@@ -1476,7 +1483,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "26038e7c5c68995fc15f2b65cbd6bbdd7791cdabd66d4db2a486ebc9ae22db27",
+      "sha256": "176a207d236395f013d5efe73cc604ea56b6ad7ff714e22d077185edbe6f1455",
       "size_bytes": 106940
     },
     {
@@ -1972,7 +1979,7 @@
   ],
   "generated_at": "2026-07-27T00:24:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 282,
+  "output_file_count": 283,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
