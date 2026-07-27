@@ -32,7 +32,8 @@ use ottto_protocol::{
     DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
     DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
     LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
-    LocalControlResponse, MachineIdentity, RedactedValue, RelayRuntimeState, RelayState,
+    LocalControlResponse, MachineIdentity, ProviderDailyReferenceBackendGrantResponseV1,
+    ProviderDailyReferenceControlAction, RedactedValue, RelayRuntimeState, RelayState,
     ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
     RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
     SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
@@ -777,6 +778,17 @@ fn handle_command(
             api_base_url,
             backend_grant,
         } => to_value(cloud_sessions_control(
+            action,
+            control_token,
+            api_base_url,
+            backend_grant,
+        )?),
+        LocalControlCommand::ProviderDailyReferenceControl {
+            action,
+            control_token,
+            api_base_url,
+            backend_grant,
+        } => to_value(provider_daily_reference_control(
             action,
             control_token,
             api_base_url,
@@ -2282,6 +2294,259 @@ fn cloud_sessions_control_with_stores(
             grants,
             &crate::cloud_sessions::DeferredCloudSessionTransport,
         ),
+        backend_create_request,
+        backend_revoke_target,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderDailyReferenceControlResult {
+    action: ProviderDailyReferenceControlAction,
+    status: crate::provider_daily_reference::CollectorStatusV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_create_request: Option<crate::provider_daily_reference::GrantCreateRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_revoke_target: Option<crate::provider_daily_reference::GrantRevokeTarget>,
+}
+
+fn provider_daily_reference_action_slug(
+    action: &ProviderDailyReferenceControlAction,
+) -> &'static str {
+    match action {
+        ProviderDailyReferenceControlAction::Prepare => "prepare_provider_daily_reference",
+        ProviderDailyReferenceControlAction::Bind => "bind_provider_daily_reference",
+        ProviderDailyReferenceControlAction::Revoke => "revoke_provider_daily_reference",
+        ProviderDailyReferenceControlAction::ConfirmRevoked => {
+            "confirm_provider_daily_reference_revoked"
+        }
+        ProviderDailyReferenceControlAction::Status => "provider_daily_reference_status",
+    }
+}
+
+/// Drive the local Codex daily-aggregates consent state on behalf of an
+/// operator who asked for it in the UI.
+///
+/// This command packages consent; it never creates it. Prepare records the
+/// operator's explicit local consent and hands back the credential-free DTO the
+/// browser POSTs; nothing collects until the backend's answer is bound, the
+/// server policy approves, and the admitted build matches. All five collection
+/// gates from the collector are untouched by this path.
+fn provider_daily_reference_control(
+    action: ProviderDailyReferenceControlAction,
+    control_token: SecretString,
+    api_base_url: Option<String>,
+    backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
+    provider_daily_reference_control_with_stores(
+        action,
+        control_token,
+        api_base_url,
+        backend_grant,
+        &FileAccountStore::default(),
+        &FileDeviceStore::default(),
+        &crate::provider_daily_reference::GrantStore::default(),
+        &crate::provider_daily_reference::control_token_use_store(),
+        // Consent is taken over the provider account that is signed in right
+        // now. Only the account id is read; the token never enters this path.
+        crate::provider_daily_reference::read_codex_credential()
+            .map(|credential| credential.account_scope),
+        crate::provider_daily_reference::network_disabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_daily_reference_control_with_stores(
+    action: ProviderDailyReferenceControlAction,
+    control_token: SecretString,
+    api_base_url: Option<String>,
+    backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+    accounts: &FileAccountStore,
+    devices: &FileDeviceStore,
+    grants: &crate::provider_daily_reference::GrantStore,
+    token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
+    provider_account_scope: Option<String>,
+    network_disabled: bool,
+) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
+    let action_slug = provider_daily_reference_action_slug(&action);
+    let control_token = control_token.expose_secret();
+    let expires_at_unix = validate_control_token_fresh_for(control_token, action_slug, "codex")?;
+    let token_validation_base_url = control_token_validation_base_url(api_base_url.as_deref())?;
+    let claims = validate_control_token_with_backend_for(
+        &token_validation_base_url,
+        control_token,
+        action_slug,
+        "codex",
+    )?;
+
+    // Hold exact account/device authority stable from local binding validation
+    // through the grant transition, the same way the cloud-sessions bridge does.
+    let identity_lifecycle_lock = lock_setup_run_binding();
+    if action != ProviderDailyReferenceControlAction::Status {
+        require_identity_mutation_reservation(None)?;
+    }
+
+    let account = accounts.load().map_err(|_| {
+        LocalApiError::LocalOperationFailed(
+            "codex daily aggregates account binding is unavailable".to_string(),
+        )
+    })?;
+    let device = devices
+        .load()
+        .map_err(|_| {
+            LocalApiError::LocalOperationFailed(
+                "codex daily aggregates device binding is unavailable".to_string(),
+            )
+        })?
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    if account.state != LocalAccountState::Connected
+        || claims.user_id.as_deref() != Some(local_user_id)
+        || claims.organization_id.as_deref() != Some(local_organization_id)
+        || claims.device_id.as_deref() != Some(device.device_id.as_str())
+        || !device.sources.iter().any(|source| source == "codex")
+    {
+        return Err(LocalApiError::LocalClientNotTrusted);
+    }
+    let token_id = claims
+        .token_id
+        .as_deref()
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+
+    let backend_grant_allowed = matches!(
+        action,
+        ProviderDailyReferenceControlAction::Bind
+            | ProviderDailyReferenceControlAction::Revoke
+            | ProviderDailyReferenceControlAction::ConfirmRevoked
+    );
+    let backend_grant_required = matches!(
+        action,
+        ProviderDailyReferenceControlAction::Bind
+            | ProviderDailyReferenceControlAction::ConfirmRevoked
+    );
+    if (backend_grant_required && backend_grant.is_none())
+        || (!backend_grant_allowed && backend_grant.is_some())
+    {
+        return Err(LocalApiError::InvalidRequest(
+            "backend_grant presence does not match provider daily reference action".to_string(),
+        ));
+    }
+
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_secs();
+    // Consume after trusted-backend and exact local binding validation, but
+    // before any local grant side effect.
+    token_uses
+        .consume(token_id, expires_at_unix, now_unix)
+        .map_err(|_| LocalApiError::LocalClientNotTrusted)?;
+
+    let mut backend_create_request = None;
+    let mut backend_revoke_target = None;
+    let result = match action {
+        ProviderDailyReferenceControlAction::Prepare => {
+            let Some(provider_account_scope) = provider_account_scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(LocalApiError::LocalOperationFailed(
+                    "a signed-in Codex account is required before consent".to_string(),
+                ));
+            };
+            grants
+                .enable(
+                    &crate::provider_daily_reference::GrantSetup {
+                        installation_id: device.device_id.clone(),
+                        organization_scope: local_organization_id.to_string(),
+                        effective_user_scope: local_user_id.to_string(),
+                        provider_account_scope: provider_account_scope.to_string(),
+                    },
+                    time::OffsetDateTime::now_utc(),
+                )
+                .and_then(|_| grants.grant_create_request(&device.device_id))
+                .map(|request| backend_create_request = Some(request))
+        }
+        ProviderDailyReferenceControlAction::Bind => grants
+            .bind_backend_grant(
+                backend_grant
+                    .as_ref()
+                    .expect("backend grant presence validated"),
+                &device.device_id,
+            )
+            .map(|_| ()),
+        ProviderDailyReferenceControlAction::Revoke => grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .and_then(|()| {
+                // Completion-safe compensating cleanup: an authenticated POST
+                // response can arrive after the local revoke. Binding it
+                // retains only its identity - a revoked local grant is never
+                // resurrected - so the DELETE has an exact target.
+                if let Some(response) = backend_grant.as_ref() {
+                    grants.bind_backend_grant(response, &device.device_id)?;
+                }
+                Ok(())
+            }),
+        ProviderDailyReferenceControlAction::ConfirmRevoked => grants
+            .apply_backend_revocation(
+                backend_grant
+                    .as_ref()
+                    .expect("backend grant presence validated"),
+                &device.device_id,
+            )
+            .map(|_| ()),
+        ProviderDailyReferenceControlAction::Status => Ok(()),
+    };
+    result.map_err(|_| {
+        LocalApiError::LocalOperationFailed(
+            "codex daily aggregates local control failed".to_string(),
+        )
+    })?;
+
+    if action == ProviderDailyReferenceControlAction::Status
+        && grants
+            .load()
+            .map_err(|_| {
+                LocalApiError::LocalOperationFailed(
+                    "codex daily aggregates local control failed".to_string(),
+                )
+            })?
+            .is_some_and(|grant| grant.backend_create_pending)
+    {
+        // An authenticated Status after a lost Prepare response returns the
+        // create DTO again, so the browser retries the idempotent POST and
+        // binds its response instead of guessing one.
+        backend_create_request = Some(grants.grant_create_request(&device.device_id).map_err(
+            |_| {
+                LocalApiError::LocalOperationFailed(
+                    "codex daily aggregates local control failed".to_string(),
+                )
+            },
+        )?);
+    }
+
+    if action == ProviderDailyReferenceControlAction::Revoke {
+        // Best effort by design: an unreconciled create has no backend id to
+        // delete, and that is "nothing to delete", not a failed revoke - the
+        // local stop already happened and already blocks collection.
+        backend_revoke_target = grants.grant_revoke_target().ok();
+    }
+    drop(identity_lifecycle_lock);
+
+    Ok(ProviderDailyReferenceControlResult {
+        action,
+        status: crate::provider_daily_reference::collector_status(grants, network_disabled),
         backend_create_request,
         backend_revoke_target,
     })
@@ -14186,6 +14451,326 @@ mod tests {
         )
         .unwrap();
         assert_eq!(confirmed.status.reason_code, "revoked");
+    }
+
+    fn provider_daily_reference_backend_grant(
+        local: &crate::provider_daily_reference::DailyReferenceGrant,
+        device_id: &str,
+        status: &str,
+        grant_version: u64,
+    ) -> ProviderDailyReferenceBackendGrantResponseV1 {
+        ProviderDailyReferenceBackendGrantResponseV1 {
+            id: "00000000-0000-4000-8000-000000000002".to_string(),
+            installation_id: device_id.to_string(),
+            source: crate::provider_daily_reference::SOURCE.to_string(),
+            collector_id: crate::provider_daily_reference::COLLECTOR_ID.to_string(),
+            schema_version: crate::provider_daily_reference::SCHEMA_VERSION.to_string(),
+            collector_version: compiled_release_version(),
+            release_lane: crate::provider_daily_reference::RELEASE_LANE.to_string(),
+            disclosure_version: crate::provider_daily_reference::DISCLOSURE_VERSION.to_string(),
+            grant_scope_fingerprint: local.grant_scope_fingerprint.clone(),
+            account_fingerprint: local.account_fingerprint.clone(),
+            status: status.to_string(),
+            grant_version,
+            server_policy_state: ottto_protocol::ProviderDailyReferenceServerPolicyState::Approved,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn provider_daily_reference_control_composes_prepare_bind_revoke_and_confirm() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("provider-daily-reference-control");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::provider_daily_reference::GrantStore::new(root.join("grant.json"));
+        let token_path = root.join("control-token-uses.json");
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(&token_path);
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |action: ProviderDailyReferenceControlAction,
+                   token_id: &str,
+                   backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+                   network_disabled: bool| {
+            let action_slug = provider_daily_reference_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            provider_daily_reference_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                // An attacker-supplied base url never wins over the trusted one.
+                Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
+                backend_grant,
+                &accounts,
+                &devices,
+                &grants,
+                &token_uses,
+                Some("provider-account-scope".to_string()),
+                network_disabled,
+            )
+        };
+
+        let prepared = run(
+            ProviderDailyReferenceControlAction::Prepare,
+            "pdr-control-prepare",
+            None,
+            false,
+        )
+        .unwrap();
+        let create = prepared.backend_create_request.clone().unwrap();
+        assert_eq!(create.installation_id, device_id);
+        assert_eq!(create.source, crate::provider_daily_reference::SOURCE);
+        assert_eq!(
+            create.collector_id,
+            crate::provider_daily_reference::COLLECTOR_ID
+        );
+        assert_eq!(
+            create.schema_version,
+            crate::provider_daily_reference::SCHEMA_VERSION
+        );
+        assert_eq!(
+            create.disclosure_version,
+            crate::provider_daily_reference::DISCLOSURE_VERSION
+        );
+        assert_eq!(create.collector_version, compiled_release_version());
+        assert!(create.consent);
+        assert_eq!(
+            prepared.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::ConsentRequired
+        );
+        assert_eq!(
+            prepared.status.reason_code,
+            "backend_grant_reconciliation_required"
+        );
+        assert!(!prepared.status.provider_read_permitted);
+
+        // A lost Prepare response: authenticated Status hands the same create
+        // request back so the browser retries the idempotent POST.
+        let recovered = run(
+            ProviderDailyReferenceControlAction::Status,
+            "pdr-control-status-pending",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(recovered.backend_create_request, Some(create));
+
+        let local = grants.load().unwrap().unwrap();
+        let bound = run(
+            ProviderDailyReferenceControlAction::Bind,
+            "pdr-control-bind",
+            Some(provider_daily_reference_backend_grant(
+                &local, device_id, "enabled", 1,
+            )),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            bound.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::Enabled
+        );
+        assert_eq!(bound.status.reason_code, "enabled");
+        assert!(bound.status.provider_read_permitted);
+        assert!(bound.backend_create_request.is_none());
+
+        // The local off-switch outranks a live grant in the served status.
+        let switched_off = run(
+            ProviderDailyReferenceControlAction::Status,
+            "pdr-control-status-off",
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            switched_off.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::NetworkDisabled
+        );
+        assert!(!switched_off.status.provider_read_permitted);
+
+        let revoked = run(
+            ProviderDailyReferenceControlAction::Revoke,
+            "pdr-control-revoke",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            revoked.backend_revoke_target.unwrap().grant_id,
+            "00000000-0000-4000-8000-000000000002"
+        );
+        assert_eq!(
+            revoked.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::Revoked
+        );
+
+        let confirmed = run(
+            ProviderDailyReferenceControlAction::ConfirmRevoked,
+            "pdr-control-confirm",
+            Some(provider_daily_reference_backend_grant(
+                &grants.load().unwrap().unwrap(),
+                device_id,
+                "revoked",
+                2,
+            )),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            confirmed.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::Revoked
+        );
+        assert_eq!(confirmed.status.reason_code, "revoked");
+        assert!(
+            grants
+                .load()
+                .unwrap()
+                .unwrap()
+                .backend_binding
+                .unwrap()
+                .backend_revoked
+        );
+
+        // The replay ledger persists digests only.
+        let persisted = fs::read_to_string(token_path).unwrap();
+        for raw_id in [
+            "pdr-control-prepare",
+            "pdr-control-status-pending",
+            "pdr-control-bind",
+            "pdr-control-status-off",
+            "pdr-control-revoke",
+            "pdr-control-confirm",
+        ] {
+            assert!(!persisted.contains(raw_id));
+        }
+        assert!(!persisted.contains("header."));
+    }
+
+    #[test]
+    #[serial]
+    fn provider_daily_reference_control_refuses_to_create_consent_without_authority() {
+        let _guard = lock_backend_test_env();
+        let root = telemetry_key_store_root("provider-daily-reference-control-authority");
+        let accounts = FileAccountStore::new(root.join("account.json"));
+        let devices = FileDeviceStore::new(root.join("device.json"));
+        let grants = crate::provider_daily_reference::GrantStore::new(root.join("grant.json"));
+        let token_uses = crate::cloud_sessions::CloudSessionControlTokenUseStore::new(
+            root.join("control-token-uses.json"),
+        );
+        accounts.save(&connected_account()).unwrap();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        devices
+            .save(&LocalDeviceBinding {
+                device_id: device_id.to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .unwrap();
+
+        let run = |action: ProviderDailyReferenceControlAction,
+                   token_id: &str,
+                   backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+                   provider_account_scope: Option<String>| {
+            let action_slug = provider_daily_reference_action_slug(&action);
+            let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
+            let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            provider_daily_reference_control_with_stores(
+                action,
+                SecretString::new(test_control_token(action_slug, "codex", 240)),
+                None,
+                backend_grant,
+                &accounts,
+                &devices,
+                &grants,
+                &token_uses,
+                provider_account_scope,
+                false,
+            )
+        };
+
+        // Consent is taken over a provider account. Without a signed-in Codex
+        // account there is nothing to consent about, and none is invented.
+        assert!(matches!(
+            run(
+                ProviderDailyReferenceControlAction::Prepare,
+                "pdr-authority-no-provider-account",
+                None,
+                Some("   ".to_string()),
+            ),
+            Err(LocalApiError::LocalOperationFailed(_))
+        ));
+        assert!(grants.load().unwrap().is_none());
+
+        // A backend grant on an action that must not carry one is refused
+        // before any local mutation.
+        assert!(matches!(
+            run(
+                ProviderDailyReferenceControlAction::Prepare,
+                "pdr-authority-unexpected-grant",
+                Some(ProviderDailyReferenceBackendGrantResponseV1 {
+                    id: "00000000-0000-4000-8000-000000000002".to_string(),
+                    installation_id: device_id.to_string(),
+                    source: crate::provider_daily_reference::SOURCE.to_string(),
+                    collector_id: crate::provider_daily_reference::COLLECTOR_ID.to_string(),
+                    schema_version: crate::provider_daily_reference::SCHEMA_VERSION.to_string(),
+                    collector_version: compiled_release_version(),
+                    release_lane: crate::provider_daily_reference::RELEASE_LANE.to_string(),
+                    disclosure_version: crate::provider_daily_reference::DISCLOSURE_VERSION
+                        .to_string(),
+                    grant_scope_fingerprint: format!("hmac-sha256:{}", "a".repeat(64)),
+                    account_fingerprint: format!("hmac-sha256:{}", "b".repeat(64)),
+                    status: "enabled".to_string(),
+                    grant_version: 1,
+                    server_policy_state:
+                        ottto_protocol::ProviderDailyReferenceServerPolicyState::Approved,
+                }),
+                Some("provider-account-scope".to_string()),
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+        assert!(grants.load().unwrap().is_none());
+
+        // Bind requires one.
+        assert!(matches!(
+            run(
+                ProviderDailyReferenceControlAction::Bind,
+                "pdr-authority-missing-grant",
+                None,
+                Some("provider-account-scope".to_string()),
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+
+        // A control token minted for a different action is not this action's.
+        let api_base = cloud_control_validation_server(
+            "prepare_provider_daily_reference",
+            "pdr-authority-wrong-action",
+            device_id,
+        );
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+        assert!(matches!(
+            provider_daily_reference_control_with_stores(
+                ProviderDailyReferenceControlAction::Prepare,
+                SecretString::new(test_control_token("prepare_cloud_sessions", "codex", 240)),
+                None,
+                None,
+                &accounts,
+                &devices,
+                &grants,
+                &token_uses,
+                Some("provider-account-scope".to_string()),
+                false,
+            ),
+            Err(LocalApiError::LocalClientNotTrusted)
+        ));
+        assert!(grants.load().unwrap().is_none());
     }
 
     #[test]

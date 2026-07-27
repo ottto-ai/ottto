@@ -31,7 +31,9 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
+use time::{
+    format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime, UtcOffset,
+};
 use zeroize::Zeroizing;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -425,6 +427,8 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         plan_type: None,
         subscription_product: None,
         billing_channel: None,
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
@@ -3244,6 +3248,8 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         plan_type: None,
         subscription_product: None,
         billing_channel: None,
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
@@ -3514,6 +3520,8 @@ fn not_installed_snapshot(
         plan_type: None,
         subscription_product: None,
         billing_channel: None,
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
@@ -3547,6 +3555,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
             plan_type: None,
             subscription_product: None,
             billing_channel: None,
+            subscription_period_start: None,
+            subscription_period_end: None,
             account_identifier_hash: None,
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
@@ -3575,6 +3585,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
         plan_type: plan_type.clone(),
         subscription_product: plan_type.map(|plan| format!("chatgpt_{plan}")),
         billing_channel: Some("subscription".to_string()),
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
@@ -3647,6 +3659,18 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         .or_else(|| first_json_string(&claims, &["sub"]));
     let organization = auth_claim.and_then(default_codex_organization);
     let email = first_json_string(&claims, &["email"]);
+    // The same claim object that carries `chatgpt_plan_type` also carries the
+    // real subscription period. Read it here rather than deriving one: the
+    // backend contract is "reported or absent".
+    let subscription_period_start = auth_claim.and_then(|value| {
+        subscription_period_timestamp(value, "chatgpt_subscription_active_start")
+    });
+    let subscription_period_end = auth_claim.and_then(|value| {
+        subscription_period_timestamp(value, "chatgpt_subscription_active_until")
+    });
+    // Deliberately unchanged: a period with no plan, account, email, or
+    // organization is not a useful account row, so it does not by itself
+    // resurrect one.
     if plan_type.is_none() && account_id.is_none() && email.is_none() && organization.is_none() {
         return None;
     }
@@ -3674,6 +3698,8 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         plan_type: plan_type.clone(),
         subscription_product: plan_type.map(chatgpt_subscription_product),
         billing_channel: Some("subscription".to_string()),
+        subscription_period_start,
+        subscription_period_end,
         account_identifier_hash,
         organization_identifier_hash,
         credential_fingerprint_hash: None,
@@ -3681,6 +3707,32 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     })
+}
+
+/// Sanity window for a reported subscription-period boundary, in Unix seconds.
+///
+/// The claim's wire type is not guaranteed, so a millisecond-encoded value is a
+/// real possibility. It lands far outside this window and therefore reads as
+/// "not reported" rather than as a year-57000 renewal date.
+const SUBSCRIPTION_PERIOD_MIN_UNIX_SECONDS: i64 = 1_420_070_400; // 2015-01-01T00:00:00Z
+const SUBSCRIPTION_PERIOD_MAX_UNIX_SECONDS: i64 = 4_102_444_800; // 2100-01-01T00:00:00Z
+
+/// Read one subscription-period boundary from a provider auth claim.
+///
+/// Format-tolerant by design: epoch seconds (number or numeric string) and
+/// RFC3339 strings are both accepted and normalized to an offset-bearing UTC
+/// RFC3339 timestamp. Anything unparseable, or outside the sanity window,
+/// returns `None`. No failure path substitutes `now`.
+fn subscription_period_timestamp(value: &Value, key: &str) -> Option<String> {
+    let parsed = OffsetDateTime::parse(&json_timestamp_rfc3339(value, &[key])?, &Rfc3339).ok()?;
+    if !(SUBSCRIPTION_PERIOD_MIN_UNIX_SECONDS..=SUBSCRIPTION_PERIOD_MAX_UNIX_SECONDS)
+        .contains(&parsed.unix_timestamp())
+    {
+        return None;
+    }
+    // An offset-bearing input is converted, not reinterpreted: the instant is
+    // preserved and every emitted boundary reads as UTC.
+    parsed.to_offset(UtcOffset::UTC).format(&Rfc3339).ok()
 }
 
 fn collect_codex_app_server_usage() -> Result<CodexUsageProbe, String> {
@@ -4335,6 +4387,14 @@ fn merge_codex_accounts(
             .subscription_product
             .or(existing.subscription_product),
         billing_channel: auth_account.billing_channel.or(existing.billing_channel),
+        // This struct is rebuilt field-by-field, so a field added upstream and
+        // not carried here is dropped silently on every merged Codex account.
+        subscription_period_start: auth_account
+            .subscription_period_start
+            .or(existing.subscription_period_start),
+        subscription_period_end: auth_account
+            .subscription_period_end
+            .or(existing.subscription_period_end),
         account_identifier_hash: auth_account
             .account_identifier_hash
             .or(existing.account_identifier_hash),
@@ -4466,6 +4526,8 @@ fn parse_claude_auth_json(value: &Value) -> AgentAccountStatus {
             api_provider.as_deref(),
             plan_type.as_deref(),
         )),
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash,
         organization_identifier_hash,
         credential_fingerprint_hash: None,
@@ -5978,6 +6040,8 @@ fn unsupported_account(provider: &str) -> AgentAccountStatus {
         plan_type: None,
         subscription_product: None,
         billing_channel: None,
+        subscription_period_start: None,
+        subscription_period_end: None,
         account_identifier_hash: None,
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
@@ -6551,6 +6615,8 @@ for line in sys.stdin:
                     "chatgpt_account_id": "account_123",
                     "chatgpt_user_id": "user_123",
                     "chatgpt_plan_type": "Team",
+                    "chatgpt_subscription_active_start": 1782864000,
+                    "chatgpt_subscription_active_until": 1785542400,
                     "organizations": [
                         {"id": "org_old", "title": "Old Org", "is_default": false},
                         {"id": "org_current", "title": "Current Org", "is_default": true}
@@ -6573,7 +6639,162 @@ for line in sys.stdin:
             account.subscription_product.as_deref(),
             Some("chatgpt_team")
         );
+        assert_eq!(
+            account.subscription_period_start.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            account.subscription_period_end.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
         assert_eq!(account.confidence, AgentStatusConfidence::High);
+    }
+
+    fn codex_id_token_with_auth_claim(auth_claim: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{
+                "email": "codex@example.com",
+                "sub": "account_sub",
+                "https://api.openai.com/auth": {auth_claim}
+            }}"#
+        ));
+        format!("{header}.{payload}.signature")
+    }
+
+    #[test]
+    fn codex_id_token_subscription_period_is_absent_when_the_claims_are_absent() {
+        let token = codex_id_token_with_auth_claim(
+            r#"{"chatgpt_account_id": "account_123", "chatgpt_plan_type": "Pro"}"#,
+        );
+
+        let account = parse_codex_id_token_account(&token).expect("account");
+
+        assert_eq!(account.plan_type.as_deref(), Some("pro"));
+        assert_eq!(account.subscription_period_start, None);
+        assert_eq!(account.subscription_period_end, None);
+    }
+
+    #[test]
+    fn codex_id_token_subscription_period_reads_rfc3339_strings_as_utc() {
+        let token = codex_id_token_with_auth_claim(
+            r#"{
+                "chatgpt_account_id": "account_123",
+                "chatgpt_plan_type": "Pro",
+                "chatgpt_subscription_active_start": "2026-07-01T03:00:00+03:00",
+                "chatgpt_subscription_active_until": "1785542400"
+            }"#,
+        );
+
+        let account = parse_codex_id_token_account(&token).expect("account");
+
+        // An offset-bearing string is converted, not reinterpreted: same instant.
+        assert_eq!(
+            account.subscription_period_start.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            account.subscription_period_end.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn codex_id_token_subscription_period_drops_malformed_and_out_of_range_claims() {
+        // Milliseconds, a non-date string, a null, and a nested object are all
+        // "not reported" - never a panic, never a substituted `now`.
+        for claim in [
+            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": 1782864000000, "chatgpt_subscription_active_until": 1785542400000}"#,
+            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": "not-a-date", "chatgpt_subscription_active_until": "also-not-a-date"}"#,
+            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": null, "chatgpt_subscription_active_until": null}"#,
+            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": {"seconds": 1782864000}, "chatgpt_subscription_active_until": []}"#,
+            r#"{"chatgpt_plan_type": "Pro", "chatgpt_subscription_active_start": 0, "chatgpt_subscription_active_until": -1}"#,
+        ] {
+            let account = parse_codex_id_token_account(&codex_id_token_with_auth_claim(claim))
+                .expect("account");
+            assert_eq!(account.plan_type.as_deref(), Some("pro"), "claim: {claim}");
+            assert_eq!(account.subscription_period_start, None, "claim: {claim}");
+            assert_eq!(account.subscription_period_end, None, "claim: {claim}");
+        }
+    }
+
+    #[test]
+    fn codex_id_token_subscription_period_accepts_one_sided_reporting() {
+        let token = codex_id_token_with_auth_claim(
+            r#"{
+                "chatgpt_plan_type": "Pro",
+                "chatgpt_subscription_active_until": 1785542400
+            }"#,
+        );
+
+        let account = parse_codex_id_token_account(&token).expect("account");
+
+        assert_eq!(account.subscription_period_start, None);
+        assert_eq!(
+            account.subscription_period_end.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn codex_id_token_subscription_period_alone_does_not_resurrect_an_empty_account() {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{
+                "https://api.openai.com/auth": {
+                    "chatgpt_subscription_active_start": 1782864000,
+                    "chatgpt_subscription_active_until": 1785542400
+                }
+            }"#,
+        );
+        let token = format!("{header}.{payload}.signature");
+
+        assert!(parse_codex_id_token_account(&token).is_none());
+    }
+
+    #[test]
+    fn merged_codex_accounts_carry_the_subscription_period() {
+        let mut auth_account = unsupported_account("openai");
+        auth_account.login_state = AgentLoginState::SignedIn;
+        auth_account.subscription_period_start = Some("2026-07-01T00:00:00Z".to_string());
+        auth_account.subscription_period_end = Some("2026-08-01T00:00:00Z".to_string());
+        let mut existing = unsupported_account("openai");
+        existing.email = Some("codex@example.com".to_string());
+
+        let merged = merge_codex_accounts(Some(existing), auth_account.clone());
+
+        assert_eq!(
+            merged.subscription_period_start.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            merged.subscription_period_end.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+
+        // A later probe that reports nothing must not blank a known period.
+        let mut silent = unsupported_account("openai");
+        silent.login_state = AgentLoginState::SignedIn;
+        let preserved = merge_codex_accounts(Some(merged), silent);
+
+        assert_eq!(
+            preserved.subscription_period_start.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            preserved.subscription_period_end.as_deref(),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn subscription_period_is_omitted_from_the_wire_when_absent() {
+        let account = unsupported_account("openai");
+
+        let wire = serde_json::to_value(&account).expect("serialize");
+
+        assert!(wire.get("subscription_period_start").is_none());
+        assert!(wire.get("subscription_period_end").is_none());
     }
 
     #[test]
