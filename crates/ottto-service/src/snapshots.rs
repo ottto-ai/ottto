@@ -11418,11 +11418,13 @@ mod tests {
     fn claude_subagent_facts_fit_the_bounded_payload_budget() {
         // The budget is a hard byte ceiling over the serialized fact list and
         // one oversized item 422s the whole batch, so the daemon must trim. At
-        // ~269 bytes per fact the old 2 KiB budget fit only seven and dropped
-        // `spawn_depth`; the 4 KiB budget fits all eight, which is the whole
-        // point of the raise. Pin the full set for the single layout that
-        // carries every fact -- a WORKFLOW agent -- so a future trim cannot
-        // silently move back onto one of them.
+        // ~269 bytes per fact the retired 2 KiB budget fit only seven and
+        // dropped `spawn_depth` -- the field deliberately ordered last -- which
+        // is what a production Claude subagent session actually lost. The 8 KiB
+        // budget the deployed backend also enforces fits all eight with room to
+        // spare, which is the whole point of the raise. Pin the full set for the
+        // single layout that carries every fact -- a WORKFLOW agent -- so a
+        // future trim cannot silently move back onto one of them.
         let root = temp_dir("claude-subagent-budget");
         let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
         let workflow_dir = root
@@ -11466,14 +11468,36 @@ mod tests {
                 "spawn_depth",
             ]
         );
+        const RETIRED_PAYLOAD_BUDGET_BYTES: usize = 2_048;
+        let payload_bytes = serde_json::to_vec(&item.attribution_facts)
+            .expect("serialize facts")
+            .len();
         assert!(
-            serde_json::to_vec(&item.attribution_facts)
-                .expect("serialize facts")
-                .len()
-                <= crate::session_attribution::MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+            payload_bytes <= crate::session_attribution::MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            "the full workflow-subagent fact set must fit the wire budget"
+        );
+        assert!(
+            payload_bytes > RETIRED_PAYLOAD_BUDGET_BYTES,
+            "this set is the one the retired 2 KiB budget trimmed; if it now fits there, the \
+             fixture stopped covering the regression"
+        );
+        // Not merely inside the budget but comfortably inside it: the raise is
+        // supposed to leave headroom for the grouping facts appended after these
+        // eight, not land one skill fact short of trimming again.
+        assert!(
+            payload_bytes * 2 <= crate::session_attribution::MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            "expected the full fact set to use under half the budget, used {payload_bytes}"
         );
         crate::session_attribution::validate_fact_limits(&item.attribution_facts)
             .expect("bounded payload");
+        // Re-bounding an already-fitting set must be a no-op; this is the call
+        // the upload path makes, and it is where `spawn_depth` used to vanish.
+        let mut rebounded = item.attribution_facts.clone();
+        crate::session_attribution::enforce_fact_limits(&mut rebounded);
+        assert_eq!(
+            rebounded, item.attribution_facts,
+            "the full workflow-subagent fact set must survive enforce_fact_limits untouched"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
