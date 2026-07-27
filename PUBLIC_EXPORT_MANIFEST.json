@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 281,
-  "content_sha256": "95244d31078fd50717be18c7631a5dcf02fc7ffce67485bebe9472229feef924",
+  "candidate_file_count": 282,
+  "content_sha256": "b428a896843da842798e1120d7ff69c2345a1ff55c6a5cea5a2648945333711a",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "8ba70820407d304f78c72c68f4e5611754e620c38ee594820794bf85e9839d18",
-      "size_bytes": 362370
+      "sha256": "eef998c0e05844157d4f74c3fa1a513a9b4b6b59962f5c15cf2e00efa8158b29",
+      "size_bytes": 368741
     },
     {
       "executable": false,
@@ -1128,6 +1128,13 @@
       "path": "docs/session-2026-07-27-codex-daily-aggregates-collector.md",
       "sha256": "150ef07eb545c63979c77b2ef1f46c1f93d7bb29b3480920786d305d41471300",
       "size_bytes": 13673
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-27-oauth-window-account-stamp.md",
+      "sha256": "2f0aecba81afd02297d0fa682c0c432b827e8b53be5825e6cde2002ad3d9ee9f",
+      "size_bytes": 2071
     },
     {
       "executable": false,
@@ -1972,7 +1979,7 @@
   ],
   "generated_at": "2026-07-27T00:24:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 282,
+  "output_file_count": 283,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
