@@ -1,6 +1,7 @@
 {
-  "candidate_file_count": 283,
-  "content_sha256": "5fc43d201c6955015f1639eedd6dd594f488703d3d4cdcd516c0c139cc874867",
+  "candidate_file_count": 284,
+  "content_sha256": "ab8c6e2c35ac4fc759ce9c1a0e57ea3f865c3723e64c94d1c672228e5d8e7f0a",
+  "file_count": 284,
   "files": [
     {
       "executable": false,
@@ -846,8 +847,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "94e336a0ee5a80c18676cb6840de5fd7bd24e2c459f037418b545496b8ac977c",
-      "size_bytes": 620181
+      "sha256": "c9f8a4c5242b936ca503bf3a7135f99db3282b86f63421980320b10cdc8344ff",
+      "size_bytes": 649501
     },
     {
       "executable": false,
@@ -1142,6 +1143,13 @@
       "path": "docs/session-2026-07-27-oauth-window-account-stamp.md",
       "sha256": "2f0aecba81afd02297d0fa682c0c432b827e8b53be5825e6cde2002ad3d9ee9f",
       "size_bytes": 2071
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-27-subagent-session-display-names.md",
+      "sha256": "b711c38cf003f2b6252e2bc0a008803a00d3d48820deaee498d5303cb9c746cd",
+      "size_bytes": 3647
     },
     {
       "executable": false,
@@ -1490,7 +1498,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "26038e7c5c68995fc15f2b65cbd6bbdd7791cdabd66d4db2a486ebc9ae22db27",
+      "sha256": "176a207d236395f013d5efe73cc604ea56b6ad7ff714e22d077185edbe6f1455",
       "size_bytes": 106940
     },
     {
@@ -1986,7 +1994,7 @@
   ],
   "generated_at": "2026-07-27T10:46:40+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 284,
+  "output_file_count": 285,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2020,5 +2028,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cee030a1a6a6b5df6419d0cdc5389a34a63fd48d"
+  "source_commit": "7d4e4543d02d823dee83206575b13130705679ea"
 }

@@ -126,8 +126,25 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // one parent session. The bump re-walks every Claude transcript once so already
 // scanned workflow-agent files re-emit under their own
 // `<parentSessionId>_agent-<agentId>` id instead of over their parent.
+// claude_code v21: subagent sessions get real display names. A re-keyed
+// `<parentSessionId>_agent-<agentId>` session now emits
+// `session_display_name_source=agent_label` built from the best available
+// durable label material — Workflow run-manifest `label`
+// (`workflows/wf_*.json` -> `workflowProgress[].label`, e.g.
+// `probe:data-model`) > Task sidecar `description` (`agent-<id>.meta.json`,
+// e.g. "Fix flaky backend tests") > sidecar `agentType` — optionally composed
+// as "spawned by <parent title> - <label>" when the parent's desktop-store
+// title is known, mirroring the desktop app's own spawned-session naming. The
+// first-prompt TITLE fallback is suppressed for subagent transcripts (their
+// "first prompt" is the injected Task prompt body; the operator decision is
+// short titles yes, prompt content no), while first-prompt MATERIAL still
+// feeds attribution grouping. Naming sidecars (meta.json, workflow manifest,
+// parent desktop title) join the subagent scan fingerprint so late-arriving
+// labels re-select unchanged transcripts, and the scan-identity bump below
+// re-walks already-indexed subagent files once so EXISTING agent sessions
+// re-emit with names instead of staying on their generic fallbacks.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v20";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v21";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
@@ -144,8 +161,17 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 // is scan identity, not parser provenance. Cost of the one-time revisit stays
 // bounded: an unchanged session re-parses to the same semantic fingerprint and
 // is suppressed as a semantic no-op instead of being re-uploaded.
+// claude_code v21 also moves scan identity, for the same reason v20 did: the
+// scan index skips a transcript whose bytes and mtime are unchanged, and the
+// new naming-sidecar fingerprint components only guard FUTURE label/title
+// changes — they are computed against entries indexed under the old identity,
+// which recorded no sidecar contribution at all, so without the bump every
+// already-indexed subagent transcript would keep its generic fallback name
+// forever. The one-time revisit stays bounded: an unchanged session re-parses
+// to a new title but is otherwise a semantic no-op-sized re-upload of
+// already-known usage.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v20";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v21";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
@@ -2281,8 +2307,28 @@ impl SnapshotAccumulator {
         // A subagent transcript (Task tool or Workflow tool, at any nesting
         // depth under `subagents/`) carries its PARENT's sessionId on every line
         // and is re-keyed later in into_items; never hand a subagent session its
-        // parent's desktop title.
-        if claude_subagent_identity(path).is_some() {
+        // parent's desktop title. Instead, name it from the agent's own durable
+        // label material (workflow label > Task description > agentType),
+        // optionally composed with the parent's title the way the desktop app
+        // composes its "spawned by <parent> - <child>" session titles.
+        if let Some(identity) = claude_subagent_identity(path) {
+            let label = claude_workflow_agent_label(path, &identity).or_else(|| {
+                let meta = read_claude_agent_meta(path);
+                meta.description.or(meta.agent_kind)
+            });
+            if let Some(label) = label {
+                let parent_title = metadata
+                    .titles
+                    .get(identity.root_session_id.as_str())
+                    .map(|candidate| candidate.title.as_str());
+                // Unconditional set: the deterministic agent label is the
+                // operator-approved name for these sessions and must also
+                // replace any prompt-derived candidate captured line-by-line.
+                self.set_title(
+                    Some(compose_claude_agent_title(&label, parent_title)),
+                    "agent_label",
+                );
+            }
             return;
         }
         let Some(candidate) = metadata.titles.get(session_id.as_str()) else {
@@ -3034,9 +3080,19 @@ fn scan_source_roots_with_limit_and_attribution(
                 // A subagent transcript at any depth under `subagents/` has no
                 // desktop-store entry of its own: its file stem is an agent id,
                 // never a session id, so looking one up would either miss or
-                // (worse) collide with an unrelated session.
-                if claude_subagent_identity(&candidate.path).is_some() {
-                    String::new()
+                // (worse) collide with an unrelated session. Its NAMING
+                // material lives elsewhere — the `meta.json` sidecar, the
+                // Workflow run manifest, and the parent's title — so those
+                // feed the scan fingerprint instead: a label or parent title
+                // arriving AFTER the transcript was indexed must still
+                // re-select the unchanged transcript for a title re-emit
+                // (same late-sidecar rationale as claude_code v14).
+                if let Some(identity) = claude_subagent_identity(&candidate.path) {
+                    claude_subagent_sidecar_fingerprint(
+                        &candidate.path,
+                        &identity,
+                        &claude_title_metadata,
+                    )
                 } else {
                     candidate
                         .path
@@ -3530,7 +3586,14 @@ fn parse_jsonl_file(
         if let Some(metadata) = claude_title_metadata {
             accumulator.apply_claude_title_metadata(path, metadata);
         }
-        accumulator.apply_first_prompt_fallback();
+        // A subagent transcript's "first user prompt" is the Task/Workflow
+        // prompt BODY the parent injected, not a human-authored title. Agent
+        // sessions are named from label material only (`agent_label` above);
+        // prompt content must never become their display name. The captured
+        // first-prompt MATERIAL still feeds attribution grouping unchanged.
+        if claude_subagent_identity(path).is_none() {
+            accumulator.apply_first_prompt_fallback();
+        }
     }
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
@@ -6393,6 +6456,36 @@ fn first_prompt_display_title(value: String) -> Option<String> {
     normalize_display_title(normalized, "first_prompt")
 }
 
+/// Compose a subagent session title from its label and (when known) the
+/// parent's title, mirroring the Claude desktop app's own
+/// "spawned by <parent title> - <child title>" naming for desktop-spawned
+/// sessions. The parent part is truncated so the whole composition stays under
+/// `is_safe_display_title`'s 120-char ceiling — a too-long parent title must
+/// shrink rather than sink the child's name entirely — and is skipped when the
+/// remaining budget would leave a uselessly short fragment.
+fn compose_claude_agent_title(label: &str, parent_title: Option<&str>) -> String {
+    const COMPOSED_TITLE_MAX_CHARS: usize = 120;
+    const MIN_PARENT_FRAGMENT_CHARS: usize = 12;
+    let Some(parent_title) = parent_title else {
+        return label.to_string();
+    };
+    let parent_normalized = parent_title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if parent_normalized.is_empty() {
+        return label.to_string();
+    }
+    let fixed_chars = "spawned by ".chars().count() + " - ".chars().count();
+    let parent_budget =
+        COMPOSED_TITLE_MAX_CHARS.saturating_sub(fixed_chars + label.chars().count());
+    if parent_budget < MIN_PARENT_FRAGMENT_CHARS {
+        return label.to_string();
+    }
+    let parent_fragment: String = parent_normalized.chars().take(parent_budget).collect();
+    format!("spawned by {} - {label}", parent_fragment.trim_end())
+}
+
 fn is_safe_display_title(value: &str, source: &str) -> bool {
     let char_count = value.chars().count();
     if char_count == 0 || char_count > 120 {
@@ -6687,9 +6780,14 @@ const MAX_CLAUDE_AGENT_META_BYTES: u64 = 64 * 1024;
 /// Provider-written sidecar describing one Claude Code subagent, read from
 /// `<transcript>.meta.json` (e.g. `agent-a4d15....meta.json`).
 ///
-/// Only the fields that are safe to forward are retained. `description`,
-/// `worktreePath`, and `worktreeBranch` are deliberately NOT read: they carry
-/// user prompt material and local filesystem paths.
+/// Only the fields that are safe to forward are retained. `worktreePath` and
+/// `worktreeBranch` are deliberately NOT read: they carry local filesystem
+/// paths. `description` (the Task tool's 3-8 word task summary) IS read as
+/// display-title material — an operator decision (2026-07-27) that partially
+/// revisits the original exclusion: short agent titles are wanted, full prompt
+/// bodies and paths stay out, and `safe_claude_agent_display_label` enforces
+/// that shape (char allowlist + hard truncation) so a pathological description
+/// cannot smuggle prompt content.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeAgentMeta {
     /// `agentType`, e.g. `workflow-subagent`, `Explore`, `general-purpose`.
@@ -6699,6 +6797,9 @@ pub(crate) struct ClaudeAgentMeta {
     /// `parentAgentId` when this agent was spawned by another agent rather than
     /// by the top-level session.
     parent_agent_id: Option<String>,
+    /// `description` — the short title-shaped Task summary (e.g. "Fix flaky
+    /// backend tests"). Sanitized display-label material, never a prompt body.
+    description: Option<String>,
 }
 
 /// Best-effort read of a subagent's `*.meta.json` sidecar.
@@ -6738,7 +6839,174 @@ fn read_claude_agent_meta(transcript_path: &Path) -> ClaudeAgentMeta {
             .and_then(Value::as_u64)
             .map(|depth| depth.to_string()),
         parent_agent_id: string_at(&value, &["parentAgentId"]).and_then(safe_attribution_token),
+        description: string_at(&value, &["description"]).and_then(safe_claude_agent_display_label),
     }
+}
+
+/// Hard cap for a subagent display label (workflow `label` or Task
+/// `description`). Longer values are truncated, not rejected: the leading
+/// characters of a title-shaped value are still a useful title, and the cap is
+/// what keeps a pathological description from smuggling prompt content.
+const MAX_CLAUDE_AGENT_LABEL_CHARS: usize = 80;
+
+/// Sanitize a provider-supplied subagent display label.
+///
+/// Unlike `safe_attribution_token` (identifiers only), a label is short human
+/// text: whitespace is collapsed, then the value must pass a conservative
+/// printable-ASCII allowlist — anything with control characters, non-ASCII, or
+/// separator-smuggling backslashes is dropped rather than repaired. Values are
+/// truncated to `MAX_CLAUDE_AGENT_LABEL_CHARS`, and anything that still looks
+/// like a path escapes the allowlist via the same forbidden fragments the
+/// attribution tokens use.
+fn safe_claude_agent_display_label(value: String) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if !normalized.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                ' ' | '.'
+                    | ','
+                    | ':'
+                    | ';'
+                    | '_'
+                    | '-'
+                    | '+'
+                    | '#'
+                    | '('
+                    | ')'
+                    | '\''
+                    | '&'
+                    | '/'
+                    | '?'
+                    | '!'
+            )
+    }) {
+        return None;
+    }
+    let truncated: String = normalized
+        .chars()
+        .take(MAX_CLAUDE_AGENT_LABEL_CHARS)
+        .collect();
+    let lowered = truncated.to_ascii_lowercase();
+    if ATTRIBUTION_TOKEN_FORBIDDEN_FRAGMENTS
+        .iter()
+        .any(|fragment| lowered.contains(fragment))
+        || lowered.contains("/users/")
+        || lowered.contains("/home/")
+    {
+        return None;
+    }
+    Some(truncated)
+}
+
+/// Upper bound for a Workflow run-manifest read (`workflows/wf_*.json`).
+/// Observed manifests are a few hundred KB (they carry per-agent progress rows
+/// including result previews); the cap only stops a pathological file from
+/// being slurped into the per-user daemon.
+const MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+
+/// `<sessionDir>/workflows/<wfId>.json` — the Workflow tool's run manifest,
+/// sibling of the `subagents/` tree that holds the agent transcripts. Resolved
+/// from the transcript path by walking up to the nearest `subagents` ancestor
+/// (the same anchor `claude_subagent_identity` keys on).
+fn claude_workflow_manifest_path(transcript_path: &Path, workflow_ref: &str) -> Option<PathBuf> {
+    let mut directory = transcript_path.parent();
+    while let Some(current) = directory {
+        if current.file_name().and_then(|value| value.to_str()) == Some("subagents") {
+            return Some(
+                current
+                    .parent()?
+                    .join("workflows")
+                    .join(format!("{workflow_ref}.json")),
+            );
+        }
+        directory = current.parent();
+    }
+    None
+}
+
+/// The human-readable label a Workflow run assigned to one of its agents (e.g.
+/// `probe:data-model`, `verify:daemon-scan-claim`).
+///
+/// Labels are durably recorded in the run manifest's `workflowProgress` array
+/// as `{type:"workflow_agent", agentId, label, ...}` rows — the agent's own
+/// `meta.json` sidecar does NOT carry them. Only `label` is extracted; the
+/// prompt/result previews that ride the same rows are never read past the
+/// serde parse. Best-effort: every failure mode degrades to `None`.
+fn claude_workflow_agent_label(
+    transcript_path: &Path,
+    identity: &ClaudeSubagentIdentity,
+) -> Option<String> {
+    let workflow_ref = identity.workflow_ref.as_deref()?;
+    let agent_ref = identity.agent_ref()?;
+    let manifest_path = claude_workflow_manifest_path(transcript_path, workflow_ref)?;
+    let metadata = fs::metadata(&manifest_path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES {
+        return None;
+    }
+    let file = File::open(&manifest_path).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_CLAUDE_WORKFLOW_MANIFEST_BYTES)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let value = serde_json::from_slice::<Value>(&raw).ok()?;
+    let progress = value.get("workflowProgress")?.as_array()?;
+    progress
+        .iter()
+        .find(|entry| {
+            string_eq_at(entry, &["type"], "workflow_agent")
+                && string_eq_at(entry, &["agentId"], agent_ref)
+        })
+        .and_then(|entry| string_at(entry, &["label"]))
+        .and_then(safe_claude_agent_display_label)
+}
+
+/// `size:mtime_nanos` stat token for a naming-material sidecar, or empty when
+/// the file is absent/unreadable. Stat-only on purpose: this runs during
+/// candidate enumeration for every subagent transcript on every scan cycle, so
+/// it must never read file contents.
+fn file_stat_token(path: &Path) -> String {
+    fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| {
+            let nanos = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            format!("{}:{nanos}", metadata.len())
+        })
+        .unwrap_or_default()
+}
+
+/// Scan-fingerprint contribution of a subagent transcript's naming material:
+/// the `meta.json` sidecar (Task `description` / `agentType`), the Workflow
+/// run manifest (agent `label`), and the parent session's desktop-title
+/// candidate (the "spawned by <parent>" fragment). Changing any of them
+/// re-selects the transcript even when the transcript bytes are unchanged.
+fn claude_subagent_sidecar_fingerprint(
+    transcript_path: &Path,
+    identity: &ClaudeSubagentIdentity,
+    metadata: &ClaudeTitleMetadata,
+) -> String {
+    let meta_stat = file_stat_token(&transcript_path.with_extension("meta.json"));
+    let manifest_stat = identity
+        .workflow_ref
+        .as_deref()
+        .and_then(|workflow_ref| claude_workflow_manifest_path(transcript_path, workflow_ref))
+        .map(|manifest_path| file_stat_token(&manifest_path))
+        .unwrap_or_default();
+    sha256_hex(&[
+        "claude_subagent_sidecar:v1",
+        &meta_stat,
+        &manifest_stat,
+        &metadata.session_sidecar_fingerprint(identity.root_session_id.as_str()),
+    ])
 }
 
 /// Path-like fragments the backend fact validator rejects outright. One
@@ -11543,6 +11811,17 @@ mod tests {
         // spawnDepth must be an integer; a string is not silently accepted.
         assert_eq!(meta.spawn_depth, None);
         assert_eq!(meta.parent_agent_id, None);
+        // `description` IS retained (operator decision 2026-07-27: short agent
+        // titles are wanted) — but only through the display-label allowlist.
+        assert_eq!(meta.description.as_deref(), Some("do not leak me"));
+        // A path-shaped description is dropped, not sanitized: `worktreePath`
+        // stays unread and a description cannot smuggle one in either.
+        fs::write(
+            dir.join("agent-a1.meta.json"),
+            "{\"description\":\"review /Users/someone/private notes\"}",
+        )
+        .expect("rewrite sidecar");
+        assert_eq!(read_claude_agent_meta(&transcript).description, None);
 
         // Fragments the BACKEND fact validator rejects are dropped locally too:
         // one rejected fact fails the whole upload batch.
@@ -11642,6 +11921,382 @@ mod tests {
                 path.display()
             );
         }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_workflow_label_titles_workflow_subagent_sessions() {
+        // The prize path: a Workflow agent is named from the run manifest's
+        // `workflowProgress[].label`, composed with the parent's title the way
+        // the desktop app names its spawned sessions.
+        let root = temp_dir("claude-wf-agent-label");
+        let parent_session = "58e9c6bc-c733-4946-b9e4-aa57c707dbf2";
+        let session_dir = root.join(parent_session);
+        let workflow_dir = session_dir
+            .join("subagents")
+            .join("workflows")
+            .join("wf_f7ae7a92-02b");
+        fs::create_dir_all(&workflow_dir).expect("create dirs");
+        fs::create_dir_all(session_dir.join("workflows")).expect("create manifest dir");
+        fs::write(
+            session_dir.join("workflows").join("wf_f7ae7a92-02b.json"),
+            "{\"runId\":\"wf_f7ae7a92-02b\",\"workflowProgress\":[\
+             {\"type\":\"workflow_phase\",\"index\":1,\"title\":\"Investigate\"},\
+             {\"type\":\"workflow_agent\",\"agentId\":\"a09c3096ec4de4f11\",\"label\":\"probe:data-model\",\"promptPreview\":\"CONTEXT (established facts)\"},\
+             {\"type\":\"workflow_agent\",\"agentId\":\"a747add886fd90cd8\",\"label\":\"verify:data-model\"}]}",
+        )
+        .expect("write manifest");
+        let transcript = workflow_dir.join("agent-a09c3096ec4de4f11.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_L\",\"message\":{{\"id\":\"msg_L\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+        // Sidecar exists too, with a lower-precedence description: the
+        // workflow label must win over it.
+        fs::write(
+            workflow_dir.join("agent-a09c3096ec4de4f11.meta.json"),
+            "{\"agentType\":\"workflow-subagent\",\"spawnDepth\":1,\"description\":\"should lose to label\"}",
+        )
+        .expect("write sidecar");
+        let mut metadata = ClaudeTitleMetadata::default();
+        metadata.titles.insert(
+            parent_session.to_string(),
+            ClaudeTitleCandidate {
+                title: "Two Claude accounts research".to_string(),
+                user_set: false,
+            },
+        );
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript,
+            "2026-07-24T13:10:00Z",
+            "fp".to_string(),
+            &metadata,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("spawned by Two Claude accounts research - probe:data-model")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("agent_label")
+        );
+
+        // Without a parent title candidate the label stands alone.
+        let bare = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript,
+            "2026-07-24T13:10:00Z",
+            "fp".to_string(),
+            &ClaudeTitleMetadata::default(),
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            bare.session_display_name.as_deref(),
+            Some("probe:data-model")
+        );
+        assert_eq!(
+            bare.session_display_name_source.as_deref(),
+            Some("agent_label")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_task_agent_description_and_agent_type_title_fallbacks() {
+        // A Task-tool agent has no workflow manifest; its sidecar
+        // `description` (the 3-8 word task summary) names it, and a sidecar
+        // with only `agentType` still yields that as the last-resort label.
+        let root = temp_dir("claude-task-agent-label");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let task_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&task_dir).expect("create dirs");
+        let transcript = task_dir.join("agent-abadf13e89f0b1c4c.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent_session}\",\"isSidechain\":true,\"requestId\":\"req_D\",\"message\":{{\"id\":\"msg_D\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+        fs::write(
+            task_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
+            "{\"agentType\":\"Explore\",\"description\":\"Fix 2 failing backend integration tests\",\"spawnDepth\":1}",
+        )
+        .expect("write sidecar");
+
+        let parse = |metadata: &ClaudeTitleMetadata| {
+            parse_claude_code_jsonl_file_with_title_metadata(
+                &transcript,
+                "2026-07-24T13:10:00Z",
+                "fp".to_string(),
+                metadata,
+                true,
+            )
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot")
+        };
+        let item = parse(&ClaudeTitleMetadata::default());
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Fix 2 failing backend integration tests")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("agent_label")
+        );
+
+        // Parent title known -> desktop-style composition.
+        let mut metadata = ClaudeTitleMetadata::default();
+        metadata.titles.insert(
+            parent_session.to_string(),
+            ClaudeTitleCandidate {
+                title: "Lightweight data collection and ingestion".to_string(),
+                user_set: false,
+            },
+        );
+        assert_eq!(
+            parse(&metadata).session_display_name.as_deref(),
+            Some(
+                "spawned by Lightweight data collection and ingestion - Fix 2 failing backend integration tests"
+            )
+        );
+
+        // agentType-only sidecar -> the agent kind is still a usable name.
+        fs::write(
+            task_dir.join("agent-abadf13e89f0b1c4c.meta.json"),
+            "{\"agentType\":\"Explore\",\"spawnDepth\":1}",
+        )
+        .expect("rewrite sidecar");
+        let item = parse(&ClaudeTitleMetadata::default());
+        assert_eq!(item.session_display_name.as_deref(), Some("Explore"));
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("agent_label")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_subagent_first_prompt_never_becomes_title() {
+        // A subagent's "first user prompt" is the injected Task/Workflow prompt
+        // BODY. Titles yes, content no: with no label material at all the
+        // session stays unnamed rather than falling back to prompt text.
+        let root = temp_dir("claude-subagent-no-prompt-title");
+        let parent_session = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let task_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&task_dir).expect("create dirs");
+        let transcript = task_dir.join("agent-a58d4ac79525212cf.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                concat!(
+                    "{{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"{parent}\",\"isSidechain\":true,\"message\":{{\"role\":\"user\",\"content\":\"Survey the quota tools\"}}}}\n",
+                    "{{\"timestamp\":\"2026-07-24T13:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"isSidechain\":true,\"requestId\":\"req_P\",\"message\":{{\"id\":\"msg_P\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":6,\"output_tokens\":2}}}}}}\n"
+                ),
+                parent = parent_session
+            ),
+        )
+        .expect("write transcript");
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript,
+            "2026-07-24T13:10:00Z",
+            "fp".to_string(),
+            &ClaudeTitleMetadata::default(),
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(item.session_display_name, None);
+        assert_eq!(item.session_display_name_source, None);
+        // An ordinary top-level transcript with the same shape keeps the
+        // first-prompt fallback — the suppression is subagent-scoped.
+        let top_level = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000.jsonl");
+        fs::write(
+            &top_level,
+            concat!(
+                "{\"timestamp\":\"2026-07-24T13:00:00.000Z\",\"type\":\"user\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000\",\"message\":{\"role\":\"user\",\"content\":\"Survey the quota tools\"}}\n",
+                "{\"timestamp\":\"2026-07-24T13:00:05.000Z\",\"type\":\"assistant\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeffff0000\",\"requestId\":\"req_P\",\"message\":{\"id\":\"msg_P\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":6,\"output_tokens\":2}}}\n"
+            ),
+        )
+        .expect("write top-level transcript");
+        let top_item = parse_claude_code_jsonl_file_with_title_metadata(
+            &top_level,
+            "2026-07-24T13:10:00Z",
+            "fp".to_string(),
+            &ClaudeTitleMetadata::default(),
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            top_item.session_display_name.as_deref(),
+            Some("Survey the quota tools")
+        );
+        assert_eq!(
+            top_item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn safe_claude_agent_display_label_allowlist_and_truncation() {
+        // Real observed values survive unchanged.
+        for value in [
+            "probe:data-model",
+            "verify:daemon-scan-claim",
+            "map:collector-daemon",
+            "Fix 2 failing + 1 flaky backend integration tests",
+        ] {
+            // `+` is allowlisted; everything observed must round-trip.
+            assert_eq!(
+                safe_claude_agent_display_label(value.to_string()).as_deref(),
+                Some(value),
+                "{value} must survive"
+            );
+        }
+        // Whitespace collapses like every other title path.
+        assert_eq!(
+            safe_claude_agent_display_label("  probe:\n desktop-path ".to_string()).as_deref(),
+            Some("probe: desktop-path")
+        );
+        // Truncated at the cap, not rejected.
+        let long = "a".repeat(200);
+        assert_eq!(
+            safe_claude_agent_display_label(long)
+                .expect("truncated")
+                .chars()
+                .count(),
+            MAX_CLAUDE_AGENT_LABEL_CHARS
+        );
+        // Paths, home fragments, non-ASCII, and control smuggling are dropped.
+        for hostile in [
+            "/Users/someone/secret",
+            "see /home/user/notes",
+            "read ~/.claude/settings",
+            "café découverte",
+            "line\u{7}bell",
+            "back\\slash",
+        ] {
+            assert_eq!(
+                safe_claude_agent_display_label(hostile.to_string()),
+                None,
+                "{hostile:?} must be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_claude_agent_title_truncates_parent_never_the_label() {
+        assert_eq!(
+            compose_claude_agent_title("probe:data-model", None),
+            "probe:data-model"
+        );
+        assert_eq!(
+            compose_claude_agent_title("probe:data-model", Some("Parent title")),
+            "spawned by Parent title - probe:data-model"
+        );
+        // An oversized parent shrinks to keep the whole title <= 120 chars.
+        let long_parent = "p".repeat(300);
+        let composed = compose_claude_agent_title("probe:data-model", Some(&long_parent));
+        assert!(
+            composed.chars().count() <= 120,
+            "composed too long: {composed}"
+        );
+        assert!(composed.starts_with("spawned by ppp"));
+        assert!(composed.ends_with(" - probe:data-model"));
+        // A cap-length label still gets a (short) parent fragment...
+        let wide_label = "w".repeat(MAX_CLAUDE_AGENT_LABEL_CHARS);
+        let composed =
+            compose_claude_agent_title(&wide_label, Some("Parent title with a longer tail"));
+        assert!(composed.chars().count() <= 120);
+        assert!(composed.starts_with("spawned by Parent title"));
+        // ...but when the label leaves no useful parent budget, the label
+        // stands alone rather than carrying a truncated-to-noise parent.
+        let oversized_label = "w".repeat(110);
+        assert_eq!(
+            compose_claude_agent_title(&oversized_label, Some("Parent title")),
+            oversized_label
+        );
+    }
+
+    #[test]
+    fn claude_subagent_sidecar_fingerprint_tracks_naming_material() {
+        let root = temp_dir("claude-subagent-sidecar-fp");
+        let parent_session = "58e9c6bc-c733-4946-b9e4-aa57c707dbf2";
+        let session_dir = root.join(parent_session);
+        let workflow_dir = session_dir
+            .join("subagents")
+            .join("workflows")
+            .join("wf_f7ae7a92-02b");
+        fs::create_dir_all(&workflow_dir).expect("create dirs");
+        let transcript = workflow_dir.join("agent-a09c3096ec4de4f11.jsonl");
+        fs::write(&transcript, "{}\n").expect("write transcript");
+        let identity = claude_subagent_identity(&transcript).expect("identity");
+        let metadata = ClaudeTitleMetadata::default();
+
+        let baseline = claude_subagent_sidecar_fingerprint(&transcript, &identity, &metadata);
+        assert_eq!(
+            baseline,
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, &metadata),
+            "fingerprint must be deterministic"
+        );
+
+        // A workflow manifest appearing later re-selects the transcript.
+        fs::create_dir_all(session_dir.join("workflows")).expect("create manifest dir");
+        fs::write(
+            session_dir.join("workflows").join("wf_f7ae7a92-02b.json"),
+            "{\"workflowProgress\":[]}",
+        )
+        .expect("write manifest");
+        let with_manifest = claude_subagent_sidecar_fingerprint(&transcript, &identity, &metadata);
+        assert_ne!(baseline, with_manifest);
+
+        // So does a meta sidecar appearing...
+        fs::write(
+            workflow_dir.join("agent-a09c3096ec4de4f11.meta.json"),
+            "{\"agentType\":\"workflow-subagent\"}",
+        )
+        .expect("write sidecar");
+        let with_meta = claude_subagent_sidecar_fingerprint(&transcript, &identity, &metadata);
+        assert_ne!(with_manifest, with_meta);
+
+        // ...and a parent desktop title arriving (the "spawned by" fragment).
+        let mut titled = ClaudeTitleMetadata::default();
+        titled.titles.insert(
+            parent_session.to_string(),
+            ClaudeTitleCandidate {
+                title: "Parent orchestrator session".to_string(),
+                user_set: false,
+            },
+        );
+        assert_ne!(
+            with_meta,
+            claude_subagent_sidecar_fingerprint(&transcript, &identity, &titled)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
