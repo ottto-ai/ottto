@@ -108,6 +108,7 @@ require_command plutil
 require_command codesign
 require_command install_name_tool
 require_command otool
+require_command gh
 
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "aarch64" ]]; then
@@ -150,7 +151,77 @@ if [[ "$CHANNEL" == "stable-candidate" || "$CHANNEL" == "stable" ]]; then
   fi
 fi
 
-COMMIT="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
+if ! git -C "$ROOT" diff --quiet HEAD -- .; then
+  echo "Public release source has tracked changes; freeze a clean public commit before packaging" >&2
+  exit 2
+fi
+if [[ -n "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+  echo "Public release source has untracked files; freeze a clean public commit before packaging" >&2
+  exit 2
+fi
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+COMMIT="${SOURCE_COMMIT:0:12}"
+MAC_APP_GIT_ROOT="$(git -C "$MAC_APP_ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -z "$MAC_APP_GIT_ROOT" ]]; then
+  echo "macOS app root must belong to the private Git checkout: $MAC_APP_ROOT" >&2
+  exit 2
+fi
+MAC_APP_GIT_ROOT="$(cd "$MAC_APP_GIT_ROOT" && pwd -P)"
+MAC_APP_ROOT="$(cd "$MAC_APP_ROOT" && pwd -P)"
+case "$MAC_APP_ROOT/" in
+  "$MAC_APP_GIT_ROOT/"*)
+    MAC_APP_SOURCE_PATH="${MAC_APP_ROOT#"$MAC_APP_GIT_ROOT"/}"
+    ;;
+  *)
+    echo "macOS app root is outside its Git checkout" >&2
+    exit 2
+    ;;
+esac
+if [[ "$MAC_APP_SOURCE_PATH" != "tools/ottto-macos-app" ]]; then
+  echo "macOS app root must be the tracked tools/ottto-macos-app subtree" >&2
+  exit 2
+fi
+MAC_APP_SOURCE_REMOTE="$(git -C "$MAC_APP_GIT_ROOT" config --get remote.origin.url 2>/dev/null || true)"
+case "$MAC_APP_SOURCE_REMOTE" in
+  git@github.com:ottto-ai/coding-agents-observability | \
+  git@github.com:ottto-ai/coding-agents-observability.git | \
+  ssh://git@github.com/ottto-ai/coding-agents-observability | \
+  ssh://git@github.com/ottto-ai/coding-agents-observability.git | \
+  https://github.com/ottto-ai/coding-agents-observability | \
+  https://github.com/ottto-ai/coding-agents-observability.git) ;;
+  *)
+    echo "macOS app source must come from ottto-ai/coding-agents-observability" >&2
+    exit 2
+    ;;
+esac
+if ! git -C "$MAC_APP_GIT_ROOT" diff --quiet HEAD -- "$MAC_APP_SOURCE_PATH"; then
+  echo "macOS app source subtree has tracked changes; freeze a clean private commit before packaging" >&2
+  exit 2
+fi
+if [[ -n "$(git -C "$MAC_APP_GIT_ROOT" ls-files --others --exclude-standard -- "$MAC_APP_SOURCE_PATH")" ]]; then
+  echo "macOS app source subtree has untracked files; freeze a clean private commit before packaging" >&2
+  exit 2
+fi
+MAC_APP_SOURCE_COMMIT="$(git -C "$MAC_APP_GIT_ROOT" rev-parse HEAD)"
+if env -u GH_TOKEN -u GITHUB_TOKEN \
+  gh api repos/singular-labs/coding-agents-observability >/dev/null 2>&1; then
+  echo "Singular guard failed while verifying the private app source" >&2
+  exit 2
+fi
+MAC_APP_REMOTE_MASTER="$(
+  env -u GH_TOKEN -u GITHUB_TOKEN \
+    gh api repos/ottto-ai/coding-agents-observability/commits/master --jq .sha
+)"
+if [[ ! "$MAC_APP_REMOTE_MASTER" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Could not resolve authoritative private app source master from GitHub" >&2
+  exit 2
+fi
+if [[ "$MAC_APP_SOURCE_COMMIT" != "$MAC_APP_REMOTE_MASTER" ]]; then
+  echo "macOS app source commit must equal authoritative GitHub master" >&2
+  exit 2
+fi
+MAC_APP_SOURCE_TREE="$(git -C "$MAC_APP_GIT_ROOT" rev-parse "HEAD:$MAC_APP_SOURCE_PATH")"
+MAC_APP_SOURCE_REPOSITORY="ottto-ai/coding-agents-observability"
 BUNDLE_VERSION="$(ottto_sparkle_bundle_version "$VERSION")"
 MIN_PROTOCOL_VERSION="${OTTTO_MIN_PROTOCOL_VERSION:-$(sed -n 's/.*PROTOCOL_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' "$ROOT/crates/ottto-protocol/src/lib.rs" | head -n1)}"
 if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
@@ -445,6 +516,11 @@ jq -n \
   --arg version "$VERSION" \
   --arg channel "$CHANNEL" \
   --arg commit "$COMMIT" \
+  --arg source_commit "$SOURCE_COMMIT" \
+  --arg mac_app_source_repository "$MAC_APP_SOURCE_REPOSITORY" \
+  --arg mac_app_source_commit "$MAC_APP_SOURCE_COMMIT" \
+  --arg mac_app_source_path "$MAC_APP_SOURCE_PATH" \
+  --arg mac_app_source_tree "$MAC_APP_SOURCE_TREE" \
   --arg generated_at "$GENERATED_AT" \
   --arg release_notes "$RELEASE_NOTES" \
   --arg min_supported_version "$MIN_SUPPORTED_VERSION" \
@@ -522,6 +598,21 @@ jq -n \
       }
     },
     supply_chain: {
+      materials: [
+        {
+          kind: "git_repository",
+          repository: $repository,
+          commit: $source_commit
+        },
+        {
+          kind: "git_subtree",
+          repository: $mac_app_source_repository,
+          commit: $mac_app_source_commit,
+          path: $mac_app_source_path,
+          tree: $mac_app_source_tree,
+          clean: true
+        }
+      ],
       slsa_build: {
         spec_version: "1.2",
         level: "build_l1",

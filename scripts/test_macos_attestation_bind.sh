@@ -121,6 +121,21 @@ jq -n \
       }
     },
     supply_chain: {
+      materials: [
+        {
+          kind: "git_repository",
+          repository: "ottto-ai/ottto",
+          commit: "abcdef123456abcdef123456abcdef123456abcd"
+        },
+        {
+          kind: "git_subtree",
+          repository: "ottto-ai/coding-agents-observability",
+          commit: "123456abcdef123456abcdef123456abcdef1234",
+          path: "tools/ottto-macos-app",
+          tree: "fedcba654321fedcba654321fedcba654321fedc",
+          clean: true
+        }
+      ],
       slsa_build: {
         spec_version: "1.2",
         level: "build_l1",
@@ -186,6 +201,9 @@ jq -e '
   and .supply_chain.slsa_build.source_ref == "refs/heads/main"
   and .supply_chain.slsa_build.source_digest == "abcdef123456"
   and (.supply_chain.slsa_build.subjects | index("release-manifest.json") != null)
+  and .supply_chain.materials[1].repository == "ottto-ai/coding-agents-observability"
+  and .supply_chain.materials[1].path == "tools/ottto-macos-app"
+  and .supply_chain.materials[1].tree == "fedcba654321fedcba654321fedcba654321fedc"
   and .supply_chain.sbom.attested == true
   and .supply_chain.sbom.verified == true
 ' "$manifest" >/dev/null

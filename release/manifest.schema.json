@@ -128,9 +128,73 @@
     },
     "supply_chain": {
       "type": "object",
-      "required": ["slsa_build", "sbom"],
+      "required": ["materials", "slsa_build", "sbom"],
       "additionalProperties": false,
       "properties": {
+        "materials": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "kind",
+              "repository",
+              "commit"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "git_repository",
+                  "git_subtree"
+                ]
+              },
+              "repository": {
+                "type": "string",
+                "minLength": 1
+              },
+              "commit": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tree": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "clean": {
+                "type": "boolean"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "git_subtree"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "path",
+                    "tree",
+                    "clean"
+                  ],
+                  "properties": {
+                    "clean": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
         "slsa_build": {
           "type": "object",
           "required": [

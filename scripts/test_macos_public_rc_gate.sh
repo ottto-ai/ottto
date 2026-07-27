@@ -137,6 +137,21 @@ write_candidate_manifest() {
         }
       },
       supply_chain: {
+        materials: [
+          {
+            kind: "git_repository",
+            repository: "ottto-ai/ottto",
+            commit: "abcdef123456abcdef123456abcdef123456abcd"
+          },
+          {
+            kind: "git_subtree",
+            repository: "ottto-ai/coding-agents-observability",
+            commit: "123456abcdef123456abcdef123456abcdef1234",
+            path: "tools/ottto-macos-app",
+            tree: "fedcba654321fedcba654321fedcba654321fedc",
+            clean: true
+          }
+        ],
         slsa_build: {
           spec_version: "1.2",
           level: "build_l1",
