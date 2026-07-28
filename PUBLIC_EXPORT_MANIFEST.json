@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 286,
-  "content_sha256": "920b0d8a3d7e9af4f56a5633716037980fc70adf69c2529eb29245e2c9f4744a",
+  "candidate_file_count": 287,
+  "content_sha256": "95d9b8def87d8c33de7f2c4585a13834afb6a698cbb5e742ef39987db2b27f56",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "3df11e42918c6c66f5170b81fca249f46604181c0b5e79be715cb1c74844fd2b",
-      "size_bytes": 378382
+      "sha256": "6f2ddfc32f95a8d5002f8af45d2b7d14ec5d5050a69f5f5619539407816d5353",
+      "size_bytes": 389661
     },
     {
       "executable": false,
@@ -1163,6 +1163,13 @@
       "path": "docs/session-2026-07-27-subagent-session-display-names.md",
       "sha256": "b711c38cf003f2b6252e2bc0a008803a00d3d48820deaee498d5303cb9c746cd",
       "size_bytes": 3647
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-28-plan-observation-identity.md",
+      "sha256": "428bb5bdecc08d24ce692c9983fb50dbeb0a9480b843f6e900a5769c648f3579",
+      "size_bytes": 2375
     },
     {
       "executable": false,
@@ -2005,9 +2012,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-28T10:00:30+00:00",
+  "generated_at": "2026-07-28T15:26:13+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 287,
+  "output_file_count": 288,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2041,5 +2048,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "18fcc7382073cea8e75acaf841bcea138e9e6da7"
+  "source_commit": "5c693b976a0fe225c599827b6c60614e213fbb23"
 }
