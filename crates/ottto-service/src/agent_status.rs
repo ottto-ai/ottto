@@ -729,6 +729,11 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 // Mutually exclusive by plan_type gate (`team` vs `max`).
                 refined_seat_plan = refine_claude_team_seat_plan(&mut account, &oauth);
                 refined_max_plan = refine_claude_max_rate_limit_plan(&mut account, &oauth);
+                // Regardless of plan refinement: carry the account uuid onto
+                // the account so the snapshot account section and the plan
+                // observation built from it resolve under the same account
+                // hash the quota windows are stamped with.
+                stamp_claude_cli_account_identity(&mut account, &oauth);
             }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
@@ -1268,9 +1273,20 @@ fn claude_desktop_builder_plan_observation(
 ) -> Option<AgentStatusPlanObservation> {
     let account_identifier_hash =
         billing_identity_hash("anthropic", "account", &builder.account_uuid);
-    let organization_id = builder
-        .current_organization_uuid
-        .or_else(|| builder.organization_uuids.iter().next().cloned());
+    // An organization is attached only when the pairing is unambiguous: the
+    // current organization when the Desktop config names this account as
+    // current, or the single organization the session store holds for it.
+    // Picking `iter().next()` off a multi-org set fabricated pairings for
+    // non-current accounts (a personal account hash next to an employer org
+    // hash), which the backend then minted as a brand-new billing identity.
+    // Fail closed: omit the organization rather than guess.
+    let organization_id = builder.current_organization_uuid.or_else(|| {
+        if builder.organization_uuids.len() == 1 {
+            builder.organization_uuids.iter().next().cloned()
+        } else {
+            None
+        }
+    });
     let organization_identifier_hash = organization_id
         .as_deref()
         .and_then(|value| billing_identity_hash("anthropic", "organization", value));
@@ -4597,6 +4613,70 @@ fn parse_claude_cli_oauth_account(value: &Value) -> Option<ClaudeCliOauthAccount
     })
 }
 
+/// Identity guard shared by every consumer of `~/.claude.json` account
+/// metadata: the file can lag behind `claude auth status` after an account
+/// switch, so metadata is only trusted when neither the email nor the
+/// organization contradicts the auth-status identity. A field absent on
+/// either side is not a mismatch — only two present-and-different values
+/// refuse.
+fn claude_cli_oauth_identity_mismatch(
+    account: &AgentAccountStatus,
+    oauth: &ClaudeCliOauthAccount,
+) -> bool {
+    let mismatch = |ours: &Option<String>, theirs: &Option<String>| match (ours, theirs) {
+        (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    };
+    mismatch(&account.email, &oauth.email_address)
+        || mismatch(&account.organization_id, &oauth.organization_uuid)
+}
+
+/// Stamp the Claude account identity from the local Claude Code account
+/// metadata (`~/.claude.json` `oauthAccount`) onto the auth-status account.
+/// `claude auth status --json` names the organization but not the account
+/// uuid, so without this the CLI plan observation reaches the backend with an
+/// organization hash only while the quota windows from the very same
+/// `oauthAccount` carry the account hash — plan and quota evidence then
+/// resolve at different ranks and cannot deterministically converge.
+///
+/// Same identity guard as the seat/tier refinements above: stale metadata
+/// from a different account must never be stamped, and a present auth-status
+/// account id that disagrees with `accountUuid` also refuses. Uses the exact
+/// `billing_identity_hash("anthropic", "account", …)` the quota path stamps,
+/// never a second hashing implementation.
+fn stamp_claude_cli_account_identity(
+    account: &mut AgentAccountStatus,
+    oauth: &ClaudeCliOauthAccount,
+) -> bool {
+    if claude_cli_oauth_identity_mismatch(account, oauth) {
+        return false;
+    }
+    let Some(account_uuid) = oauth.account_uuid.as_deref() else {
+        return false;
+    };
+    if let Some(existing) = account.account_id.as_deref() {
+        if !existing.eq_ignore_ascii_case(account_uuid.trim()) {
+            return false;
+        }
+    }
+    let Some(account_identifier_hash) = billing_identity_hash("anthropic", "account", account_uuid)
+    else {
+        return false;
+    };
+    if account.account_id.is_none() {
+        account.account_id = Some(account_uuid.to_string());
+    }
+    if account.account_identifier_hash.is_none() {
+        account.account_identifier_hash = Some(account_identifier_hash);
+    }
+    account.billing_identity_evidence = billing_identity_evidence_for(
+        &account.account_identifier_hash,
+        &account.organization_identifier_hash,
+        &account.credential_fingerprint_hash,
+    );
+    true
+}
+
 /// Refine a generic Claude `team` plan into `team_premium` / `team_standard`
 /// when the local Claude Code account metadata carries an explicit seat-tier
 /// signal. Mirrors the Claude Max 5x/20x rule: explicit collector evidence
@@ -4613,13 +4693,7 @@ fn refine_claude_team_seat_plan(
     }
     // Identity guard: `~/.claude.json` can lag behind `claude auth status`
     // after an account switch. Refuse to mix metadata across accounts.
-    let mismatch = |ours: &Option<String>, theirs: &Option<String>| match (ours, theirs) {
-        (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b.trim()),
-        _ => false,
-    };
-    if mismatch(&account.email, &oauth.email_address)
-        || mismatch(&account.organization_id, &oauth.organization_uuid)
-    {
+    if claude_cli_oauth_identity_mismatch(account, oauth) {
         return None;
     }
     if let Some(organization_type) = oauth.organization_type.as_deref() {
@@ -4669,13 +4743,7 @@ fn refine_claude_max_rate_limit_plan(
     }
     // Identity guard: `~/.claude.json` can lag behind `claude auth status`
     // after an account switch. Refuse to mix metadata across accounts.
-    let mismatch = |ours: &Option<String>, theirs: &Option<String>| match (ours, theirs) {
-        (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b.trim()),
-        _ => false,
-    };
-    if mismatch(&account.email, &oauth.email_address)
-        || mismatch(&account.organization_id, &oauth.organization_uuid)
-    {
+    if claude_cli_oauth_identity_mismatch(account, oauth) {
         return None;
     }
     if let Some(organization_type) = oauth.organization_type.as_deref() {
@@ -7227,7 +7295,9 @@ for line in sys.stdin:
         }))
         .expect("oauthAccount parsed");
 
+        assert_eq!(parsed.account_uuid.as_deref(), Some("acct-1"));
         assert_eq!(parsed.email_address.as_deref(), Some("ron.s@singular.net"));
+        assert_eq!(parsed.organization_uuid.as_deref(), Some("org-1"));
         assert_eq!(parsed.organization_type.as_deref(), Some("claude_team"));
         assert_eq!(parsed.seat_tier.as_deref(), Some("premium"));
         assert_eq!(
@@ -7235,6 +7305,112 @@ for line in sys.stdin:
             Some("default_claude_max_5x")
         );
         assert!(parse_claude_cli_oauth_account(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn claude_cli_account_identity_stamps_account_hash_onto_plan_observation() {
+        // `claude auth status --json` names the org but not the account uuid;
+        // the uuid rides `~/.claude.json` `oauthAccount`. The stamped hash must
+        // be the exact `billing_identity_hash` the quota windows carry so plan
+        // and quota evidence converge on one billing identity.
+        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        assert!(account.account_id.is_none());
+        assert!(account.account_identifier_hash.is_none());
+        let oauth = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-1".to_string()),
+            email_address: Some("ron.s@singular.net".to_string()),
+            organization_uuid: Some("org-1".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        assert!(stamp_claude_cli_account_identity(&mut account, &oauth));
+
+        assert_eq!(account.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(
+            account.account_identifier_hash,
+            billing_identity_hash("anthropic", "account", "acct-1")
+        );
+        assert!(account.organization_identifier_hash.is_some());
+        assert_eq!(
+            account.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-07-28T10:00:00Z".to_string(),
+            "2026-07-28T10:30:00Z".to_string(),
+        );
+        snapshot.account = Some(account);
+        append_current_plan_observation(&mut snapshot);
+
+        let observation = snapshot
+            .plan_observations
+            .first()
+            .expect("plan observation");
+        assert_eq!(observation.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(
+            observation.account_identifier_hash,
+            billing_identity_hash("anthropic", "account", "acct-1")
+        );
+        assert!(observation.organization_identifier_hash.is_some());
+        assert_eq!(
+            observation.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+    }
+
+    #[test]
+    fn claude_cli_account_identity_refuses_mismatched_metadata() {
+        // `~/.claude.json` lagging behind an account switch must never stamp a
+        // different account's uuid onto the signed-in account.
+        let mut account = team_auth_account("ron.s@singular.net", "org-1");
+        let stale_email = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-other".to_string()),
+            email_address: Some("someone.else@example.com".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert!(!stamp_claude_cli_account_identity(
+            &mut account,
+            &stale_email
+        ));
+        assert!(account.account_id.is_none());
+        assert!(account.account_identifier_hash.is_none());
+
+        let stale_org = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-other".to_string()),
+            organization_uuid: Some("org-other".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert!(!stamp_claude_cli_account_identity(&mut account, &stale_org));
+        assert!(account.account_identifier_hash.is_none());
+
+        // A present auth-status account id that disagrees with `accountUuid`
+        // refuses too, and the existing id is left untouched.
+        account.account_id = Some("acct-auth-status".to_string());
+        let conflicting = ClaudeCliOauthAccount {
+            account_uuid: Some("acct-other".to_string()),
+            email_address: Some("ron.s@singular.net".to_string()),
+            organization_uuid: Some("org-1".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        assert!(!stamp_claude_cli_account_identity(
+            &mut account,
+            &conflicting
+        ));
+        assert_eq!(account.account_id.as_deref(), Some("acct-auth-status"));
+        assert!(account.account_identifier_hash.is_none());
+
+        // No account uuid in the metadata: nothing to stamp.
+        let uuid_less = ClaudeCliOauthAccount {
+            email_address: Some("ron.s@singular.net".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+        let mut fresh = team_auth_account("ron.s@singular.net", "org-1");
+        assert!(!stamp_claude_cli_account_identity(&mut fresh, &uuid_less));
+        assert!(fresh.account_identifier_hash.is_none());
     }
 
     #[test]
@@ -7751,6 +7927,88 @@ for line in sys.stdin:
 
         assert_eq!(observation.account_label.as_deref(), Some("Claude Desktop"));
         assert!(claude_desktop_web_usage_target(&[observation]).is_some());
+    }
+
+    #[test]
+    fn claude_desktop_multi_org_account_without_current_org_omits_organization() {
+        // A non-current account with session buckets under several orgs must
+        // not have one picked for it: pairing an account hash with an
+        // arbitrary org hash minted a chimera billing identity in production
+        // (personal account + employer org). Fail closed: no org at all.
+        let observation = claude_desktop_builder_plan_observation(
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "account-multi".to_string(),
+                organization_uuids: BTreeSet::from([
+                    "employer-org".to_string(),
+                    "personal-org".to_string(),
+                ]),
+                code_session_count: 2,
+                ..Default::default()
+            },
+            "2026-07-28T10:00:00Z",
+            Some("some-other-account"),
+        )
+        .expect("multi-org Desktop observation");
+
+        assert_eq!(observation.organization_id, None);
+        assert_eq!(observation.organization_identifier_hash, None);
+        assert_eq!(
+            observation.account_identifier_hash,
+            billing_identity_hash("anthropic", "account", "account-multi")
+        );
+        assert_eq!(
+            observation.billing_identity_evidence.as_deref(),
+            Some("provider_account_id")
+        );
+        assert_eq!(observation.is_current, Some(false));
+    }
+
+    #[test]
+    fn claude_desktop_single_org_account_keeps_its_organization() {
+        let observation = claude_desktop_builder_plan_observation(
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "account-single".to_string(),
+                organization_uuids: BTreeSet::from(["only-org".to_string()]),
+                code_session_count: 1,
+                ..Default::default()
+            },
+            "2026-07-28T10:00:00Z",
+            None,
+        )
+        .expect("single-org Desktop observation");
+
+        assert_eq!(observation.organization_id.as_deref(), Some("only-org"));
+        assert_eq!(
+            observation.organization_identifier_hash,
+            billing_identity_hash("anthropic", "organization", "only-org")
+        );
+        assert_eq!(observation.is_current, Some(false));
+    }
+
+    #[test]
+    fn claude_desktop_current_org_wins_over_multi_org_ambiguity() {
+        let observation = claude_desktop_builder_plan_observation(
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "account-current".to_string(),
+                organization_uuids: BTreeSet::from([
+                    "employer-org".to_string(),
+                    "personal-org".to_string(),
+                ]),
+                current_organization_uuid: Some("employer-org".to_string()),
+                code_session_count: 2,
+                ..Default::default()
+            },
+            "2026-07-28T10:00:00Z",
+            Some("account-current"),
+        )
+        .expect("current multi-org Desktop observation");
+
+        assert_eq!(observation.organization_id.as_deref(), Some("employer-org"));
+        assert_eq!(
+            observation.organization_identifier_hash,
+            billing_identity_hash("anthropic", "organization", "employer-org")
+        );
+        assert_eq!(observation.is_current, Some(true));
     }
 
     #[test]
