@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 284,
-  "content_sha256": "387ca2fc832d6face92147db2c855d916db5ef30909786c6a22f34c510c0916d",
+  "candidate_file_count": 286,
+  "content_sha256": "920b0d8a3d7e9af4f56a5633716037980fc70adf69c2529eb29245e2c9f4744a",
   "files": [
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/build.rs",
-      "sha256": "9d0dd94d160b9a4666895e8ba18b6e6072012bde1ce54093137811d0a5d5c769",
-      "size_bytes": 1059
+      "sha256": "241bc1d11d1bbff58d4aea4fa6beb7fd0800b431926da29ccf18e73eefec442e",
+      "size_bytes": 1347
     },
     {
       "executable": false,
@@ -754,9 +754,23 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/legacy_service.rs",
+      "sha256": "64c1d69753249d926a97f3b4918d135cb26dfe5567a19b4dbdfcaf5bb1d8b33f",
+      "size_bytes": 16492
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/legacy_service_shim.m",
+      "sha256": "0f0cf0ad55afb95b3cabfbca790014a54932bdd4dfd5fc8197df005d65bbdd18",
+      "size_bytes": 1117
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "62444944675333323fcdd35acfa6407ffdea470383e72ffd2584c43d1ff404a3",
-      "size_bytes": 305410
+      "sha256": "438edc6deda7781b916dea75d193c9e8ef5670049bafcd069e8d551b4c1246f6",
+      "size_bytes": 305434
     },
     {
       "executable": false,
@@ -769,8 +783,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/main.rs",
-      "sha256": "0a577d48e9aca5bef117936342bcb115bc1612d4d5bbf134822a90870a3274d6",
-      "size_bytes": 33079
+      "sha256": "c79517886117a2871bd1d7155a8b779419520c0a1c66a007224c0b4eff2cbf9e",
+      "size_bytes": 34301
     },
     {
       "executable": false,
@@ -1651,8 +1665,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_dev_install.sh",
-      "sha256": "2c3254bf178368450e1d224329d05244c5c7c45d37c1c2a8e4163a886040bde6",
-      "size_bytes": 10364
+      "sha256": "1238cdf1f5bfd9de87226917670766b71aee08f5582e47df2011e924b34b0299",
+      "size_bytes": 10747
     },
     {
       "executable": true,
@@ -1686,8 +1700,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/macos_package.sh",
-      "sha256": "2fb93c2a382dcba785a819fd0e9f575a55ef8be9920c30bf719c21b5c0e76c59",
-      "size_bytes": 36212
+      "sha256": "be7232c5fe112c33f7f0da573153ac0c6270748b426d400f4a69519baf196c3b",
+      "size_bytes": 37427
     },
     {
       "executable": true,
@@ -1861,8 +1875,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_macos_package_root_resolution.sh",
-      "sha256": "73c62e9d29030c1de3fa0f1cc3ca9c69edca8357425d9c2aee2bb5313d072bd0",
-      "size_bytes": 2060
+      "sha256": "d1add0cbe64d4e5479c7a44541fbff77e78f658cc96f1591227f6010dacbc111",
+      "size_bytes": 2553
     },
     {
       "executable": true,
@@ -1991,9 +2005,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-27T16:31:24+00:00",
+  "generated_at": "2026-07-28T10:00:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 285,
+  "output_file_count": 287,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2027,5 +2041,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "ca14b9139bfc6fb6acb7ee8af819de00b55224f2"
+  "source_commit": "18fcc7382073cea8e75acaf841bcea138e9e6da7"
 }

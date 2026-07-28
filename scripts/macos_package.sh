@@ -398,6 +398,32 @@ PLIST
 
 plutil -lint "$APP_LAUNCH_AGENTS/net.ottto.service.plist" >/dev/null
 
+# Keep a disabled descriptor for the retired plist name so a current app-bundle
+# helper can resolve the old same-parent SMAppService and unregister it. This
+# plist is never registered by current code.
+cat > "$APP_LAUNCH_AGENTS/net.ottto.locald.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.ottto.locald</string>
+  <key>BundleProgram</key>
+  <string>Contents/Helpers/ottto-service</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>ottto-service</string>
+    <string>status</string>
+    <string>--json</string>
+  </array>
+  <key>Disabled</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+plutil -lint "$APP_LAUNCH_AGENTS/net.ottto.locald.plist" >/dev/null
+
 SIGNED="false"
 if [[ -n "$SIGN_IDENTITY" ]]; then
   sign_code() {
@@ -858,6 +884,16 @@ cleanup_legacy_service() {
   rm -f "$legacy_target" "$legacy_plist"
 }
 
+deregister_legacy_smappservice() {
+  local app_daemon="$app_target/Contents/Helpers/ottto-service"
+  if [[ ! -x "$app_daemon" ]]; then
+    return 0
+  fi
+  if ! "$app_daemon" service cleanup-legacy --json >/dev/null; then
+    echo "Warning: could not de-register the retired net.ottto.locald login item; Ottto will retry at daemon startup." >&2
+  fi
+}
+
 copy_app_artifact() {
   local app_artifact="$1"
   local app_target="$2"
@@ -1023,6 +1059,8 @@ install -m 0755 "$tmp_dir/daemon/ottto-service" "$daemon_target"
 if command -v xattr >/dev/null 2>&1; then
   xattr -dr com.apple.quarantine "$app_target" "$cli_target" "$daemon_target" 2>/dev/null || true
 fi
+
+deregister_legacy_smappservice
 
 SETUP_NOTES=()
 
