@@ -17,6 +17,16 @@ if ! grep -Fq "SUPPORTED_INSTALL_OWNERS_JSON='[\"app_bundle\", \"homebrew\"]'" "
   echo "Stable packages must advertise app_bundle and homebrew install owners." >&2
   exit 1
 fi
+if ! grep -Fq 'APP_LAUNCH_AGENTS/net.ottto.locald.plist' "$ROOT/scripts/macos_package.sh"; then
+  echo "Packaged apps must retain the retired plist descriptor for SMAppService cleanup." >&2
+  exit 1
+fi
+for installer in "$ROOT/scripts/macos_package.sh" "$ROOT/scripts/macos_dev_install.sh"; do
+  if ! grep -Fq "\"\$app_daemon\" service cleanup-legacy --json" "$installer"; then
+    echo "$installer must de-register retired SMAppService jobs after installing the app." >&2
+    exit 1
+  fi
+done
 
 repo="$TMP_DIR/public-ottto"
 mkdir -p "$repo/scripts" "$repo/crates/ottto-protocol/src"

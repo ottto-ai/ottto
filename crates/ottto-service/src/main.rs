@@ -95,6 +95,11 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    /// Remove retired Ottto login items and LaunchAgents.
+    CleanupLegacy {
+        #[arg(long)]
+        json: bool,
+    },
     InstallPlan {
         #[arg(long)]
         executable: PathBuf,
@@ -212,6 +217,7 @@ fn main() -> Result<()> {
         Command::Serve { socket, once } => {
             #[cfg(unix)]
             {
+                cleanup_legacy_services_at_startup();
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -241,6 +247,7 @@ fn main() -> Result<()> {
             mach_service,
             socket,
         } => {
+            cleanup_legacy_services_at_startup();
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),
@@ -342,6 +349,13 @@ fn load_registered_device_sources() -> Option<LocalDeviceBinding> {
 fn handle_service_command(command: ServiceCommand) -> Result<()> {
     let home = home_dir()?;
     let (executable, write, execute, json, migrate_owner) = match command {
+        ServiceCommand::CleanupLegacy { json } => {
+            let report = ottto_service::legacy_service::cleanup_legacy_services(&home);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            return Ok(());
+        }
         ServiceCommand::InstallPlan { executable, json } => (executable, false, false, json, false),
         ServiceCommand::WriteLaunchAgent {
             executable,
@@ -357,6 +371,10 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
     let config = macos_service::LaunchAgentConfig::local_user_default(&home, executable);
     let plist_path = macos_service::launch_agent_path(&home);
     let plan = if write {
+        // Install, repair, and app-update registration paths all pass here.
+        // Remove the retired locald registration before touching the current
+        // single-owner LaunchAgent.
+        ottto_service::legacy_service::cleanup_legacy_services(&home);
         macos_service::ensure_launch_agent_write_allowed(&config, &plist_path, migrate_owner)?;
         macos_service::write_launch_agent(&config, &plist_path)?
     } else {
@@ -384,12 +402,28 @@ fn handle_service_command(command: ServiceCommand) -> Result<()> {
 impl ServiceCommand {
     fn json_enabled(&self) -> bool {
         match self {
-            ServiceCommand::InstallPlan { json, .. }
+            ServiceCommand::CleanupLegacy { json }
+            | ServiceCommand::InstallPlan { json, .. }
             | ServiceCommand::WriteLaunchAgent { json, .. }
             | ServiceCommand::Bootstrap { json, .. } => *json,
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+fn cleanup_legacy_services_at_startup() {
+    match home_dir() {
+        Ok(home) => {
+            ottto_service::legacy_service::cleanup_legacy_services(&home);
+        }
+        Err(error) => {
+            eprintln!("legacy_service_cleanup unavailable: {error}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_legacy_services_at_startup() {}
 
 fn start_builtin_relays(daemon: &LocalDaemon) {
     // Proactively rebuild upstream HTTP pools on macOS network transitions so

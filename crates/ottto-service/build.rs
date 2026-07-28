@@ -24,5 +24,11 @@ fn main() {
             .file("src/xpc_shim.c")
             .flag("-fblocks")
             .compile("ottto_xpc_shim");
+        cc::Build::new()
+            .file("src/legacy_service_shim.m")
+            .flag("-fobjc-arc")
+            .compile("ottto_legacy_service_shim");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=ServiceManagement");
     }
 }

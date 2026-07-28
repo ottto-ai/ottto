@@ -128,6 +128,16 @@ cleanup_legacy_service() {
   rm -f "$legacy_target" "$legacy_plist"
 }
 
+deregister_legacy_smappservice() {
+  local app_daemon="$app_target/Contents/Helpers/ottto-service"
+  if [[ ! -x "$app_daemon" ]]; then
+    return 0
+  fi
+  if ! "$app_daemon" service cleanup-legacy --json >/dev/null; then
+    echo "Warning: could not de-register the retired net.ottto.locald login item; Ottto will retry at daemon startup." >&2
+  fi
+}
+
 canonical_app_path() {
   local path="$1"
   local parent
@@ -318,6 +328,7 @@ if [[ "$CLEAR_QUARANTINE" == "true" ]] && command -v xattr >/dev/null 2>&1; then
 fi
 
 register_installed_app "$app_target"
+deregister_legacy_smappservice
 
 if [[ "$WRITE_LAUNCH_AGENT" == "true" ]]; then
   if [[ "$BOOTSTRAP_LAUNCH_AGENT" == "true" ]]; then
