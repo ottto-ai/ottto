@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 290,
-  "content_sha256": "28085f9c653b7b425223ee19eb1a09902d7ff070ad2b6e1818da3afee168d80b",
+  "candidate_file_count": 291,
+  "content_sha256": "0ba4c96d276b4ec086fb3fd696b7763931d333d534e3c15a0701f4103c0576f0",
   "files": [
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c02bab1357acbc8f41b66e7fe9fbb62a8c0513dcc597789621ef45315356373f",
-      "size_bytes": 651849
+      "sha256": "82237097fe1cc88e081374d96a53a1a8d3973fa1138fd2e0e357c47a8fdecf2f",
+      "size_bytes": 656518
     },
     {
       "executable": false,
@@ -1170,6 +1170,13 @@
       "path": "docs/session-2026-07-28-plan-observation-identity.md",
       "sha256": "428bb5bdecc08d24ce692c9983fb50dbeb0a9480b843f6e900a5769c648f3579",
       "size_bytes": 2375
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-codex-agent-role-titles.md",
+      "sha256": "09c910ae2091bedcb5daeba5ad056e42c42d385778337f0ddf4945e4daa17cef",
+      "size_bytes": 1191
     },
     {
       "executable": false,
@@ -1539,7 +1546,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "fcf444453d1239bb6e287153d9ee2dc82bdb8515196da201239803a72df71c95",
+      "sha256": "6311c670094538f6665f554e5b190643e223906b3d848ec598d266e5336e7470",
       "size_bytes": 106940
     },
     {
@@ -2033,9 +2040,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-29T14:09:04+00:00",
+  "generated_at": "2026-07-29T18:41:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 291,
+  "output_file_count": 292,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2069,5 +2076,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "35a82905159d682e295227f4ffbbf37a06ba2770"
+  "source_commit": "be6f8c7e270e5c341f8e41e843f34f03a62290fe"
 }
