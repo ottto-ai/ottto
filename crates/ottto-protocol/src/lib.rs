@@ -1265,18 +1265,21 @@ pub struct AgentAccountStatus {
     pub plan_type: Option<String>,
     pub subscription_product: Option<String>,
     pub billing_channel: Option<String>,
-    /// Reported boundaries of the account's current subscription period.
+    /// Reported boundaries and provider verification time for the account's
+    /// current subscription period.
     ///
     /// Provider-neutral on purpose: any provider that publishes real period
-    /// boundaries fills these same two fields rather than growing a
-    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire
-    /// payload byte-identical when the provider reports nothing, and the
-    /// backend contract is "reported or absent" - a producer never
-    /// substitutes `now`, a calendar month, or a first-seen date.
+    /// boundaries fills these same fields rather than growing a
+    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire payload
+    /// byte-identical when the provider reports nothing, and the backend
+    /// contract is "reported or absent" - a producer never substitutes `now`,
+    /// a calendar month, or a first-seen date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_period_start: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_period_end: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_last_checked_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3489,6 +3492,7 @@ mod tests {
                 billing_channel: Some("subscription".to_string()),
                 subscription_period_start: None,
                 subscription_period_end: None,
+                subscription_period_last_checked_at: None,
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
                 credential_fingerprint_hash: None,
