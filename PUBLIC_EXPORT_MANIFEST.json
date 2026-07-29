@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 289,
-  "content_sha256": "754f7e5471e13a4db1f33c85bcaf1377c382d55a98683334bdfd75f356250c21",
+  "content_sha256": "eaf30a32d7883d15db95e57fdf385958916b51edd8759249218643b968d2df86",
   "files": [
     {
       "executable": false,
@@ -517,15 +517,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_statusline.rs",
-      "sha256": "e3a9c909af5e2a4f9284a388fc309440778ba59859c94f9c8411f49a2053d886",
-      "size_bytes": 29011
+      "sha256": "5a3dc5654b3dbbc29203a6d222a736bb071c2096153d9ba05a04f52dd56fb232",
+      "size_bytes": 44228
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lib.rs",
-      "sha256": "027d70ccd3e842355092bf411068be6e0e93ba01553b9998108984be27568276",
-      "size_bytes": 3350
+      "sha256": "57bb0da53fa061c6daf43d75bd38e911dd5d09136697c13154c503d5349809dd",
+      "size_bytes": 3395
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "6f2ddfc32f95a8d5002f8af45d2b7d14ec5d5050a69f5f5619539407816d5353",
-      "size_bytes": 389661
+      "sha256": "8c6c85e00671e7b00ff0f5b3d4fc233071a55703cd8db13cf0e43f24d5867a12",
+      "size_bytes": 393755
     },
     {
       "executable": false,

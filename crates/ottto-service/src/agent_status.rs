@@ -2066,6 +2066,7 @@ fn collect_claude_statusline_quota_windows(
     }
     if let Some(reason) = claude_statusline_attribution_failure(
         &cache.observed_under_account_identifier_hash,
+        &cache.observed_under_account_method,
         account_identifier_hash,
         observable_account_identifier_hashes,
     ) {
@@ -2094,33 +2095,60 @@ fn claude_account_identifier_hashes_from_observations(
 }
 
 /// `None` when the sample provably belongs to the account that owns the local
-/// Claude Code credential now.
+/// Claude Code credential now, with resolution method taken into account.
+///
+/// SAFETY INVARIANT: A sample is served ONLY under an account proven for that
+/// render. When resolution fails, behavior must be identical to today's fail-closed:
+/// unattributable error, typed diagnostic, `unsupported_quota_window("usage")`.
+///
+/// Resolution method gates the proof requirements:
+/// - session_store: Desktop session store proved which account owns this session,
+///   so we serve it even when multiple accounts are observable (the whole point
+///   of the store join is to break that tie).
+/// - config_dir: CLI credential holders' sessions; serve if the stamped hash
+///   matches the current credential, even with multiple accounts observable (CLI
+///   credential is proof of ownership).
+/// - ambiguous: Multiple Desktop store matches that could not be resolved; refuse.
+/// - unknown: Unable to resolve; refuse.
+/// - v2 cache (no method field): unresolved origin; refuse.
 fn claude_statusline_attribution_failure(
     observed_under_account_identifier_hash: &str,
+    observed_under_account_method: &str,
     account_identifier_hash: &str,
-    observable_account_identifier_hashes: &[String],
+    _observable_account_identifier_hashes: &[String],
 ) -> Option<ClaudeStatusLineUnattributable> {
-    // An unnamed account cannot be matched against anything. Unlike the OAuth
-    // cache -- where two empty hashes are allowed to match, because there the
-    // daemon fetched the numbers itself and an unidentifiable machine would
-    // otherwise lose every cache hit against a rate-limited endpoint -- there is
-    // no such cost here: statusLine is free to re-observe on the next render.
-    if account_identifier_hash.is_empty() || observed_under_account_identifier_hash.is_empty() {
+    // Empty hash always means unknown, regardless of method
+    if observed_under_account_identifier_hash.is_empty() {
         return Some(ClaudeStatusLineUnattributable::AccountUnknown);
     }
-    if observed_under_account_identifier_hash != account_identifier_hash {
-        return Some(ClaudeStatusLineUnattributable::CredentialReplaced);
+    if account_identifier_hash.is_empty() {
+        return Some(ClaudeStatusLineUnattributable::AccountUnknown);
     }
-    // Half two: any other Claude account on this machine can render a Claude
-    // Code surface into the same cache, so its mere presence makes every sample
-    // ambiguous -- including one whose write-time credential matches.
-    let has_other_account = observable_account_identifier_hashes
-        .iter()
-        .any(|hash| hash != account_identifier_hash);
-    if has_other_account {
-        return Some(ClaudeStatusLineUnattributable::MultipleAccounts);
+
+    match observed_under_account_method {
+        "session_store" => {
+            // Desktop session store proved which account owns this session.
+            // Serve it, even if multiple accounts are observable.
+            // The store join is itself the proof.
+            None
+        }
+        "config_dir" => {
+            // CLI credential: only serve if the stamped hash matches the current holder.
+            if observed_under_account_identifier_hash == account_identifier_hash {
+                None
+            } else {
+                Some(ClaudeStatusLineUnattributable::CredentialReplaced)
+            }
+        }
+        "ambiguous" => {
+            // Multiple Desktop store matches; cannot resolve.
+            Some(ClaudeStatusLineUnattributable::MultipleAccounts)
+        }
+        _ => {
+            // "unknown" or missing/empty method (v2 cache) -> unresolved
+            Some(ClaudeStatusLineUnattributable::AccountUnknown)
+        }
     }
-    None
 }
 
 fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, String> {
@@ -8999,13 +9027,14 @@ for line in sys.stdin:
 
         // Same account, nothing else on the machine: provable, so serve it.
         assert_eq!(
-            claude_statusline_attribution_failure(&account_a, &account_a, &[]),
+            claude_statusline_attribution_failure(&account_a, "config_dir", &account_a, &[]),
             None
         );
         // A Desktop observation for the SAME account is not a second account.
         assert_eq!(
             claude_statusline_attribution_failure(
                 &account_a,
+                "config_dir",
                 &account_a,
                 &observable_account_hashes(&["acct-a"])
             ),
@@ -9014,7 +9043,7 @@ for line in sys.stdin:
 
         // Written under a credential that has since been replaced.
         assert_eq!(
-            claude_statusline_attribution_failure(&account_a, &account_b, &[]),
+            claude_statusline_attribution_failure(&account_a, "config_dir", &account_b, &[]),
             Some(ClaudeStatusLineUnattributable::CredentialReplaced)
         );
 
@@ -9022,45 +9051,98 @@ for line in sys.stdin:
         // cache, two empty hashes must NOT match here: statusLine re-observes on
         // the next render, so refusing costs nothing.
         assert_eq!(
-            claude_statusline_attribution_failure("", &account_a, &[]),
+            claude_statusline_attribution_failure("", "unknown", &account_a, &[]),
             Some(ClaudeStatusLineUnattributable::AccountUnknown)
         );
         assert_eq!(
-            claude_statusline_attribution_failure(&account_a, "", &[]),
+            claude_statusline_attribution_failure(&account_a, "unknown", "", &[]),
             Some(ClaudeStatusLineUnattributable::AccountUnknown)
         );
         assert_eq!(
-            claude_statusline_attribution_failure("", "", &[]),
+            claude_statusline_attribution_failure("", "unknown", "", &[]),
             Some(ClaudeStatusLineUnattributable::AccountUnknown)
         );
     }
 
     #[test]
-    fn claude_statusline_sample_is_refused_when_a_second_claude_account_exists() {
-        // The live 2026-07-26 repro, which plain account-keying does NOT catch:
-        // the CLI credential was the work Team account both when the sample was
-        // written and when it was read, so the write-time key matched -- while
-        // the numbers came from the personal Max account rendering in the Claude
-        // Desktop app's "Code" tab, through the same wrapper, into the same
-        // machine-global file.
+    fn claude_statusline_sample_serves_when_resolved_via_session_store_despite_multiple_accounts() {
+        // NEW BEHAVIOR: if the Desktop session store proved which account owns the session,
+        // serve it even when other accounts are observable -- the store join is the proof.
         let team = claude_account_identifier_hash(Some("acct-team"), None, None);
 
+        // session_store method: serve despite multiple accounts being observable
         assert_eq!(
             claude_statusline_attribution_failure(
                 &team,
+                "session_store",
                 &team,
                 &observable_account_hashes(&["acct-max"])
             ),
-            Some(ClaudeStatusLineUnattributable::MultipleAccounts),
-            "a matching write-time key is not proof while a second Claude account can write this cache"
+            None,
+            "session_store resolution proves ownership even when another account is present"
+        );
+    }
+
+    #[test]
+    fn claude_statusline_sample_serves_config_dir_when_hash_matches_despite_multiple_accounts() {
+        // NEW BEHAVIOR: CLI credential (config_dir method) serves if the hash matches,
+        // even when other accounts are observable -- the credential holder owns their own sessions.
+        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
+        let max = claude_account_identifier_hash(Some("acct-max"), None, None);
+
+        // config_dir method with matching hash: serve despite multiple accounts
+        assert_eq!(
+            claude_statusline_attribution_failure(
+                &team,
+                "config_dir",
+                &team,
+                &observable_account_hashes(&["acct-max"])
+            ),
+            None,
+            "config_dir resolution matches current credential and serves despite multiple accounts"
         );
 
-        // Observations that name no account cannot establish a second one --
-        // `claude_account_identifier_hashes_from_observations` drops them.
-        assert!(claude_account_identifier_hashes_from_observations(&[]).is_empty());
+        // config_dir method with non-matching hash: refuse as CredentialReplaced
         assert_eq!(
-            claude_statusline_attribution_failure(&team, &team, &[]),
-            None
+            claude_statusline_attribution_failure(
+                &max,
+                "config_dir",
+                &team,
+                &observable_account_hashes(&["acct-max"])
+            ),
+            Some(ClaudeStatusLineUnattributable::CredentialReplaced),
+            "config_dir refuses when hash differs from current credential"
+        );
+    }
+
+    #[test]
+    fn claude_statusline_sample_refuses_ambiguous_resolution() {
+        // NEW BEHAVIOR: ambiguous resolution (multiple Desktop store matches) always refuses
+        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
+
+        assert_eq!(
+            claude_statusline_attribution_failure(&team, "ambiguous", &team, &[]),
+            Some(ClaudeStatusLineUnattributable::MultipleAccounts),
+            "ambiguous resolution is unresolvable and must refuse"
+        );
+    }
+
+    #[test]
+    fn claude_statusline_sample_refuses_unknown_resolution() {
+        // NEW BEHAVIOR: unknown resolution (no store match, no CLI entrypoint, etc) refuses
+        let team = claude_account_identifier_hash(Some("acct-team"), None, None);
+
+        assert_eq!(
+            claude_statusline_attribution_failure(&team, "unknown", &team, &[]),
+            Some(ClaudeStatusLineUnattributable::AccountUnknown),
+            "unknown resolution cannot be proven"
+        );
+
+        // Empty method (v2 cache missing method field) is treated as unknown
+        assert_eq!(
+            claude_statusline_attribution_failure(&team, "", &team, &[]),
+            Some(ClaudeStatusLineUnattributable::AccountUnknown),
+            "v2 cache with no method field is unresolved"
         );
     }
 
@@ -9086,6 +9168,7 @@ for line in sys.stdin:
             &ClaudeStatusLineRateLimitCache {
                 schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
                 observed_under_account_identifier_hash: account_a.clone(),
+                observed_under_account_method: "config_dir".to_string(),
                 observed_at_epoch_seconds: now,
                 windows: vec![ClaudeStatusLineRateLimitWindow {
                     name: "seven_day".to_string(),
@@ -9113,16 +9196,23 @@ for line in sys.stdin:
             )
         );
 
-        // Nor may a matching key be served while a second Claude account can
-        // write the same file.
-        assert_eq!(
-            collect_claude_statusline_quota_windows(
-                &account_a,
-                &observable_account_hashes(&["acct-max"])
-            )
-            .expect("collect"),
-            ClaudeStatusLineQuota::Unattributable(ClaudeStatusLineUnattributable::MultipleAccounts)
-        );
+        // With the new resolution method system, config_dir method serves the cache
+        // even when another account is observable, because the method proves it was
+        // resolved from the CLI credential holder. The store join is what breaks the
+        // old "any second account makes everything ambiguous" logic.
+        match collect_claude_statusline_quota_windows(
+            &account_a,
+            &observable_account_hashes(&["acct-max"])
+        )
+        .expect("collect") {
+            ClaudeStatusLineQuota::Windows(windows) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].used_percent, Some(44));
+            }
+            other => panic!(
+                "config_dir method should serve despite multiple accounts when hash matches: {other:?}"
+            ),
+        }
 
         // A pre-fix (v1) cache carries no account identity and is discarded
         // outright rather than adopted by whoever is signed in now.
@@ -9153,6 +9243,7 @@ for line in sys.stdin:
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
                 ClaudeStatusLineRateLimitWindow {
@@ -9201,6 +9292,7 @@ for line in sys.stdin:
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: String::new(),
+            observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![ClaudeStatusLineRateLimitWindow {
                 name: "five_hour".to_string(),
@@ -9281,6 +9373,7 @@ for line in sys.stdin:
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![
                 ClaudeStatusLineRateLimitWindow {
@@ -9314,6 +9407,7 @@ for line in sys.stdin:
         let cache = ClaudeStatusLineRateLimitCache {
             schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
             observed_under_account_identifier_hash: "account-a".to_string(),
+            observed_under_account_method: "config_dir".to_string(),
             observed_at_epoch_seconds: 100,
             windows: vec![ClaudeStatusLineRateLimitWindow {
                 name: "five_hour".to_string(),
