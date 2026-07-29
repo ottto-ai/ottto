@@ -2140,9 +2140,6 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             "provider_daily_reference_control"
         }
-        LocalControlCommand::ClaudeDesktopWebUsagePreference { .. } => {
-            "claude_desktop_web_usage_preference"
-        }
         LocalControlCommand::Repair { .. } => "repair",
         LocalControlCommand::Verify { .. } => "verify",
         LocalControlCommand::RelayStart => "relay_start",

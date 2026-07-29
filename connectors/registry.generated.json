@@ -20,30 +20,6 @@
       "manifest_path": "connectors/sources/claude-code/source.toml",
       "collectors": [
         {
-          "collector_id": "desktop_quota_status",
-          "display_name": "Claude Desktop subscription quota",
-          "operations": [
-            "detect",
-            "monitor_quota",
-            "diagnostics"
-          ],
-          "data_source_kind": "local_enriched",
-          "default_state": "requires_setup",
-          "review_tier": "official",
-          "maturity": "beta",
-          "risk_classes": [
-            "auth_adjacent",
-            "network_calls",
-            "hidden_credential_read"
-          ],
-          "uploads_raw_content": false,
-          "emits": [
-            "agent_status_snapshots",
-            "source_plan_profiles"
-          ],
-          "manifest_path": "connectors/sources/claude-code/collectors/desktop_quota_status/collector.toml"
-        },
-        {
           "collector_id": "identity_probe",
           "display_name": "Identity probe",
           "operations": [

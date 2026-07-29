@@ -75,7 +75,7 @@ trip. No new telemetry channel.
 ## Off-switch sentinel
 
 `<support>/claude-oauth-usage-network-disabled`, resolved through
-`default_support_dir()` exactly like the existing Claude Desktop usage sentinel.
+`default_support_dir()`.
 Present means the endpoint is never contacted; quota comes from statusLine only,
 and an info diagnostic `claude_oauth_usage_network_disabled` says so. The check
 runs ahead of the cache and the cached payload is removed from disk, because the
@@ -97,6 +97,5 @@ diagnostics survive `redacted_for_backend` intact.
 ## Deliberately unchanged
 
 The honest User-Agent, the account-keying of the usage cache and statusLine
-cache, the Claude Desktop cookie collector, and the statusLine-vs-network
-preference order (promoting statusLine to default is a separate, deferred
-change).
+cache, and the statusLine-vs-network preference order (promoting statusLine to
+default is a separate, deferred change).
