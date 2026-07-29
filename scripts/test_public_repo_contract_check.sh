@@ -1893,6 +1893,47 @@ grep -q "Claude Code skill must keep support claims out of chat" \
 
 pin_private="$tmp_dir/pin-private"
 write_valid_private_consumers "$pin_private" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
+pin_private_v2="$tmp_dir/pin-private-v2"
+write_valid_private_consumers "$pin_private_v2" "$output_dir/PUBLIC_EXPORT_MANIFEST.json"
+python3 - "$pin_private_v2/backend/app/domain/local_platform/public_runtime_pin.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+pin = json.loads(path.read_text(encoding="utf-8"))
+pin["schema_version"] = 2
+pin["stable_version"] = "0.1.100"
+pin["provider_daily_reference_admission_required"] = True
+path.write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+"$CONTRACT_SCRIPT" \
+  --staged-output "$output_dir" \
+  --private-repo-root "$pin_private_v2" \
+  >/tmp/public-contract-pin-v2.out
+
+bad_pin_v2="$tmp_dir/bad-pin-v2.json"
+python3 - "$pin_private_v2/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$bad_pin_v2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pin = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+pin.pop("stable_version")
+Path(sys.argv[2]).write_text(json.dumps(pin, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+if "$CONTRACT_SCRIPT" \
+  --staged-output "$output_dir" \
+  --private-repo-root "$pin_private_v2" \
+  --private-runtime-pin "$bad_pin_v2" \
+  >/tmp/public-contract-bad-pin-v2.out 2>&1; then
+  echo "Expected contract check to fail when the v2 private runtime pin lacks stable_version" >&2
+  exit 1
+fi
+grep -q "schema_version 2 requires an exact X.Y.Z stable_version" \
+  /tmp/public-contract-bad-pin-v2.out
+
 bad_pin="$tmp_dir/bad-pin.json"
 python3 - "$pin_private/backend/app/domain/local_platform/public_runtime_pin.json" "$bad_pin" <<'PY'
 import json
