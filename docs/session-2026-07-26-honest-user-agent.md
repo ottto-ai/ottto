@@ -20,6 +20,5 @@ time), and `collect_claude_oauth_usage` dropped its now unused `version`
 parameter. A unit test pins the posture: the UA must start
 with `ottto/` and must never contain `claude`.
 
-Deliberately unchanged: the Claude Desktop cookie collector's browser UA
-(sentinel-gated off, slated for removal under the multi-slot config-dir work)
-and polling cadence (separate change).
+The separate Claude Desktop browser-session collector was deliberately unchanged
+in this session; it was retired on 2026-07-29.

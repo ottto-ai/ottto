@@ -20,6 +20,5 @@ collectors = [
   "local_sessions",
   "otel_config",
   "quota_status",
-  "desktop_quota_status",
   "identity_probe"
 ]
