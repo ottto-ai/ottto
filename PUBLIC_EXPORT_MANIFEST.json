@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 289,
-  "content_sha256": "1610868abd34a29f33fa821783a841212d8da5960f1f5ab93585e610c4d2c683",
+  "content_sha256": "dba1ac52b7a0ba069965fdbfc52b2a74bf2747423295827b71b8f4efe5914911",
   "files": [
     {
       "executable": false,
@@ -1175,8 +1175,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-29-retire-cookie-collector-and-last-checked.md",
-      "sha256": "4ce664cd6a07564673641c325e0ae6d64dce762ea1f9c49950d88880ac6c7fa2",
-      "size_bytes": 4425
+      "sha256": "8e8833370b933cfe5947a08b08b7d946b76ca3cfd6a250c960092206c335f968",
+      "size_bytes": 4724
     },
     {
       "executable": false,
@@ -2026,7 +2026,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-29T18:59:45+00:00",
+  "generated_at": "2026-07-29T19:04:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 290,
   "public_roots": [
@@ -2062,5 +2062,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "33bfbd78521f28c59be680a4a9e7e600cb0e79f1"
+  "source_commit": "c7e36ce194a01055e94cf68bd3ea63489d4d92b9"
 }

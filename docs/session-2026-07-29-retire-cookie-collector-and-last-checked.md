@@ -92,5 +92,11 @@ the new field, not to the collector deletion.
   silent probe.
 - Serialization coverage pins omission when absent.
 - `cargo fmt --all -- --check`: clean.
+- `cargo test --workspace`: 1,259 passed, 0 failed, 3 ignored on the final tree
+  after merging the current `origin/main`.
+- `cargo clippy --workspace --all-targets`: clean.
+- `scripts/public_repo_manifest_check.sh`: clean after final manifest
+  regeneration.
+- `cargo fmt --all -- --check`: clean.
 - `cargo test --workspace`: 1,257 passed, 0 failed, 3 ignored.
 - `cargo clippy --workspace --all-targets`: clean.
