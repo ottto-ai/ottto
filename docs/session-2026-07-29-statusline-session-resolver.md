@@ -59,10 +59,38 @@ The entire point: relaxation is method-gated. Do NOT refuse merely because multi
 
 ## Safety Invariant
 
-**A sample is served ONLY under an account proven for that render.** Unproven resolution yields the same behavior as today: fail-closed, typed diagnostic, `unsupported_quota_window("usage")`. The new window-open (session_store serving) is safe because the store join has never been observed to fail on live Desktop "Code" tab renders — an unproven join simply yields `unknown`, i.e., today's behavior.
+**A sample is served ONLY under an account proven for that render.** Unproven
+resolution yields the same behavior as today: fail-closed, typed diagnostic,
+`unsupported_quota_window("usage")`.
+
+Be precise about what is and is not established. The `session_id` ->
+`cliSessionId` join has been verified against the store at rest (369 of 373
+leaf files carry `cliSessionId`; Desktop-hosted sessions are present and
+terminal sessions are absent), and it has **never been observed on a live
+Desktop "Code" tab render** - not "observed and found reliable", simply never
+observed, because that surface did not render a status line during 4.5 hours of
+armed capture. This change does not depend on that gap being closed: a join
+that misses resolves to `unknown`, which is byte-identical to today's
+fail-closed behavior. Confirming it would tell us how much coverage the
+`session_store` method actually buys, not whether it is safe.
+
+There is no fallback to the credential holder. An unresolved sample carries no
+account at all, so a reader that trusted the hash without checking the method
+still cannot misattribute.
 
 ## Test Coverage
 
-- Core: store hit resolves to `session_store`, memo prevents rescan, multi-account tie-breaks work, privacy holds.
-- Service: `session_store` serves despite other accounts; `config_dir` serves when hash matches despite others; `config_dir` refuses on hash mismatch; `ambiguous` refuses; `unknown` refuses; v2 cache refuses.
-- Negative control: stub resolver to always return `config_dir`, verify that the test FAILS attribution when hash differs — proof that method-gated logic is load-bearing.
+- Core: store hit resolves to `session_store` and is memoized (proven by
+  deleting the store and resolving again); a mirrored session prefers the live
+  claim, then the newest `lastActivityAt`; a mirrored session with no
+  discriminator resolves `ambiguous` with an empty hash; a terminal render
+  resolves `config_dir` only with a CLI entrypoint, and a store miss without one
+  resolves `unknown` carrying no account; the cache and the memo hold no raw
+  session id, cwd or transcript path.
+- Service: `session_store` serves despite other accounts; `config_dir` serves
+  when the hash matches despite others; `config_dir` refuses on hash mismatch;
+  `ambiguous` refuses; `unknown` refuses; a v2 cache refuses.
+- Negative control: the same render resolved via the store yields the hosting
+  account while the credential holder yields a different one, asserted
+  `assert_ne!`. If those ever matched, the resolver would be decorative and
+  every attribution test here would pass anyway.

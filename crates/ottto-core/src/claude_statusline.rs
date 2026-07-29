@@ -148,15 +148,24 @@ fn claude_statusline_resolution_memo_path(support_dir: &Path) -> PathBuf {
     support_dir.join(CLAUDE_STATUSLINE_RESOLUTION_MEMO_FILE_NAME)
 }
 
-/// Resolve the account for a Claude Code session, checking Desktop session store first,
-/// then CLI credential if available, otherwise marking as unknown.
+/// Resolve which account owns the numbers in THIS render.
 ///
-/// SAFETY INVARIANT: the session_id is hashed before memoization. The memo and
-/// all persisted files NEVER contain raw session_id, cwd, or transcript_path values.
+/// SAFETY INVARIANT: the session id is hashed before memoization. The memo and
+/// every persisted file NEVER contain a raw session id, cwd, or transcript path.
+///
+/// `cli_account_identifier_hash` is the account the local Claude CLI credential
+/// names right now. It is used ONLY for the `config_dir` method, where the
+/// inherited entrypoint proves the render came from a terminal/IDE session and
+/// therefore used that credential. It is deliberately NOT a fallback for the
+/// unresolved cases: stamping it on a sample we could not attribute would put a
+/// real account name on an unproven observation, and any reader that trusted
+/// the hash without also checking the method would misattribute silently.
 fn resolve_claude_statusline_account_for_session(
+    support_dir: &Path,
     payload: &str,
     desktop_sessions_root: Option<&Path>,
     cli_entrypoint: Option<&str>,
+    cli_account_identifier_hash: &str,
 ) -> Result<(String, ClaudeStatusLineAccountResolutionMethod)> {
     let value: Value =
         serde_json::from_str(payload).context("parse payload to extract session_id")?;
@@ -171,7 +180,7 @@ fn resolve_claude_statusline_account_for_session(
 
     // Try memoization first (keyed by session_id hash, not raw session_id)
     let session_id_hash = hash_session_id(session_id);
-    if let Ok(Some((hash, method))) = check_resolution_memo(&session_id_hash) {
+    if let Ok(Some((hash, method))) = check_resolution_memo(support_dir, &session_id_hash) {
         return Ok((hash, method));
     }
 
@@ -179,20 +188,22 @@ fn resolve_claude_statusline_account_for_session(
     if let Some(root) = desktop_sessions_root {
         if let Ok(Some((hash, method))) = resolve_from_desktop_session_store(root, session_id) {
             // Memoize the result
-            let _ = add_to_resolution_memo(&session_id_hash, &hash, &method);
+            let _ = add_to_resolution_memo(support_dir, &session_id_hash, &hash, &method);
             return Ok((hash, method));
         }
     }
 
     // Try CLI credential if entrypoint indicates CLI session
     let is_cli_session = cli_entrypoint.is_some_and(|ep| ep.eq("cli") || ep.contains("vscode"));
-    if is_cli_session {
-        let cli_hash = crate::claude_cli_account_identifier_hash();
-        if !cli_hash.is_empty() {
-            let method = ClaudeStatusLineAccountResolutionMethod::ConfigDir;
-            let _ = add_to_resolution_memo(&session_id_hash, &cli_hash, &method);
-            return Ok((cli_hash, method));
-        }
+    if is_cli_session && !cli_account_identifier_hash.is_empty() {
+        let method = ClaudeStatusLineAccountResolutionMethod::ConfigDir;
+        let _ = add_to_resolution_memo(
+            support_dir,
+            &session_id_hash,
+            cli_account_identifier_hash,
+            &method,
+        );
+        return Ok((cli_account_identifier_hash.to_string(), method));
     }
 
     // Unable to resolve
@@ -209,10 +220,10 @@ fn hash_session_id(session_id: &str) -> String {
 }
 
 fn check_resolution_memo(
+    support_dir: &Path,
     session_id_hash: &str,
 ) -> Result<Option<(String, ClaudeStatusLineAccountResolutionMethod)>> {
-    let support_dir = crate::default_support_dir();
-    let memo_path = claude_statusline_resolution_memo_path(&support_dir);
+    let memo_path = claude_statusline_resolution_memo_path(support_dir);
     if !memo_path.exists() {
         return Ok(None);
     }
@@ -235,14 +246,14 @@ fn check_resolution_memo(
 }
 
 fn add_to_resolution_memo(
+    support_dir: &Path,
     session_id_hash: &str,
     account_hash: &str,
     method: &ClaudeStatusLineAccountResolutionMethod,
 ) -> Result<()> {
-    let support_dir = crate::default_support_dir();
-    fs::create_dir_all(&support_dir).context("create support dir")?;
+    fs::create_dir_all(support_dir).context("create support dir")?;
 
-    let memo_path = claude_statusline_resolution_memo_path(&support_dir);
+    let memo_path = claude_statusline_resolution_memo_path(support_dir);
     let mut memo = if memo_path.exists() {
         let body = fs::read_to_string(&memo_path).context("read existing memo")?;
         serde_json::from_str::<ClaudeStatusLineResolutionMemo>(&body).unwrap_or_else(|_| {
@@ -297,7 +308,8 @@ fn resolve_from_desktop_session_store(
         return Ok(None);
     }
 
-    let mut candidates: Vec<(String, String, bool)> = Vec::new(); // (account_uuid, hash, is_archived)
+    // (account_identifier_hash, is_archived, last_activity_at)
+    let mut candidates: Vec<(String, bool, String)> = Vec::new();
 
     // Iterate account directories
     for account_entry in fs::read_dir(sessions_root).context("read sessions root")? {
@@ -359,45 +371,80 @@ fn resolve_from_desktop_session_store(
                         crate::billing_identity_hash("anthropic", "account", &account_uuid)
                             .unwrap_or_default();
 
-                    candidates.push((account_uuid.clone(), account_hash, is_archived));
+                    // `lastActivityAt` is the second tie-break for a session
+                    // mirrored under two accounts (a session resumed under the
+                    // other account). Compared as a string: the store writes
+                    // RFC3339 UTC, which sorts lexicographically.
+                    let last_activity_at = session_obj
+                        .get("lastActivityAt")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+
+                    candidates.push((account_hash, is_archived, last_activity_at));
                 }
             }
         }
     }
 
-    match candidates.len() {
-        0 => Ok(None),
-        1 => {
-            let (_, hash, _) = &candidates[0];
-            Ok(Some((
-                hash.clone(),
-                ClaudeStatusLineAccountResolutionMethod::SessionStore,
-            )))
+    // Distinct accounts only: the same account claiming a session twice is not
+    // an ambiguity, it is one owner.
+    let mut distinct: Vec<(String, bool, String)> = Vec::new();
+    for candidate in candidates {
+        if !distinct.iter().any(|(hash, _, _)| hash == &candidate.0) {
+            distinct.push(candidate);
         }
-        _ => {
-            // Multiple matches - apply tie-breaks
-            // First try: prefer not archived
-            let not_archived: Vec<_> = candidates
-                .iter()
-                .filter(|(_, _, archived)| !archived)
-                .collect();
+    }
 
-            match not_archived.len() {
-                1 => {
-                    let (_, hash, _) = not_archived[0];
-                    Ok(Some((
-                        hash.clone(),
+    match distinct.len() {
+        0 => Ok(None),
+        1 => Ok(Some((
+            distinct[0].0.clone(),
+            ClaudeStatusLineAccountResolutionMethod::SessionStore,
+        ))),
+        _ => {
+            // Tie-break 1: exactly one live (non-archived) claim wins.
+            let live: Vec<&(String, bool, String)> = distinct
+                .iter()
+                .filter(|(_, archived, _)| !archived)
+                .collect();
+            if live.len() == 1 {
+                return Ok(Some((
+                    live[0].0.clone(),
+                    ClaudeStatusLineAccountResolutionMethod::SessionStore,
+                )));
+            }
+            // Tie-break 2: among the remaining claims, a single strictly
+            // greatest `lastActivityAt` wins - the account that touched the
+            // session last is the one that hosted this render.
+            let pool: Vec<&(String, bool, String)> = if live.len() > 1 {
+                live
+            } else {
+                distinct.iter().collect()
+            };
+            let newest = pool
+                .iter()
+                .map(|(_, _, at)| at.as_str())
+                .max()
+                .unwrap_or_default();
+            if !newest.is_empty() {
+                let winners: Vec<&&(String, bool, String)> = pool
+                    .iter()
+                    .filter(|(_, _, at)| at.as_str() == newest)
+                    .collect();
+                if winners.len() == 1 {
+                    return Ok(Some((
+                        winners[0].0.clone(),
                         ClaudeStatusLineAccountResolutionMethod::SessionStore,
-                    )))
-                }
-                _ => {
-                    // Still ambiguous - could try lastActivityAt tie-break but for now return ambiguous
-                    Ok(Some((
-                        String::new(),
-                        ClaudeStatusLineAccountResolutionMethod::Ambiguous,
-                    )))
+                    )));
                 }
             }
+            // Genuinely unresolvable: two accounts claim the session with no
+            // discriminator. Refuse rather than guess.
+            Ok(Some((
+                String::new(),
+                ClaudeStatusLineAccountResolutionMethod::Ambiguous,
+            )))
         }
     }
 }
@@ -408,10 +455,37 @@ pub fn ingest_claude_statusline_payload(
     observed_at_epoch_seconds: u64,
     observed_under_account_identifier_hash: &str,
 ) -> Result<ClaudeStatusLineIngestResult> {
+    // Resolve WHOSE numbers this render carries before anything is written. The
+    // environment and the memo are read here, not in the parser, so the parser
+    // stays pure and this stays the one place with ambient inputs.
+    let desktop_sessions_root = std::env::var("CLAUDE_DESKTOP_SESSIONS_ROOT")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|home| {
+                PathBuf::from(home).join("Library/Application Support/Claude/claude-code-sessions")
+            })
+        });
+    let cli_entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
+    let (resolved_account_hash, resolved_method) = resolve_claude_statusline_account_for_session(
+        support_dir,
+        payload,
+        desktop_sessions_root.as_deref(),
+        cli_entrypoint.as_deref(),
+        observed_under_account_identifier_hash,
+    )
+    .unwrap_or_else(|_| {
+        (
+            String::new(),
+            ClaudeStatusLineAccountResolutionMethod::Unknown,
+        )
+    });
+
     let rate_cache = parse_claude_statusline_payload(
         payload,
         observed_at_epoch_seconds,
-        observed_under_account_identifier_hash,
+        &resolved_account_hash,
+        &resolved_method,
     )?;
     let context_cache =
         parse_claude_statusline_context_window_payload(payload, observed_at_epoch_seconds)?;
@@ -444,10 +518,19 @@ pub fn ingest_claude_statusline_payload(
     })
 }
 
+/// Parse the quota windows out of a statusLine payload and stamp them with an
+/// ALREADY RESOLVED account identity.
+///
+/// Deliberately pure: resolution reads the environment and memoizes to disk, so
+/// it lives in `ingest_claude_statusline_payload`, which owns the support dir.
+/// Keeping it out of here means this function has no ambient inputs and no side
+/// effects, which is also what makes it testable without touching real machine
+/// state.
 pub fn parse_claude_statusline_payload(
     payload: &str,
     observed_at_epoch_seconds: u64,
     observed_under_account_identifier_hash: &str,
+    observed_under_account_method: &ClaudeStatusLineAccountResolutionMethod,
 ) -> Result<Option<ClaudeStatusLineRateLimitCache>> {
     let value: Value =
         serde_json::from_str(payload).context("parse Claude Code statusLine JSON")?;
@@ -469,41 +552,10 @@ pub fn parse_claude_statusline_payload(
         return Ok(None);
     }
 
-    // Resolve account and method
-    let desktop_sessions_root = std::env::var("CLAUDE_DESKTOP_SESSIONS_ROOT")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME").ok().map(|home| {
-                PathBuf::from(home).join("Library/Application Support/Claude/claude-code-sessions")
-            })
-        });
-
-    let cli_entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").ok();
-
-    let (resolved_hash, method) = resolve_claude_statusline_account_for_session(
-        payload,
-        desktop_sessions_root.as_deref(),
-        cli_entrypoint.as_deref(),
-    )
-    .unwrap_or_else(|_| {
-        (
-            String::new(),
-            ClaudeStatusLineAccountResolutionMethod::Unknown,
-        )
-    });
-
-    // Prefer resolved hash from Desktop store, fall back to passed-in hash from CLI credential
-    let final_hash = if !resolved_hash.is_empty() {
-        resolved_hash
-    } else {
-        observed_under_account_identifier_hash.to_string()
-    };
-
     Ok(Some(ClaudeStatusLineRateLimitCache {
         schema_version: CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
-        observed_under_account_identifier_hash: final_hash,
-        observed_under_account_method: method.as_ref().to_string(),
+        observed_under_account_identifier_hash: observed_under_account_identifier_hash.to_string(),
+        observed_under_account_method: observed_under_account_method.as_ref().to_string(),
         observed_at_epoch_seconds,
         windows,
     }))
@@ -833,9 +885,14 @@ mod tests {
           }
         }"#;
 
-        let cache = parse_claude_statusline_payload(payload, 1738422000, "account-a")
-            .expect("parse")
-            .expect("cache");
+        let cache = parse_claude_statusline_payload(
+            payload,
+            1738422000,
+            "account-a",
+            &ClaudeStatusLineAccountResolutionMethod::ConfigDir,
+        )
+        .expect("parse")
+        .expect("cache");
 
         assert_eq!(cache.observed_at_epoch_seconds, 1738422000);
         assert_eq!(cache.windows.len(), 2);
@@ -1103,35 +1160,233 @@ mod tests {
         assert_eq!(replaced.active_tokens, Some(99_999));
     }
 
-    #[test]
-    fn memo_prevents_rescan_on_second_render() {
-        // Set up memo environment
-        let support_dir = support_dir("memo-test");
-        std::env::set_var("OTTTO_SUPPORT_DIR_OVERRIDE", &support_dir);
+    /// Build a Desktop session store fixture: <root>/<account>/<org>/local_x.json
+    fn write_store_session(
+        root: &Path,
+        account_uuid: &str,
+        cli_session_id: &str,
+        is_archived: bool,
+        last_activity_at: &str,
+    ) {
+        let dir = root.join(account_uuid).join("org-1");
+        fs::create_dir_all(&dir).expect("create store dirs");
+        let body = serde_json::json!({
+            "cliSessionId": cli_session_id,
+            "isArchived": is_archived,
+            "lastActivityAt": last_activity_at,
+        });
+        fs::write(
+            dir.join(format!("local_{cli_session_id}.json")),
+            serde_json::to_vec(&body).expect("serialize session"),
+        )
+        .expect("write store session");
+    }
 
-        let session_id = "test-session-12345";
-        let payload = format!(
+    fn account_hash(uuid: &str) -> String {
+        crate::billing_identity_hash("anthropic", "account", uuid).expect("hash")
+    }
+
+    fn payload_for(session_id: &str) -> String {
+        format!(
             r#"{{"session_id": "{session_id}", "rate_limits": {{"five_hour": {{"used_percentage": 10, "resets_at": 1738425600}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn session_store_hit_resolves_the_hosting_account_and_memoizes() {
+        let support = support_dir("resolve-store");
+        let store = support.join("store");
+        fs::create_dir_all(&support).expect("support dir");
+        write_store_session(
+            &store,
+            "acct-desktop",
+            "sess-1",
+            false,
+            "2026-07-29T10:00:00Z",
         );
 
-        // First parse - should resolve (or not, depending on store)
-        let cache1 = parse_claude_statusline_payload(&payload, 100, "account-fallback")
-            .expect("first parse");
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-1"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(
+            method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(hash, account_hash("acct-desktop"));
 
-        // Second parse - should hit memo
-        let cache2 = parse_claude_statusline_payload(&payload, 200, "account-fallback")
-            .expect("second parse");
+        // The memo must carry the answer without the raw session id, and must
+        // survive the store going away - that is what proves it is a memo and
+        // not a rescan.
+        let memo = fs::read_to_string(claude_statusline_resolution_memo_path(&support))
+            .expect("memo written");
+        assert!(
+            !memo.contains("sess-1"),
+            "memo must not hold a raw session id"
+        );
+        fs::remove_dir_all(&store).expect("drop store");
+        let (memo_hash, memo_method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-1"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve from memo");
+        assert_eq!(
+            memo_method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(memo_hash, hash);
 
-        // Both should have same resolution method (if memo worked)
-        if let (Some(c1), Some(c2)) = (cache1, cache2) {
-            // Both should have the same method string
-            assert_eq!(
-                c1.observed_under_account_method,
-                c2.observed_under_account_method
-            );
-        }
+        let _ = fs::remove_dir_all(&support);
+    }
 
-        std::env::remove_var("OTTTO_SUPPORT_DIR_OVERRIDE");
+    #[test]
+    fn mirrored_session_prefers_the_live_claim_then_the_newest() {
+        // A session resumed under a second account is claimed twice. Verified on
+        // a real machine: 7 of 369 store sessions are mirrored like this.
+        let support = support_dir("resolve-mirrored-live");
+        let store = support.join("store");
+        write_store_session(&store, "acct-a", "sess-m", true, "2026-07-29T10:00:00Z");
+        write_store_session(&store, "acct-b", "sess-m", false, "2026-07-29T09:00:00Z");
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-m"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(
+            method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(hash, account_hash("acct-b"), "the non-archived claim wins");
+        let _ = fs::remove_dir_all(&support);
+
+        // Both live: the account that touched it last hosted this render.
+        let support = support_dir("resolve-mirrored-newest");
+        let store = support.join("store");
+        write_store_session(&store, "acct-a", "sess-n", false, "2026-07-29T08:00:00Z");
+        write_store_session(&store, "acct-b", "sess-n", false, "2026-07-29T11:30:00Z");
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-n"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(
+            method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(hash, account_hash("acct-b"), "newest lastActivityAt wins");
+        let _ = fs::remove_dir_all(&support);
+    }
+
+    #[test]
+    fn mirrored_session_with_no_discriminator_is_ambiguous_not_a_guess() {
+        let support = support_dir("resolve-ambiguous");
+        let store = support.join("store");
+        write_store_session(&store, "acct-a", "sess-x", false, "2026-07-29T10:00:00Z");
+        write_store_session(&store, "acct-b", "sess-x", false, "2026-07-29T10:00:00Z");
+
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-x"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(method, ClaudeStatusLineAccountResolutionMethod::Ambiguous);
+        assert!(hash.is_empty(), "an unresolved sample carries no account");
+        let _ = fs::remove_dir_all(&support);
+    }
+
+    #[test]
+    fn terminal_render_falls_back_to_the_credential_only_with_a_cli_entrypoint() {
+        let support = support_dir("resolve-config-dir");
+        let store = support.join("store");
+        fs::create_dir_all(&store).expect("empty store");
+
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-term"),
+            Some(&store),
+            Some("cli"),
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(method, ClaudeStatusLineAccountResolutionMethod::ConfigDir);
+        assert_eq!(hash, "cli-credential-hash");
+        let _ = fs::remove_dir_all(&support);
+
+        // No entrypoint evidence: the credential holder is NOT a fallback.
+        let support = support_dir("resolve-unknown");
+        let store = support.join("store");
+        fs::create_dir_all(&store).expect("empty store");
+        let (hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-desktop-miss"),
+            Some(&store),
+            None,
+            "cli-credential-hash",
+        )
+        .expect("resolve");
+        assert_eq!(method, ClaudeStatusLineAccountResolutionMethod::Unknown);
+        assert!(
+            hash.is_empty(),
+            "a store miss on a non-CLI render must not borrow the credential holder"
+        );
+        let _ = fs::remove_dir_all(&support);
+    }
+
+    /// NEGATIVE CONTROL: prove the per-session store join is load-bearing.
+    ///
+    /// The same render resolved via the store yields the hosting account; the
+    /// old behavior (credential holder) yields a DIFFERENT account. If these
+    /// ever matched, every attribution test in this file would pass while the
+    /// resolver did nothing.
+    #[test]
+    fn store_resolution_differs_from_the_credential_holder() {
+        let support = support_dir("resolve-negative-control");
+        let store = support.join("store");
+        write_store_session(
+            &store,
+            "acct-desktop",
+            "sess-nc",
+            false,
+            "2026-07-29T10:00:00Z",
+        );
+        let credential_holder_hash = account_hash("acct-work-credential");
+
+        let (store_hash, method) = resolve_claude_statusline_account_for_session(
+            &support,
+            &payload_for("sess-nc"),
+            Some(&store),
+            Some("cli"),
+            &credential_holder_hash,
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            method,
+            ClaudeStatusLineAccountResolutionMethod::SessionStore
+        );
+        assert_eq!(store_hash, account_hash("acct-desktop"));
+        assert_ne!(
+            store_hash, credential_holder_hash,
+            "the store must win over the credential holder, otherwise this whole \
+             change is decorative and the sample would be misattributed"
+        );
+        let _ = fs::remove_dir_all(&support);
     }
 
     #[test]

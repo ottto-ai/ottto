@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 289,
-  "content_sha256": "eaf30a32d7883d15db95e57fdf385958916b51edd8759249218643b968d2df86",
+  "candidate_file_count": 290,
+  "content_sha256": "28085f9c653b7b425223ee19eb1a09902d7ff070ad2b6e1818da3afee168d80b",
   "files": [
     {
       "executable": false,
@@ -517,8 +517,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_statusline.rs",
-      "sha256": "5a3dc5654b3dbbc29203a6d222a736bb071c2096153d9ba05a04f52dd56fb232",
-      "size_bytes": 44228
+      "sha256": "01b7f030090a164006e8529612f4877bcde46e70b4ac6d4627759a616a822eb8",
+      "size_bytes": 54546
     },
     {
       "executable": false,
@@ -1184,6 +1184,13 @@
       "path": "docs/session-2026-07-29-session-title-source-fixes.md",
       "sha256": "79f9bb82140ad09f3f829882fa2894b5e1d2c15d145434cdb0218699bc5b7c59",
       "size_bytes": 1042
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-statusline-session-resolver.md",
+      "sha256": "2923212a95062a4fdde16167a2f20666964e590dbaa22d78127590ded03e9118",
+      "size_bytes": 5775
     },
     {
       "executable": false,
@@ -2028,7 +2035,7 @@
   ],
   "generated_at": "2026-07-29T14:09:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 290,
+  "output_file_count": 291,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
