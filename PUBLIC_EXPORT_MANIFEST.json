@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 288,
-  "content_sha256": "ba8f7ed0cc2b70622d499eba43aed6a933e4ab10201fb6ef5eb4d99c45d11553",
+  "candidate_file_count": 289,
+  "content_sha256": "754f7e5471e13a4db1f33c85bcaf1377c382d55a98683334bdfd75f356250c21",
   "files": [
     {
       "executable": false,
@@ -825,8 +825,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/session_attribution.rs",
-      "sha256": "c967af639cfa785a175d42d964349e70c1c70725a972c92cfd07a0f95d5e6f63",
-      "size_bytes": 70636
+      "sha256": "cce69334f227d7d9730162e3fc00728182e0fa5dc03a0a8436fe3131bd1df39c",
+      "size_bytes": 73171
     },
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "57680d147a1b340bbbbd4522dd2078e9ddee310ef1dff94f16b0c270eb55d653",
-      "size_bytes": 648867
+      "sha256": "c02bab1357acbc8f41b66e7fe9fbb62a8c0513dcc597789621ef45315356373f",
+      "size_bytes": 651849
     },
     {
       "executable": false,
@@ -1170,6 +1170,13 @@
       "path": "docs/session-2026-07-28-plan-observation-identity.md",
       "sha256": "428bb5bdecc08d24ce692c9983fb50dbeb0a9480b843f6e900a5769c648f3579",
       "size_bytes": 2375
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-ignore-injected-prompt-scaffolding.md",
+      "sha256": "6097d9cdb6f9c7eb9bc7eb2e9e094c60792d4b0cc4cc6b4ae0c0352af675b072",
+      "size_bytes": 1698
     },
     {
       "executable": false,
@@ -1525,14 +1532,14 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "8f1b2ada74a189ff0841368cf27eca0ae1699aa56f4be1ec78ec3611279abee5",
+      "sha256": "fcf444453d1239bb6e287153d9ee2dc82bdb8515196da201239803a72df71c95",
       "size_bytes": 106940
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/v2-golden-keys.json",
-      "sha256": "9fab0021357e32fea17182ce863a0694066b88035f87f165f521296484a20651",
+      "sha256": "7bd98d7f26ec11c1860931ab58f811f6ac61e89859997e410fe8edcd8ec61687",
       "size_bytes": 1055
     },
     {
@@ -2019,9 +2026,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-29T13:01:26+00:00",
+  "generated_at": "2026-07-29T14:09:04+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 289,
+  "output_file_count": 290,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2055,5 +2062,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "45af991d8e49694345de6c3abf9f17224c051168"
+  "source_commit": "35a82905159d682e295227f4ffbbf37a06ba2770"
 }
