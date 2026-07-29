@@ -155,7 +155,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v24: constrained "You are the <role> agent/worker/orchestrator" startup
 // prompts expose the role as a safe title instead of falling back to the model
 // or repository. The full prompt remains private and is never used as a title.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v24";
+// codex v25: Codex response-item user messages carry injected prompt scaffolds
+// as separate content elements. Strip each full element before title/template
+// normalization; the shared 255-character normalizer used to truncate the
+// recommended-plugins element before its closing tag, making it look human.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v23";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 
@@ -182,7 +186,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 // forever. The one-time revisit stays bounded: an unchanged session re-parses
 // to a new title but is otherwise a semantic no-op-sized re-upload of
 // already-known usage.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v24";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v11";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
@@ -4367,19 +4371,38 @@ fn codex_first_user_prompt(value: &Value) -> Option<String> {
     if string_eq_at(value, &["payload", "type"], "user_message") {
         return string_at(value, &["payload", "message"])
             .or_else(|| string_at(value, &["payload", "text"]))
-            .or_else(|| text_from_array(value.pointer("/payload/text_elements")));
+            .or_else(|| prompt_text_from_array(value.pointer("/payload/text_elements")));
     }
     if string_eq_at(value, &["type"], "user_message") {
         return string_at(value, &["message"])
             .or_else(|| string_at(value, &["text"]))
-            .or_else(|| text_from_array(value.get("text_elements")));
+            .or_else(|| prompt_text_from_array(value.get("text_elements")));
     }
     if string_eq_at(value, &["payload", "type"], "message")
         && string_eq_at(value, &["payload", "role"], "user")
     {
-        return text_from_array(value.pointer("/payload/content"));
+        return prompt_text_from_array(value.pointer("/payload/content"));
     }
     None
+}
+
+fn prompt_text_from_array(value: Option<&Value>) -> Option<String> {
+    let Value::Array(items) = value? else {
+        return None;
+    };
+    let parts = items.iter().filter_map(|item| {
+        let text = match item {
+            Value::String(text) => Some(text.as_str()),
+            Value::Object(_) => item
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("input_text").and_then(Value::as_str)),
+            _ => None,
+        }?;
+        let text = crate::session_attribution::prompt_without_injected_scaffolding(text);
+        (!text.is_empty()).then_some(text)
+    });
+    normalize_title(parts.collect::<Vec<_>>().join("\n"))
 }
 
 fn text_from_array(value: Option<&Value>) -> Option<String> {
@@ -9181,6 +9204,54 @@ mod tests {
             accumulator.first_prompt_title.as_deref(),
             Some("Explain how this XML is parsed")
         );
+    }
+
+    #[test]
+    fn codex_response_item_skips_separate_injected_content_elements() {
+        let scaffold_message: Value = serde_json::from_str(concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[",
+            "{\"type\":\"input_text\",\"text\":\"<recommended_plugins>Here is a deliberately long injected plugin catalog whose closing tag falls beyond the old title normalization boundary. Plugin one. Plugin two. Plugin three. Plugin four. Plugin five. Plugin six. Plugin seven. Plugin eight. Plugin nine. Plugin ten. Plugin eleven. Plugin twelve. Plugin thirteen. Plugin fourteen. Plugin fifteen.</recommended_plugins>\"},",
+            "{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /repo\\n<INSTRUCTIONS>Shared setup that must not become prompt material.</INSTRUCTIONS>\"},",
+            "{\"type\":\"input_text\",\"text\":\"<environment_context><cwd>/repo</cwd></environment_context>\"}]}}"
+        ))
+        .expect("parse scaffold message");
+        assert_eq!(codex_first_user_prompt(&scaffold_message), None);
+
+        let path = temp_file("codex-response-item-scaffolding");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-29T08:39:04Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019facf4-d985-7081-bb16-5c4af8e8d44b\"}}\n",
+                "{\"timestamp\":\"2026-07-29T08:39:05Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[",
+                "{\"type\":\"input_text\",\"text\":\"<recommended_plugins>Here is a deliberately long injected plugin catalog whose closing tag falls beyond the old title normalization boundary. Plugin one. Plugin two. Plugin three. Plugin four. Plugin five. Plugin six. Plugin seven. Plugin eight. Plugin nine. Plugin ten. Plugin eleven. Plugin twelve. Plugin thirteen. Plugin fourteen. Plugin fifteen.</recommended_plugins>\"},",
+                "{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /repo\\n<INSTRUCTIONS>Shared setup that must not become prompt material.</INSTRUCTIONS>\"},",
+                "{\"type\":\"input_text\",\"text\":\"<environment_context><cwd>/repo</cwd></environment_context>\"}]}}\n",
+                "{\"timestamp\":\"2026-07-29T08:40:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Continue Stage 3 from the verified checkpoint.\"}]}}\n",
+                "{\"timestamp\":\"2026-07-29T08:41:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.6\"}}}\n"
+            ),
+        )
+        .expect("write response-item fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-07-29T08:42:00Z",
+            "response-item-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Continue Stage 3 from the verified checkpoint.")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
