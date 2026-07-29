@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 287,
-  "content_sha256": "95d9b8def87d8c33de7f2c4585a13834afb6a698cbb5e742ef39987db2b27f56",
+  "candidate_file_count": 288,
+  "content_sha256": "ba8f7ed0cc2b70622d499eba43aed6a933e4ab10201fb6ef5eb4d99c45d11553",
   "files": [
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c9f8a4c5242b936ca503bf3a7135f99db3282b86f63421980320b10cdc8344ff",
-      "size_bytes": 649501
+      "sha256": "57680d147a1b340bbbbd4522dd2078e9ddee310ef1dff94f16b0c270eb55d653",
+      "size_bytes": 648867
     },
     {
       "executable": false,
@@ -1170,6 +1170,13 @@
       "path": "docs/session-2026-07-28-plan-observation-identity.md",
       "sha256": "428bb5bdecc08d24ce692c9983fb50dbeb0a9480b843f6e900a5769c648f3579",
       "size_bytes": 2375
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-session-title-source-fixes.md",
+      "sha256": "79f9bb82140ad09f3f829882fa2894b5e1d2c15d145434cdb0218699bc5b7c59",
+      "size_bytes": 1042
     },
     {
       "executable": false,
@@ -1518,7 +1525,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "176a207d236395f013d5efe73cc604ea56b6ad7ff714e22d077185edbe6f1455",
+      "sha256": "8f1b2ada74a189ff0841368cf27eca0ae1699aa56f4be1ec78ec3611279abee5",
       "size_bytes": 106940
     },
     {
@@ -2012,9 +2019,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-28T15:26:13+00:00",
+  "generated_at": "2026-07-29T13:01:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 288,
+  "output_file_count": 289,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2048,5 +2055,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "5c693b976a0fe225c599827b6c60614e213fbb23"
+  "source_commit": "45af991d8e49694345de6c3abf9f17224c051168"
 }
