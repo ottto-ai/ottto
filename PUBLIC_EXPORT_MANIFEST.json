@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 289,
-  "content_sha256": "dba1ac52b7a0ba069965fdbfc52b2a74bf2747423295827b71b8f4efe5914911",
+  "candidate_file_count": 290,
+  "content_sha256": "989b58c3a7444a60381871a8172438fc30889a00132a089113f22cbee8e71dce",
   "files": [
     {
       "executable": false,
@@ -503,15 +503,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_statusline.rs",
-      "sha256": "e3a9c909af5e2a4f9284a388fc309440778ba59859c94f9c8411f49a2053d886",
-      "size_bytes": 29011
+      "sha256": "01b7f030090a164006e8529612f4877bcde46e70b4ac6d4627759a616a822eb8",
+      "size_bytes": 54546
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/lib.rs",
-      "sha256": "027d70ccd3e842355092bf411068be6e0e93ba01553b9998108984be27568276",
-      "size_bytes": 3350
+      "sha256": "57bb0da53fa061c6daf43d75bd38e911dd5d09136697c13154c503d5349809dd",
+      "size_bytes": 3395
     },
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "6d923b43edea5cdbb98b01f403c12af82889c13b6ac3e74ba168843bdefa6024",
-      "size_bytes": 358773
+      "sha256": "2a000e9f83fa9d30ec460c15e7e13cb29817265ecdcd8538c145603630eee9a3",
+      "size_bytes": 362867
     },
     {
       "executable": false,
@@ -1184,6 +1184,13 @@
       "path": "docs/session-2026-07-29-session-title-source-fixes.md",
       "sha256": "79f9bb82140ad09f3f829882fa2894b5e1d2c15d145434cdb0218699bc5b7c59",
       "size_bytes": 1042
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-statusline-session-resolver.md",
+      "sha256": "2923212a95062a4fdde16167a2f20666964e590dbaa22d78127590ded03e9118",
+      "size_bytes": 5775
     },
     {
       "executable": false,
@@ -2028,7 +2035,7 @@
   ],
   "generated_at": "2026-07-29T19:04:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 290,
+  "output_file_count": 291,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
