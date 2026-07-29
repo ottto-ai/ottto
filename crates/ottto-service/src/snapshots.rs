@@ -147,9 +147,14 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // reject continuation boilerplate as a first-prompt title; and keep subagent
 // task labels independent from their parent relationship. The bump revisits
 // existing transcripts so corrected titles replace already-uploaded fallbacks.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v22";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
+// v23/v23/v11: injected AGENTS/environment envelopes are not human prompts.
+// Skip them before selecting first-prompt title and attribution material, then
+// continue to the first real task message. All scan identities move so already
+// indexed sessions are revisited and stale shared-envelope template groups are
+// removed or replaced by task-specific opaque groups.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v23";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v23";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
 // by the 0.1.91 baseline so upgrading to semantic sync does not itself select
@@ -174,9 +179,9 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v10";
 // forever. The one-time revisit stays bounded: an unchanged session re-parses
 // to a new title but is otherwise a semantic no-op-sized re-upload of
 // already-known usage.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v22";
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v22";
-pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v10";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v23";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
+pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v11";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
@@ -2265,11 +2270,15 @@ impl SnapshotAccumulator {
         let Some(value) = value else {
             return;
         };
+        let value = crate::session_attribution::prompt_without_injected_scaffolding(&value);
+        if value.is_empty() {
+            return;
+        }
         if self.first_prompt_material.is_none() {
-            self.first_prompt_material = Some(value.clone());
+            self.first_prompt_material = Some(value.to_string());
         }
         if self.first_prompt_title.is_none() {
-            self.first_prompt_title = first_prompt_display_title(value);
+            self.first_prompt_title = first_prompt_display_title(value.to_string());
         }
     }
 
@@ -8938,6 +8947,7 @@ mod tests {
             concat!(
                 "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-5555-7000-9000-eeeeeeeeeeee\"}}\n",
                 "{\"timestamp\":\"2026-05-14T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"# AGENTS.md instructions for /repo\\n\\n<INSTRUCTIONS>Do not use this as a title</INSTRUCTIONS>\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Investigate the upload timeout\"}}\n",
                 "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
             ),
         )
@@ -8952,8 +8962,14 @@ mod tests {
         .into_iter()
         .next()
         .expect("snapshot");
-        assert_eq!(noisy_item.session_display_name, None);
-        assert_eq!(noisy_item.session_display_name_source, None);
+        assert_eq!(
+            noisy_item.session_display_name.as_deref(),
+            Some("Investigate the upload timeout")
+        );
+        assert_eq!(
+            noisy_item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
 
         let continuation_path = temp_file("codex-continuation-first-prompt");
         fs::write(
@@ -8980,6 +8996,62 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(noisy_path);
         let _ = fs::remove_file(continuation_path);
+    }
+
+    #[test]
+    fn first_prompt_material_skips_injected_scaffolding() {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        accumulator.set_first_prompt_title(Some(
+            "# AGENTS.md instructions for /repo\n\
+             <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
+             <environment_context><cwd>/repo</cwd></environment_context>"
+                .to_string(),
+        ));
+        accumulator.set_first_prompt_title(Some("Investigate the upload timeout".to_string()));
+
+        assert_eq!(
+            accumulator.first_prompt_material.as_deref(),
+            Some("Investigate the upload timeout")
+        );
+        assert_eq!(
+            accumulator.first_prompt_title.as_deref(),
+            Some("Investigate the upload timeout")
+        );
+    }
+
+    #[test]
+    fn first_prompt_material_keeps_human_marker_mentions() {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        accumulator.set_first_prompt_title(Some(
+            "Update the AGENTS.md instructions and parse the current date: field".to_string(),
+        ));
+
+        assert_eq!(
+            accumulator.first_prompt_material.as_deref(),
+            Some("Update the AGENTS.md instructions and parse the current date: field")
+        );
+    }
+
+    #[test]
+    fn first_prompt_material_keeps_task_after_injected_prefix() {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        accumulator.set_first_prompt_title(Some(
+            "<recommended_plugins>Plugins</recommended_plugins>\n\
+             # AGENTS.md instructions for /repo\n\
+             <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
+             <environment_context><cwd>/repo</cwd></environment_context>\n\
+             Explain how this XML is parsed"
+                .to_string(),
+        ));
+
+        assert_eq!(
+            accumulator.first_prompt_material.as_deref(),
+            Some("Explain how this XML is parsed")
+        );
+        assert_eq!(
+            accumulator.first_prompt_title.as_deref(),
+            Some("Explain how this XML is parsed")
+        );
     }
 
     #[test]
@@ -9500,7 +9572,7 @@ mod tests {
         );
 
         assert_eq!(before_parser_upgrade, after_parser_upgrade);
-        assert_ne!(CODEX_SNAPSHOT_PARSER_VERSION, "codex_jsonl:v23");
+        assert_ne!(CODEX_SNAPSHOT_PARSER_VERSION, "codex_jsonl:v24");
     }
 
     #[test]

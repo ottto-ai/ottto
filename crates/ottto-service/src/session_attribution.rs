@@ -522,6 +522,10 @@ pub(crate) fn opaque_hmac_id(key: &[u8], domain: &str, material: &str) -> Option
 }
 
 pub(crate) fn normalize_template_material(raw: &str) -> Option<String> {
+    let raw = prompt_without_injected_scaffolding(raw);
+    if raw.is_empty() {
+        return None;
+    }
     let collapsed = raw
         .split_whitespace()
         .take(MAX_TEMPLATE_MATERIAL_CHARS)
@@ -646,6 +650,35 @@ fn contains_private_prompt_scaffolding(value: &str) -> bool {
         || lowered.contains("agents.md instructions")
         || lowered.contains("knowledge cutoff:")
         || lowered.contains("current date:")
+}
+
+pub(crate) fn prompt_without_injected_scaffolding(mut value: &str) -> &str {
+    loop {
+        value = value.trim_start();
+        let lowered = value.to_ascii_lowercase();
+        let consumed = if lowered.starts_with("<recommended_plugins>") {
+            scaffold_block_end(&lowered, "</recommended_plugins>")
+        } else if lowered.starts_with("# agents.md instructions for ") {
+            lowered.find("<instructions>").and_then(|start| {
+                scaffold_block_end(&lowered[start..], "</instructions>").map(|end| start + end)
+            })
+        } else if lowered.starts_with("<environment_context>") {
+            scaffold_block_end(&lowered, "</environment_context>")
+                .filter(|end| lowered[..*end].contains("<cwd>"))
+        } else {
+            None
+        };
+        let Some(consumed) = consumed else {
+            return value;
+        };
+        value = &value[consumed..];
+    }
+}
+
+fn scaffold_block_end(value: &str, closing_tag: &str) -> Option<usize> {
+    value
+        .find(closing_tag)
+        .map(|start| start + closing_tag.len())
 }
 
 fn looks_like_local_path(token: &str) -> bool {
@@ -1423,6 +1456,44 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first, "review build <dynamic> at <dynamic> now");
+    }
+
+    #[test]
+    fn template_normalization_rejects_injected_prompt_scaffolding() {
+        assert_eq!(
+            normalize_template_material(
+                "# AGENTS.md instructions for /repo\n\
+                 <INSTRUCTIONS>Shared agent setup</INSTRUCTIONS>\n\
+                 <environment_context><cwd>/repo</cwd></environment_context>"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn template_normalization_keeps_human_prompts_that_mention_markers() {
+        assert_eq!(
+            normalize_template_material(
+                "Update the AGENTS.md instructions and parse the current date: field"
+            )
+            .as_deref(),
+            Some("update the agents.md instructions and parse the current date: field")
+        );
+    }
+
+    #[test]
+    fn template_normalization_keeps_task_after_injected_prefix() {
+        assert_eq!(
+            normalize_template_material(
+                "<recommended_plugins>Plugins</recommended_plugins>\n\
+                 # AGENTS.md instructions for /repo\n\
+                 <INSTRUCTIONS>Shared setup</INSTRUCTIONS>\n\
+                 <environment_context><cwd>/repo</cwd></environment_context>\n\
+                 Explain how this XML is parsed"
+            )
+            .as_deref(),
+            Some("explain how this xml is parsed")
+        );
     }
 
     #[test]
