@@ -152,7 +152,10 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // continue to the first real task message. All scan identities move so already
 // indexed sessions are revisited and stale shared-envelope template groups are
 // removed or replaced by task-specific opaque groups.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v23";
+// codex v24: constrained "You are the <role> agent/worker/orchestrator" startup
+// prompts expose the role as a safe title instead of falling back to the model
+// or repository. The full prompt remains private and is never used as a title.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v24";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v23";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 
@@ -179,7 +182,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 // forever. The one-time revisit stays bounded: an unchanged session re-parses
 // to a new title but is otherwise a semantic no-op-sized re-upload of
 // already-known usage.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v23";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v24";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v11";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
@@ -2278,7 +2281,7 @@ impl SnapshotAccumulator {
             self.first_prompt_material = Some(value.to_string());
         }
         if self.first_prompt_title.is_none() {
-            self.first_prompt_title = first_prompt_display_title(value.to_string());
+            self.first_prompt_title = first_prompt_display_title(self.source, value.to_string());
         }
     }
 
@@ -6441,13 +6444,18 @@ fn normalize_display_title(value: String, source: &str) -> Option<String> {
     }
 }
 
-fn first_prompt_display_title(value: String) -> Option<String> {
+fn first_prompt_display_title(source: SnapshotSource, value: String) -> Option<String> {
     let raw = value.trim();
     if raw.is_empty()
         || contains_blocked_prompt_fragment(raw)
         || looks_like_resume_boilerplate(&raw.to_ascii_lowercase())
     {
         return None;
+    }
+    if source == SnapshotSource::Codex {
+        if let Some(role_title) = agent_role_prompt_display_title(raw) {
+            return Some(role_title);
+        }
     }
     let first_line = raw.lines().find_map(|line| {
         let trimmed = line
@@ -6461,6 +6469,62 @@ fn first_prompt_display_title(value: String) -> Option<String> {
         return None;
     }
     normalize_display_title(normalized, "first_prompt")
+}
+
+fn agent_role_prompt_display_title(raw: &str) -> Option<String> {
+    let first_line = raw.lines().find_map(|line| {
+        let trimmed = line.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })?;
+    let lowered = first_line.to_ascii_lowercase();
+    let mut role = lowered.strip_prefix("you are ")?;
+    role = role
+        .strip_prefix("the ")
+        .or_else(|| role.strip_prefix("an "))
+        .or_else(|| role.strip_prefix("a "))
+        .unwrap_or(role);
+
+    let role_end = [" agent", " worker", " orchestrator"]
+        .into_iter()
+        .filter_map(|suffix| {
+            role.match_indices(suffix).find_map(|(index, _)| {
+                let end = index + suffix.len();
+                let boundary = role[end..].chars().next();
+                (boundary.is_none()
+                    || boundary.is_some_and(|character| {
+                        character.is_whitespace()
+                            || matches!(character, '.' | ',' | ':' | ';' | '(' | ')' | '—' | '–')
+                    }))
+                .then_some(end)
+            })
+        })
+        .min()?;
+    let role = role[..role_end].trim();
+    let word_count = role.split_whitespace().count();
+    if !(2..=8).contains(&word_count)
+        || role.chars().count() > 64
+        || role.contains(['/', '\\', '<', '>', '{', '}', '@'])
+    {
+        return None;
+    }
+
+    let mut words = role
+        .split_whitespace()
+        .map(|word| match word {
+            "ai" | "api" | "ci" | "mcp" | "pr" | "qa" | "ui" => word.to_ascii_uppercase(),
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let first = words.first_mut()?;
+    if !matches!(
+        first.as_str(),
+        "AI" | "API" | "CI" | "MCP" | "PR" | "QA" | "UI"
+    ) {
+        let mut chars = first.chars();
+        let initial = chars.next()?.to_uppercase().collect::<String>();
+        *first = initial + chars.as_str();
+    }
+    normalize_display_title(words.join(" "), "first_prompt")
 }
 
 fn claude_custom_title_display_title(value: String) -> Option<String> {
@@ -8999,6 +9063,71 @@ mod tests {
     }
 
     #[test]
+    fn codex_agent_role_prompt_has_a_bounded_title() {
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are the LANDING OWNER AGENT for ottto-ai/coding-agents-observability — \
+                 coordinate the queue and keep the full operating contract private."
+                    .to_string()
+            )
+            .as_deref(),
+            Some("Landing owner agent")
+        );
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are a PR REPAIR AGENT for ottto-ai/coding-agents-observability.".to_string()
+            )
+            .as_deref(),
+            Some("PR repair agent")
+        );
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are a Phase-2 projector implementation worker (GPT-5.6 Sol via Codex CLI)."
+                    .to_string()
+            )
+            .as_deref(),
+            Some("Phase-2 projector implementation worker")
+        );
+    }
+
+    #[test]
+    fn codex_agent_role_prompt_rejects_unbounded_or_path_like_roles() {
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are the extraordinarily detailed multi-stage cross-repository production \
+                 incident response coordination agent for this task."
+                    .to_string()
+            ),
+            None
+        );
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are the /root repair agent for this task.".to_string()
+            ),
+            None
+        );
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::Codex,
+                "You are the diligent agentless helper.".to_string()
+            ),
+            None
+        );
+        assert_eq!(
+            first_prompt_display_title(
+                SnapshotSource::ClaudeCode,
+                "You are the LANDING OWNER AGENT for this task.".to_string()
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn first_prompt_material_skips_injected_scaffolding() {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         accumulator.set_first_prompt_title(Some(
@@ -9572,7 +9701,10 @@ mod tests {
         );
 
         assert_eq!(before_parser_upgrade, after_parser_upgrade);
-        assert_ne!(CODEX_SNAPSHOT_PARSER_VERSION, "codex_jsonl:v24");
+        assert_ne!(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_jsonl:future-parser-build"
+        );
     }
 
     #[test]
