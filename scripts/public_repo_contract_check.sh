@@ -2330,7 +2330,23 @@ def check_private_runtime_pin() -> int:
         fail("private runtime pin must be a JSON object")
         return 0
 
-    expect(pin.get("schema_version") == 1, "private runtime pin schema_version must be 1")
+    pin_schema_version = pin.get("schema_version")
+    expect(
+        pin_schema_version in {1, 2},
+        "private runtime pin schema_version must be 1 or 2",
+    )
+    if pin_schema_version == 2:
+        stable_version = pin.get("stable_version")
+        expect(
+            isinstance(stable_version, str)
+            and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", stable_version) is not None,
+            "private runtime pin schema_version 2 requires an exact X.Y.Z stable_version",
+        )
+        expect(
+            isinstance(pin.get("provider_daily_reference_admission_required"), bool),
+            "private runtime pin schema_version 2 requires "
+            "provider_daily_reference_admission_required",
+        )
     expect(
         pin.get("generated_by") == "public_runtime_pin.v1",
         "private runtime pin generated_by must be public_runtime_pin.v1",
