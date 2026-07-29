@@ -13,8 +13,7 @@ identity came from the current login. The two could disagree.
 `oauthAccount` `accountUuid`, falling back to `organizationUuid` then
 `emailAddress`. Every cache read is scoped to the account that owns the
 credential right now, and a cache belonging to a different account is discarded
-rather than served. This mirrors `ClaudeDesktopWebUsageCache`, which already
-keys the Claude Desktop usage cache by account hash.
+rather than served.
 
 The schema version moves 2 -> 3. Version-2 caches carry no account identity, so
 they are discarded wholesale on upgrade rather than adopted by whoever happens

@@ -253,5 +253,4 @@ workspace, `cargo fmt --all --check`, and
   wiring them to the snapshot later is mechanical. The backend already learns
   liveness and coverage from the batch itself.
 - **The reconciliation view.** Frontend lane.
-- Claude collectors, the statusLine path, and the Claude Desktop cookie
-  collector are untouched.
+- Claude collectors and the statusLine path are untouched.

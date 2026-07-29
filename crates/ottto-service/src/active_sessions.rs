@@ -458,6 +458,7 @@ mod tests {
             billing_channel: Some("subscription".to_string()),
             subscription_period_start: None,
             subscription_period_end: None,
+            subscription_period_last_checked_at: None,
             account_identifier_hash: Some("acct_hash".to_string()),
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,

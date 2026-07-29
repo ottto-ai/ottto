@@ -1265,18 +1265,21 @@ pub struct AgentAccountStatus {
     pub plan_type: Option<String>,
     pub subscription_product: Option<String>,
     pub billing_channel: Option<String>,
-    /// Reported boundaries of the account's current subscription period.
+    /// Reported boundaries and provider verification time for the account's
+    /// current subscription period.
     ///
     /// Provider-neutral on purpose: any provider that publishes real period
-    /// boundaries fills these same two fields rather than growing a
-    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire
-    /// payload byte-identical when the provider reports nothing, and the
-    /// backend contract is "reported or absent" - a producer never
-    /// substitutes `now`, a calendar month, or a first-seen date.
+    /// boundaries fills these same fields rather than growing a
+    /// vendor-prefixed sibling. `skip_serializing_if` keeps today's wire payload
+    /// byte-identical when the provider reports nothing, and the backend
+    /// contract is "reported or absent" - a producer never substitutes `now`,
+    /// a calendar month, or a first-seen date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_period_start: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_period_end: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_period_last_checked_at: Option<Rfc3339Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2374,11 +2377,6 @@ impl<'de> Deserialize<'de> for LocalControlRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeDesktopWebUsagePreferenceState {
-    pub enabled: bool,
-}
-
 pub fn expected_local_control_protocol_version(command: &LocalControlCommand) -> u16 {
     match command {
         LocalControlCommand::CloudSessionsControl { .. } => CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
@@ -2537,13 +2535,6 @@ pub enum LocalControlCommand {
     AuthStatus,
     AgentStatusRefresh {
         source: Option<SourceKind>,
-    },
-    /// Read or update the explicit local opt-in for Claude Desktop web usage.
-    /// The daemon owns the marker and credential access; clients never receive
-    /// cookie or Keychain bytes.
-    ClaudeDesktopWebUsagePreference {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        enabled: Option<bool>,
     },
     PersonalMeterLocalSnapshot {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3501,6 +3492,7 @@ mod tests {
                 billing_channel: Some("subscription".to_string()),
                 subscription_period_start: None,
                 subscription_period_end: None,
+                subscription_period_last_checked_at: None,
                 account_identifier_hash: Some("abc123hash".to_string()),
                 organization_identifier_hash: Some("def456hash".to_string()),
                 credential_fingerprint_hash: None,
@@ -4325,27 +4317,6 @@ mod tests {
             serde_json::json!("personal_meter_local_snapshot")
         );
         assert_eq!(encoded["source"], serde_json::json!("codex"));
-    }
-
-    #[test]
-    fn claude_desktop_web_usage_preference_command_round_trips() {
-        let request = serde_json::from_str::<LocalControlRequest>(&format!(
-            r#"{{"request_id":"req_desktop_usage","protocol_version":{PROTOCOL_VERSION},"command":"claude_desktop_web_usage_preference","enabled":true}}"#
-        ))
-        .expect("Claude Desktop usage preference request should deserialize");
-
-        assert_eq!(
-            request.command,
-            LocalControlCommand::ClaudeDesktopWebUsagePreference {
-                enabled: Some(true),
-            }
-        );
-        let encoded = serde_json::to_value(request).expect("request serializes");
-        assert_eq!(
-            encoded["command"],
-            serde_json::json!("claude_desktop_web_usage_preference")
-        );
-        assert_eq!(encoded["enabled"], serde_json::json!(true));
     }
 
     #[test]
