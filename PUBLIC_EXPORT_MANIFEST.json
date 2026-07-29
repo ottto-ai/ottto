@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 290,
-  "content_sha256": "86ee6feeaa80108908623053cfd9212a8f01f8a10e3e9a5d0b084cea1bc8cc9f",
+  "candidate_file_count": 291,
+  "content_sha256": "62512d5bf9736ffc0e1b556a82dd5fe7621b9a40d2c35519c6e828dfe3ae6198",
   "files": [
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "82237097fe1cc88e081374d96a53a1a8d3973fa1138fd2e0e357c47a8fdecf2f",
-      "size_bytes": 656518
+      "sha256": "695444c870e67be9fdacbf2e6948943bf41a97e737a8c870335a5732ffe462f5",
+      "size_bytes": 660913
     },
     {
       "executable": false,
@@ -1163,6 +1163,13 @@
       "path": "docs/session-2026-07-29-codex-agent-role-titles.md",
       "sha256": "09c910ae2091bedcb5daeba5ad056e42c42d385778337f0ddf4945e4daa17cef",
       "size_bytes": 1191
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-07-29-codex-content-element-scaffolding.md",
+      "sha256": "919a2d00095e046fd721248a7953940abcd61ec1dba9522e451132656621d349",
+      "size_bytes": 1443
     },
     {
       "executable": false,
@@ -1539,7 +1546,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "6311c670094538f6665f554e5b190643e223906b3d848ec598d266e5336e7470",
+      "sha256": "b2683b9a4ee329cfb5da76a5b40937c71584c2f22c9eae0d710a76de7c31e050",
       "size_bytes": 106940
     },
     {
@@ -2033,9 +2040,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-07-29T19:29:54+00:00",
+  "generated_at": "2026-07-29T20:36:42+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 291,
+  "output_file_count": 292,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2069,5 +2076,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b51c3a6b4345f3da8fbb77bf038f96a1972db8a7"
+  "source_commit": "35581140cd6f8ebbadf92c4618d67260e4023e00"
 }
