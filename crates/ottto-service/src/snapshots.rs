@@ -160,7 +160,7 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // normalization; the shared 255-character normalizer used to truncate the
 // recommended-plugins element before its closing tag, making it look human.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v23";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v24";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
@@ -4511,13 +4511,15 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
-    // Compaction (auto or manual `/compact`) injects a `type=user` record
-    // flagged with a top-level `isCompactSummary: true` boolean. Count it and
-    // retain the event timestamp; customer-facing copy calls this compaction,
-    // matching the provider/runtime term.
-    if value.get("type").and_then(Value::as_str) == Some("user")
-        && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-    {
+    // Claude currently records compaction as
+    // `type=system, subtype=compact_boundary`. Older transcripts used a
+    // `type=user, isCompactSummary=true` record. Count both shapes so current
+    // and historical sessions remain comparable.
+    let is_legacy_compaction = string_eq_at(value, &["type"], "user")
+        && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
+    let is_current_compaction = string_eq_at(value, &["type"], "system")
+        && string_eq_at(value, &["subtype"], "compact_boundary");
+    if is_legacy_compaction || is_current_compaction {
         accumulator.compaction_count += 1;
         if let Some(timestamp) = timestamp.clone() {
             accumulator.compaction_timestamps.push(timestamp);
@@ -12807,10 +12809,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_parser_counts_compaction_records() {
-        // Compaction (auto or /compact) injects a type=user record flagged
-        // with top-level `isCompactSummary: true`. Each one counts; an
-        // explicit `false` does not.
+    fn claude_code_parser_counts_current_and_legacy_compaction_records() {
         let path = temp_file("claude-compaction-count");
         fs::write(
             &path,
@@ -12819,14 +12818,17 @@ mod tests {
                 "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n",
-                "{\"timestamp\":\"2026-07-01T11:04:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"assistant\",\"isCompactSummary\":true,\"message\":{\"role\":\"assistant\",\"content\":\"not a compaction event\"}}\n"
+                "{\"timestamp\":\"2026-07-01T11:04:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"assistant\",\"isCompactSummary\":true,\"message\":{\"role\":\"assistant\",\"content\":\"not a compaction event\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:05:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:06:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"manual\"}}\n",
+                "{\"timestamp\":\"2026-07-01T11:07:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"status\"}\n"
             ),
         )
         .expect("write fixture");
 
         let item = parse_claude_code_jsonl_file(
             &path,
-            "2026-07-01T11:05:00Z",
+            "2026-07-01T11:08:00Z",
             "file-fingerprint".to_string(),
         )
         .expect("parse")
@@ -12834,12 +12836,14 @@ mod tests {
         .next()
         .expect("snapshot");
 
-        assert_eq!(item.compaction_count, Some(2));
+        assert_eq!(item.compaction_count, Some(4));
         assert_eq!(
             item.compaction_timestamps,
             vec![
                 "2026-07-01T11:01:00Z".to_string(),
                 "2026-07-01T11:03:00Z".to_string(),
+                "2026-07-01T11:05:00Z".to_string(),
+                "2026-07-01T11:06:00Z".to_string(),
             ]
         );
 

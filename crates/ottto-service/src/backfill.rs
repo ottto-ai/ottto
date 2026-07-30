@@ -222,10 +222,16 @@ pub struct HistoricalReplayDirective {
 /// Compiled replay intent. Changing a parser version does nothing here. A
 /// deliberate full replay requires both `Full` and a new revision, making the
 /// expensive operation visible in code review and one-shot in production.
-pub fn current_historical_replay(_source: SnapshotSource) -> HistoricalReplayDirective {
-    HistoricalReplayDirective {
-        revision: "historical_replay:none:v1",
-        policy: HistoricalReplayPolicy::None,
+pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDirective {
+    match source {
+        SnapshotSource::ClaudeCode => HistoricalReplayDirective {
+            revision: "claude_compact_boundary:v1",
+            policy: HistoricalReplayPolicy::Full,
+        },
+        SnapshotSource::Codex | SnapshotSource::Pi => HistoricalReplayDirective {
+            revision: "historical_replay:none:v1",
+            policy: HistoricalReplayPolicy::None,
+        },
     }
 }
 
@@ -693,20 +699,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_backfill_skips_source_whose_parser_matches_recorded() {
+    fn pending_backfill_skips_sources_after_current_replays_complete() {
         let mut state = BackfillState::default();
-        state.completed_parser_versions.insert(
-            SnapshotSource::ClaudeCode.api_slug().to_string(),
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION.to_string(),
-        );
-        state.completed_parser_versions.insert(
-            SnapshotSource::Codex.api_slug().to_string(),
-            CODEX_SNAPSHOT_PARSER_VERSION.to_string(),
-        );
-        state.completed_parser_versions.insert(
-            SnapshotSource::Pi.api_slug().to_string(),
-            PI_SNAPSHOT_PARSER_VERSION.to_string(),
-        );
+        mark_backfill_complete(&mut state, SnapshotSource::ClaudeCode);
+        mark_backfill_complete(&mut state, SnapshotSource::Codex);
+        mark_backfill_complete(&mut state, SnapshotSource::Pi);
         assert!(pending_backfill_sources(&state).is_empty());
     }
 
@@ -738,6 +735,23 @@ mod tests {
             source.api_slug().to_string(),
             directive.revision.to_string(),
         );
+        assert!(!source_needs_backfill(&state, source, directive));
+    }
+
+    #[test]
+    fn current_claude_compaction_replay_is_one_shot() {
+        let source = SnapshotSource::ClaudeCode;
+        let directive = current_historical_replay(source);
+        assert_eq!(directive.policy, HistoricalReplayPolicy::Full);
+        assert_eq!(directive.revision, "claude_compact_boundary:v1");
+
+        let mut state = BackfillState::default();
+        state.completed_parser_versions.insert(
+            source.api_slug().to_string(),
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION.to_string(),
+        );
+        assert!(source_needs_backfill(&state, source, directive));
+        mark_backfill_complete(&mut state, source);
         assert!(!source_needs_backfill(&state, source, directive));
     }
 
