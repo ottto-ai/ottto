@@ -814,6 +814,8 @@ struct ScanTraversalCounts {
     invalid_utf8_line_count: usize,
     over_line_cap_count: usize,
     recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
 }
 
 impl ScanTraversalCounts {
@@ -827,6 +829,8 @@ impl ScanTraversalCounts {
             || self.invalid_utf8_line_count > 0
             || self.over_line_cap_count > 0
             || self.recognized_usage_drop_count > 0
+            || self.zero_snapshot_usage_evidence_count > 0
+            || self.dropped_usage_record_count > 0
     }
 }
 
@@ -1111,6 +1115,9 @@ pub struct SourceScanResult {
     pub invalid_utf8_line_count: usize,
     pub over_line_cap_count: usize,
     pub recognized_usage_drop_count: usize,
+    pub zero_snapshot_confirmed_count: usize,
+    pub zero_snapshot_usage_evidence_count: usize,
+    pub dropped_usage_record_count: u64,
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
 }
@@ -3193,12 +3200,18 @@ struct SnapshotAccumulator {
     // older exporters used `type=message_end`. When both representations are
     // present, their response id is the exact occurrence key that prevents a
     // compatibility parser from charging the same response twice.
-    seen_pi_usage_keys: BTreeMap<String, String>,
+    // The value includes record shape plus the canonical occurrence digest.
+    // Opposite-shape exact duplicates are suppressed, repeated same-shape
+    // records remain distinct, and divergent opposite-shape reuse is loss.
+    seen_pi_usage_keys: BTreeMap<String, (PiUsageRecordShape, String)>,
     // A response id reused with different semantic usage is ambiguous rather
     // than a duplicate. Keep the conflict count on the per-file accumulator so
     // the whole transcript stays retryable and no first-wins partial result can
     // settle.
     pi_usage_conflict_count: usize,
+    // Positive usage observations deliberately refused because their activity
+    // timestamp could not produce a truthful hourly bucket.
+    dropped_usage_record_count: u64,
     // Timestamp of the most recent Claude Code `type=user` record (a real user
     // prompt OR a tool_result — both are "model input available" moments). Each
     // assistant API response's first content-block record subtracts this to
@@ -3258,6 +3271,7 @@ impl SnapshotAccumulator {
             seen_claude_usage_keys: BTreeSet::new(),
             seen_pi_usage_keys: BTreeMap::new(),
             pi_usage_conflict_count: 0,
+            dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
@@ -3296,6 +3310,26 @@ impl SnapshotAccumulator {
             .last_activity_at
             .as_ref()
             .map_or(true, |current| timestamp > *current)
+        {
+            self.last_activity_at = Some(timestamp);
+        }
+    }
+
+    fn note_pi_time(&mut self, timestamp: Option<String>) {
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+        if self
+            .started_at
+            .as_ref()
+            .map_or(true, |current| pi_timestamp_is_before(&timestamp, current))
+        {
+            self.started_at = Some(timestamp.clone());
+        }
+        if self
+            .last_activity_at
+            .as_ref()
+            .map_or(true, |current| pi_timestamp_is_after(&timestamp, current))
         {
             self.last_activity_at = Some(timestamp);
         }
@@ -3471,6 +3505,10 @@ impl SnapshotAccumulator {
         self.current_selector.merge(selector);
     }
 
+    fn note_dropped_usage(&mut self) {
+        self.dropped_usage_record_count = self.dropped_usage_record_count.saturating_add(1);
+    }
+
     /// True when the running turn (`latest_turn_id`) paid for Codex fast mode,
     /// per the `logs_2` request tier. Used to stamp `service_tier=priority` onto
     /// that turn's usage row only — never onto `current_selector`, so the signal
@@ -3508,11 +3546,13 @@ impl SnapshotAccumulator {
             .map(|value| value.to_string())
             .or_else(|| self.fallback_bucket_timestamp(None));
         let Some(bucket_input) = bucket_input else {
+            self.note_dropped_usage();
             return;
         };
         let Some((bucket_start, normalized_timestamp)) =
             activity_bucket_from_timestamp(&bucket_input)
         else {
+            self.note_dropped_usage();
             return;
         };
 
@@ -4408,7 +4448,6 @@ fn scan_source_roots_with_limit_and_attribution(
         // candidate comparison and parsing.
         candidate.source_file_fingerprint = sidecar_fingerprint;
     }
-
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
     let mut scanned_session_count = 0;
@@ -4515,6 +4554,8 @@ fn scan_source_roots_with_limit_and_attribution(
         let parse_complete = parsed_file.complete();
         let report = parsed_file.report;
         let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
+        let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
+        let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
         let mut parsed = parsed_file.snapshots;
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
@@ -4536,7 +4577,7 @@ fn scan_source_roots_with_limit_and_attribution(
             parse_complete,
             parsed_snapshot_count,
         });
-        if parse_complete && (source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some()) {
+        if parse_complete {
             let outcome = if last_snapshot_fingerprint.is_some() {
                 ScanParseOutcome::Snapshot
             } else {
@@ -4548,6 +4589,10 @@ fn scan_source_roots_with_limit_and_attribution(
         census.invalid_utf8_line_count += report.invalid_utf8_line_count;
         census.over_line_cap_count += report.over_line_cap_count;
         census.recognized_usage_drop_count += recognized_usage_drop_count;
+        census.zero_snapshot_usage_evidence_count += usize::from(zero_snapshot_usage_evidence);
+        census.dropped_usage_record_count = census
+            .dropped_usage_record_count
+            .saturating_add(dropped_usage_record_count);
         // A lossy file is one quarantined input, not a partially-authoritative
         // entity. Healthy siblings continue, but none of this file's derived
         // snapshots may reach upload/progress/manifest state until every line
@@ -4577,6 +4622,12 @@ fn scan_source_roots_with_limit_and_attribution(
         traversal.counts.invalid_utf8_line_count += census.invalid_utf8_line_count;
         traversal.counts.over_line_cap_count += census.over_line_cap_count;
         traversal.counts.recognized_usage_drop_count += census.recognized_usage_drop_count;
+        traversal.counts.zero_snapshot_usage_evidence_count +=
+            census.zero_snapshot_usage_evidence_count;
+        traversal.counts.dropped_usage_record_count = traversal
+            .counts
+            .dropped_usage_record_count
+            .saturating_add(census.dropped_usage_record_count);
     }
     let traversal_snapshot = index
         .traversal
@@ -4648,6 +4699,9 @@ fn scan_source_roots_with_limit_and_attribution(
         index.resume_census_window_end = None;
     }
     let counts = traversal_snapshot.counts;
+    let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
+    let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
+    let dropped_usage_record_count = counts.dropped_usage_record_count;
     Ok(SourceScanResult {
         source,
         backfill_window_days,
@@ -4671,6 +4725,9 @@ fn scan_source_roots_with_limit_and_attribution(
         invalid_utf8_line_count: counts.invalid_utf8_line_count,
         over_line_cap_count: counts.over_line_cap_count,
         recognized_usage_drop_count: counts.recognized_usage_drop_count,
+        zero_snapshot_confirmed_count,
+        zero_snapshot_usage_evidence_count,
+        dropped_usage_record_count,
         snapshots,
         pending_finalization,
     })
@@ -4894,6 +4951,25 @@ fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_codex_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        codex_turn_traces,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_codex_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &CodexTitleMetadata,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -4963,6 +5039,25 @@ fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        artifacts_enabled,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_claude_code_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &ClaudeTitleMetadata,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -4991,6 +5086,21 @@ fn parse_pi_jsonl_file_with_attribution(
     source_file_fingerprint: String,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_pi_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_pi_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -5006,6 +5116,11 @@ fn parse_pi_jsonl_file_with_attribution(
     )
 }
 
+#[derive(Debug)]
+struct ParsedSnapshotFile {
+    snapshots: Vec<SnapshotItem>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_jsonl_file(
     path: &Path,
@@ -5018,11 +5133,11 @@ fn parse_jsonl_file(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<Vec<SnapshotItem>> {
+) -> Result<ParsedSnapshotFile> {
     let mut file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let opened_identity = opened_object_identity(source, &mut file)
         .with_context(|| format!("fingerprint opened JSONL {}", path.display()))?;
-    Ok(parse_opened_jsonl_file(
+    let parsed = parse_opened_jsonl_file(
         file,
         &opened_identity,
         path,
@@ -5035,8 +5150,10 @@ fn parse_jsonl_file(
         codex_turn_traces,
         artifacts_enabled,
         attribution_context,
-    )?
-    .snapshots)
+    )?;
+    Ok(ParsedSnapshotFile {
+        snapshots: parsed.snapshots,
+    })
 }
 
 #[derive(Debug)]
@@ -5044,6 +5161,8 @@ struct ParsedJsonlFile {
     snapshots: Vec<SnapshotItem>,
     report: JsonlReadReport,
     recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence: bool,
+    dropped_usage_record_count: u64,
 }
 
 impl ParsedJsonlFile {
@@ -5076,7 +5195,8 @@ fn parse_opened_jsonl_file(
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
     let mut recognized_usage_drop_count = 0;
-    let mut positive_recognized_usage_count = 0;
+    let mut positive_recognized_usage_count: usize = 0;
+    let mut positive_usage_evidence = false;
     let report = read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, |value| {
         if recognized_usage_shape_was_dropped(source, value) {
             recognized_usage_drop_count += 1;
@@ -5084,6 +5204,7 @@ fn parse_opened_jsonl_file(
         if recognized_positive_usage_shape(source, value) {
             positive_recognized_usage_count += 1;
         }
+        positive_usage_evidence |= json_has_positive_usage_evidence(value);
         apply_line(value, &mut accumulator);
     })
     .with_context(|| format!("read JSONL {}", path.display()))?;
@@ -5117,6 +5238,9 @@ fn parse_opened_jsonl_file(
         accumulator.apply_first_prompt_fallback();
         recognized_usage_drop_count += accumulator.pi_usage_conflict_count;
     }
+    let accumulator_dropped_usage_record_count = accumulator.dropped_usage_record_count as usize;
+    recognized_usage_drop_count =
+        recognized_usage_drop_count.saturating_add(accumulator_dropped_usage_record_count);
     let snapshots = accumulator.into_items(
         path,
         collected_at,
@@ -5127,13 +5251,21 @@ fn parse_opened_jsonl_file(
     // entity is still loss. Typical causes are an absent/unparseable activity
     // timestamp or an identity shape the accumulator cannot settle. Treat the
     // whole file as retryable instead of persisting it as confirmed-empty.
+    let zero_snapshot_usage_evidence = snapshots.is_empty() && positive_usage_evidence;
     if snapshots.is_empty() {
-        recognized_usage_drop_count += positive_recognized_usage_count;
+        recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(
+            positive_recognized_usage_count.saturating_sub(accumulator_dropped_usage_record_count),
+        );
+        if positive_usage_evidence && positive_recognized_usage_count == 0 {
+            recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(1);
+        }
     }
     Ok(ParsedJsonlFile {
         snapshots,
         report,
         recognized_usage_drop_count,
+        zero_snapshot_usage_evidence,
+        dropped_usage_record_count: recognized_usage_drop_count as u64,
     })
 }
 
@@ -5147,7 +5279,7 @@ fn recognized_positive_usage_shape(source: SnapshotSource, value: &Value) -> boo
             .unwrap_or(false),
         SnapshotSource::Pi => {
             pi_usage_event(value)
-                && pi_message_end_usage(value)
+                && pi_message_usage(value)
                     .map(|usage| !usage.is_zero())
                     .unwrap_or(false)
         }
@@ -5174,9 +5306,145 @@ fn recognized_usage_shape_was_dropped(source: SnapshotSource, value: &Value) -> 
         SnapshotSource::Pi => {
             pi_usage_event(value)
                 && value.pointer("/message/usage").is_some()
-                && pi_message_end_usage(value).is_none()
+                && pi_message_usage(value).is_none()
         }
     }
+}
+
+fn json_has_positive_usage_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            (is_recognized_usage_container(&normalized)
+                && usage_container_has_positive_consumption(value, false))
+                || json_has_positive_usage_evidence(value)
+        }),
+        Value::Array(values) => values.iter().any(json_has_positive_usage_evidence),
+        _ => false,
+    }
+}
+
+fn normalized_usage_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_recognized_usage_container(name: &str) -> bool {
+    matches!(
+        name,
+        "usage"
+            | "tokenusage"
+            | "totalusage"
+            | "totaltokenusage"
+            | "lasttokenusage"
+            | "billingusage"
+    )
+}
+
+fn is_consumption_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "input"
+            | "output"
+            | "inputtokens"
+            | "outputtokens"
+            | "prompttokens"
+            | "completiontokens"
+            | "cachedinputtokens"
+            | "cacheread"
+            | "cachereadtokens"
+            | "cachereadinputtokens"
+            | "cachewrite"
+            | "cachewritetokens"
+            | "cachecreationtokens"
+            | "cachecreationinputtokens"
+            | "reasoning"
+            | "reasoningtokens"
+            | "reasoningoutputtokens"
+            | "unattributedtotaltokens"
+            | "totaltokens"
+            | "requestcount"
+            | "requests"
+    )
+}
+
+fn is_cost_container(name: &str) -> bool {
+    matches!(
+        name,
+        "cost" | "costs" | "usagecost" | "usagecosts" | "billingcost" | "billingcosts"
+    )
+}
+
+fn is_cost_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "total"
+            | "amount"
+            | "usd"
+            | "totalcost"
+            | "inputcost"
+            | "outputcost"
+            | "cachereadcost"
+            | "cachewritecost"
+            | "reasoningcost"
+    )
+}
+
+fn is_nonconsumption_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "schemaversion"
+            | "usageversion"
+            | "limit"
+            | "limits"
+            | "usagelimit"
+            | "usagelimits"
+            | "ratelimit"
+            | "ratelimits"
+            | "budget"
+            | "budgets"
+            | "quota"
+            | "quotas"
+            | "reset"
+            | "resetsat"
+            | "timestamp"
+            | "createdat"
+            | "updatedat"
+            | "maxtokens"
+    )
+}
+
+fn usage_container_has_positive_consumption(value: &Value, inside_cost: bool) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            if is_nonconsumption_metadata(&normalized) {
+                return false;
+            }
+            if is_consumption_metric(&normalized) || (inside_cost && is_cost_metric(&normalized)) {
+                return json_is_positive_number(value);
+            }
+            let child_inside_cost = inside_cost || is_cost_container(&normalized);
+            usage_container_has_positive_consumption(value, child_inside_cost)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| usage_container_has_positive_consumption(value, inside_cost)),
+        _ => false,
+    }
+}
+
+fn json_is_positive_number(value: &Value) -> bool {
+    let Value::Number(value) = value else {
+        return false;
+    };
+    value.as_u64().is_some_and(|value| value > 0)
+        || value.as_i64().is_some_and(|value| value > 0)
+        || value.as_f64().is_some_and(|value| value > 0.0)
 }
 
 /// Stream a JSONL reader line-by-line with a hard per-line byte ceiling,
@@ -5702,7 +5970,7 @@ fn pi_selector_from_custom(value: &Value) -> Option<SelectorCapture> {
     (!selector.is_empty()).then_some(selector)
 }
 
-fn pi_selector_from_message_end(value: &Value) -> SelectorCapture {
+fn pi_selector_from_usage_message(value: &Value) -> SelectorCapture {
     let mut selector = SelectorCapture::default();
     selector.merge(selector_from_object(value, ""));
     if let Some(message) = raw_value_at(value, &["message"]) {
@@ -6543,33 +6811,60 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(selector) = pi_selector_from_custom(value) {
                 accumulator.set_selector(selector);
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
-                accumulator.source_session_id = string_at(value, &["session_id"])
-                    .or_else(|| string_at(value, &["sessionId"]))
-                    .or_else(|| string_at(value, &["id"]));
+                accumulator.source_session_id = string_at(value, &["id"])
+                    .or_else(|| string_at(value, &["session_id"]))
+                    .or_else(|| string_at(value, &["sessionId"]));
             }
             accumulator.set_workspace_hash(string_at(value, &["cwd"]));
-            accumulator.note_time(string_at(value, &["timestamp"]));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
             // Pi user prompts use both legacy top-level `role` and current
             // nested `message.role`. This is the only chance to capture prompt
             // text for a title fallback.
-            if pi_message_role(value).as_deref() == Some("user") {
+            let role = pi_message_role(value);
+            if role.as_deref() == Some("user") {
                 accumulator.set_first_prompt_title(pi_message_text(value));
             }
-            // Current Pi persists completed assistant responses directly as
-            // `type=message`; the older `message_end` form stays supported.
-            if pi_message_role(value).as_deref() == Some("assistant") {
-                apply_pi_usage_line(value, accumulator);
+            let timestamp = pi_message_timestamp(value);
+            if role.as_deref() == Some("assistant")
+                && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
+            {
+                apply_pi_usage_line(
+                    value,
+                    accumulator,
+                    timestamp.as_deref(),
+                    PiUsageRecordShape::Message,
+                );
+            } else if role.as_deref() == Some("assistant")
+                && pi_message_usage(value).is_some_and(|usage| !usage.is_zero())
+            {
+                accumulator.note_dropped_usage();
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            accumulator.note_pi_time(timestamp);
         }
         Some("message_end") => {
-            apply_pi_usage_line(value, accumulator);
+            let timestamp = pi_message_end_timestamp(value);
+            if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+                apply_pi_usage_line(
+                    value,
+                    accumulator,
+                    timestamp.as_deref(),
+                    PiUsageRecordShape::MessageEnd,
+                );
+            } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+                accumulator.note_dropped_usage();
+            }
+            accumulator.note_pi_time(timestamp);
+        }
+        Some("model_change") => {
+            accumulator
+                .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         _ => {}
     }
@@ -6592,26 +6887,35 @@ fn pi_usage_dedup_key(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["response_id"]))
 }
 
-fn apply_pi_usage_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
-    let timestamp = pi_message_end_timestamp(value);
+fn apply_pi_usage_line(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    shape: PiUsageRecordShape,
+) {
     let model = string_at(value, &["message", "model"]);
     accumulator.set_model(model.clone());
-    if let Some(usage) = pi_message_end_usage(value) {
+    if let Some(usage) = pi_message_usage(value) {
         let mut selector = accumulator.current_selector.clone();
-        selector.merge(pi_selector_from_message_end(value));
+        selector.merge(pi_selector_from_usage_message(value));
         let occurrence_digest =
-            pi_usage_occurrence_digest(model.as_deref(), &usage, &selector, timestamp.as_deref());
+            pi_usage_occurrence_digest(model.as_deref(), &usage, &selector, timestamp);
         let is_new_occurrence = match pi_usage_dedup_key(value) {
             Some(key) => match accumulator.seen_pi_usage_keys.get(&key) {
-                Some(previous) if previous == &occurrence_digest => false,
-                Some(_) => {
+                Some((previous_shape, previous_digest))
+                    if *previous_shape != shape && previous_digest == &occurrence_digest =>
+                {
+                    false
+                }
+                Some((previous_shape, _)) if *previous_shape != shape => {
                     accumulator.pi_usage_conflict_count += 1;
                     false
                 }
+                Some(_) => true,
                 None => {
                     accumulator
                         .seen_pi_usage_keys
-                        .insert(key, occurrence_digest);
+                        .insert(key, (shape, occurrence_digest));
                     true
                 }
             },
@@ -6619,16 +6923,12 @@ fn apply_pi_usage_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
         };
         if is_new_occurrence {
             accumulator.add_usage_with_selector(
-                model,
-                usage,
-                selector,
-                timestamp.as_deref(),
+                model, usage, selector, timestamp,
                 // Pi does not emit a per-turn reasoning effort tier.
                 None,
             );
         }
     }
-    accumulator.note_time(timestamp);
 }
 
 fn pi_usage_occurrence_digest(
@@ -6669,16 +6969,67 @@ fn pi_message_text(value: &Value) -> Option<String> {
 }
 
 fn pi_timestamp_field(value: &Value) -> Option<String> {
-    string_at(value, &["timestamp"])
-        .or_else(|| pi_ms_timestamp(value.get("timestamp")))
-        .or_else(|| pi_ms_timestamp(value.pointer("/message/timestamp")))
+    pi_timestamp_value(value.get("timestamp"))
+        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
+}
+
+fn pi_message_timestamp(value: &Value) -> Option<String> {
+    pi_timestamp_value(value.get("timestamp"))
+        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
 }
 
 fn pi_message_end_timestamp(value: &Value) -> Option<String> {
-    pi_ms_timestamp(value.pointer("/message/timestamp"))
-        .or_else(|| string_at(value, &["message", "timestamp"]))
-        .or_else(|| pi_ms_timestamp(value.get("timestamp")))
-        .or_else(|| string_at(value, &["timestamp"]))
+    // Historical `message_end` records use the provider response timestamp
+    // nested in `message`; a later envelope write time may cross an hour
+    // boundary and must not move already-accounted usage.
+    pi_timestamp_value(value.pointer("/message/timestamp"))
+        .or_else(|| pi_timestamp_value(value.get("timestamp")))
+}
+
+fn pi_message_timestamp_is_present(value: &Value) -> bool {
+    value.get("timestamp").is_some() || value.pointer("/message/timestamp").is_some()
+}
+
+fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        if let Ok(parsed) = OffsetDateTime::parse(text, &Rfc3339) {
+            if (1..=9999).contains(&parsed.year()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    pi_ms_timestamp(Some(value))
+}
+
+fn pi_timestamp_is_before(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate < current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate < current,
+    }
+}
+
+fn pi_timestamp_is_after(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate > current,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiUsageRecordShape {
+    Message,
+    MessageEnd,
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -6688,19 +7039,29 @@ fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
         Value::String(text) => text.parse::<i64>().ok(),
         _ => None,
     }?;
-    Some(format_rfc3339_millis(ms))
+    bounded_rfc3339_millis(ms)
 }
 
-fn format_rfc3339_millis(ms: i64) -> String {
-    let total_secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000) as u32;
-    let days = total_secs.div_euclid(86_400);
-    let time_of_day = total_secs.rem_euclid(86_400) as u32;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+fn bounded_rfc3339_millis(ms: i64) -> Option<String> {
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
+    // Python/Pydantic datetimes, and therefore the backend snapshot contract,
+    // admit only civil years 1..=9999. `time` deliberately supports a wider
+    // internal range, so validate before formatting instead of minting a
+    // superficially RFC3339-looking value that can poison an upload batch.
+    if !(1..=9999).contains(&timestamp.year()) {
+        return None;
+    }
+    let utc = timestamp.to_offset(time::UtcOffset::UTC);
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.millisecond(),
+    ))
 }
 
 fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
@@ -6715,22 +7076,7 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
     Some((bucket_start, normalized_timestamp))
 }
 
-// Howard Hinnant's civil_from_days. Returns (year, month, day) from days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-fn pi_message_end_usage(value: &Value) -> Option<UsageTotals> {
+fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
     let usage = value.pointer("/message/usage")?;
     if !usage_object_has_numeric_field(
         usage,
@@ -6973,6 +7319,8 @@ struct ScanCensus {
     invalid_utf8_line_count: usize,
     over_line_cap_count: usize,
     recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
     #[cfg(test)]
     observed_index_keys: BTreeSet<String>,
 }
@@ -7407,7 +7755,7 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
 
 fn codex_state_timestamp(ms: Option<i64>, seconds: Option<i64>) -> Option<String> {
     let timestamp_ms = ms.or_else(|| seconds.map(|value| value.saturating_mul(1_000)))?;
-    Some(format_rfc3339_millis(timestamp_ms))
+    bounded_rfc3339_millis(timestamp_ms)
 }
 
 fn load_codex_config_selector(path: &Path) -> SelectorCapture {
@@ -13110,7 +13458,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_scan_retries_zero_parsed_file_until_usage_arrives() {
+    fn scan_checkpoints_pi_zero_parsed_file_until_it_changes() {
         let root = temp_dir("pi-retry-zero-parsed");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -13129,6 +13477,22 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 0);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+
+        let unchanged_empty = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unchanged empty scan");
+        assert_eq!(unchanged_empty.snapshots.len(), 0);
+        assert_eq!(unchanged_empty.scanned_file_count, 0);
+        assert_eq!(unchanged_empty.scanned_session_count, 0);
+        assert_eq!(unchanged_empty.zero_snapshot_usage_evidence_count, 0);
 
         fs::write(
             &path,
@@ -13162,6 +13526,369 @@ mod tests {
         )
         .expect("third scan");
         assert_eq!(third.snapshots.len(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_checkpoints_codex_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("codex-retry-zero-parsed");
+        let path =
+            root.join("rollout-2026-05-14T10-00-00-019e2700-3333-7000-9000-333333333333.jsonl");
+        let session_meta = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-3333-7000-9000-333333333333\"}}\n";
+        fs::write(&path, session_meta).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_meta}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zero_snapshot_usage_evidence_stays_visible_across_bounded_retries() {
+        let root = temp_dir("pi-zero-snapshot-usage-evidence");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"assistant_v2\",\"message\":{\"billing\":{\"usage\":{\"input\":12,\"output\":4}}}}\n",
+            ),
+        )
+        .expect("write schema-drift fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first schema-drift scan");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 1);
+
+        let retry = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("bounded schema-drift retry");
+        assert_eq!(retry.scanned_file_count, 1);
+        assert_eq!(retry.scanned_session_count, 0);
+        assert_eq!(retry.zero_snapshot_usage_evidence_count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_evidence_is_structural_and_ignores_metadata_limits_and_budgets() {
+        let positive = [
+            serde_json::json!({"token_count": {"info": {"total_token_usage": {"input_tokens": 12}}}}),
+            serde_json::json!({"message": {"usage": {"output_tokens": 4}}}),
+            serde_json::json!({"message": {"usage": {"input": 2, "cost": {"total": 0.01}}}}),
+            serde_json::json!({"unknown": {"nested": {"usage": {"future": {"request_count": 1}}}}}),
+        ];
+        for value in positive {
+            assert!(
+                json_has_positive_usage_evidence(&value),
+                "recognized consumption must stay visible"
+            );
+        }
+
+        let negative = [
+            serde_json::json!({"usage_version": 25}),
+            serde_json::json!({"usage_limit": 1000}),
+            serde_json::json!({"usage": {"version": 25, "limits": {"input_tokens": 1000}}}),
+            serde_json::json!({"usage": {"budget": {"usd": 500}, "timestamp": 1784707201000_i64}}),
+            serde_json::json!({"usage": {"future": {"opaque_positive": 99}}}),
+            serde_json::json!({"billing_usage": {"quota": {"requests": 100}}}),
+        ];
+        for value in negative {
+            assert!(
+                !json_has_positive_usage_evidence(&value),
+                "metadata and unknown numerics must not page"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_parser_quarantines_hostile_partial_timestamps_until_corrected() {
+        let root = temp_dir("pi-hostile-timestamps");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-max\",\"model\":\"gpt-5.4\",\"timestamp\":9223372036854775807,\"usage\":{\"input\":100,\"output\":10}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-min\",\"model\":\"gpt-5.4\",\"timestamp\":-9223372036854775808,\"usage\":{\"input\":200,\"output\":20}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-text\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"healthy\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write hostile timestamp fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 3);
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
+
+        let mixed_settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled mixed scan");
+        assert_eq!(mixed_settled.scanned_file_count, 0);
+        assert_eq!(mixed_settled.dropped_usage_record_count, 3);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-only\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+            ),
+        )
+        .expect("rewrite with nonzero usage behind a malformed timestamp");
+        let regressed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan malformed-only usage");
+        assert!(regressed.snapshots.is_empty());
+        assert_eq!(regressed.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(regressed.dropped_usage_record_count, 1);
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0,
+            "the incomplete file never advances the durable manifest"
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled malformed-usage checkpoint");
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(settled.dropped_usage_record_count, 1);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"corrected\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":30,\"output\":3}}}\n",
+            ),
+        )
+        .expect("correct malformed timestamp");
+        let corrected = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:08:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("corrected scan");
+        assert_eq!(corrected.snapshots.len(), 1);
+        assert_eq!(corrected.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(corrected.dropped_usage_record_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let codex_root = temp_dir("codex-partial-timestamp-loss");
+        let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"not-a-time\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":15,\"output_tokens\":3},\"model\":\"gpt-5.5\"}}}\n",
+            ),
+        )
+        .expect("write Codex partial-loss fixture");
+        let mut codex_index = ScanIndex::default();
+        let codex = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&codex_root),
+            &mut codex_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Codex partial-loss fixture");
+        assert!(codex.snapshots.is_empty());
+        assert!(!codex.census_complete);
+        assert_eq!(codex.dropped_usage_record_count, 1);
+
+        let claude_root = temp_dir("claude-partial-timestamp-loss");
+        let claude_path = claude_root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n",
+                "{\"timestamp\":\"not-a-time\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"bad\",\"message\":{\"id\":\"bad\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"good\",\"message\":{\"id\":\"good\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n",
+            ),
+        )
+        .expect("write Claude partial-loss fixture");
+        let mut claude_index = ScanIndex::default();
+        let claude = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&claude_root),
+            &mut claude_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Claude partial-loss fixture");
+        assert!(claude.snapshots.is_empty());
+        assert!(!claude.census_complete);
+        assert_eq!(claude.dropped_usage_record_count, 1);
+
+        let _ = fs::remove_dir_all(codex_root);
+        let _ = fs::remove_dir_all(claude_root);
+    }
+
+    #[test]
+    fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("claude-retry-zero-parsed");
+        let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
+        fs::write(&path, session_header).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_header}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -18802,7 +19529,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_sums_message_end_usage_and_extracts_session_meta() {
+    fn pi_parser_sums_legacy_message_end_usage_and_extracts_session_meta() {
         let path = temp_file("pi-basic");
         fs::write(
             &path,
@@ -18884,91 +19611,370 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_accepts_current_nested_message_usage_shape() {
-        let path = temp_file("pi-current-message");
+    fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
+        let path = temp_file("pi-legacy-timestamp-precedence");
         fs::write(
             &path,
             concat!(
-                "{\"type\":\"session\",\"id\":\"019e2700-aaaa-7000-9000-111111111111\",\"cwd\":\"/Users/example/work\",\"version\":\"0.42\",\"timestamp\":\"2026-05-14T22:00:00Z\"}\n",
-                "{\"type\":\"message\",\"id\":\"user-row\",\"timestamp\":\"2026-05-14T22:00:01Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Summarize the changes in the diff\"}],\"timestamp\":1779234001000}}\n",
-                "{\"type\":\"message\",\"id\":\"assistant-row\",\"timestamp\":\"2026-05-14T22:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"google\",\"model\":\"gemini-2.5-pro\",\"api\":\"vertex\",\"responseId\":\"response-1\",\"timestamp\":1779234002000,\"usage\":{\"input\":100,\"output\":40,\"cacheRead\":20,\"cacheWrite\":5}}}\n"
+                "{\"type\":\"session\",\"session_id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
             ),
+        )
+        .expect("write legacy timestamp precedence fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
+        assert_eq!(
+            item.usage_buckets[0].last_activity_at.as_deref(),
+            Some("2026-07-22T10:59:59Z")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_reads_current_nested_message_shape() {
+        let path = temp_file("pi-current-message");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
         )
         .expect("write current Pi fixture");
 
-        let item = parse_pi_jsonl_file(&path, "2026-05-14T22:05:00Z", "fp".to_string())
-            .expect("parse current Pi shape")
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
             .into_iter()
             .next()
             .expect("snapshot");
 
         assert_eq!(
             item.source_session_id,
-            "019e2700-aaaa-7000-9000-111111111111"
+            "fixture-session-019e2700-1111-7000-9000-111111111111"
         );
-        assert_eq!(item.input_tokens, 100);
-        assert_eq!(item.output_tokens, 40);
-        assert_eq!(item.cache_read_tokens, 20);
-        assert_eq!(item.cache_creation_5m_tokens, 5);
-        assert_eq!(item.request_count, 1);
-        assert_eq!(
-            item.session_display_name.as_deref(),
-            Some("Summarize the changes in the diff")
-        );
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn pi_dual_usage_shapes_deduplicate_exact_response_id() {
-        let path = temp_file("pi-dual-usage-shape");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"session\",\"id\":\"019e2700-aaaa-7000-9000-111111111111\",\"timestamp\":\"2026-05-14T22:00:00Z\"}\n",
-                "{\"type\":\"message\",\"id\":\"assistant-row\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1779234002000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1779234002000,\"usage\":{\"input\":12,\"output\":4}}}\n"
-            ),
-        )
-        .expect("write dual-shape Pi fixture");
-
-        let item = parse_pi_jsonl_file(&path, "2026-05-14T22:05:00Z", "fp".to_string())
-            .expect("parse dual-shape Pi usage")
-            .into_iter()
-            .next()
-            .expect("snapshot");
         assert_eq!(item.input_tokens, 12);
         assert_eq!(item.output_tokens, 4);
         assert_eq!(item.request_count, 1);
+        assert_eq!(item.model_usage.len(), 1);
+        assert_eq!(item.model_usage[0].model, "gpt-5.4");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Summarize the fixture change")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-07-22T08:00:00Z")
+        );
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-07-22T08:00:01.000Z")
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn pi_divergent_response_id_reuse_quarantines_the_whole_file() {
+    fn pi_parser_dedupes_transitional_message_and_message_end_records() {
+        let path = temp_file("pi-current-legacy-dedup");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write transitional fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(item.request_count, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_divergent_cross_shape_response_id_quarantines_the_file() {
         let root = temp_dir("pi-divergent-response-id");
         let path = root.join("session.jsonl");
         fs::write(
             &path,
             concat!(
-                "{\"type\":\"session\",\"id\":\"019e2700-aaaa-7000-9000-111111111111\",\"timestamp\":\"2026-05-14T22:00:00Z\"}\n",
-                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1779234002000,\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1779234002000,\"usage\":{\"input\":99,\"output\":4}}}\n"
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":99,\"output\":4}}}\n",
             ),
         )
-        .expect("write divergent Pi fixture");
+        .expect("write divergent response-id fixture");
 
         let mut index = ScanIndex::default();
         let scan = scan_source_roots(
             SnapshotSource::Pi,
             std::slice::from_ref(&root),
             &mut index,
-            "2026-05-14T22:05:00Z",
+            "2026-07-22T08:02:00Z",
             BACKFILL_WINDOW_DAYS,
         )
-        .expect("scan divergent Pi response id");
+        .expect("scan divergent response-id fixture");
+
         assert!(scan.snapshots.is_empty());
-        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert_eq!(scan.dropped_usage_record_count, 1);
         assert!(!scan.census_complete);
         assert!(index.files.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_parser_does_not_dedupe_repeated_same_shape_response_ids() {
+        let path = temp_file("pi-same-shape-response-id");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated same-shape fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:03:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_keeps_identical_usage_without_response_ids_distinct() {
+        let path = temp_file("pi-no-id-distinct");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated id-less fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
+        assert!(pi_timestamp_is_before(
+            "2026-07-22T08:00:00Z",
+            "2026-07-22T08:00:00.500Z"
+        ));
+        assert!(pi_timestamp_is_after(
+            "2026-07-22T08:00:00.500Z",
+            "2026-07-22T08:00:00Z"
+        ));
+        assert!(pi_timestamp_is_before("invalid-a", "invalid-b"));
+        assert!(pi_timestamp_is_after("invalid-b", "invalid-a"));
+        assert!(!pi_timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
+        assert!(!pi_timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
+        assert!(pi_timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
+        assert!(pi_timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
+    }
+
+    #[test]
+    fn pi_current_shape_scan_populates_manifest_and_settles_idempotently() {
+        let root = temp_dir("pi-current-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
+        )
+        .expect("write current Pi fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        let first_manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first.discovered_file_count, 1);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 1);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first_manifest.entity_count, 1);
+
+        let second = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(second.discovered_file_count, 1);
+        assert_eq!(second.scanned_file_count, 0);
+        assert_eq!(second.scanned_session_count, 0);
+        assert!(second.snapshots.is_empty());
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            first_manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_scan_settles_the_observed_populated_and_genuine_empty_mix() {
+        const POPULATED: usize = 426;
+        const EMPTY: usize = 30;
+        let root = temp_dir("pi-observed-populated-empty-mix");
+        for index in 0..POPULATED + EMPTY {
+            let session_id = format!("fixture-session-{index:04}");
+            let content = if index < POPULATED {
+                format!(
+                    concat!(
+                        "{{\"type\":\"session\",\"id\":\"{session_id}\",",
+                        "\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n",
+                        "{{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",",
+                        "\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",",
+                        "\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
+                    ),
+                    session_id = session_id,
+                )
+            } else {
+                format!(
+                    "{{\"type\":\"session\",\"id\":\"{session_id}\",\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n"
+                )
+            };
+            fs::write(root.join(format!("session-{index:04}.jsonl")), content)
+                .expect("write observed-shape fixture");
+        }
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_session_count, POPULATED);
+        assert_eq!(first.snapshots.len(), POPULATED);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(index.confirmed_empty_files.len(), EMPTY);
+        let manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(manifest.entity_count, POPULATED as u64);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.scanned_session_count, 0);
+        assert!(settled.snapshots.is_empty());
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parser_identity_change_that_yields_zero_clears_the_manifest_contribution() {
+        let root = temp_dir("pi-parser-regression-clears-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+        )
+        .expect("write genuine empty transcript");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("establish empty checkpoint");
+        assert_eq!(first.scanned_file_count, 1);
+        let key = path.to_string_lossy().to_string();
+        index.confirmed_empty_files.remove(&key);
+        let entry = index.files.get_mut(&key).expect("index entry");
+        entry.last_snapshot_fingerprint = Some("previous-server-snapshot".to_string());
+        entry.source_file_fingerprint = "previous-parser-identity".to_string();
+
+        let reparsed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("reparse after identity change");
+        assert_eq!(reparsed.scanned_file_count, 1);
+        assert_eq!(reparsed.scanned_session_count, 0);
+        let entry = &index.files[&key];
+        assert!(entry.last_snapshot_fingerprint.is_none());
+        assert!(index.confirmed_empty_files.contains(&key));
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled regression scan");
+        assert_eq!(settled.scanned_file_count, 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19023,19 +20029,24 @@ mod tests {
     }
 
     #[test]
-    fn pi_ms_timestamp_formats_rfc3339_with_millis() {
+    fn pi_ms_timestamp_formats_bounded_rfc3339() {
         // Anchor on epoch 0 and a verifiable mid-2024 date.
-        assert_eq!(format_rfc3339_millis(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            bounded_rfc3339_millis(0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
         // 2024-01-01T00:00:00.000Z = 1_704_067_200 s = 1_704_067_200_000 ms
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_000),
-            "2024-01-01T00:00:00.000Z"
+            bounded_rfc3339_millis(1_704_067_200_000).as_deref(),
+            Some("2024-01-01T00:00:00.000Z")
         );
         // Sub-second granularity is preserved.
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_123),
-            "2024-01-01T00:00:00.123Z"
+            bounded_rfc3339_millis(1_704_067_200_123).as_deref(),
+            Some("2024-01-01T00:00:00.123Z")
         );
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
     }
 
     #[test]

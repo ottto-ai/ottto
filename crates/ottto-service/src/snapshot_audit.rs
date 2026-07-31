@@ -71,6 +71,9 @@ pub struct SnapshotAuditReport {
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
+    pub zero_snapshot_confirmed_count: usize,
+    pub zero_snapshot_usage_evidence_count: usize,
+    pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
     pub sessions: Vec<SnapshotAuditSession>,
 }
@@ -302,6 +305,9 @@ pub fn run_snapshot_audit<W: Write>(
         scanned_file_count: scan.scanned_file_count,
         scanned_session_count: scan.scanned_session_count,
         semantic_noop_count: scan.semantic_noop_count,
+        zero_snapshot_confirmed_count: scan.zero_snapshot_confirmed_count,
+        zero_snapshot_usage_evidence_count: scan.zero_snapshot_usage_evidence_count,
+        dropped_usage_record_count: scan.dropped_usage_record_count,
         emitted_session_count: sessions.len(),
         sessions,
     };
