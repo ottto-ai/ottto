@@ -688,6 +688,8 @@ pub struct SnapshotModelUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_product: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cost_usd: Option<String>,
@@ -1083,6 +1085,21 @@ fn model_usage_with_totals(
 }
 
 fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
+    let account_hashes = item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .filter_map(|row| row.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    let has_missing_account_hash = item
+        .usage_buckets
+        .iter()
+        .flat_map(|bucket| &bucket.model_usage)
+        .any(|row| row.account_identifier_hash.is_none());
+    let account_identifier_hash = (!has_missing_account_hash && account_hashes.len() == 1)
+        .then(|| account_hashes.first().map(|value| (*value).to_string()))
+        .flatten();
+    drop(account_hashes);
     let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
     for bucket in &item.usage_buckets {
         for row in &bucket.model_usage {
@@ -1103,6 +1120,9 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
         .iter()
         .map(|(key, row)| model_usage_from_row(key, row))
         .collect();
+    for row in &mut item.model_usage {
+        row.account_identifier_hash = account_identifier_hash.clone();
+    }
 }
 
 fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
@@ -1124,7 +1144,38 @@ fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
     facts
 }
 
+fn semantic_attribution(item: &SnapshotItem) -> Value {
+    let account_identifier_hashes = item
+        .model_usage
+        .iter()
+        .chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| bucket.model_usage.iter()),
+        )
+        .filter_map(|row| row.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut value = json!({
+        "origin": &item.origin,
+        "facts": semantic_attribution_facts(item),
+    });
+    if !account_identifier_hashes.is_empty() {
+        value
+            .as_object_mut()
+            .expect("semantic attribution is an object")
+            .insert(
+                "account_identifier_hashes".to_string(),
+                json!(account_identifier_hashes),
+            );
+    }
+    value
+}
+
 fn semantic_model_usage(row: &SnapshotModelUsage) -> Value {
+    // `account_identifier_hash` remains outside hash epoch 1. The account-keyed
+    // Claude sidecar fingerprint changes `source_file_fingerprint`, and thus
+    // `revision_hash`, when exact evidence appears; changing epoch-1 content
+    // semantics would reject older clients that already use this wire field.
     json!({
         "model": &row.model,
         "input_tokens": row.input_tokens,
@@ -1243,13 +1294,7 @@ pub(crate) fn snapshot_semantic_component_hashes(
             "workspace_kind": &item.workspace_kind,
         }),
     );
-    insert(
-        "attribution",
-        json!({
-            "origin": &item.origin,
-            "facts": semantic_attribution_facts(item),
-        }),
-    );
+    insert("attribution", semantic_attribution(item));
     insert("artifacts", json!(&item.session_artifacts));
     components
 }
@@ -1833,6 +1878,7 @@ struct CodexStateThread {
 #[derive(Debug, Clone, Default)]
 struct ClaudeTitleMetadata {
     titles: BTreeMap<String, ClaudeTitleCandidate>,
+    account_identifier_hashes: BTreeMap<String, BTreeSet<String>>,
     legacy_sidecar_fingerprint: String,
 }
 
@@ -1852,15 +1898,28 @@ const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
 
 impl ClaudeTitleMetadata {
+    fn account_identifier_hash(&self, source_session_id: &str) -> Option<&str> {
+        let hashes = self.account_identifier_hashes.get(source_session_id)?;
+        (hashes.len() == 1)
+            .then(|| hashes.first().map(String::as_str))
+            .flatten()
+    }
+
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
         let candidate = self.titles.get(source_session_id);
+        let account_identity = match self.account_identifier_hashes.get(source_session_id) {
+            Some(hashes) if hashes.len() == 1 => hashes.first().map(String::as_str).unwrap_or(""),
+            Some(_) => "ambiguous",
+            None => "",
+        };
         sha256_hex(&[
-            "claude_session_sidecar:v1",
+            "claude_session_sidecar:v2",
             source_session_id,
             candidate.map(|value| value.title.as_str()).unwrap_or(""),
             candidate
                 .map(|value| if value.user_set { "user" } else { "auto" })
                 .unwrap_or(""),
+            account_identity,
         ])
     }
 
@@ -1886,12 +1945,19 @@ impl ClaudeTitleMetadata {
         let mut metadata = Self::default();
         let mut session_files = Vec::new();
         for dir in store_dirs {
-            collect_claude_desktop_session_files(dir, 0, &mut session_files);
+            let mut files = Vec::new();
+            collect_claude_desktop_session_files(dir, 0, &mut files);
+            session_files.extend(files.into_iter().map(|path| (dir.clone(), path)));
         }
         session_files.sort();
         session_files.truncate(MAX_CLAUDE_DESKTOP_SESSION_FILES);
-        for path in &session_files {
-            load_claude_desktop_session_title(path, &mut metadata.titles);
+        for (store_dir, path) in &session_files {
+            load_claude_desktop_session_metadata(
+                store_dir,
+                path,
+                &mut metadata.titles,
+                &mut metadata.account_identifier_hashes,
+            );
         }
         let sidecar_parts = metadata
             .titles
@@ -1931,9 +1997,11 @@ fn collect_claude_desktop_session_files(dir: &Path, depth: usize, files: &mut Ve
     }
 }
 
-fn load_claude_desktop_session_title(
+fn load_claude_desktop_session_metadata(
+    store_dir: &Path,
     path: &Path,
     titles: &mut BTreeMap<String, ClaudeTitleCandidate>,
+    account_identifier_hashes: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     let Ok(bytes) = fs::read(path) else {
         return;
@@ -1946,6 +2014,22 @@ fn load_claude_desktop_session_title(
     let Some(cli_session_id) = string_at(&value, &["cliSessionId"]) else {
         return;
     };
+    let account_uuid = path
+        .strip_prefix(store_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        });
+    if let Some(account_hash) = account_uuid
+        .and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "account", uuid))
+    {
+        account_identifier_hashes
+            .entry(cli_session_id.clone())
+            .or_default()
+            .insert(account_hash);
+    }
     let Some(title) = string_at(&value, &["title"]) else {
         return;
     };
@@ -2134,6 +2218,7 @@ impl UsageBucketState {
 struct SnapshotAccumulator {
     source: SnapshotSource,
     source_session_id: Option<String>,
+    account_identifier_hash: Option<String>,
     title: Option<String>,
     title_source: Option<String>,
     first_prompt_title: Option<String>,
@@ -2221,6 +2306,7 @@ impl SnapshotAccumulator {
         Self {
             source,
             source_session_id: None,
+            account_identifier_hash: None,
             title: None,
             title_source: None,
             first_prompt_title: None,
@@ -2417,6 +2503,9 @@ impl SnapshotAccumulator {
             }
             return;
         }
+        self.account_identifier_hash = metadata
+            .account_identifier_hash(session_id.as_str())
+            .map(str::to_string);
         let Some(candidate) = metadata.titles.get(session_id.as_str()) else {
             return;
         };
@@ -2750,10 +2839,18 @@ impl SnapshotAccumulator {
         if session_rows.is_empty() {
             return Vec::new();
         }
-        let model_usage: Vec<SnapshotModelUsage> = session_rows
+        let mut model_usage: Vec<SnapshotModelUsage> = session_rows
             .iter()
             .map(|(row_key, row)| model_usage_from_row(row_key, row))
             .collect();
+        for row in &mut model_usage {
+            row.account_identifier_hash = self.account_identifier_hash.clone();
+        }
+        for bucket in &mut usage_buckets {
+            for row in &mut bucket.model_usage {
+                row.account_identifier_hash = self.account_identifier_hash.clone();
+            }
+        }
         let mut totals = UsageTotals::default();
         for row in session_rows.values() {
             totals.add(&row.usage);
@@ -2932,6 +3029,7 @@ fn model_usage_from_row(row_key: &RowKey, row: &BucketRowAccumulator) -> Snapsho
         gateway_provider: row_key.gateway_provider.clone(),
         model_provider: row_key.model_provider.clone(),
         subscription_product: row_key.subscription_product.clone(),
+        account_identifier_hash: None,
         cost_usd: row.usage.costs.total.map(usd_picos_string),
         input_cost_usd: row.usage.costs.input.map(usd_picos_string),
         output_cost_usd: row.usage.costs.output.map(usd_picos_string),
@@ -3405,6 +3503,7 @@ fn codex_state_only_snapshot(
         gateway_provider: None,
         model_provider: None,
         subscription_product: None,
+        account_identifier_hash: None,
         cost_usd: None,
         input_cost_usd: None,
         output_cost_usd: None,
@@ -11286,6 +11385,12 @@ mod tests {
         let mut items =
             parse_claude_code_jsonl_file(&path, "2026-07-11T10:04:00Z", "fp".to_string())
                 .expect("parse");
+        for row in &mut items[0].model_usage {
+            row.account_identifier_hash = Some("hash-account-exact".to_string());
+        }
+        for row in &mut items[0].usage_buckets[0].model_usage {
+            row.account_identifier_hash = Some("hash-account-exact".to_string());
+        }
         let evidence = BTreeMap::from([(
             "claude-effort-1".to_string(),
             vec![
@@ -11329,6 +11434,10 @@ mod tests {
             .model_usage
             .iter()
             .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 20));
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some("hash-account-exact")));
         validate_snapshot_item(0, &items[0]).expect("split snapshot remains byte-exact");
         let _ = fs::remove_file(path);
     }
@@ -13323,6 +13432,200 @@ mod tests {
             item.session_display_name_source.as_deref(),
             Some("desktop_title")
         );
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+                .expect("account hash");
+        assert!(item
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+        assert!(item.usage_buckets.iter().all(|bucket| bucket
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str()))));
+        let serialized = serde_json::to_string(&item).expect("serialize snapshot");
+        assert!(serialized.contains("account_identifier_hash"));
+        assert!(!serialized.contains("account-ctx"));
+        let mut without_account = item.clone();
+        for row in &mut without_account.model_usage {
+            row.account_identifier_hash = None;
+        }
+        for bucket in &mut without_account.usage_buckets {
+            for row in &mut bucket.model_usage {
+                row.account_identifier_hash = None;
+            }
+        }
+        let with_account_components =
+            snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
+        let without_account_components =
+            snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &without_account);
+        assert_eq!(
+            policy_neutral_component_hashes(&with_account_components),
+            policy_neutral_component_hashes(&without_account_components),
+            "hash epoch 1 excludes the later account-identity wire field"
+        );
+        assert_ne!(
+            snapshot_fingerprint_from_component_hashes(
+                SnapshotSource::ClaudeCode,
+                &item.source_session_id,
+                &with_account_components,
+            ),
+            snapshot_fingerprint_from_component_hashes(
+                SnapshotSource::ClaudeCode,
+                &without_account.source_session_id,
+                &without_account_components,
+            ),
+            "account evidence must escape semantic no-op suppression"
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn late_claude_desktop_account_mapping_escapes_semantic_noop_suppression() {
+        let session_id = "33333333-4444-5555-6666-777777777777";
+        let home = temp_dir("claude-desktop-account-late-mapping");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-07-31T10:01:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+        assert!(first.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-late")
+            .join("workspace");
+        fs::create_dir_all(&store_dir).expect("create Desktop store");
+        fs::write(
+            store_dir.join("local_desktop-late.json"),
+            format!("{{\"cliSessionId\":\"{session_id}\"}}"),
+        )
+        .expect("write late account mapping");
+
+        let second = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan");
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.semantic_noop_count, 0);
+        assert_eq!(second.snapshots.len(), 1);
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-late")
+                .expect("account hash");
+        assert!(second.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert!(settled.snapshots.is_empty());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_desktop_account_identity_fails_closed_across_accounts() {
+        let session_id = "22222222-3333-4444-5555-666666666666";
+        let desktop_json = format!(
+            "{{\"cliSessionId\":\"{session_id}\",\"title\":\"Shared session\",\"titleSource\":\"auto\"}}"
+        );
+        let transcript = format!(
+            "{{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+        );
+        let (home, transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-account-ambiguity",
+            session_id,
+            &desktop_json,
+            &transcript,
+        );
+        let second_store = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-other")
+            .join("workspace");
+        fs::create_dir_all(&second_store).expect("create second account store");
+        fs::write(second_store.join("local_desktop-2.json"), &desktop_json)
+            .expect("write second account session");
+
+        let ambiguous = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert!(ambiguous.account_identifier_hash(session_id).is_none());
+        let ambiguous_fingerprint = ambiguous.session_sidecar_fingerprint(session_id);
+        let item = parse_claude_code_jsonl_file_with_title_metadata(
+            &transcript_path,
+            "2026-07-10T10:04:00Z",
+            "fp".to_string(),
+            &ambiguous,
+            true,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert!(item
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        // Negative control: removing the conflicting account makes the exact
+        // mapping load-bearing and must change both selection fingerprint and
+        // emitted attribution. An implementation that always matched would
+        // fail the ambiguity assertions above.
+        fs::remove_dir_all(
+            home.join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude-code-sessions")
+                .join("account-other"),
+        )
+        .expect("remove conflicting account");
+        let exact = ClaudeTitleMetadata::load_from_roots(std::slice::from_ref(&projects_root));
+        assert_ne!(
+            ambiguous_fingerprint,
+            exact.session_sidecar_fingerprint(session_id)
+        );
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+                .expect("account hash");
+        assert_eq!(
+            exact.account_identifier_hash(session_id),
+            Some(expected_hash.as_str())
+        );
 
         let _ = fs::remove_dir_all(home);
     }
@@ -14755,6 +15058,7 @@ mod tests {
             gateway_provider: Some("vertex".to_string()),
             model_provider: Some("anthropic".to_string()),
             subscription_product: None,
+            account_identifier_hash: None,
             cost_usd: None,
             input_cost_usd: None,
             output_cost_usd: None,
@@ -14995,6 +15299,7 @@ mod tests {
             gateway_provider: Some("vertex".to_string()),
             model_provider: Some("anthropic".to_string()),
             subscription_product: None,
+            account_identifier_hash: None,
             cost_usd: None,
             input_cost_usd: None,
             output_cost_usd: None,

@@ -341,6 +341,7 @@ mod tests {
             gateway_provider: gateway_provider.map(str::to_string),
             model_provider: model_provider.map(str::to_string),
             subscription_product: subscription_product.map(str::to_string),
+            account_identifier_hash: None,
             cost_usd: None,
             input_cost_usd: None,
             output_cost_usd: None,
