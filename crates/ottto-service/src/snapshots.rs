@@ -899,8 +899,12 @@ pub fn apply_claude_effort_evidence(
         let Some(evidence) = evidence_by_session.get(&item.source_session_id) else {
             continue;
         };
+        let mut changed = apply_claude_account_evidence(item, evidence);
         let mut grouped: BTreeMap<(String, String, String), UsageTotals> = BTreeMap::new();
         for observed in evidence {
+            if observed.effort.is_empty() {
+                continue;
+            }
             let Some((bucket_start, _)) = activity_bucket_from_timestamp(&observed.observed_at)
             else {
                 continue;
@@ -926,7 +930,6 @@ pub fn apply_claude_effort_evidence(
                 .add(&totals);
         }
 
-        let mut changed = false;
         for bucket in &mut item.usage_buckets {
             let mut model_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
             for (index, row) in bucket.model_usage.iter().enumerate() {
@@ -999,6 +1002,88 @@ pub fn apply_claude_effort_evidence(
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
     }
+}
+
+fn apply_claude_account_evidence(
+    item: &mut SnapshotItem,
+    evidence: &[crate::claude_effort::ClaudeEffortEvidence],
+) -> bool {
+    let checked_evidence = evidence
+        .iter()
+        .filter(|row| row.account_identity_checked)
+        .collect::<Vec<_>>();
+    if checked_evidence.is_empty() {
+        return false;
+    }
+    let evidence_hashes = checked_evidence
+        .iter()
+        .filter_map(|row| row.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    let has_unidentified_request = checked_evidence
+        .iter()
+        .any(|row| row.account_identifier_hash.is_none());
+    let has_legacy_unchecked_request = evidence.iter().any(|row| !row.account_identity_checked);
+    let existing_hashes = item
+        .model_usage
+        .iter()
+        .chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| bucket.model_usage.iter()),
+        )
+        .filter_map(|row| row.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    let existing_identity_matches =
+        !existing_hashes.is_empty() && existing_hashes == evidence_hashes;
+    let evidence_covers_snapshot = claude_account_evidence_covers_snapshot(item, &checked_evidence);
+    let target = (!has_unidentified_request
+        && evidence_hashes.len() == 1
+        && (existing_identity_matches
+            || (existing_hashes.is_empty()
+                && !has_legacy_unchecked_request
+                && evidence_covers_snapshot)))
+        .then(|| evidence_hashes.first().map(|value| (*value).to_string()))
+        .flatten();
+    let mut changed = false;
+    for row in item.model_usage.iter_mut().chain(
+        item.usage_buckets
+            .iter_mut()
+            .flat_map(|bucket| bucket.model_usage.iter_mut()),
+    ) {
+        if row.account_identifier_hash != target {
+            row.account_identifier_hash = target.clone();
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn claude_account_evidence_covers_snapshot(
+    item: &SnapshotItem,
+    evidence: &[&crate::claude_effort::ClaudeEffortEvidence],
+) -> bool {
+    let sum = |value: fn(&crate::claude_effort::ClaudeEffortEvidence) -> u64| {
+        evidence
+            .iter()
+            .map(|row| u128::from(value(row)))
+            .sum::<u128>()
+    };
+    let cache_creation = evidence
+        .iter()
+        .map(|row| {
+            u128::from(row.cache_creation_tokens)
+                + u128::from(row.cache_creation_5m_tokens)
+                + u128::from(row.cache_creation_1h_tokens)
+        })
+        .sum::<u128>();
+    item.unattributed_total_tokens == 0
+        && sum(|row| row.input_tokens) == u128::from(item.input_tokens)
+        && sum(|row| row.output_tokens) == u128::from(item.output_tokens)
+        && sum(|row| row.cache_read_tokens) == u128::from(item.cache_read_tokens)
+        && cache_creation
+            == u128::from(item.cache_creation_5m_tokens) + u128::from(item.cache_creation_1h_tokens)
+        && sum(|row| row.reasoning_output_tokens) == u128::from(item.reasoning_output_tokens)
+        && sum(|row| row.request_count) == u128::from(item.request_count)
 }
 
 fn normalized_evidence_model(model: &str) -> String {
@@ -3186,6 +3271,36 @@ pub fn scan_source_roots_with_attribution(
         MAX_BACKFILL_FILES_PER_SOURCE,
         artifacts_enabled,
         attribution_context,
+        None,
+    )
+}
+
+/// Production scan entry that also tracks the local Claude OTLP sidecar.
+///
+/// Keeping the support directory explicit preserves the pure scan API for
+/// audits/backfills while ensuring a late provider identity re-selects an
+/// otherwise unchanged live transcript.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_source_roots_with_attribution_and_claude_effort(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    claude_effort_support_dir: Option<&Path>,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        artifacts_enabled,
+        attribution_context,
+        claude_effort_support_dir,
     )
 }
 
@@ -3209,6 +3324,7 @@ fn scan_source_roots_with_limit(
         file_limit,
         artifacts_enabled,
         None,
+        None,
     )
 }
 
@@ -3222,6 +3338,7 @@ fn scan_source_roots_with_limit_and_attribution(
     file_limit: usize,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    claude_effort_support_dir: Option<&Path>,
 ) -> Result<SourceScanResult> {
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
     let codex_title_metadata = if source == SnapshotSource::Codex {
@@ -3287,7 +3404,25 @@ fn scan_source_roots_with_limit_and_attribution(
                         .file_stem()
                         .and_then(|value| value.to_str())
                         .map(|session_id| {
-                            claude_title_metadata.session_sidecar_fingerprint(session_id)
+                            let desktop_fingerprint =
+                                claude_title_metadata.session_sidecar_fingerprint(session_id);
+                            let effort_fingerprint = claude_effort_support_dir
+                                .map(|support_dir| {
+                                    crate::claude_effort::claude_effort_sidecar_fingerprint(
+                                        support_dir,
+                                        session_id,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            if effort_fingerprint.is_empty() {
+                                desktop_fingerprint
+                            } else {
+                                sha256_hex(&[
+                                    "claude_session_sidecars:v1",
+                                    desktop_fingerprint.as_str(),
+                                    effort_fingerprint.as_str(),
+                                ])
+                            }
                         })
                         .unwrap_or_default()
                 }
@@ -3312,6 +3447,7 @@ fn scan_source_roots_with_limit_and_attribution(
     let mut scanned_session_count = 0;
     let mut semantic_noop_count = 0;
     for candidate in files {
+        let source_context_changed = index.source_context_changed(&candidate);
         let decision = index.candidate_decision(&candidate);
         match decision {
             CandidateDecision::Skip => continue,
@@ -3367,6 +3503,7 @@ fn scan_source_roots_with_limit_and_attribution(
         } else {
             last_snapshot_fingerprint.is_some()
                 && last_snapshot_fingerprint == previous_snapshot_fingerprint
+                && !source_context_changed
         };
         if source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some() {
             index.record(candidate, last_snapshot_fingerprint);
@@ -6550,6 +6687,20 @@ impl ScanIndex {
         } else {
             CandidateDecision::Skip
         }
+    }
+
+    fn source_context_changed(&self, candidate: &CandidateFile) -> bool {
+        self.files
+            .get(&local_index_key(&candidate.path))
+            .is_some_and(|entry| {
+                entry.size_bytes == candidate.size_bytes
+                    && entry.modified_unix_seconds == candidate.modified_unix_seconds
+                    && entry
+                        .modified_unix_nanos
+                        .map(|value| value == candidate.modified_unix_nanos)
+                        .unwrap_or(true)
+                    && entry.source_file_fingerprint != candidate.source_file_fingerprint
+            })
     }
 
     fn last_snapshot_fingerprint(&self, candidate: &CandidateFile) -> Option<String> {
@@ -11525,6 +11676,173 @@ mod tests {
     }
 
     #[test]
+    fn claude_local_otel_account_hash_stamps_unique_and_clears_conflict() {
+        let path = temp_file("claude-account-evidence");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-07-31T10:00:00Z\",\"sessionId\":\"claude-account-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-07-31T10:01:00Z\",\"sessionId\":\"claude-account-1\",\"message\":{\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, "2026-07-31T10:02:00Z", "fp".to_string())
+                .expect("parse");
+        let account_a = "a".repeat(64);
+        let account_b = "b".repeat(64);
+        let unique = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                session_id: "claude-account-1".to_string(),
+                model: "unmatched-model".to_string(),
+                effort: "high".to_string(),
+                input_tokens: 2,
+                output_tokens: 1,
+                request_count: 1,
+                account_identity_checked: true,
+                account_identifier_hash: Some(account_a.clone()),
+                ..Default::default()
+            }],
+        )]);
+
+        apply_claude_effort_evidence(&mut items, &unique);
+
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_a.as_str())));
+        let unique_fingerprint = items[0].snapshot_fingerprint.clone();
+
+        let conflicting = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![
+                crate::claude_effort::ClaudeEffortEvidence {
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(account_a),
+                    ..Default::default()
+                },
+                crate::claude_effort::ClaudeEffortEvidence {
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(account_b),
+                    ..Default::default()
+                },
+            ],
+        )]);
+        apply_claude_effort_evidence(&mut items, &conflicting);
+
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert_ne!(items[0].snapshot_fingerprint, unique_fingerprint);
+
+        let partially_identified = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![
+                crate::claude_effort::ClaudeEffortEvidence {
+                    account_identity_checked: true,
+                    account_identifier_hash: Some("a".repeat(64)),
+                    ..Default::default()
+                },
+                crate::claude_effort::ClaudeEffortEvidence {
+                    account_identity_checked: true,
+                    ..Default::default()
+                },
+            ],
+        )]);
+        apply_claude_effort_evidence(&mut items, &unique);
+        apply_claude_effort_evidence(&mut items, &partially_identified);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        apply_claude_effort_evidence(&mut items, &unique);
+        let unidentified = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                account_identity_checked: true,
+                ..Default::default()
+            }],
+        )]);
+        apply_claude_effort_evidence(&mut items, &unidentified);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        let mixed_legacy_and_current = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![
+                crate::claude_effort::ClaudeEffortEvidence::default(),
+                crate::claude_effort::ClaudeEffortEvidence {
+                    account_identity_checked: true,
+                    account_identifier_hash: Some("a".repeat(64)),
+                    ..Default::default()
+                },
+            ],
+        )]);
+        apply_claude_effort_evidence(&mut items, &mixed_legacy_and_current);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        let incomplete_current = BTreeMap::from([(
+            "claude-account-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                account_identity_checked: true,
+                account_identifier_hash: Some("a".repeat(64)),
+                request_count: 1,
+                ..Default::default()
+            }],
+        )]);
+        apply_claude_effort_evidence(&mut items, &incomplete_current);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .chain(
+                items[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.is_none()));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn claude_effort_cache_reconciliation_drops_only_conflicting_ttl_component() {
         let mut rows = vec![(
             "low".to_string(),
@@ -13550,6 +13868,103 @@ mod tests {
             &mut index,
             "2026-07-31T10:06:00Z",
             BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert!(settled.snapshots.is_empty());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn late_claude_otel_account_evidence_reselects_unchanged_transcript() {
+        let session_id = "44444444-5555-6666-7777-888888888888";
+        let home = temp_dir("claude-otel-account-late-mapping");
+        let support_dir = home.join("support");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join("-Users-dev-repo");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-07-31T10:01:00Z\",\"sessionId\":\"{session_id}\",\"message\":{{\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
+        )
+        .expect("first scan");
+        assert_eq!(first.snapshots.len(), 1);
+
+        let body = format!(
+            "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785492120000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{session_id}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"35\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"8\"}}}}]}}]}}]}}]}}"
+        );
+        assert_eq!(
+            crate::claude_effort::capture_claude_api_request_logs(
+                &support_dir,
+                body.as_bytes(),
+                "application/json",
+            )
+            .expect("capture account evidence"),
+            1
+        );
+
+        let mut second = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
+        )
+        .expect("second scan");
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.semantic_noop_count, 0);
+        assert_eq!(second.snapshots.len(), 1);
+
+        let evidence = crate::claude_effort::load_claude_effort_evidence(
+            &support_dir,
+            [session_id.to_string()],
+        )
+        .expect("load account evidence");
+        apply_claude_effort_evidence(&mut second.snapshots, &evidence);
+        let expected_hash = ottto_core::billing_identity_hash(
+            "anthropic",
+            "account",
+            "123e4567-e89b-12d3-a456-426614174000",
+        )
+        .expect("account hash");
+        assert!(second.snapshots[0]
+            .model_usage
+            .iter()
+            .chain(
+                second.snapshots[0]
+                    .usage_buckets
+                    .iter()
+                    .flat_map(|bucket| bucket.model_usage.iter())
+            )
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+
+        let settled = scan_source_roots_with_attribution_and_claude_effort(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-31T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+            true,
+            None,
+            Some(&support_dir),
         )
         .expect("settled scan");
         assert!(settled.snapshots.is_empty());
