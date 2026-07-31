@@ -159,9 +159,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // as separate content elements. Strip each full element before title/template
 // normalization; the shared 255-character normalizer used to truncate the
 // recommended-plugins element before its closing tag, making it look human.
+// pi v12: current Pi transcripts use `session.id` and `type: "message"` with a
+// nested `message` object for both user prompts and assistant usage. Retain the
+// historical `session_id` / `message_end` shapes, but parse the current native
+// form and dedupe a response if a transitional writer emits both records.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v24";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v12";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
 // by the 0.1.91 baseline so upgrading to semantic sync does not itself select
@@ -188,7 +192,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 // already-known usage.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
-pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v11";
+pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v12";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
@@ -674,6 +678,10 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanIndex {
     pub files: BTreeMap<String, ScanIndexEntry>,
@@ -696,6 +704,24 @@ pub struct ScanIndexEntry {
     pub modified_unix_nanos: Option<u64>,
     pub source_file_fingerprint: String,
     pub last_snapshot_fingerprint: Option<String>,
+    /// This exact file and scan identity was parsed successfully but yielded no
+    /// semantic snapshot. The marker prevents truthful empty transcripts from
+    /// consuming CPU forever while remaining invalidated by any file or scan
+    /// identity change. Missing on older indexes so they reparse once.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_snapshot_confirmed: bool,
+    /// The zero-snapshot parse still observed a positive numeric value under a
+    /// provider usage-shaped object. This privacy-safe boolean keeps parser
+    /// drift red across later zero-work scans without retaining transcript
+    /// content.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub zero_snapshot_usage_evidence: bool,
+    /// Count of positive usage records that the semantic parser deliberately
+    /// refused because it could not derive a valid activity bucket. Persisted
+    /// so a healthy sibling upload cannot hide partial loss on later settled
+    /// scans. No transcript value is retained.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped_usage_record_count: u64,
     /// Marks entries written by the semantic-sync scan derivation. `None`
     /// identifies a pre-cutover entry that can be adopted without reparsing
     /// when transcript size and mtime are unchanged.
@@ -727,6 +753,9 @@ pub struct SourceScanResult {
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
+    pub zero_snapshot_confirmed_count: usize,
+    pub zero_snapshot_usage_evidence_count: usize,
+    pub dropped_usage_record_count: u64,
     pub snapshots: Vec<SnapshotItem>,
 }
 
@@ -2122,6 +2151,16 @@ struct SnapshotAccumulator {
     // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
     // the set's lifetime matches one scan of one session file exactly.
     seen_claude_usage_keys: BTreeSet<String>,
+    // Current Pi writes assistant usage inside `type: "message"` while older
+    // versions wrote `message_end`. A transitional transcript may contain both.
+    // Remember which record shape first carried a stable response id. Only the
+    // opposite transitional shape is suppressed; repeated same-shape records
+    // remain distinct observations, as do all id-less messages.
+    seen_pi_usage_shapes: BTreeMap<String, PiUsageRecordShape>,
+    // Positive usage observations deliberately refused because their activity
+    // timestamp could not produce a truthful hourly bucket. This diagnostic is
+    // persisted separately from emitted snapshots so partial loss stays red.
+    dropped_usage_record_count: u64,
     // Timestamp of the most recent Claude Code `type=user` record (a real user
     // prompt OR a tool_result — both are "model input available" moments). Each
     // assistant API response's first content-block record subtracts this to
@@ -2177,6 +2216,8 @@ impl SnapshotAccumulator {
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
+            seen_pi_usage_shapes: BTreeMap::new(),
+            dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
@@ -2214,6 +2255,26 @@ impl SnapshotAccumulator {
             .last_activity_at
             .as_ref()
             .map_or(true, |current| timestamp > *current)
+        {
+            self.last_activity_at = Some(timestamp);
+        }
+    }
+
+    fn note_pi_time(&mut self, timestamp: Option<String>) {
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+        if self
+            .started_at
+            .as_ref()
+            .map_or(true, |current| pi_timestamp_is_before(&timestamp, current))
+        {
+            self.started_at = Some(timestamp.clone());
+        }
+        if self
+            .last_activity_at
+            .as_ref()
+            .map_or(true, |current| pi_timestamp_is_after(&timestamp, current))
         {
             self.last_activity_at = Some(timestamp);
         }
@@ -2386,6 +2447,10 @@ impl SnapshotAccumulator {
         self.current_selector.merge(selector);
     }
 
+    fn note_dropped_usage(&mut self) {
+        self.dropped_usage_record_count = self.dropped_usage_record_count.saturating_add(1);
+    }
+
     /// True when the running turn (`latest_turn_id`) paid for Codex fast mode,
     /// per the `logs_2` request tier. Used to stamp `service_tier=priority` onto
     /// that turn's usage row only — never onto `current_selector`, so the signal
@@ -2423,11 +2488,13 @@ impl SnapshotAccumulator {
             .map(|value| value.to_string())
             .or_else(|| self.fallback_bucket_timestamp(None));
         let Some(bucket_input) = bucket_input else {
+            self.note_dropped_usage();
             return;
         };
         let Some((bucket_start, normalized_timestamp)) =
             activity_bucket_from_timestamp(&bucket_input)
         else {
+            self.note_dropped_usage();
             return;
         };
 
@@ -3125,6 +3192,10 @@ fn scan_source_roots_with_limit_and_attribution(
     let skipped_file_count_due_to_limit = discovered_file_count.saturating_sub(file_limit);
     files.sort_by_key(|file| Reverse(file.modified_unix_seconds));
     files.truncate(file_limit);
+    let current_candidate_keys = files
+        .iter()
+        .map(|candidate| local_index_key(&candidate.path))
+        .collect::<BTreeSet<_>>();
 
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
@@ -3143,8 +3214,8 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_file_count += 1;
         let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
-        let mut parsed = match source {
-            SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata_and_attribution(
+        let parsed_file = match source {
+            SnapshotSource::Codex => parse_codex_jsonl_file_with_diagnostics(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
@@ -3152,23 +3223,22 @@ fn scan_source_roots_with_limit_and_attribution(
                 codex_turn_traces.clone(),
                 attribution_context,
             )?,
-            SnapshotSource::ClaudeCode => {
-                parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
-                    &candidate.path,
-                    collected_at,
-                    source_file_fingerprint.clone(),
-                    &claude_title_metadata,
-                    artifacts_enabled,
-                    attribution_context,
-                )?
-            }
-            SnapshotSource::Pi => parse_pi_jsonl_file_with_attribution(
+            SnapshotSource::ClaudeCode => parse_claude_code_jsonl_file_with_diagnostics(
+                &candidate.path,
+                collected_at,
+                source_file_fingerprint.clone(),
+                &claude_title_metadata,
+                artifacts_enabled,
+                attribution_context,
+            )?,
+            SnapshotSource::Pi => parse_pi_jsonl_file_with_diagnostics(
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
                 attribution_context,
             )?,
         };
+        let mut parsed = parsed_file.snapshots;
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
@@ -3178,6 +3248,8 @@ fn scan_source_roots_with_limit_and_attribution(
         let last_snapshot_fingerprint = parsed
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
+        let zero_snapshot_usage_evidence = last_snapshot_fingerprint.is_none()
+            && transcript_has_positive_usage_evidence(&candidate.path)?;
         let is_semantic_noop = if decision == CandidateDecision::ReconcileLegacy {
             // The legacy index cannot prove which rows inherited mutable config
             // defaults. Emit the current provider-native snapshot once; after
@@ -3187,9 +3259,17 @@ fn scan_source_roots_with_limit_and_attribution(
             last_snapshot_fingerprint.is_some()
                 && last_snapshot_fingerprint == previous_snapshot_fingerprint
         };
-        if source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some() {
-            index.record(candidate, last_snapshot_fingerprint);
-        }
+        // Empty transcripts are semantic scan results too. Persist an explicit
+        // zero-snapshot marker so truthful empty files settle, while any file or
+        // scan-identity change reparses them. Replacing a prior fingerprint with
+        // the marker also removes its manifest contribution, so parser drift
+        // cannot retain a stale green manifest.
+        index.record(
+            candidate,
+            last_snapshot_fingerprint,
+            zero_snapshot_usage_evidence,
+            parsed_file.dropped_usage_record_count,
+        );
         if is_semantic_noop {
             semantic_noop_count += parsed.len();
         } else {
@@ -3206,6 +3286,21 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_session_count += state_only_scanned;
         semantic_noop_count += state_only_noops;
     }
+    let zero_snapshot_confirmed_count = current_candidate_keys
+        .iter()
+        .filter_map(|key| index.files.get(key))
+        .filter(|entry| entry.zero_snapshot_confirmed)
+        .count();
+    let zero_snapshot_usage_evidence_count = current_candidate_keys
+        .iter()
+        .filter_map(|key| index.files.get(key))
+        .filter(|entry| entry.zero_snapshot_confirmed && entry.zero_snapshot_usage_evidence)
+        .count();
+    let dropped_usage_record_count = current_candidate_keys
+        .iter()
+        .filter_map(|key| index.files.get(key))
+        .map(|entry| entry.dropped_usage_record_count)
+        .fold(0u64, u64::saturating_add);
     Ok(SourceScanResult {
         source,
         backfill_window_days,
@@ -3216,6 +3311,9 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_file_count,
         scanned_session_count,
         semantic_noop_count,
+        zero_snapshot_confirmed_count,
+        zero_snapshot_usage_evidence_count,
+        dropped_usage_record_count,
         snapshots,
     })
 }
@@ -3445,6 +3543,25 @@ fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_codex_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        codex_turn_traces,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_codex_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &CodexTitleMetadata,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3514,6 +3631,25 @@ fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        artifacts_enabled,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_claude_code_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &ClaudeTitleMetadata,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3542,6 +3678,21 @@ fn parse_pi_jsonl_file_with_attribution(
     source_file_fingerprint: String,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_pi_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_pi_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3557,6 +3708,12 @@ fn parse_pi_jsonl_file_with_attribution(
     )
 }
 
+#[derive(Debug)]
+struct ParsedSnapshotFile {
+    snapshots: Vec<SnapshotItem>,
+    dropped_usage_record_count: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_jsonl_file(
     path: &Path,
@@ -3569,7 +3726,7 @@ fn parse_jsonl_file(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<Vec<SnapshotItem>> {
+) -> Result<ParsedSnapshotFile> {
     let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
     let reader = BufReader::new(file);
     // Snapshot semantics come from provider-native session evidence. Mutable
@@ -3605,12 +3762,172 @@ fn parse_jsonl_file(
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
     }
-    Ok(accumulator.into_items(
-        path,
-        collected_at,
-        source_file_fingerprint,
-        attribution_context,
-    ))
+    let dropped_usage_record_count = accumulator.dropped_usage_record_count;
+    Ok(ParsedSnapshotFile {
+        snapshots: accumulator.into_items(
+            path,
+            collected_at,
+            source_file_fingerprint,
+            attribution_context,
+        ),
+        dropped_usage_record_count,
+    })
+}
+
+/// Return a content-free parser-liveness witness for a zero-snapshot file.
+///
+/// A provider schema can move fields so the semantic parser returns no rows
+/// even though the transcript still contains paid usage. We deliberately do
+/// not retain any value: only whether an exact usage container carries a
+/// positive allowlisted consumption/cost/request field. The same bounded JSONL
+/// reader used by parsing prevents this second zero-only pass from materializing
+/// oversized lines.
+fn transcript_has_positive_usage_evidence(path: &Path) -> Result<bool> {
+    let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
+    let mut found = false;
+    read_bounded_jsonl_lines(BufReader::new(file), MAX_JSONL_LINE_BYTES, |value| {
+        if !found && json_has_positive_usage_evidence(value) {
+            found = true;
+        }
+    })
+    .with_context(|| format!("read JSONL {}", path.display()))?;
+    Ok(found)
+}
+
+fn json_has_positive_usage_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            (is_recognized_usage_container(&normalized)
+                && usage_container_has_positive_consumption(value, false))
+                || json_has_positive_usage_evidence(value)
+        }),
+        Value::Array(values) => values.iter().any(json_has_positive_usage_evidence),
+        _ => false,
+    }
+}
+
+fn normalized_usage_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_recognized_usage_container(name: &str) -> bool {
+    matches!(
+        name,
+        "usage"
+            | "tokenusage"
+            | "totalusage"
+            | "totaltokenusage"
+            | "lasttokenusage"
+            | "billingusage"
+    )
+}
+
+fn is_consumption_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "input"
+            | "output"
+            | "inputtokens"
+            | "outputtokens"
+            | "prompttokens"
+            | "completiontokens"
+            | "cachedinputtokens"
+            | "cacheread"
+            | "cachereadtokens"
+            | "cachereadinputtokens"
+            | "cachewrite"
+            | "cachewritetokens"
+            | "cachecreationtokens"
+            | "cachecreationinputtokens"
+            | "reasoning"
+            | "reasoningtokens"
+            | "reasoningoutputtokens"
+            | "unattributedtotaltokens"
+            | "totaltokens"
+            | "requestcount"
+            | "requests"
+    )
+}
+
+fn is_cost_container(name: &str) -> bool {
+    matches!(
+        name,
+        "cost" | "costs" | "usagecost" | "usagecosts" | "billingcost" | "billingcosts"
+    )
+}
+
+fn is_cost_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "total"
+            | "amount"
+            | "usd"
+            | "totalcost"
+            | "inputcost"
+            | "outputcost"
+            | "cachereadcost"
+            | "cachewritecost"
+            | "reasoningcost"
+    )
+}
+
+fn is_nonconsumption_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "schemaversion"
+            | "usageversion"
+            | "limit"
+            | "limits"
+            | "usagelimit"
+            | "usagelimits"
+            | "ratelimit"
+            | "ratelimits"
+            | "budget"
+            | "budgets"
+            | "quota"
+            | "quotas"
+            | "reset"
+            | "resetsat"
+            | "timestamp"
+            | "createdat"
+            | "updatedat"
+            | "maxtokens"
+    )
+}
+
+fn usage_container_has_positive_consumption(value: &Value, inside_cost: bool) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            if is_nonconsumption_metadata(&normalized) {
+                return false;
+            }
+            if is_consumption_metric(&normalized) || (inside_cost && is_cost_metric(&normalized)) {
+                return json_is_positive_number(value);
+            }
+            let child_inside_cost = inside_cost || is_cost_container(&normalized);
+            usage_container_has_positive_consumption(value, child_inside_cost)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| usage_container_has_positive_consumption(value, inside_cost)),
+        _ => false,
+    }
+}
+
+fn json_is_positive_number(value: &Value) -> bool {
+    let Value::Number(value) = value else {
+        return false;
+    };
+    value.as_u64().is_some_and(|value| value > 0)
+        || value.as_i64().is_some_and(|value| value > 0)
+        || value.as_f64().is_some_and(|value| value > 0.0)
 }
 
 /// Stream a JSONL reader line-by-line with a hard per-line byte ceiling,
@@ -4112,7 +4429,7 @@ fn pi_selector_from_custom(value: &Value) -> Option<SelectorCapture> {
     (!selector.is_empty()).then_some(selector)
 }
 
-fn pi_selector_from_message_end(value: &Value) -> SelectorCapture {
+fn pi_selector_from_usage_message(value: &Value) -> SelectorCapture {
     let mut selector = SelectorCapture::default();
     selector.merge(selector_from_object(value, ""));
     if let Some(message) = raw_value_at(value, &["message"]) {
@@ -4922,42 +5239,58 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(selector) = pi_selector_from_custom(value) {
                 accumulator.set_selector(selector);
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
-                accumulator.source_session_id =
-                    string_at(value, &["session_id"]).or_else(|| string_at(value, &["sessionId"]));
+                accumulator.source_session_id = string_at(value, &["id"])
+                    .or_else(|| string_at(value, &["session_id"]))
+                    .or_else(|| string_at(value, &["sessionId"]));
             }
             accumulator.set_workspace_hash(string_at(value, &["cwd"]));
-            accumulator.note_time(string_at(value, &["timestamp"]));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
-            // Pi user prompts arrive as `type: "message"` with role: "user". The
-            // backend's message_end event omits prompt text, so this is the only
-            // chance to grab a first-prompt title fallback.
-            if string_eq_at(value, &["role"], "user") {
+            let role =
+                string_at(value, &["message", "role"]).or_else(|| string_at(value, &["role"]));
+            if role.as_deref() == Some("user") {
                 accumulator.set_first_prompt_title(pi_message_text(value));
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            let timestamp = pi_message_timestamp(value);
+            if role.as_deref() == Some("assistant")
+                && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
+            {
+                add_pi_message_usage(
+                    value,
+                    accumulator,
+                    timestamp.as_deref(),
+                    PiUsageRecordShape::Message,
+                );
+            } else if role.as_deref() == Some("assistant")
+                && pi_message_usage(value).is_some_and(|usage| !usage.is_zero())
+            {
+                accumulator.note_dropped_usage();
+            }
+            accumulator.note_pi_time(timestamp);
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
-            let model = string_at(value, &["message", "model"]);
-            accumulator.set_model(model.clone());
-            if let Some(usage) = pi_message_end_usage(value) {
-                let mut selector = accumulator.current_selector.clone();
-                selector.merge(pi_selector_from_message_end(value));
-                accumulator.add_usage_with_selector(
-                    model,
-                    usage,
-                    selector,
+            if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+                add_pi_message_usage(
+                    value,
+                    accumulator,
                     timestamp.as_deref(),
-                    // Pi does not emit a per-turn reasoning effort tier.
-                    None,
+                    PiUsageRecordShape::MessageEnd,
                 );
+            } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+                accumulator.note_dropped_usage();
             }
-            accumulator.note_time(timestamp);
+            accumulator.note_pi_time(timestamp);
+        }
+        Some("model_change") => {
+            accumulator
+                .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         _ => {}
     }
@@ -4968,18 +5301,106 @@ fn pi_message_text(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["text"]))
         .or_else(|| string_at(value, &["message", "content"]))
         .or_else(|| text_from_array(value.get("content")))
+        .or_else(|| text_from_array(value.pointer("/message/content")))
 }
 
 fn pi_timestamp_field(value: &Value) -> Option<String> {
-    string_at(value, &["timestamp"])
-        .or_else(|| pi_ms_timestamp(value.get("timestamp")))
-        .or_else(|| pi_ms_timestamp(value.pointer("/message/timestamp")))
+    pi_timestamp_value(value.get("timestamp"))
+        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
+}
+
+fn pi_message_timestamp(value: &Value) -> Option<String> {
+    pi_timestamp_value(value.get("timestamp"))
+        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
 }
 
 fn pi_message_end_timestamp(value: &Value) -> Option<String> {
-    pi_ms_timestamp(value.pointer("/message/timestamp"))
-        .or_else(|| string_at(value, &["message", "timestamp"]))
-        .or_else(|| string_at(value, &["timestamp"]))
+    // Historical `message_end` records use the provider response timestamp
+    // nested in `message`; a later envelope write time may cross an hour
+    // boundary and must not move already-accounted usage.
+    pi_timestamp_value(value.pointer("/message/timestamp"))
+        .or_else(|| pi_timestamp_value(value.get("timestamp")))
+}
+
+fn pi_message_timestamp_is_present(value: &Value) -> bool {
+    value.get("timestamp").is_some() || value.pointer("/message/timestamp").is_some()
+}
+
+fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        if let Ok(parsed) = OffsetDateTime::parse(text, &Rfc3339) {
+            if (1..=9999).contains(&parsed.year()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    pi_ms_timestamp(Some(value))
+}
+
+fn pi_timestamp_is_before(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate < current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate < current,
+    }
+}
+
+fn pi_timestamp_is_after(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate > current,
+    }
+}
+
+fn pi_usage_event_key(value: &Value) -> Option<String> {
+    string_at(value, &["message", "responseId"])
+        .or_else(|| string_at(value, &["responseId"]))
+        .or_else(|| string_at(value, &["message", "id"]))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiUsageRecordShape {
+    Message,
+    MessageEnd,
+}
+
+fn add_pi_message_usage(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    shape: PiUsageRecordShape,
+) {
+    let Some(usage) = pi_message_usage(value) else {
+        return;
+    };
+    if let Some(key) = pi_usage_event_key(value) {
+        match accumulator.seen_pi_usage_shapes.get(&key) {
+            Some(first_shape) if *first_shape != shape => return,
+            Some(_) => {}
+            None => {
+                accumulator.seen_pi_usage_shapes.insert(key, shape);
+            }
+        }
+    }
+    let model = string_at(value, &["message", "model"]);
+    accumulator.set_model(model.clone());
+    let mut selector = accumulator.current_selector.clone();
+    selector.merge(pi_selector_from_usage_message(value));
+    accumulator.add_usage_with_selector(
+        model, usage, selector, timestamp,
+        // Pi does not emit a per-turn reasoning effort tier.
+        None,
+    );
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -4989,19 +5410,29 @@ fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
         Value::String(text) => text.parse::<i64>().ok(),
         _ => None,
     }?;
-    Some(format_rfc3339_millis(ms))
+    bounded_rfc3339_millis(ms)
 }
 
-fn format_rfc3339_millis(ms: i64) -> String {
-    let total_secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000) as u32;
-    let days = total_secs.div_euclid(86_400);
-    let time_of_day = total_secs.rem_euclid(86_400) as u32;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+fn bounded_rfc3339_millis(ms: i64) -> Option<String> {
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
+    // Python/Pydantic datetimes, and therefore the backend snapshot contract,
+    // admit only civil years 1..=9999. `time` deliberately supports a wider
+    // internal range, so validate before formatting instead of minting a
+    // superficially RFC3339-looking value that can poison an upload batch.
+    if !(1..=9999).contains(&timestamp.year()) {
+        return None;
+    }
+    let utc = timestamp.to_offset(time::UtcOffset::UTC);
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.millisecond(),
+    ))
 }
 
 fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
@@ -5016,22 +5447,7 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
     Some((bucket_start, normalized_timestamp))
 }
 
-// Howard Hinnant's civil_from_days. Returns (year, month, day) from days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-fn pi_message_end_usage(value: &Value) -> Option<UsageTotals> {
+fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
     let usage = value.pointer("/message/usage")?;
     // Pi is multi-provider (Anthropic / OpenAI / Gemini). When the underlying
     // model is Anthropic and Pi exposes the nested `cacheCreation` object with
@@ -5547,7 +5963,7 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
 
 fn codex_state_timestamp(ms: Option<i64>, seconds: Option<i64>) -> Option<String> {
     let timestamp_ms = ms.or_else(|| seconds.map(|value| value.saturating_mul(1_000)))?;
-    Some(format_rfc3339_millis(timestamp_ms))
+    bounded_rfc3339_millis(timestamp_ms)
 }
 
 fn load_codex_config_selector(path: &Path) -> SelectorCapture {
@@ -6336,7 +6752,14 @@ impl ScanIndex {
             return CandidateDecision::Parse;
         }
         if entry.last_snapshot_fingerprint.is_none() {
-            return CandidateDecision::Parse;
+            return if entry.zero_snapshot_confirmed
+                && entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+                && entry.source_file_fingerprint == candidate.source_file_fingerprint
+            {
+                CandidateDecision::Skip
+            } else {
+                CandidateDecision::Parse
+            };
         }
         if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) {
             return if entry.source_file_fingerprint == candidate.legacy_source_file_fingerprint {
@@ -6380,12 +6803,21 @@ impl ScanIndex {
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
+                zero_snapshot_confirmed: false,
+                zero_snapshot_usage_evidence: false,
+                dropped_usage_record_count: 0,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
     }
 
-    fn record(&mut self, candidate: CandidateFile, last_snapshot_fingerprint: Option<String>) {
+    fn record(
+        &mut self,
+        candidate: CandidateFile,
+        last_snapshot_fingerprint: Option<String>,
+        zero_snapshot_usage_evidence: bool,
+        dropped_usage_record_count: u64,
+    ) {
         self.files.insert(
             local_index_key(&candidate.path),
             ScanIndexEntry {
@@ -6393,6 +6825,9 @@ impl ScanIndex {
                 modified_unix_seconds: candidate.modified_unix_seconds,
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
                 source_file_fingerprint: candidate.source_file_fingerprint,
+                zero_snapshot_confirmed: last_snapshot_fingerprint.is_none(),
+                zero_snapshot_usage_evidence,
+                dropped_usage_record_count,
                 last_snapshot_fingerprint,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
@@ -7261,6 +7696,9 @@ mod tests {
                     modified_unix_nanos: Some(1_700_000_000_000_000_000),
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -7315,6 +7753,9 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: legacy_source_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -7392,6 +7833,9 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: legacy_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -7440,6 +7884,9 @@ mod tests {
                     modified_unix_nanos: Some(1_777_777_777_000_000_001),
                     source_file_fingerprint: "old".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -7472,6 +7919,9 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: "legacy-previous-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -7504,6 +7954,9 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: "legacy-matching-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    zero_snapshot_confirmed: false,
+                    zero_snapshot_usage_evidence: false,
+                    dropped_usage_record_count: 0,
                     scan_identity_version: None,
                 },
             )]),
@@ -8865,7 +9318,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_scan_retries_zero_parsed_file_until_usage_arrives() {
+    fn scan_checkpoints_pi_zero_parsed_file_until_it_changes() {
         let root = temp_dir("pi-retry-zero-parsed");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -8884,6 +9337,22 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 0);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+
+        let unchanged_empty = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unchanged empty scan");
+        assert_eq!(unchanged_empty.snapshots.len(), 0);
+        assert_eq!(unchanged_empty.scanned_file_count, 0);
+        assert_eq!(unchanged_empty.scanned_session_count, 0);
+        assert_eq!(unchanged_empty.zero_snapshot_usage_evidence_count, 0);
 
         fs::write(
             &path,
@@ -8922,6 +9391,379 @@ mod tests {
     }
 
     #[test]
+    fn scan_checkpoints_codex_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("codex-retry-zero-parsed");
+        let path =
+            root.join("rollout-2026-05-14T10-00-00-019e2700-3333-7000-9000-333333333333.jsonl");
+        let session_meta = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-3333-7000-9000-333333333333\"}}\n";
+        fs::write(&path, session_meta).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_meta}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zero_snapshot_usage_evidence_stays_visible_across_settled_scans() {
+        let root = temp_dir("pi-zero-snapshot-usage-evidence");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"assistant_v2\",\"message\":{\"billing\":{\"usage\":{\"input\":12,\"output\":4}}}}\n",
+            ),
+        )
+        .expect("write schema-drift fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first schema-drift scan");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled schema-drift scan");
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.scanned_session_count, 0);
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_evidence_is_structural_and_ignores_metadata_limits_and_budgets() {
+        let positive = [
+            serde_json::json!({"token_count": {"info": {"total_token_usage": {"input_tokens": 12}}}}),
+            serde_json::json!({"message": {"usage": {"output_tokens": 4}}}),
+            serde_json::json!({"message": {"usage": {"input": 2, "cost": {"total": 0.01}}}}),
+            serde_json::json!({"unknown": {"nested": {"usage": {"future": {"request_count": 1}}}}}),
+        ];
+        for value in positive {
+            assert!(
+                json_has_positive_usage_evidence(&value),
+                "recognized consumption must stay visible"
+            );
+        }
+
+        let negative = [
+            serde_json::json!({"usage_version": 25}),
+            serde_json::json!({"usage_limit": 1000}),
+            serde_json::json!({"usage": {"version": 25, "limits": {"input_tokens": 1000}}}),
+            serde_json::json!({"usage": {"budget": {"usd": 500}, "timestamp": 1784707201000_i64}}),
+            serde_json::json!({"usage": {"future": {"opaque_positive": 99}}}),
+            serde_json::json!({"billing_usage": {"quota": {"requests": 100}}}),
+        ];
+        for value in negative {
+            assert!(
+                !json_has_positive_usage_evidence(&value),
+                "metadata and unknown numerics must not page"
+            );
+        }
+    }
+
+    #[test]
+    fn pi_parser_drops_hostile_timestamps_without_poisoning_healthy_usage() {
+        let root = temp_dir("pi-hostile-timestamps");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-max\",\"model\":\"gpt-5.4\",\"timestamp\":9223372036854775807,\"usage\":{\"input\":100,\"output\":10}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-min\",\"model\":\"gpt-5.4\",\"timestamp\":-9223372036854775808,\"usage\":{\"input\":200,\"output\":20}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-text\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"healthy\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write hostile timestamp fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert_eq!(scan.snapshots.len(), 1);
+        let snapshot = &scan.snapshots[0];
+        assert_eq!(snapshot.input_tokens, 12);
+        assert_eq!(snapshot.output_tokens, 4);
+        assert_eq!(snapshot.request_count, 1);
+        assert_eq!(
+            snapshot.source_started_at.as_deref(),
+            Some("2026-07-22T08:00:00Z")
+        );
+        assert_eq!(
+            snapshot.source_last_activity_at.as_deref(),
+            Some("2026-07-22T08:00:01.000Z")
+        );
+        validate_snapshot_item(0, snapshot).expect("healthy sibling remains upload-valid");
+        assert_eq!(scan.dropped_usage_record_count, 3);
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
+
+        let mixed_settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled mixed scan");
+        assert_eq!(mixed_settled.scanned_file_count, 0);
+        assert_eq!(mixed_settled.dropped_usage_record_count, 3);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-only\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+            ),
+        )
+        .expect("rewrite with nonzero usage behind a malformed timestamp");
+        let regressed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan malformed-only usage");
+        assert!(regressed.snapshots.is_empty());
+        assert_eq!(regressed.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(regressed.dropped_usage_record_count, 1);
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0,
+            "the prior positive contribution cannot survive a successful zero parse"
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled malformed-usage checkpoint");
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(settled.dropped_usage_record_count, 1);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"corrected\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":30,\"output\":3}}}\n",
+            ),
+        )
+        .expect("correct malformed timestamp");
+        let corrected = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:08:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("corrected scan");
+        assert_eq!(corrected.snapshots.len(), 1);
+        assert_eq!(corrected.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(corrected.dropped_usage_record_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let codex_root = temp_dir("codex-partial-timestamp-loss");
+        let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"not-a-time\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":15,\"output_tokens\":3},\"model\":\"gpt-5.5\"}}}\n",
+            ),
+        )
+        .expect("write Codex partial-loss fixture");
+        let mut codex_index = ScanIndex::default();
+        let codex = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&codex_root),
+            &mut codex_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Codex partial-loss fixture");
+        assert_eq!(codex.snapshots.len(), 1);
+        assert_eq!(codex.dropped_usage_record_count, 1);
+
+        let claude_root = temp_dir("claude-partial-timestamp-loss");
+        let claude_path = claude_root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n",
+                "{\"timestamp\":\"not-a-time\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"bad\",\"message\":{\"id\":\"bad\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"good\",\"message\":{\"id\":\"good\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n",
+            ),
+        )
+        .expect("write Claude partial-loss fixture");
+        let mut claude_index = ScanIndex::default();
+        let claude = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&claude_root),
+            &mut claude_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Claude partial-loss fixture");
+        assert_eq!(claude.snapshots.len(), 1);
+        assert_eq!(claude.dropped_usage_record_count, 1);
+
+        let _ = fs::remove_dir_all(codex_root);
+        let _ = fs::remove_dir_all(claude_root);
+    }
+
+    #[test]
+    fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("claude-retry-zero-parsed");
+        let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
+        fs::write(&path, session_header).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_header}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pi_scan_reprocesses_v6_zero_parse_index_entries() {
         let root = temp_dir("pi-v6-index");
         let path = root.join("session-019e2700-2222-7000-9000-222222222222.jsonl");
@@ -8950,6 +9792,9 @@ mod tests {
             modified_unix_nanos: None,
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
+            zero_snapshot_confirmed: false,
+            zero_snapshot_usage_evidence: false,
+            dropped_usage_record_count: 0,
             scan_identity_version: None,
         };
 
@@ -13817,7 +14662,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_sums_message_end_usage_and_extracts_session_meta() {
+    fn pi_parser_sums_legacy_message_end_usage_and_extracts_session_meta() {
         let path = temp_file("pi-basic");
         fs::write(
             &path,
@@ -13899,6 +14744,351 @@ mod tests {
     }
 
     #[test]
+    fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
+        let path = temp_file("pi-legacy-timestamp-precedence");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write legacy timestamp precedence fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
+        assert_eq!(
+            item.usage_buckets[0].last_activity_at.as_deref(),
+            Some("2026-07-22T10:59:59Z")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_reads_current_nested_message_shape() {
+        let path = temp_file("pi-current-message");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
+        )
+        .expect("write current Pi fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(
+            item.source_session_id,
+            "fixture-session-019e2700-1111-7000-9000-111111111111"
+        );
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.model_usage.len(), 1);
+        assert_eq!(item.model_usage[0].model, "gpt-5.4");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Summarize the fixture change")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-07-22T08:00:00Z")
+        );
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-07-22T08:00:01.000Z")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_dedupes_transitional_message_and_message_end_records() {
+        let path = temp_file("pi-current-legacy-dedup");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write transitional fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(item.request_count, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_does_not_dedupe_repeated_same_shape_response_ids() {
+        let path = temp_file("pi-same-shape-response-id");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated same-shape fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:03:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_keeps_identical_usage_without_response_ids_distinct() {
+        let path = temp_file("pi-no-id-distinct");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated id-less fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
+        assert!(pi_timestamp_is_before(
+            "2026-07-22T08:00:00Z",
+            "2026-07-22T08:00:00.500Z"
+        ));
+        assert!(pi_timestamp_is_after(
+            "2026-07-22T08:00:00.500Z",
+            "2026-07-22T08:00:00Z"
+        ));
+        assert!(pi_timestamp_is_before("invalid-a", "invalid-b"));
+        assert!(pi_timestamp_is_after("invalid-b", "invalid-a"));
+        assert!(!pi_timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
+        assert!(!pi_timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
+        assert!(pi_timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
+        assert!(pi_timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
+    }
+
+    #[test]
+    fn pi_current_shape_scan_populates_manifest_and_settles_idempotently() {
+        let root = temp_dir("pi-current-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
+        )
+        .expect("write current Pi fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        let first_manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first.discovered_file_count, 1);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 1);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first_manifest.entity_count, 1);
+
+        let second = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(second.discovered_file_count, 1);
+        assert_eq!(second.scanned_file_count, 0);
+        assert_eq!(second.scanned_session_count, 0);
+        assert!(second.snapshots.is_empty());
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            first_manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_scan_settles_the_observed_populated_and_genuine_empty_mix() {
+        const POPULATED: usize = 426;
+        const EMPTY: usize = 30;
+        let root = temp_dir("pi-observed-populated-empty-mix");
+        for index in 0..POPULATED + EMPTY {
+            let session_id = format!("fixture-session-{index:04}");
+            let content = if index < POPULATED {
+                format!(
+                    concat!(
+                        "{{\"type\":\"session\",\"id\":\"{session_id}\",",
+                        "\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n",
+                        "{{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",",
+                        "\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",",
+                        "\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
+                    ),
+                    session_id = session_id,
+                )
+            } else {
+                format!(
+                    "{{\"type\":\"session\",\"id\":\"{session_id}\",\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n"
+                )
+            };
+            fs::write(root.join(format!("session-{index:04}.jsonl")), content)
+                .expect("write observed-shape fixture");
+        }
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_session_count, POPULATED);
+        assert_eq!(first.snapshots.len(), POPULATED);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(
+            index
+                .files
+                .values()
+                .filter(|entry| entry.zero_snapshot_confirmed)
+                .count(),
+            EMPTY
+        );
+        let manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(manifest.entity_count, POPULATED as u64);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.scanned_session_count, 0);
+        assert!(settled.snapshots.is_empty());
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parser_identity_change_that_yields_zero_clears_the_manifest_contribution() {
+        let root = temp_dir("pi-parser-regression-clears-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+        )
+        .expect("write genuine empty transcript");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("establish empty checkpoint");
+        assert_eq!(first.scanned_file_count, 1);
+        let key = path.to_string_lossy().to_string();
+        let entry = index.files.get_mut(&key).expect("index entry");
+        entry.last_snapshot_fingerprint = Some("previous-server-snapshot".to_string());
+        entry.zero_snapshot_confirmed = false;
+        entry.source_file_fingerprint = "previous-parser-identity".to_string();
+
+        let reparsed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("reparse after identity change");
+        assert_eq!(reparsed.scanned_file_count, 1);
+        assert_eq!(reparsed.scanned_session_count, 0);
+        let entry = &index.files[&key];
+        assert!(entry.last_snapshot_fingerprint.is_none());
+        assert!(entry.zero_snapshot_confirmed);
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled regression scan");
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pi_parser_handles_multi_model_sessions() {
         let path = temp_file("pi-multimodel");
         fs::write(
@@ -13949,19 +15139,24 @@ mod tests {
     }
 
     #[test]
-    fn pi_ms_timestamp_formats_rfc3339_with_millis() {
+    fn pi_ms_timestamp_formats_bounded_rfc3339() {
         // Anchor on epoch 0 and a verifiable mid-2024 date.
-        assert_eq!(format_rfc3339_millis(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            bounded_rfc3339_millis(0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
         // 2024-01-01T00:00:00.000Z = 1_704_067_200 s = 1_704_067_200_000 ms
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_000),
-            "2024-01-01T00:00:00.000Z"
+            bounded_rfc3339_millis(1_704_067_200_000).as_deref(),
+            Some("2024-01-01T00:00:00.000Z")
         );
         // Sub-second granularity is preserved.
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_123),
-            "2024-01-01T00:00:00.123Z"
+            bounded_rfc3339_millis(1_704_067_200_123).as_deref(),
+            Some("2024-01-01T00:00:00.123Z")
         );
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
     }
 
     #[test]
@@ -15259,6 +16454,9 @@ mod tests {
             modified_unix_nanos: Some(3),
             source_file_fingerprint: "source".to_string(),
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
+            zero_snapshot_confirmed: fingerprint.is_none(),
+            zero_snapshot_usage_evidence: false,
+            dropped_usage_record_count: 0,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
         }
     }
@@ -15326,6 +16524,42 @@ mod tests {
             .insert("new.jsonl".to_string(), manifest_index_entry(Some("dd")));
         let committable = fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new());
         assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn confirmed_empty_checkpoint_survives_commit_and_reload_without_old_manifest() {
+        let root = temp_dir("confirmed-empty-index-reload");
+        let path = root.join("scan-index.json");
+        let previous = ScanIndex {
+            files: BTreeMap::from([(
+                "session.jsonl".to_string(),
+                manifest_index_entry(Some("previous-server-snapshot")),
+            )]),
+            ..ScanIndex::default()
+        };
+        let mut scanned = previous.clone();
+        scanned
+            .files
+            .insert("session.jsonl".to_string(), manifest_index_entry(None));
+
+        let committable = scanned.committable_subset(&previous, &BTreeSet::new());
+        let entry = &committable.files["session.jsonl"];
+        assert!(entry.zero_snapshot_confirmed);
+        assert!(entry.last_snapshot_fingerprint.is_none());
+        assert_eq!(
+            committable
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0,
+            "the empty checkpoint must not pretend the prior entity was accepted"
+        );
+        committable.save(&path).expect("save committable index");
+        let loaded = ScanIndex::load(&path).expect("reload committable index");
+        let loaded_entry = &loaded.files["session.jsonl"];
+        assert!(loaded_entry.zero_snapshot_confirmed);
+        assert!(loaded_entry.last_snapshot_fingerprint.is_none());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -520,6 +520,9 @@ struct SyncCounts {
     scanned_file_count: u64,
     scanned_session_count: u64,
     semantic_noop_count: u64,
+    zero_snapshot_confirmed_count: u64,
+    zero_snapshot_usage_evidence_count: u64,
+    dropped_usage_record_count: u64,
     uploaded_count: u64,
 }
 
@@ -542,6 +545,10 @@ impl SyncCounts {
             scanned_file_count: scan_result.scanned_file_count as u64,
             scanned_session_count: scan_result.scanned_session_count as u64,
             semantic_noop_count: scan_result.semantic_noop_count as u64,
+            zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
+            zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
+                as u64,
+            dropped_usage_record_count: scan_result.dropped_usage_record_count,
             uploaded_count,
         }
     }
@@ -2145,6 +2152,18 @@ fn report_status(
     let finished_at = current_rfc3339();
     let (enabled, disabled_reason, last_error_code, last_error_message, consecutive_failures) =
         match status.state {
+            CollectorState::Success
+                if status.counts.zero_snapshot_usage_evidence_count > 0
+                    || status.counts.dropped_usage_record_count > 0 =>
+            {
+                (
+                    true,
+                    None,
+                    Some("parse_error".to_string()),
+                    Some("local usage evidence produced no session snapshot".to_string()),
+                    1,
+                )
+            }
             CollectorState::Success => (true, None, None, None, 0),
             CollectorState::Disabled(disabled_reason) => (false, disabled_reason, None, None, 0),
             CollectorState::Error { code, message } => (
@@ -2169,6 +2188,9 @@ fn report_status(
         last_uploaded_count: status.counts.uploaded_count,
         last_scanned_session_count: status.counts.scanned_session_count,
         last_scanned_file_count: status.counts.scanned_file_count,
+        last_zero_snapshot_confirmed_count: status.counts.zero_snapshot_confirmed_count,
+        last_zero_snapshot_usage_evidence_count: status.counts.zero_snapshot_usage_evidence_count,
+        last_dropped_usage_record_count: status.counts.dropped_usage_record_count,
         last_backfill_window_days: status.counts.backfill_window_days,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
@@ -2225,6 +2247,9 @@ fn report_checkin_status(
         last_uploaded_count: 0,
         last_scanned_session_count: 0,
         last_scanned_file_count: 0,
+        last_zero_snapshot_confirmed_count: 0,
+        last_zero_snapshot_usage_evidence_count: 0,
+        last_dropped_usage_record_count: 0,
         last_backfill_window_days: CHECKIN_BACKFILL_WINDOW_DAYS,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
@@ -4087,6 +4112,77 @@ mod tests {
         assert!(requests[1].contains("\"schema_version\":5"));
         assert!(requests[1].contains("\"source\":\"codex\""));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+    }
+
+    #[test]
+    fn settled_zero_snapshot_usage_evidence_reports_persistent_parse_error() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["pi".to_string()],
+        };
+        let mut counts = SyncCounts::for_policy(30);
+        counts.discovered_file_count = 1;
+        counts.zero_snapshot_usage_evidence_count = 1;
+
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Pi,
+            CollectorStatus {
+                source: SnapshotSource::Pi,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report parser liveness failure");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(requests[1].contains("\"last_error_code\":\"parse_error\""));
+        assert!(requests[1].contains("\"last_zero_snapshot_usage_evidence_count\":1"));
+        assert!(requests[1].contains("\"last_success_at\":null"));
+        assert!(requests[1].contains("\"consecutive_failures\":1"));
+    }
+
+    #[test]
+    fn healthy_sibling_upload_does_not_hide_dropped_usage_record() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["pi".to_string()],
+        };
+        let mut counts = SyncCounts::for_policy(30);
+        counts.discovered_file_count = 1;
+        counts.scanned_session_count = 1;
+        counts.uploaded_count = 1;
+        counts.dropped_usage_record_count = 1;
+
+        report_status_with_fresh_relay_token(
+            &client,
+            &device,
+            "device-secret",
+            SnapshotSource::Pi,
+            CollectorStatus {
+                source: SnapshotSource::Pi,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts,
+                state: CollectorState::Success,
+            },
+        )
+        .expect("report partial parser liveness failure");
+
+        let requests = captured.lock().expect("captured requests").clone();
+        assert!(requests[1].contains("\"last_error_code\":\"parse_error\""));
+        assert!(requests[1].contains("\"last_dropped_usage_record_count\":1"));
+        assert!(requests[1].contains("\"last_uploaded_count\":1"));
     }
 
     #[test]

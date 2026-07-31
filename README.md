@@ -563,9 +563,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   labels, and tool/function names such as `exec_command` or `write_stdin`.
   Claude Code parser version `claude_code_jsonl:v4` carries
   `message.usage.speed`, service tier, residency, batch, and context aliases
-  into selector context. Pi parser version `pi_jsonl:v4` carries
-  `ottto-selector` / `ottto.selector` custom entries and per-message selector
-  aliases into subsequent assistant-message usage rows. All three parsers emit
+  into selector context. The Pi parser accepts both the current native
+  `session.id` plus nested `type: "message"` records and the historical
+  `session_id` plus `message_end` records. It carries `ottto-selector` /
+  `ottto.selector` custom entries and per-message selector aliases into
+  subsequent assistant-message usage rows, and deduplicates a response when a
+  transitional writer persists both usage-record shapes. All three parsers emit
   content-free hourly activity buckets from persisted request/usage event
   timestamps; polling cadence affects freshness only and no wall-clock activity
   is inferred. Parser build versions are provenance and do not trigger scans or
@@ -577,7 +580,21 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   semantic component hashes (usage, lifecycle, latency, context, display,
   attribution, and artifacts); collection time, parser build, file identity,
   and evidence-lineage metadata cannot manufacture a new snapshot. Semantic
-  no-ops are retained in the local index but omitted from upload. Historical
+  no-ops are retained in the local index but omitted from upload. A file that
+  truthfully parses to no snapshot records an explicit zero-snapshot checkpoint
+  under the same file and scan identity, so unchanged empty transcripts cost no
+  repeated parse work; any file/scan-identity change reparses it, and a
+  previously populated file that becomes zero clears its manifest contribution.
+  If a zero-snapshot file nevertheless contains a recognized usage container
+  with a positive allowlisted consumption, request, or cost field, the index
+  persists only that content-free Boolean and collector status remains
+  `parse_error` across settled scans. Versions, limits, budgets, quotas, and
+  unknown positive metadata do not qualify. Separately, a content-free
+  per-file counter persists any positive usage record dropped because no valid
+  activity bucket could be derived; healthy siblings still upload, but status
+  remains red until the file is corrected. Parser drift and partial loss
+  therefore cannot disappear before periodic server reconciliation observes it.
+  Historical
   walks occur only for first bootstrap or an explicit reviewed replay revision.
   The daemon starts the
   snapshot sync loop beside the local OTLP relay,

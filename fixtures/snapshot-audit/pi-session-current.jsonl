@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"fixture-session-019e2700-1111-7000-9000-111111111111","cwd":"/private/work","timestamp":"2026-07-22T08:00:00Z"}
+{"type":"model_change","id":"fixture-model-change","parentId":null,"timestamp":"2026-07-22T08:00:00.500Z","provider":"openai","modelId":"gpt-5.4"}
+{"type":"message","id":"fixture-user-message","parentId":"fixture-model-change","timestamp":"2026-07-22T08:00:00.750Z","message":{"role":"user","content":[{"type":"text","text":"Summarize the fixture change"}],"timestamp":1784707200750}}
+{"type":"message","id":"fixture-assistant-message","parentId":"fixture-user-message","timestamp":"2026-07-22T08:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixture response"}],"api":"responses","provider":"openai","model":"gpt-5.4","responseId":"fixture-response","usage":{"input":12,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":16,"cost":{"total":0.0001}},"stopReason":"stop","timestamp":1784707201000}}
