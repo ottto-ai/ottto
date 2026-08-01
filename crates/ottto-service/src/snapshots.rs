@@ -12159,6 +12159,7 @@ mod tests {
                 1,
                 true,
                 None,
+                None,
                 std::slice::from_ref(&active_path),
                 false,
             )
@@ -12217,6 +12218,7 @@ mod tests {
                 BACKFILL_WINDOW_DAYS,
                 1,
                 true,
+                None,
                 None,
                 hints,
                 false,
@@ -12288,6 +12290,7 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
             1,
             true,
+            None,
             None,
             std::slice::from_ref(&removed_path),
             false,
@@ -12876,6 +12879,7 @@ mod tests {
             1,
             1,
             true,
+            None,
             None,
             std::slice::from_ref(&path),
             false,
@@ -20094,7 +20098,7 @@ mod tests {
     }
 
     #[test]
-    fn one_sided_claude_title_shapes_are_complete_noops() {
+    fn one_sided_claude_title_shapes_preserve_account_only_mapping() {
         let (home, _transcript_path, projects_root) = claude_desktop_fixture(
             "claude-desktop-one-sided",
             "no-title-session",
@@ -20125,7 +20129,16 @@ mod tests {
         .expect("scan one-sided optional title shapes");
         assert!(scan.sidecar_census_complete);
         assert!(scan.census_complete);
-        assert!(index.claude_desktop_title_files.is_empty());
+        assert_eq!(index.claude_desktop_title_files.len(), 1);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].session_display_name.is_none());
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+                .expect("account hash");
+        assert!(scan.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
         let _ = fs::remove_dir_all(home);
     }
 
