@@ -19616,7 +19616,7 @@ mod tests {
         .expect("write transcript");
 
         let mut index = ScanIndex::default();
-        let first = scan_source_roots_with_attribution_and_claude_effort(
+        let mut first = scan_source_roots_with_attribution_and_claude_effort(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&projects_root),
             &mut index,
@@ -19628,6 +19628,7 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
 
         let body = format!(
             "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785492120000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{session_id}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"35\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"8\"}}}}]}}]}}]}}]}}"
@@ -19663,6 +19664,7 @@ mod tests {
         )
         .expect("load account evidence");
         apply_claude_effort_evidence(&mut second.snapshots, &evidence);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut second, &mut index);
         let expected_hash = ottto_core::billing_identity_hash(
             "anthropic",
             "account",
