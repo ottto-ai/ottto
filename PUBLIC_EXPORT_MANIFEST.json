@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 300,
-  "content_sha256": "50e163eacb119a102b876d77e2c2ce5dc333cd78747592b2e270682123b7c5cb",
+  "candidate_file_count": 301,
+  "content_sha256": "0a7e0fc07cf9361d044fd20248d79bcf61f50ab9e20e5754ab3edc070fd77488",
   "files": [
     {
       "executable": false,
@@ -538,8 +538,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/redaction.rs",
-      "sha256": "ebbb17dd101014ce62c7f9474ba35f429021823b90427768624795388f80dbea",
-      "size_bytes": 30058
+      "sha256": "04687668dba05588b4ceef1dead2c452b9a4b854e027885e9ad721baa7fc0eff",
+      "size_bytes": 30603
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "a50a9df91432e669625810ad33eddcb94053b8302de00d9c4f59a4217837028a",
-      "size_bytes": 903776
+      "sha256": "e5df6524c868cf69dcb1c5363309d75c878cff01288bdf421a816d43a5ef852a",
+      "size_bytes": 905812
     },
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_audit.rs",
-      "sha256": "f9119359020475490546c62f0f4ea6c7a7f04e55ce6d5156596fb093ebd08933",
-      "size_bytes": 42510
+      "sha256": "6892b512b74ab9a7646935971ea075907f2d5e625e4c5df0e93bad6314151e48",
+      "size_bytes": 45031
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b66fe5c09f96efe1914ad4961e4b66dbc3c234b509a950c340e6a5bae4fa86dd",
-      "size_bytes": 967240
+      "sha256": "ba393b1ac50613b833917b4013886e6ab6f83b502f259055c86dd14752f260a4",
+      "size_bytes": 970544
     },
     {
       "executable": false,
@@ -1233,6 +1233,13 @@
       "path": "docs/session-2026-08-01-claude-compaction-dedup.md",
       "sha256": "8895bfa9b9e7b21818ecd44be5dc5c00d2ca6d4ad73e21c780635a655d754065",
       "size_bytes": 1058
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-01-scanner-composition-final-audit.md",
+      "sha256": "c3599a68fac1ab5663f715f4e8fe9f69529d13bd3e2e2c2617be6523389ca166",
+      "size_bytes": 2233
     },
     {
       "executable": false,
@@ -2103,9 +2110,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-01T19:20:00+00:00",
+  "generated_at": "2026-08-01T19:57:48+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 301,
+  "output_file_count": 302,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2139,5 +2146,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f91cc838bdf49ad588bdf8f42e77074e74803ab7"
+  "source_commit": "0b0aac7e22c1930323550c7fe18a3e1b773062e0"
 }
