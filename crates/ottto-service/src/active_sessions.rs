@@ -542,6 +542,7 @@ mod tests {
             gateway_provider: Some("openai".to_string()),
             model_provider: Some("openai".to_string()),
             subscription_product: Some("chatgpt_plus".to_string()),
+            account_identifier_hash: None,
             cost_usd: None,
             input_cost_usd: None,
             output_cost_usd: None,

@@ -4,7 +4,9 @@
 //! `claude_code.api_request` OTLP log carries the actual applied tier and exact
 //! request token counts, so the loopback relay reduces only those allowlisted
 //! fields into an owner-only sidecar. Raw OTLP payloads, prompts, responses,
-//! commands, paths, account identifiers, and email addresses are never stored.
+//! commands, paths, raw account identifiers, and email addresses are never
+//! stored. A provider UUID may be reduced to the same privacy-safe billing
+//! identity hash used by snapshots and then discarded.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,13 @@ pub struct ClaudeEffortEvidence {
     pub cache_creation_1h_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub request_count: u64,
+    /// True for records written by a daemon that evaluated the provider's
+    /// account attribute. Legacy effort-only rows default false and are neutral
+    /// to account attribution during upgrades.
+    #[serde(default)]
+    pub account_identity_checked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
 }
 
 pub fn capture_claude_api_request_logs(
@@ -130,18 +139,43 @@ pub fn load_claude_effort_evidence(
     Ok(result)
 }
 
+/// Stat-only fingerprint for one session's local OTLP sidecar.
+///
+/// Snapshot candidate selection uses this so evidence appended after the
+/// transcript's final write still re-selects that transcript. The fingerprint
+/// exposes neither the session id nor any sidecar content.
+pub fn claude_effort_sidecar_fingerprint(support_dir: &Path, session_id: &str) -> String {
+    let path = evidence_path(support_dir, session_id);
+    let Ok(metadata) = fs::metadata(path) else {
+        return String::new();
+    };
+    if !metadata.is_file() || metadata.len() > MAX_EVIDENCE_FILE_BYTES {
+        return String::new();
+    }
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let token = format!("{}:{modified_nanos}", metadata.len());
+    format!(
+        "{:x}",
+        Sha256::digest(format!("claude_effort_sidecar:v1:{token}").as_bytes())
+    )
+}
+
 fn evidence_from_record(
     record: &Value,
     attrs: &BTreeMap<String, String>,
 ) -> Option<ClaudeEffortEvidence> {
     let session_id = first_attr(attrs, &["session.id", "session_id"])?;
     let model = first_attr(attrs, &["model", "gen_ai.request.model"])?;
-    let effort = first_attr(attrs, &["effort", "effort_level"])?
-        .trim()
-        .to_ascii_lowercase();
-    if !VALID_EFFORTS.contains(&effort.as_str()) {
-        return None;
-    }
+    let effort = first_attr(attrs, &["effort", "effort_level"])
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|value| VALID_EFFORTS.contains(&value.as_str()))
+        .unwrap_or_default();
     let observed_at = timestamp_at(record)?;
     let mut item = ClaudeEffortEvidence {
         fingerprint: String::new(),
@@ -202,6 +236,12 @@ fn evidence_from_record(
             ],
         ),
         request_count: 1,
+        account_identity_checked: true,
+        account_identifier_hash: first_attr(attrs, &["user.account_uuid"])
+            .and_then(canonical_uuid)
+            .and_then(|uuid| {
+                ottto_core::billing_identity_hash("anthropic", "account", uuid.as_str())
+            }),
     };
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
@@ -245,6 +285,23 @@ fn first_u64(attrs: &BTreeMap<String, String>, keys: &[&str]) -> u64 {
     keys.iter()
         .find_map(|key| attrs.get(*key)?.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn canonical_uuid(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() != 36 {
+        return None;
+    }
+    for (index, byte) in normalized.bytes().enumerate() {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return None;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+    }
+    Some(normalized)
 }
 
 fn timestamp_at(record: &Value) -> Option<String> {
@@ -306,7 +363,7 @@ mod tests {
     fn captures_only_allowlisted_api_request_fields_and_dedupes_reads() {
         let dir = std::env::temp_dir().join(format!("ottto-effort-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let body = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-1"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"cache_creation_tokens","value":{"intValue":"2014"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
+        let body = br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1783728000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-1"}},{"key":"user.account_uuid","value":{"stringValue":"123E4567-E89B-12D3-A456-426614174000"}},{"key":"model","value":{"stringValue":"claude-opus-4-7"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"input_tokens","value":{"intValue":"12"}},{"key":"output_tokens","value":{"intValue":"3"}},{"key":"cache_creation_tokens","value":{"intValue":"2014"}},{"key":"prompt","value":{"stringValue":"must-not-persist"}}]}]}]}]}"#;
         assert_eq!(
             capture_claude_api_request_logs(&dir, body, "application/json").unwrap(),
             1
@@ -323,8 +380,18 @@ mod tests {
         assert_eq!(row.cache_creation_tokens, 2014);
         assert_eq!(row.cache_creation_5m_tokens, 0);
         assert_eq!(row.cache_creation_1h_tokens, 0);
+        assert!(row.account_identity_checked);
+        assert_eq!(
+            row.account_identifier_hash,
+            ottto_core::billing_identity_hash(
+                "anthropic",
+                "account",
+                "123e4567-e89b-12d3-a456-426614174000"
+            )
+        );
         let persisted = fs::read_to_string(evidence_path(&dir, "sess-1")).unwrap();
         assert!(!persisted.contains("must-not-persist"));
+        assert!(!persisted.contains("123e4567-e89b-12d3-a456-426614174000"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -337,5 +404,6 @@ mod tests {
 
         assert_eq!(row.cache_creation_tokens, 0);
         assert_eq!(row.cache_creation_5m_tokens, 2014);
+        assert!(!row.account_identity_checked);
     }
 }

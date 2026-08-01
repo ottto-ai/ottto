@@ -16,7 +16,7 @@ use crate::snapshot_client::{
     UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
-    apply_upload_policy, collector_version, scan_source_roots_with_attribution,
+    apply_upload_policy, collector_version, scan_source_roots_with_attribution_and_claude_effort,
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
     SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
     SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
@@ -1374,7 +1374,7 @@ fn sync_source(
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
     let committed_index = index.clone();
-    let mut scan_result = match scan_source_roots_with_attribution(
+    let mut scan_result = match scan_source_roots_with_attribution_and_claude_effort(
         source,
         &roots,
         &mut index,
@@ -1382,6 +1382,7 @@ fn sync_source(
         activity_hint.backfill_window_days,
         upload_policy.session_artifacts_enabled,
         attribution_context.as_ref(),
+        (source == SnapshotSource::ClaudeCode).then_some(support_dir),
     ) {
         Ok(scan_result) => scan_result,
         Err(error) => {
