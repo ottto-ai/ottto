@@ -557,11 +557,19 @@ impl SnapshotBatchResponse {
             }
             return Ok(());
         }
-        if self.entity_ack_contract.as_deref() != Some(SNAPSHOT_ENTITY_ACK_CONTRACT) {
-            if self.accepted != request.snapshots.len() as u64 {
-                return Err(anyhow!("legacy snapshot response accepted count mismatch"));
+        match self.entity_ack_contract.as_deref() {
+            None => {
+                if self.accepted != request.snapshots.len() as u64 {
+                    return Err(anyhow!("legacy snapshot response accepted count mismatch"));
+                }
+                return Ok(());
             }
-            return Ok(());
+            Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => {}
+            Some(_) => {
+                return Err(anyhow!(
+                    "snapshot response uses an unsupported entity ACK contract"
+                ));
+            }
         }
         self.validate_entity_ack_identities(request.snapshots.iter().map(|item| {
             (
@@ -741,8 +749,9 @@ pub struct SnapshotStatusRequest {
     pub collector_version: Option<String>,
     pub parser_version: Option<String>,
     /// `{source, entity_count, rolling_hash}` over this source's scan index, as
-    /// of the most recent completed scan on this machine. Absent before the
-    /// first scan of the process; never fabricated.
+    /// of the most recent completed scan on this machine. On a terminal status,
+    /// absence explicitly withdraws prior agreement; on a nonterminal check-in,
+    /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
 }
@@ -2167,6 +2176,24 @@ mod tests {
         response
             .validate_entity_ack(&request)
             .expect_err("disabled response cannot settle an entity");
+    }
+
+    #[test]
+    fn unknown_entity_ack_contract_never_falls_back_to_legacy_count_only_ack() {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = entity_ack(0, Vec::new());
+        response.entity_ack_contract = Some("snapshot_entity_ack:v999".to_string());
+        response
+            .validate_entity_ack(&request)
+            .expect_err("future ACK shapes require explicit client support");
     }
 
     #[test]

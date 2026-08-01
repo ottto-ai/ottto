@@ -41,9 +41,9 @@ fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
 }
 
 fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBuf>) {
-    let Ok(mut state) = pending_snapshot_paths().lock() else {
-        return;
-    };
+    let mut state = pending_snapshot_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let index = source_index(source);
     for path in paths {
         if state.paths[index].contains(path) {
@@ -58,9 +58,11 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
 }
 
 fn record_raw_watcher_overflow() {
-    if let Ok(mut state) = pending_snapshot_paths().lock() {
-        state.overflowed.fill(true);
-    }
+    pending_snapshot_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .overflowed
+        .fill(true);
 }
 
 fn complete_debounce_events(result: DebounceEventResult) -> Option<Vec<DebouncedEvent>> {
@@ -74,12 +76,13 @@ fn complete_debounce_events(result: DebounceEventResult) -> Option<Vec<Debounced
 }
 
 pub fn take_pending_snapshot_paths(source: SnapshotSource) -> PendingSnapshotPaths {
-    let Ok(mut state) = pending_snapshot_paths().lock() else {
-        return PendingSnapshotPaths {
-            paths: Vec::new(),
-            overflowed: true,
-        };
-    };
+    // A caught panic in an unrelated watcher consumer must not turn the
+    // process-global queue into a permanent manifest fence. The guarded state
+    // is structurally valid after every mutation, so recover the poisoned
+    // mutex and keep the explicit overflow/path witnesses moving.
+    let mut state = pending_snapshot_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let index = source_index(source);
     PendingSnapshotPaths {
         paths: std::mem::take(&mut state.paths[index])
@@ -241,5 +244,28 @@ mod tests {
         ] {
             assert!(take_pending_snapshot_paths(source).overflowed);
         }
+    }
+
+    #[test]
+    fn poisoned_pending_mutex_recovers_without_permanently_fencing_sources() {
+        let _guard = pending_state_test_guard();
+        let source = SnapshotSource::Pi;
+        let _ = take_pending_snapshot_paths(source);
+        let poisoned = std::thread::spawn(|| {
+            let _state = pending_snapshot_paths()
+                .lock()
+                .expect("unpoisoned test mutex");
+            panic!("intentional watcher-state poison");
+        })
+        .join();
+        assert!(poisoned.is_err());
+
+        record_pending_snapshot_paths(
+            source,
+            &BTreeSet::from([PathBuf::from("/tmp/recovered-session.jsonl")]),
+        );
+        let recovered = take_pending_snapshot_paths(source);
+        assert_eq!(recovered.paths.len(), 1);
+        assert!(!recovered.overflowed);
     }
 }

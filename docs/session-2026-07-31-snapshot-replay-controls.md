@@ -16,6 +16,15 @@ daemon, or tighten the backend registration route.
   directory wider than the discovery budget fails red without materializing
   the tail. It rejects root and descendant symlinks, keeps per-path
   unreadable/oversize/disappearance counts, and continues with healthy paths.
+  A configured root that has never existed remains optional. Once a root has
+  resolved, its durable content-free witness makes later disappearance fail
+  red while retaining prior entities; old indexes infer direct roots from
+  existing indexed paths and retain path-level unresolved witnesses for a
+  vanished configured symlink only when the prior traversal proves the same
+  root context. Those witnesses clear when the actual canonical root returns or
+  the configured root context changes, without promoting unrelated optional
+  roots. A restored root converges through a new authoritative census instead
+  of requiring local-state surgery.
   File-age eligibility is evaluated against that frozen census boundary on
   every later page; elapsed wall time cannot silently shrink the generation.
 - Watcher paths are coalesced, bounded, exact-path hints, never source-wide
@@ -36,11 +45,17 @@ daemon, or tighten the backend registration route.
 - The parser reads the exact `O_NOFOLLOW`-opened regular file. Its v2 identity
   binds device/inode/change-time-nanoseconds plus bounded first/last content
   samples; change time catches middle-only in-place rewrites whose size and
-  mtime were restored. Nanosecond mtime remains in the scan fingerprint and
-  `semantic_sync:v1` remains unchanged.
+  mtime were restored. The exact opened object's mtime is also rechecked against
+  the frozen lookback, closing the discovery-to-open replacement interval.
+  Nanosecond mtime remains in the scan fingerprint and `semantic_sync:v1`
+  remains unchanged.
 - Malformed JSON, invalid UTF-8, over-cap lines, or a recognized usage shape
   that failed conversion make the file incomplete. An incomplete file is not
   recorded as empty or settled. Confirmed-empty is a separate durable state.
+  Positive-usage drift detection traverses unknown provider envelopes, but
+  treats structurally identified authored-message and tool payload fields as
+  opaque so usage-shaped prompt, assistant example, or tool data cannot hold a
+  genuine empty file red.
 - Pi accepts both current nested `type=message` assistant usage and legacy
   `message_end` usage. Provider response time has the same precedence in both
   shapes; a later envelope write time cannot move usage across an hour. Every
@@ -68,6 +83,18 @@ daemon, or tighten the backend registration route.
   pinned by `fixtures/snapshot-audit/snapshot-manifest-v2-golden.json` against
   the backend Python implementation; the shared metadata-only golden pins the
   upload-versus-manifest boundary.
+- Transcript deletion reconciliation precedes Codex's state-database-only
+  fallback. If a rollout disappears while its thread row remains, that same
+  complete generation emits the state-only replacement rather than briefly
+  publishing a manifest with neither representation.
+- Manifest-bearing terminal status has three states at the wire boundary: a
+  terminal receipt with a manifest publishes agreement; a terminal receipt
+  without one explicitly withdraws stale agreement after incomplete/error/
+  disabled collection; a nonterminal check-in without one is liveness-only and
+  preserves the last terminal outcome. The process cache recovers from mutex
+  poison so one caught panic cannot permanently suppress publication or
+  withdrawal. The daemon never fabricates an empty manifest to represent
+  unknown evidence.
 
 ## Durable state and quarantine
 
@@ -108,7 +135,9 @@ duplicate ACK validation remains multiset-exact. The uploader coalesces byte-
 equal same-fingerprint bodies to one representative; divergent bodies under one
 fingerprint are corruption and are quarantined while healthy siblings continue.
 Partial, short, foreign, zero-count, over-counted, or cross-classified ACKs
-settle nothing. Legacy 422 handling is full-batch/no-write followed by bounded
+settle nothing. Only an absent ACK-contract field selects legacy count-only
+compatibility; an unknown/future named contract fails closed before local
+progress advances. Legacy 422 handling is full-batch/no-write followed by bounded
 singleton isolation; timeouts retain bounded splits. Items are capped at 128
 KiB, exact uncompressed requests at 4 MiB, and conservative serialized-item
 packing keeps pages below that request boundary before exact preflight.

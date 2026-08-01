@@ -867,6 +867,20 @@ pub struct ScanIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_context_fingerprint: Option<String>,
     pub files: BTreeMap<String, ScanIndexEntry>,
+    /// Configured roots that have successfully resolved at least once for this
+    /// destination/source index. A root that never existed is optional, but a
+    /// root that disappears after contributing an authoritative census must
+    /// fail the generation red instead of reconciling every entity beneath it
+    /// away as if the directory had been observed empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    known_configured_scan_roots: BTreeSet<String>,
+    /// Pre-root-witness index paths not currently covered by any resolved root.
+    /// This is the upgrade-safe witness for a configured symlink whose old
+    /// canonical target cannot be reconstructed while the link is missing.
+    /// Inference requires a prior traversal with the same root-context proof;
+    /// paths clear when a resolved root covers them or the root context changes.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    legacy_unresolved_root_file_witnesses: BTreeSet<String>,
     /// Last accepted semantic fingerprint for Codex sessions that exist only
     /// in the local state database and have no usage-bearing rollout file.
     ///
@@ -961,6 +975,8 @@ impl Default for ScanIndex {
             generation: 0,
             upload_context_fingerprint: None,
             files: BTreeMap::new(),
+            known_configured_scan_roots: BTreeSet::new(),
+            legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
             claude_desktop_title_files: BTreeMap::new(),
             claude_desktop_store_cursor: None,
@@ -4486,6 +4502,20 @@ fn scan_source_roots_with_limit_and_attribution(
                 continue;
             }
         };
+        if !opened_candidate_is_within_frozen_window(
+            &candidate,
+            census_unix_seconds,
+            backfill_window_days,
+        ) {
+            // The path can be atomically replaced after directory/candidate
+            // stat but before the no-follow open. Eligibility follows the
+            // exact opened object, not stale discovery metadata; otherwise an
+            // object outside the frozen lookback can enter this generation.
+            census
+                .removed_index_keys
+                .insert(local_index_key(&candidate.path));
+            continue;
+        }
         let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
         candidate.legacy_source_file_fingerprint = source_file_fingerprint_with_context(
             &candidate.path,
@@ -4615,16 +4645,6 @@ fn scan_source_roots_with_limit_and_attribution(
             snapshots.extend(parsed);
         }
     }
-    if source == SnapshotSource::Codex {
-        let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
-            &mut snapshots,
-            &codex_title_metadata,
-            collected_at,
-            index,
-        );
-        scanned_session_count += state_only_scanned;
-        semantic_noop_count += state_only_noops;
-    }
     if let Some(traversal) = index.traversal.as_mut() {
         // Exact watcher remove/rename hints must amend the same durable
         // observation set used by directory census reconciliation. Apply
@@ -4681,6 +4701,21 @@ fn scan_source_roots_with_limit_and_attribution(
     } else {
         false
     };
+    if source == SnapshotSource::Codex {
+        // Reconcile authoritative transcript deletions before deciding which
+        // state-database threads are file-backed. Otherwise a vanished rollout
+        // remains "covered" for this whole generation, the state-only fallback
+        // is delayed one cycle, and a complete terminal manifest can briefly
+        // omit a thread the local state database still proves exists.
+        let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
+            &mut snapshots,
+            &codex_title_metadata,
+            collected_at,
+            index,
+        );
+        scanned_session_count += state_only_scanned;
+        semantic_noop_count += state_only_noops;
+    }
     let census_complete = traversal_discovery_done
         && traversal_healthy
         && clean_frozen_generation
@@ -5350,15 +5385,100 @@ fn recognized_usage_shape_was_dropped(source: SnapshotSource, value: &Value) -> 
 
 fn json_has_positive_usage_evidence(value: &Value) -> bool {
     match value {
-        Value::Object(values) => values.iter().any(|(name, value)| {
-            let normalized = normalized_usage_key(name);
-            (is_recognized_usage_container(&normalized)
-                && usage_container_has_positive_consumption(value, false))
-                || json_has_positive_usage_evidence(value)
-        }),
+        Value::Object(values) => {
+            let object_kind = json_usage_object_kind(values);
+            values.iter().any(|(name, value)| {
+                let normalized = normalized_usage_key(name);
+                if json_usage_child_is_opaque(&normalized, object_kind) {
+                    return false;
+                }
+                (is_recognized_usage_container(&normalized)
+                    && usage_container_has_positive_consumption(value, false))
+                    || json_has_positive_usage_evidence(value)
+            })
+        }
         Value::Array(values) => values.iter().any(json_has_positive_usage_evidence),
         _ => false,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonUsageObjectKind {
+    ProviderEnvelope,
+    AssistantMessage,
+    OpaqueAuthored,
+}
+
+fn json_usage_object_kind(values: &serde_json::Map<String, Value>) -> JsonUsageObjectKind {
+    let normalized = |key| {
+        values
+            .get(key)
+            .and_then(Value::as_str)
+            .map(normalized_usage_key)
+    };
+    if normalized("role").is_some_and(|role| matches!(role.as_str(), "assistant" | "model"))
+        || normalized("type")
+            .is_some_and(|kind| matches!(kind.as_str(), "assistantmessage" | "modelmessage"))
+    {
+        return JsonUsageObjectKind::AssistantMessage;
+    }
+    if normalized("role").is_some_and(|role| {
+        matches!(
+            role.as_str(),
+            "user" | "human" | "system" | "developer" | "tool"
+        )
+    }) || normalized("type").is_some_and(|kind| {
+        matches!(
+            kind.as_str(),
+            "user"
+                | "human"
+                | "system"
+                | "developer"
+                | "usermessage"
+                | "tool"
+                | "text"
+                | "inputtext"
+                | "outputtext"
+                | "thinking"
+                | "redactedthinking"
+                | "tooluse"
+                | "toolresult"
+                | "toolcall"
+                | "function"
+                | "functioncall"
+                | "functionresult"
+                | "image"
+                | "document"
+        )
+    }) {
+        return JsonUsageObjectKind::OpaqueAuthored;
+    }
+    JsonUsageObjectKind::ProviderEnvelope
+}
+
+fn json_usage_child_is_opaque(name: &str, object_kind: JsonUsageObjectKind) -> bool {
+    (object_kind == JsonUsageObjectKind::OpaqueAuthored && is_recognized_usage_container(name))
+        || (object_kind != JsonUsageObjectKind::ProviderEnvelope
+            && matches!(
+                name,
+                "content"
+                    | "contents"
+                    | "text"
+                    | "prompt"
+                    | "prompts"
+                    | "argument"
+                    | "arguments"
+                    | "args"
+                    | "toolinput"
+                    | "tooloutput"
+                    | "toolresult"
+                    | "message"
+                    | "payload"
+                    | "data"
+                    | "input"
+                    | "output"
+                    | "result"
+            ))
 }
 
 fn normalized_usage_key(value: &str) -> String {
@@ -8387,6 +8507,10 @@ fn ensure_bounded_traversal(
 ) {
     let context_fingerprint =
         scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
+    let prior_traversal_context_matches = index
+        .traversal
+        .as_ref()
+        .is_some_and(|traversal| traversal.context_fingerprint == context_fingerprint);
     let retry_attempt = if let Some(traversal) = index
         .traversal
         .as_ref()
@@ -8416,10 +8540,71 @@ fn ensure_bounded_traversal(
     };
 
     let mut census = ScanCensus::default();
+    let resolved_roots = roots
+        .iter()
+        .map(|root| {
+            let problems_before = census
+                .unreadable_path_count
+                .saturating_add(census.disappeared_file_count);
+            let resolved = resolve_configured_scan_root(root, &mut census);
+            let problems_after = census
+                .unreadable_path_count
+                .saturating_add(census.disappeared_file_count);
+            (root, resolved, problems_after > problems_before)
+        })
+        .collect::<Vec<_>>();
+    let currently_resolved = resolved_roots
+        .iter()
+        .filter_map(|(_, resolved, _)| resolved.as_ref())
+        .collect::<Vec<_>>();
+    let missing_roots = resolved_roots
+        .iter()
+        .filter(|(_, resolved, _)| resolved.is_none())
+        .map(|(root, _, _)| *root)
+        .collect::<Vec<_>>();
+    let missing_root_reported_problem = resolved_roots
+        .iter()
+        .any(|(_, resolved, reported_problem)| resolved.is_none() && *reported_problem);
+    // Upgrade compatibility: indexes written before the durable root witness
+    // existed can still prove that a now-missing root was previously observed.
+    // Direct roots are inferred by lexical containment below. A vanished
+    // configured symlink has no recoverable canonical target, so retain the
+    // exact prior index paths until a future resolved root covers them. This
+    // avoids falsely promoting every unrelated optional root to required.
+    if prior_traversal_context_matches {
+        index.legacy_unresolved_root_file_witnesses.retain(|key| {
+            index.files.contains_key(key)
+                && !currently_resolved
+                    .iter()
+                    .any(|root| Path::new(key).starts_with(root))
+        });
+    } else {
+        // A changed root set is an explicit new census scope, not evidence that
+        // one of its absent optional roots owns every old out-of-scope path.
+        index.legacy_unresolved_root_file_witnesses.clear();
+    }
+    if prior_traversal_context_matches && !missing_roots.is_empty() {
+        index.legacy_unresolved_root_file_witnesses.extend(
+            index
+                .files
+                .keys()
+                .filter(|key| {
+                    !currently_resolved
+                        .iter()
+                        .any(|root| Path::new(key).starts_with(root))
+                        && !missing_roots
+                            .iter()
+                            .any(|root| Path::new(key).starts_with(root))
+                })
+                .cloned(),
+        );
+    }
     let mut scan_roots = Vec::new();
     let mut pending_directories = VecDeque::new();
-    for root in roots {
-        if let Some(scan_root) = resolve_configured_scan_root(root, &mut census) {
+    for (root, resolved, resolver_reported_problem) in resolved_roots {
+        let root_key = local_index_key(root);
+        if let Some(scan_root) = resolved {
+            index.known_configured_scan_roots.insert(root_key);
             scan_roots.push(scan_root.clone());
             pending_directories.push_back(ScanTraversalPath {
                 scan_root: scan_root.clone(),
@@ -8427,7 +8612,21 @@ fn ensure_bounded_traversal(
                 census_member: true,
                 watcher_hint: false,
             });
+            continue;
         }
+        let inferred_from_old_index = index
+            .files
+            .keys()
+            .any(|key| Path::new(key).starts_with(root));
+        if inferred_from_old_index {
+            index.known_configured_scan_roots.insert(root_key.clone());
+        }
+        if index.known_configured_scan_roots.contains(&root_key) && !resolver_reported_problem {
+            census.disappeared_file_count += 1;
+        }
+    }
+    if !index.legacy_unresolved_root_file_witnesses.is_empty() && !missing_root_reported_problem {
+        census.disappeared_file_count += 1;
     }
     let counts = ScanTraversalCounts {
         directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
@@ -8921,6 +9120,16 @@ fn is_recent_enough_at(
 ) -> bool {
     let window_seconds = effective_backfill_window_days(backfill_window_days) * 24 * 60 * 60;
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
+}
+
+fn opened_candidate_is_within_frozen_window(
+    candidate: &CandidateFile,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> bool {
+    census_unix_seconds.map_or(true, |now| {
+        is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
+    })
 }
 
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
@@ -9634,6 +9843,10 @@ impl ScanIndex {
             generation: previous.generation,
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
             files,
+            known_configured_scan_roots: self.known_configured_scan_roots.clone(),
+            legacy_unresolved_root_file_witnesses: self
+                .legacy_unresolved_root_file_witnesses
+                .clone(),
             codex_state_only_snapshot_fingerprints,
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
@@ -10667,6 +10880,27 @@ mod tests {
         path
     }
 
+    fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalCheckpoint {
+        ScanTraversalCheckpoint {
+            context_fingerprint,
+            census_window_end: "2026-07-31T00:00:00Z".to_string(),
+            scan_roots: Vec::new(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            unhealthy_retry_attempt: 1,
+            unhealthy_retry_not_before_unix_seconds: Some(0),
+            counts: ScanTraversalCounts {
+                disappeared_file_count: 1,
+                ..ScanTraversalCounts::default()
+            },
+        }
+    }
+
     #[test]
     fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
         let root = temp_dir("scan-index-recovery");
@@ -10973,6 +11207,48 @@ mod tests {
         let mut second = test_candidate(path);
         open_candidate_file(SnapshotSource::ClaudeCode, &mut second).expect("open second content");
         assert_ne!(first.opened_object_identity, second.opened_object_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opened_replacement_is_rechecked_against_the_frozen_lookback_window() {
+        let root = temp_dir("opened-object-age-recheck");
+        let path = root.join("session.jsonl");
+        fs::write(&path, b"{}\n").expect("write recent discovery object");
+        let census_at = rfc3339_unix_seconds("2026-07-31T00:00:00Z");
+        let mut census = ScanCensus::default();
+        let mut candidate = candidate_from_traversal_path(
+            SnapshotSource::Pi,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            census_at,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("recent path is discovered");
+
+        let replacement = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open replacement");
+        replacement
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+            )
+            .expect("restore replacement to old mtime");
+        drop(replacement);
+        open_candidate_file(SnapshotSource::Pi, &mut candidate)
+            .expect("open exact replacement object");
+
+        assert!(
+            !opened_candidate_is_within_frozen_window(&candidate, census_at, BACKFILL_WINDOW_DAYS,),
+            "eligibility must follow the opened object's mtime"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -12139,6 +12415,7 @@ mod tests {
         )
         .expect("missing optional root is complete-empty");
         assert!(absent.census_complete);
+        assert!(index.known_configured_scan_roots.is_empty());
 
         fs::create_dir_all(&root).expect("create root after watcher startup");
         fs::write(
@@ -12156,6 +12433,231 @@ mod tests {
         .expect("periodic scan finds late root");
         assert!(found.census_complete);
         assert_eq!(found.snapshots.len(), 1);
+        assert!(index
+            .known_configured_scan_roots
+            .contains(&local_index_key(&root)));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn previously_observed_root_disappearance_fails_red_until_root_returns() {
+        let parent = temp_dir("disappearing-scan-root-parent");
+        let root = parent.join("sessions");
+        fs::create_dir_all(&root).expect("create observed root");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write observed entity");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("observe configured root");
+        assert!(first.census_complete);
+        assert_eq!(index.files.len(), 1);
+
+        fs::remove_dir_all(&root).expect("temporarily remove configured root");
+        let missing = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("missing root is a source-local red witness");
+        assert!(!missing.census_complete);
+        assert_eq!(missing.disappeared_file_count, 1);
+        assert_eq!(index.files.len(), 1, "prior entities remain authoritative");
+
+        fs::create_dir_all(&root).expect("restore configured root empty");
+        let restored = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("restored root converges through a fresh complete census");
+        assert!(restored.census_complete);
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn old_index_without_root_witness_infers_missing_previously_observed_root() {
+        let parent = temp_dir("old-index-missing-root");
+        let root = parent.join("sessions");
+        let index_path = parent.join("scan-index.json");
+        let prior_path = root.join("session.jsonl");
+        let mut old_index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        old_index
+            .save(&index_path)
+            .expect("write pre-witness index");
+        let serialized: Value =
+            serde_json::from_slice(&fs::read(&index_path).expect("read pre-witness index"))
+                .expect("parse pre-witness index");
+        assert!(serialized.get("known_configured_scan_roots").is_none());
+        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness index");
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut upgraded,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("upgrade inference remains source-local");
+
+        assert!(!scan.census_complete);
+        assert_eq!(scan.disappeared_file_count, 1);
+        assert!(upgraded.files.contains_key(&local_index_key(&prior_path)));
+        assert!(upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&root)));
+        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_vanished_symlink_witness_does_not_promote_optional_roots() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("legacy-vanished-symlink-root");
+        let target = parent.join("relocated-sessions");
+        let configured_link = parent.join("configured-sessions");
+        let optional_root = parent.join("optional-sessions");
+        fs::create_dir_all(&target).expect("create prior canonical target");
+        let prior_path = fs::canonicalize(&target)
+            .expect("canonicalize prior target")
+            .join("session.jsonl");
+        fs::remove_dir_all(&target).expect("remove prior canonical target");
+        let index_path = parent.join("scan-index.json");
+        let mut old_index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        let roots = vec![optional_root.clone(), configured_link.clone()];
+        old_index.traversal = Some(terminal_unhealthy_traversal(
+            scan_traversal_context_fingerprint(
+                SnapshotSource::Pi,
+                &roots,
+                &old_index,
+                BACKFILL_WINDOW_DAYS,
+            ),
+        ));
+        old_index
+            .save(&index_path)
+            .expect("write pre-witness symlink index");
+        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness symlink index");
+
+        let missing = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut upgraded,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unresolved legacy symlink remains source-local");
+
+        assert!(!missing.census_complete);
+        assert_eq!(missing.disappeared_file_count, 1);
+        assert_eq!(
+            upgraded.legacy_unresolved_root_file_witnesses,
+            BTreeSet::from([local_index_key(&prior_path)])
+        );
+        assert!(!upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&optional_root)));
+
+        fs::create_dir_all(&target).expect("restore canonical target");
+        symlink(&target, &configured_link).expect("restore configured symlink");
+        let restored = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut upgraded,
+            "2026-07-31T00:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("restored symlink covers its durable legacy witness");
+
+        assert_eq!(
+            restored.disappeared_file_count,
+            0,
+            "legacy_witnesses={} optional_known={} link_known={}",
+            upgraded.legacy_unresolved_root_file_witnesses.len(),
+            upgraded
+                .known_configured_scan_roots
+                .contains(&local_index_key(&optional_root)),
+            upgraded
+                .known_configured_scan_roots
+                .contains(&local_index_key(&configured_link)),
+        );
+        assert!(restored.census_complete, "restored scan: {restored:#?}");
+        assert!(upgraded.files.is_empty());
+        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
+        assert!(upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&configured_link)));
+        assert!(!upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&optional_root)));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn legacy_root_context_change_does_not_claim_unrelated_optional_root() {
+        let parent = temp_dir("legacy-root-context-change");
+        let old_root = parent.join("old-sessions");
+        let new_optional_root = parent.join("new-optional-sessions");
+        let prior_path = old_root.join("session.jsonl");
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        let old_roots = vec![old_root];
+        index.traversal = Some(terminal_unhealthy_traversal(
+            scan_traversal_context_fingerprint(
+                SnapshotSource::Pi,
+                &old_roots,
+                &index,
+                BACKFILL_WINDOW_DAYS,
+            ),
+        ));
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&new_optional_root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("changed root context starts a fresh authoritative scope");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.disappeared_file_count, 0);
+        assert!(index.files.is_empty());
+        assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
+        assert!(!index
+            .known_configured_scan_roots
+            .contains(&local_index_key(&new_optional_root)));
         let _ = fs::remove_dir_all(parent);
     }
 
@@ -13689,6 +14191,80 @@ mod tests {
     }
 
     #[test]
+    fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
+        let codex_dir = temp_dir("codex-state-deleted-rollout");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_id = "019e253c-bbbb-7000-9000-ffffffffffff";
+        let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{session_id}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
+            ),
+        )
+        .expect("write rollout");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    session_id,
+                    "Deleted Rollout",
+                    59_i64,
+                    0_i64,
+                    1_777_777_000_i64,
+                    1_777_777_100_i64,
+                    1_777_777_000_000_i64,
+                    1_777_777_100_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan file-backed session");
+        assert!(first.census_complete);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
+
+        fs::remove_file(&rollout).expect("remove rollout while state row remains");
+        let replacement = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("reconcile deletion and state fallback together");
+
+        assert!(replacement.census_complete);
+        assert!(index.files.is_empty());
+        let state_only = replacement
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == session_id)
+            .expect("same complete generation emits the state-only replacement");
+        assert_eq!(state_only.unattributed_total_tokens, 59);
+        assert_eq!(
+            state_only.provenance.input_token_scope.as_deref(),
+            Some("total_only")
+        );
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
     fn codex_state_only_preserved_when_rollout_parses_to_no_usage() {
         // Regression guard: a rollout that exists but yields zero usage rows
         // (e.g. only session_meta, or a legacy/unknown token payload) is still
@@ -14006,6 +14582,8 @@ mod tests {
             serde_json::json!({"message": {"usage": {"output_tokens": 4}}}),
             serde_json::json!({"message": {"usage": {"input": 2, "cost": {"total": 0.01}}}}),
             serde_json::json!({"unknown": {"nested": {"usage": {"future": {"request_count": 1}}}}}),
+            serde_json::json!({"provider_response": {"content": {"billing": {"usage": {"input_tokens": 7}}}}}),
+            serde_json::json!({"message": {"role": "assistant", "content": {"example": true}, "usage": {"output_tokens": 5}}}),
         ];
         for value in positive {
             assert!(
@@ -14021,6 +14599,10 @@ mod tests {
             serde_json::json!({"usage": {"budget": {"usd": 500}, "timestamp": 1784707201000_i64}}),
             serde_json::json!({"usage": {"future": {"opaque_positive": 99}}}),
             serde_json::json!({"billing_usage": {"quota": {"requests": 100}}}),
+            serde_json::json!({"message": {"role": "user", "content": {"usage": {"input_tokens": 12}}}}),
+            serde_json::json!({"message": {"role": "user", "usage": {"input_tokens": 12}}}),
+            serde_json::json!({"message": {"role": "assistant", "content": {"usage": {"output_tokens": 4}}}}),
+            serde_json::json!({"type": "tool_result", "payload": {"usage": {"output_tokens": 4}}}),
         ];
         for value in negative {
             assert!(
@@ -14028,6 +14610,35 @@ mod tests {
                 "metadata and unknown numerics must not page"
             );
         }
+    }
+
+    #[test]
+    fn authored_usage_shaped_content_does_not_hold_empty_transcript_red() {
+        let root = temp_dir("pi-authored-usage-content");
+        fs::write(
+            root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"example\"},{\"type\":\"tool_result\",\"content\":{\"usage\":{\"input_tokens\":12}}}]}}\n",
+            ),
+        )
+        .expect("write authored-content fixture");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan authored-content fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+        assert!(scan.census_complete);
+        assert_eq!(scan.zero_snapshot_confirmed_count, 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

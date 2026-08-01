@@ -419,40 +419,46 @@ fn publish_source_manifest(
     source: SnapshotSource,
     manifest: SnapshotSourceManifest,
 ) {
-    if let Ok(mut manifests) = source_manifests().lock() {
-        // One destination at a time: a machine that has moved is never coming
-        // back to the old binding with the same secret, so retaining its
-        // manifests would only risk reporting them.
-        manifests.retain(|(namespace, _), _| namespace == destination_namespace);
-        manifests.insert(
-            (destination_namespace.to_string(), source.api_slug()),
-            manifest,
-        );
-    }
+    // These mutations preserve BTreeMap invariants even if an unrelated
+    // consumer panics while holding the process-global cache. Recover poison
+    // so one caught panic cannot permanently suppress every future manifest.
+    let mut manifests = source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // One destination at a time: a machine that has moved is never coming
+    // back to the old binding with the same secret, so retaining its
+    // manifests would only risk reporting them.
+    manifests.retain(|(namespace, _), _| namespace == destination_namespace);
+    manifests.insert(
+        (destination_namespace.to_string(), source.api_slug()),
+        manifest,
+    );
 }
 
 fn withdraw_source_manifest(destination_namespace: &str, source: SnapshotSource) {
-    if let Ok(mut manifests) = source_manifests().lock() {
-        manifests.remove(&(destination_namespace.to_string(), source.api_slug()));
-    }
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(destination_namespace.to_string(), source.api_slug()));
 }
 
 fn cached_source_manifest(
     destination_namespace: &str,
     source: SnapshotSource,
 ) -> Option<SnapshotSourceManifest> {
-    source_manifests().lock().ok().and_then(|manifests| {
-        manifests
-            .get(&(destination_namespace.to_string(), source.api_slug()))
-            .cloned()
-    })
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(destination_namespace.to_string(), source.api_slug()))
+        .cloned()
 }
 
 #[cfg(test)]
 fn clear_source_manifests_for_test() {
-    if let Ok(mut manifests) = source_manifests().lock() {
-        manifests.clear();
-    }
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
@@ -2391,7 +2397,15 @@ where
                 return Ok(ResumableUploadResult::Disabled(response.disabled_reason));
             }
             Ok(response) => {
-                let entity_ack = response.entity_ack_contract.is_some();
+                let entity_ack = match response.entity_ack_contract.as_deref() {
+                    None => false,
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT) => true,
+                    Some(_) => {
+                        return Err(anyhow!(
+                            "snapshot response uses an unsupported entity ACK contract"
+                        ));
+                    }
+                };
                 if !entity_ack && response.accepted != indices.len() as u64 {
                     return Err(anyhow::Error::new(SnapshotBatchResponseRejected {
                         expected: indices.len() as u64,
@@ -3213,6 +3227,33 @@ mod tests {
         assert!(chunk_lengths.iter().all(|length| *length <= 20));
         assert_eq!(accepted, 45);
         assert_eq!(result, ResumableUploadResult::Completed);
+    }
+
+    #[test]
+    fn resumable_upload_rejects_unknown_ack_contract_before_progress_advances() {
+        let items = test_fingerprints(1);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let error = upload_resumable_batches(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                let mut response = accepted_batch(batch.len());
+                response.entity_ack_contract = Some("snapshot_entity_ack:v999".to_string());
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .expect_err("unsupported ACK shapes cannot settle local progress");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported entity ACK contract"));
+        assert_eq!(accepted, 0);
+        assert!(progress.accepted_fingerprints.is_empty());
     }
 
     #[test]
@@ -5221,6 +5262,7 @@ mod tests {
         assert!(requests[1].contains("\"last_scan_finished_at\":null"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"last_error_code\":null"));
+        assert!(!requests[1].contains("\"manifest\""));
     }
 
     #[test]
@@ -5253,6 +5295,7 @@ mod tests {
         assert!(requests[1].contains("\"last_scan_finished_at\":null"));
         assert!(requests[1].contains("\"last_success_at\":null"));
         assert!(requests[1].contains("\"machine_id\":\"otm_test\""));
+        assert!(!requests[1].contains("\"manifest\""));
     }
 
     #[test]
@@ -5397,6 +5440,86 @@ mod tests {
             cached_source_manifest(destination, SnapshotSource::ClaudeCode),
             Some(claude)
         );
+        clear_source_manifests_for_test();
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn poisoned_manifest_cache_recovers_publish_read_and_withdraw() {
+        clear_source_manifests_for_test();
+        let poisoned = std::thread::spawn(|| {
+            let _manifests = source_manifests()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("intentional source-manifest cache poison");
+        })
+        .join();
+        assert!(poisoned.is_err());
+
+        let destination = "destination";
+        let manifest = ScanIndex::default().manifest(SnapshotSource::Codex, 183);
+        publish_source_manifest(destination, SnapshotSource::Codex, manifest.clone());
+        assert_eq!(
+            cached_source_manifest(destination, SnapshotSource::Codex),
+            Some(manifest)
+        );
+        withdraw_source_manifest(destination, SnapshotSource::Codex);
+        assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
+        clear_source_manifests_for_test();
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_incomplete_error_and_disabled_receipts_carry_explicit_withdrawal_shape() {
+        clear_source_manifests_for_test();
+        let device = LocalDeviceBinding {
+            device_id: "device_test".to_string(),
+            machine_id: Some("otm_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let destination = snapshot_upload_destination_namespace(&device, "device-secret");
+        let manifest = ScanIndex::default().manifest(SnapshotSource::Codex, 183);
+        let capture_terminal_without_manifest = |state| {
+            publish_source_manifest(&destination, SnapshotSource::Codex, manifest.clone());
+            withdraw_source_manifest(&destination, SnapshotSource::Codex);
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
+            let mut counts = SyncCounts::for_policy(183);
+            counts.census_complete = false;
+            report_status_with_fresh_relay_token(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                CollectorStatus {
+                    source: SnapshotSource::Codex,
+                    machine_id: "otm_test",
+                    scan_started_at: "2026-06-01T10:00:00Z",
+                    counts,
+                    state,
+                },
+            )
+            .expect("report terminal manifest withdrawal");
+            let request = captured.lock().expect("captured requests")[1].clone();
+            request
+        };
+
+        for request in [
+            capture_terminal_without_manifest(CollectorState::Success),
+            capture_terminal_without_manifest(CollectorState::Error {
+                code: "scan_error",
+                message: "local snapshot scan failed",
+            }),
+            capture_terminal_without_manifest(CollectorState::Disabled(Some(
+                "disabled_by_admin".to_string(),
+            ))),
+        ] {
+            assert!(!request.contains("\"last_scan_finished_at\":null"));
+            assert!(request.contains("\"last_census_complete\":false"));
+            // Terminal + absent manifest is the explicit withdrawal shape.
+            // Nonterminal + absent manifest remains liveness-only/unknown.
+            assert!(!request.contains("\"manifest\""));
+        }
         clear_source_manifests_for_test();
     }
 
