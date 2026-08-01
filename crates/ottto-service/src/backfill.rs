@@ -225,7 +225,7 @@ pub struct HistoricalReplayDirective {
 pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDirective {
     match source {
         SnapshotSource::ClaudeCode => HistoricalReplayDirective {
-            revision: "claude_compact_boundary:v1",
+            revision: "claude_compact_boundary_dedup:v2",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Codex | SnapshotSource::Pi => HistoricalReplayDirective {
@@ -743,7 +743,7 @@ mod tests {
         let source = SnapshotSource::ClaudeCode;
         let directive = current_historical_replay(source);
         assert_eq!(directive.policy, HistoricalReplayPolicy::Full);
-        assert_eq!(directive.revision, "claude_compact_boundary:v1");
+        assert_eq!(directive.revision, "claude_compact_boundary_dedup:v2");
 
         let mut state = BackfillState::default();
         state.completed_parser_versions.insert(

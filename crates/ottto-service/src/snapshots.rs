@@ -159,8 +159,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // as separate content elements. Strip each full element before title/template
 // normalization; the shared 255-character normalizer used to truncate the
 // recommended-plugins element before its closing tag, making it look human.
+// claude_code v25: current Claude transcripts write one compaction twice: a
+// `compact_boundary` system record and a legacy `isCompactSummary` user record
+// a few milliseconds apart. Pair those provider records into one event while
+// retaining support for transcripts that carry only one of the two shapes.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v24";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v25";
 pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
@@ -261,6 +265,74 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
     } else {
         timestamps
     }
+}
+
+const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCompactionKind {
+    LegacySummary,
+    CurrentBoundary,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeCompactionObservation {
+    kind: ClaudeCompactionKind,
+    timestamp: Option<String>,
+}
+
+fn claude_compaction_summary(observations: &[ClaudeCompactionObservation]) -> (u64, Vec<String>) {
+    let mut matched_legacy = BTreeSet::new();
+    let mut pair_count = 0_u64;
+
+    for current in observations
+        .iter()
+        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
+    {
+        let Some(current_timestamp) = current
+            .timestamp
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        else {
+            continue;
+        };
+        let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
+        let candidate = observations
+            .iter()
+            .enumerate()
+            .filter(|(index, observation)| {
+                observation.kind == ClaudeCompactionKind::LegacySummary
+                    && !matched_legacy.contains(index)
+            })
+            .filter_map(|(index, observation)| {
+                let legacy_timestamp = observation
+                    .timestamp
+                    .as_deref()
+                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+                let delta =
+                    (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
+                (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
+            })
+            .min();
+        if let Some((_, legacy_index)) = candidate {
+            matched_legacy.insert(legacy_index);
+            pair_count += 1;
+        }
+    }
+
+    let timestamps = observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.kind == ClaudeCompactionKind::CurrentBoundary
+                || !matched_legacy.contains(index)
+        })
+        .filter_map(|(_, observation)| observation.timestamp.clone())
+        .collect();
+    (
+        observations.len() as u64 - pair_count,
+        bounded_compaction_timestamps(timestamps),
+    )
 }
 
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
@@ -2141,6 +2213,7 @@ struct SnapshotAccumulator {
     first_turn_context_tokens: Option<u64>,
     compaction_count: u64,
     compaction_timestamps: Vec<String>,
+    claude_compaction_observations: Vec<ClaudeCompactionObservation>,
 }
 
 impl SnapshotAccumulator {
@@ -2182,6 +2255,7 @@ impl SnapshotAccumulator {
             first_turn_context_tokens: None,
             compaction_count: 0,
             compaction_timestamps: Vec::new(),
+            claude_compaction_observations: Vec::new(),
         }
     }
 
@@ -2684,6 +2758,15 @@ impl SnapshotAccumulator {
         for row in session_rows.values() {
             totals.add(&row.usage);
         }
+        let (compaction_count, compaction_timestamps) = if self.source == SnapshotSource::ClaudeCode
+        {
+            claude_compaction_summary(&self.claude_compaction_observations)
+        } else {
+            (
+                self.compaction_count,
+                bounded_compaction_timestamps(self.compaction_timestamps),
+            )
+        };
         let mut item = SnapshotItem {
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
@@ -2721,9 +2804,9 @@ impl SnapshotAccumulator {
             compaction_count: self
                 .source
                 .derives_context_posture()
-                .then_some(self.compaction_count),
+                .then_some(compaction_count),
             compaction_timestamps: if self.source.derives_context_posture() {
-                bounded_compaction_timestamps(self.compaction_timestamps)
+                compaction_timestamps
             } else {
                 Vec::new()
             },
@@ -4511,19 +4594,29 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
-    // Claude currently records compaction as
-    // `type=system, subtype=compact_boundary`. Older transcripts used a
-    // `type=user, isCompactSummary=true` record. Count both shapes so current
-    // and historical sessions remain comparable.
+    // Current Claude transcripts write both of these shapes for one compaction.
+    // Keep the raw observations here; `claude_compaction_summary` pairs records
+    // within the provider's millisecond-scale emission window while preserving
+    // either shape when it appears alone in an older transcript.
     let is_legacy_compaction = string_eq_at(value, &["type"], "user")
         && value.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
     let is_current_compaction = string_eq_at(value, &["type"], "system")
         && string_eq_at(value, &["subtype"], "compact_boundary");
-    if is_legacy_compaction || is_current_compaction {
-        accumulator.compaction_count += 1;
-        if let Some(timestamp) = timestamp.clone() {
-            accumulator.compaction_timestamps.push(timestamp);
-        }
+    if is_legacy_compaction {
+        accumulator
+            .claude_compaction_observations
+            .push(ClaudeCompactionObservation {
+                kind: ClaudeCompactionKind::LegacySummary,
+                timestamp: timestamp.clone(),
+            });
+    }
+    if is_current_compaction {
+        accumulator
+            .claude_compaction_observations
+            .push(ClaudeCompactionObservation {
+                kind: ClaudeCompactionKind::CurrentBoundary,
+                timestamp: timestamp.clone(),
+            });
     }
     accumulator.note_time(timestamp.clone());
     // Remember the latest user-input moment so the next assistant response can
@@ -12809,12 +12902,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_parser_counts_current_and_legacy_compaction_records() {
+    fn claude_code_parser_pairs_current_and_legacy_compaction_records() {
         let path = temp_file("claude-compaction-count");
         fs::write(
             &path,
             concat!(
                 "{\"timestamp\":\"2026-07-01T11:00:00Z\",\"sessionId\":\"claude-compact-1\",\"requestId\":\"req_011AAA\",\"message\":{\"id\":\"msg_011AAA\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
+                // Real provider order: boundary first, then its legacy summary
+                // with a timestamp three milliseconds earlier.
+                "{\"timestamp\":\"2026-07-01T11:01:00.003Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:01:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:02:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":false,\"message\":{\"role\":\"user\",\"content\":\"regular prompt\"}}\n",
                 "{\"timestamp\":\"2026-07-01T11:03:00Z\",\"sessionId\":\"claude-compact-1\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary again\"}}\n",
@@ -12840,7 +12936,7 @@ mod tests {
         assert_eq!(
             item.compaction_timestamps,
             vec![
-                "2026-07-01T11:01:00Z".to_string(),
+                "2026-07-01T11:01:00.003Z".to_string(),
                 "2026-07-01T11:03:00Z".to_string(),
                 "2026-07-01T11:05:00Z".to_string(),
                 "2026-07-01T11:06:00Z".to_string(),
