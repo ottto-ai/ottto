@@ -1272,6 +1272,9 @@ pub fn finalize_scan_after_policy(
             }
             format!("{:x}", digest.finalize())
         });
+        let quarantine_retry_required = final_fingerprints
+            .iter()
+            .any(|fingerprint| index.quarantine_requires_retry(fingerprint));
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
         }
@@ -1288,6 +1291,7 @@ pub fn finalize_scan_after_policy(
         }
         if final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
+            && !quarantine_retry_required
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
             result.semantic_noop_count = result
@@ -11792,6 +11796,52 @@ mod tests {
         assert_eq!(changed.snapshots.len(), 1);
         assert_eq!(changed.semantic_noop_count, 0);
         assert_eq!(changed.snapshots[0].input_tokens, 15);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn due_quarantine_retry_is_not_suppressed_as_a_semantic_noop() {
+        let root = temp_dir("semantic-noop-quarantine-retry");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        let fingerprint = first.snapshots[0].snapshot_fingerprint.clone();
+        index.quarantined_snapshot_fingerprints.insert(
+            fingerprint.clone(),
+            SnapshotQuarantineRecord {
+                witness: snapshot_quarantine_witness(SnapshotSource::Pi),
+                retry_after_unix_seconds: 0,
+            },
+        );
+
+        let retry = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("due quarantine retry");
+        assert_eq!(retry.scanned_file_count, 1);
+        assert_eq!(retry.semantic_noop_count, 0);
+        assert_eq!(retry.snapshots.len(), 1);
+        assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -2670,6 +2670,7 @@ fn auth_start(
             });
         }
     }
+    discard_abandoned_unconfirmed_claim_credential()?;
     let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
@@ -2680,6 +2681,36 @@ fn auth_start(
         claim_url,
         expires_at: claim.expires_at,
     })
+}
+
+/// A fresh claim is the explicit cancellation boundary for an older completed
+/// claim that was waiting for account-switch confirmation. The journal is not
+/// active authority until confirmation is authorized, so invalidate it before
+/// asking the backend to mint a different immutable preparation. The binding
+/// lock plus the reservation check exclude a concurrently completing claim.
+fn discard_abandoned_unconfirmed_claim_credential() -> Result<(), LocalApiError> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    require_identity_mutation_reservation(None)?;
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let Some(pending) = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(());
+    };
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.confirmed_at.is_some()
+        || pending.confirmation_authorized
+        || pending.preconfirm_guards_passed
+        || pending.claim_commit.is_none()
+    {
+        return Err(LocalApiError::IdentityMutationInProgress);
+    }
+    clear_pending_device_credential(
+        &pending_store,
+        &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
 }
 
 /// Whether a pending claim's `expires_at` is in the past (with a 30s safety
@@ -4134,13 +4165,14 @@ fn auth_reset(
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
         reset_local_account_files_locked(Some(&identity_reservation))?;
     }
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    let _ = FilePendingDeviceCredentialStore::default().reset();
-    let _ = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT).delete();
-    let _ = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let mut reset = daemon.reset_account_for_authorized_client()?;
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
@@ -13033,6 +13065,63 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn new_claim_discards_abandoned_unauthorized_account_switch_preparation() {
+        let support_root = telemetry_key_store_root("credential-abandoned-switch");
+        let secret_root = telemetry_key_store_root("credential-abandoned-switch-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let setup_run_token = format!("setup-{}", "abandoned".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-abandoned", false);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: connected_account(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup-abandoned".to_string(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                claim_code: Some("claim-abandoned".to_string()),
+                api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            },
+            target_user_id: "user_test".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_run_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        stage_pending_device_credential(&pending, &candidate).expect("stage abandoned candidate");
+        stage_pending_setup_run_token(&pending, &setup_run_token)
+            .expect("stage abandoned setup token");
+
+        discard_abandoned_unconfirmed_claim_credential().expect("discard abandoned claim");
+
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load cleared journal")
+            .is_none());
+        assert!(matches!(
+            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT).load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert!(matches!(
+            KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).load(),
+            Err(TokenStoreError::Missing)
+        ));
+
+        let replacement = test_pending_device_credential("preparation-replacement", false);
+        stage_pending_device_credential(&replacement, &candidate)
+            .expect("new claim can stage a distinct preparation");
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )
+        .expect("clear replacement");
+        let _ = fs::remove_dir_all(support_root);
+        let _ = fs::remove_dir_all(secret_root);
+    }
+
+    #[test]
     fn pending_setup_token_repairs_an_unreadable_orphan_with_exact_journal_value() {
         struct FailFirstLoadStore {
             loads: AtomicUsize,
@@ -14417,6 +14506,60 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, CliErrorCode::InvalidRequest);
         assert!(error.message.contains("--local-only"));
+    }
+
+    #[test]
+    #[serial]
+    fn logout_fails_before_active_reset_when_recovery_journal_cannot_be_invalidated() {
+        let support_root = telemetry_key_store_root("logout-pending-invalidation");
+        let secret_root = telemetry_key_store_root("logout-pending-invalidation-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "device-logout-preserved".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileAccountStore::default()
+            .save(&account)
+            .expect("save active account");
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save active device");
+        fs::create_dir_all(ottto_core::default_pending_device_credential_path())
+            .expect("make pending journal unreadable as a file");
+        let daemon = daemon().with_account(account.clone());
+
+        let response = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_logout_pending_invalidation".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset { local_only: true },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            FileAccountStore::default().load().expect("active account"),
+            account
+        );
+        assert_eq!(
+            FileDeviceStore::default().load().expect("active device"),
+            Some(device)
+        );
+        assert_eq!(
+            daemon.status("token").expect("daemon status").account.state,
+            LocalAccountState::Connected
+        );
+        let _ = fs::remove_dir_all(support_root);
+        let _ = fs::remove_dir_all(secret_root);
     }
 
     #[test]
