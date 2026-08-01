@@ -567,10 +567,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `session.id` plus nested `type: "message"` records and the historical
   `session_id` plus `message_end` records. It carries `ottto-selector` /
   `ottto.selector` custom entries and per-message selector aliases into
-  subsequent assistant-message usage rows. An exact response id deduplicates
-  matching `message` / `message_end` compatibility records; repeated
-  same-shape or id-less responses remain distinct, while divergent cross-shape
-  reuse makes the file retryable. All three parsers emit
+  subsequent assistant-message usage rows. Provider response time is the
+  canonical usage clock even when a later envelope timestamp crosses an hour.
+  An exact response id deduplicates every matching `message` / `message_end`
+  compatibility occurrence; repeated same-shape or id-less responses remain
+  distinct, while unmatched divergent cross-shape reuse makes the file
+  retryable. All three parsers emit
   content-free hourly activity buckets from persisted request/usage event
   timestamps; polling cadence affects freshness only and no wall-clock activity
   is inferred. Parser build versions are provenance and do not trigger scans or
@@ -601,7 +603,7 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   snapshot sync loop beside the local OTLP relay,
   uses source-scoped relay tokens and backend activity hints, scans the last
   six months by default with stricter backend windows allowed, caps each
-  app/source at 1000 recent files, strips filtered session titles or path-free
+  app/source at 10,000 recent files, strips filtered session titles or path-free
   workspace labels before upload when the effective backend org/user activity
   hint disables them, uploads changed snapshots in schema-v5 batches, and
   reports collector status and cap-hit metadata without exposing local paths.

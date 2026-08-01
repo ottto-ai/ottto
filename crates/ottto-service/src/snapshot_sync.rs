@@ -230,6 +230,13 @@ impl SnapshotUploadProgress {
             }));
     }
 
+    fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
+        let before = self.quarantined_fingerprints.len();
+        self.quarantined_fingerprints
+            .retain(|fingerprint, _| current.contains(fingerprint));
+        self.quarantined_fingerprints.len() != before
+    }
+
     fn save(&mut self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
@@ -1763,6 +1770,13 @@ fn sync_source(
         );
     }
     finalize_scan_after_policy(source, &mut scan_result, &mut index);
+    // A long-lived poison item can keep upload progress around while unrelated
+    // files continue changing. Drop quarantine revisions no longer represented
+    // by the authoritative current index before any early upload error can
+    // preserve them forever.
+    if upload_progress.retain_current_quarantines(&index.current_snapshot_fingerprints()) {
+        upload_progress.save(&upload_progress_path)?;
+    }
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
@@ -4474,6 +4488,25 @@ mod tests {
         .expect("backend-only recovery is retried after the bounded delay");
         assert_eq!(attempts, 1);
         assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn upload_progress_prunes_quarantine_revisions_absent_from_current_index() {
+        let current = "a".repeat(64);
+        let stale = "b".repeat(64);
+        let mut progress = test_upload_progress();
+        progress.quarantine([current.as_str(), stale.as_str()]);
+
+        assert!(progress.retain_current_quarantines(&BTreeSet::from([current.clone()])));
+        assert_eq!(
+            progress
+                .quarantined_fingerprints
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [current]
+        );
+        assert!(!progress.retain_current_quarantines(&BTreeSet::from(["a".repeat(64)])));
     }
 
     #[test]

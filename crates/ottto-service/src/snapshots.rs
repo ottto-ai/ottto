@@ -171,11 +171,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // retaining support for transcripts that carry only one of the two shapes.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v25";
-// v12 accepts Pi's current persisted assistant `type=message` usage shape in
-// addition to the legacy `message_end` form, deduplicating an exact response
-// id when both are present. It also reads current session `id` and nested user
-// role/title material.
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v12";
+// v13 makes the provider response timestamp authoritative for both Pi usage
+// record shapes and reconciles every exact cross-shape occurrence for a reused
+// response id. This prevents envelope write time from moving current records
+// into a different hour or turning a valid transitional pair into loss.
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
 // by the 0.1.91 baseline so upgrading to semantic sync does not itself select
@@ -202,7 +202,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v12";
 // already-known usage.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
-pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v12";
+pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
 const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
@@ -3200,15 +3200,12 @@ struct SnapshotAccumulator {
     // older exporters used `type=message_end`. When both representations are
     // present, their response id is the exact occurrence key that prevents a
     // compatibility parser from charging the same response twice.
-    // The value includes record shape plus the canonical occurrence digest.
-    // Opposite-shape exact duplicates are suppressed, repeated same-shape
-    // records remain distinct, and divergent opposite-shape reuse is loss.
-    seen_pi_usage_keys: BTreeMap<String, (PiUsageRecordShape, String)>,
-    // A response id reused with different semantic usage is ambiguous rather
-    // than a duplicate. Keep the conflict count on the per-file accumulator so
-    // the whole transcript stays retryable and no first-wins partial result can
-    // settle.
-    pi_usage_conflict_count: usize,
+    // Each response id retains the unmatched digest multiset for both record
+    // shapes. A later opposite-shape exact match consumes one occurrence;
+    // repeated same-shape occurrences remain distinct. Keeping the multiset is
+    // required because transitional writers may reuse one response id for more
+    // than one paired occurrence.
+    seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
     // Positive usage observations deliberately refused because their activity
     // timestamp could not produce a truthful hourly bucket.
     dropped_usage_record_count: u64,
@@ -3270,7 +3267,6 @@ impl SnapshotAccumulator {
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
             seen_pi_usage_keys: BTreeMap::new(),
-            pi_usage_conflict_count: 0,
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
@@ -4333,7 +4329,16 @@ fn scan_source_roots_with_limit_and_attribution(
     let census_window_end = traversal.census_window_end.clone();
     let discovered_file_count = traversal.counts.discovered_file_count;
     let mut pending_paths = Vec::new();
-    let hinted_budget = file_limit.min(MAX_WATCHER_HINTED_FILES_PER_TICK);
+    // Watcher freshness must not starve the durable census when callers use a
+    // small page size. Production reserves almost the whole 10k page already,
+    // but the explicit slot also makes liveness independent of that ratio.
+    let ordinary_census_pending = traversal
+        .pending_candidates
+        .iter()
+        .any(|candidate| candidate.census_member && !candidate.watcher_hint);
+    let hinted_budget = file_limit
+        .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
+        .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
     for _ in 0..hinted_budget {
         let Some(position) = traversal
             .pending_candidates
@@ -4350,7 +4355,7 @@ fn scan_source_roots_with_limit_and_attribution(
         let Some(position) = traversal
             .pending_candidates
             .iter()
-            .position(|candidate| candidate.census_member)
+            .position(|candidate| candidate.census_member && !candidate.watcher_hint)
         else {
             break;
         };
@@ -4612,6 +4617,15 @@ fn scan_source_roots_with_limit_and_attribution(
         semantic_noop_count += state_only_noops;
     }
     if let Some(traversal) = index.traversal.as_mut() {
+        // Exact watcher remove/rename hints must amend the same durable
+        // observation set used by directory census reconciliation. Apply
+        // removals first so a valid observation later in this page wins.
+        for index_key in &census.removed_index_keys {
+            traversal.observed_index_keys.remove(index_key);
+        }
+        traversal
+            .observed_index_keys
+            .extend(census.observed_index_keys.iter().cloned());
         traversal.counts.directory_entry_cap_exceeded_count +=
             census.directory_entry_cap_exceeded_count;
         traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
@@ -5236,7 +5250,11 @@ fn parse_opened_jsonl_file(
     }
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
-        recognized_usage_drop_count += accumulator.pi_usage_conflict_count;
+        recognized_usage_drop_count += accumulator
+            .seen_pi_usage_keys
+            .values()
+            .filter(|state| state.has_cross_shape_conflict())
+            .count();
     }
     let accumulator_dropped_usage_record_count = accumulator.dropped_usage_record_count as usize;
     recognized_usage_drop_count =
@@ -6901,24 +6919,11 @@ fn apply_pi_usage_line(
         let occurrence_digest =
             pi_usage_occurrence_digest(model.as_deref(), &usage, &selector, timestamp);
         let is_new_occurrence = match pi_usage_dedup_key(value) {
-            Some(key) => match accumulator.seen_pi_usage_keys.get(&key) {
-                Some((previous_shape, previous_digest))
-                    if *previous_shape != shape && previous_digest == &occurrence_digest =>
-                {
-                    false
-                }
-                Some((previous_shape, _)) if *previous_shape != shape => {
-                    accumulator.pi_usage_conflict_count += 1;
-                    false
-                }
-                Some(_) => true,
-                None => {
-                    accumulator
-                        .seen_pi_usage_keys
-                        .insert(key, (shape, occurrence_digest));
-                    true
-                }
-            },
+            Some(key) => accumulator
+                .seen_pi_usage_keys
+                .entry(key)
+                .or_default()
+                .record(shape, occurrence_digest),
             None => true,
         };
         if is_new_occurrence {
@@ -6940,7 +6945,9 @@ fn pi_usage_occurrence_digest(
     let selector_context = serde_json::to_string(&selector.context).unwrap_or_default();
     sha256_hex(&[
         model.unwrap_or(""),
-        timestamp.unwrap_or(""),
+        &timestamp
+            .and_then(pi_usage_timestamp_identity)
+            .unwrap_or_default(),
         &usage.input_tokens.to_string(),
         &usage.output_tokens.to_string(),
         &usage.cache_read_tokens.to_string(),
@@ -6974,16 +6981,26 @@ fn pi_timestamp_field(value: &Value) -> Option<String> {
 }
 
 fn pi_message_timestamp(value: &Value) -> Option<String> {
-    pi_timestamp_value(value.get("timestamp"))
-        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
+    // Current and transitional Pi records may carry a later envelope write
+    // time at the top level. Provider response time is the usage occurrence
+    // clock and is also what historical message_end records use.
+    pi_usage_record_timestamp(value)
 }
 
 fn pi_message_end_timestamp(value: &Value) -> Option<String> {
-    // Historical `message_end` records use the provider response timestamp
-    // nested in `message`; a later envelope write time may cross an hour
-    // boundary and must not move already-accounted usage.
-    pi_timestamp_value(value.pointer("/message/timestamp"))
-        .or_else(|| pi_timestamp_value(value.get("timestamp")))
+    pi_usage_record_timestamp(value)
+}
+
+fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
+    let provider_timestamp = value.pointer("/message/timestamp");
+    if provider_timestamp.is_some() {
+        // Present-but-invalid provider evidence is loss. Falling back to the
+        // envelope would silently turn a malformed occurrence clock into a
+        // different, often later, billable hour.
+        pi_timestamp_value(provider_timestamp)
+    } else {
+        pi_timestamp_value(value.get("timestamp"))
+    }
 }
 
 fn pi_message_timestamp_is_present(value: &Value) -> bool {
@@ -7000,6 +7017,12 @@ fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
         }
     }
     pi_ms_timestamp(Some(value))
+}
+
+fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp_nanos().to_string())
 }
 
 fn pi_timestamp_is_before(candidate: &str, current: &str) -> bool {
@@ -7030,6 +7053,37 @@ fn pi_timestamp_is_after(candidate: &str, current: &str) -> bool {
 enum PiUsageRecordShape {
     Message,
     MessageEnd,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PiUsageDedupState {
+    message: BTreeMap<String, usize>,
+    message_end: BTreeMap<String, usize>,
+}
+
+impl PiUsageDedupState {
+    /// Returns true when this record is a new billable occurrence. An exact
+    /// opposite-shape occurrence consumes one unmatched digest and is the
+    /// compatibility duplicate of the occurrence already counted.
+    fn record(&mut self, shape: PiUsageRecordShape, digest: String) -> bool {
+        let (same_shape, opposite_shape) = match shape {
+            PiUsageRecordShape::Message => (&mut self.message, &mut self.message_end),
+            PiUsageRecordShape::MessageEnd => (&mut self.message_end, &mut self.message),
+        };
+        if let Some(count) = opposite_shape.get_mut(&digest) {
+            *count -= 1;
+            if *count == 0 {
+                opposite_shape.remove(&digest);
+            }
+            return false;
+        }
+        *same_shape.entry(digest).or_default() += 1;
+        true
+    }
+
+    fn has_cross_shape_conflict(&self) -> bool {
+        !self.message.is_empty() && !self.message_end.is_empty()
+    }
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -7321,8 +7375,8 @@ struct ScanCensus {
     recognized_usage_drop_count: usize,
     zero_snapshot_usage_evidence_count: usize,
     dropped_usage_record_count: u64,
-    #[cfg(test)]
     observed_index_keys: BTreeSet<String>,
+    removed_index_keys: BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -8391,6 +8445,11 @@ fn enqueue_watcher_hints(
     hinted_paths: &[PathBuf],
     watcher_overflowed: bool,
 ) {
+    // Ordinary, bounded watcher paths are exact path hints. They join the
+    // durable traversal census and are revalidated by the same no-follow open
+    // and post-read identity checks as directory-discovered candidates. Only
+    // overflow/backend loss makes the watcher evidence incomplete and forces a
+    // following clean generation.
     traversal.watcher_hint_seen |= watcher_overflowed;
     let mut pending = traversal
         .pending_candidates
@@ -8413,13 +8472,14 @@ fn enqueue_watcher_hints(
         else {
             continue;
         };
-        traversal.pending_candidates.push_front(ScanTraversalPath {
+        // FIFO keeps an actively rewritten path from repeatedly jumping ahead
+        // of an older remove/rename hint in a small bounded page.
+        traversal.pending_candidates.push_back(ScanTraversalPath {
             scan_root,
             path: path.clone(),
-            census_member: false,
+            census_member: true,
             watcher_hint: true,
         });
-        traversal.watcher_hint_seen = true;
     }
 }
 
@@ -8582,7 +8642,15 @@ fn candidate_from_traversal_path(
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if pending.census_member {
+            if pending.watcher_hint {
+                // Remove/rename events legitimately name an object that no
+                // longer exists. They are not lossy census failures; remove an
+                // earlier observation so terminal reconciliation can delete
+                // the stale entry exactly.
+                census
+                    .removed_index_keys
+                    .insert(local_index_key(&pending.path));
+            } else if pending.census_member {
                 census.disappeared_file_count += 1;
             }
             return None;
@@ -8616,6 +8684,11 @@ fn candidate_from_traversal_path(
         .ok()
         .and_then(unix_nanos)
         .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
+    if pending.census_member {
+        census
+            .observed_index_keys
+            .insert(local_index_key(&pending.path));
+    }
     Some(CandidateFile {
         scan_root: pending.scan_root,
         source_file_fingerprint: String::new(),
@@ -8641,7 +8714,6 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
         return true;
     };
     let after = snapshot.reconciliation_after.clone();
-    let observed = snapshot.observed_index_keys.clone();
     let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
     let page = index
         .files
@@ -8653,7 +8725,11 @@ fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usiz
         return true;
     }
     for key in &page {
-        if !observed.contains(key) {
+        let observed = index
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
+        if !observed {
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -9243,10 +9319,10 @@ impl ScanIndex {
     /// locally" is not derivable from anything the server already receives.
     ///
     /// Grain, stated precisely because a consumer cannot infer it: one entity
-    /// per indexed transcript that produced a snapshot, plus one per Codex
-    /// state-only session. A transcript that parses into several snapshots
-    /// contributes its LAST fingerprint, which is the same value the index uses
-    /// for no-op suppression.
+    /// per final snapshot fingerprint, including every entity when one indexed
+    /// transcript produces several snapshots, plus each Codex state-only
+    /// entity. The separate per-file group fingerprint is only an incremental
+    /// no-op witness and never substitutes for this exact entity set.
     ///
     /// Scope is the exact half-open semantic activity window `[start, end)`.
     /// Membership uses the same producer-side activity clock as accepted-log
@@ -9296,26 +9372,10 @@ impl ScanIndex {
                 "snapshot manifest window must be non-empty and increasing"
             ));
         }
-        let exact_file_fingerprints = self
-            .file_snapshot_fingerprints
-            .values()
-            .flat_map(|values| values.iter().map(String::as_str));
-        let legacy_file_fingerprints = self
-            .files
-            .iter()
-            .filter(|(key, _)| !self.file_snapshot_fingerprints.contains_key(*key))
-            .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
-        let all_fingerprints = exact_file_fingerprints
-            .chain(legacy_file_fingerprints)
-            .chain(
-                self.codex_state_only_snapshot_fingerprints
-                    .values()
-                    .map(String::as_str),
-            )
-            .collect::<BTreeSet<_>>();
+        let all_fingerprints = self.current_snapshot_fingerprints();
         let fingerprints = all_fingerprints
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|fingerprint| {
                 !self
                     .quarantined_snapshot_fingerprints
@@ -9341,11 +9401,11 @@ impl ScanIndex {
             .filter(|fingerprint| {
                 !self
                     .quarantined_snapshot_fingerprints
-                    .contains_key(**fingerprint)
+                    .contains_key(*fingerprint)
             })
             .all(|fingerprint| {
                 self.snapshot_activity_at
-                    .get(*fingerprint)
+                    .get(fingerprint)
                     .is_some_and(valid_snapshot_activity)
             })
         {
@@ -9362,6 +9422,26 @@ impl ScanIndex {
             entity_count: fingerprints.len() as u64,
             rolling_hash: format!("{:x}", digest.finalize()),
         })
+    }
+
+    pub(crate) fn current_snapshot_fingerprints(&self) -> BTreeSet<String> {
+        let exact_file_fingerprints = self
+            .file_snapshot_fingerprints
+            .values()
+            .flat_map(|values| values.iter().cloned());
+        let legacy_file_fingerprints = self
+            .files
+            .iter()
+            .filter(|(key, _)| !self.file_snapshot_fingerprints.contains_key(*key))
+            .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.clone());
+        exact_file_fingerprints
+            .chain(legacy_file_fingerprints)
+            .chain(
+                self.codex_state_only_snapshot_fingerprints
+                    .values()
+                    .cloned(),
+            )
+            .collect()
     }
 
     /// The subset of this scan's index that is safe to commit when the upload
@@ -11616,7 +11696,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_hint_progresses_immediately_then_requires_clean_frozen_sweep() {
+    fn bounded_watcher_hint_joins_complete_durable_census() {
         let root = temp_dir("bounded-watcher-hint");
         let path = root.join("session.jsonl");
         fs::write(
@@ -11641,23 +11721,112 @@ mod tests {
         .expect("hinted scan");
         finalize_scan_after_policy(SnapshotSource::Pi, &mut hinted, &mut index);
         assert_eq!(hinted.snapshots.len(), 1);
-        assert!(!hinted.census_complete);
-        assert!(hinted.scan_cap_hit);
-        assert!(index.traversal.is_none(), "next tick starts a clean sweep");
+        assert!(hinted.census_complete);
+        assert!(!hinted.scan_cap_hit);
+        assert!(index.traversal.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
 
-        let clean = scan_source_roots(
+    #[test]
+    fn repeated_watcher_hints_cannot_starve_bounded_census() {
+        let root = temp_dir("bounded-repeated-watcher-hint");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let active_path = root.join("a-active.jsonl");
+        fs::write(&active_path, fixture(1)).expect("write active fixture");
+        fs::write(root.join("b.jsonl"), fixture(2)).expect("write second fixture");
+        fs::write(root.join("c.jsonl"), fixture(3)).expect("write third fixture");
+        let mut index = ScanIndex::default();
+
+        for tick in 0..3 {
+            let scan = scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                &format!("2026-07-31T00:0{tick}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                None,
+                std::slice::from_ref(&active_path),
+                false,
+            )
+            .expect("bounded hinted scan");
+            if tick < 2 {
+                assert!(!scan.census_complete);
+                assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
+            } else {
+                assert!(scan.census_complete);
+                assert!(index.traversal.is_none());
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_hint_removes_old_index_key_despite_repeated_active_hints() {
+        let root = temp_dir("bounded-watcher-rename");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let old_path = root.join("a-old.jsonl");
+        let new_path = root.join("b-new.jsonl");
+        let active_path = root.join("c-active.jsonl");
+        fs::write(&old_path, fixture(1)).expect("write old fixture");
+        fs::write(&active_path, fixture(2)).expect("write active fixture");
+        let mut index = ScanIndex::default();
+
+        let initial = scan_source_roots(
             SnapshotSource::Pi,
             std::slice::from_ref(&root),
             &mut index,
-            "2026-07-31T00:05:00Z",
+            "2026-07-31T00:00:00Z",
             BACKFILL_WINDOW_DAYS,
         )
-        .expect("clean follow-up sweep");
-        assert!(clean.census_complete);
-        assert!(
-            clean.snapshots.is_empty(),
-            "accepted hint is a semantic no-op"
-        );
+        .expect("initial complete scan");
+        assert!(initial.census_complete);
+        assert!(index.files.contains_key(&local_index_key(&old_path)));
+
+        fs::rename(&old_path, &new_path).expect("rename fixture");
+        let initial_hints = vec![old_path.clone(), new_path.clone(), active_path.clone()];
+        let mut completed = false;
+        for tick in 1..=6 {
+            let hints = if tick == 1 {
+                initial_hints.as_slice()
+            } else {
+                std::slice::from_ref(&active_path)
+            };
+            let mut scan = scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                &format!("2026-07-31T00:0{tick}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                None,
+                hints,
+                false,
+            )
+            .expect("bounded rename scan");
+            finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+            assert_eq!(scan.disappeared_file_count, 0);
+            if scan.census_complete {
+                completed = true;
+                break;
+            }
+        }
+
+        assert!(completed, "rename/remove hint must settle under activity");
+        assert!(!index.files.contains_key(&local_index_key(&old_path)));
+        assert!(index.files.contains_key(&local_index_key(&new_path)));
+        assert!(index.files.contains_key(&local_index_key(&active_path)));
+        assert_eq!(index.files.len(), 2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -13770,6 +13939,36 @@ mod tests {
         assert_eq!(corrected.zero_snapshot_usage_evidence_count, 0);
         assert_eq!(corrected.dropped_usage_record_count, 0);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_invalid_provider_timestamp_does_not_fall_back_to_envelope_time() {
+        let root = temp_dir("pi-invalid-provider-valid-envelope");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T09:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"bad-provider-time\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write invalid provider timestamp fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T09:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan invalid provider timestamp fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(index.files.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19705,6 +19904,70 @@ mod tests {
         assert_eq!(item.request_count, 1);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_transitional_pair_uses_provider_time_across_hour_boundary() {
+        let path = temp_file("pi-provider-time-dedup");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:02Z\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":\"2026-07-22T10:59:59.000Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write provider-time fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-07-22T10:59:59Z")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_reused_response_id_reconciles_every_cross_shape_occurrence() {
+        let root = temp_dir("pi-reused-response-id-pairs");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"usage\":{\"input\":20,\"output\":5}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:01.000Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:02.000Z\",\"usage\":{\"input\":20,\"output\":5}}}\n",
+            ),
+        )
+        .expect("write reused response-id fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan reused response-id fixture");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 0);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots[0].input_tokens, 32);
+        assert_eq!(scan.snapshots[0].output_tokens, 9);
+        assert_eq!(scan.snapshots[0].request_count, 2);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

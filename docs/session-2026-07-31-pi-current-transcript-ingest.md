@@ -16,9 +16,12 @@ transcripts but derived no session snapshots.
   model, and timestamp fields while preserving historical compatibility.
 - Deduplicate a provider response if a transitional transcript contains both
   `message` and `message_end` usage records and exposes a stable response
-  identifier. Repeated same-shape and id-less responses remain distinct; a
-  divergent cross-shape reuse makes the file retryable instead of selecting a
-  first-wins total.
+  identifier. The provider response timestamp, not the later envelope write
+  timestamp, is authoritative in both shapes. A digest multiset reconciles
+  every exact pair even when one response id is reused for multiple
+  occurrences. Repeated same-shape and id-less responses remain distinct; any
+  unmatched divergent cross-shape reuse makes the file retryable instead of
+  selecting a first-wins total.
 - Compare Pi's parsed RFC 3339 timestamps chronologically rather than
   lexicographically, including mixed fractional-second forms. Valid timestamps
   outrank malformed boundaries; malformed pairs retain deterministic lexical
@@ -43,7 +46,7 @@ transcripts but derived no session snapshots.
 - Snapshot audit, client status, and sync state expose confirmed-empty,
   positive-usage-evidence, and dropped-usage counters without introducing a
   second per-file settlement state machine.
-- Advance Pi parser and scan identity to `pi_jsonl:v12`, causing one bounded
+- Advance Pi parser and scan identity to `pi_jsonl:v13`, causing one bounded
   correctness rescan without changing the explicit historical replay policy.
 - Add a content-sanitized current-shape fixture plus parser, transitional
   deduplication, timestamp-boundary, zero-checkpoint, scan-manifest, and
@@ -59,3 +62,10 @@ The next scan did zero repeated work for those genuine empties while preserving
 the 426-entity manifest, and none set the positive-usage evidence marker. The
 audit did not alter the daemon's production replay
 index or upload data.
+
+A second read-only aggregate audit found 512 current assistant-usage rows. All
+512 carried distinct envelope and provider timestamps, and two crossed an hour
+boundary. The provider-time regression fixture pins that observed shape without
+copying transcript content. A capacity audit covered 1,030 configured-root
+directories: the widest had 411 entries and none exceeded the explicit 10,000
+entry fail-closed boundary.

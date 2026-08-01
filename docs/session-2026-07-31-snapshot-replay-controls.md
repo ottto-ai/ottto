@@ -16,12 +16,19 @@ daemon, or tighten the backend registration route.
   directory wider than the discovery budget fails red without materializing
   the tail. It rejects root and descendant symlinks, keeps per-path
   unreadable/oversize/disappearance counts, and continues with healthy paths.
-- Watcher paths are coalesced and bounded hints, never completeness authority.
-  Queue overflow or a watcher backend error dirties the current generation;
-  no terminal manifest can publish until a following clean durable traversal.
-  A terminal unhealthy generation retains its red witness and retries on a
-  bounded 1-minute-to-1-hour backoff instead of rescanning history every tick,
-  while healthy hinted siblings continue through quarantine-not-fence.
+- Watcher paths are coalesced, bounded, exact-path hints, never source-wide
+  completeness authority. An ordinary hint joins the durable census, is
+  revalidated through the same no-follow opened-object checks, and cannot
+  starve ordinary directory candidates even under a one-file test page. Queue
+  order is FIFO, and remove/rename hints delete the prior durable observation
+  without treating the now-missing path as census loss, so a continuously
+  active sibling cannot strand stale index entries or keep settlement red.
+  overflow or a watcher backend error is different: lost paths dirty the
+  current generation, and no terminal manifest can publish until a following
+  clean durable traversal. A terminal unhealthy generation retains its red
+  witness and retries on a bounded 1-minute-to-1-hour backoff instead of
+  rescanning history every tick, while healthy hinted siblings continue
+  through quarantine-not-fence.
 - The parser reads the exact `O_NOFOLLOW`-opened regular file. Its v2 identity
   binds device/inode/change-time-nanoseconds plus bounded first/last content
   samples; change time catches middle-only in-place rewrites whose size and
@@ -31,10 +38,13 @@ daemon, or tighten the backend registration route.
   that failed conversion make the file incomplete. An incomplete file is not
   recorded as empty or settled. Confirmed-empty is a separate durable state.
 - Pi accepts both current nested `type=message` assistant usage and legacy
-  `message_end` usage. Exact duplicate response ids deduplicate by a canonical
-  usage occurrence digest; divergent reuse makes the whole file retryable.
-  Numeric timestamps are accepted at either the message or top level, and
-  current nested user content arrays feed the safe title fallback.
+  `message_end` usage. Provider response time has the same precedence in both
+  shapes; a later envelope write time cannot move usage across an hour. Every
+  exact duplicate response-id occurrence is reconciled by a canonical instant
+  plus usage digest, including multiple pairs under one reused id; unmatched
+  divergent cross-shape reuse makes the whole file retryable. Numeric
+  timestamps are accepted at either the message or top level, and current
+  nested user content arrays feed the safe title fallback.
 - Claude desktop titles are optional enrichment. CLI sessions without a title
   and desktop-only titles without a CLI session id are complete no-ops, not
   corrupt files. True parse/read/type failures retain prior durable titles,
@@ -75,6 +85,9 @@ changing repair code or a contract component automatically retries even the
 same semantic fingerprint. Unchanged backend-only failures retry on a
 deterministically staggered 6–12 hour clock, at most one 20-entity retry page per
 cycle; far-future or backward-clock-corrupted deadlines cannot fence forever.
+Before upload, quarantine revisions absent from the authoritative current index
+are pruned and checkpointed, so one long-lived poison item cannot make the
+hash-only progress ledger grow with every unrelated historical revision.
 Partial commits advance only files whose complete entity set is accepted or
 quarantined; an unsettled repair retry preserves the older mismatched witness so
 the following cycle retries again.
