@@ -137,6 +137,15 @@ fn redact_json_value(value: &mut serde_json::Value) -> bool {
             }
             changed
         }
+        serde_json::Value::String(text) => {
+            let redacted = redact_inline(text);
+            if redacted == *text {
+                false
+            } else {
+                *text = redacted;
+                true
+            }
+        }
         _ => false,
     }
 }
@@ -561,6 +570,14 @@ mod tests {
         ] {
             assert!(!redacted.contains(private_value));
         }
+    }
+
+    #[test]
+    fn compact_json_key_redaction_does_not_bypass_inline_secret_redaction() {
+        assert_eq!(
+            redact_inline(r#"{"token":"secret-value","detail":"token candidate-header-value"}"#,),
+            r#"{"detail":"token [REDACTED]","token":"[REDACTED]"}"#
+        );
     }
 
     #[test]

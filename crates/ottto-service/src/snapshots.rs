@@ -7198,6 +7198,7 @@ enum PiUsageRecordShape {
 struct PiUsageDedupState {
     message: BTreeMap<String, usize>,
     message_end: BTreeMap<String, usize>,
+    paired_digests: BTreeSet<String>,
 }
 
 impl PiUsageDedupState {
@@ -7210,6 +7211,7 @@ impl PiUsageDedupState {
             PiUsageRecordShape::MessageEnd => (&mut self.message_end, &mut self.message),
         };
         if let Some(count) = opposite_shape.get_mut(&digest) {
+            self.paired_digests.insert(digest.clone());
             *count -= 1;
             if *count == 0 {
                 opposite_shape.remove(&digest);
@@ -7221,7 +7223,13 @@ impl PiUsageDedupState {
     }
 
     fn has_cross_shape_conflict(&self) -> bool {
-        !self.message.is_empty() && !self.message_end.is_empty()
+        (!self.message.is_empty() && !self.message_end.is_empty())
+            || (!self.paired_digests.is_empty()
+                && self
+                    .message
+                    .keys()
+                    .chain(self.message_end.keys())
+                    .any(|digest| !self.paired_digests.contains(digest)))
     }
 }
 
@@ -20882,6 +20890,65 @@ mod tests {
         assert!(index.files.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_unmatched_divergence_after_exact_pair_quarantines_the_file() {
+        let root = temp_dir("pi-divergent-response-id-after-pair");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707202000,\"usage\":{\"input\":99,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write partially paired divergent response-id fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan partially paired divergent response-id fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(!scan.census_complete);
+        assert!(index.files.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_repeated_identical_occurrence_survives_one_compatibility_pair() {
+        let path = temp_file("pi-repeated-identical-with-pair");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated identical occurrence fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

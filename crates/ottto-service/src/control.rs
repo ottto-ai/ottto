@@ -3797,8 +3797,7 @@ fn probe_pruned_device_credential_authority(
         Err(error)
             if matches!(
                 &error,
-                LocalApiError::Backend(details)
-                    if matches!(details.status, Some(401) | Some(403))
+                LocalApiError::Backend(details) if details.status == Some(401)
             ) && pending_device_credential_is_past_expiry(pending) =>
         {
             Ok(PrunedDeviceCredentialProbe::Inactive)
@@ -13654,6 +13653,51 @@ mod tests {
             .load()
             .expect("load pending")
             .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn expired_pruned_preparation_preserves_candidate_after_forbidden_probe() {
+        let support_root = telemetry_key_store_root("credential-pruned-forbidden");
+        let secret_root = telemetry_key_store_root("credential-pruned-forbidden-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let (pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        );
+        let server = thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pruned status");
+            let _ = read_complete_http_request(&mut status);
+            write_json_response(&mut status, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept forbidden relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 403, "Forbidden", r#"{"detail":"policy"}"#);
+        });
+
+        assert!(matches!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::Backend(details)) if details.status == Some(403)
+        ));
+        server.join().expect("recovery server");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("load pending candidate"),
+            candidate
+        );
     }
 
     #[test]
