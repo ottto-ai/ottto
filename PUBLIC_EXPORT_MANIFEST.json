@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 300,
-  "content_sha256": "861508cb3bb9c978f81cd858882a740d87bc045842e6d115291b3a17aaad9537",
+  "content_sha256": "e0ccdf82701d3a7db0019864de70f9e95773d8987c3923248cd84fa4ec817e3b",
   "files": [
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "89545ac021b836905e9cf75df3947d3624e737208e223d3303ac926d8e57ece0",
-      "size_bytes": 232413
+      "sha256": "351c24fded06f00fadeb67b412730c5ef25c35834dad4d632cd745b835094407",
+      "size_bytes": 232538
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "79a97780182b50a6e9fbe7f5601c742b3323bb5ebf26cdbd358f9918c0418180",
-      "size_bytes": 928171
+      "sha256": "d76af30af951e82237622ab41b1c82d288d61128bf3eb54b7abc626edd479d2e",
+      "size_bytes": 938241
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-31-snapshot-replay-controls.md",
-      "sha256": "f40cd76ec6a77562523a482f1332081f355323026cb66a5807ca5eecacd0bc5e",
-      "size_bytes": 9002
+      "sha256": "9f7b1c9bd4705fc344208e251a095d025a5597d2e2cf9330bd1d27497651f7e0",
+      "size_bytes": 9544
     },
     {
       "executable": false,
@@ -1616,7 +1616,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/v2-golden-keys.json",
-      "sha256": "c833e469e8d1ce50126de8efc1357bc5533e4314f2a1d53a2f431f415ee23299",
+      "sha256": "29d6e6591f2c80c074ccced4747a0c84c2f8d343f93fcdc875b8173ae69b1221",
       "size_bytes": 1055
     },
     {
@@ -2103,7 +2103,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-01T19:14:06+00:00",
+  "generated_at": "2026-08-01T19:14:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 301,
   "public_roots": [
@@ -2139,5 +2139,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d4eda0839b7806cbed546c2a58f2041f40661927"
+  "source_commit": "d0a89d38a0d5f7862954c63dcc27a5d9d8a89ce4"
 }
