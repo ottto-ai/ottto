@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 300,
-  "content_sha256": "6c673a99d028a666653eab56a37a48ccaa22f39be4c2889b2d60c9dc84a9d219",
+  "content_sha256": "861508cb3bb9c978f81cd858882a740d87bc045842e6d115291b3a17aaad9537",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "934084df188d8db1edeae9cca14a761db4d382720bc36e0a3b5a4d2adf837ffa",
-      "size_bytes": 47422
+      "sha256": "6e152f3d21348ea1a6d39f003250261282ca84d3123450f3a9e605ad95d554ee",
+      "size_bytes": 47553
     },
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "80c58f51c48a4e7c8149fbf4192df3ce01eb5ba555f1bdbfd2a65d72cccc4fcd",
-      "size_bytes": 231011
+      "sha256": "89545ac021b836905e9cf75df3947d3624e737208e223d3303ac926d8e57ece0",
+      "size_bytes": 232413
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e534282cc6ea0cb51cbb66682b05d711901e7eadfe8dd64ca1e4eed6769ea8c0",
-      "size_bytes": 916515
+      "sha256": "79a97780182b50a6e9fbe7f5601c742b3323bb5ebf26cdbd358f9918c0418180",
+      "size_bytes": 928171
     },
     {
       "executable": false,
@@ -1217,15 +1217,15 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-31-pi-current-transcript-ingest.md",
-      "sha256": "61c56144c66cef8bc82b2fb85295f3077af5da9b8bd126ecc50b806b4392240a",
-      "size_bytes": 3423
+      "sha256": "a7f97b2299793163cafb440df861006fb16e8f10afad86a24813f74162f2241c",
+      "size_bytes": 4075
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-31-snapshot-replay-controls.md",
-      "sha256": "70613c086f802cc5b55fa1dc30403a03f08cf67ae76a66ba434e3c06be2c4236",
-      "size_bytes": 8084
+      "sha256": "f40cd76ec6a77562523a482f1332081f355323026cb66a5807ca5eecacd0bc5e",
+      "size_bytes": 9002
     },
     {
       "executable": false,
@@ -1595,7 +1595,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "1e2931c7a41f07c5422edc461e6daf0556921fcc781af0cce8ebf6c692a27591",
+      "sha256": "bc9f4d325d7adc40c7aa81b1b6040acea497c86198b6209b2de63865b5ee2cf5",
       "size_bytes": 218514
     },
     {
@@ -2103,7 +2103,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-01T19:13:42+00:00",
+  "generated_at": "2026-08-01T19:14:06+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 301,
   "public_roots": [
@@ -2139,5 +2139,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "df2dc76554d5e9f6b634227772f7a3038e80ab3e"
+  "source_commit": "d4eda0839b7806cbed546c2a58f2041f40661927"
 }
