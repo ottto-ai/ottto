@@ -93,8 +93,11 @@ daemon, or tighten the backend registration route.
   disabled collection; a nonterminal check-in without one is liveness-only and
   preserves the last terminal outcome. The process cache recovers from mutex
   poison so one caught panic cannot permanently suppress publication or
-  withdrawal. The daemon never fabricates an empty manifest to represent
-  unknown evidence.
+  withdrawal. Disabled, indeterminate, and partially failed upload outcomes
+  withdraw the cached agreement before a concurrent heartbeat can repeat it; a
+  shed republishes only after its accepted/quarantined committable subset is
+  durable. The daemon never fabricates an empty manifest to represent unknown
+  evidence.
 
 ## Durable state and quarantine
 
@@ -107,6 +110,13 @@ then removes it; a stale daemon cannot delete a winner. Invalid progress is
 moved to a unique corrupt sibling under the lock and rebuilt without overwriting
 the evidence. Syntactically valid corrupt activity clocks and quarantine retry
 deadlines beyond the bounded horizon are treated the same way.
+
+One-time legacy checkpoint adoption takes that same destination lock and
+rechecks the winner before copying, so overlapping upgraded daemons cannot
+replace an already-advanced generation. Frozen traversal context also binds the
+source scan identity, local index derivation, and exact-open identity; a restart
+after any reviewed derivation change begins a fresh bounded census instead of
+finishing a mixed-version queue.
 
 Per-entity permanent rejection is quarantine, not a source fence. The exact
 fingerprint is checkpointed locally with a content-free witness over collector,

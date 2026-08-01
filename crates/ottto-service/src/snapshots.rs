@@ -8460,6 +8460,15 @@ fn scan_traversal_context_fingerprint(
     let mut digest = Sha256::new();
     update_length_prefixed(&mut digest, b"ottto:snapshot-bounded-traversal:v1");
     update_length_prefixed(&mut digest, source.api_slug().as_bytes());
+    // A persisted queue contains paths already consumed under the scanner that
+    // created it. Resuming that queue after an upgrade without binding these
+    // derivations can skip the consumed prefix under the new identity and
+    // publish a mixed old/new terminal census. Parser-only releases remain
+    // resumable; reviewed scan/open identity changes start a fresh bounded
+    // traversal so every pre-existing candidate is reconsidered.
+    update_length_prefixed(&mut digest, source.scan_identity_version().as_bytes());
+    update_length_prefixed(&mut digest, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(&mut digest, &backfill_window_days.to_be_bytes());
     update_length_prefixed(
         &mut digest,
@@ -11883,6 +11892,61 @@ mod tests {
         assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
         assert!(traversal.pending_candidates.is_empty());
         assert!(traversal.counts.has_errors());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn traversal_restart_after_scan_derivation_upgrade_revisits_consumed_prefix() {
+        let root = temp_dir("bounded-traversal-derivation-upgrade");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write traversal fixture");
+        let roots = vec![root.clone()];
+        let mut index = ScanIndex::default();
+
+        // Exact pre-repair context: it bound scope/policy but not the scan,
+        // local-index, or exact-open derivations. Its empty queue represents a
+        // prefix already consumed by the older daemon before restart.
+        let mut legacy = Sha256::new();
+        update_length_prefixed(&mut legacy, b"ottto:snapshot-bounded-traversal:v1");
+        update_length_prefixed(&mut legacy, SnapshotSource::Pi.api_slug().as_bytes());
+        update_length_prefixed(&mut legacy, &BACKFILL_WINDOW_DAYS.to_be_bytes());
+        update_length_prefixed(&mut legacy, b"none");
+        update_length_prefixed(&mut legacy, b"none");
+        for scan_root in &roots {
+            update_length_prefixed(&mut legacy, scan_root.to_string_lossy().as_bytes());
+        }
+        index.traversal = Some(ScanTraversalCheckpoint {
+            context_fingerprint: format!("{:x}", legacy.finalize()),
+            census_window_end: "2026-07-31T00:00:00Z".to_string(),
+            scan_roots: roots.clone(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            unhealthy_retry_attempt: 0,
+            unhealthy_retry_not_before_unix_seconds: None,
+            counts: ScanTraversalCounts::default(),
+        });
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan derivation change starts a fresh bounded traversal");
+
+        assert_eq!(scan.census_window_end, "2026-07-31T00:05:00Z");
+        assert_eq!(scan.discovered_file_count, 1);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(scan.census_complete);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -442,6 +442,32 @@ fn withdraw_source_manifest(destination_namespace: &str, source: SnapshotSource)
         .remove(&(destination_namespace.to_string(), source.api_slug()));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn save_index_and_publish_manifest(
+    index: &mut ScanIndex,
+    index_path: &Path,
+    destination_namespace: &str,
+    source: SnapshotSource,
+    census_complete: bool,
+    window_start: &str,
+    window_end: &str,
+) -> Result<()> {
+    // The server may already hold this pass's new entities. Keep the previous
+    // process-cache witness withdrawn until the exact replacement index is
+    // durable; a failed CAS/save or manifest derivation must not let a
+    // concurrent heartbeat repeat stale agreement.
+    withdraw_source_manifest(destination_namespace, source);
+    index.save(index_path)?;
+    if census_complete {
+        publish_source_manifest(
+            destination_namespace,
+            source,
+            index.manifest_for_window(source, window_start, window_end)?,
+        );
+    }
+    Ok(())
+}
+
 fn cached_source_manifest(
     destination_namespace: &str,
     source: SnapshotSource,
@@ -1892,6 +1918,12 @@ fn sync_source(
         Ok(result)
     });
 
+    // The server may have accepted new entities even when the final result is a
+    // timeout, a disabled response, or a later local-state failure. Withdraw
+    // the pre-cycle cache for every outcome; completed/shed branches republish
+    // only after their exact replacement index is durable.
+    withdraw_source_manifest(&upload_destination_namespace, source);
+
     match upload_result {
         Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
         Ok(ResumableUploadResult::Shed { retry_after }) => {
@@ -1912,21 +1944,19 @@ fn sync_source(
             // `committable_subset` also retains an older quarantine witness for
             // restored prior entities. Replacing it with only this pass's
             // progress would make an absent retry look server-held.
-            if let Err(error) = committable.save(&index_path) {
+            if let Err(error) = save_index_and_publish_manifest(
+                &mut committable,
+                &index_path,
+                &upload_destination_namespace,
+                source,
+                scan_result.census_complete,
+                &manifest_window_start,
+                &manifest_window_end,
+            ) {
                 eprintln!(
                     "local snapshot partial scan checkpoint failed for {}: {}",
                     source.api_slug(),
                     safe_error(&error)
-                );
-            } else if scan_result.census_complete {
-                publish_source_manifest(
-                    &upload_destination_namespace,
-                    source,
-                    committable.manifest_for_window(
-                        source,
-                        &manifest_window_start,
-                        &manifest_window_end,
-                    )?,
                 );
             }
             report_status_with_fresh_relay_token(
@@ -2087,14 +2117,15 @@ fn sync_source(
     }
 
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
-    index.save(&index_path)?;
-    if scan_result.census_complete {
-        publish_source_manifest(
-            &upload_destination_namespace,
-            source,
-            index.manifest_for_window(source, &manifest_window_start, &manifest_window_end)?,
-        );
-    }
+    save_index_and_publish_manifest(
+        &mut index,
+        &index_path,
+        &upload_destination_namespace,
+        source,
+        scan_result.census_complete,
+        &manifest_window_start,
+        &manifest_window_end,
+    )?;
     // A completed cycle is what moves the tier: uploads keep a source warm, a
     // quiet cycle lets it fall to idle and then cold. The sweep marker is stamped
     // on the same event, which is what keeps the 6-hour full sweep independent of
@@ -2948,6 +2979,16 @@ fn adopt_legacy_checkpoint_file(legacy_path: &Path, stable_path: &Path) -> Resul
     }
     if let Some(parent) = stable_path.parent() {
         std::fs::create_dir_all(parent).context("create stable checkpoint directory")?;
+    }
+    // Adoption targets the same lock sibling used by scan-index/progress
+    // load/save. Without it, two overlapping upgraded daemons can both observe
+    // an absent stable path and a late legacy copy can overwrite the winner's
+    // already-advanced CAS generation. Recheck after acquiring because another
+    // process may have completed adoption between the optimistic check above
+    // and this non-blocking lock attempt.
+    let _lock = SnapshotProgressLock::acquire(stable_path)?;
+    if stable_path.exists() || !legacy_path.exists() {
+        return Ok(());
     }
     let temp_path = stable_path.with_extension(format!("json.{}.migrate", std::process::id()));
     let migration = (|| -> Result<()> {
@@ -4787,6 +4828,12 @@ mod tests {
         std::fs::write(&legacy, br#"{"files":{"legacy":{"size_bytes":1,"modified_unix_seconds":2,"source_file_fingerprint":"source","last_snapshot_fingerprint":"snapshot"}}}"#)
             .expect("write legacy index");
 
+        let held = SnapshotProgressLock::acquire(&stable).expect("hold destination lock");
+        adopt_legacy_checkpoint_file(&legacy, &stable)
+            .expect_err("overlapping adopter must not copy outside the destination lock");
+        assert!(!stable.exists());
+        drop(held);
+
         adopt_legacy_checkpoint_file(&legacy, &stable).expect("adopt exact legacy checkpoint");
         assert_eq!(
             std::fs::read(&stable).expect("read stable index"),
@@ -5521,6 +5568,37 @@ mod tests {
             assert!(!request.contains("\"manifest\""));
         }
         clear_source_manifests_for_test();
+    }
+
+    #[test]
+    #[serial(source_manifests)]
+    fn completed_upload_save_failure_cannot_leave_the_stale_manifest_cached() {
+        clear_source_manifests_for_test();
+        let destination = "destination";
+        publish_source_manifest(
+            destination,
+            SnapshotSource::Codex,
+            ScanIndex::default().manifest(SnapshotSource::Codex, 183),
+        );
+        let root = test_dir("completed-upload-index-save-failure");
+        let invalid_index_path = root.join("index-is-a-directory");
+        std::fs::create_dir_all(&invalid_index_path).expect("create invalid index target");
+        let mut replacement = ScanIndex::default();
+
+        save_index_and_publish_manifest(
+            &mut replacement,
+            &invalid_index_path,
+            destination,
+            SnapshotSource::Codex,
+            true,
+            "2026-01-01T00:00:00Z",
+            "2026-07-01T00:00:00Z",
+        )
+        .expect_err("post-ACK index save must fail at the invalid target");
+
+        assert!(cached_source_manifest(destination, SnapshotSource::Codex).is_none());
+        clear_source_manifests_for_test();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
