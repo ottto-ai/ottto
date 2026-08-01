@@ -1903,7 +1903,9 @@ fn sync_source(
                 &upload_progress.quarantined_fingerprints,
             );
             committable.mark_bounded_sweep_unsettled();
-            committable.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+            // `committable_subset` also retains an older quarantine witness for
+            // restored prior entities. Replacing it with only this pass's
+            // progress would make an absent retry look server-held.
             if let Err(error) = committable.save(&index_path) {
                 eprintln!(
                     "local snapshot partial scan checkpoint failed for {}: {}",

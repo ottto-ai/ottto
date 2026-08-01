@@ -3,7 +3,7 @@
   "machine_key": "eaf14fee18d0f4920ceb121e6de49b8a922b41d0d7fe2d1c5b8ce33949e6a2ac",
   "session_key": "c0ebc3cdc87f238c06dd113fdbe4be3f4323c220461d09c0c619caf0492e04de",
   "semantic_key": "91ca3a237a84fbb9ab1f91da740df6dcdc2efd36d7aac42d026b766f4b088a4c",
-  "revision_key_with_fixture_input_fingerprint": "f548f20efd4ec5f86aea4479dc5a0b9607674d27fa755838603eb7f3827ec3fb",
+  "revision_key_with_fixture_input_fingerprint": "da6328aafbaf60474b39026fbf7c53367ee92b0984a3ff5baff13f8536dd6f3f",
   "policy_neutral_component_keys": {
     "latency": "52d22ebfa2a082bef2d1126d3cfd502939dac65e33b830a830761614b38d1f09",
     "lifecycle_activity": "43be6b72d4be5bbeb97e3dc076bb06f94b02aa128053b7c54cfbd6d56b0b60a3",

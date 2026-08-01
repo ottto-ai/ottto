@@ -4370,10 +4370,19 @@ fn scan_source_roots_with_limit_and_attribution(
         pending_paths.push(candidate);
     }
     index.resume_census_window_end = Some(census_window_end.clone());
+    let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
     let mut census = ScanCensus::default();
     let mut files = pending_paths
         .into_iter()
-        .filter_map(|pending| candidate_from_traversal_path(source, pending, &mut census))
+        .filter_map(|pending| {
+            candidate_from_traversal_path(
+                source,
+                pending,
+                &mut census,
+                census_unix_seconds,
+                backfill_window_days,
+            )
+        })
         .collect::<Vec<_>>();
 
     let legacy_sidecar_fingerprint = match source {
@@ -4642,6 +4651,16 @@ fn scan_source_roots_with_limit_and_attribution(
             .counts
             .dropped_usage_record_count
             .saturating_add(census.dropped_usage_record_count);
+    }
+    // A remove/rename hint can arrive after bounded reconciliation has already
+    // passed this key. Removing it only from `observed_index_keys` is then too
+    // late: the reconciliation cursor will never revisit the stale entry and a
+    // terminal manifest can still publish it. The hint was revalidated as
+    // absent beneath the configured root above, so retire the corresponding
+    // derived index state directly. Any recreation after this absence witness
+    // belongs to the next generation.
+    for index_key in &census.removed_index_keys {
+        index.remove_file_entry(index_key);
     }
     let traversal_snapshot = index
         .traversal
@@ -8502,6 +8521,11 @@ fn advance_bounded_directory_traversal_with_budget(
     backfill_window_days: u64,
     max_entries: usize,
 ) {
+    // Eligibility belongs to the frozen census generation, not to whichever
+    // later tick happens to reach a directory. Otherwise a multi-page walk can
+    // silently age boundary files out while still publishing the earlier
+    // `census_window_end` as its agreement scope.
+    let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
     let mut remaining = max_entries;
     while remaining > 0 {
         let Some(directory) = traversal.pending_directories.pop_front() else {
@@ -8607,7 +8631,9 @@ fn advance_bounded_directory_traversal_with_budget(
                 .ok()
                 .and_then(unix_seconds)
                 .unwrap_or_default();
-            if !is_recent_enough(modified_unix_seconds, backfill_window_days) {
+            if census_unix_seconds.is_some_and(|now| {
+                !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
+            }) {
                 continue;
             }
             traversal.counts.discovered_file_count += 1;
@@ -8638,6 +8664,8 @@ fn candidate_from_traversal_path(
     source: SnapshotSource,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
 ) -> Option<CandidateFile> {
     let metadata = match fs::symlink_metadata(&pending.path) {
         Ok(metadata) => metadata,
@@ -8679,6 +8707,19 @@ fn candidate_from_traversal_path(
         .ok()
         .and_then(unix_seconds)
         .unwrap_or_default();
+    if census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days))
+    {
+        // Watcher hints must not widen the configured activity window. The
+        // same revalidation also handles an ordinary candidate whose mtime was
+        // restored behind the cutoff after directory discovery.
+        if pending.census_member {
+            census
+                .removed_index_keys
+                .insert(local_index_key(&pending.path));
+        }
+        return None;
+    }
     let modified_unix_nanos = metadata
         .modified()
         .ok()
@@ -8865,6 +8906,7 @@ fn collect_recent_jsonl_files(
     }
 }
 
+#[cfg(test)]
 fn is_recent_enough(modified_unix_seconds: u64, backfill_window_days: u64) -> bool {
     let Some(now) = unix_seconds(SystemTime::now()) else {
         return true;
@@ -9473,6 +9515,23 @@ impl ScanIndex {
             accepted.contains(fingerprint) || quarantined.contains_key(fingerprint)
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
+            if self.confirmed_empty_files.contains(key) {
+                // A newly discovered empty file has no remote entity to lose.
+                // A file that PREVIOUSLY produced an entity is different: a
+                // shed/partial pass has not acknowledged removal of that old
+                // server entity, so retain the prior checkpoint and retry the
+                // complete generation instead of publishing false agreement.
+                let previous_had_entity = previous
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_empty())
+                    || previous
+                        .files
+                        .get(key)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
+                        .is_some();
+                return !previous_had_entity;
+            }
             if let Some(exact) = self.file_snapshot_fingerprints.get(key) {
                 return exact.iter().all(|fingerprint| settled(fingerprint));
             }
@@ -9517,6 +9576,15 @@ impl ScanIndex {
                     .insert(session_id.clone(), committed.clone());
             }
         }
+        // A partial upload cannot make an absent state-only entity authoritative
+        // any more than it can publish a vanished transcript. No request in
+        // this pass settled deletion of the old server entity, so preserve it
+        // until a fully completed census can commit the absence.
+        for (session_id, fingerprint) in &previous.codex_state_only_snapshot_fingerprints {
+            codex_state_only_snapshot_fingerprints
+                .entry(session_id.clone())
+                .or_insert_with(|| fingerprint.clone());
+        }
         let mut confirmed_empty_files = previous.confirmed_empty_files.clone();
         let mut file_snapshot_fingerprints = previous.file_snapshot_fingerprints.clone();
         for key in &safe_keys {
@@ -9534,29 +9602,23 @@ impl ScanIndex {
                 }
             }
         }
-        let current_fingerprints = self
-            .file_snapshot_fingerprints
+        let committable_fingerprints = file_snapshot_fingerprints
             .values()
             .flat_map(BTreeSet::iter)
-            .chain(self.codex_state_only_snapshot_fingerprints.values())
+            .chain(codex_state_only_snapshot_fingerprints.values())
             .collect::<BTreeSet<_>>();
         let mut retained_quarantine = quarantined.clone();
         // If an old quarantine was retried under a newer contract but this
         // pass stopped before settlement, preserve the old witness. Its
         // mismatch is the durable instruction to retry again next cycle.
         for (fingerprint, witness) in &previous.quarantined_snapshot_fingerprints {
-            if current_fingerprints.contains(fingerprint)
+            if committable_fingerprints.contains(fingerprint)
                 && !accepted.contains(fingerprint)
                 && !quarantined.contains_key(fingerprint)
             {
                 retained_quarantine.insert(fingerprint.clone(), witness.clone());
             }
         }
-        let committable_fingerprints = file_snapshot_fingerprints
-            .values()
-            .flat_map(BTreeSet::iter)
-            .chain(codex_state_only_snapshot_fingerprints.values())
-            .collect::<BTreeSet<_>>();
         let mut snapshot_activity_at = BTreeMap::new();
         for fingerprint in committable_fingerprints {
             if let Some(activity_at) = self
@@ -9612,6 +9674,12 @@ impl ScanIndex {
             .filter(|(fingerprint, _)| current.contains(*fingerprint))
             .map(|(fingerprint, witness)| (fingerprint.clone(), witness.clone()))
             .collect();
+    }
+
+    fn remove_file_entry(&mut self, key: &str) {
+        self.files.remove(key);
+        self.confirmed_empty_files.remove(key);
+        self.file_snapshot_fingerprints.remove(key);
     }
 
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
@@ -11831,6 +11899,68 @@ mod tests {
     }
 
     #[test]
+    fn late_remove_hint_retires_key_already_passed_by_reconciliation() {
+        let root = temp_dir("bounded-watcher-late-remove");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let removed_path = root.join("a-removed.jsonl");
+        let retained_path = root.join("b-retained.jsonl");
+        fs::write(&removed_path, fixture(1)).expect("write removed fixture");
+        fs::write(&retained_path, fixture(2)).expect("write retained fixture");
+        let mut index = ScanIndex::default();
+
+        let initial = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("initial complete scan");
+        assert!(initial.census_complete);
+
+        let removed_key = local_index_key(&removed_path);
+        let retained_key = local_index_key(&retained_path);
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().expect("traversal");
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        traversal.observed_index_keys = BTreeSet::from([removed_key.clone(), retained_key.clone()]);
+        traversal.reconciliation_upper_bound = Some(retained_key.clone());
+        traversal.reconciliation_after = Some(removed_key.clone());
+        traversal.reconciliation_started = true;
+
+        fs::remove_file(&removed_path).expect("remove already-reconciled fixture");
+        let scan = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            std::slice::from_ref(&removed_path),
+            false,
+        )
+        .expect("settle late remove hint");
+
+        assert!(scan.census_complete);
+        assert!(!index.files.contains_key(&removed_key));
+        assert!(index.files.contains_key(&retained_key));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn watcher_overflow_dirties_generation_and_clean_sweep_repairs_missed_change() {
         let root = temp_dir("bounded-watcher-overflow");
         let first_path = root.join("a.jsonl");
@@ -12127,6 +12257,68 @@ mod tests {
         assert_eq!(scan.oversized_file_count, 1);
         assert!(!scan.census_complete);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_traversal_uses_frozen_census_time_for_age_cutoff() {
+        let root = temp_dir("bounded-frozen-age-cutoff");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+        )
+        .expect("write age-cutoff fixture");
+        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&Rfc3339)
+            .expect("format future frozen boundary");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            &future_boundary,
+            1,
+        )
+        .expect("scan against frozen future boundary");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.discovered_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_hint_cannot_widen_the_frozen_age_scope() {
+        let root = temp_dir("bounded-watcher-age-cutoff");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+        )
+        .expect("write watcher age-cutoff fixture");
+        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&Rfc3339)
+            .expect("format future frozen boundary");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            &future_boundary,
+            1,
+            1,
+            true,
+            None,
+            std::slice::from_ref(&path),
+            false,
+        )
+        .expect("scan out-of-scope watcher hint");
+
+        assert!(scan.census_complete);
+        assert!(scan.snapshots.is_empty());
+        assert!(index.files.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21748,6 +21940,22 @@ mod tests {
             "pending.jsonl".to_string(),
             manifest_index_entry(Some("old")),
         );
+        committed.files.insert(
+            "became-empty.jsonl".to_string(),
+            manifest_index_entry(Some("old-empty-entity")),
+        );
+        committed.file_snapshot_fingerprints.insert(
+            "became-empty.jsonl".to_string(),
+            BTreeSet::from(["old-empty-entity".to_string()]),
+        );
+        committed.codex_state_only_snapshot_fingerprints.insert(
+            "removed-state-only".to_string(),
+            "old-state-entity".to_string(),
+        );
+        committed.quarantined_snapshot_fingerprints.insert(
+            "old-state-entity".to_string(),
+            snapshot_quarantine_record(SnapshotSource::Codex),
+        );
 
         let mut scanned = committed.clone();
         // A semantic no-op: same fingerprint as the committed entry, so the
@@ -21774,6 +21982,23 @@ mod tests {
         scanned
             .files
             .insert("empty.jsonl".to_string(), manifest_index_entry(None));
+        scanned
+            .confirmed_empty_files
+            .insert("empty.jsonl".to_string());
+        // This file and state-only row previously had server entities. Their
+        // absence cannot become authoritative during a shed/partial commit.
+        scanned
+            .files
+            .insert("became-empty.jsonl".to_string(), manifest_index_entry(None));
+        scanned
+            .confirmed_empty_files
+            .insert("became-empty.jsonl".to_string());
+        scanned
+            .file_snapshot_fingerprints
+            .remove("became-empty.jsonl");
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .remove("removed-state-only");
 
         let accepted = BTreeSet::from(["bb".to_string()]);
         let committable = scanned.committable_subset(&committed, &accepted, &BTreeMap::new());
@@ -21784,6 +22009,25 @@ mod tests {
         );
         assert!(committable.files.contains_key("accepted.jsonl"));
         assert!(committable.files.contains_key("empty.jsonl"));
+        assert_eq!(
+            committable.files["became-empty.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old-empty-entity")
+        );
+        assert!(!committable
+            .confirmed_empty_files
+            .contains("became-empty.jsonl"));
+        assert_eq!(
+            committable
+                .codex_state_only_snapshot_fingerprints
+                .get("removed-state-only")
+                .map(String::as_str),
+            Some("old-state-entity")
+        );
+        assert!(committable
+            .quarantined_snapshot_fingerprints
+            .contains_key("old-state-entity"));
         assert_eq!(
             committable.files["pending.jsonl"]
                 .last_snapshot_fingerprint

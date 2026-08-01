@@ -16,6 +16,8 @@ daemon, or tighten the backend registration route.
   directory wider than the discovery budget fails red without materializing
   the tail. It rejects root and descendant symlinks, keeps per-path
   unreadable/oversize/disappearance counts, and continues with healthy paths.
+  File-age eligibility is evaluated against that frozen census boundary on
+  every later page; elapsed wall time cannot silently shrink the generation.
 - Watcher paths are coalesced, bounded, exact-path hints, never source-wide
   completeness authority. An ordinary hint joins the durable census, is
   revalidated through the same no-follow opened-object checks, and cannot
@@ -23,6 +25,8 @@ daemon, or tighten the backend registration route.
   order is FIFO, and remove/rename hints delete the prior durable observation
   without treating the now-missing path as census loss, so a continuously
   active sibling cannot strand stale index entries or keep settlement red.
+  Hinted files pass the same frozen age-window check as directory-discovered
+  files, so a watcher event cannot widen collection beyond policy.
   overflow or a watcher backend error is different: lost paths dirty the
   current generation, and no terminal manifest can publish until a following
   clean durable traversal. A terminal unhealthy generation retains its red
@@ -90,7 +94,10 @@ are pruned and checkpointed, so one long-lived poison item cannot make the
 hash-only progress ledger grow with every unrelated historical revision.
 Partial commits advance only files whose complete entity set is accepted or
 quarantined; an unsettled repair retry preserves the older mismatched witness so
-the following cycle retries again.
+the following cycle retries again. A transcript that became confirmed-empty, a
+vanished transcript, or an absent Codex state-only entity retains its prior
+checkpoint until a complete cycle can make that absence authoritative; any
+associated quarantine witness is retained with it.
 
 ## Batch/ACK contract
 
