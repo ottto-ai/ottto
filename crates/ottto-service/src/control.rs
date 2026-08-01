@@ -17,9 +17,13 @@ use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
     execute_local_uninstall, generate_control_token, install_owner_for_path,
     local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
-    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore, KeychainSecretStore,
-    LocalConnectionBinding, LocalDeviceBinding, UninstallExecutionOptions, OTTTO_CLIENT_NAME,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore,
+    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
+    LocalDeviceBinding, LocalDeviceCredentialBinding, PendingClaimCredentialCommit,
+    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority, TokenStoreError,
+    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
     validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -64,6 +68,10 @@ use toml_edit::{DocumentMut, Item, Table};
 // marketing-site cutover). Matches DIRECT_API_BASE_URL below.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
+const DEVICE_CREDENTIAL_PREPARATION_CAPABILITY: &str = "device_credential_prepare_confirm_v1";
+const DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER: &str =
+    "X-Ottto-Device-Credential-Preparation-Secret";
+const PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION: u16 = 2;
 // Legacy apex proxy base persisted by daemons installed before the marketing
 // cutover. Still trusted/recognized so existing installs keep ingesting until
 // they re-onboard onto the direct api.ottto.net base.
@@ -2721,16 +2729,20 @@ fn complete_pending_auth_claim(
     // lifecycle mutex during network I/O. The RAII guard blocks concurrent
     // Cloud-session admission and clears on every return or panic.
     let identity_reservation = reserve_identity_mutation(true)?;
-    let completed = match complete_setup_claim(&pending, machine) {
+    let completion = match complete_setup_claim(&pending, machine, Some(&identity_reservation)) {
         Ok(completed) => completed,
         Err(error) => {
             log_auth_complete_backend_failure(&error);
             return Err(error);
         }
     };
+    let completed = completion.response;
     // Validate the relay-device payload up front so a malformed completion is
     // rejected before any staging or persistence.
-    let relay_credentials = relay_device_credentials_from_claim_completion(&completed)?;
+    let relay_credentials = relay_device_credentials_from_claim_completion(
+        &completed,
+        completion.prior_device_credential.as_ref(),
+    )?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -2749,13 +2761,50 @@ fn complete_pending_auth_claim(
             text: "This Mac is connected to Ottto.".to_string(),
         }),
     };
+    let prepared_pending = match &relay_credentials {
+        ClaimRelayDeviceCredential::Prepared(prepared) => {
+            let claim_commit = PendingClaimCredentialCommit {
+                account: account.clone(),
+                connection: LocalConnectionBinding {
+                    setup_run_id: completed.setup_run_id.clone(),
+                    setup_run_token_expires_at: completed.setup_run_token_expires_at.clone(),
+                    machine_id: completed.machine_id.clone(),
+                    claim_code: Some(pending.claim_code.clone()),
+                    api_base_url: validated_api_base_url(None)?,
+                },
+                target_user_id: completed.user.id.clone(),
+                setup_run_token_sha256: secret_sha256(&completed.setup_run_token),
+                backfill_policy: completed.backfill_policy.clone(),
+                backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
+            };
+            let pending = pending_device_credential_from_preparation(
+                &validated_api_base_url(None)?,
+                prepared,
+                false,
+                Some(claim_commit),
+                completion.request_authority.clone(),
+            )?;
+            stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
+            stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
+            let staged = FilePendingDeviceCredentialStore::default()
+                .load()
+                .map_err(|_| LocalApiError::StatePoisoned)?
+                .ok_or(LocalApiError::StatePoisoned)?;
+            if staged.preparation_id != pending.preparation_id {
+                return Err(LocalApiError::StatePoisoned);
+            }
+            Some(staged)
+        }
+        ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Legacy(_, _) => None,
+    };
     // Claim-collision check BEFORE any persistence. Previously the new
     // setup-run token and relay-device credentials were written to the
     // keychain before the user-mismatch check fired, leaving a half-installed
     // credential set for the wrong user alongside the old account files. On a
     // mismatch the fully-completed claim is staged in memory and surfaced as a
-    // switch candidate; nothing on disk or in the keychain changes until the
-    // switch is confirmed via `auth_switch_account`.
+    // switch candidate. A modern candidate may already be present in the
+    // separate pending journal/Keychain account, but active account/device
+    // authority remains unchanged until `auth_switch_account`.
     if let Some(candidate) = daemon.stage_account_switch_if_user_mismatch(StagedAccountSwitch {
         claim_code: pending.claim_code.clone(),
         new_account: account.clone(),
@@ -2763,8 +2812,17 @@ fn complete_pending_auth_claim(
         setup_run_token: completed.setup_run_token.clone(),
         setup_run_token_expires_at: completed.setup_run_token_expires_at.clone(),
         machine_id: completed.machine_id.clone(),
-        relay_device: relay_credentials.as_ref().map(|(device, _)| device.clone()),
-        relay_device_secret: relay_credentials.as_ref().map(|(_, secret)| secret.clone()),
+        relay_device: match &relay_credentials {
+            ClaimRelayDeviceCredential::Legacy(device, _) => Some(device.clone()),
+            ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
+        },
+        relay_device_secret: match &relay_credentials {
+            ClaimRelayDeviceCredential::Legacy(_, secret) => Some(secret.clone()),
+            ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
+        },
+        relay_device_credential_preparation_id: prepared_pending
+            .as_ref()
+            .map(|pending| pending.preparation_id.clone()),
         backfill_policy: completed.backfill_policy.clone(),
         backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
     })? {
@@ -2774,11 +2832,71 @@ fn complete_pending_auth_claim(
             claim_code: candidate.claim_code,
         });
     }
+    let prepared_pending = match prepared_pending {
+        Some(pending) => Some(authorize_pending_device_credential_confirmation(
+            &pending.preparation_id,
+        )?),
+        None => None,
+    };
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+    }
+    let prepared_pending = match prepared_pending {
+        Some(pending) => Some(mark_pending_device_credential_guards_passed(
+            &pending,
+            &FilePendingDeviceCredentialStore::default(),
+        )?),
+        None => None,
+    };
+    let confirmed_pending = match (&relay_credentials, prepared_pending.as_ref()) {
+        (ClaimRelayDeviceCredential::Prepared(prepared), Some(pending)) => {
+            if pending.confirmed_at.is_some() {
+                Some(pending.clone())
+            } else {
+                let confirmed =
+                    confirm_device_credential_preparation(pending, &prepared.candidate_secret)?;
+                Some(mark_pending_device_credential_confirmed(
+                    pending,
+                    &confirmed.confirmed_at,
+                    &FilePendingDeviceCredentialStore::default(),
+                )?)
+            }
+        }
+        (ClaimRelayDeviceCredential::Prepared(_), None) => {
+            return Err(LocalApiError::StatePoisoned)
+        }
+        _ => None,
+    };
+    if let (ClaimRelayDeviceCredential::Prepared(prepared), Some(confirmed)) =
+        (&relay_credentials, confirmed_pending.as_ref())
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        write_and_verify_pending_claim_commit(confirmed, &prepared.candidate_secret)?;
+        let response = daemon.complete_auth_with_account(
+            &pending.claim_code,
+            &pending.nonce,
+            account,
+            completed.setup_run_id,
+            completed.setup_run_token_expires_at,
+            completed.machine_id,
+        )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+        request_snapshot_sync_after_device_registration(daemon);
+        return Ok(response);
+    }
     let _binding_lock = lock_setup_run_binding();
     identity_reservation.validate_locked()?;
-    require_cloud_session_cleanup_before_identity_change_without_pause(
-        &crate::cloud_sessions::CloudSessionGrantStore::default(),
-    )?;
     // Persist the server-issued backfill policy BEFORE committing any of the
     // new binding (token, relay credentials, account/connection files): if
     // this write failed after the binding were already durable, the daemon
@@ -2794,12 +2912,13 @@ fn complete_pending_auth_claim(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    let relay_credentials_persisted = match &relay_credentials {
-        Some((device, secret)) => {
+    let relay_credentials_persisted = match (&relay_credentials, confirmed_pending.as_ref()) {
+        (ClaimRelayDeviceCredential::Legacy(device, secret), _) => {
             persist_relay_device_credentials_locked(device, secret, Some(&identity_reservation))?;
             true
         }
-        None => false,
+        (ClaimRelayDeviceCredential::Prepared(_), _) => return Err(LocalApiError::StatePoisoned),
+        (ClaimRelayDeviceCredential::None, _) => false,
     };
     let response = daemon.complete_auth_with_account(
         &pending.claim_code,
@@ -2859,13 +2978,25 @@ fn auth_switch_account(
 ) -> Result<AuthCompleteResponse, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
     daemon.require_staged_account_switch(claim_code)?;
+    let staged_snapshot = daemon.staged_account_switch_snapshot(claim_code)?;
+    if let Some(preparation_id) = staged_snapshot
+        .relay_device_credential_preparation_id
+        .as_deref()
+    {
+        // This bit is only the user's durable approval. Cleanup remains a
+        // separate gate and is rerun immediately before every confirm,
+        // including startup recovery after a crash at the next instruction.
+        authorize_pending_device_credential_confirmation(preparation_id)?;
+    }
     // Keep the staged completion and current account/device reachable until
     // the browser has completed the exact grant DELETE + local confirmation.
     // This check must precede `take_staged_account_switch`, which mutates the
     // in-memory switch state.
     let identity_reservation = reserve_identity_mutation(true)?;
     let staged = daemon.take_staged_account_switch(claim_code)?;
-    disconnect_previous_binding_best_effort(daemon);
+    if staged.relay_device_credential_preparation_id.is_none() {
+        disconnect_previous_binding_best_effort(daemon);
+    }
     match install_staged_account_switch(daemon, &staged, &identity_reservation) {
         Ok(response) => Ok(response),
         Err(error) => {
@@ -2908,14 +3039,88 @@ fn install_staged_account_switch(
     staged: &StagedAccountSwitch,
     identity_reservation: &IdentityMutationReservation,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        // Defense in depth for direct/internal callers and for a grant
+        // transition that raced the earlier auth-switch preflight.
+        require_cloud_session_cleanup_before_identity_change(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+    }
+    let modern_credential = if let Some(preparation_id) =
+        staged.relay_device_credential_preparation_id.as_deref()
+    {
+        if staged.relay_device.is_some() || staged.relay_device_secret.is_some() {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        let pending_store = FilePendingDeviceCredentialStore::default();
+        let pending = pending_store
+            .load()
+            .map_err(|_| LocalApiError::StatePoisoned)?
+            .ok_or(LocalApiError::StatePoisoned)?;
+        if pending.preparation_id != preparation_id {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        let pending = authorize_pending_device_credential_confirmation(&pending.preparation_id)?;
+        let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)?;
+        let candidate_secret = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+        let confirmed_pending = if pending.confirmed_at.is_some() {
+            pending
+        } else {
+            let confirmed = confirm_device_credential_preparation(&pending, &candidate_secret)?;
+            mark_pending_device_credential_confirmed(
+                &pending,
+                &confirmed.confirmed_at,
+                &pending_store,
+            )?
+        };
+        // Only now may the old local/cloud binding be disconnected: every
+        // earlier failure cut retained usable old authority.
+        disconnect_previous_binding_best_effort(daemon);
+        Some((confirmed_pending, candidate_secret))
+    } else {
+        None
+    };
+    if let Some((pending, candidate_secret)) = modern_credential.as_ref() {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        let claim = pending
+            .claim_commit
+            .as_ref()
+            .ok_or(LocalApiError::StatePoisoned)?;
+        if claim.account != staged.new_account
+            || claim.connection.setup_run_id != staged.setup_run_id
+            || claim.connection.setup_run_token_expires_at != staged.setup_run_token_expires_at
+            || claim.connection.machine_id != staged.machine_id
+            || claim.connection.claim_code.as_deref() != Some(staged.claim_code.as_str())
+            || claim.backfill_policy != staged.backfill_policy
+            || claim.backfill_cutoff_at != staged.backfill_cutoff_at
+        {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        write_and_verify_pending_claim_commit(pending, candidate_secret)?;
+        let response = daemon.install_switched_account(
+            staged.new_account.clone(),
+            staged.setup_run_id.clone(),
+            staged.setup_run_token_expires_at.clone(),
+            staged.machine_id.clone(),
+            &staged.claim_code,
+        )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+        request_snapshot_sync_after_device_registration(daemon);
+        return Ok(response);
+    }
     let _binding_lock = lock_setup_run_binding();
     identity_reservation.validate_locked()?;
-    // Defense in depth for direct/internal callers and for a grant transition
-    // that raced the earlier auth-switch preflight. No account/device file is
-    // changed before this second fail-closed check.
-    require_cloud_session_cleanup_before_identity_change(
-        &crate::cloud_sessions::CloudSessionGrantStore::default(),
-    )?;
     reset_local_account_files_locked(Some(identity_reservation))?;
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
@@ -2936,12 +3141,18 @@ fn install_staged_account_switch(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    let relay_credentials_persisted = match (&staged.relay_device, &staged.relay_device_secret) {
-        (Some(device), Some(secret)) => {
+    let relay_credentials_persisted = match (
+        &staged.relay_device,
+        &staged.relay_device_secret,
+        modern_credential.as_ref(),
+    ) {
+        (Some(device), Some(secret), None) => {
             persist_relay_device_credentials_locked(device, secret, Some(identity_reservation))?;
             true
         }
-        _ => false,
+        (None, None, Some(_)) => return Err(LocalApiError::StatePoisoned),
+        (None, None, None) => false,
+        _ => return Err(LocalApiError::StatePoisoned),
     };
     let response = daemon.install_switched_account(
         staged.new_account.clone(),
@@ -3044,21 +3255,42 @@ fn auth_complete_log_endpoint(endpoint: &str) -> String {
     )
 }
 
-/// Validate and materialize the relay-device credentials from a claim
-/// completion without persisting anything. `Ok(None)` means the completion
-/// legitimately carried no relay device.
+enum ClaimRelayDeviceCredential {
+    None,
+    Legacy(LocalDeviceBinding, String),
+    Prepared(DeviceCredentialPreparationApiResponse),
+}
+
+/// Validate and materialize the relay-device credential transition from a
+/// claim completion without persisting anything. Modern and legacy forms are
+/// mutually exclusive so a malformed response cannot silently downgrade after
+/// the server has created a preparation.
 fn relay_device_credentials_from_claim_completion(
     completed: &SetupClaimCompleteResponse,
-) -> Result<Option<(LocalDeviceBinding, String)>, LocalApiError> {
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<ClaimRelayDeviceCredential, LocalApiError> {
+    if let Some(prepared) = &completed.relay_device_credential_preparation {
+        if completed.relay_device.is_some() || completed.relay_device_secret.is_some() {
+            return Err(claim_completion_response_unexpected(
+                "claim completion mixed prepared and active relay-device credentials",
+            ));
+        }
+        validate_device_credential_preparation(
+            "/api/v1/setup-claims/[claim]/local-client/complete",
+            prepared,
+            prior,
+        )?;
+        return Ok(ClaimRelayDeviceCredential::Prepared(prepared.clone()));
+    }
     match (&completed.relay_device, &completed.relay_device_secret) {
-        (None, None) => Ok(None),
+        (None, None) => Ok(ClaimRelayDeviceCredential::None),
         (Some(device), Some(device_secret)) => {
             if device.sources.is_empty() || device_secret.trim().is_empty() {
                 return Err(claim_completion_response_unexpected(
                     "claim completion returned incomplete relay-device credentials",
                 ));
             }
-            Ok(Some((
+            Ok(ClaimRelayDeviceCredential::Legacy(
                 LocalDeviceBinding {
                     device_id: device.id.clone(),
                     machine_id: device
@@ -3068,7 +3300,7 @@ fn relay_device_credentials_from_claim_completion(
                     sources: device.sources.clone(),
                 },
                 device_secret.clone(),
-            )))
+            ))
         }
         _ => Err(claim_completion_response_unexpected(
             "claim completion returned partial relay-device credentials",
@@ -3090,11 +3322,712 @@ fn persist_relay_device_credentials_locked(
     device_secret: &str,
     reservation: Option<&IdentityMutationReservation>,
 ) -> Result<(), LocalApiError> {
-    save_relay_device_binding_locked(device, reservation)?;
-    KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+    require_identity_mutation_reservation(reservation)?;
+    let device_store = FileDeviceStore::default();
+    let current_device = device_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    require_relay_device_binding_change_cleanup(current_device.as_ref(), device)?;
+
+    let secret_store = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+    let current_secret = match current_device {
+        Some(_) => match secret_store.load() {
+            Ok(secret) => Some(secret),
+            Err(TokenStoreError::Missing) => None,
+            Err(_) => return Err(LocalApiError::StatePoisoned),
+        },
+        // With no active device binding, a stray old secret is not usable
+        // authority and does not need to be read for rollback. This also lets
+        // first registration use the owner-only fallback when Keychain reads
+        // are transiently unavailable.
+        None => None,
+    };
+    secret_store
         .save(device_secret)
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    if device_store.save(device).is_ok() {
+        return Ok(());
+    }
+
+    // The device binding is an atomic file replace, but the credential spans
+    // that file and Keychain. Restore the exact prior secret on any file-side
+    // failure so callers never observe a durably half-rotated pair.
+    let rollback = match current_secret {
+        Some(secret) => secret_store.save(&secret),
+        None => secret_store.delete(),
+    };
+    if rollback.is_err() {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Err(LocalApiError::StatePoisoned)
+}
+
+fn pending_device_credential_from_preparation(
+    api_base_url: &str,
+    prepared: &DeviceCredentialPreparationApiResponse,
+    confirmation_authorized: bool,
+    claim_commit: Option<PendingClaimCredentialCommit>,
+    request_authority: PendingDeviceCredentialRequestAuthority,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    Ok(PendingDeviceCredentialPreparation {
+        schema_version: PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION,
+        capability: prepared.capability.clone(),
+        preparation_id: prepared.preparation_id.clone(),
+        api_base_url: validated_api_base_url(Some(api_base_url))?,
+        expires_at: prepared.expires_at.clone(),
+        credential_generation: prepared.credential_generation,
+        secret_commitment_sha256: secret_sha256(&prepared.candidate_secret),
+        request_authority: Some(request_authority),
+        device: LocalDeviceBinding {
+            device_id: prepared.device.id.clone(),
+            machine_id: prepared.device.machine_id.clone(),
+            sources: prepared.device.sources.clone(),
+        },
+        confirmation_authorized,
+        preconfirm_guards_passed: false,
+        claim_commit,
+        confirmed_at: None,
+    })
+}
+
+fn authorize_pending_device_credential_confirmation(
+    preparation_id: &str,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    let store = FilePendingDeviceCredentialStore::default();
+    let mut pending = store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if pending.preparation_id != preparation_id {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    if pending.confirmation_authorized {
+        return Ok(pending);
+    }
+    pending.confirmation_authorized = true;
+    store
+        .save(&pending)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&pending)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(pending)
+}
+
+fn mark_pending_device_credential_guards_passed(
+    pending: &PendingDeviceCredentialPreparation,
+    pending_store: &FilePendingDeviceCredentialStore,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    if pending.confirmed_at.is_some() {
+        return if pending.confirmation_authorized && pending.preconfirm_guards_passed {
+            Ok(pending.clone())
+        } else {
+            Err(LocalApiError::StatePoisoned)
+        };
+    }
+    if !pending.confirmation_authorized {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let current = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if current != *pending {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let mut guarded = pending.clone();
+    guarded.preconfirm_guards_passed = true;
+    pending_store
+        .save(&guarded)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&guarded)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(guarded)
+}
+
+fn stage_pending_device_credential(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    stage_pending_device_credential_with_stores(
+        pending,
+        candidate_secret,
+        &FilePendingDeviceCredentialStore::default(),
+        &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
+}
+
+fn stage_pending_device_credential_with_stores(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.preparation_id.trim().is_empty()
+        || pending.credential_generation == 0
+        || validate_pending_prior_credential_binding(pending).is_err()
+        || validate_pending_candidate_secret(pending, candidate_secret).is_err()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let existing = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let effective_pending = if let Some(current) = existing.as_ref() {
+        // An idempotent server retry must reproduce the entire immutable
+        // preparation and candidate. Never replace a same-ID candidate or
+        // mutate its account commit merely because the identifier matches.
+        let mut immutable = current.clone();
+        immutable.confirmation_authorized = pending.confirmation_authorized;
+        immutable.preconfirm_guards_passed = pending.preconfirm_guards_passed;
+        immutable.confirmed_at = pending.confirmed_at.clone();
+        if immutable != *pending {
+            return Err(LocalApiError::IdentityMutationInProgress);
+        }
+        match pending_secret_store.load() {
+            Ok(stored) if stored == candidate_secret => return Ok(()),
+            Ok(_) => return Err(LocalApiError::StatePoisoned),
+            Err(TokenStoreError::Missing) => {}
+            Err(_) => return Err(LocalApiError::StatePoisoned),
+        }
+        current
+    } else {
+        pending
+    };
+
+    pending_secret_store
+        .save(candidate_secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store.save(effective_pending).is_err() {
+        // A newly written orphan candidate is not active authority. Remove it
+        // when possible; if deletion itself fails, the active credential and
+        // device binding are still unchanged and usable.
+        if existing.is_none() {
+            let _ = pending_secret_store.delete();
+        }
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let stored_secret = pending_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let stored_pending = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if stored_secret != candidate_secret || stored_pending.as_ref() != Some(effective_pending) {
+        return Err(LocalApiError::StatePoisoned);
+    }
     Ok(())
+}
+
+fn stage_pending_setup_run_token(
+    pending: &PendingDeviceCredentialPreparation,
+    setup_run_token: &str,
+) -> Result<(), LocalApiError> {
+    let store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+    stage_pending_setup_run_token_with_store(pending, setup_run_token, &store)
+}
+
+fn stage_pending_setup_run_token_with_store<S: ControlTokenStore + ?Sized>(
+    pending: &PendingDeviceCredentialPreparation,
+    setup_run_token: &str,
+    store: &S,
+) -> Result<(), LocalApiError> {
+    let claim = pending
+        .claim_commit
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if setup_run_token.trim().is_empty()
+        || claim.setup_run_token_sha256 != secret_sha256(setup_run_token)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    match store.load() {
+        Ok(current) if current == setup_run_token => return Ok(()),
+        // A different value cannot belong to this hash-bound journal. It is
+        // an inert orphan from a cut before the journal write and is safe to
+        // replace with the exact server-reproduced token.
+        // The same recovery is safe when the old value cannot be read (for
+        // example, while macOS is re-resolving a replaced login Keychain):
+        // the exact journal-bound value is written and then read back before
+        // this function succeeds.
+        Ok(_) | Err(_) => {}
+    }
+    store
+        .save(setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if store.load().map_err(|_| LocalApiError::StatePoisoned)? != setup_run_token {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn secret_sha256(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn validate_pending_candidate_secret(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    let candidate_commitment = secret_sha256(candidate_secret);
+    if candidate_secret.trim().is_empty()
+        || !valid_secret_commitment(&pending.secret_commitment_sha256)
+        || !constant_work_eq(
+            pending.secret_commitment_sha256.as_bytes(),
+            candidate_commitment.as_bytes(),
+        )
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn valid_secret_commitment(commitment: &str) -> bool {
+    commitment.len() == 71
+        && commitment.starts_with("sha256:")
+        && commitment[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_pending_prior_credential_binding(
+    pending: &PendingDeviceCredentialPreparation,
+) -> Result<(), LocalApiError> {
+    let Some(authority) = pending.request_authority.as_ref() else {
+        // Additive compatibility for a v2 journal created by an older binary.
+        return Ok(());
+    };
+    if !matches!(authority.flow.as_str(), "register" | "setup_claim")
+        || !valid_secret_commitment(&authority.credential_preparation_idempotency_key)
+        || authority.machine_id.trim().is_empty()
+        || authority.installation_id.trim().is_empty()
+        || authority
+            .identity_continuity_capability
+            .as_deref()
+            .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    match (
+        authority.prior_device_id.as_deref(),
+        authority.prior_device_sources.as_deref(),
+        authority.prior_secret_commitment_sha256.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(device_id), Some(sources), Some(commitment))
+            if !device_id.trim().is_empty()
+                && !sources.is_empty()
+                && authority.identity_continuity_capability.as_deref()
+                    == Some(IDENTITY_CONTINUITY_CAPABILITY)
+                && valid_secret_commitment(commitment) =>
+        {
+            Ok(())
+        }
+        _ => Err(LocalApiError::StatePoisoned),
+    }
+}
+
+fn mark_pending_device_credential_confirmed(
+    pending: &PendingDeviceCredentialPreparation,
+    confirmed_at: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    if !pending.confirmation_authorized || !pending.preconfirm_guards_passed {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let current = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if current != *pending {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let mut confirmed = pending.clone();
+    confirmed.confirmed_at = Some(confirmed_at.to_string());
+    pending_store
+        .save(&confirmed)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&confirmed)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(confirmed)
+}
+
+fn write_and_verify_active_device_credential(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    device_store: &FileDeviceStore,
+    active_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    if pending.confirmed_at.is_none()
+        || !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let expected_binding = LocalDeviceCredentialBinding {
+        device: pending.device.clone(),
+        credential_generation: pending.credential_generation,
+    };
+
+    active_secret_store
+        .save(candidate_secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    device_store
+        .save_with_credential_generation(&expected_binding)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+
+    let active_secret = active_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_binding = device_store
+        .load_with_credential_generation()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if active_secret != candidate_secret || active_binding.as_ref() != Some(&expected_binding) {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn clear_pending_device_credential(
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    pending_store
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let _ = pending_secret_store.delete();
+    let _ = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).delete();
+    Ok(())
+}
+
+fn promote_pending_device_credential_with_stores(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+    device_store: &FileDeviceStore,
+    active_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    // After server confirmation the old active secret may already be invalid.
+    // Never roll it back on a file-side failure: keep the separately staged
+    // candidate intact so restart recovery can finish the same generation.
+    write_and_verify_active_device_credential(
+        pending,
+        candidate_secret,
+        device_store,
+        active_secret_store,
+    )?;
+
+    // Delete metadata first. A crash between these operations leaves only an
+    // inert orphan Keychain entry while the verified active pair keeps working.
+    clear_pending_device_credential(pending_store, pending_secret_store)
+}
+
+fn backend_error_has_status(error: &LocalApiError, status: u16) -> bool {
+    matches!(error, LocalApiError::Backend(details) if details.status == Some(status))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrunedDeviceCredentialProbe {
+    Confirmed,
+    Inactive,
+}
+
+fn pending_device_credential_is_past_expiry(pending: &PendingDeviceCredentialPreparation) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(&pending.expires_at, &Rfc3339)
+        .is_ok_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+}
+
+fn probe_pruned_device_credential_authority(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<PrunedDeviceCredentialProbe, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/devices/{}/relay-token",
+            pending.device.device_id
+        ),
+    );
+    let source = pending
+        .device
+        .sources
+        .first()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let body = relay_token_request_payload(&pending.device, source);
+    match backend_post_json::<serde_json::Value>(
+        &url,
+        &body,
+        &[("X-Ottto-Device-Secret", candidate_secret)],
+    ) {
+        Ok(_) => Ok(PrunedDeviceCredentialProbe::Confirmed),
+        Err(error)
+            if matches!(
+                &error,
+                LocalApiError::Backend(details)
+                    if matches!(details.status, Some(401) | Some(403))
+            ) && pending_device_credential_is_past_expiry(pending) =>
+        {
+            Ok(PrunedDeviceCredentialProbe::Inactive)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn discard_server_inactive_pending_device_credential(
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    clear_pending_device_credential(pending_store, pending_secret_store)
+}
+
+fn write_and_verify_pending_claim_commit(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    let claim = pending
+        .claim_commit
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if pending.confirmed_at.is_none()
+        || !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+        || claim.target_user_id.trim().is_empty()
+        || claim.connection.setup_run_id.trim().is_empty()
+        || claim
+            .connection
+            .claim_code
+            .as_deref()
+            .map_or(true, str::is_empty)
+        || claim
+            .account
+            .user
+            .as_ref()
+            .map_or(true, |user| user.id != claim.target_user_id)
+        || validated_api_base_url(Some(&claim.connection.api_base_url))?
+            != claim.connection.api_base_url
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let pending_setup_token_store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+    let setup_run_token = pending_setup_token_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if claim.setup_run_token_sha256 != secret_sha256(&setup_run_token) {
+        return Err(LocalApiError::StatePoisoned);
+    }
+
+    // The attribution boundary must become durable before any credential or
+    // account binding from the new claim. This operation is idempotent.
+    persist_claim_backfill_policy(
+        claim.backfill_policy.as_deref(),
+        claim.backfill_cutoff_at.as_deref(),
+        &claim.target_user_id,
+    )?;
+    write_and_verify_active_device_credential(
+        pending,
+        candidate_secret,
+        &FileDeviceStore::default(),
+        &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+    )?;
+    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .save(&setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileAccountStore::default()
+        .save(&claim.account)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileConnectionStore::default()
+        .save(&claim.connection)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+
+    let active_setup_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_account = FileAccountStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_connection = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if active_setup_token != setup_run_token
+        || active_account != claim.account
+        || active_connection.as_ref() != Some(&claim.connection)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+/// Resume an exact prepared generation before relays start. Local wall-clock
+/// expiry never deletes a pending candidate: only a definitive server 410 can
+/// prove an unconfirmed preparation is safe to discard.
+pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiError> {
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let pending_secret_store = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
+    let Some(pending) = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(false);
+    };
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.preparation_id.trim().is_empty()
+        || pending.credential_generation == 0
+        || validate_pending_prior_credential_binding(&pending).is_err()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let candidate_secret = pending_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    validate_pending_candidate_secret(&pending, &candidate_secret)?;
+    if pending.confirmed_at.is_none() && !pending.confirmation_authorized {
+        return match inspect_device_credential_preparation(&pending, &candidate_secret) {
+            Ok(status) if status.status == "pending" => Ok(false),
+            Ok(status) if matches!(status.status.as_str(), "expired" | "superseded") => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                Ok(false)
+            }
+            // A server-confirmed switch that was never locally authorized is
+            // an invariant violation. Retain both halves for operator recovery;
+            // never silently install or discard it.
+            Ok(_) => Err(LocalApiError::StatePoisoned),
+            Err(error) if backend_error_has_status(&error, 410) => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                Ok(false)
+            }
+            Err(error) if backend_error_has_status(&error, 404) => {
+                match probe_pruned_device_credential_authority(&pending, &candidate_secret)? {
+                    PrunedDeviceCredentialProbe::Confirmed => Err(LocalApiError::StatePoisoned),
+                    PrunedDeviceCredentialProbe::Inactive => {
+                        discard_server_inactive_pending_device_credential(
+                            &pending_store,
+                            &pending_secret_store,
+                        )?;
+                        Ok(false)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+    }
+    if pending.confirmed_at.is_some()
+        && (!pending.confirmation_authorized || !pending.preconfirm_guards_passed)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let identity_reservation = reserve_identity_mutation(false)?;
+    // A persisted guard bit records the prior process's cut, but it is never
+    // authority to confirm. Re-run cleanup under a fresh reservation at the
+    // last possible point before confirm/promotion.
+    let pending = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        if pending.confirmed_at.is_none() {
+            mark_pending_device_credential_guards_passed(&pending, &pending_store)?
+        } else {
+            pending
+        }
+    };
+    let confirmed = if pending.confirmed_at.is_some() {
+        pending
+    } else {
+        match confirm_device_credential_preparation(&pending, &candidate_secret) {
+            Ok(receipt) => mark_pending_device_credential_confirmed(
+                &pending,
+                &receipt.confirmed_at,
+                &pending_store,
+            )?,
+            Err(error) if backend_error_has_status(&error, 410) => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                return Ok(false);
+            }
+            Err(error) if backend_error_has_status(&error, 404) => {
+                match probe_pruned_device_credential_authority(&pending, &candidate_secret)? {
+                    PrunedDeviceCredentialProbe::Confirmed => {
+                        mark_pending_device_credential_confirmed(
+                            &pending,
+                            &current_rfc3339_timestamp(),
+                            &pending_store,
+                        )?
+                    }
+                    PrunedDeviceCredentialProbe::Inactive => {
+                        discard_server_inactive_pending_device_credential(
+                            &pending_store,
+                            &pending_secret_store,
+                        )?;
+                        return Ok(false);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    identity_reservation.validate_locked()?;
+    require_cloud_session_cleanup_before_identity_change_without_pause(
+        &crate::cloud_sessions::CloudSessionGrantStore::default(),
+    )?;
+    if confirmed.claim_commit.is_some() {
+        write_and_verify_pending_claim_commit(&confirmed, &candidate_secret)?;
+        clear_pending_device_credential(&pending_store, &pending_secret_store)?;
+    } else {
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate_secret,
+            &pending_store,
+            &pending_secret_store,
+            &FileDeviceStore::default(),
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -3103,6 +4036,7 @@ fn save_relay_device_binding(device: &LocalDeviceBinding) -> Result<(), LocalApi
     save_relay_device_binding_locked(device, None)
 }
 
+#[cfg(test)]
 fn save_relay_device_binding_locked(
     device: &LocalDeviceBinding,
     reservation: Option<&IdentityMutationReservation>,
@@ -3110,6 +4044,14 @@ fn save_relay_device_binding_locked(
     require_identity_mutation_reservation(reservation)?;
     let store = FileDeviceStore::default();
     let current = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    require_relay_device_binding_change_cleanup(current.as_ref(), device)?;
+    store.save(device).map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn require_relay_device_binding_change_cleanup(
+    current: Option<&LocalDeviceBinding>,
+    device: &LocalDeviceBinding,
+) -> Result<(), LocalApiError> {
     let changes_cleanup_authority = match current.as_ref() {
         Some(existing) => {
             existing.device_id != device.device_id
@@ -3123,7 +4065,7 @@ fn save_relay_device_binding_locked(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
     }
-    store.save(device).map_err(|_| LocalApiError::StatePoisoned)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3197,6 +4139,9 @@ fn auth_reset(
     }
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    let _ = FilePendingDeviceCredentialStore::default().reset();
+    let _ = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT).delete();
+    let _ = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let mut reset = daemon.reset_account_for_authorized_client()?;
     reset.local_only = local_only;
     reset.cloud_disconnected = cloud_disconnect.is_some();
@@ -3318,6 +4263,8 @@ struct SetupClaimCompleteResponse {
     machine_id: Option<String>,
     relay_device: Option<SetupClaimCompleteRelayDevice>,
     relay_device_secret: Option<String>,
+    #[serde(default)]
+    relay_device_credential_preparation: Option<DeviceCredentialPreparationApiResponse>,
     connected_at: String,
     user: SetupClaimCompleteUser,
     organization: SetupClaimCompleteOrganization,
@@ -3328,6 +4275,15 @@ struct SetupClaimCompleteResponse {
     /// Server-UTC takeover moment accompanying `backfill_policy: "from"`.
     #[serde(default)]
     backfill_cutoff_at: Option<String>,
+}
+
+/// Claim completion plus the exact prior authority snapshot used to authorize
+/// it. Deliberately has no `Debug` implementation because it owns a Keychain
+/// secret until the non-secret recovery journal is staged.
+struct SetupClaimCompletion {
+    response: SetupClaimCompleteResponse,
+    prior_device_credential: Option<PriorDeviceCredential>,
+    request_authority: PendingDeviceCredentialRequestAuthority,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3384,26 +4340,86 @@ fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json
 fn complete_setup_claim(
     claim: &PendingAuthClaim,
     machine: &MachineIdentity,
-) -> Result<SetupClaimCompleteResponse, LocalApiError> {
+    identity_reservation: Option<&IdentityMutationReservation>,
+) -> Result<SetupClaimCompletion, LocalApiError> {
     let url = api_url(&format!(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
+    // Snapshot established file + Keychain authority under the identity
+    // lifecycle fence. Network I/O runs without the mutex, while the
+    // reservation prevents legitimate local writers from rotating authority.
+    let prior_device_credential = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        match identity_reservation {
+            Some(reservation) => reservation.validate_locked()?,
+            None => require_identity_mutation_reservation(None)?,
+        }
+        prior_device_credential_for_registration()?
+    };
+    let request_authority = device_credential_request_authority(
+        "setup_claim",
+        &claim.claim_code,
+        machine,
+        prior_device_credential.as_ref(),
+        prior_device_credential
+            .as_ref()
+            .map(|_| IDENTITY_CONTINUITY_CAPABILITY),
+    );
     let mut body = setup_claim_complete_body(claim, machine);
-    if let Some(device) = FileDeviceStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "credential_preparation_capability".to_string(),
+            json!(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY),
+        );
+        object.insert(
+            "credential_preparation_idempotency_key".to_string(),
+            json!(request_authority
+                .credential_preparation_idempotency_key
+                .clone()),
+        );
+    }
+    if let Some(prior) = prior_device_credential.as_ref() {
         if let Some(object) = body.as_object_mut() {
-            object.insert("relay_device_id".to_string(), json!(device.device_id));
-            object.insert("relay_device_sources".to_string(), json!(device.sources));
+            object.insert(
+                "identity_continuity_capability".to_string(),
+                json!(IDENTITY_CONTINUITY_CAPABILITY),
+            );
+            object.insert("relay_device_id".to_string(), json!(prior.device_id));
+            object.insert(
+                "relay_device_sources".to_string(),
+                json!(prior.device_sources),
+            );
+            object.insert(
+                "prior_device_secret".to_string(),
+                json!(prior.device_secret),
+            );
         }
     }
-    backend_post_json(
+    let response = backend_post_json(
         &url,
         &body,
         &[("X-Ottto-Setup-Claim-Token", claim.claim_token.as_str())],
-    )
+    )?;
+    // Revalidate immediately after the remote preparation and before any
+    // journal write. This catches out-of-band Keychain mutation in addition
+    // to file/account mutations fenced by the reservation snapshot.
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        match identity_reservation {
+            Some(reservation) => reservation.validate_locked()?,
+            None => require_identity_mutation_reservation(None)?,
+        }
+        let current = prior_device_credential_for_registration()?;
+        if !same_prior_device_authority(prior_device_credential.as_ref(), current.as_ref()) {
+            return Err(LocalApiError::StatePoisoned);
+        }
+    }
+    Ok(SetupClaimCompletion {
+        response,
+        prior_device_credential,
+        request_authority,
+    })
 }
 
 fn setup_claim_complete_body(
@@ -4681,6 +5697,8 @@ fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<RefreshedSetupRunToken, LocalApiError> {
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
+        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
@@ -4745,6 +5763,8 @@ fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<SetupRunCredentials, LocalApiError> {
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
+        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
         Ok(token) => Ok(SetupRunCredentials {
             setup_run_token: token,
@@ -5511,35 +6531,56 @@ fn run_install_source_action(
             device_id: None,
         },
     )?;
-    // Device registration can rotate/revoke backend device credentials. Hold
-    // a panic-safe reservation across that remote side effect and the exact
-    // local identity install, while leaving the lifecycle mutex free during
-    // network I/O.
+    // Resolve any previously confirmed-but-not-promoted generation before
+    // beginning another identity mutation. Uncertain pending state fails
+    // closed; it is never overwritten by a modern-to-legacy fallback.
+    recover_pending_device_credential_at_startup()?;
+    // Preparation is server-side non-authoritative. Hold a panic-safe local
+    // reservation across prepare, local durable staging, confirm, and exact
+    // promotion while leaving the lifecycle mutex free during network I/O.
     let identity_reservation = reserve_identity_mutation(true)?;
-    let registered = register_telemetry_device(api_base_url, &install_session, machine)?;
-    let device_id = registered.device.id.clone();
-    let device = LocalDeviceBinding {
-        device_id: registered.device.id.clone(),
-        machine_id: registered
-            .device
-            .machine_id
-            .clone()
-            .or_else(|| credentials.connection.machine_id.clone())
-            .or_else(|| Some(machine.machine_id.clone())),
-        sources: registered.device.sources.clone(),
-    };
+    let (prepared, _prior, request_authority) =
+        prepare_telemetry_device_registration(api_base_url, &install_session, machine)?;
+    let pending = pending_device_credential_from_preparation(
+        api_base_url,
+        &prepared,
+        true,
+        None,
+        request_authority,
+    )?;
+    stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
     {
         let _identity_lifecycle_lock = lock_setup_run_binding();
         identity_reservation.validate_locked()?;
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
-        persist_relay_device_credentials_locked(
-            &device,
-            &registered.device_secret,
-            Some(&identity_reservation),
+    }
+    let pending = mark_pending_device_credential_guards_passed(
+        &pending,
+        &FilePendingDeviceCredentialStore::default(),
+    )?;
+    let confirmed = confirm_device_credential_preparation(&pending, &prepared.candidate_secret)?;
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let pending = mark_pending_device_credential_confirmed(
+        &pending,
+        &confirmed.confirmed_at,
+        &pending_store,
+    )?;
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        promote_pending_device_credential_with_stores(
+            &pending,
+            &prepared.candidate_secret,
+            &pending_store,
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+            &FileDeviceStore::default(),
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
         )?;
     }
+    let device = pending.device;
+    let device_id = device.device_id.clone();
     drop(identity_reservation);
     // The local device binding + secret are now durable. Wake the snapshot
     // collector before any backend completion/event call that can transiently
@@ -6277,13 +7318,83 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[derive(Deserialize)]
 struct TelemetryDeviceRegisterApiResponse {
     device: TelemetryDeviceApiResponse,
     device_secret: String,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    #[serde(default)]
+    credential_rotation_performed: Option<bool>,
+    #[serde(default)]
+    rotated_prior_device_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
+struct DeviceCredentialPreparationApiResponse {
+    preparation_id: String,
+    capability: String,
+    expires_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    candidate_secret: String,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    credential_rotation_planned: bool,
+    #[serde(default)]
+    prior_device_id: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceCredentialPreparationApiResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCredentialPreparationApiResponse")
+            .field("preparation_id", &"[redacted]")
+            .field("capability", &self.capability)
+            .field("expires_at", &self.expires_at)
+            .field("credential_generation", &self.credential_generation)
+            .field("device", &"[redacted]")
+            .field("candidate_secret", &"[redacted]")
+            .field(
+                "identity_continuity_capability",
+                &self.identity_continuity_capability,
+            )
+            .field(
+                "credential_rotation_planned",
+                &self.credential_rotation_planned,
+            )
+            .field("prior_device_id", &self.prior_device_id)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceCredentialConfirmationApiResponse {
+    preparation_id: String,
+    status: String,
+    confirmed_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    credential_rotation_performed: bool,
+    #[serde(default)]
+    rotated_prior_device_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceCredentialPreparationStatusApiResponse {
+    preparation_id: String,
+    status: String,
+    expires_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    #[serde(default)]
+    confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TelemetryDeviceApiResponse {
     id: String,
     machine_id: Option<String>,
@@ -6299,21 +7410,406 @@ struct InstallSessionEvent<'a> {
     device_id: Option<&'a str>,
 }
 
-fn register_telemetry_device(
+#[allow(dead_code)]
+fn register_telemetry_device_legacy(
     api_base_url: &str,
     install_session: &InstallSessionApiResponse,
     machine: &MachineIdentity,
 ) -> Result<TelemetryDeviceRegisterApiResponse, LocalApiError> {
     let url = api_url_with_base(api_base_url, "/api/v1/telemetry/devices/register");
-    let body = telemetry_device_register_body(install_session, machine);
-    backend_post_json(&url, &body, &[])
+    let prior = prior_device_credential_for_registration()?;
+    let body = telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
+    let registered = backend_post_json(&url, &body, &[])?;
+    validate_registration_continuity_response(&url, &registered, prior.as_ref())?;
+    Ok(registered)
 }
 
+fn prepare_telemetry_device_registration(
+    api_base_url: &str,
+    install_session: &InstallSessionApiResponse,
+    machine: &MachineIdentity,
+) -> Result<
+    (
+        DeviceCredentialPreparationApiResponse,
+        Option<PriorDeviceCredential>,
+        PendingDeviceCredentialRequestAuthority,
+    ),
+    LocalApiError,
+> {
+    let url = api_url_with_base(
+        api_base_url,
+        "/api/v1/telemetry/devices/registration-preparations",
+    );
+    let prior = prior_device_credential_for_registration()?;
+    let request_authority = device_credential_request_authority(
+        "register",
+        &install_session.install_session_id,
+        machine,
+        prior.as_ref(),
+        Some(IDENTITY_CONTINUITY_CAPABILITY),
+    );
+    let mut body =
+        telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
+    body["credential_preparation_capability"] = json!(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY);
+    body["credential_preparation_idempotency_key"] = json!(request_authority
+        .credential_preparation_idempotency_key
+        .clone());
+    let prepared = backend_post_json(&url, &body, &[])?;
+    validate_device_credential_preparation(&url, &prepared, prior.as_ref())?;
+    Ok((prepared, prior, request_authority))
+}
+
+fn confirm_device_credential_preparation(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<DeviceCredentialConfirmationApiResponse, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    if !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+        || pending.confirmed_at.is_some()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    // The pending file is local state, not authority. Revalidate its base
+    // before releasing the candidate secret in a request header.
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/device-credential-preparations/{}/confirm",
+            pending.preparation_id
+        ),
+    );
+    let body = json!({
+        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+        "credential_generation": pending.credential_generation,
+    });
+    let confirmed = backend_post_json(
+        &url,
+        &body,
+        &[(
+            DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER,
+            candidate_secret,
+        )],
+    )?;
+    validate_device_credential_confirmation(&url, pending, &confirmed)?;
+    Ok(confirmed)
+}
+
+fn inspect_device_credential_preparation(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<DeviceCredentialPreparationStatusApiResponse, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/device-credential-preparations/{}",
+            pending.preparation_id
+        ),
+    );
+    let status = backend_get_json(
+        &url,
+        &[(
+            DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER,
+            candidate_secret,
+        )],
+    )?;
+    validate_device_credential_status(&url, pending, &status)?;
+    Ok(status)
+}
+
+fn device_credential_preparation_idempotency_key(
+    flow: &str,
+    operation_id: &str,
+    installation_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+        flow,
+        operation_id,
+        installation_id,
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn device_credential_request_authority(
+    flow: &str,
+    operation_id: &str,
+    machine: &MachineIdentity,
+    prior: Option<&PriorDeviceCredential>,
+    identity_continuity_capability: Option<&str>,
+) -> PendingDeviceCredentialRequestAuthority {
+    PendingDeviceCredentialRequestAuthority {
+        flow: flow.to_string(),
+        credential_preparation_idempotency_key: device_credential_preparation_idempotency_key(
+            flow,
+            operation_id,
+            &machine.installation_id,
+        ),
+        machine_id: machine.machine_id.clone(),
+        installation_id: machine.installation_id.clone(),
+        hardware_uuid: machine.hardware_uuid.clone(),
+        account_scope: machine.account_scope.clone(),
+        identity_continuity_capability: identity_continuity_capability.map(str::to_string),
+        prior_device_id: prior.map(|value| value.device_id.clone()),
+        prior_device_sources: prior.map(|value| value.device_sources.clone()),
+        prior_secret_commitment_sha256: prior.map(|value| secret_sha256(&value.device_secret)),
+    }
+}
+
+fn same_prior_device_authority(
+    expected: Option<&PriorDeviceCredential>,
+    actual: Option<&PriorDeviceCredential>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            let expected_secret_commitment = secret_sha256(&expected.device_secret);
+            let actual_secret_commitment = secret_sha256(&actual.device_secret);
+            expected.device_id == actual.device_id
+                && expected.device_sources == actual.device_sources
+                && constant_work_eq(
+                    expected_secret_commitment.as_bytes(),
+                    actual_secret_commitment.as_bytes(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// The operation id is server-issued and survives a daemon crash. Retrying the
+/// same install session or claim therefore reuses one idempotency key. An
+/// expired attempt obtains a new boundary only by obtaining a new server
+/// install session or setup claim; the daemon never spins on a locally minted
+/// replacement key after a definitive 410.
+fn validate_device_credential_preparation(
+    url: &str,
+    prepared: &DeviceCredentialPreparationApiResponse,
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<(), LocalApiError> {
+    if prepared.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || prepared.preparation_id.trim().is_empty()
+        || prepared.expires_at.trim().is_empty()
+        || prepared.credential_generation == 0
+        || prepared.device.id.trim().is_empty()
+        || prepared.device.sources.is_empty()
+        || prepared.candidate_secret.trim().is_empty()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an incomplete credential preparation".to_string(),
+        ));
+    }
+    if prepared
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an unsupported identity continuity capability"
+                .to_string(),
+        ));
+    }
+    match prior {
+        Some(prior)
+            if !prepared.credential_rotation_planned
+                || prepared.identity_continuity_capability.as_deref()
+                    != Some(IDENTITY_CONTINUITY_CAPABILITY)
+                || prepared.prior_device_id.as_deref() != Some(prior.device_id.as_str()) =>
+        {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned inconsistent credential rotation preparation"
+                    .to_string(),
+            ))
+        }
+        None if prepared.credential_rotation_planned || prepared.prior_device_id.is_some() => {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration planned a prior-device rotation without prior authority"
+                    .to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_device_credential_confirmation(
+    url: &str,
+    pending: &PendingDeviceCredentialPreparation,
+    confirmed: &DeviceCredentialConfirmationApiResponse,
+) -> Result<(), LocalApiError> {
+    if confirmed.preparation_id != pending.preparation_id
+        || confirmed.status != "confirmed"
+        || confirmed.confirmed_at.trim().is_empty()
+        || confirmed.credential_generation != pending.credential_generation
+        || confirmed.device.id != pending.device.device_id
+        || confirmed.device.machine_id != pending.device.machine_id
+        || confirmed.device.sources != pending.device.sources
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential confirmation did not match the staged preparation".to_string(),
+        ));
+    }
+    if confirmed
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+        || confirmed.credential_rotation_performed != confirmed.rotated_prior_device_id.is_some()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential confirmation returned inconsistent rotation proof".to_string(),
+        ));
+    }
+    if let Some(prior_device_id) = pending
+        .request_authority
+        .as_ref()
+        .and_then(|authority| authority.prior_device_id.as_deref())
+    {
+        if confirmed.identity_continuity_capability.as_deref()
+            != Some(IDENTITY_CONTINUITY_CAPABILITY)
+            || !confirmed.credential_rotation_performed
+            || confirmed.rotated_prior_device_id.as_deref() != Some(prior_device_id)
+        {
+            return Err(backend_response_unexpected(
+                url,
+                "credential confirmation did not match the journaled prior authority".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_device_credential_status(
+    url: &str,
+    pending: &PendingDeviceCredentialPreparation,
+    status: &DeviceCredentialPreparationStatusApiResponse,
+) -> Result<(), LocalApiError> {
+    if status.preparation_id != pending.preparation_id
+        || status.expires_at != pending.expires_at
+        || status.credential_generation != pending.credential_generation
+        || status.device.id != pending.device.device_id
+        || status.device.machine_id != pending.device.machine_id
+        || status.device.sources != pending.device.sources
+        || !matches!(
+            status.status.as_str(),
+            "pending" | "confirmed" | "expired" | "superseded"
+        )
+        || (status.status == "confirmed") != status.confirmed_at.is_some()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential preparation status did not match the staged generation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration_continuity_response(
+    url: &str,
+    registered: &TelemetryDeviceRegisterApiResponse,
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<(), LocalApiError> {
+    if registered
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an unsupported identity continuity capability"
+                .to_string(),
+        ));
+    }
+    match registered.credential_rotation_performed {
+        Some(true)
+            if registered.identity_continuity_capability.as_deref()
+                != Some(IDENTITY_CONTINUITY_CAPABILITY)
+                || prior.is_none()
+                || registered.rotated_prior_device_id.as_deref()
+                    != prior.map(|value| value.device_id.as_str()) =>
+        {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned inconsistent credential rotation proof"
+                    .to_string(),
+            ))
+        }
+        Some(false) | None if registered.rotated_prior_device_id.is_some() => {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned a prior device without rotation".to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
+
+struct PriorDeviceCredential {
+    device_id: String,
+    device_sources: Vec<String>,
+    device_secret: String,
+}
+
+fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
+{
+    prior_device_credential_with_stores(
+        &FileDeviceStore::default(),
+        &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
+}
+
+fn prior_device_credential_with_stores(
+    device_store: &FileDeviceStore,
+    secret_store: &impl ControlTokenStore,
+) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
+    let Some(device) = device_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(None);
+    };
+    let device_secret = secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if device.device_id.trim().is_empty()
+        || device.sources.is_empty()
+        || device_secret.trim().is_empty()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(Some(PriorDeviceCredential {
+        device_id: device.device_id,
+        device_sources: device.sources,
+        device_secret,
+    }))
+}
+
+#[cfg(test)]
 fn telemetry_device_register_body(
     install_session: &InstallSessionApiResponse,
     machine: &MachineIdentity,
 ) -> serde_json::Value {
-    json!({
+    telemetry_device_register_body_with_prior(install_session, machine, None)
+}
+
+fn telemetry_device_register_body_with_prior(
+    install_session: &InstallSessionApiResponse,
+    machine: &MachineIdentity,
+    prior: Option<&PriorDeviceCredential>,
+) -> serde_json::Value {
+    let mut body = json!({
         "install_session_id": install_session.install_session_id,
         "install_session_token": install_session.install_session_token,
         "machine_name": machine.display_name,
@@ -6324,7 +7820,13 @@ fn telemetry_device_register_body(
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
-    })
+        "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+    });
+    if let Some(prior) = prior {
+        body["prior_device_id"] = json!(prior.device_id);
+        body["prior_device_secret"] = json!(prior.device_secret);
+    }
+    body
 }
 
 fn record_install_session_event(
@@ -10529,7 +12031,28 @@ fn backend_response_unexpected(url: &str, detail: String) -> LocalApiError {
 }
 
 fn safe_backend_endpoint(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
+    let endpoint = url.split('?').next().unwrap_or(url);
+    for (marker, replacement) in [
+        (
+            "/api/v1/telemetry/device-credential-preparations/",
+            "[preparation]",
+        ),
+        ("/api/v1/telemetry/devices/", "[device]"),
+    ] {
+        let Some(start) = endpoint.find(marker) else {
+            continue;
+        };
+        let identifier_start = start + marker.len();
+        let suffix = endpoint[identifier_start..]
+            .find('/')
+            .map(|offset| &endpoint[identifier_start + offset..])
+            .unwrap_or_default();
+        if marker == "/api/v1/telemetry/devices/" && suffix != "/relay-token" {
+            continue;
+        }
+        return format!("{}{}{}", &endpoint[..identifier_start], replacement, suffix);
+    }
+    endpoint.to_string()
 }
 
 fn safe_backend_body_excerpt(body: &str) -> Option<String> {
@@ -10657,6 +12180,52 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_body_excerpt_redacts_compact_json_secret_fields() {
+        let prior = format!("prior-{}", "value".repeat(4));
+        let install = format!("install-{}", "value".repeat(4));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let body = serde_json::json!({
+            "detail": "registration rejected",
+            "prior_device_secret": prior,
+            "candidate_secret": candidate,
+            "nested": {"install_session_token": install},
+        })
+        .to_string();
+
+        let excerpt = super::safe_backend_body_excerpt(&body).expect("non-empty excerpt");
+        let parsed: serde_json::Value = serde_json::from_str(&excerpt).expect("valid JSON excerpt");
+        assert_eq!(parsed["detail"], "registration rejected");
+        assert_eq!(parsed["prior_device_secret"], "[REDACTED]");
+        assert_eq!(parsed["candidate_secret"], "[REDACTED]");
+        assert_eq!(parsed["nested"]["install_session_token"], "[REDACTED]");
+        assert!(!excerpt.contains(&prior));
+        assert!(!excerpt.contains(&install));
+        assert!(!excerpt.contains(&candidate));
+    }
+
+    #[test]
+    fn backend_endpoint_redacts_device_credential_preparation_id() {
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/device-credential-preparations/private-preparation-id/confirm?x=1"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/device-credential-preparations/[preparation]/confirm"
+        );
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/devices/private-device-id/relay-token"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/devices/[device]/relay-token"
+        );
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/devices/registration-preparations"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/devices/registration-preparations"
+        );
+    }
+
     #[test]
     fn managed_config_preview_extracts_and_redacts_fence_region() {
         // Assembled at runtime so no token-shaped literal lands in the
@@ -11080,7 +12649,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     // The per-file Mutex below serializes tests within control.rs that mutate
@@ -11180,6 +12749,1301 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         create_control_test_dir(&root);
         root
+    }
+
+    fn test_pending_device_credential(
+        preparation_id: &str,
+        confirmation_authorized: bool,
+    ) -> PendingDeviceCredentialPreparation {
+        let candidate_secret = format!("candidate-{}", "value".repeat(4));
+        PendingDeviceCredentialPreparation {
+            schema_version: PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION,
+            capability: DEVICE_CREDENTIAL_PREPARATION_CAPABILITY.to_string(),
+            preparation_id: preparation_id.to_string(),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            expires_at: "2026-08-01T00:00:00Z".to_string(),
+            credential_generation: 4,
+            secret_commitment_sha256: secret_sha256(&candidate_secret),
+            request_authority: None,
+            device: LocalDeviceBinding {
+                device_id: "device-prepared".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            confirmation_authorized,
+            preconfirm_guards_passed: confirmation_authorized,
+            claim_commit: None,
+            confirmed_at: None,
+        }
+    }
+
+    fn test_setup_claim_request_authority(
+        prior_secret: &str,
+    ) -> PendingDeviceCredentialRequestAuthority {
+        let machine = MachineIdentity {
+            hardware_uuid: Some("hardware-test".to_string()),
+            ..test_machine()
+        };
+        let prior = PriorDeviceCredential {
+            device_id: "device-prior".to_string(),
+            device_sources: vec!["codex".to_string(), "pi".to_string()],
+            device_secret: prior_secret.to_string(),
+        };
+        device_credential_request_authority(
+            "setup_claim",
+            "claim-immutable",
+            &machine,
+            Some(&prior),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        )
+    }
+
+    #[test]
+    fn credential_preparation_idempotency_is_stable_and_server_operation_bounded() {
+        let first = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-one",
+            "installation-one",
+        );
+        let replay = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-one",
+            "installation-one",
+        );
+        let new_claim_after_expiry = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-two",
+            "installation-one",
+        );
+
+        assert_eq!(first, replay);
+        assert_ne!(first, new_claim_after_expiry);
+        assert!(first.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn confirmation_receipt_must_match_journaled_prior_device() {
+        let mut pending = test_pending_device_credential("preparation-confirm-prior", true);
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-confirm-proof"));
+        let exact: DeviceCredentialConfirmationApiResponse = serde_json::from_value(json!({
+            "preparation_id": pending.preparation_id,
+            "status": "confirmed",
+            "confirmed_at": "2026-07-31T20:00:00Z",
+            "credential_generation": pending.credential_generation,
+            "device": {
+                "id": pending.device.device_id,
+                "machine_id": pending.device.machine_id,
+                "sources": pending.device.sources,
+            },
+            "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+            "credential_rotation_performed": true,
+            "rotated_prior_device_id": "device-prior",
+        }))
+        .expect("parse exact confirmation");
+        validate_device_credential_confirmation("https://api.test/confirm", &pending, &exact)
+            .expect("exact prior confirmation");
+
+        let mismatched: DeviceCredentialConfirmationApiResponse = serde_json::from_value(json!({
+            "preparation_id": pending.preparation_id,
+            "status": "confirmed",
+            "confirmed_at": "2026-07-31T20:00:00Z",
+            "credential_generation": pending.credential_generation,
+            "device": {
+                "id": pending.device.device_id,
+                "machine_id": pending.device.machine_id,
+                "sources": pending.device.sources,
+            },
+            "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+            "credential_rotation_performed": true,
+            "rotated_prior_device_id": "device-other",
+        }))
+        .expect("parse mismatched confirmation");
+        assert!(validate_device_credential_confirmation(
+            "https://api.test/confirm",
+            &pending,
+            &mismatched,
+        )
+        .is_err());
+
+        let wrong_generation: DeviceCredentialConfirmationApiResponse =
+            serde_json::from_value(json!({
+                "preparation_id": pending.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:00:00Z",
+                "credential_generation": pending.credential_generation + 1,
+                "device": {
+                    "id": pending.device.device_id,
+                    "machine_id": pending.device.machine_id,
+                    "sources": pending.device.sources,
+                },
+                "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+                "credential_rotation_performed": true,
+                "rotated_prior_device_id": "device-prior",
+            }))
+            .expect("parse wrong-generation confirmation");
+        assert!(validate_device_credential_confirmation(
+            "https://api.test/confirm",
+            &pending,
+            &wrong_generation,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prepared_candidate_stages_without_changing_active_authority() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-stage-old-authority");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let old_device = LocalDeviceBinding {
+            device_id: "device-old".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let old_secret = format!("old-{}", "value".repeat(4));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        device_store.save(&old_device).expect("save old device");
+        active_secret.save(&old_secret).expect("save old secret");
+        let pending = test_pending_device_credential("preparation-one", true);
+
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+
+        assert_eq!(
+            device_store.load().expect("load old device"),
+            Some(old_device)
+        );
+        assert_eq!(active_secret.load().expect("load old secret"), old_secret);
+        assert_eq!(pending_secret.load().expect("load candidate"), candidate);
+        assert_eq!(pending_store.load().expect("load pending"), Some(pending));
+    }
+
+    #[test]
+    fn same_preparation_id_cannot_replace_the_staged_candidate_or_binding() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-same-id-immutable");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let first_candidate = format!("candidate-{}", "first".repeat(4));
+        let prior_secret = format!("prior-{}", "authority".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-immutable", true);
+        pending.secret_commitment_sha256 = secret_sha256(&first_candidate);
+        pending.request_authority = Some(test_setup_claim_request_authority(&prior_secret));
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &first_candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage first candidate");
+
+        let replacement_candidate = format!("candidate-{}", "second".repeat(4));
+        assert_eq!(
+            stage_pending_device_credential_with_stores(
+                &pending,
+                &replacement_candidate,
+                &pending_store,
+                &pending_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        let assert_rebound = |rebound: PendingDeviceCredentialPreparation| {
+            assert_eq!(
+                stage_pending_device_credential_with_stores(
+                    &rebound,
+                    &first_candidate,
+                    &pending_store,
+                    &pending_secret,
+                ),
+                Err(LocalApiError::IdentityMutationInProgress)
+            );
+        };
+        let mut rebound = pending.clone();
+        rebound.device.device_id = "device-rebound".to_string();
+        assert_rebound(rebound);
+
+        let mut mutations = Vec::new();
+        for field in [
+            "prior_device_id",
+            "prior_secret_commitment",
+            "prior_sources",
+            "continuity_capability",
+            "account_scope",
+            "installation_id",
+            "machine_id",
+            "hardware_uuid",
+        ] {
+            let mut rebound = pending.clone();
+            let authority = rebound
+                .request_authority
+                .as_mut()
+                .expect("request authority");
+            match field {
+                "prior_device_id" => authority.prior_device_id = Some("device-other".to_string()),
+                "prior_secret_commitment" => {
+                    authority.prior_secret_commitment_sha256 = Some(secret_sha256("prior-other"));
+                }
+                "prior_sources" => {
+                    authority.prior_device_sources = Some(vec!["claude_code".to_string()]);
+                }
+                "continuity_capability" => {
+                    authority.identity_continuity_capability = Some("other-capability".to_string());
+                }
+                "account_scope" => authority.account_scope = Some("account-other".to_string()),
+                "installation_id" => authority.installation_id = "install-other".to_string(),
+                "machine_id" => authority.machine_id = "machine-other".to_string(),
+                "hardware_uuid" => authority.hardware_uuid = Some("hardware-other".to_string()),
+                _ => unreachable!(),
+            }
+            mutations.push((field, rebound));
+        }
+        for (field, rebound) in mutations {
+            let result = stage_pending_device_credential_with_stores(
+                &rebound,
+                &first_candidate,
+                &pending_store,
+                &pending_secret,
+            );
+            if field == "continuity_capability" {
+                assert_eq!(result, Err(LocalApiError::StatePoisoned));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(LocalApiError::IdentityMutationInProgress),
+                    "same-ID request authority rebound for {field}"
+                );
+            }
+        }
+        assert_eq!(
+            pending_secret.load().expect("original candidate retained"),
+            first_candidate
+        );
+        assert_eq!(
+            pending_store.load().expect("original binding retained"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    fn pending_setup_token_repairs_an_unreadable_orphan_with_exact_journal_value() {
+        struct FailFirstLoadStore {
+            loads: AtomicUsize,
+            value: Mutex<Option<String>>,
+        }
+
+        impl ControlTokenStore for FailFirstLoadStore {
+            fn load(&self) -> Result<String, TokenStoreError> {
+                if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(TokenStoreError::Store(
+                        "simulated transient read failure".to_string(),
+                    ));
+                }
+                self.value
+                    .lock()
+                    .expect("token value lock")
+                    .clone()
+                    .ok_or(TokenStoreError::Missing)
+            }
+
+            fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+                *self.value.lock().expect("token value lock") = Some(token.to_string());
+                Ok(())
+            }
+
+            fn delete(&self) -> Result<(), TokenStoreError> {
+                *self.value.lock().expect("token value lock") = None;
+                Ok(())
+            }
+        }
+
+        let setup_token = format!("setup-{}", "recovery".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-token-recovery", true);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: connected_account(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup-token-recovery".to_string(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                claim_code: Some("claim-token-recovery".to_string()),
+                api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            },
+            target_user_id: "user_test".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let store = FailFirstLoadStore {
+            loads: AtomicUsize::new(0),
+            value: Mutex::new(Some("unreadable-orphan".to_string())),
+        };
+
+        stage_pending_setup_run_token_with_store(&pending, &setup_token, &store)
+            .expect("replace unreadable orphan with exact journal token");
+
+        assert_eq!(
+            store.value.lock().expect("token value lock").as_deref(),
+            Some(setup_token.as_str())
+        );
+    }
+
+    #[test]
+    fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-promote-file-failure");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let blocked_parent = root.join("blocked-parent");
+        fs::write(&blocked_parent, b"not-a-directory").expect("create blocker");
+        let device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let pending = test_pending_device_credential("preparation-two", true);
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark confirmed");
+
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            pending_store.load().expect("pending survives"),
+            Some(confirmed.clone())
+        );
+        assert_eq!(
+            pending_secret.load().expect("candidate survives"),
+            candidate
+        );
+        assert_eq!(
+            active_secret.load().expect("active candidate write"),
+            candidate
+        );
+
+        fs::remove_file(&blocked_parent).expect("remove blocker");
+        fs::create_dir(&blocked_parent).expect("create device parent");
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+            &device_store,
+            &active_secret,
+        )
+        .expect("retry promotion");
+
+        assert!(pending_store.load().expect("pending cleared").is_none());
+        assert!(matches!(
+            pending_secret.load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert_eq!(
+            device_store
+                .load_with_credential_generation()
+                .expect("load active binding")
+                .expect("active binding")
+                .credential_generation,
+            4
+        );
+    }
+
+    #[test]
+    fn confirmed_journal_rejects_a_replaced_candidate_secret_before_promotion() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-confirmed-secret-binding");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let replacement = format!("candidate-{}", "replaced".repeat(4));
+        let old_secret = format!("old-{}", "authority".repeat(3));
+        active_secret.save(&old_secret).expect("save old authority");
+        let pending = test_pending_device_credential("preparation-secret-binding", true);
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark confirmed");
+
+        // Mutation oracle: simulate a stale/corrupted Keychain value after the
+        // server confirmation receipt became durable.
+        pending_secret
+            .save(&replacement)
+            .expect("replace staged secret");
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &replacement,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            active_secret.load().expect("old authority retained"),
+            old_secret
+        );
+        assert_eq!(
+            pending_store.load().expect("journal retained"),
+            Some(confirmed)
+        );
+        assert!(device_store
+            .load()
+            .expect("device remains absent")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
+        let support_root = telemetry_key_store_root("credential-rotation-recovery");
+        let secret_root = telemetry_key_store_root("credential-rotation-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+
+        let old_device = LocalDeviceBinding {
+            device_id: "device-old".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let old_secret = format!("old-{}", "authority".repeat(3));
+        FileDeviceStore::default()
+            .save(&old_device)
+            .expect("save old device");
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &old_secret,
+        )
+        .expect("save old secret fallback");
+
+        let pending_store = FilePendingDeviceCredentialStore::default();
+        let pending_secret = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
+        let active_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        let candidate = format!("candidate-{}", "rotation".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-regular-rotation", true);
+        pending.preconfirm_guards_passed = false;
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        pending.request_authority = Some(device_credential_request_authority(
+            "register",
+            "install-regular-rotation",
+            &test_machine(),
+            Some(&PriorDeviceCredential {
+                device_id: old_device.device_id.clone(),
+                device_sources: old_device.sources.clone(),
+                device_secret: old_secret.clone(),
+            }),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        stage_pending_device_credential(&pending, &candidate).expect("stage rotation candidate");
+
+        // Preparing alone never invalidates the old authority.
+        assert_eq!(
+            crate::snapshot_client::load_snapshot_device_credentials()
+                .expect("old authority remains admissible before confirmation"),
+            (old_device.clone(), old_secret)
+        );
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+
+        let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)
+            .expect("persist pre-confirm crash boundary");
+        // Once the confirm request can be sent, a lost response is ambiguous:
+        // the server may already have revoked the prior generation.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark rotation confirmed");
+        let blocked_parent = support_root.join("blocked-rotation-parent");
+        fs::write(&blocked_parent, b"not-a-directory").expect("create promotion blocker");
+        let blocked_device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &blocked_device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("old device remains"),
+            Some(old_device)
+        );
+
+        // Server confirmation can revoke the old generation. Even though its
+        // local files still exist, neither snapshots nor cached OTLP admission
+        // may use it across this crash cut.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert!(pending_store.load().expect("pending cleared").is_none());
+        assert_eq!(
+            crate::snapshot_client::load_snapshot_device_credentials()
+                .expect("promoted authority admitted"),
+            (confirmed.device, candidate)
+        );
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() {
+        let support_root = telemetry_key_store_root("credential-claim-commit-recovery");
+        let secret_root = telemetry_key_store_root("credential-claim-commit-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup-recover".to_string(),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            claim_code: Some("claim-recover".to_string()),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        let setup_token = format!("setup-{}", "claim".repeat(4));
+        let mut pending = test_pending_device_credential("preparation-claim-recover", true);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            target_user_id: account.user.as_ref().expect("connected user").id.clone(),
+            account: account.clone(),
+            connection: connection.clone(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let candidate = format!("candidate-{}", "claim".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        stage_pending_device_credential(&pending, &candidate).expect("stage claim candidate");
+        stage_pending_setup_run_token(&pending, &setup_token).expect("stage claim setup token");
+        pending = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &FilePendingDeviceCredentialStore::default(),
+        )
+        .expect("mark claim confirmed");
+
+        let blocked_connection = support_root.join("connection.json");
+        fs::create_dir(&blocked_connection).expect("block connection file");
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("claim journal retained"),
+            Some(pending.clone())
+        );
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(matches!(
+            setup_run_token_for_connection(DEFAULT_API_BASE_URL, &connection),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        fs::remove_dir(&blocked_connection).expect("unblock connection file");
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert_eq!(
+            FileAccountStore::default().load().expect("active account"),
+            account
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("active connection"),
+            Some(connection)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("active setup token"),
+            setup_token
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("active device candidate"),
+            candidate
+        );
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("claim journal cleared")
+            .is_none());
+        // Pending-secret deletion is deliberately best-effort after the
+        // verified active commit. A Keychain cleanup failure may leave an
+        // inert orphan, but without the journal it is neither discoverable nor
+        // authority and the next exact journal-bound stage replaces it.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_ok());
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+    }
+
+    #[test]
+    fn unconfirmed_or_unauthorized_candidate_cannot_promote() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-promote-unauthorized");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let pending = test_pending_device_credential("preparation-three", false);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &pending,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert!(matches!(
+            active_secret.load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert_eq!(
+            pending_store.load().expect("pending remains"),
+            Some(pending)
+        );
+    }
+
+    fn seed_pending_recovery_fixture(
+        api_base_url: String,
+        confirmation_authorized: bool,
+        expires_at: &str,
+        secret_root: &Path,
+    ) -> (PendingDeviceCredentialPreparation, String) {
+        use ottto_core::token_store::FileControlTokenStore;
+
+        let mut pending =
+            test_pending_device_credential("preparation-recovery", confirmation_authorized);
+        pending.api_base_url = api_base_url;
+        pending.expires_at = expires_at.to_string();
+        let candidate = format!("candidate-{}", "recovery".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save pending recovery fixture");
+        FileControlTokenStore::new(secret_root.join(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT))
+            .save(&candidate)
+            .expect("save pending candidate fallback");
+        (pending, candidate)
+    }
+
+    #[test]
+    #[serial]
+    fn startup_recovery_rejects_a_confirmed_journal_with_a_mismatched_secret() {
+        use ottto_core::token_store::FileControlTokenStore;
+
+        let support_root = telemetry_key_store_root("credential-recovery-secret-binding");
+        let secret_root = telemetry_key_store_root("credential-recovery-secret-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let (mut pending, _) = seed_pending_recovery_fixture(
+            unused_loopback_base_url(),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.confirmed_at = Some("2026-07-31T20:00:00Z".to_string());
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save confirmed journal");
+        FileControlTokenStore::new(secret_root.join(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT))
+            .save(&format!("candidate-{}", "replaced".repeat(4)))
+            .expect("replace pending candidate");
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("journal retained"),
+            Some(pending)
+        );
+        assert!(FileDeviceStore::default()
+            .load()
+            .expect("device remains absent")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn pending_status_preserves_exact_request_authority_and_candidate() {
+        let support_root = telemetry_key_store_root("credential-status-authority-binding");
+        let secret_root = telemetry_key_store_root("credential-status-authority-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status backend");
+        let address = listener.local_addr().expect("status backend address");
+        let (mut pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-status-proof"));
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save authority-bound status journal");
+        let pending_for_server = pending.clone();
+        let server = thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pending status");
+            let request = read_complete_http_request(&mut status);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "pending",
+                "expires_at": pending_for_server.expires_at,
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                }
+            });
+            write_json_response(&mut status, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        server.join().expect("status server");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("pending journal"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn confirmed_pruned_preparation_recovers_via_normal_device_auth() {
+        let support_root = telemetry_key_store_root("credential-pruned-confirmed");
+        let secret_root = telemetry_key_store_root("credential-pruned-confirmed-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let api_base_url = format!("http://{address}");
+        let (mut pending, _) =
+            seed_pending_recovery_fixture(api_base_url, true, "2026-08-01T00:00:00Z", &secret_root);
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-pruned-proof"));
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save authority-bound pruned journal");
+        thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept pruned confirm");
+            let _ = read_complete_http_request(&mut confirm);
+            write_json_response(&mut confirm, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 200, "OK", r#"{"relay_token":"issued"}"#);
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+        let active = FileDeviceStore::default()
+            .load_with_credential_generation()
+            .expect("load active")
+            .expect("active generation");
+        assert_eq!(active.device, pending.device);
+        assert_eq!(active.credential_generation, pending.credential_generation);
+    }
+
+    #[test]
+    #[serial]
+    fn expired_pruned_preparation_clears_only_after_normal_auth_rejection() {
+        let support_root = telemetry_key_store_root("credential-pruned-expired");
+        let secret_root = telemetry_key_store_root("credential-pruned-expired-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        );
+        thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pruned status");
+            let _ = read_complete_http_request(&mut status);
+            write_json_response(&mut status, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept rejected relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 401, "Unauthorized", r#"{"detail":"invalid"}"#);
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn superseded_preparation_status_clears_the_unauthorized_waiter() {
+        let support_root = telemetry_key_store_root("credential-superseded");
+        let secret_root = telemetry_key_store_root("credential-superseded-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let (pending, _) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept superseded status");
+            let _ = read_complete_http_request(&mut status);
+            let body = json!({
+                "preparation_id": pending.preparation_id,
+                "status": "superseded",
+                "expires_at": pending.expires_at,
+                "credential_generation": pending.credential_generation,
+                "device": {
+                    "id": pending.device.device_id,
+                    "machine_id": pending.device.machine_id,
+                    "sources": pending.device.sources,
+                }
+            });
+            write_json_response(&mut status, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn offline_past_retention_keeps_pending_candidate() {
+        let support_root = telemetry_key_store_root("credential-offline-retained");
+        let secret_root = telemetry_key_store_root("credential-offline-retained-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let pending = seed_pending_recovery_fixture(
+            unused_loopback_base_url(),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        )
+        .0;
+
+        assert!(recover_pending_device_credential_at_startup().is_err());
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn confirm_server_failure_keeps_authorized_pending_candidate() {
+        let support_root = telemetry_key_store_root("credential-confirm-uncertain");
+        let secret_root = telemetry_key_store_root("credential-confirm-uncertain-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let pending = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        )
+        .0;
+        thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept uncertain confirm");
+            let _ = read_complete_http_request(&mut confirm);
+            write_json_response(&mut confirm, 503, "Unavailable", r#"{"detail":"retry"}"#);
+        });
+
+        assert!(recover_pending_device_credential_at_startup().is_err());
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
+    }
+
+    fn seed_active_default_cloud_session_grant() -> crate::cloud_sessions::CloudSessionGrantStore {
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        grants
+            .enable(
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device_id.to_string(),
+                    organization_scope: "org_guard".to_string(),
+                    effective_user_scope: "user_guard".to_string(),
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("enable cleanup guard");
+        grants
+            .grant_create_request(device_id)
+            .expect("prepare cleanup grant");
+        let local = grants.load().expect("load cleanup grant").expect("grant");
+        let enabled = cloud_control_backend_grant(&local, device_id, "enabled", 1);
+        grants
+            .bind_backend_grant(&enabled, device_id)
+            .expect("bind cleanup grant");
+        grants
+    }
+
+    fn confirm_default_cloud_session_cleanup(
+        grants: &crate::cloud_sessions::CloudSessionGrantStore,
+    ) {
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .expect("revoke cleanup grant");
+        let local = grants.load().expect("load revoked grant").expect("grant");
+        let revoked = cloud_control_backend_grant(&local, device_id, "revoked", 2);
+        grants
+            .apply_backend_revocation(&revoked, device_id)
+            .expect("confirm cleanup revocation");
+    }
+
+    #[test]
+    #[serial]
+    fn restart_guard_failure_never_confirms_authorized_preparation() {
+        let support_root = telemetry_key_store_root("credential-restart-guard-blocked");
+        let secret_root = telemetry_key_store_root("credential-restart-guard-blocked-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind guarded backend");
+        let address = listener.local_addr().expect("guarded backend address");
+        let (mut pending, _) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.preconfirm_guards_passed = false;
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save unguarded pending");
+        let _grants = seed_active_default_cloud_session_grant();
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("make guarded listener nonblocking");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load guarded pending"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn restart_confirms_once_only_after_cleanup_later_clears() {
+        let support_root = telemetry_key_store_root("credential-restart-guard-clears");
+        let secret_root = telemetry_key_store_root("credential-restart-guard-clears-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind later-clear backend");
+        let address = listener.local_addr().expect("later-clear backend address");
+        let (mut pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.preconfirm_guards_passed = false;
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save unguarded pending");
+        let grants = seed_active_default_cloud_session_grant();
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        confirm_default_cloud_session_cleanup(&grants);
+
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let confirms_for_server = confirms.clone();
+        let pending_for_server = pending.clone();
+        let server = thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept one confirm");
+            let request = read_complete_http_request(&mut confirm);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            confirms_for_server.fetch_add(1, Ordering::SeqCst);
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:00:00Z",
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                },
+                "credential_rotation_performed": false,
+            });
+            write_json_response(&mut confirm, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        server.join().expect("confirm server");
+        assert_eq!(confirms.load(Ordering::SeqCst), 1);
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending cleared")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn user_approved_switch_survives_crash_before_cleanup_and_recovers_exact_claim() {
+        let support_root = telemetry_key_store_root("credential-switch-intent-recovery");
+        let secret_root = telemetry_key_store_root("credential-switch-intent-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind switch recovery backend");
+        let address = listener.local_addr().expect("switch recovery address");
+        let old_account = connected_account();
+        FileAccountStore::default()
+            .save(&old_account)
+            .expect("save old account");
+        let old_device = LocalDeviceBinding {
+            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            machine_id: Some("machine-old".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileDeviceStore::default()
+            .save(&old_device)
+            .expect("save old device");
+        let new_account = LocalAccountBinding {
+            state: LocalAccountState::Connected,
+            user: Some(LocalAccountUser {
+                id: "user_switch_new".to_string(),
+                email: "new@example.com".to_string(),
+                display_name: None,
+            }),
+            organization: Some(LocalAccountOrganization {
+                id: "org_switch_new".to_string(),
+                name: "New Org".to_string(),
+            }),
+            connected_at: Some("2026-07-31T20:00:00Z".to_string()),
+            last_refreshed_at: Some("2026-07-31T20:00:00Z".to_string()),
+            message: None,
+        };
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup-switch-new".to_string(),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine-new".to_string()),
+            claim_code: Some("claim-switch-new".to_string()),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        let setup_token = format!("setup-{}", "switch".repeat(4));
+        let mut pending = test_pending_device_credential("preparation-switch-new", false);
+        pending.api_base_url = format!("http://{address}");
+        pending.device.device_id = "device-switch-new".to_string();
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: new_account.clone(),
+            connection: connection.clone(),
+            target_user_id: "user_switch_new".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let candidate = format!("candidate-{}", "switch".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        stage_pending_device_credential(&pending, &candidate).expect("stage switch candidate");
+        stage_pending_setup_run_token(&pending, &setup_token).expect("stage switch setup token");
+        let daemon = daemon().with_account(old_account.clone());
+        daemon
+            .stage_account_switch_if_user_mismatch(StagedAccountSwitch {
+                claim_code: "claim-switch-new".to_string(),
+                new_account: new_account.clone(),
+                setup_run_id: "setup-switch-new".to_string(),
+                setup_run_token: setup_token.clone(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-new".to_string()),
+                relay_device: None,
+                relay_device_secret: None,
+                relay_device_credential_preparation_id: Some("preparation-switch-new".to_string()),
+                backfill_policy: None,
+                backfill_cutoff_at: None,
+            })
+            .expect("stage account switch")
+            .expect("different user switch");
+        let grants = seed_active_default_cloud_session_grant();
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        assert_eq!(
+            auth_switch_account(&daemon, &authorization, "claim-switch-new"),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        let authorized = FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load authorized switch")
+            .expect("pending switch");
+        assert!(authorized.confirmation_authorized);
+        assert!(!authorized.preconfirm_guards_passed);
+        assert_eq!(
+            FileAccountStore::default().load().expect("old account"),
+            old_account
+        );
+        drop(daemon);
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        confirm_default_cloud_session_cleanup(&grants);
+        let pending_for_server = authorized.clone();
+        let server = thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept switch confirm");
+            let request = read_complete_http_request(&mut confirm);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:01:00Z",
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                },
+                "credential_rotation_performed": false,
+            });
+            write_json_response(&mut confirm, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        server.join().expect("switch confirm server");
+        assert_eq!(
+            FileAccountStore::default().load().expect("new account"),
+            new_account
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("new connection"),
+            Some(connection)
+        );
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("new device")
+                .expect("device"),
+            pending.device
+        );
     }
 
     fn create_control_test_dir(path: &Path) {
@@ -11570,8 +14434,8 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let (device, secret) =
-            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+        let credentials = relay_device_credentials_from_claim_completion(
+            &SetupClaimCompleteResponse {
                 setup_run_id: "setup_claim".to_string(),
                 setup_run_token: "otsr_claim".to_string(),
                 setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -11586,6 +14450,7 @@ mod tests {
                     ],
                 }),
                 relay_device_secret: Some("otdev_rotated_claim".to_string()),
+                relay_device_credential_preparation: None,
                 connected_at: "2026-05-05T09:20:00Z".to_string(),
                 user: SetupClaimCompleteUser {
                     id: "user_claim".to_string(),
@@ -11598,9 +14463,13 @@ mod tests {
                 },
                 backfill_policy: None,
                 backfill_cutoff_at: None,
-            })
-            .expect("materialize claim relay device")
-            .expect("relay device credentials present");
+            },
+            None,
+        )
+        .expect("materialize claim relay device");
+        let ClaimRelayDeviceCredential::Legacy(device, secret) = credentials else {
+            panic!("legacy relay device credentials present");
+        };
         persist_relay_device_credentials(&device, &secret).expect("persist claim relay device");
         assert_eq!(
             FileDeviceStore::default()
@@ -11635,14 +14504,15 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let credentials =
-            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+        let credentials = relay_device_credentials_from_claim_completion(
+            &SetupClaimCompleteResponse {
                 setup_run_id: "setup_claim".to_string(),
                 setup_run_token: "otsr_claim".to_string(),
                 setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
                 machine_id: Some("machine_claim".to_string()),
                 relay_device: None,
                 relay_device_secret: None,
+                relay_device_credential_preparation: None,
                 connected_at: "2026-05-05T09:20:00Z".to_string(),
                 user: SetupClaimCompleteUser {
                     id: "user_claim".to_string(),
@@ -11655,14 +14525,84 @@ mod tests {
                 },
                 backfill_policy: None,
                 backfill_cutoff_at: None,
-            })
-            .expect("materialize no claim relay device");
+            },
+            None,
+        )
+        .expect("materialize no claim relay device");
 
-        assert!(credentials.is_none());
+        assert!(matches!(credentials, ClaimRelayDeviceCredential::None));
         assert_eq!(
             FileDeviceStore::default().load().expect("load device"),
             None
         );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_accepts_only_the_modern_prepared_credential_shape() {
+        let support_root = telemetry_key_store_root("claim-complete-prepared-device");
+        let secret_root = telemetry_key_store_root("claim-complete-prepared-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let completed: SetupClaimCompleteResponse = serde_json::from_value(json!({
+            "setup_run_id": "setup_claim",
+            "setup_run_token": "setup-token",
+            "setup_run_token_expires_at": "2026-08-01T00:00:00Z",
+            "machine_id": "machine-one",
+            "relay_device_credential_preparation": {
+                "preparation_id": "preparation-modern",
+                "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                "expires_at": "2026-08-01T00:00:00Z",
+                "credential_generation": 2,
+                "device": {"id": "device-modern", "machine_id": "machine-one", "sources": ["codex"]},
+                "candidate_secret": candidate.clone(),
+                "credential_rotation_planned": false
+            },
+            "connected_at": "2026-07-31T20:00:00Z",
+            "user": {"id": "user-one", "email": "user@example.com", "display_name": null},
+            "organization": {"id": "org-one", "name": "Org"}
+        }))
+        .expect("parse modern completion");
+
+        let credentials = relay_device_credentials_from_claim_completion(&completed, None)
+            .expect("validate modern completion");
+        let ClaimRelayDeviceCredential::Prepared(prepared) = credentials else {
+            panic!("modern preparation expected");
+        };
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains(&candidate));
+        assert!(!debug.contains("preparation-modern"));
+
+        let mut mixed: serde_json::Value = serde_json::to_value(json!({
+            "setup_run_id": "setup_claim",
+            "setup_run_token": "setup-token",
+            "setup_run_token_expires_at": "2026-08-01T00:00:00Z",
+            "machine_id": "machine-one",
+            "relay_device": {"id": "device-active", "machine_id": "machine-one", "sources": ["codex"]},
+            "relay_device_secret": "legacy-secret",
+            "relay_device_credential_preparation": {
+                "preparation_id": "preparation-modern",
+                "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                "expires_at": "2026-08-01T00:00:00Z",
+                "credential_generation": 2,
+                "device": {"id": "device-modern", "machine_id": "machine-one", "sources": ["codex"]},
+                "candidate_secret": "candidate-secret",
+                "credential_rotation_planned": false
+            },
+            "connected_at": "2026-07-31T20:00:00Z",
+            "user": {"id": "user-one", "email": "user@example.com", "display_name": null},
+            "organization": {"id": "org-one", "name": "Org"}
+        }))
+        .expect("serialize mixed completion");
+        // Keep the value mutable to make it explicit this is a wire-shape
+        // rejection test, not a typed constructor accidentally omitting data.
+        mixed["backfill_policy"] = serde_json::Value::Null;
+        let mixed: SetupClaimCompleteResponse =
+            serde_json::from_value(mixed).expect("parse mixed completion");
+        assert!(relay_device_credentials_from_claim_completion(&mixed, None).is_err());
     }
 
     #[test]
@@ -11694,6 +14634,151 @@ mod tests {
                 Some("install_test")
             );
         }
+    }
+
+    #[test]
+    fn telemetry_registration_declares_continuity_and_sends_proof_only_as_a_pair() {
+        let machine = test_machine();
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install_session_continuity".to_string(),
+            install_session_token: "install_token_continuity".to_string(),
+        };
+        let first = telemetry_device_register_body(&install_session, &machine);
+        assert_eq!(
+            first["identity_continuity_capability"],
+            IDENTITY_CONTINUITY_CAPABILITY
+        );
+        assert!(first.get("prior_device_id").is_none());
+        assert!(first.get("prior_device_secret").is_none());
+
+        let prior = PriorDeviceCredential {
+            device_id: "device_prior".to_string(),
+            device_sources: vec!["codex".to_string()],
+            device_secret: "secret_prior".to_string(),
+        };
+        let repeat =
+            telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
+        assert_eq!(repeat["prior_device_id"], "device_prior");
+        assert_eq!(repeat["prior_device_secret"], "secret_prior");
+    }
+
+    #[test]
+    fn telemetry_registration_response_keeps_old_backend_tolerance_and_checks_rotation() {
+        let url = "https://api.ottto.net/api/v1/telemetry/devices/register";
+        let prior = PriorDeviceCredential {
+            device_id: "device_prior".to_string(),
+            device_sources: vec!["codex".to_string()],
+            device_secret: "secret_prior".to_string(),
+        };
+        let old: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
+            r#"{"device":{"id":"device","machine_id":"machine","sources":["codex"]},"device_secret":"secret"}"#,
+        )
+        .expect("old backend response");
+        validate_registration_continuity_response(url, &old, Some(&prior))
+            .expect("additive response fields stay optional");
+
+        let rotated: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
+            r#"{"device":{"id":"device_new","machine_id":"machine","sources":["codex"]},"device_secret":"secret_new","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_prior"}"#,
+        )
+        .expect("rotation response");
+        validate_registration_continuity_response(url, &rotated, Some(&prior))
+            .expect("matching rotation proof");
+
+        validate_registration_continuity_response(url, &rotated, None)
+            .expect_err("first registration cannot claim a prior rotation");
+    }
+
+    #[test]
+    #[serial]
+    fn modern_registration_prepare_and_confirm_use_the_additive_contract() {
+        let support_root = telemetry_key_store_root("device-prepare-wire");
+        let secret_root = telemetry_key_store_root("device-prepare-wire-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind prepare backend");
+        let address = listener.local_addr().expect("prepare backend address");
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let candidate_for_server = candidate.clone();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_server = captured.clone();
+        thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept credential request");
+                let request = read_complete_http_request(&mut stream);
+                captured_for_server
+                    .lock()
+                    .expect("captured request lock")
+                    .push(request);
+                let body = if index == 0 {
+                    json!({
+                        "preparation_id": "preparation-wire",
+                        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                        "expires_at": "2026-08-01T00:00:00Z",
+                        "credential_generation": 3,
+                        "device": {"id": "device-wire", "machine_id": "machine_test", "sources": ["codex"]},
+                        "candidate_secret": candidate_for_server.clone(),
+                        "credential_rotation_planned": false
+                    })
+                } else {
+                    json!({
+                        "preparation_id": "preparation-wire",
+                        "status": "confirmed",
+                        "confirmed_at": "2026-07-31T20:00:00Z",
+                        "credential_generation": 3,
+                        "device": {"id": "device-wire", "machine_id": "machine_test", "sources": ["codex"]},
+                        "credential_rotation_performed": false
+                    })
+                };
+                write_json_response(&mut stream, 200, "OK", &body.to_string());
+            }
+        });
+        let api_base_url = format!("http://{address}");
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install-session-wire".to_string(),
+            install_session_token: "install-token-wire".to_string(),
+        };
+        let (prepared, _prior, request_authority) =
+            prepare_telemetry_device_registration(&api_base_url, &install_session, &test_machine())
+                .expect("prepare registration");
+        let mut pending = pending_device_credential_from_preparation(
+            &api_base_url,
+            &prepared,
+            true,
+            None,
+            request_authority,
+        )
+        .expect("materialize pending");
+        pending.preconfirm_guards_passed = true;
+        confirm_device_credential_preparation(&pending, &candidate).expect("confirm registration");
+
+        let requests = captured.lock().expect("captured requests");
+        let prepare_request = &requests[0];
+        assert!(prepare_request
+            .starts_with("POST /api/v1/telemetry/devices/registration-preparations HTTP/1.1"));
+        let prepare_body: serde_json::Value =
+            serde_json::from_str(http_request_body(prepare_request)).expect("prepare body");
+        assert_eq!(
+            prepare_body["credential_preparation_capability"],
+            DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        );
+        assert_eq!(
+            prepare_body["credential_preparation_idempotency_key"],
+            device_credential_preparation_idempotency_key(
+                "register",
+                "install-session-wire",
+                "install_test"
+            )
+        );
+        let confirm_request = &requests[1];
+        assert!(confirm_request.starts_with(
+            "POST /api/v1/telemetry/device-credential-preparations/preparation-wire/confirm HTTP/1.1"
+        ));
+        assert!(confirm_request.contains(&format!(
+            "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+        )));
+        assert!(!confirm_request.contains("/telemetry/devices/register "));
     }
 
     /// Every backend payload that already carries install-scoped identity must
@@ -11747,10 +14832,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn claim_completion_request_includes_existing_relay_device_identity() {
+    fn claim_completion_request_sends_existing_keychain_proof_stably_across_retries() {
         let support_root = telemetry_key_store_root("claim-complete-request-device");
+        let secret_root = telemetry_key_store_root("claim-complete-request-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         FileDeviceStore::default()
             .save(&LocalDeviceBinding {
                 device_id: "device_existing_claim".to_string(),
@@ -11758,45 +14846,86 @@ mod tests {
                 sources: vec!["codex".to_string(), "pi".to_string()],
             })
             .expect("persist existing relay device");
+        let prior_secret = format!("prior-{}", "claim-proof".repeat(3));
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &prior_secret,
+        )
+        .expect("persist existing relay secret fallback");
+        let candidate_secret = format!("candidate-{}", "claim".repeat(4));
 
-        let captured_request = Arc::new(Mutex::new(None));
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
         let address = listener.local_addr().expect("claim backend address");
-        let captured_request_for_thread = captured_request.clone();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept claim complete");
-            let request = read_complete_http_request(&mut stream);
-            *captured_request_for_thread
-                .lock()
-                .expect("captured request lock") = Some(request);
-            write_json_response(
-                &mut stream,
-                200,
-                "OK",
-                r#"{"setup_run_id":"setup_claim","setup_run_token":"otsr_claim","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_claim","email":"claim@example.com","display_name":null},"organization":{"id":"org_claim","name":"Claim Org"}}"#,
-            );
+        let captured_requests_for_thread = captured_requests.clone();
+        let candidate_for_server = candidate_secret.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept claim complete");
+                let request = read_complete_http_request(&mut stream);
+                captured_requests_for_thread
+                    .lock()
+                    .expect("captured request lock")
+                    .push(request);
+                let response = json!({
+                    "setup_run_id": "setup_claim",
+                    "setup_run_token": "otsr_claim",
+                    "setup_run_token_expires_at": "2026-05-05T10:30:00Z",
+                    "machine_id": "machine_test",
+                    "relay_device_credential_preparation": {
+                        "preparation_id": "preparation-claim-existing",
+                        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "credential_generation": 7,
+                        "device": {
+                            "id": "device_claim_next",
+                            "machine_id": "machine_test",
+                            "sources": ["codex", "pi"],
+                        },
+                        "candidate_secret": candidate_for_server.clone(),
+                        "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+                        "credential_rotation_planned": true,
+                        "prior_device_id": "device_existing_claim",
+                    },
+                    "connected_at": "2026-05-05T09:20:00Z",
+                    "user": {
+                        "id": "user_claim",
+                        "email": "claim@example.com",
+                        "display_name": null,
+                    },
+                    "organization": {"id": "org_claim", "name": "Claim Org"},
+                });
+                write_json_response(&mut stream, 200, "OK", &response.to_string());
+            }
         });
         let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
 
-        complete_setup_claim(
-            &PendingAuthClaim {
-                claim_code: "claim_existing".to_string(),
-                claim_token: "token_existing".to_string(),
-                nonce: "nonce_existing".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
-                expires_at: "2026-05-05T09:30:00Z".to_string(),
-            },
-            &test_machine(),
-        )
-        .expect("complete setup claim");
+        let claim = PendingAuthClaim {
+            claim_code: "claim_existing".to_string(),
+            claim_token: "token_existing".to_string(),
+            nonce: "nonce_existing".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
+            expires_at: "2026-05-05T09:30:00Z".to_string(),
+        };
+        let mut completions = Vec::new();
+        for _ in 0..2 {
+            completions.push(
+                complete_setup_claim(&claim, &test_machine(), None).expect("complete setup claim"),
+            );
+        }
+        server.join().expect("claim server");
 
-        let request = captured_request
-            .lock()
-            .expect("captured request lock")
-            .clone()
-            .expect("request captured");
+        let requests = captured_requests.lock().expect("captured request lock");
+        assert_eq!(requests.len(), 2);
+        let request = &requests[0];
         let body: serde_json::Value =
-            serde_json::from_str(http_request_body(&request)).expect("claim request json");
+            serde_json::from_str(http_request_body(request)).expect("claim request json");
+        let retry_body: serde_json::Value =
+            serde_json::from_str(http_request_body(&requests[1])).expect("retry request json");
+        assert_eq!(
+            retry_body, body,
+            "retry must reproduce the exact proof body"
+        );
         assert_eq!(
             body.get("relay_device_id")
                 .and_then(serde_json::Value::as_str),
@@ -11812,6 +14941,16 @@ mod tests {
             Some(vec!["codex", "pi"])
         );
         assert_eq!(
+            body.get("identity_continuity_capability")
+                .and_then(serde_json::Value::as_str),
+            Some(IDENTITY_CONTINUITY_CAPABILITY)
+        );
+        assert_eq!(
+            body.get("prior_device_secret")
+                .and_then(serde_json::Value::as_str),
+            Some(prior_secret.as_str())
+        );
+        assert_eq!(
             body.get("installation_id")
                 .and_then(serde_json::Value::as_str),
             Some("install_test"),
@@ -11822,6 +14961,280 @@ mod tests {
             Some(&serde_json::Value::Null),
             "claim completion must send hardware_uuid when known and null otherwise"
         );
+        assert_eq!(
+            body.get("credential_preparation_capability")
+                .and_then(serde_json::Value::as_str),
+            Some(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY)
+        );
+        let expected_idempotency_key = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim_existing",
+            "install_test",
+        );
+        assert_eq!(
+            body.get("credential_preparation_idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_idempotency_key.as_str())
+        );
+
+        let completion = completions.pop().expect("claim completion");
+        let credentials = relay_device_credentials_from_claim_completion(
+            &completion.response,
+            completion.prior_device_credential.as_ref(),
+        )
+        .expect("validate prepared claim credential");
+        let ClaimRelayDeviceCredential::Prepared(prepared) = credentials else {
+            panic!("prepared claim credential");
+        };
+        let pending = pending_device_credential_from_preparation(
+            &format!("http://{address}"),
+            &prepared,
+            false,
+            None,
+            completion.request_authority,
+        )
+        .expect("materialize exact pending claim credential");
+        let authority = pending
+            .request_authority
+            .as_ref()
+            .expect("request authority journal");
+        assert_eq!(authority.flow, "setup_claim");
+        assert_eq!(
+            authority.prior_device_id.as_deref(),
+            Some("device_existing_claim")
+        );
+        assert_eq!(
+            authority.prior_device_sources.as_deref(),
+            Some(["codex".to_string(), "pi".to_string()].as_slice())
+        );
+        let prior_secret_commitment = secret_sha256(&prior_secret);
+        assert_eq!(
+            authority.prior_secret_commitment_sha256.as_deref(),
+            Some(prior_secret_commitment.as_str())
+        );
+        assert_eq!(
+            pending.secret_commitment_sha256,
+            secret_sha256(&candidate_secret)
+        );
+        let raw_journal = serde_json::to_string(&pending).expect("serialize pending journal");
+        assert!(!raw_journal.contains(&prior_secret));
+        assert!(!raw_journal.contains(&candidate_secret));
+        stage_pending_device_credential(&pending, &candidate_secret)
+            .expect("stage exact pending candidate");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load exact pending candidate"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn first_device_claim_completion_omits_prior_credential_proof() {
+        let support_root = telemetry_key_store_root("claim-complete-first-device");
+        let secret_root = telemetry_key_store_root("claim-complete-first-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let captured = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind first claim backend");
+        let address = listener.local_addr().expect("first claim address");
+        let captured_for_server = captured.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept first claim");
+            *captured_for_server.lock().expect("captured request lock") =
+                Some(read_complete_http_request(&mut stream));
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_first","setup_run_token":"otsr_first","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_first","email":"first@example.com","display_name":null},"organization":{"id":"org_first","name":"First Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_first".to_string(),
+                claim_token: "token_first".to_string(),
+                nonce: "nonce_first".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_first".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        )
+        .expect("complete first setup claim");
+        server.join().expect("first claim server");
+
+        let request = captured
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("first request");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("first request body");
+        for field in [
+            "relay_device_id",
+            "relay_device_sources",
+            "prior_device_secret",
+            "identity_continuity_capability",
+        ] {
+            assert!(body.get(field).is_none(), "unexpected first-device {field}");
+        }
+    }
+
+    #[test]
+    fn existing_device_with_missing_secret_fails_closed() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("claim-prior-secret-missing");
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        device_store
+            .save(&LocalDeviceBinding {
+                device_id: "device-existing".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save existing device");
+        let missing_secret = MemoryTokenStore::new();
+
+        assert!(matches!(
+            prior_device_credential_with_stores(&device_store, &missing_secret),
+            Err(LocalApiError::StatePoisoned)
+        ));
+        assert!(device_store
+            .load()
+            .expect("existing binding remains readable")
+            .is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn rejected_prior_proof_preserves_active_authority_and_no_pending_candidate() {
+        let support_root = telemetry_key_store_root("claim-prior-proof-rejected");
+        let secret_root = telemetry_key_store_root("claim-prior-proof-rejected-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let active_device = LocalDeviceBinding {
+            device_id: "device-rejected-proof".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let rejected_secret = format!("rejected-{}", "proof".repeat(4));
+        FileDeviceStore::default()
+            .save(&active_device)
+            .expect("save active binding");
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &rejected_secret,
+        )
+        .expect("save rejected proof fallback");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rejecting backend");
+        let address = listener.local_addr().expect("rejecting backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept rejected proof");
+            let _ = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                401,
+                "Unauthorized",
+                r#"{"detail":"invalid prior device credential"}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        let result = complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_rejected".to_string(),
+                claim_token: "token_rejected".to_string(),
+                nonce: "nonce_rejected".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_rejected".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        );
+        server.join().expect("rejecting backend");
+
+        assert!(matches!(
+            result,
+            Err(LocalApiError::Backend(details)) if details.status == Some(401)
+        ));
+        assert_eq!(
+            FileDeviceStore::default().load().expect("active binding"),
+            Some(active_device)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("active proof"),
+            rejected_secret
+        );
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending journal")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn prior_secret_rotation_during_claim_http_is_detected_before_journaling() {
+        let support_root = telemetry_key_store_root("claim-prior-proof-race");
+        let secret_root = telemetry_key_store_root("claim-prior-proof-race-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device-proof-race".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save active binding");
+        let secret_path = secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        fs::write(&secret_path, "prior-proof-before").expect("save initial proof");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proof race backend");
+        let address = listener.local_addr().expect("proof race address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept proof race");
+            let request = read_complete_http_request(&mut stream);
+            let body: serde_json::Value =
+                serde_json::from_str(http_request_body(&request)).expect("proof race body");
+            assert_eq!(body["prior_device_secret"], "prior-proof-before");
+            fs::write(secret_path, "prior-proof-after").expect("rotate proof out of band");
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_race","setup_run_token":"otsr_race","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_race","email":"race@example.com","display_name":null},"organization":{"id":"org_race","name":"Race Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        let result = complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_race".to_string(),
+                claim_token: "token_race".to_string(),
+                nonce: "nonce_race".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_race".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        );
+        server.join().expect("proof race server");
+
+        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending journal")
+            .is_none());
     }
 
     #[test]
@@ -13285,6 +16698,7 @@ mod tests {
                 machine_id: Some("machine_new".to_string()),
                 relay_device: None,
                 relay_device_secret: None,
+                relay_device_credential_preparation_id: None,
                 backfill_policy: None,
                 backfill_cutoff_at: None,
             })
@@ -13697,6 +17111,9 @@ mod tests {
         };
         FileAccountStore::default().save(&account).unwrap();
         FileDeviceStore::default().save(&old_device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("otdev_old_claim")
+            .unwrap();
         let pending = PendingAuthClaim {
             claim_code: "claim_reserved".to_string(),
             claim_token: "claim_token_reserved".to_string(),
@@ -13904,6 +17321,9 @@ mod tests {
         };
         FileAccountStore::default().save(&account).unwrap();
         FileDeviceStore::default().save(&old_device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("otdev_old_install")
+            .unwrap();
         let (api_base, register_seen, allow_register) = controlled_install_registration_server();
         let connection = LocalConnectionBinding {
             setup_run_id: "setup_install_reserved".to_string(),
@@ -18398,12 +21818,23 @@ log_user_prompt = true
                 ) && request.contains("X-Ottto-Install-Session-Token: install_token_fresh")
                 {
                     write_json_response(&mut stream, 200, "OK", "{}");
-                } else if request.contains("/api/v1/telemetry/devices/register") {
+                } else if request.contains(
+                    "/api/v1/telemetry/devices/registration-preparations",
+                ) {
                     write_json_response(
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_secret_install"}"#,
+                        r#"{"preparation_id":"preparation_install_fresh","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_secret_install","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"device_existing"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/telemetry/device-credential-preparations/preparation_install_fresh/confirm",
+                ) {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"preparation_id":"preparation_install_fresh","status":"confirmed","confirmed_at":"2026-07-31T20:00:00Z","credential_generation":2,"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_existing"}"#,
                     );
                 } else if request
                     .contains("/api/v1/setup-runs/setup_install_fresh/local-client/actions/action_install_pi/complete")
@@ -19120,7 +22551,7 @@ log_user_prompt = true
         let (register_seen_tx, register_seen_rx) = mpsc::channel();
         let (allow_register_tx, allow_register_rx) = mpsc::channel();
         thread::spawn(move || {
-            for _ in 0..6 {
+            for _ in 0..8 {
                 let (mut stream, _) = listener.accept().expect("accept install request");
                 let request = read_complete_http_request(&mut stream);
                 if request.contains("/local-client/install-sessions") {
@@ -19130,14 +22561,25 @@ log_user_prompt = true
                         "OK",
                         r#"{"install_session_id":"install_reserved","install_session_token":"install_token_reserved"}"#,
                     );
-                } else if request.contains("/api/v1/telemetry/devices/register") {
+                } else if request.contains(
+                    "/api/v1/telemetry/devices/registration-preparations",
+                ) {
                     register_seen_tx.send(()).unwrap();
                     allow_register_rx.recv().unwrap();
                     write_json_response(
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_reserved_install"}"#,
+                        r#"{"preparation_id":"preparation_reserved_install","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_reserved_install","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/telemetry/device-credential-preparations/preparation_reserved_install/confirm",
+                ) {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"preparation_id":"preparation_reserved_install","status":"confirmed","confirmed_at":"2026-07-31T20:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
                     );
                 } else {
                     write_json_response(&mut stream, 200, "OK", "{}");
@@ -19169,12 +22611,14 @@ log_user_prompt = true
                                 "OK",
                                 r#"{"install_session_id":"install_blocked","install_session_token":"install_token_blocked"}"#,
                             );
-                        } else if request.contains("/api/v1/telemetry/devices/register") {
+                        } else if request
+                            .contains("/api/v1/telemetry/devices/registration-preparations")
+                        {
                             write_json_response(
                                 &mut stream,
                                 200,
                                 "OK",
-                                r#"{"device":{"id":"device_should_not_rotate","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_should_not_rotate"}"#,
+                                r#"{"preparation_id":"preparation_should_not_rotate","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_should_not_rotate","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_should_not_rotate","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
                             );
                             observed_tx.send(true).unwrap();
                             return;

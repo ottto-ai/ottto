@@ -35,8 +35,13 @@ underlying SHA-256 component hash or revision material.
 
 Every genuinely emitted normal snapshot now carries the same bounded
 `semantic_envelope`: both contract versions, the five policy booleans, the
-source-exact component hash set, and a client-authored revision hash. The
-backend can therefore bind the envelope to the existing snapshot fingerprint
+source-exact component hash set, the legacy client-authored revision hash, and
+an additive server-reproducible `snapshot_revision:v2` witness. The v2 witness
+uses RFC 8785 canonical JSON over an explicit field list: source/session,
+parser and scan versions, opened/source-file witness, stable lifecycle and
+provenance state, upload policy, and every post-policy component hash. It
+excludes scan wall-clock, source-wide file count, fingerprints, and the semantic
+envelope itself. The backend can therefore bind the envelope to the existing snapshot fingerprint
 without reconstructing normalized payload fields. The compact envelope is
 hard-capped at 2 KiB; the 60 Pi/Codex/Claude policy golden cases are 896–984
 bytes. It contains no audit key, raw content, path, title, or provider session

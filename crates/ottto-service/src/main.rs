@@ -218,6 +218,9 @@ fn main() -> Result<()> {
             #[cfg(unix)]
             {
                 cleanup_legacy_services_at_startup();
+                if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
+                    eprintln!("pending relay credential recovery deferred");
+                }
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -248,6 +251,9 @@ fn main() -> Result<()> {
             socket,
         } => {
             cleanup_legacy_services_at_startup();
+            if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
+                eprintln!("pending relay credential recovery deferred");
+            }
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),

@@ -17,6 +17,8 @@ pub const OTTTO_LEGACY_KEYCHAIN_SERVICE: &str = "net.ottto.locald";
 pub const OTTTO_KEYCHAIN_ACCOUNT: &str = "control-token";
 pub const OTTTO_SETUP_RUN_TOKEN_ACCOUNT: &str = "setup-run-token";
 pub const OTTTO_RELAY_DEVICE_SECRET_ACCOUNT: &str = "relay-device-secret";
+pub const OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT: &str = "pending-relay-device-secret";
+pub const OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT: &str = "pending-setup-run-token";
 pub const CONTROL_TOKEN_FILE_NAME: &str = "control-token";
 
 #[derive(Debug, Error)]

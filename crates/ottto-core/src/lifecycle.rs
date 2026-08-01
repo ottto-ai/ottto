@@ -6,6 +6,7 @@ use crate::local_service::{
 use crate::token_store::{ControlTokenStore, KeychainSecretStore};
 use crate::{
     OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
+    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
     OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{UninstallAction, UninstallExecutionResult, UninstallPlan};
@@ -166,6 +167,20 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             requires_confirmation: true,
             destructive: true,
         },
+        UninstallAction {
+            action: "remove_pending_relay_device_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_pending_setup_run_credential".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
     ];
 
     actions.extend(
@@ -185,6 +200,8 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
             OTTTO_KEYCHAIN_ACCOUNT,
             OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
             OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+            OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
         ]
         .into_iter()
         .map(|account| UninstallAction {
@@ -423,6 +440,8 @@ fn remove_keychain_tokens(report: &mut CleanupReport) {
         OTTTO_KEYCHAIN_ACCOUNT,
         OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
         OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
     ] {
         match KeychainSecretStore::new(account).delete() {
             Ok(()) => {}
@@ -438,6 +457,8 @@ fn remove_keychain_tokens(report: &mut CleanupReport) {
         OTTTO_KEYCHAIN_ACCOUNT,
         OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
         OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+        OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
     ] {
         if let Err(error) = delete_legacy_keychain_item(account) {
             failures += 1;
@@ -624,6 +645,14 @@ mod tests {
                     "remove_relay_device_credential",
                     "net.ottto.service/relay-device-secret"
                 ),
+                (
+                    "remove_pending_relay_device_credential",
+                    "net.ottto.service/pending-relay-device-secret"
+                ),
+                (
+                    "remove_pending_setup_run_credential",
+                    "net.ottto.service/pending-setup-run-token"
+                ),
             ]
         );
         let legacy_credentials = plan
@@ -638,6 +667,8 @@ mod tests {
                 "net.ottto.locald/control-token",
                 "net.ottto.locald/setup-run-token",
                 "net.ottto.locald/relay-device-secret",
+                "net.ottto.locald/pending-relay-device-secret",
+                "net.ottto.locald/pending-setup-run-token",
             ]
         );
         let telemetry_services = plan

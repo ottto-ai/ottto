@@ -116,32 +116,28 @@ report actively misleading:
 
 ## Scan-index manifest on check-ins
 
-`{source, entity_count, rolling_hash}` on the collector status receipt, from the
-scan index the sync cycle already had open:
+`snapshot_manifest:v2` on the collector status receipt, from the scan index the
+sync cycle already had open:
 
 * **Grain:** one entity per indexed transcript that produced a snapshot, plus one
   per Codex state-only session. A transcript that parses into several snapshots
   contributes its last fingerprint — the same value the index uses for no-op
   suppression.
-* **Scope, declared on the wire** as `scope: "live_scan_window"` plus
-  `window_days`. The live scan index only holds transcripts inside the authorized
-  scan window; the one-time historical bootstrap uploads older sessions from a
-  throwaway index that is never persisted, so those entities are on the server
-  and permanently absent here. A consumer that compared this count against its
-  whole stored set would report a mismatch on a perfectly healthy machine, so the
-  scoping is the consumer's job and the manifest states what it can see. Making
-  the count cover all history means persisting the bootstrap's index into the
-  live one — a change to emission bookkeeping, deliberately not folded into this
-  release.
-  `scope` and `window_days` are reported but **not** folded into `rolling_hash`:
-  two machines holding the same entity set must agree on the fold even if their
-  authorized windows differ.
+* **Scope, declared exactly on the wire** as
+  `scope: "semantic_activity_window"`, `window_start`, and `window_end`.
+  Membership is the half-open `[window_start, window_end)` interval over stable
+  usage/session activity, never file mtime or `collected_at`. Metadata-only
+  entities have an explicit null activity witness: they are still uploaded and
+  ACKed, but cannot enter this semantic window. Census completeness and loss
+  diagnostics remain top-level status counts; the manifest never presents a
+  locally computed count as server-acceptance proof.
 * **`rolling_hash`:** SHA-256 over the length-prefixed concatenation of the
   manifest contract version, the scope, the source slug, and then each distinct
-  entity fingerprint in ascending byte order. Length prefixes are load-bearing: without
-  them two different fingerprint splits can produce identical bytes. Sorting
-  makes the fold order-independent, so the server can recompute it from its own
-  stored fingerprints for this (user, machine, source).
+  in-window entity fingerprint in ascending byte order. Window timestamps are
+  not hash inputs. Length prefixes are load-bearing: without them two different
+  fingerprint splits can produce identical bytes. Sorting makes the fold
+  order-independent, so the server can recompute it from its own stored
+  fingerprints for this (user, machine, source).
 * **No path, session id, title, or byte offset participates.** The fold is over
   fingerprints that are already on the wire.
 * Absent before the first completed scan of a process — absent, not zeroed. A
@@ -183,7 +179,8 @@ Two fixtures are the cross-language contract, both regenerable:
 
 * `fixtures/snapshot-audit/semantic-envelope-golden.json` — 60 cases (3 sources ×
   20 valid upload policies) carrying, per case, the component hashes, the
-  policy-neutral subset, `content_hash`, `hash_epoch`, the canonical byte count,
+  policy-neutral subset, `content_hash`, `hash_epoch`, the additive explicit
+  `snapshot_revision:v2` canonical body and digest, the canonical byte count,
   and the envelope byte count. Regenerate with
   `UPDATE_SEMANTIC_ENVELOPE_GOLDEN=1 cargo test -p ottto-service --lib semantic_envelope_cross_language_golden`.
   The corpus itself asserts the identity contract: for each source all twenty

@@ -1,0 +1,9 @@
+{
+  "contract_version": "snapshot_manifest:v2",
+  "scope": "semantic_activity_window",
+  "source": "codex",
+  "window_start": "2026-01-01T00:00:00Z",
+  "window_end": "2026-07-01T00:00:00Z",
+  "entity_count": 2,
+  "rolling_hash": "e41e4e5554ee39e83f09a876578cfe6fd4bd2f1bbfcb7fb6fab1b0e958fe3e45"
+}

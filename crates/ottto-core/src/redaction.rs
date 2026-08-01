@@ -28,6 +28,10 @@ pub fn redact_key_value(key: &str, value: &str) -> RedactedValue {
 }
 
 pub fn redact_inline(input: &str) -> String {
+    if let Some(redacted) = redact_json_secret_values(input) {
+        return redacted;
+    }
+
     let mut redacted = Vec::new();
     let mut prompt_tail_redacted = false;
     // Set when the *previous* token was a standalone auth label (e.g. the
@@ -89,6 +93,52 @@ pub fn redact_inline(input: &str) -> String {
     }
 
     redacted.join(" ")
+}
+
+fn redact_json_secret_values(input: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    if !redact_json_value(&mut value) {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn redact_json_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut changed = false;
+            for (key, value) in object {
+                let replacement = if is_secret_key(key) {
+                    Some("[REDACTED]")
+                } else if is_local_path_key(key) {
+                    Some("[path]")
+                } else if is_machine_identifier_key(key) {
+                    Some("[machine_id]")
+                } else if is_account_identifier_key(key) {
+                    Some("[account_id]")
+                } else if is_raw_prompt_key(key) {
+                    Some("[prompt]")
+                } else {
+                    None
+                };
+                if let Some(replacement) = replacement {
+                    *value = serde_json::Value::String(replacement.to_string());
+                    changed = true;
+                } else {
+                    changed |= redact_json_value(value);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= redact_json_value(item);
+            }
+            changed
+        }
+        _ => false,
+    }
 }
 
 fn is_secret_key(key: &str) -> bool {
@@ -238,7 +288,14 @@ fn is_auth_label(token: &str) -> bool {
     let label = lower.strip_suffix(':').unwrap_or(&lower);
     matches!(
         label,
-        "bearer" | "authorization" | "token" | "x-api-key" | "apikey" | "api-key" | "password"
+        "bearer"
+            | "authorization"
+            | "token"
+            | "x-api-key"
+            | "apikey"
+            | "api-key"
+            | "password"
+            | "x-ottto-device-credential-preparation-secret"
     )
 }
 
@@ -463,6 +520,53 @@ mod tests {
             redact_inline("header bearer=ottto_live_secret endpoint ok"),
             "header [REDACTED] endpoint ok"
         );
+    }
+
+    #[test]
+    fn redacts_compact_json_secret_values_recursively() {
+        let redacted = redact_inline(
+            r#"{"prior_device_secret":"prior-value","candidate_secret":"candidate-value","nested":[{"install_session_token":"install-value"},{"client_secret":"client-value"}],"detail":"ordinary diagnostic"}"#,
+        );
+
+        assert_eq!(
+            redacted,
+            r#"{"candidate_secret":"[REDACTED]","detail":"ordinary diagnostic","nested":[{"install_session_token":"[REDACTED]"},{"client_secret":"[REDACTED]"}],"prior_device_secret":"[REDACTED]"}"#
+        );
+        assert!(!redacted.contains("prior-value"));
+        assert!(!redacted.contains("install-value"));
+        assert!(!redacted.contains("client-value"));
+        assert!(!redacted.contains("candidate-value"));
+        assert_eq!(
+            redact_inline("X-Ottto-Device-Credential-Preparation-Secret: candidate-header-value"),
+            "X-Ottto-Device-Credential-Preparation-Secret: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn compact_json_secret_redaction_does_not_bypass_identifier_privacy() {
+        let redacted = redact_inline(
+            r#"{"token":"secret-value","file_path":"/Users/private/session.jsonl","organization_id":"org_private","machine_id":"machine-private","raw_prompt":"private prompt"}"#,
+        );
+
+        assert_eq!(
+            redacted,
+            r#"{"file_path":"[path]","machine_id":"[machine_id]","organization_id":"[account_id]","raw_prompt":"[prompt]","token":"[REDACTED]"}"#
+        );
+        for private_value in [
+            "secret-value",
+            "/Users/private",
+            "org_private",
+            "machine-private",
+            "private prompt",
+        ] {
+            assert!(!redacted.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn preserves_ordinary_colon_diagnostic_prose() {
+        let text = "backend response: session registration is still pending";
+        assert_eq!(redact_inline(text), text);
     }
 
     #[test]
