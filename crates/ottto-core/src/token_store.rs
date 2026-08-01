@@ -167,6 +167,12 @@ impl ControlTokenStore for KeychainTokenStore {
 #[cfg(target_os = "macos")]
 impl ControlTokenStore for KeychainSecretStore {
     fn load(&self) -> Result<String, TokenStoreError> {
+        // An explicit file-store directory is an isolation boundary, not just
+        // a different mirror location. Tests and support tools use it with a
+        // temporary HOME and must never fall through to the user's Keychain.
+        if explicit_file_secret_store() {
+            return load_file_secret(self.account);
+        }
         match load_file_secret(self.account) {
             Ok(token) => return Ok(token),
             Err(TokenStoreError::Missing) => {}
@@ -184,6 +190,9 @@ impl ControlTokenStore for KeychainSecretStore {
     }
 
     fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+        if explicit_file_secret_store() {
+            return save_file_secret(self.account, token);
+        }
         let token = token.to_string();
         let keychain_token = token.clone();
         match run_keychain_with_timeout(self.account, "save", move |account| {
@@ -207,6 +216,9 @@ impl ControlTokenStore for KeychainSecretStore {
     }
 
     fn delete(&self) -> Result<(), TokenStoreError> {
+        if explicit_file_secret_store() {
+            return delete_file_secret(self.account);
+        }
         let keychain_result = run_keychain_with_timeout(self.account, "delete", keychain_delete);
         let file_result = delete_file_secret(self.account);
         match (keychain_result, file_result) {
@@ -597,6 +609,10 @@ fn file_secret_dir() -> PathBuf {
     std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| default_support_dir().join("secrets"))
+}
+
+fn explicit_file_secret_store() -> bool {
+    std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV).is_some()
 }
 
 fn secret_file_name(account: &str) -> String {
