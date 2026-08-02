@@ -175,8 +175,18 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // sidecar so existing Codex child sessions emit exact parent/root/depth facts.
 // Codex v27 / Claude Code v26 add privacy-safe hourly Browser, Chrome, and
 // Computer Use activity to the existing content-free activity summary.
+// claude_code v27: attribute reasoning effort per API request instead of
+// reconciling hourly aggregates. Claude Code stamps the top-level `session.id`
+// on subagent OTLP records, so evidence keyed by session id alone never reached
+// a sidechain transcript -- every subagent session reported effort-unknown --
+// and the pooled subagent requests also overflowed the parent's fit check,
+// dropping the parent's effort for that hour too. The sidecar now carries the
+// API request id and the transcript repeats it as `requestId`, so each turn
+// takes its own observed tier. Scan identity does NOT move: which session a file
+// maps to is unchanged, and the effort sidecar fingerprint already re-selects a
+// transcript whose evidence grew after its final write.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v26";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v27";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -1484,6 +1494,12 @@ fn snapshot_semantic_activity_at(item: &SnapshotItem) -> Option<String> {
         .map(|(_, value)| value.to_string())
 }
 
+/// Anthropic request id -> applied reasoning-effort tier, for one scan.
+///
+/// Request ids are globally unique, so one flat map covers every transcript in
+/// the scan and each request attaches to whichever transcript recorded it.
+pub type ClaudeEffortByRequest = BTreeMap<String, String>;
+
 /// Split Claude transcript bucket rows by exact locally-reduced OTLP effort.
 ///
 /// The transcript remains authoritative for total tokens. Evidence is applied
@@ -1723,6 +1739,13 @@ fn apply_claude_effort_evidence_with_families(
                 let index = indices[0];
                 let base = &bucket.model_usage[index];
                 if model_usage_has_cost(base) {
+                    continue;
+                }
+                // Already attributed per request during the parse. Re-splitting
+                // it from hourly aggregates could only lose precision, and the
+                // evidence pool may include subagent requests this transcript
+                // never recorded.
+                if base.reasoning_effort.is_some() {
                     continue;
                 }
                 let mut effort_rows: Vec<(String, UsageTotals)> = grouped
@@ -3728,6 +3751,11 @@ struct SnapshotAccumulator {
     // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
     // read-only across every session file in the cycle via `Arc`.
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    // Claude per-request reasoning effort, reduced once per scan from the local
+    // OTLP sidecar and shared read-only via `Arc`. Keyed by Anthropic request
+    // id because Claude Code reports the top-level session id even for subagent
+    // requests, so session id alone cannot route effort to the right transcript.
+    claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
     // Exact sum of every usage record admitted to the wire projection. A
@@ -3832,6 +3860,7 @@ impl SnapshotAccumulator {
             latest_reasoning_effort: None,
             latest_turn_id: None,
             codex_turn_traces: None,
+            claude_effort_by_request: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             accepted_usage_totals: UsageTotals::default(),
@@ -4251,6 +4280,17 @@ impl SnapshotAccumulator {
             return false;
         };
         traces.is_priority_turn(turn_id)
+    }
+
+    /// The applied reasoning-effort tier for this transcript line, if the local
+    /// OTLP sidecar observed that request. `None` leaves the row effort-unknown,
+    /// which is the honest answer when telemetry was off or the request predates
+    /// request-id capture.
+    fn claude_effort_for_line(&self, value: &Value) -> Option<String> {
+        let index = self.claude_effort_by_request.as_ref()?;
+        let request_id =
+            string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]))?;
+        index.get(&request_id).cloned()
     }
 
     fn add_usage_with_selector(
@@ -5158,6 +5198,33 @@ fn scan_source_roots_with_limit_and_attribution(
         })
         .collect::<Vec<_>>();
 
+    // Reduce this scan's Claude effort sidecars once, keyed by API request id,
+    // and share the result read-only across every transcript in the cycle.
+    //
+    // A subagent transcript's evidence lives in its PARENT session's sidecar,
+    // because Claude Code stamps the top-level `session.id` on subagent OTLP
+    // records while the daemon files each subagent transcript under its own
+    // session id. Collect the OWNING session id per candidate, then let the
+    // globally unique request ids route each observation back to whichever
+    // transcript actually recorded it.
+    let claude_effort_by_request = (source == SnapshotSource::ClaudeCode).then(|| {
+        let session_ids = files.iter().filter_map(|candidate| {
+            claude_subagent_identity(&candidate.path)
+                .map(|identity| identity.root_session_id)
+                .or_else(|| {
+                    candidate
+                        .path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string)
+                })
+        });
+        Arc::new(crate::claude_effort::load_claude_effort_by_request(
+            &ottto_core::default_support_dir(),
+            session_ids,
+        ))
+    });
+
     let legacy_sidecar_fingerprint = match source {
         SnapshotSource::Codex => codex_title_metadata.legacy_sidecar_fingerprint.as_str(),
         SnapshotSource::ClaudeCode => claude_title_metadata.legacy_sidecar_fingerprint.as_str(),
@@ -5322,6 +5389,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 Some(&codex_title_metadata),
                 None,
                 codex_turn_traces.clone(),
+                None,
                 true,
                 attribution_context,
             ),
@@ -5336,6 +5404,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 Some(&claude_title_metadata),
                 None,
+                claude_effort_by_request.clone(),
                 artifacts_enabled,
                 attribution_context,
             ),
@@ -5347,6 +5416,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 source_file_fingerprint.clone(),
                 source,
                 apply_pi_line,
+                None,
                 None,
                 None,
                 None,
@@ -5817,6 +5887,7 @@ fn parse_codex_jsonl_file_with_diagnostics(
         Some(title_metadata),
         None,
         codex_turn_traces,
+        None,
         // Codex lines never feed the artifact scraper; the value is moot.
         true,
         attribution_context,
@@ -5829,6 +5900,31 @@ pub fn parse_claude_code_jsonl_file(
     source_file_fingerprint: String,
 ) -> Result<Vec<SnapshotItem>> {
     parse_claude_code_jsonl_file_with_artifacts(path, collected_at, source_file_fingerprint, true)
+}
+
+/// As ``parse_claude_code_jsonl_file`` but with the scan's per-request effort
+/// index threaded in, exactly as the production scan path does.
+#[cfg(test)]
+fn parse_claude_code_jsonl_file_with_effort_index(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
+) -> Result<Vec<SnapshotItem>> {
+    parse_jsonl_file(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        SnapshotSource::ClaudeCode,
+        apply_claude_code_line,
+        None,
+        Some(&ClaudeTitleMetadata::default()),
+        None,
+        claude_effort_by_request,
+        true,
+        None,
+    )
+    .map(|parsed| parsed.snapshots)
 }
 
 /// As ``parse_claude_code_jsonl_file`` but with the artifact-scrape policy
@@ -5905,6 +6001,7 @@ fn parse_claude_code_jsonl_file_with_diagnostics(
         None,
         Some(title_metadata),
         None,
+        None,
         artifacts_enabled,
         attribution_context,
     )
@@ -5948,6 +6045,7 @@ fn parse_pi_jsonl_file_with_diagnostics(
         None,
         None,
         None,
+        None,
         // Pi lines never feed the artifact scraper; the value is moot.
         true,
         attribution_context,
@@ -5969,6 +6067,7 @@ fn parse_jsonl_file(
     codex_title_metadata: Option<&CodexTitleMetadata>,
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedSnapshotFile> {
@@ -5986,6 +6085,7 @@ fn parse_jsonl_file(
         codex_title_metadata,
         claude_title_metadata,
         codex_turn_traces,
+        claude_effort_by_request,
         artifacts_enabled,
         attribution_context,
     )?;
@@ -6021,6 +6121,7 @@ fn parse_opened_jsonl_file(
     codex_title_metadata: Option<&CodexTitleMetadata>,
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedJsonlFile> {
@@ -6032,6 +6133,7 @@ fn parse_opened_jsonl_file(
     let mut accumulator = SnapshotAccumulator::new(source);
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
+    accumulator.claude_effort_by_request = claude_effort_by_request;
     let mut recognized_usage_drop_count = 0;
     let mut positive_recognized_usage_count: usize = 0;
     let mut positive_usage_evidence = false;
@@ -7594,6 +7696,12 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 "derived_from_effective_input_volume",
             );
         }
+        // Claude Code surfaces per-turn effort via OTLP, never in the transcript.
+        // The sidecar carries the API request id, and the transcript repeats it
+        // as `requestId`, so the tier attaches to the exact turn that used it --
+        // no hourly reconciliation, and subagent turns land on their own
+        // transcript instead of the parent's.
+        let reasoning_effort = accumulator.claude_effort_for_line(value);
         accumulator.add_usage_with_selector(
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
@@ -7601,8 +7709,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             usage,
             selector,
             timestamp.as_deref(),
-            // Claude Code surfaces per-turn effort via OTLP, not this snapshot path.
-            None,
+            reasoning_effort,
         );
     }
     // Artifact scraping clones and tokenizes every tool-result blob on the
@@ -18701,6 +18808,216 @@ mod tests {
             .any(|fact| fact.field == "provider_surface" && fact.value == "claude_cli"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_per_request_effort_attaches_each_tier_to_its_own_turn() {
+        // Two requests in one hour on one model, different applied tiers. The
+        // aggregate path could only reconcile these by matching token totals;
+        // the request id names the turn outright.
+        let path = temp_file("claude-effort-per-request");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-01T10:00:00Z\",\"sessionId\":\"per-request-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-01T10:01:00Z\",\"sessionId\":\"per-request-1\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-01T10:02:00Z\",\"sessionId\":\"per-request-1\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let index = Arc::new(ClaudeEffortByRequest::from([
+            ("req_A".to_string(), "xhigh".to_string()),
+            ("req_B".to_string(), "low".to_string()),
+        ]));
+
+        let item = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-01T10:04:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let mut split: Vec<(Option<String>, u64, u64)> = item
+            .model_usage
+            .iter()
+            .map(|row| {
+                (
+                    row.reasoning_effort.clone(),
+                    row.input_tokens,
+                    row.output_tokens,
+                )
+            })
+            .collect();
+        split.sort();
+        assert_eq!(
+            split,
+            vec![
+                (Some("low".to_string()), 20, 7),
+                (Some("xhigh".to_string()), 10, 5),
+            ]
+        );
+        // Totals are untouched: the split only labels usage the transcript
+        // already owned.
+        assert_eq!(
+            item.model_usage
+                .iter()
+                .map(|row| row.input_tokens)
+                .sum::<u64>(),
+            30
+        );
+        assert_eq!(
+            item.model_usage
+                .iter()
+                .map(|row| row.output_tokens)
+                .sum::<u64>(),
+            12
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_per_request_effort_reaches_subagent_transcripts() {
+        // The regression this whole change exists for. Claude Code stamps the
+        // PARENT `session.id` on subagent OTLP records, so evidence keyed by
+        // session id alone never reached a sidechain snapshot and every
+        // subagent session reported effort-unknown. Request ids do reach it.
+        let root = temp_dir("claude-effort-subagent");
+        let parent_session = "1f2e3d4c-5b6a-4798-8765-4321abcdef00";
+        let subagents_dir = root.join(parent_session).join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("create subagents dir");
+        let path = subagents_dir.join("agent-a43f55c3b414272d5.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-01T09:48:14.432Z\",\"type\":\"user\",\"sessionId\":\"1f2e3d4c-5b6a-4798-8765-4321abcdef00\",\"agentId\":\"a43f55c3b414272d5\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"explore\"}}\n",
+                "{\"timestamp\":\"2026-08-01T09:48:20.000Z\",\"type\":\"assistant\",\"sessionId\":\"1f2e3d4c-5b6a-4798-8765-4321abcdef00\",\"agentId\":\"a43f55c3b414272d5\",\"isSidechain\":true,\"requestId\":\"req_SUB\",\"message\":{\"id\":\"msg_SUB\",\"model\":\"claude-sonnet-5\",\"usage\":{\"input_tokens\":40,\"output_tokens\":12}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        // The index holds the parent turn and the subagent turn together,
+        // exactly as one parent sidecar stores them.
+        let index = Arc::new(ClaudeEffortByRequest::from([
+            ("req_PARENT".to_string(), "xhigh".to_string()),
+            ("req_SUB".to_string(), "high".to_string()),
+        ]));
+
+        let item = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-01T09:50:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.source_session_id,
+            format!("{parent_session}_agent-a43f55c3b414272d5")
+        );
+        assert_eq!(item.model_usage.len(), 1);
+        // Its own tier, not the parent's.
+        assert_eq!(
+            item.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_turn_without_captured_request_stays_effort_unknown() {
+        // Partial collection must degrade to unknown, never borrow a
+        // neighbouring turn's tier.
+        let path = temp_file("claude-effort-partial");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-01T11:00:00Z\",\"sessionId\":\"partial-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-01T11:01:00Z\",\"sessionId\":\"partial-1\",\"requestId\":\"req_KNOWN\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-01T11:02:00Z\",\"sessionId\":\"partial-1\",\"requestId\":\"req_MISSING\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let index = Arc::new(ClaudeEffortByRequest::from([(
+            "req_KNOWN".to_string(),
+            "max".to_string(),
+        )]));
+
+        let item = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-01T11:04:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let mut split: Vec<(Option<String>, u64)> = item
+            .model_usage
+            .iter()
+            .map(|row| (row.reasoning_effort.clone(), row.input_tokens))
+            .collect();
+        split.sort();
+        assert_eq!(split, vec![(None, 20), (Some("max".to_string()), 10)]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_aggregate_effort_pass_leaves_per_request_rows_alone() {
+        // Legacy sidecar rows still reconcile in aggregate, but a row the parse
+        // already attributed must not be re-split from hourly sums: the pool can
+        // include subagent requests this transcript never recorded.
+        let path = temp_file("claude-effort-already-attributed");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-01T12:00:00Z\",\"sessionId\":\"attributed-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-01T12:01:00Z\",\"sessionId\":\"attributed-1\",\"requestId\":\"req_ONLY\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let index = Arc::new(ClaudeEffortByRequest::from([(
+            "req_ONLY".to_string(),
+            "high".to_string(),
+        )]));
+        let mut items = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-01T12:04:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse");
+        // A legacy-shaped observation claiming the whole hour ran at `low`.
+        let evidence = BTreeMap::from([(
+            "attributed-1".to_string(),
+            vec![crate::claude_effort::ClaudeEffortEvidence {
+                fingerprint: "legacy".to_string(),
+                session_id: "attributed-1".to_string(),
+                observed_at: "2026-08-01T12:01:00Z".to_string(),
+                model: "claude-opus-5".to_string(),
+                effort: "low".to_string(),
+                input_tokens: 10,
+                output_tokens: 5,
+                request_count: 1,
+                ..Default::default()
+            }],
+        )]);
+
+        apply_claude_effort_evidence(&mut items, &evidence);
+
+        assert_eq!(items[0].model_usage.len(), 1);
+        assert_eq!(
+            items[0].model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
