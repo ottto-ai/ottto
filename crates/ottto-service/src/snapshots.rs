@@ -12076,6 +12076,54 @@ mod tests {
     }
 
     #[test]
+    fn census_window_is_pinned_only_while_traversal_scope_matches() {
+        let first_root = temp_dir("bounded-traversal-pinned-scope-first");
+        let second_root = temp_dir("bounded-traversal-pinned-scope-second");
+        let mut index = ScanIndex::default();
+
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&first_root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&first_root),
+            &mut index,
+            "2027-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .expect("matching traversal resumes")
+                .census_window_end,
+            "2026-07-31T00:00:00Z",
+            "elapsed wall time cannot move a resumed census boundary"
+        );
+
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&second_root),
+            &mut index,
+            "2027-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let restarted = index
+            .traversal
+            .as_ref()
+            .expect("changed root scope starts a new traversal");
+        assert_eq!(restarted.census_window_end, "2027-07-31T00:05:00Z");
+        assert_eq!(restarted.scan_roots, vec![second_root.clone()]);
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
     fn new_tail_waits_for_next_bounded_traversal_generation() {
         let root = temp_dir("bounded-traversal-new-tail");
         let fixture = |tokens: usize| {

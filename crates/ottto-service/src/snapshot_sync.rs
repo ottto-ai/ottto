@@ -726,12 +726,12 @@ fn clear_source_upload_deadlines_for_test() {
 
 /// Entity fingerprints already counted as a client-report poison loss.
 ///
-/// The server has no per-entity rejection vocabulary yet, so a permanently
-/// invalid entity is re-attempted every cycle. Counting each attempt would make
-/// one broken session look like an unbounded stream of losses — and if the
-/// source has no valid sibling, no request ever succeeds, so nothing commits the
-/// report and the number only grows. One entity is one loss until the per-entity
-/// ACK contract lands and the daemon can mark it durably poisoned.
+/// Legacy validation failures are re-attempted every cycle because they have no
+/// durable per-entity settlement. Counting each attempt would make one broken
+/// session look like an unbounded stream of losses — and if the source has no
+/// valid sibling, no request ever succeeds, so nothing commits the report and
+/// the number only grows. Entity-ACK rejections and local corruption are counted
+/// through the same ledger after their quarantine checkpoint is durable.
 ///
 /// Pruned to the current scan on every upload pass, exactly like the accepted
 /// fingerprint ledger, so it stays O(current scan) rather than O(all history).
@@ -1844,6 +1844,12 @@ fn sync_source(
     let manifest_window_end = manifest_window_end
         .format(&Rfc3339)
         .context("format snapshot manifest window end")?;
+    // A bounded traversal may span process restarts. Its manifest is scoped to
+    // the first tick's pinned census boundary, so every post-scan terminal
+    // receipt must identify that same logical scan start rather than the later
+    // resume attempt. This gives the backend an exact, restart-stable binding:
+    // manifest.window_end == last_scan_started_at.
+    let terminal_scan_started_at = manifest_window_end.as_str();
 
     // Persist the Companion-facing posture projection as soon as an
     // activity-hint-authorized local scan is complete and account-switch
@@ -1967,7 +1973,7 @@ fn sync_source(
                 CollectorStatus {
                     source,
                     machine_id,
-                    scan_started_at: &scan_started_at,
+                    scan_started_at: terminal_scan_started_at,
                     counts: SyncCounts::from_scan_result(&scan_result, accepted),
                     // `server_error` is the closest code the receipt contract
                     // carries; the loss report is where the shed is named
@@ -1989,7 +1995,7 @@ fn sync_source(
                 CollectorStatus {
                     source,
                     machine_id,
-                    scan_started_at: &scan_started_at,
+                    scan_started_at: terminal_scan_started_at,
                     counts: SyncCounts::from_scan_result(&scan_result, accepted),
                     state: CollectorState::Disabled(
                         disabled_reason.or_else(|| Some("disabled_by_admin".to_string())),
@@ -2107,7 +2113,7 @@ fn sync_source(
                 CollectorStatus {
                     source,
                     machine_id,
-                    scan_started_at: &scan_started_at,
+                    scan_started_at: terminal_scan_started_at,
                     counts: SyncCounts::from_scan_result(&scan_result, accepted),
                     state,
                 },
@@ -2182,7 +2188,7 @@ fn sync_source(
         CollectorStatus {
             source,
             machine_id,
-            scan_started_at: &scan_started_at,
+            scan_started_at: terminal_scan_started_at,
             counts: SyncCounts::from_scan_result(&scan_result, accepted),
             state: CollectorState::Success,
         },
@@ -2386,6 +2392,9 @@ where
                 operation: "save divergent duplicate quarantine",
             })
         })?;
+        for fingerprint in &divergent_fingerprints {
+            record_poison_loss_once(poison_scope, fingerprint);
+        }
         deferred_validation_error = Some(anyhow::Error::new(SnapshotLocalStateRejected {
             operation: "quarantine divergent duplicate fingerprint bodies",
         }));
@@ -2487,6 +2496,11 @@ where
                         operation: "save upload checkpoint",
                     })
                 })?;
+                if entity_ack {
+                    for entity in &response.rejected_entities {
+                        record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+                    }
+                }
                 *accepted = accepted.saturating_add(response.accepted);
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
@@ -2690,6 +2704,15 @@ fn report_status(
                 1,
             ),
         };
+    let manifest = cached_source_manifest(destination_namespace, status.source);
+    if manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.window_end != status.scan_started_at)
+    {
+        return Err(anyhow!(
+            "snapshot manifest window end does not match terminal scan start"
+        ));
+    }
     let request = SnapshotStatusRequest {
         schema_version: SNAPSHOT_STATUS_SCHEMA_VERSION,
         source: status.source.api_slug().to_string(),
@@ -2726,7 +2749,7 @@ fn report_status(
         next_retry_at: None,
         collector_version: Some(collector_version()),
         parser_version: Some(status.source.parser_version().to_string()),
-        manifest: cached_source_manifest(destination_namespace, status.source),
+        manifest,
     };
     client.report_status(relay_token, &request)?;
     Ok(())
@@ -3344,6 +3367,127 @@ mod tests {
     }
 
     #[test]
+    #[serial(client_report)]
+    fn entity_ack_rejection_counts_one_poison_after_durable_quarantine() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+
+        reset_for_test();
+        let poison_scope = unique_poison_scope();
+        let items = test_fingerprints(2);
+        let accepted_fingerprint = items[0].clone();
+        let rejected_fingerprint = items[1].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let result = upload_resumable_batches(
+            &items,
+            &poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: 1,
+                    sessions_reconciled: 1,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                    ),
+                    accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: "accepted".to_string(),
+                        snapshot_fingerprint: accepted_fingerprint.clone(),
+                        occurrence_count: 1,
+                    }],
+                    unchanged_entities: Vec::new(),
+                    rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: "rejected".to_string(),
+                        snapshot_fingerprint: rejected_fingerprint.clone(),
+                        reason: "invalid".to_string(),
+                        detail: "permanent validation failure".to_string(),
+                        permanent: true,
+                        occurrence_count: 1,
+                    }],
+                    conflict_entities: Vec::new(),
+                })
+            },
+            |_| Ok(()),
+        )
+        .expect("permanent entity rejection is durably settled");
+
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(accepted, 1);
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&accepted_fingerprint));
+        assert!(progress
+            .quarantined_fingerprints
+            .contains_key(&rejected_fingerprint));
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
+        assert_eq!(
+            counted_poison_fingerprints_for_test(&poison_scope),
+            BTreeSet::from([rejected_fingerprint])
+        );
+        reset_for_test();
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn entity_ack_rejection_is_not_counted_before_quarantine_persists() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+
+        reset_for_test();
+        let poison_scope = unique_poison_scope();
+        let items = test_fingerprints(1);
+        let rejected_fingerprint = items[0].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+
+        let error = upload_resumable_batches(
+            &items,
+            &poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: 0,
+                    sessions_reconciled: 0,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                    ),
+                    accepted_entities: Vec::new(),
+                    unchanged_entities: Vec::new(),
+                    rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: "rejected".to_string(),
+                        snapshot_fingerprint: rejected_fingerprint.clone(),
+                        reason: "invalid".to_string(),
+                        detail: "permanent validation failure".to_string(),
+                        permanent: true,
+                        occurrence_count: 1,
+                    }],
+                    conflict_entities: Vec::new(),
+                })
+            },
+            |_| Err(anyhow!("checkpoint unavailable")),
+        )
+        .expect_err("an undurable rejection quarantine cannot settle the source");
+
+        assert_eq!(
+            snapshot_upload_error_class(&error),
+            Some(SnapshotUploadErrorClass::LocalState)
+        );
+        assert_eq!(accepted, 0);
+        assert!(counted_poison_fingerprints_for_test(&poison_scope).is_empty());
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+        reset_for_test();
+    }
+
+    #[test]
     fn snapshot_upload_coalesces_byte_equal_duplicate_occurrences() {
         let poison_scope = &unique_poison_scope();
         let duplicate = "a".repeat(64);
@@ -3405,7 +3549,12 @@ mod tests {
     }
 
     #[test]
+    #[serial(client_report)]
     fn snapshot_upload_quarantines_divergent_duplicate_bodies_and_continues() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+
+        reset_for_test();
+        let poison_scope = unique_poison_scope();
         let duplicate = "d".repeat(64);
         let valid = "e".repeat(64);
         let items = vec![
@@ -3427,7 +3576,7 @@ mod tests {
         let mut uploaded = Vec::new();
         let error = upload_resumable_batches(
             &items,
-            &unique_poison_scope(),
+            &poison_scope,
             &mut progress,
             &mut accepted,
             |item| item.fingerprint.as_str(),
@@ -3447,6 +3596,12 @@ mod tests {
             snapshot_upload_error_class(&error),
             Some(SnapshotUploadErrorClass::LocalState)
         );
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
+        assert_eq!(
+            counted_poison_fingerprints_for_test(&poison_scope),
+            BTreeSet::from([duplicate])
+        );
+        reset_for_test();
     }
 
     #[test]
@@ -5697,7 +5852,7 @@ mod tests {
             CollectorStatus {
                 source: SnapshotSource::Codex,
                 machine_id: "otm_test",
-                scan_started_at: "2026-06-01T10:00:00Z",
+                scan_started_at: "2100-01-01T00:00:00Z",
                 counts,
                 state: CollectorState::Success,
             },
@@ -5708,6 +5863,24 @@ mod tests {
         // "the collector dropped what changed".
         assert!(requests[1].contains("\"last_semantic_noop_count\":718"));
         assert!(requests[1].contains("\"entity_count\":1"));
+        assert!(requests[1].contains("\"last_scan_started_at\":\"2100-01-01T00:00:00Z\""));
+
+        let mismatch = report_status(
+            &client,
+            "relay-token-codex",
+            destination_namespace,
+            CollectorStatus {
+                source: SnapshotSource::Codex,
+                machine_id: "otm_test",
+                scan_started_at: "2026-06-01T10:00:00Z",
+                counts: SyncCounts::for_policy(30),
+                state: CollectorState::Success,
+            },
+        )
+        .expect_err("terminal receipt cannot detach a manifest from its census boundary");
+        assert!(mismatch
+            .to_string()
+            .contains("manifest window end does not match terminal scan start"));
 
         // An account switch replaces the relay binding without restarting the
         // daemon. The new destination must not receive the previous account's
