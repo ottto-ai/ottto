@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 302,
-  "content_sha256": "2e17a2c9c77854a3bc4282141e1a9b4c8ffdb26972847e7c8c79050c9f34e31d",
+  "candidate_file_count": 303,
+  "content_sha256": "818fc3fb967c074e5887ff67f5a9b6d4fae6c628e79bf31e72c5e0740747c253",
   "files": [
     {
       "executable": false,
@@ -713,7 +713,7 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "e6cde014ad0e5a3b2903f5121bb5ff1766a5f1c79933a2164c83197e37fb80a0",
+      "sha256": "8b09dc60330ba32f6cd33b3f72e50c21fafa945bc83223e26ec4ef7c3798930a",
       "size_bytes": 912274
     },
     {
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "f674504e8ddf0240828d3405370fee9cbfcb4da53660897efc20e99d570fb837",
-      "size_bytes": 260400
+      "sha256": "c80f9005b4f1035d7858b2bc678e03198f7df492f0bdd7534330397cfde47323",
+      "size_bytes": 259860
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8d7b7330e2ddcbfbad69eb53b85a5f25c5e373db3d645c4d11aaba8786de0a05",
-      "size_bytes": 979456
+      "sha256": "99eb1c324205b66cc9881fdee1187a3b1fd2e85dadb17d1b9955b0053e2d0944",
+      "size_bytes": 987005
     },
     {
       "executable": false,
@@ -1224,8 +1224,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-07-31-snapshot-replay-controls.md",
-      "sha256": "4ca438ef9220e04a6e650ceec3975e803b416baddcd3c46d4c12e83bca974b10",
-      "size_bytes": 12211
+      "sha256": "e9ac4400ffbd6fb5b382da770a300d7f9a141cb3705d56b3e9b7334d745377f3",
+      "size_bytes": 12380
     },
     {
       "executable": false,
@@ -1247,6 +1247,13 @@
       "path": "docs/session-2026-08-01-setup-claim-credential-continuity.md",
       "sha256": "06aa117acef4319310a8a6ade33c19d454683b9b6c3a515a35295e2c17a40fdc",
       "size_bytes": 3079
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-02-scanner-correctness-followup.md",
+      "sha256": "f7a811eca10d2e09a91d716e395b077c081c021e87c298a89c7014b6de9f4ad6",
+      "size_bytes": 4101
     },
     {
       "executable": false,
@@ -2117,9 +2124,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T03:30:47+00:00",
+  "generated_at": "2026-08-02T04:16:53+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 303,
+  "output_file_count": 304,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2153,5 +2160,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6ae681bc8ce2e2f35e93d69badd387fd7e44ee6e"
+  "source_commit": "b683be4c63191838c1ad45f85e787be3625c407b"
 }
