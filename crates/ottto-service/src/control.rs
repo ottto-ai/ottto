@@ -55,7 +55,13 @@ use std::io;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +93,15 @@ const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const PI_SESSION_MAX_DEPTH: usize = 32;
+const PI_SESSION_MAX_ENTRIES: usize = 20_000;
+const PI_SESSION_MAX_FILES: usize = 10_000;
+const PI_SESSION_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const PI_SESSION_MAX_AGGREGATE_BYTES: u64 = 128 * 1024 * 1024;
+const PI_MULTIPART_MAX_FIELD_BYTES: usize = 4 * 1024;
+const PI_MULTIPART_MAX_BODY_BYTES: usize = 132 * 1024 * 1024;
+const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
+    "race-safe rooted session access is unavailable on this platform";
 // Poll long enough for slow-arriving agent telemetry (codex batches + flushes
 // its token records, then the relay forwards them) to reach the backend before
 // we give up — claude/pi still return early on success. Kept under
@@ -9132,38 +9147,158 @@ fn local_session_observed(before_session_count: Option<usize>) -> Option<bool> {
 }
 
 fn pi_session_file_count() -> usize {
-    pi_session_files().len()
+    pi_session_files().map_or(0, |files| files.len())
 }
 
-fn pi_session_files() -> BTreeSet<PathBuf> {
-    pi_session_files_in(&home_path(".pi/agent/sessions"))
+#[derive(Clone, Copy)]
+struct PiSessionSafetyLimits {
+    max_depth: usize,
+    max_entries: usize,
+    max_files: usize,
+    max_file_bytes: u64,
+    max_aggregate_bytes: u64,
+    max_multipart_field_bytes: usize,
+    max_multipart_body_bytes: usize,
 }
 
-fn pi_session_files_in(root: &Path) -> BTreeSet<PathBuf> {
+const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
+    max_depth: PI_SESSION_MAX_DEPTH,
+    max_entries: PI_SESSION_MAX_ENTRIES,
+    max_files: PI_SESSION_MAX_FILES,
+    max_file_bytes: PI_SESSION_MAX_FILE_BYTES,
+    max_aggregate_bytes: PI_SESSION_MAX_AGGREGATE_BYTES,
+    max_multipart_field_bytes: PI_MULTIPART_MAX_FIELD_BYTES,
+    max_multipart_body_bytes: PI_MULTIPART_MAX_BODY_BYTES,
+};
+
+fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    let Some(root) = open_pi_session_root()? else {
+        return Ok(BTreeSet::new());
+    };
+    pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)
+}
+
+#[cfg(test)]
+fn pi_session_files_in(root: &Path) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    pi_session_files_in_with_limits(root, PI_SESSION_SAFETY_LIMITS)
+}
+
+#[cfg(test)]
+fn pi_session_files_in_with_limits(
+    root: &Path,
+    limits: PiSessionSafetyLimits,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    let Some(root) = open_pi_session_root_direct(root)? else {
+        return Ok(BTreeSet::new());
+    };
+    pi_session_files_for_root(&root, limits)
+}
+
+fn pi_session_files_for_root(
+    root: &OpenPiSessionRoot,
+    limits: PiSessionSafetyLimits,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    verify_pi_session_root_path_identity(root)?;
     let mut files = BTreeSet::new();
-    collect_pi_session_files(root, &mut files);
-    files
+    let mut entries_seen = 0;
+    collect_pi_session_files(&root.path, 0, &mut entries_seen, &mut files, limits)?;
+    verify_pi_session_root_path_identity(root)?;
+    validate_discovered_pi_session_files(root, files)
 }
 
-fn collect_pi_session_files(path: &Path, files: &mut BTreeSet<PathBuf>) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
+fn validate_discovered_pi_session_files(
+    root: &OpenPiSessionRoot,
+    files: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    let mut validated = BTreeSet::new();
+    for path in files {
+        let file = open_pi_session_file_beneath_root(root, &path).map_err(|_| {
+            pi_session_import_refused("session tree changed during bounded discovery")
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            pi_session_import_refused("session tree changed during bounded discovery")
+        })?;
+        if !metadata.is_file() {
+            return Err(pi_session_import_refused(
+                "session tree changed during bounded discovery",
+            ));
+        }
+        validated.insert(path);
+    }
+    verify_pi_session_root_path_identity(root)?;
+    Ok(validated)
+}
+
+#[cfg(unix)]
+fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), LocalApiError> {
+    let opened = root
+        .directory
+        .metadata()
+        .map_err(|_| pi_session_import_refused("session root identity could not be verified"))?;
+    let current = fs::metadata(&root.path)
+        .map_err(|_| pi_session_import_refused("session root changed during bounded discovery"))?;
+    if !current.is_dir() || opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Err(pi_session_import_refused(
+            "session root changed during bounded discovery",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), LocalApiError> {
+    let _ = root;
+    require_pi_session_import_platform_support()
+}
+
+fn collect_pi_session_files(
+    path: &Path,
+    depth: usize,
+    entries_seen: &mut usize,
+    files: &mut BTreeSet<PathBuf>,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    if depth > limits.max_depth {
+        return Err(pi_session_import_refused(
+            "session traversal exceeded the maximum depth",
+        ));
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(());
     };
     if metadata.is_file() {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+            if files.len() >= limits.max_files {
+                return Err(pi_session_import_refused(
+                    "session traversal exceeded the maximum file count",
+                ));
+            }
             files.insert(path.to_path_buf());
         }
-        return;
+        return Ok(());
     }
     if !metadata.is_dir() {
-        return;
+        return Ok(());
     }
     let Ok(entries) = fs::read_dir(path) else {
-        return;
+        return Ok(());
     };
-    for entry in entries.filter_map(Result::ok) {
-        collect_pi_session_files(&entry.path(), files);
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            pi_session_import_refused("session traversal could not read a directory entry")
+        })?;
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > limits.max_entries {
+            return Err(pi_session_import_refused(
+                "session traversal exceeded the maximum entry count",
+            ));
+        }
+        collect_pi_session_files(&entry.path(), depth + 1, entries_seen, files, limits)?;
     }
+    Ok(())
 }
 
 fn import_new_pi_route_sessions(
@@ -9171,7 +9306,10 @@ fn import_new_pi_route_sessions(
     route: &PiModelRoute,
     before_session_files: &BTreeSet<PathBuf>,
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    let session_files = pi_session_files()
+    let Some(root) = open_pi_session_root()? else {
+        return Ok(None);
+    };
+    let session_files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?
         .difference(before_session_files)
         .cloned()
         .collect::<Vec<_>>();
@@ -9179,7 +9317,7 @@ fn import_new_pi_route_sessions(
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+    upload_pi_import_run(api_base_url, &relay_token, route, &root, &session_files).map(Some)
 }
 
 /// Upload local Pi session files modified at or after `since` for `route`. Used
@@ -9188,20 +9326,37 @@ fn import_new_pi_route_sessions(
 /// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
 /// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
 /// verify from re-uploading the user's entire session history.
-fn recent_pi_session_files(since: SystemTime) -> Vec<PathBuf> {
-    pi_session_files_modified_since(pi_session_files(), since)
+struct PiSessionSelection {
+    root: OpenPiSessionRoot,
+    files: Vec<PathBuf>,
+}
+
+fn recent_pi_session_files(since: SystemTime) -> Result<Option<PiSessionSelection>, LocalApiError> {
+    let Some(root) = open_pi_session_root()? else {
+        return Ok(None);
+    };
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_modified_since(&root, files, since)?;
+    Ok(Some(PiSessionSelection { root, files }))
 }
 
 fn import_pi_route_session_files(
     api_base_url: &str,
     route: &PiModelRoute,
-    session_files: &[PathBuf],
+    selection: &PiSessionSelection,
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    if session_files.is_empty() {
+    if selection.files.is_empty() {
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, session_files).map(Some)
+    upload_pi_import_run(
+        api_base_url,
+        &relay_token,
+        route,
+        &selection.root,
+        &selection.files,
+    )
+    .map(Some)
 }
 
 /// Keep only session files whose on-disk mtime is at or after `since`. Files
@@ -9210,18 +9365,208 @@ fn import_pi_route_session_files(
 /// bound used by the passive Pi route verifier is unit-testable without the
 /// relay-token / upload network calls.
 fn pi_session_files_modified_since(
+    root: &OpenPiSessionRoot,
     files: impl IntoIterator<Item = PathBuf>,
     since: SystemTime,
-) -> Vec<PathBuf> {
-    files
-        .into_iter()
-        .filter(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .map(|modified| modified >= since)
-                .unwrap_or(false)
-        })
-        .collect()
+) -> Result<Vec<PathBuf>, LocalApiError> {
+    let mut recent = Vec::new();
+    for path in files {
+        let file = match open_pi_session_file_beneath_root(root, &path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(pi_session_import_refused(
+                    "session tree changed during recent-file selection",
+                ))
+            }
+        };
+        let modified = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|_| {
+                pi_session_import_refused("session tree changed during recent-file selection")
+            })?;
+        if modified >= since {
+            recent.push(path);
+        }
+    }
+    verify_pi_session_root_path_identity(root)?;
+    Ok(recent)
+}
+
+fn pi_session_import_refused(reason: &str) -> LocalApiError {
+    LocalApiError::LocalOperationFailed(format!("Pi session import refused: {reason}"))
+}
+
+const fn pi_session_import_supported_on_target() -> bool {
+    cfg!(unix)
+}
+
+fn require_pi_session_import_platform_support() -> Result<(), LocalApiError> {
+    if pi_session_import_supported_on_target() {
+        Ok(())
+    } else {
+        Err(pi_session_import_refused(
+            PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON,
+        ))
+    }
+}
+
+struct OpenPiSessionRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
+fn open_pi_session_root() -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    let home = home_path("");
+    open_pi_session_root_from_home(&home)
+}
+
+#[cfg(test)]
+fn open_pi_session_root_direct(root: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    match open_pi_session_root_direct_io(root) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
+    }
+}
+
+fn open_pi_session_root_from_home(home: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    match open_pi_session_root_from_home_io(home) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn open_pi_session_root_direct_io(root: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = options.open(root)?;
+    Ok(OpenPiSessionRoot {
+        path: root.to_path_buf(),
+        directory,
+    })
+}
+
+#[cfg(unix)]
+fn open_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let trusted_home = open_pi_session_root_direct_io(home)?;
+    let mut directory = trusted_home.directory;
+    let mut path = home.to_path_buf();
+    for component in [".pi", "agent", "sessions"] {
+        directory = open_pi_directory_component(&directory, component.as_ref())?;
+        path.push(component);
+    }
+    Ok(OpenPiSessionRoot { path, directory })
+}
+
+#[cfg(unix)]
+fn open_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory contains a NUL byte",
+        )
+    })?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(unix)]
+fn open_pi_session_file_beneath_root(
+    root: &OpenPiSessionRoot,
+    path: &Path,
+) -> std::io::Result<fs::File> {
+    let relative = path.strip_prefix(&root.path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Pi session file escaped its session root",
+        )
+    })?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Pi session file is not root-relative",
+        ));
+    }
+
+    let mut directory = root.directory.try_clone()?;
+    for (position, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("components validated above")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Pi session file contains a NUL byte",
+            )
+        })?;
+        let is_final = position + 1 == components.len();
+        let flags = if is_final {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { fs::File::from_raw_fd(fd) };
+        if is_final {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    unreachable!("non-empty component list returns its final object")
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_file_beneath_root(
+    _root: &OpenPiSessionRoot,
+    _path: &Path,
+) -> std::io::Result<fs::File> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn pi_session_import_unsupported_io_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -9410,23 +9755,17 @@ fn upload_pi_import_run(
     api_base_url: &str,
     relay_token: &str,
     route: &PiModelRoute,
+    session_root: &OpenPiSessionRoot,
     session_files: &[PathBuf],
 ) -> Result<serde_json::Value, LocalApiError> {
     let boundary = format!("ottto-pi-route-{}", current_millis());
-    let mut body = Vec::new();
-    for (field, value) in pi_route_import_defaults(route) {
-        append_multipart_text_field(&mut body, &boundary, field, &value);
-    }
-    for path in session_files {
-        let content = fs::read(path)
-            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("session.jsonl");
-        append_multipart_file_field(&mut body, &boundary, "files", file_name, &content);
-    }
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let body = build_pi_import_multipart(
+        route,
+        session_root,
+        session_files,
+        &boundary,
+        PI_SESSION_SAFETY_LIMITS,
+    )?;
     let url = api_url_with_base(api_base_url, "/api/v1/pi/import-runs");
     let response = ureq::post(&url)
         .set("Accept", "application/json")
@@ -9443,40 +9782,138 @@ fn upload_pi_import_run(
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))
 }
 
-fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, String)> {
+struct OpenPiSessionUpload {
+    file: fs::File,
+    file_name: String,
+    metadata_len: u64,
+}
+
+fn build_pi_import_multipart(
+    route: &PiModelRoute,
+    session_root: &OpenPiSessionRoot,
+    session_files: &[PathBuf],
+    boundary: &str,
+    limits: PiSessionSafetyLimits,
+) -> Result<Vec<u8>, LocalApiError> {
+    if session_files.len() > limits.max_files {
+        return Err(pi_session_import_refused(
+            "upload exceeded the maximum file count",
+        ));
+    }
+    let mut body = Vec::new();
+    for (field, value) in pi_route_import_defaults(route) {
+        append_multipart_text_field(&mut body, boundary, field, value, limits)?;
+    }
+    let mut aggregate_metadata_bytes = 0_u64;
+    let mut aggregate_session_bytes = 0_u64;
+    for path in session_files {
+        let mut upload = open_pi_session_upload(session_root, path, limits)?;
+        aggregate_metadata_bytes = aggregate_metadata_bytes
+            .checked_add(upload.metadata_len)
+            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
+        if aggregate_metadata_bytes > limits.max_aggregate_bytes {
+            return Err(pi_session_import_refused(
+                "session files exceeded the maximum aggregate byte size",
+            ));
+        }
+        append_multipart_file_field(
+            &mut body,
+            boundary,
+            "files",
+            &upload.file_name,
+            &mut upload.file,
+            &mut aggregate_session_bytes,
+            limits,
+        )?;
+    }
+    append_pi_multipart_bytes(&mut body, format!("--{boundary}--\r\n").as_bytes(), limits)?;
+    Ok(body)
+}
+
+fn open_pi_session_upload(
+    session_root: &OpenPiSessionRoot,
+    path: &Path,
+    limits: PiSessionSafetyLimits,
+) -> Result<OpenPiSessionUpload, LocalApiError> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return Err(pi_session_import_refused(
+            "upload contained a non-jsonl session file",
+        ));
+    }
+    let file = open_pi_session_file_beneath_root(session_root, path)
+        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(pi_session_import_refused(
+            "upload target was not a regular file",
+        ));
+    }
+    if metadata.len() > limits.max_file_bytes {
+        return Err(pi_session_import_refused(
+            "session file exceeded the maximum byte size",
+        ));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl")
+        .to_string();
+    Ok(OpenPiSessionUpload {
+        file,
+        file_name,
+        metadata_len: metadata.len(),
+    })
+}
+
+fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, &str)> {
     let mut defaults = Vec::new();
-    if let Some(value) = route.classification.billing_provider.clone() {
+    if let Some(value) = route.classification.billing_provider.as_deref() {
         defaults.push(("billing_provider", value));
     }
-    if let Some(value) = route.classification.model_provider.clone() {
+    if let Some(value) = route.classification.model_provider.as_deref() {
         defaults.push(("model_provider", value));
     }
-    if let Some(value) = route.classification.billing_channel.clone() {
+    if let Some(value) = route.classification.billing_channel.as_deref() {
         defaults.push(("billing_channel", value));
     }
-    if let Some(value) = route.classification.auth_mode.clone() {
+    if let Some(value) = route.classification.auth_mode.as_deref() {
         defaults.push(("auth_mode", value));
     }
-    if let Some(value) = route.classification.gateway_provider.clone() {
+    if let Some(value) = route.classification.gateway_provider.as_deref() {
         defaults.push(("gateway_provider", value));
     }
-    if let Some(value) = route.classification.subscription_product.clone() {
+    if let Some(value) = route.classification.subscription_product.as_deref() {
         defaults.push(("subscription_product", value));
     }
     defaults
 }
 
-fn append_multipart_text_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
+fn append_multipart_text_field(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    value: &str,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    if value.len() > limits.max_multipart_field_bytes {
+        return Err(pi_session_import_refused(
+            "route metadata exceeded the multipart field byte cap",
+        ));
+    }
+    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
+    append_pi_multipart_bytes(
+        body,
         format!(
             "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
             multipart_token(name)
         )
         .as_bytes(),
-    );
-    body.extend_from_slice(value.as_bytes());
-    body.extend_from_slice(b"\r\n");
+        limits,
+    )?;
+    append_pi_multipart_bytes(body, value.as_bytes(), limits)?;
+    append_pi_multipart_bytes(body, b"\r\n", limits)
 }
 
 fn append_multipart_file_field(
@@ -9484,20 +9921,72 @@ fn append_multipart_file_field(
     boundary: &str,
     name: &str,
     file_name: &str,
-    content: &[u8],
-) {
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
+    file: &mut fs::File,
+    aggregate_session_bytes: &mut u64,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
+    append_pi_multipart_bytes(
+        body,
         format!(
             "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
             multipart_token(name),
             multipart_token(file_name),
         )
         .as_bytes(),
-    );
-    body.extend_from_slice(b"Content-Type: application/x-ndjson\r\n\r\n");
-    body.extend_from_slice(content);
-    body.extend_from_slice(b"\r\n");
+        limits,
+    )?;
+    append_pi_multipart_bytes(body, b"Content-Type: application/x-ndjson\r\n\r\n", limits)?;
+
+    let mut file_bytes = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let read = read as u64;
+        file_bytes = file_bytes
+            .checked_add(read)
+            .ok_or_else(|| pi_session_import_refused("session file byte count overflowed"))?;
+        if file_bytes > limits.max_file_bytes {
+            return Err(pi_session_import_refused(
+                "session file exceeded the maximum byte size while reading",
+            ));
+        }
+        *aggregate_session_bytes = (*aggregate_session_bytes)
+            .checked_add(read)
+            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
+        if *aggregate_session_bytes > limits.max_aggregate_bytes {
+            return Err(pi_session_import_refused(
+                "session files exceeded the maximum aggregate byte size while reading",
+            ));
+        }
+        append_pi_multipart_bytes(body, &buffer[..read as usize], limits)?;
+    }
+    append_pi_multipart_bytes(body, b"\r\n", limits)
+}
+
+fn append_pi_multipart_bytes(
+    body: &mut Vec<u8>,
+    bytes: &[u8],
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    let next_len = body
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| pi_session_import_refused("multipart byte count overflowed"))?;
+    if next_len > limits.max_multipart_body_bytes {
+        return Err(pi_session_import_refused(
+            "multipart body exceeded the maximum byte size",
+        ));
+    }
+    body.try_reserve(bytes.len())
+        .map_err(|_| pi_session_import_refused("multipart allocation failed"))?;
+    body.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn multipart_token(value: &str) -> String {
@@ -10905,14 +11394,23 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let before_session_files = pi_session_files();
+    let before_session_files = match pi_session_files() {
+        Ok(files) => Some(files),
+        Err(error) => {
+            eprintln!("Pi route pre-smoke session discovery failed: {error}");
+            None
+        }
+    };
     let smoke_after = current_rfc3339();
-    let smoke = run_pi_route_smoke_prompt(route, Some(before_session_files.len()));
+    let smoke = run_pi_route_smoke_prompt(route, before_session_files.as_ref().map(BTreeSet::len));
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
     }
-    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_files) {
-        eprintln!("Pi route smoke session import failed: {error}");
+    if let Some(before_session_files) = before_session_files {
+        if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_files)
+        {
+            eprintln!("Pi route smoke session import failed: {error}");
+        }
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -10999,11 +11497,21 @@ fn verify_pi_subscription_oauth_route_passively(
             u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
         ))
         .unwrap_or(UNIX_EPOCH);
-    let recent_session_files = recent_pi_session_files(import_since);
-    if let Err(error) = import_pi_route_session_files(api_base_url, route, &recent_session_files) {
-        eprintln!("Pi passive route session import failed (non-fatal): {error}");
+    let recent_session_selection = match recent_pi_session_files(import_since) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("Pi passive route session discovery failed (non-fatal): {error}");
+            None
+        }
+    };
+    if let Some(selection) = recent_session_selection.as_ref() {
+        if let Err(error) = import_pi_route_session_files(api_base_url, route, selection) {
+            eprintln!("Pi passive route session import failed (non-fatal): {error}");
+        }
     }
-    let recent_local_session_observed = !recent_session_files.is_empty();
+    let recent_local_session_observed = recent_session_selection
+        .as_ref()
+        .is_some_and(|selection| !selection.files.is_empty());
     let local_session_observed = Some(recent_local_session_observed);
     let local_evidence_observed = pi_route_has_local_verification_evidence(
         &pi_route_billing_identity_hints(route),
@@ -12780,6 +13288,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         create_control_test_dir(&root);
         root
+    }
+
+    fn open_pi_test_root(path: &Path) -> OpenPiSessionRoot {
+        open_pi_session_root_direct(path)
+            .expect("open Pi test root")
+            .expect("Pi test root exists")
     }
 
     fn test_pending_device_credential(
@@ -19095,6 +19609,37 @@ mod tests {
     }
 
     #[test]
+    fn pi_session_import_platform_support_matches_rooted_open_contract() {
+        assert_eq!(pi_session_import_supported_on_target(), cfg!(unix));
+        assert_eq!(
+            require_pi_session_import_platform_support().is_ok(),
+            cfg!(unix)
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn pi_session_import_refuses_unsupported_non_unix_target_before_path_access() {
+        let absent = Path::new("definitely-absent-pi-session-root");
+        for result in [
+            open_pi_session_root_from_home(absent),
+            open_pi_session_root_direct(absent),
+        ] {
+            let error = match result {
+                Ok(_) => panic!("non-Unix Pi session access must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON),
+                "unexpected refusal: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pi_session_files_include_nested_workspace_sessions() {
         let root = std::env::temp_dir().join(format!(
             "ottto-pi-session-files-{}-{}",
@@ -19106,13 +19651,365 @@ mod tests {
         fs::write(nested.join("session.jsonl"), "{}\n").expect("write nested session");
         fs::write(root.join("ignore.txt"), "ignored").expect("write ignored file");
 
-        let files = pi_session_files_in(&root);
+        let files = pi_session_files_in(&root).expect("discover nested Pi session");
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
+
+        let opened_root = open_pi_test_root(&root);
+        let body = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[nested.join("session.jsonl")],
+            "test-boundary",
+            PiSessionSafetyLimits {
+                max_depth: 4,
+                max_entries: 16,
+                max_files: 4,
+                max_file_bytes: 64,
+                max_aggregate_bytes: 128,
+                max_multipart_field_bytes: 64,
+                max_multipart_body_bytes: 4 * 1024,
+            },
+        )
+        .expect("build bounded nested Pi multipart");
+        assert!(body.windows(3).any(|window| window == b"{}\n"));
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_discovery_skips_symlink_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-symlinks");
+        let outside = control_test_root("pi-session-symlinks-outside");
+        let real = root.join("real.jsonl");
+        fs::write(&real, b"inside\n").expect("write real session");
+        fs::write(outside.join("outside.jsonl"), b"outside\n").expect("write outside session");
+        symlink(outside.join("outside.jsonl"), root.join("file-link.jsonl"))
+            .expect("create file symlink");
+        symlink(&outside, root.join("directory-link")).expect("create directory symlink");
+
+        let files = pi_session_files_in(&root).expect("bounded symlink-safe discovery");
+
+        assert_eq!(files, BTreeSet::from([real]));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_root_walk_rejects_pi_and_agent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-session-root-symlink-home");
+        let outside = control_test_root("pi-session-root-symlink-outside");
+        fs::create_dir_all(outside.join("agent/sessions")).expect("create outside session tree");
+        fs::write(
+            outside.join("agent/sessions/outside.jsonl"),
+            b"outside-secret\n",
+        )
+        .expect("write outside session");
+
+        symlink(&outside, home.join(".pi")).expect("symlink .pi outside home");
+        assert!(matches!(
+            open_pi_session_root_from_home(&home),
+            Err(LocalApiError::LocalOperationFailed(_))
+        ));
+
+        fs::remove_file(home.join(".pi")).expect("remove .pi symlink");
+        fs::create_dir(home.join(".pi")).expect("create real .pi");
+        symlink(outside.join("agent"), home.join(".pi/agent")).expect("symlink agent outside .pi");
+        assert!(matches!(
+            open_pi_session_root_from_home(&home),
+            Err(LocalApiError::LocalOperationFailed(_))
+        ));
+
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_discovery_refuses_root_replacement_after_open() {
+        let parent = control_test_root("pi-session-root-replacement");
+        let root = parent.join("sessions");
+        let original = parent.join("sessions-original");
+        fs::create_dir(&root).expect("create session root");
+        fs::write(root.join("inside.jsonl"), b"inside\n").expect("write inside session");
+        let opened_root = open_pi_test_root(&root);
+
+        fs::rename(&root, &original).expect("move opened session root");
+        fs::create_dir(&root).expect("create replacement session root");
+        fs::write(root.join("outside.jsonl"), b"outside-secret\n")
+            .expect("write replacement session");
+
+        let error = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect_err("count/selection must refuse a replaced root");
+        assert!(error.to_string().contains("session root changed"));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_selection_refuses_descendant_swap_after_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-selection-swap");
+        let outside = control_test_root("pi-session-selection-swap-outside");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).expect("create nested session directory");
+        let session = nested.join("session.jsonl");
+        fs::write(&session, b"inside\n").expect("write inside session");
+        fs::write(outside.join("session.jsonl"), b"outside-secret\n")
+            .expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover and validate inside session");
+
+        fs::rename(&nested, root.join("nested-original")).expect("move nested directory");
+        symlink(&outside, &nested).expect("replace nested directory with symlink");
+        let error = pi_session_files_modified_since(&opened_root, files, UNIX_EPOCH)
+            .expect_err("recent-file selection must refuse a descendant swap");
+        assert!(error.to_string().contains("session tree changed"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_rejects_file_and_directory_symlink_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-swap");
+        let outside = control_test_root("pi-session-swap-outside");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested session directory");
+        let nested_session = nested.join("session.jsonl");
+        let outside_session = outside.join("session.jsonl");
+        fs::write(&nested_session, b"inside\n").expect("write nested session");
+        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover nested session");
+
+        fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
+        symlink(&outside, &nested).expect("swap directory for symlink");
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &discovered.into_iter().collect::<Vec<_>>(),
+            "test-boundary",
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("component-wise no-follow open must reject directory swap");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+
+        fs::remove_file(&nested).expect("remove directory symlink");
+        let final_session = root.join("final.jsonl");
+        fs::write(&final_session, b"inside-final\n").expect("write final session");
+        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover final session");
+        fs::remove_file(&final_session).expect("remove discovered final session");
+        symlink(&outside_session, &final_session).expect("swap file for symlink");
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &discovered
+                .into_iter()
+                .filter(|path| path == &final_session)
+                .collect::<Vec<_>>(),
+            "test-boundary",
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("no-follow open must reject final-component swap");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_reads_held_descriptor_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-held-open");
+        let outside = control_test_root("pi-session-held-open-outside");
+        let session = root.join("session.jsonl");
+        let moved = root.join("session-original.jsonl");
+        let outside_session = outside.join("session.jsonl");
+        fs::write(&session, b"inside\n").expect("write inside session");
+        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let mut opened = open_pi_session_upload(&opened_root, &session, PI_SESSION_SAFETY_LIMITS)
+            .expect("open and verify session beneath root");
+
+        fs::rename(&session, &moved).expect("move verified session");
+        symlink(&outside_session, &session).expect("replace verified path with symlink");
+        let mut bytes = Vec::new();
+        opened
+            .file
+            .read_to_end(&mut bytes)
+            .expect("read held descriptor");
+
+        assert_eq!(bytes, b"inside\n");
+        assert!(!bytes.windows(14).any(|window| window == b"outside-secret"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_processes_large_file_sets_without_holding_all_descriptors() {
+        let root = control_test_root("pi-session-sequential-descriptors");
+        let mut files = Vec::new();
+        for index in 0..300 {
+            let path = root.join(format!("{index}.jsonl"));
+            fs::write(&path, b"{}\n").expect("write session file");
+            files.push(path);
+        }
+        let opened_root = open_pi_test_root(&root);
+        let limits = PiSessionSafetyLimits {
+            max_files: 512,
+            max_file_bytes: 16,
+            max_aggregate_bytes: 4 * 1024,
+            max_multipart_body_bytes: 128 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+
+        let body = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &files,
+            "test-boundary",
+            limits,
+        )
+        .expect("sequential descriptor use must support more than 256 session files");
+
+        assert!(body.ends_with(b"--test-boundary--\r\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_traversal_refuses_deep_and_wide_trees() {
+        let root = control_test_root("pi-session-traversal-caps");
+        let deep = root.join("one").join("two");
+        fs::create_dir_all(&deep).expect("create deep tree");
+        fs::write(deep.join("session.jsonl"), b"{}\n").expect("write deep session");
+        let limits = PiSessionSafetyLimits {
+            max_depth: 1,
+            max_entries: 16,
+            max_files: 16,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = pi_session_files_in_with_limits(&root, limits)
+            .expect_err("deep traversal must be refused");
+        assert!(error.to_string().contains("maximum depth"));
+
+        let wide = control_test_root("pi-session-file-cap");
+        for index in 0..3 {
+            fs::write(wide.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
+        }
+        let limits = PiSessionSafetyLimits {
+            max_depth: 4,
+            max_entries: 16,
+            max_files: 2,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = pi_session_files_in_with_limits(&wide, limits)
+            .expect_err("wide traversal must be refused");
+        assert!(error.to_string().contains("maximum file count"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(wide);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_refuses_file_aggregate_and_multipart_caps() {
+        let root = control_test_root("pi-session-upload-caps");
+        let first = root.join("first.jsonl");
+        let second = root.join("second.jsonl");
+        fs::write(&first, b"12345").expect("write oversized session");
+        fs::write(&second, b"6789").expect("write aggregate session");
+        let opened_root = open_pi_test_root(&root);
+
+        let per_file_limits = PiSessionSafetyLimits {
+            max_file_bytes: 4,
+            max_aggregate_bytes: 16,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            std::slice::from_ref(&first),
+            "test-boundary",
+            per_file_limits,
+        )
+        .expect_err("oversized file must be refused before reading");
+        assert!(error.to_string().contains("maximum byte size"));
+
+        let aggregate_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[first.clone(), second],
+            "test-boundary",
+            aggregate_limits,
+        )
+        .expect_err("aggregate oversize must be refused before body construction");
+        assert!(error.to_string().contains("aggregate byte size"));
+
+        let mut route = subscription_oauth_route();
+        route.classification.billing_provider = Some("x".repeat(17));
+        let multipart_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_field_bytes: 16,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &route,
+            &opened_root,
+            &[first],
+            "test-boundary",
+            multipart_limits,
+        )
+        .expect_err("oversized multipart metadata must be refused");
+        assert!(error.to_string().contains("multipart field byte cap"));
+
+        let body_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_field_bytes: 64,
+            max_multipart_body_bytes: 16,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[],
+            "test-boundary",
+            body_limits,
+        )
+        .expect_err("multipart framing must honor the total body cap");
+        assert!(error.to_string().contains("multipart body"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn pi_session_files_modified_since_filters_on_mtime() {
         let root = std::env::temp_dir().join(format!(
@@ -19126,19 +20023,24 @@ mod tests {
         let modified = fs::metadata(&session)
             .and_then(|metadata| metadata.modified())
             .expect("read session mtime");
+        let opened_root = open_pi_test_root(&root);
 
         // A boundary just after the file's mtime excludes it...
         let after = modified + Duration::from_secs(60);
         assert!(
-            pi_session_files_modified_since([session.clone()], after).is_empty(),
+            pi_session_files_modified_since(&opened_root, [session.clone()], after)
+                .expect("filter old Pi session")
+                .is_empty(),
             "file older than `since` must be filtered out"
         );
 
         // ...and a boundary before (or equal to) the mtime includes it.
         let before = modified - Duration::from_secs(60);
-        let included = pi_session_files_modified_since([session.clone()], before);
+        let included = pi_session_files_modified_since(&opened_root, [session.clone()], before)
+            .expect("include recent Pi session");
         assert_eq!(included, vec![session.clone()]);
-        let at = pi_session_files_modified_since([session.clone()], modified);
+        let at = pi_session_files_modified_since(&opened_root, [session.clone()], modified)
+            .expect("include Pi session at boundary");
         assert_eq!(
             at,
             vec![session.clone()],
@@ -19147,7 +20049,11 @@ mod tests {
 
         // Unreadable / missing paths are dropped, not panicked on.
         let missing = root.join("does-not-exist.jsonl");
-        assert!(pi_session_files_modified_since([missing], before).is_empty());
+        assert!(
+            pi_session_files_modified_since(&opened_root, [missing], before)
+                .expect("drop missing Pi session")
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -21791,12 +22697,14 @@ log_user_prompt = true
             r#"{"type":"session","id":"pi-slow-import","cwd":"/tmp/pi","version":1}"#,
         )
         .expect("write pi session file");
+        let opened_root = open_pi_test_root(&root);
 
         let started = Instant::now();
         let result = upload_pi_import_run(
             &api_base_url,
             "relay_test",
             &subscription_oauth_route(),
+            &opened_root,
             &[session_file],
         )
         .expect("Pi import POST should use Pi-specific timeout");
