@@ -1769,23 +1769,35 @@ fn sync_source(
         );
     }
 
-    apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
-
     // Backfill snapshots are appended after the live scan, so run the same
     // content-free effort enrichment over the combined set. Already-split live
     // buckets are naturally skipped because they now have multiple effort rows.
+    // This must precede upload-policy stripping: parent/root references are
+    // identity evidence needed locally even when the org disables attribution
+    // labels on the wire.
     if source == SnapshotSource::ClaudeCode {
-        let session_ids = scan_result
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot.source_session_id.clone())
-            .collect::<Vec<_>>();
+        let census_complete = scan_result.census_complete;
+        let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if census_complete {
+            session_ids.extend(crate::snapshots::claude_pending_family_session_ids(&index));
+        }
         if let Ok(evidence) =
             crate::claude_effort::load_claude_effort_evidence(support_dir, session_ids)
         {
-            crate::snapshots::apply_claude_effort_evidence(&mut scan_result.snapshots, &evidence);
+            let census_window_end = scan_result.census_window_end.clone();
+            crate::snapshots::apply_claude_effort_evidence_with_index(
+                &mut scan_result.snapshots,
+                &evidence,
+                &mut index,
+                census_complete,
+                &census_window_end,
+            );
         }
     }
+
+    apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
 
     // Account-switch backfill cutoff (server-issued at claim completion): a
     // machine claimed by a different same-org user must not re-attribute the
@@ -2194,6 +2206,28 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+fn claude_evidence_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
+    snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            std::iter::once(snapshot.source_session_id.clone()).chain(
+                snapshot
+                    .attribution_facts
+                    .iter()
+                    .filter(|fact| {
+                        matches!(
+                            fact.field.as_str(),
+                            "parent_session_ref" | "root_session_ref"
+                        )
+                    })
+                    .map(|fact| fact.value.clone()),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
