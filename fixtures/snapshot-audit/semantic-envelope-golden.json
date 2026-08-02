@@ -1343,6 +1343,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1353,7 +1354,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1381,
+      "envelope_bytes": 1467,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1361,10 +1362,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1380,14 +1382,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1399,8 +1401,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "ef147007b8a4ba71665450ea9491d986436ba7301f93283338e731495b87ee20",
-      "snapshot_fingerprint": "0efbb767e3b4f54173574cab88df04fa6de297e73586abb9e235966e5b785f38",
+      "revision_v2_hash": "d7f04ce19ae867e512120b3bead1dad0acb1567bad225d9551ff6f0e177f4152",
+      "snapshot_fingerprint": "6619d96bbd4fdb4a2f1b3fa304be6e786473ad7b4591d466379f1553324f39ad",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1413,6 +1415,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1423,7 +1426,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1380,
+      "envelope_bytes": 1466,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1431,10 +1434,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1450,14 +1454,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1469,8 +1473,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "d0b6e6b6aa7e14cf5cbbd985db4f310583f671b6552bfc736b6b5b3e0bcba852",
-      "snapshot_fingerprint": "e513bc1a7ef28f27682d342629a4b84b50bc1b15ddf8f457baec099e55162268",
+      "revision_v2_hash": "c9690966d64864c70d5002a97f2f0ce73160011b9317e675603c238729043c10",
+      "snapshot_fingerprint": "e5cdb0cebfa83e72d1709ec19b82efe638e637b17115427337c80b8c38d83c87",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1483,6 +1487,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1493,7 +1498,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1380,
+      "envelope_bytes": 1466,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1501,10 +1506,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1520,14 +1526,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1539,8 +1545,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "93208964bd056ab10ad7acfd222485d5874473922e14c3d5eb98c866de17f357",
-      "snapshot_fingerprint": "73ca89c5cc85538ac3607009cfb084fce8111e69fc403f5f11bed51b92cbbb2d",
+      "revision_v2_hash": "8625bce029dc923962d18c4005ff96f1b279e0b89963ddfaa24ed32addca5d12",
+      "snapshot_fingerprint": "e0204bfcae8b9e63dd70c044171f128d68cf89e90cb263458e49419817e52a54",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1553,6 +1559,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1563,7 +1570,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1571,10 +1578,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1590,14 +1598,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1609,8 +1617,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "f8028791bac4d0fc035af5ef28bdbc49c8141098cabe91641fc30381ee289738",
-      "snapshot_fingerprint": "398850cbedaa94834dd63959d9286ea78edeef5508ea9bc8ce91c3583e0cec07",
+      "revision_v2_hash": "ae4d34a99fd2a655a2e26564b909405ff764c43bf52e28eb9405e35cfdb8dfd6",
+      "snapshot_fingerprint": "dc9043233de5414bc5f6a05c72dcdafe510bb62b893cf52bd1c0b1f1de0258b6",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1623,6 +1631,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1633,7 +1642,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1380,
+      "envelope_bytes": 1466,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1641,10 +1650,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1660,14 +1670,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1679,8 +1689,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "7d0efb7b658b8698f17d8b519da1e07e45870edd19c7f3eef84da7aa3b2e0bc3",
-      "snapshot_fingerprint": "04a5d3aa41deef1274cec949b43098bad002a2a7fb9e5fe1db3c0377d7711f75",
+      "revision_v2_hash": "96f06eceeb04f43c81e1f0a1a2e570aa728ceebc94fbd559b1f07a694ca424df",
+      "snapshot_fingerprint": "1d6ea74774f133802777dddff2f2974bfe3e607cc1cd02fe7b71754f05169664",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1693,6 +1703,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1703,7 +1714,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1711,10 +1722,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1730,14 +1742,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1749,8 +1761,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "d635fcce0c8a959855efcef90cf888018d1f235981d046f45c34b575ecef5292",
-      "snapshot_fingerprint": "b8646346ece577fa321ab53d0312534ba838c7c0e70e7a7eae0e9ab5128a144a",
+      "revision_v2_hash": "f25af64f1fe92f864888e6813fdcc0d479fb7e9dcb2774c05c626971c3deb7e1",
+      "snapshot_fingerprint": "22664bb16cf1edf872f52cc3579aeede0112d2bbf1ac17bd7179697ba02a7739",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1763,6 +1775,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1773,7 +1786,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1781,10 +1794,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1800,14 +1814,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1819,8 +1833,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "66cd99fe31742420a858e20e65fb4be1d22e923e484b1badced74486e34467ba",
-      "snapshot_fingerprint": "f0e7f7415c8da9e52b9695b2b9421bc25476ab41f8d62a88e5a80965b77acaf6",
+      "revision_v2_hash": "e8ea819b4690f4c35f65fdba0de8cdfb53908e8e1d21497fe3e2f2a7abdd79c1",
+      "snapshot_fingerprint": "568cb5d6d05daceaa3bb91062bab6da8171fc18dd8cc1134511b23811a0e1214",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1833,6 +1847,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1843,7 +1858,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1378,
+      "envelope_bytes": 1464,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1851,10 +1866,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1870,14 +1886,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1889,8 +1905,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "15e622e8b615c5b3076ce0ef7c387cf9a1003187980e66d724fb5cdedc5d5038",
-      "snapshot_fingerprint": "b19a6138c92136985272e362f1fa43a3cb96af5f83a3e3bc885a1b980c2f0f9a",
+      "revision_v2_hash": "b6a2f7d2fe172d179a74556fadaeff759dd3671fcccb8d7ad733172e5d8c510f",
+      "snapshot_fingerprint": "e13d84017cbb748f03958850ac9626d20c04c49d31d65c0e923911bcac00a66c",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1903,6 +1919,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1913,7 +1930,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1380,
+      "envelope_bytes": 1466,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1921,10 +1938,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1940,14 +1958,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -1959,8 +1977,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "910d8b1c78ac092630585652089995ce7ccc6745f6fd9e7db7466a0932f85ac2",
-      "snapshot_fingerprint": "0efbb767e3b4f54173574cab88df04fa6de297e73586abb9e235966e5b785f38",
+      "revision_v2_hash": "fbbed4ad8ddeb0161cbe1ed7cc4f5fc6b0d67a2335bc5f9c39c42094f80b0254",
+      "snapshot_fingerprint": "6619d96bbd4fdb4a2f1b3fa304be6e786473ad7b4591d466379f1553324f39ad",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -1973,6 +1991,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1983,7 +2002,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -1991,10 +2010,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2010,14 +2030,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2029,8 +2049,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "b51dee5c67a8733ffe5eecdb15de0128e60127a570093db8e7bdcedf6c1076ad",
-      "snapshot_fingerprint": "e513bc1a7ef28f27682d342629a4b84b50bc1b15ddf8f457baec099e55162268",
+      "revision_v2_hash": "860623a82e1169014ebc1eecf7fbe1cfe8278629ae8e950a3d2459937a6824cf",
+      "snapshot_fingerprint": "e5cdb0cebfa83e72d1709ec19b82efe638e637b17115427337c80b8c38d83c87",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2043,6 +2063,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2053,7 +2074,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1378,
+      "envelope_bytes": 1464,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2061,10 +2082,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2080,14 +2102,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2099,8 +2121,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "c6ce5c5cec1a597a3bd43a45a44827c13d4a41ea4dbb5ebb6f140a6d203dc972",
-      "snapshot_fingerprint": "e513bc1a7ef28f27682d342629a4b84b50bc1b15ddf8f457baec099e55162268",
+      "revision_v2_hash": "8ba29b6a11f8b91d4a1d6c1e4a6566d046ef71774ea5bf769bbef69899f41122",
+      "snapshot_fingerprint": "e5cdb0cebfa83e72d1709ec19b82efe638e637b17115427337c80b8c38d83c87",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2113,6 +2135,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2123,7 +2146,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2131,10 +2154,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2150,14 +2174,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2169,8 +2193,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "2f535b695621972953abb6b9a6cd29446fd079bb3c71ac3d15c37ce0c9941ddb",
-      "snapshot_fingerprint": "73ca89c5cc85538ac3607009cfb084fce8111e69fc403f5f11bed51b92cbbb2d",
+      "revision_v2_hash": "59709e0a66a66fc5ff036d9e0419b87134711ce1028a3d1cd688e8f479cdecd6",
+      "snapshot_fingerprint": "e0204bfcae8b9e63dd70c044171f128d68cf89e90cb263458e49419817e52a54",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2183,6 +2207,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2193,7 +2218,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1378,
+      "envelope_bytes": 1464,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2201,10 +2226,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2220,14 +2246,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2239,8 +2265,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "19ca3ea5d9e9692d2badfce1ecf1bd9c83272f2072506f1105e0abaacb55a66f",
-      "snapshot_fingerprint": "398850cbedaa94834dd63959d9286ea78edeef5508ea9bc8ce91c3583e0cec07",
+      "revision_v2_hash": "a55974870486e0e63929af9142760d12c27ee980b4fde02016a44e256b0b4092",
+      "snapshot_fingerprint": "dc9043233de5414bc5f6a05c72dcdafe510bb62b893cf52bd1c0b1f1de0258b6",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2253,6 +2279,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2263,7 +2290,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1377,
+      "envelope_bytes": 1463,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2271,10 +2298,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "9ee588ba2521e5a7d1ea261ea4ccab4ad9b9724a8569cc2a32f812b985531e81",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2290,14 +2318,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2309,8 +2337,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "1e640cfb5928194d97b9819981eac572f1e913cad72ea9049276957e9b0f7b13",
-      "snapshot_fingerprint": "398850cbedaa94834dd63959d9286ea78edeef5508ea9bc8ce91c3583e0cec07",
+      "revision_v2_hash": "c273a9f34d31d78b660a054701aa3088ad5e0697973221b5f42eca4247c112ad",
+      "snapshot_fingerprint": "dc9043233de5414bc5f6a05c72dcdafe510bb62b893cf52bd1c0b1f1de0258b6",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2323,6 +2351,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2333,7 +2362,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1379,
+      "envelope_bytes": 1465,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2341,10 +2370,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2360,14 +2390,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2379,8 +2409,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "3835c264e8ade2a9b810fc64552c05455a0b58ac1164aff06896eed659bba49e",
-      "snapshot_fingerprint": "04a5d3aa41deef1274cec949b43098bad002a2a7fb9e5fe1db3c0377d7711f75",
+      "revision_v2_hash": "4ec5546e5a1565b794ec32267aac0610b2c47be0a39e90a145974640dbf5dd18",
+      "snapshot_fingerprint": "1d6ea74774f133802777dddff2f2974bfe3e607cc1cd02fe7b71754f05169664",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2393,6 +2423,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2403,7 +2434,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1378,
+      "envelope_bytes": 1464,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2411,10 +2442,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2430,14 +2462,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2449,8 +2481,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "d7197215167ce918fc88912aa5480e6f0ce1b3dfaa70041b3eba3357f4b6b57e",
-      "snapshot_fingerprint": "b8646346ece577fa321ab53d0312534ba838c7c0e70e7a7eae0e9ab5128a144a",
+      "revision_v2_hash": "eb6e1de45fc33392db41bfd0badd7cea25ea15e24c7dfc172404541ba1f3b8cb",
+      "snapshot_fingerprint": "22664bb16cf1edf872f52cc3579aeede0112d2bbf1ac17bd7179697ba02a7739",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2463,6 +2495,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2473,7 +2506,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1377,
+      "envelope_bytes": 1463,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2481,10 +2514,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2500,14 +2534,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2519,8 +2553,8 @@
           "workspace_labels_enabled": false
         }
       },
-      "revision_v2_hash": "7b35b9da78378face721743ab73d72b6452d3d11908d848a07ad9b58c6a5a407",
-      "snapshot_fingerprint": "b8646346ece577fa321ab53d0312534ba838c7c0e70e7a7eae0e9ab5128a144a",
+      "revision_v2_hash": "4b97bdf076db6c826ff7a09199fa4ff5cb81c01c94633b55747d2dda8c9e9d46",
+      "snapshot_fingerprint": "22664bb16cf1edf872f52cc3579aeede0112d2bbf1ac17bd7179697ba02a7739",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2533,6 +2567,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2543,7 +2578,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1378,
+      "envelope_bytes": 1464,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2551,10 +2586,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2570,14 +2606,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2589,8 +2625,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "7287252d0dc508ac0d5fd7ec5c9074a3f0f8c342e04eeba8183c70fe76aadaa8",
-      "snapshot_fingerprint": "f0e7f7415c8da9e52b9695b2b9421bc25476ab41f8d62a88e5a80965b77acaf6",
+      "revision_v2_hash": "93316a3122c5ba945d688dbd4ad59beb7b2fd052ee21cd1d1da2758760043b09",
+      "snapshot_fingerprint": "568cb5d6d05daceaa3bb91062bab6da8171fc18dd8cc1134511b23811a0e1214",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2603,6 +2639,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2613,7 +2650,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1377,
+      "envelope_bytes": 1463,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2621,10 +2658,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2640,14 +2678,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2659,8 +2697,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "322310e657a9d6c470f856988f742198ccb8f4db3b433d131363d25945f4d1ec",
-      "snapshot_fingerprint": "b19a6138c92136985272e362f1fa43a3cb96af5f83a3e3bc885a1b980c2f0f9a",
+      "revision_v2_hash": "c4aa9c951ec17ef6e43c1bd4aabe119e0df1ec485a05a90bc89e1275a91bab55",
+      "snapshot_fingerprint": "e13d84017cbb748f03958850ac9626d20c04c49d31d65c0e923911bcac00a66c",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {
@@ -2673,6 +2711,7 @@
     },
     {
       "component_hashes": {
+        "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
         "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
         "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2683,7 +2722,7 @@
       },
       "content_canonical_bytes": 481,
       "content_hash": "70d0b1b338a8ed7d8f518611c2d5b25c0545ace330047b42f7cec078d16881fd",
-      "envelope_bytes": 1376,
+      "envelope_bytes": 1462,
       "hash_epoch": 1,
       "policy_neutral_component_hashes": {
         "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2691,10 +2730,11 @@
         "lifecycle_activity": "234ad437c202caff788fd2085d846fc20db69a864b5851b9ffe27caf29fae7d8",
         "usage_accounting": "a7e103445535c661bd2a77f56aa38d8b3da877c3f09cf9ea3b0a5c65f6c42be2"
       },
-      "revision_hash": "781857c70e69af7abf35a905dcc1c588334cbadbba6b84f54b2e6b09185c5d8d",
+      "revision_hash": "e5122d4d1f44b94641878b09d1be5ab688bb6934b1dec34abea26daefeefb855",
       "revision_v2_body": {
         "canonicalization": "rfc8785:integers-only:v1",
         "component_hashes": {
+          "activity_summary": "97cccb1b1197f11c6edbb0d93975220592ef8faf618c8770a131e4f7dfe567cc",
           "artifacts": "7cdf769d23f6a98a26c85c01af3d6967da21891f080f8b4183ffafc258ce133e",
           "attribution": "3c6bdd9ff3406b7dd2cb008ef5d5ccb4cd4d0189c6ac425187d0e068070cb3c0",
           "context_posture": "3904bab3f2e2c5174b316fd0df29fce8c50a732d6ab925804c4299aeaf3e84ac",
@@ -2710,14 +2750,14 @@
           "source_started_at": "2026-05-28T17:00:00Z",
           "status": "final"
         },
-        "parser_version": "codex_jsonl:v25",
+        "parser_version": "codex_jsonl:v26",
         "provenance": {
           "collector": "claude_code_jsonl",
           "input_token_scope": "uncached",
           "state_archived": null,
           "state_total_tokens": null
         },
-        "scan_identity_version": "codex_jsonl:v25",
+        "scan_identity_version": "codex_jsonl:v26",
         "source": "codex",
         "source_file_fingerprint": "cccccccccccccccccccccccccccccccc",
         "source_session_id": "session-שלום-東京-null",
@@ -2729,8 +2769,8 @@
           "workspace_labels_enabled": true
         }
       },
-      "revision_v2_hash": "858a8ea959bcc512d49cad4f95c8d32319d8242e237bda06c75608f07a912485",
-      "snapshot_fingerprint": "b19a6138c92136985272e362f1fa43a3cb96af5f83a3e3bc885a1b980c2f0f9a",
+      "revision_v2_hash": "93a14583cd0d074f44b36628c6c4d0752cb5e652c8846bba8c482e15992fdd38",
+      "snapshot_fingerprint": "e13d84017cbb748f03958850ac9626d20c04c49d31d65c0e923911bcac00a66c",
       "source": "codex",
       "source_session_id": "session-שלום-東京-null",
       "upload_policy": {

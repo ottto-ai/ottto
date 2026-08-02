@@ -388,6 +388,7 @@ mod tests {
             first_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            activity_summary: None,
             model_usage: Vec::new(),
             usage_buckets,
             cost: None,

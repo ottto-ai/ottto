@@ -967,6 +967,61 @@ pub fn claude_subagent_facts(
     facts
 }
 
+/// Exact Codex family facts joined from `state_5.sqlite.thread_spawn_edges`.
+///
+/// The database supplies only provider-native thread ids and graph edges. No
+/// prompt, title, command, path, or tool output enters this contract.
+pub fn codex_subagent_facts(
+    root_session_ref: &str,
+    source_session_id: &str,
+    spawn_depth: Option<u64>,
+    observed_at: &str,
+    source_version: &str,
+) -> Vec<SessionAttributionFact> {
+    let mut facts = Vec::new();
+    let evidence_context = EvidenceContext {
+        source_session_id,
+        observed_at,
+        source_version,
+    };
+    push_fact(
+        &mut facts,
+        "root_session_ref",
+        root_session_ref,
+        "provider_artifact",
+        "direct",
+        &evidence_context,
+    );
+    push_fact(
+        &mut facts,
+        "agent_kind",
+        "codex_subagent",
+        "provider_artifact",
+        "direct",
+        &evidence_context,
+    );
+    push_fact(
+        &mut facts,
+        "agent_ref",
+        source_session_id,
+        "provider_artifact",
+        "direct",
+        &evidence_context,
+    );
+    if let Some(spawn_depth) = spawn_depth {
+        push_fact(
+            &mut facts,
+            "spawn_depth",
+            &spawn_depth.to_string(),
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    enforce_fact_limits(&mut facts);
+    facts
+}
+
 pub(crate) fn provider_surface(
     source: SnapshotSource,
     origin: Option<&SnapshotOrigin>,
