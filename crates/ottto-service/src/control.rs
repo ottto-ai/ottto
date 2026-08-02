@@ -9263,9 +9263,9 @@ fn collect_pi_session_files(
             "session traversal exceeded the maximum depth",
         ));
     }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Ok(());
-    };
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        pi_session_import_refused("session traversal could not inspect a directory entry")
+    })?;
     if metadata.file_type().is_symlink() {
         return Ok(());
     };
@@ -9283,9 +9283,8 @@ fn collect_pi_session_files(
     if !metadata.is_dir() {
         return Ok(());
     }
-    let Ok(entries) = fs::read_dir(path) else {
-        return Ok(());
-    };
+    let entries = fs::read_dir(path)
+        .map_err(|_| pi_session_import_refused("session traversal could not open a directory"))?;
     for entry in entries {
         let entry = entry.map_err(|_| {
             pi_session_import_refused("session traversal could not read a directory entry")
@@ -19696,6 +19695,77 @@ mod tests {
         assert_eq!(files, BTreeSet::from([real]));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_missing_root_remains_no_data() {
+        let root = control_test_root("pi-session-missing-root");
+        fs::remove_dir_all(&root).expect("remove Pi session root");
+
+        let files = pi_session_files_in(&root).expect("missing top-level root is no data");
+
+        assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_traversal_refuses_a_vanished_candidate() {
+        let root = control_test_root("pi-session-vanished-candidate");
+        let vanished = root.join("vanished.jsonl");
+        let mut entries_seen = 0;
+        let mut files = BTreeSet::new();
+
+        let error = collect_pi_session_files(
+            &vanished,
+            1,
+            &mut entries_seen,
+            &mut files,
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("a candidate that vanished after enumeration must refuse the census");
+
+        assert!(error.to_string().contains("could not inspect"));
+        assert!(files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_before_smoke_census_cannot_reclassify_existing_files_as_new() {
+        let root = control_test_root("pi-session-unreadable-before-smoke");
+        let blocked = root.join("blocked");
+        let preexisting = blocked.join("preexisting.jsonl");
+        fs::create_dir(&blocked).expect("create blocked session directory");
+        fs::write(&preexisting, b"preexisting\n").expect("write pre-existing session");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))
+            .expect("make session directory unreadable");
+
+        // Privileged Unix users may bypass mode bits. Exercise the portable
+        // permission-denied contract when this platform enforces them.
+        if fs::read_dir(&blocked).is_ok() {
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+                .expect("restore readable session directory");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let before = pi_session_files_in(&root);
+        assert!(
+            before.is_err(),
+            "an unreadable before-smoke subtree must not yield a partial baseline"
+        );
+
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore readable session directory");
+        let after = pi_session_files_in(&root).expect("read restored session tree");
+        assert_eq!(after, BTreeSet::from([preexisting]));
+        assert!(
+            before.ok().is_none(),
+            "failed baseline leaves no set from which pre-existing files can appear new"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

@@ -26,8 +26,10 @@ trees and large files could also drive unbounded traversal and allocation.
   therefore refuses the import instead of accepting a mixed directory generation.
 - Fail Pi session discovery and import closed as unsupported on non-Unix targets,
   where this service has no equivalent component-wise no-reparse open primitive.
-- Skip symlinks found during discovery and refuse unreadable directory-entry
-  iteration instead of treating a partial enumeration as complete.
+- Skip symlinks found during discovery and refuse failed candidate metadata,
+  directory opens, or directory-entry iteration instead of treating a partial
+  enumeration as complete. A missing top-level session root remains no data
+  because absence is handled before traversal by the rooted opener.
 - Bound traversal to depth 32, 20,000 entries, and 10,000 session files. Bound
   uploads to 64 MiB per file, 128 MiB aggregate transcript bytes, 4 KiB per
   route metadata field, and 132 MiB for the complete multipart body. Checked
@@ -42,9 +44,12 @@ trees and large files could also drive unbounded traversal and allocation.
   directories, symlinked `.pi` and `agent` root components, final and
   intermediate path replacement, held-descriptor replacement safety, deep and
   wide traversal refusal, sequential processing beyond 256 files, and per-file,
-  aggregate, multipart-field, and total body caps. A target-platform helper and
-  non-Unix-only refusal test keep the unsupported-platform contract compilable.
-- Full `ottto-service` tests pass (1,227 library tests and 10 binary tests); the
+  aggregate, multipart-field, and total body caps. They also prove a vanished
+  candidate refuses traversal, a missing top-level root remains no data, and an
+  unreadable before-smoke subtree cannot produce a partial baseline that later
+  reclassifies pre-existing files as new. A target-platform helper and non-Unix-
+  only refusal test keep the unsupported-platform contract compilable.
+- Full `ottto-service` tests pass (1,231 library tests and 10 binary tests); the
   two explicitly real-local-data service tests remain ignored. `ottto-core`
   passes 83 tests, `ottto-cli` passes 80 tests, and workspace all-target Clippy
   passes with warnings denied.
