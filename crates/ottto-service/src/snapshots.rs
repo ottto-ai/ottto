@@ -1420,14 +1420,20 @@ pub fn apply_claude_effort_evidence(
                 request_count: observed.request_count,
                 costs: UsageCosts::default(),
             };
-            grouped
+            let grouped_totals = grouped
                 .entry((
                     bucket_start,
                     normalized_evidence_model(&observed.model),
                     observed.effort.clone(),
                 ))
-                .or_default()
-                .add(&totals);
+                .or_default();
+            if !grouped_totals.add(&totals) {
+                // Supplemental effort evidence must never make the transcript's
+                // authoritative wire totals inexact. Ignore the whole evidence
+                // projection when its own counters are not representable.
+                grouped.clear();
+                break;
+            }
         }
 
         for bucket in &mut item.usage_buckets {
@@ -1602,12 +1608,14 @@ fn usage_totals_fit(observed: &UsageTotals, base: &UsageTotals) -> bool {
     base.is_monotonic_after(observed)
 }
 
-fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> UsageTotals {
+fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> Option<UsageTotals> {
     let mut total = UsageTotals::default();
     for (_, row) in rows {
-        total.add(row);
+        if !total.add(row) {
+            return None;
+        }
     }
-    total
+    Some(total)
 }
 
 /// Reconcile legacy cache evidence against the transcript's authoritative TTLs.
@@ -1621,7 +1629,7 @@ fn reconcile_effort_cache_creation(
     rows: &mut [(String, UsageTotals)],
     base: &UsageTotals,
 ) -> Option<UsageTotals> {
-    let observed = sum_effort_totals(rows);
+    let observed = sum_effort_totals(rows)?;
     if usage_totals_fit(&observed, base) {
         return Some(observed);
     }
@@ -1642,7 +1650,7 @@ fn reconcile_effort_cache_creation(
             totals.cache_creation_1h_tokens = 0;
         }
     }
-    let reconciled = sum_effort_totals(rows);
+    let reconciled = sum_effort_totals(rows)?;
     usage_totals_fit(&reconciled, base).then_some(reconciled)
 }
 
@@ -2172,7 +2180,7 @@ impl UsageCosts {
 
 fn add_complete_cost(left: Option<u128>, right: Option<u128>) -> Option<u128> {
     match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
+        (Some(left), Some(right)) => left.checked_add(right),
         _ => None,
     }
 }
@@ -2196,11 +2204,11 @@ impl UsageTotals {
 
     fn total_tokens(&self) -> u64 {
         self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_5m_tokens
-            + self.cache_creation_1h_tokens
-            + self.unattributed_total_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
+            .saturating_add(self.unattributed_total_tokens)
     }
 
     /// Effective input context for one turn: the prompt size the model actually
@@ -2211,21 +2219,62 @@ impl UsageTotals {
     /// could only have come from the 1M-context window.
     fn effective_input_context(&self) -> u64 {
         self.input_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_5m_tokens
-            + self.cache_creation_1h_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
     }
 
-    fn add(&mut self, other: &UsageTotals) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.cache_creation_5m_tokens += other.cache_creation_5m_tokens;
-        self.cache_creation_1h_tokens += other.cache_creation_1h_tokens;
-        self.reasoning_output_tokens += other.reasoning_output_tokens;
-        self.unattributed_total_tokens += other.unattributed_total_tokens;
-        self.request_count += other.request_count;
+    /// Add wire-carried counters atomically. Derived totals may saturate for
+    /// thresholding, but a wire field cannot: callers must preserve the prior
+    /// exact aggregate and expose the rejected record as loss.
+    fn add(&mut self, other: &UsageTotals) -> bool {
+        let Some(input_tokens) = self.input_tokens.checked_add(other.input_tokens) else {
+            return false;
+        };
+        let Some(output_tokens) = self.output_tokens.checked_add(other.output_tokens) else {
+            return false;
+        };
+        let Some(cache_read_tokens) = self.cache_read_tokens.checked_add(other.cache_read_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_5m_tokens) = self
+            .cache_creation_5m_tokens
+            .checked_add(other.cache_creation_5m_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_1h_tokens) = self
+            .cache_creation_1h_tokens
+            .checked_add(other.cache_creation_1h_tokens)
+        else {
+            return false;
+        };
+        let Some(reasoning_output_tokens) = self
+            .reasoning_output_tokens
+            .checked_add(other.reasoning_output_tokens)
+        else {
+            return false;
+        };
+        let Some(unattributed_total_tokens) = self
+            .unattributed_total_tokens
+            .checked_add(other.unattributed_total_tokens)
+        else {
+            return false;
+        };
+        let Some(request_count) = self.request_count.checked_add(other.request_count) else {
+            return false;
+        };
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_creation_5m_tokens = cache_creation_5m_tokens;
+        self.cache_creation_1h_tokens = cache_creation_1h_tokens;
+        self.reasoning_output_tokens = reasoning_output_tokens;
+        self.unattributed_total_tokens = unattributed_total_tokens;
+        self.request_count = request_count;
         self.costs.add(&other.costs);
+        true
     }
 
     fn is_monotonic_after(&self, previous: &UsageTotals) -> bool {
@@ -2362,8 +2411,12 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
                 ));
             }
             let totals = usage_totals_from_model_usage(row);
-            bucket_totals.add(&totals);
-            bucket_rows.entry(row_key).or_default().add(&totals);
+            if !bucket_totals.add(&totals) || !bucket_rows.entry(row_key).or_default().add(&totals)
+            {
+                return Err(format!(
+                    "snapshot[{index}] usage_buckets counters overflow wire bounds"
+                ));
+            }
         }
     }
 
@@ -3188,6 +3241,10 @@ struct SnapshotAccumulator {
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
+    // Exact sum of every usage record admitted to the wire projection. A
+    // provider record that would overflow any u64 wire field is refused before
+    // bucket mutation and counted as dropped, keeping the file retryable.
+    accepted_usage_totals: UsageTotals,
     usage_buckets: BTreeMap<String, UsageBucketState>,
     origin: SnapshotOrigin,
     artifacts: Vec<SessionArtifact>,
@@ -3273,6 +3330,7 @@ impl SnapshotAccumulator {
             codex_turn_traces: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
+            accepted_usage_totals: UsageTotals::default(),
             usage_buckets: BTreeMap::new(),
             origin: SnapshotOrigin::default(),
             artifacts: Vec::new(),
@@ -3571,6 +3629,10 @@ impl SnapshotAccumulator {
             self.note_dropped_usage();
             return;
         };
+        if !self.accepted_usage_totals.add(&usage) {
+            self.note_dropped_usage();
+            return;
+        }
 
         let mut merged = self.current_selector.clone();
         merged.merge(selector);
@@ -3584,7 +3646,8 @@ impl SnapshotAccumulator {
                 for (field, source) in reduced_sources {
                     row.selector_sources.insert(field, source);
                 }
-                row.usage.add(&usage);
+                let row_added = row.usage.add(&usage);
+                debug_assert!(row_added);
                 debug_assert_eq!(row.reasoning_effort, effort);
             }
             None => {
@@ -3794,6 +3857,7 @@ impl SnapshotAccumulator {
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
+        let totals = self.accepted_usage_totals.clone();
         let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
         let mut usage_buckets: Vec<SnapshotUsageBucket> = Vec::new();
         for (bucket_start, bucket) in self.usage_buckets {
@@ -3828,10 +3892,6 @@ impl SnapshotAccumulator {
             for row in &mut bucket.model_usage {
                 row.account_identifier_hash = self.account_identifier_hash.clone();
             }
-        }
-        let mut totals = UsageTotals::default();
-        for row in session_rows.values() {
-            totals.add(&row.usage);
         }
         let (compaction_count, compaction_timestamps) = if self.source == SnapshotSource::ClaudeCode
         {
@@ -3978,7 +4038,8 @@ fn merge_session_row(
             for (field, source) in row.selector_sources {
                 existing.selector_sources.insert(field, source);
             }
-            existing.usage.add(&row.usage);
+            let row_added = existing.usage.add(&row.usage);
+            debug_assert!(row_added);
             debug_assert_eq!(existing.reasoning_effort, row.reasoning_effort);
         }
         None => {
@@ -20819,6 +20880,47 @@ mod tests {
     }
 
     #[test]
+    fn pi_usage_overflow_is_counted_and_keeps_the_file_retryable() {
+        let root = temp_dir("pi-extreme-usage");
+        let path = root.join("session.jsonl");
+        let first = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "model": "gpt-5.4",
+                "timestamp": 1784707201000_u64,
+                "usage": {"input": u64::MAX, "output": 1, "cacheRead": u64::MAX}
+            }
+        });
+        let second = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "model": "gpt-5.4",
+                "timestamp": 1784707202000_u64,
+                "usage": {"input": 1, "output": u64::MAX, "cacheRead": 1}
+            }
+        });
+        fs::write(&path, format!("{first}\n{second}\n")).expect("write extreme usage fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-03T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("overflow remains a bounded scanner outcome");
+        assert!(
+            scan.snapshots.is_empty(),
+            "an exact prefix from a lossy file cannot reach upload"
+        );
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(!scan.census_complete);
+        assert!(!index.files.contains_key(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
         let path = temp_file("pi-legacy-timestamp-precedence");
         fs::write(
@@ -22289,6 +22391,20 @@ mod tests {
         let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
 
         assert!(error.contains("totals do not match"), "{error}");
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_wire_counter_overflow() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = u64::MAX;
+        let mut second_bucket = request.snapshots[0].usage_buckets[0].clone();
+        second_bucket.bucket_start = "2026-07-20T13:00:00Z".to_string();
+        second_bucket.model_usage[0].input_tokens = 1;
+        request.snapshots[0].usage_buckets.push(second_bucket);
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("counters overflow wire bounds"), "{error}");
     }
 
     #[test]
