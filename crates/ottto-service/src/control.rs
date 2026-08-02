@@ -9150,6 +9150,11 @@ fn pi_session_file_count() -> usize {
     pi_session_files().map_or(0, |files| files.len())
 }
 
+struct PiSessionCensus {
+    root: OpenPiSessionRoot,
+    files: BTreeSet<PathBuf>,
+}
+
 #[derive(Clone, Copy)]
 struct PiSessionSafetyLimits {
     max_depth: usize,
@@ -9172,10 +9177,17 @@ const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
 };
 
 fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    Ok(pi_session_census()?
+        .map(|census| census.files)
+        .unwrap_or_default())
+}
+
+fn pi_session_census() -> Result<Option<PiSessionCensus>, LocalApiError> {
     let Some(root) = open_pi_session_root()? else {
-        return Ok(BTreeSet::new());
+        return Ok(None);
     };
-    pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    Ok(Some(PiSessionCensus { root, files }))
 }
 
 #[cfg(test)]
@@ -9303,20 +9315,27 @@ fn collect_pi_session_files(
 fn import_new_pi_route_sessions(
     api_base_url: &str,
     route: &PiModelRoute,
-    before_session_files: &BTreeSet<PathBuf>,
+    before: &PiSessionCensus,
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    let Some(root) = open_pi_session_root()? else {
-        return Ok(None);
-    };
-    let session_files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?
-        .difference(before_session_files)
+    // Keep the pre-smoke descriptor as the authority across the whole live
+    // verification. Reopening the pathname here would let an entirely different
+    // real directory generation reclassify its pre-existing transcripts as new.
+    let session_files = pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
+        .difference(&before.files)
         .cloned()
         .collect::<Vec<_>>();
     if session_files.is_empty() {
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, &root, &session_files).map(Some)
+    upload_pi_import_run(
+        api_base_url,
+        &relay_token,
+        route,
+        &before.root,
+        &session_files,
+    )
+    .map(Some)
 }
 
 /// Upload local Pi session files modified at or after `since` for `route`. Used
@@ -11393,20 +11412,26 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let before_session_files = match pi_session_files() {
-        Ok(files) => Some(files),
+    let before_session_census = match pi_session_census() {
+        Ok(census) => census,
         Err(error) => {
             eprintln!("Pi route pre-smoke session discovery failed: {error}");
             None
         }
     };
     let smoke_after = current_rfc3339();
-    let smoke = run_pi_route_smoke_prompt(route, before_session_files.as_ref().map(BTreeSet::len));
+    let smoke = run_pi_route_smoke_prompt(
+        route,
+        before_session_census
+            .as_ref()
+            .map(|census| census.files.len()),
+    );
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
     }
-    if let Some(before_session_files) = before_session_files {
-        if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_files)
+    if let Some(before_session_census) = before_session_census {
+        if let Err(error) =
+            import_new_pi_route_sessions(api_base_url, route, &before_session_census)
         {
             eprintln!("Pi route smoke session import failed: {error}");
         }
@@ -19818,6 +19843,41 @@ mod tests {
         let error = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
             .expect_err("count/selection must refuse a replaced root");
         assert!(error.to_string().contains("session root changed"));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_live_import_refuses_root_replacement_between_censuses() {
+        let parent = control_test_root("pi-session-live-root-replacement");
+        let root = parent.join("sessions");
+        let original = parent.join("sessions-original");
+        fs::create_dir(&root).expect("create pre-smoke session root");
+        let baseline_session = root.join("baseline.jsonl");
+        fs::write(&baseline_session, b"baseline\n").expect("write baseline session");
+        let opened_root = open_pi_test_root(&root);
+        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("capture complete pre-smoke census");
+        let before = PiSessionCensus {
+            root: opened_root,
+            files,
+        };
+
+        fs::rename(&root, &original).expect("move pre-smoke root generation");
+        fs::create_dir(&root).expect("create replacement root generation");
+        let replacement_session = root.join("preexisting-in-replacement.jsonl");
+        fs::write(&replacement_session, b"pre-existing\n")
+            .expect("write pre-existing replacement session");
+
+        let error = import_new_pi_route_sessions(
+            "http://127.0.0.1:1",
+            &subscription_oauth_route(),
+            &before,
+        )
+        .expect_err("a different real root generation must be refused before selection or upload");
+
+        assert!(error.to_string().contains("session root changed"));
+        assert!(replacement_session.exists());
         let _ = fs::remove_dir_all(parent);
     }
 

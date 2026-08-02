@@ -24,6 +24,12 @@ trees and large files could also drive unbounded traversal and allocation.
   root before and after discovery, and reopen every discovered candidate through
   the held root before it can affect selection. A replaced root or descendant
   therefore refuses the import instead of accepting a mixed directory generation.
+- Keep the live Verify pre-smoke root descriptor and its complete file census
+  through the smoke. The post-smoke difference and upload reuse that descriptor
+  and revalidate its pathname identity, so replacing the whole sessions root
+  with a different real directory cannot reclassify that directory's existing
+  transcripts as newly created. The passive OAuth path likewise carries one
+  rooted selection from recent-file discovery through upload without reopening.
 - Fail Pi session discovery and import closed as unsupported on non-Unix targets,
   where this service has no equivalent component-wise no-reparse open primitive.
 - Skip symlinks found during discovery and refuse failed candidate metadata,
@@ -47,9 +53,12 @@ trees and large files could also drive unbounded traversal and allocation.
   aggregate, multipart-field, and total body caps. They also prove a vanished
   candidate refuses traversal, a missing top-level root remains no data, and an
   unreadable before-smoke subtree cannot produce a partial baseline that later
-  reclassifies pre-existing files as new. A target-platform helper and non-Unix-
-  only refusal test keep the unsupported-platform contract compilable.
-- Full `ottto-service` tests pass (1,231 library tests and 10 binary tests); the
+  reclassifies pre-existing files as new. A separate regression replaces the
+  whole sessions root with a different real directory between live censuses and
+  proves the import refuses it before file selection or upload. A target-platform
+  helper and non-Unix-only refusal test keep the unsupported-platform contract
+  compilable.
+- Full `ottto-service` tests pass (1,234 library tests and 10 binary tests); the
   two explicitly real-local-data service tests remain ignored. `ottto-core`
   passes 83 tests, `ottto-cli` passes 80 tests, and workspace all-target Clippy
   passes with warnings denied.
