@@ -1875,7 +1875,10 @@ mod tests {
                 | LocalControlCommand::CloudSessionsControl { .. }
                 | LocalControlCommand::ProviderDailyReferenceControl { .. }
         );
-        assert!(is_allowed, "provider_daily_reference_control must be in the browser-gate allowlist");
+        assert!(
+            is_allowed,
+            "provider_daily_reference_control must be in the browser-gate allowlist"
+        );
     }
 
     #[test]
@@ -1891,7 +1894,9 @@ mod tests {
                 | LocalControlCommand::CloudSessionsControl { .. }
                 | LocalControlCommand::ProviderDailyReferenceControl { .. }
         );
-        assert!(!is_allowed, "Status command must not be in the browser-gate allowlist");
+        assert!(
+            !is_allowed,
+            "Status command must not be in the browser-gate allowlist"
+        );
     }
-
 }
