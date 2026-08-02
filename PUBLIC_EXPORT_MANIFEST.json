@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 305,
-  "content_sha256": "6e277d997f348d4607d1d162013e900ed627f860772ad24798193a9af5b464aa",
+  "content_sha256": "263676dd85531666f596fb6a87a08d193e54ce2bf607f0445124b5c19456d28f",
   "files": [
     {
       "executable": false,
@@ -797,8 +797,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "3ff81cfa19a08c252c61803226b2cb784a0061bf88068b7e79343d2755bcd505",
-      "size_bytes": 69654
+      "sha256": "4698f6c258dcc7028970d1a692405245a7ba75300dbee224656fb51e0723f59a",
+      "size_bytes": 71403
     },
     {
       "executable": false,
@@ -2138,7 +2138,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T08:56:35+00:00",
+  "generated_at": "2026-08-02T15:11:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 306,
   "public_roots": [
@@ -2174,5 +2174,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b31fbd6da823ff52aed632e85e2663cbb342c938"
+  "source_commit": "173621b95884cef4c580e9dbd6284f677915d3b7"
 }
