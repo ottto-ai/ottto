@@ -218,12 +218,16 @@ local config or Keychain state before backend setup-key revocation completes.
 
 Claude Code can continue sending its documented OTLP logs to Ottto's loopback
 daemon when cloud live telemetry is off. The daemon reduces only content-free
-per-request effort evidence (session id, timestamp, model, effort, and token
-counters) into owner-only hashed local sidecars and uploads it later through
-the aggregate local snapshot path. It never persists the raw OTLP request or
-identity/content attributes such as email, prompts, responses, commands, or
-paths. Any transcript usage not exactly covered by local evidence remains
-explicitly effort-unknown.
+per-request effort evidence (session id, API request id, timestamp, model,
+effort, and token counters) into owner-only hashed local sidecars and uploads
+it later through the aggregate local snapshot path. It never persists the raw
+OTLP request or identity/content attributes such as email, prompts, responses,
+commands, or paths. The API request id is an opaque provider-side call
+identifier that Claude Code already writes into your own transcripts as
+`requestId`; it stays on the machine and is used only to match an observed
+effort tier to the turn that used it, so only the tier ever leaves. Any
+transcript usage not exactly covered by local evidence remains explicitly
+effort-unknown.
 
 ## Repair Boundaries
 

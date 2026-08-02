@@ -7,6 +7,12 @@
 //! commands, paths, raw account identifiers, and email addresses are never
 //! stored. A provider UUID may be reduced to the same privacy-safe billing
 //! identity hash used by snapshots and then discarded.
+//!
+//! The sidecar also keeps the API request id, which is the join key back to the
+//! turn that used the tier. It is an opaque provider-side call identifier, not
+//! user content, and Claude Code already writes the same value into the user's
+//! own transcripts as `requestId`. It stays local: only the resolved tier ever
+//! reaches a snapshot.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -27,6 +33,17 @@ const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 pub struct ClaudeEffortEvidence {
     pub fingerprint: String,
     pub session_id: String,
+    /// Anthropic's per-request id (`req_...`), which the transcript repeats as
+    /// `requestId` on every record of that response.
+    ///
+    /// This is the only field that ties one effort observation to the exact
+    /// transcript that recorded it. Claude Code reports the TOP-LEVEL session id
+    /// on subagent requests, so `session_id` alone cannot separate a parent turn
+    /// from a Task/Workflow subagent turn, while the daemon files each subagent
+    /// transcript under its own session id. Empty on evidence captured before
+    /// this field existed; those rows stay on the aggregate reconciliation path.
+    #[serde(default)]
+    pub request_id: String,
     pub observed_at: String,
     pub model: String,
     pub effort: String,
@@ -139,6 +156,51 @@ pub fn load_claude_effort_evidence(
     Ok(result)
 }
 
+/// Index one scan's effort evidence by Anthropic request id.
+///
+/// `session_ids` are the sessions whose sidecars own the evidence, which for a
+/// subagent transcript is its PARENT session (Claude Code stamps the top-level
+/// `session.id` on subagent OTLP records). Request ids are globally unique, so
+/// one flat map serves every transcript in the scan: each request lands on
+/// whichever transcript actually recorded it, parent or sidechain alike.
+///
+/// Rows without a request id (captured before the field existed) are skipped;
+/// `apply_claude_effort_evidence` still reconciles those in aggregate.
+pub fn load_claude_effort_by_request(
+    support_dir: &Path,
+    session_ids: impl IntoIterator<Item = String>,
+) -> BTreeMap<String, String> {
+    let mut index = BTreeMap::new();
+    for session_id in BTreeSet::from_iter(session_ids) {
+        let path = evidence_path(support_dir, &session_id);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_EVIDENCE_FILE_BYTES {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else { continue };
+            let Ok(item) = serde_json::from_str::<ClaudeEffortEvidence>(&line) else {
+                continue;
+            };
+            if item.session_id != session_id
+                || item.request_id.is_empty()
+                || !VALID_EFFORTS.contains(&item.effort.as_str())
+            {
+                continue;
+            }
+            // One request has exactly one applied tier; a repeated id is the
+            // same observation re-exported, so first write wins.
+            index.entry(item.request_id).or_insert(item.effort);
+        }
+    }
+    index
+}
+
 /// Stat-only fingerprint for one session's local OTLP sidecar.
 ///
 /// Snapshot candidate selection uses this so evidence appended after the
@@ -177,9 +239,16 @@ fn evidence_from_record(
         .filter(|value| VALID_EFFORTS.contains(&value.as_str()))
         .unwrap_or_default();
     let observed_at = timestamp_at(record)?;
+    // Anthropic's own request id, not the client-generated one: the transcript
+    // records `requestId` from the response, so only this value joins.
+    let request_id = first_attr(attrs, &["request_id", "gen_ai.response.id"])
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
     let mut item = ClaudeEffortEvidence {
         fingerprint: String::new(),
         session_id: session_id.to_string(),
+        request_id,
         observed_at,
         model: model.to_string(),
         effort,
@@ -358,6 +427,64 @@ fn append_lock() -> &'static Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One OTLP export carrying a parent turn and a subagent turn, exactly as
+    /// Claude Code emits them: same `session.id`, different `request_id`, and
+    /// `query_source` the only hint that one came from a Task agent.
+    fn parent_and_subagent_body() -> &'static [u8] {
+        br#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-code"}}]},"scopeLogs":[{"logRecords":[
+        {"timeUnixNano":"1785708000000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-mixed"}},{"key":"model","value":{"stringValue":"claude-opus-5"}},{"key":"effort","value":{"stringValue":"xhigh"}},{"key":"request_id","value":{"stringValue":"req_PARENT"}},{"key":"query_source","value":{"stringValue":"main"}},{"key":"input_tokens","value":{"intValue":"12"}}]},
+        {"timeUnixNano":"1785708001000000000","body":{"stringValue":"claude_code.api_request"},"attributes":[{"key":"session.id","value":{"stringValue":"sess-mixed"}},{"key":"model","value":{"stringValue":"claude-sonnet-5"}},{"key":"effort","value":{"stringValue":"high"}},{"key":"request_id","value":{"stringValue":"req_SUB"}},{"key":"query_source","value":{"stringValue":"agent:builtin:Explore"}},{"key":"input_tokens","value":{"intValue":"9"}}]}
+        ]}]}]}"#
+    }
+
+    #[test]
+    fn indexes_effort_by_request_id_across_parent_and_subagent_turns() {
+        let dir = std::env::temp_dir().join(format!("ottto-effort-req-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            capture_claude_api_request_logs(&dir, parent_and_subagent_body(), "application/json")
+                .unwrap(),
+            2
+        );
+
+        let index = load_claude_effort_by_request(&dir, ["sess-mixed".to_string()]);
+
+        // Both turns are reachable from the ONE sidecar the parent session owns,
+        // which is what lets a sidechain transcript resolve its own tier.
+        assert_eq!(index.get("req_PARENT").map(String::as_str), Some("xhigh"));
+        assert_eq!(index.get("req_SUB").map(String::as_str), Some("high"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn effort_index_skips_rows_without_a_request_id() {
+        let dir = std::env::temp_dir().join(format!("ottto-effort-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // A pre-request-id row: still valid evidence, but only the aggregate
+        // path can place it, so it must not enter the per-request index.
+        append_evidence(
+            &dir,
+            &ClaudeEffortEvidence {
+                fingerprint: "legacy".to_string(),
+                session_id: "sess-legacy".to_string(),
+                observed_at: "2026-07-12T15:07:58Z".to_string(),
+                model: "claude-opus-4-8".to_string(),
+                effort: "low".to_string(),
+                ..Default::default()
+            },
+        )
+        .expect("append legacy evidence");
+
+        assert!(load_claude_effort_by_request(&dir, ["sess-legacy".to_string()]).is_empty());
+        // The aggregate loader still sees it.
+        assert_eq!(
+            load_claude_effort_evidence(&dir, ["sess-legacy".to_string()]).unwrap()["sess-legacy"]
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn captures_only_allowlisted_api_request_fields_and_dedupes_reads() {

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 305,
-  "content_sha256": "263676dd85531666f596fb6a87a08d193e54ce2bf607f0445124b5c19456d28f",
+  "candidate_file_count": 306,
+  "content_sha256": "c6f472a3cdf23f965f98508839cbbf32489d18963ebc41bf59e6e9797139d088",
   "files": [
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_effort.rs",
-      "sha256": "400243c962a91c8be21925d7ba1c06d22c11de71792166dc35ab4ffc7b8979d9",
-      "size_bytes": 15251
+      "sha256": "6e4cb2ff3330e86a6f516ca0d2136faf148a50fe2d27d849e802d2a046706bda",
+      "size_bytes": 21817
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "e8d1f2556bb294a64bb53fde9df9e506d64d03ffb948c906493f5361af3ed982",
-      "size_bytes": 1041382
+      "sha256": "fa97a4fb2430a2f00499f5ad6392143c1ec7776abd01d21f8a49d079380bddd4",
+      "size_bytes": 1055355
     },
     {
       "executable": false,
@@ -930,8 +930,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "5269aad5efa1b16e276c7aa3a762007f4ce104f953a31f0140d84b9cf973ffb1",
-      "size_bytes": 15179
+      "sha256": "404a7ae57114d67a362c248fb0f679904d412656d0dbc7ca2e85a69ff588efcf",
+      "size_bytes": 15461
     },
     {
       "executable": false,
@@ -1254,6 +1254,13 @@
       "path": "docs/session-2026-08-01-setup-claim-credential-continuity.md",
       "sha256": "06aa117acef4319310a8a6ade33c19d454683b9b6c3a515a35295e2c17a40fdc",
       "size_bytes": 3079
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-02-claude-effort-per-request-attribution.md",
+      "sha256": "5a51dcbcf75589e93afe242f1a3f3e78f6e2d7354fcae20d7c743fb21943ce48",
+      "size_bytes": 5108
     },
     {
       "executable": false,
@@ -1630,7 +1637,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "31ebae02894128ed2b09ea8cbf4cf0b13ed5cefbf88710bf29aea6c61b8af3e4",
+      "sha256": "ecd10a5e05078244c72068c17d2df6754ce2b7f058c8b8886cecdeb8ec540acc",
       "size_bytes": 222394
     },
     {
@@ -2138,9 +2145,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T15:11:55+00:00",
+  "generated_at": "2026-08-02T19:12:19+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 306,
+  "output_file_count": 307,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
