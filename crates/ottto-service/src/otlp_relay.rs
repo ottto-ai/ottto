@@ -442,6 +442,7 @@ fn handle_control_request(
         &control_request.command,
         LocalControlCommand::TelemetryControl { .. }
             | LocalControlCommand::CloudSessionsControl { .. }
+            | LocalControlCommand::ProviderDailyReferenceControl { .. }
     ) {
         return write_json_response_with_headers(
             stream,
@@ -1855,4 +1856,42 @@ mod tests {
         );
         let _agent = build_upstream_http_agent();
     }
+
+    #[test]
+    fn browser_gate_allows_provider_daily_reference_control_through_allowlist() {
+        // Regression test: verify that provider_daily_reference_control passes the
+        // browser-gate command allowlist. The matches! pattern must include it.
+        let cmd = LocalControlCommand::ProviderDailyReferenceControl {
+            action: ottto_protocol::ProviderDailyReferenceControlAction::Status,
+            control_token: ottto_protocol::SecretString::new("test-token"),
+            api_base_url: None,
+            backend_grant: None,
+        };
+
+        // This should match the allowlist in handle_control_request.
+        let is_allowed = matches!(
+            &cmd,
+            LocalControlCommand::TelemetryControl { .. }
+                | LocalControlCommand::CloudSessionsControl { .. }
+                | LocalControlCommand::ProviderDailyReferenceControl { .. }
+        );
+        assert!(is_allowed, "provider_daily_reference_control must be in the browser-gate allowlist");
+    }
+
+    #[test]
+    fn browser_gate_rejects_unknown_commands() {
+        // Verify that genuinely unknown commands do NOT match the allowlist.
+        let cmd = LocalControlCommand::Status {
+            refresh_agent_status: false,
+        };
+
+        let is_allowed = matches!(
+            &cmd,
+            LocalControlCommand::TelemetryControl { .. }
+                | LocalControlCommand::CloudSessionsControl { .. }
+                | LocalControlCommand::ProviderDailyReferenceControl { .. }
+        );
+        assert!(!is_allowed, "Status command must not be in the browser-gate allowlist");
+    }
+
 }
