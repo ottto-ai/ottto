@@ -1,10 +1,13 @@
-use crate::snapshots::{SnapshotBatchRequest, SnapshotSource, SnapshotSourceManifest};
+use crate::snapshots::{
+    SnapshotBatchRequest, SnapshotSource, SnapshotSourceManifest, SNAPSHOT_ENTITY_ACK_CONTRACT,
+};
 use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ottto_core::{
     compiled_release_version, redact_inline, ControlTokenStore, FileDeviceStore,
-    KeychainSecretStore, LocalDeviceBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalDeviceBinding,
+    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
 };
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
@@ -501,6 +504,208 @@ pub struct SnapshotBatchResponse {
     pub session_ids: Vec<String>,
     pub disabled: bool,
     pub disabled_reason: Option<String>,
+    #[serde(default)]
+    pub entity_ack_contract: Option<String>,
+    #[serde(default)]
+    pub accepted_entities: Vec<SnapshotEntityRef>,
+    #[serde(default)]
+    pub unchanged_entities: Vec<SnapshotEntityRef>,
+    #[serde(default)]
+    pub rejected_entities: Vec<SnapshotEntityRejection>,
+    #[serde(default)]
+    pub conflict_entities: Vec<SnapshotEntityRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SnapshotEntityRef {
+    pub source_session_id: String,
+    pub snapshot_fingerprint: String,
+    #[serde(default = "default_occurrence_count")]
+    pub occurrence_count: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SnapshotEntityRejection {
+    pub source_session_id: String,
+    pub snapshot_fingerprint: String,
+    pub reason: String,
+    pub detail: String,
+    #[serde(default = "default_true")]
+    pub permanent: bool,
+    #[serde(default = "default_occurrence_count")]
+    pub occurrence_count: u64,
+}
+
+fn default_occurrence_count() -> u64 {
+    1
+}
+
+impl SnapshotBatchResponse {
+    /// Reject malformed, short, duplicated, foreign, overlapping, or partial
+    /// ACKs before any local checkpoint can advance.
+    pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
+        if self.disabled {
+            if self.accepted != 0
+                || !self.accepted_entities.is_empty()
+                || !self.unchanged_entities.is_empty()
+                || !self.rejected_entities.is_empty()
+                || !self.conflict_entities.is_empty()
+            {
+                return Err(anyhow!(
+                    "disabled snapshot response contains entity outcomes"
+                ));
+            }
+            return Ok(());
+        }
+        match self.entity_ack_contract.as_deref() {
+            None => {
+                if self.accepted != request.snapshots.len() as u64 {
+                    return Err(anyhow!("legacy snapshot response accepted count mismatch"));
+                }
+                return Ok(());
+            }
+            Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => {}
+            Some(_) => {
+                return Err(anyhow!(
+                    "snapshot response uses an unsupported entity ACK contract"
+                ));
+            }
+        }
+        self.validate_entity_ack_identities(request.snapshots.iter().map(|item| {
+            (
+                item.source_session_id.as_str(),
+                item.snapshot_fingerprint.as_str(),
+            )
+        }))
+    }
+
+    fn validate_entity_ack_identities<'a>(
+        &self,
+        identities: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<()> {
+        let mut requested = std::collections::BTreeMap::new();
+        for (source_session_id, snapshot_fingerprint) in identities {
+            *requested
+                .entry((
+                    source_session_id.to_string(),
+                    snapshot_fingerprint.to_string(),
+                ))
+                .or_insert(0_u64) += 1;
+        }
+        let mut covered = std::collections::BTreeMap::new();
+        let mut classifications = std::collections::BTreeMap::new();
+        let mut accepted_or_unchanged = 0_u64;
+        for (classification, references) in [
+            ("accepted", self.accepted_entities.as_slice()),
+            ("unchanged", self.unchanged_entities.as_slice()),
+        ] {
+            for reference in references {
+                validate_snapshot_entity_ref(reference)?;
+                record_snapshot_ack_occurrences(
+                    &requested,
+                    &mut covered,
+                    &mut classifications,
+                    reference.source_session_id.as_str(),
+                    reference.snapshot_fingerprint.as_str(),
+                    reference.occurrence_count,
+                    classification,
+                )?;
+                accepted_or_unchanged = accepted_or_unchanged
+                    .checked_add(reference.occurrence_count)
+                    .ok_or_else(|| anyhow!("snapshot ACK accepted count overflow"))?;
+            }
+        }
+        for rejection in &self.rejected_entities {
+            let reference = SnapshotEntityRef {
+                source_session_id: rejection.source_session_id.clone(),
+                snapshot_fingerprint: rejection.snapshot_fingerprint.clone(),
+                occurrence_count: rejection.occurrence_count,
+            };
+            validate_snapshot_entity_ref(&reference)?;
+            if !rejection.permanent {
+                return Err(anyhow!("snapshot ACK contains invalid rejection"));
+            }
+            record_snapshot_ack_occurrences(
+                &requested,
+                &mut covered,
+                &mut classifications,
+                rejection.source_session_id.as_str(),
+                rejection.snapshot_fingerprint.as_str(),
+                rejection.occurrence_count,
+                "rejected",
+            )?;
+        }
+        for reference in &self.conflict_entities {
+            validate_snapshot_entity_ref(reference)?;
+            record_snapshot_ack_occurrences(
+                &requested,
+                &mut covered,
+                &mut classifications,
+                reference.source_session_id.as_str(),
+                reference.snapshot_fingerprint.as_str(),
+                reference.occurrence_count,
+                "conflict",
+            )?;
+        }
+        if covered != requested {
+            return Err(anyhow!("snapshot ACK does not cover the request exactly"));
+        }
+        if self.accepted != accepted_or_unchanged {
+            return Err(anyhow!("snapshot ACK accepted count mismatch"));
+        }
+        Ok(())
+    }
+}
+
+fn record_snapshot_ack_occurrences(
+    requested: &std::collections::BTreeMap<(String, String), u64>,
+    covered: &mut std::collections::BTreeMap<(String, String), u64>,
+    classifications: &mut std::collections::BTreeMap<(String, String), &'static str>,
+    source_session_id: &str,
+    snapshot_fingerprint: &str,
+    occurrence_count: u64,
+    classification: &'static str,
+) -> Result<()> {
+    let key = (
+        source_session_id.to_string(),
+        snapshot_fingerprint.to_string(),
+    );
+    let Some(expected) = requested.get(&key) else {
+        return Err(anyhow!("snapshot ACK contains a foreign entity"));
+    };
+    if occurrence_count == 0 {
+        return Err(anyhow!("snapshot ACK occurrence_count must be positive"));
+    }
+    if classifications
+        .insert(key.clone(), classification)
+        .is_some()
+    {
+        return Err(anyhow!(
+            "snapshot ACK contains a duplicate outcome identity"
+        ));
+    }
+    let observed = covered.entry(key).or_insert(0);
+    *observed = observed
+        .checked_add(occurrence_count)
+        .ok_or_else(|| anyhow!("snapshot ACK occurrence_count overflow"))?;
+    if *observed > *expected {
+        return Err(anyhow!("snapshot ACK over-counts an entity"));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
+    if reference.source_session_id.trim().is_empty()
+        || reference.occurrence_count == 0
+        || reference.snapshot_fingerprint.len() != 64
+        || !reference
+            .snapshot_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(anyhow!("snapshot ACK entity identity is malformed"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -518,6 +723,9 @@ pub struct SnapshotStatusRequest {
     pub last_uploaded_count: u64,
     pub last_scanned_session_count: u64,
     pub last_scanned_file_count: u64,
+    pub last_zero_snapshot_confirmed_count: u64,
+    pub last_zero_snapshot_usage_evidence_count: u64,
+    pub last_dropped_usage_record_count: u64,
     pub last_backfill_window_days: u64,
     pub last_backfill_file_limit: u64,
     pub last_discovered_file_count: u64,
@@ -527,13 +735,23 @@ pub struct SnapshotStatusRequest {
     /// not upload. Without it, "the collector suppressed 718 unchanged
     /// sessions" and "the collector did nothing" are the same receipt.
     pub last_semantic_noop_count: u64,
+    pub last_census_complete: bool,
+    pub last_symlink_rejected_count: u64,
+    pub last_unreadable_path_count: u64,
+    pub last_oversized_file_count: u64,
+    pub last_disappeared_file_count: u64,
+    pub last_malformed_json_line_count: u64,
+    pub last_invalid_utf8_line_count: u64,
+    pub last_over_line_cap_count: u64,
+    pub last_recognized_usage_drop_count: u64,
     pub consecutive_failures: u64,
     pub next_retry_at: Option<String>,
     pub collector_version: Option<String>,
     pub parser_version: Option<String>,
     /// `{source, entity_count, rolling_hash}` over this source's scan index, as
-    /// of the most recent completed scan on this machine. Absent before the
-    /// first scan of the process; never fabricated.
+    /// of the most recent completed scan on this machine. On a terminal status,
+    /// absence explicitly withdraws prior agreement; on a nonterminal check-in,
+    /// absence is liveness-only/unknown. Never fabricated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SnapshotSourceManifest>,
 }
@@ -1546,7 +1764,23 @@ fn truncate_diagnostic(value: &str) -> String {
     truncated
 }
 
+/// Fence relay admission once confirmation may have reached the server and
+/// until the candidate is fully promoted into local active state. Persisted
+/// pre-confirm guards are the crash boundary immediately before the request:
+/// a transport failure after that cut cannot prove the old authority survived.
+pub fn ensure_no_incomplete_device_credential_promotion() -> Result<()> {
+    let pending = FilePendingDeviceCredentialStore::default().load()?;
+    if pending.as_ref().is_some_and(|pending| {
+        pending.confirmed_at.is_some()
+            || (pending.confirmation_authorized && pending.preconfirm_guards_passed)
+    }) {
+        return Err(anyhow!("relay identity commit is incomplete"));
+    }
+    Ok(())
+}
+
 pub fn load_snapshot_device_credentials() -> Result<(LocalDeviceBinding, String)> {
+    ensure_no_incomplete_device_credential_promotion()?;
     let device = FileDeviceStore::default()
         .load()?
         .ok_or_else(|| anyhow!("relay device binding is missing"))?;
@@ -1862,21 +2096,282 @@ mod tests {
             last_discovered_file_count: 1_100,
             last_skipped_file_count_due_to_limit: 100,
             last_scan_cap_hit: true,
+            last_zero_snapshot_confirmed_count: 12,
+            last_zero_snapshot_usage_evidence_count: 0,
+            last_dropped_usage_record_count: 0,
             last_semantic_noop_count: 7,
+            last_census_complete: false,
+            last_symlink_rejected_count: 1,
+            last_unreadable_path_count: 2,
+            last_oversized_file_count: 3,
+            last_disappeared_file_count: 4,
+            last_malformed_json_line_count: 5,
+            last_invalid_utf8_line_count: 6,
+            last_over_line_cap_count: 7,
+            last_recognized_usage_drop_count: 8,
             consecutive_failures: 1,
             next_retry_at: None,
             collector_version: Some("0.1.0".to_string()),
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
             manifest: Some(SnapshotSourceManifest {
+                contract_version: crate::snapshots::SNAPSHOT_MANIFEST_CONTRACT_VERSION,
+                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
                 source: "codex".to_string(),
+                window_start: "2026-01-01T00:00:00Z".to_string(),
+                window_end: "2026-07-03T00:00:00Z".to_string(),
                 entity_count: 3,
                 rolling_hash: "b".repeat(64),
-                scope: crate::snapshots::SNAPSHOT_MANIFEST_SCOPE,
-                window_days: 183,
             }),
         };
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));
         assert!(!serialized.contains("/Users/"));
+    }
+
+    fn entity_ref(session: &str, fingerprint: &str, occurrence_count: u64) -> SnapshotEntityRef {
+        SnapshotEntityRef {
+            source_session_id: session.to_string(),
+            snapshot_fingerprint: fingerprint.to_string(),
+            occurrence_count,
+        }
+    }
+
+    fn entity_ack(
+        accepted: u64,
+        accepted_entities: Vec<SnapshotEntityRef>,
+    ) -> SnapshotBatchResponse {
+        SnapshotBatchResponse {
+            accepted,
+            sessions_reconciled: 0,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
+            accepted_entities,
+            unchanged_entities: Vec::new(),
+            rejected_entities: Vec::new(),
+            conflict_entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disabled_batch_response_is_not_mistaken_for_a_partial_ack() {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = entity_ack(0, Vec::new());
+        response.disabled = true;
+        response.disabled_reason = Some("disabled_by_admin".to_string());
+        response
+            .validate_entity_ack(&request)
+            .expect("disabled response intentionally has no entity partition");
+
+        response.accepted = 1;
+        response
+            .validate_entity_ack(&request)
+            .expect_err("disabled response cannot settle an entity");
+    }
+
+    #[test]
+    fn unknown_entity_ack_contract_never_falls_back_to_legacy_count_only_ack() {
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: Vec::new(),
+            upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let mut response = entity_ack(0, Vec::new());
+        response.entity_ack_contract = Some("snapshot_entity_ack:v999".to_string());
+        response
+            .validate_entity_ack(&request)
+            .expect_err("future ACK shapes require explicit client support");
+    }
+
+    #[test]
+    fn entity_ack_validates_reordered_duplicate_occurrences_as_a_multiset() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let response = entity_ack(
+            3,
+            vec![
+                entity_ref("session-b", &second, 1),
+                entity_ref("session-a", &first, 2),
+            ],
+        );
+        response
+            .validate_entity_ack_identities([
+                ("session-a", first.as_str()),
+                ("session-b", second.as_str()),
+                ("session-a", first.as_str()),
+            ])
+            .expect("reordered duplicate occurrences are exact");
+    }
+
+    #[test]
+    fn entity_ack_requires_one_compressed_outcome_per_identity() {
+        let fingerprint = "a".repeat(64);
+        let requested = [
+            ("session", fingerprint.as_str()),
+            ("session", fingerprint.as_str()),
+        ];
+
+        entity_ack(
+            2,
+            vec![
+                entity_ref("session", &fingerprint, 1),
+                entity_ref("session", &fingerprint, 1),
+            ],
+        )
+        .validate_entity_ack_identities(requested)
+        .expect_err("duplicate response entries are not a compressed outcome");
+
+        entity_ack(2, vec![entity_ref("session", &fingerprint, 2)])
+            .validate_entity_ack_identities(requested)
+            .expect("one response entry may cover both requested occurrences");
+    }
+
+    #[test]
+    fn entity_ack_allows_divergent_bodies_for_one_session_when_each_is_exact() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        entity_ack(
+            2,
+            vec![
+                entity_ref("same-session", &first, 1),
+                entity_ref("same-session", &second, 1),
+            ],
+        )
+        .validate_entity_ack_identities([
+            ("same-session", first.as_str()),
+            ("same-session", second.as_str()),
+        ])
+        .expect("fingerprint keeps divergent revisions distinct");
+    }
+
+    #[test]
+    fn entity_ack_rejects_partial_foreign_and_inconsistent_duplicate_counts() {
+        let fingerprint = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        assert!(entity_ack(1, vec![entity_ref("session", &fingerprint, 1)])
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+        assert!(entity_ack(2, vec![entity_ref("foreign", &foreign, 2)])
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+
+        let mut inconsistent = entity_ack(1, vec![entity_ref("session", &fingerprint, 1)]);
+        inconsistent.unchanged_entities = vec![entity_ref("session", &fingerprint, 1)];
+        inconsistent.accepted = 2;
+        assert!(inconsistent
+            .validate_entity_ack_identities([
+                ("session", fingerprint.as_str()),
+                ("session", fingerprint.as_str()),
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn entity_ack_decodes_compressed_outcomes_across_all_classes() {
+        let accepted = "a".repeat(64);
+        let unchanged = "b".repeat(64);
+        let rejected = "c".repeat(64);
+        let conflict = "d".repeat(64);
+        let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+            "accepted": 5,
+            "sessions_reconciled": 0,
+            "session_ids": [],
+            "disabled": false,
+            "disabled_reason": null,
+            "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+            "accepted_entities": [{
+                "source_session_id": "accepted-session",
+                "snapshot_fingerprint": accepted,
+                "occurrence_count": 2
+            }],
+            "unchanged_entities": [{
+                "source_session_id": "unchanged-session",
+                "snapshot_fingerprint": unchanged,
+                "occurrence_count": 3
+            }],
+            "rejected_entities": [{
+                "source_session_id": "rejected-session",
+                "snapshot_fingerprint": rejected,
+                "reason": "schema",
+                "detail": "bounded",
+                "permanent": true,
+                "occurrence_count": 2
+            }],
+            "conflict_entities": [{
+                "source_session_id": "conflict-session",
+                "snapshot_fingerprint": conflict,
+                "occurrence_count": 2
+            }]
+        }))
+        .expect("decode compressed ACK");
+        response
+            .validate_entity_ack_identities(
+                std::iter::repeat_n(("accepted-session", accepted.as_str()), 2)
+                    .chain(std::iter::repeat_n(
+                        ("unchanged-session", unchanged.as_str()),
+                        3,
+                    ))
+                    .chain(std::iter::repeat_n(
+                        ("rejected-session", rejected.as_str()),
+                        2,
+                    ))
+                    .chain(std::iter::repeat_n(
+                        ("conflict-session", conflict.as_str()),
+                        2,
+                    )),
+            )
+            .expect("identity-unique compressed outcomes cover the request exactly");
+    }
+
+    #[test]
+    fn entity_ack_rejects_zero_and_overflow_occurrence_counts() {
+        let fingerprint = "a".repeat(64);
+        entity_ack(0, vec![entity_ref("session", &fingerprint, 0)])
+            .validate_entity_ack_identities([("session", fingerprint.as_str())])
+            .expect_err("zero occurrence count is invalid");
+
+        let key = ("session".to_string(), fingerprint.clone());
+        let requested = std::collections::BTreeMap::from([(key, u64::MAX)]);
+        let mut covered = std::collections::BTreeMap::new();
+        let mut classifications = std::collections::BTreeMap::new();
+        record_snapshot_ack_occurrences(
+            &requested,
+            &mut covered,
+            &mut classifications,
+            "session",
+            &fingerprint,
+            u64::MAX,
+            "accepted",
+        )
+        .expect("first count fits");
+        record_snapshot_ack_occurrences(
+            &requested,
+            &mut covered,
+            &mut classifications,
+            "session",
+            &fingerprint,
+            1,
+            "accepted",
+        )
+        .expect_err("occurrence sum overflow is rejected");
     }
 }

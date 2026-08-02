@@ -17,9 +17,13 @@ use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
     execute_local_uninstall, generate_control_token, install_owner_for_path,
     local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
-    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore, KeychainSecretStore,
-    LocalConnectionBinding, LocalDeviceBinding, UninstallExecutionOptions, OTTTO_CLIENT_NAME,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore,
+    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
+    LocalDeviceBinding, LocalDeviceCredentialBinding, PendingClaimCredentialCommit,
+    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority, TokenStoreError,
+    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
     validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -51,7 +55,13 @@ use std::io;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,6 +74,10 @@ use toml_edit::{DocumentMut, Item, Table};
 // marketing-site cutover). Matches DIRECT_API_BASE_URL below.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
+const DEVICE_CREDENTIAL_PREPARATION_CAPABILITY: &str = "device_credential_prepare_confirm_v1";
+const DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER: &str =
+    "X-Ottto-Device-Credential-Preparation-Secret";
+const PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION: u16 = 2;
 // Legacy apex proxy base persisted by daemons installed before the marketing
 // cutover. Still trusted/recognized so existing installs keep ingesting until
 // they re-onboard onto the direct api.ottto.net base.
@@ -79,6 +93,16 @@ const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const PI_SESSION_MAX_DEPTH: usize = 32;
+const PI_SESSION_MAX_ENTRIES: usize = 20_000;
+const PI_SESSION_MAX_FILES: usize = 10_000;
+const PI_SESSION_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const PI_SESSION_MAX_AGGREGATE_BYTES: u64 = 128 * 1024 * 1024;
+const PI_MULTIPART_MAX_FIELD_BYTES: usize = 4 * 1024;
+const PI_MULTIPART_MAX_BODY_BYTES: usize = 132 * 1024 * 1024;
+const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
+    "race-safe rooted session access is unavailable on this platform";
+const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
 // Poll long enough for slow-arriving agent telemetry (codex batches + flushes
 // its token records, then the relay forwards them) to reach the backend before
 // we give up — claude/pi still return early on success. Kept under
@@ -2662,6 +2686,7 @@ fn auth_start(
             });
         }
     }
+    discard_abandoned_unconfirmed_claim_credential()?;
     let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
@@ -2672,6 +2697,36 @@ fn auth_start(
         claim_url,
         expires_at: claim.expires_at,
     })
+}
+
+/// A fresh claim is the explicit cancellation boundary for an older completed
+/// claim that was waiting for account-switch confirmation. The journal is not
+/// active authority until confirmation is authorized, so invalidate it before
+/// asking the backend to mint a different immutable preparation. The binding
+/// lock plus the reservation check exclude a concurrently completing claim.
+fn discard_abandoned_unconfirmed_claim_credential() -> Result<(), LocalApiError> {
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    require_identity_mutation_reservation(None)?;
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let Some(pending) = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(());
+    };
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.confirmed_at.is_some()
+        || pending.confirmation_authorized
+        || pending.preconfirm_guards_passed
+        || pending.claim_commit.is_none()
+    {
+        return Err(LocalApiError::IdentityMutationInProgress);
+    }
+    clear_pending_device_credential(
+        &pending_store,
+        &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
 }
 
 /// Whether a pending claim's `expires_at` is in the past (with a 30s safety
@@ -2721,16 +2776,20 @@ fn complete_pending_auth_claim(
     // lifecycle mutex during network I/O. The RAII guard blocks concurrent
     // Cloud-session admission and clears on every return or panic.
     let identity_reservation = reserve_identity_mutation(true)?;
-    let completed = match complete_setup_claim(&pending, machine) {
+    let completion = match complete_setup_claim(&pending, machine, Some(&identity_reservation)) {
         Ok(completed) => completed,
         Err(error) => {
             log_auth_complete_backend_failure(&error);
             return Err(error);
         }
     };
+    let completed = completion.response;
     // Validate the relay-device payload up front so a malformed completion is
     // rejected before any staging or persistence.
-    let relay_credentials = relay_device_credentials_from_claim_completion(&completed)?;
+    let relay_credentials = relay_device_credentials_from_claim_completion(
+        &completed,
+        completion.prior_device_credential.as_ref(),
+    )?;
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -2749,13 +2808,50 @@ fn complete_pending_auth_claim(
             text: "This Mac is connected to Ottto.".to_string(),
         }),
     };
+    let prepared_pending = match &relay_credentials {
+        ClaimRelayDeviceCredential::Prepared(prepared) => {
+            let claim_commit = PendingClaimCredentialCommit {
+                account: account.clone(),
+                connection: LocalConnectionBinding {
+                    setup_run_id: completed.setup_run_id.clone(),
+                    setup_run_token_expires_at: completed.setup_run_token_expires_at.clone(),
+                    machine_id: completed.machine_id.clone(),
+                    claim_code: Some(pending.claim_code.clone()),
+                    api_base_url: validated_api_base_url(None)?,
+                },
+                target_user_id: completed.user.id.clone(),
+                setup_run_token_sha256: secret_sha256(&completed.setup_run_token),
+                backfill_policy: completed.backfill_policy.clone(),
+                backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
+            };
+            let pending = pending_device_credential_from_preparation(
+                &validated_api_base_url(None)?,
+                prepared,
+                false,
+                Some(claim_commit),
+                completion.request_authority.clone(),
+            )?;
+            stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
+            stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
+            let staged = FilePendingDeviceCredentialStore::default()
+                .load()
+                .map_err(|_| LocalApiError::StatePoisoned)?
+                .ok_or(LocalApiError::StatePoisoned)?;
+            if staged.preparation_id != pending.preparation_id {
+                return Err(LocalApiError::StatePoisoned);
+            }
+            Some(staged)
+        }
+        ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Legacy(_, _) => None,
+    };
     // Claim-collision check BEFORE any persistence. Previously the new
     // setup-run token and relay-device credentials were written to the
     // keychain before the user-mismatch check fired, leaving a half-installed
     // credential set for the wrong user alongside the old account files. On a
     // mismatch the fully-completed claim is staged in memory and surfaced as a
-    // switch candidate; nothing on disk or in the keychain changes until the
-    // switch is confirmed via `auth_switch_account`.
+    // switch candidate. A modern candidate may already be present in the
+    // separate pending journal/Keychain account, but active account/device
+    // authority remains unchanged until `auth_switch_account`.
     if let Some(candidate) = daemon.stage_account_switch_if_user_mismatch(StagedAccountSwitch {
         claim_code: pending.claim_code.clone(),
         new_account: account.clone(),
@@ -2763,8 +2859,17 @@ fn complete_pending_auth_claim(
         setup_run_token: completed.setup_run_token.clone(),
         setup_run_token_expires_at: completed.setup_run_token_expires_at.clone(),
         machine_id: completed.machine_id.clone(),
-        relay_device: relay_credentials.as_ref().map(|(device, _)| device.clone()),
-        relay_device_secret: relay_credentials.as_ref().map(|(_, secret)| secret.clone()),
+        relay_device: match &relay_credentials {
+            ClaimRelayDeviceCredential::Legacy(device, _) => Some(device.clone()),
+            ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
+        },
+        relay_device_secret: match &relay_credentials {
+            ClaimRelayDeviceCredential::Legacy(_, secret) => Some(secret.clone()),
+            ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
+        },
+        relay_device_credential_preparation_id: prepared_pending
+            .as_ref()
+            .map(|pending| pending.preparation_id.clone()),
         backfill_policy: completed.backfill_policy.clone(),
         backfill_cutoff_at: completed.backfill_cutoff_at.clone(),
     })? {
@@ -2774,11 +2879,71 @@ fn complete_pending_auth_claim(
             claim_code: candidate.claim_code,
         });
     }
+    let prepared_pending = match prepared_pending {
+        Some(pending) => Some(authorize_pending_device_credential_confirmation(
+            &pending.preparation_id,
+        )?),
+        None => None,
+    };
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+    }
+    let prepared_pending = match prepared_pending {
+        Some(pending) => Some(mark_pending_device_credential_guards_passed(
+            &pending,
+            &FilePendingDeviceCredentialStore::default(),
+        )?),
+        None => None,
+    };
+    let confirmed_pending = match (&relay_credentials, prepared_pending.as_ref()) {
+        (ClaimRelayDeviceCredential::Prepared(prepared), Some(pending)) => {
+            if pending.confirmed_at.is_some() {
+                Some(pending.clone())
+            } else {
+                let confirmed =
+                    confirm_device_credential_preparation(pending, &prepared.candidate_secret)?;
+                Some(mark_pending_device_credential_confirmed(
+                    pending,
+                    &confirmed.confirmed_at,
+                    &FilePendingDeviceCredentialStore::default(),
+                )?)
+            }
+        }
+        (ClaimRelayDeviceCredential::Prepared(_), None) => {
+            return Err(LocalApiError::StatePoisoned)
+        }
+        _ => None,
+    };
+    if let (ClaimRelayDeviceCredential::Prepared(prepared), Some(confirmed)) =
+        (&relay_credentials, confirmed_pending.as_ref())
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        write_and_verify_pending_claim_commit(confirmed, &prepared.candidate_secret)?;
+        let response = daemon.complete_auth_with_account(
+            &pending.claim_code,
+            &pending.nonce,
+            account,
+            completed.setup_run_id,
+            completed.setup_run_token_expires_at,
+            completed.machine_id,
+        )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+        request_snapshot_sync_after_device_registration(daemon);
+        return Ok(response);
+    }
     let _binding_lock = lock_setup_run_binding();
     identity_reservation.validate_locked()?;
-    require_cloud_session_cleanup_before_identity_change_without_pause(
-        &crate::cloud_sessions::CloudSessionGrantStore::default(),
-    )?;
     // Persist the server-issued backfill policy BEFORE committing any of the
     // new binding (token, relay credentials, account/connection files): if
     // this write failed after the binding were already durable, the daemon
@@ -2794,12 +2959,13 @@ fn complete_pending_auth_claim(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    let relay_credentials_persisted = match &relay_credentials {
-        Some((device, secret)) => {
+    let relay_credentials_persisted = match (&relay_credentials, confirmed_pending.as_ref()) {
+        (ClaimRelayDeviceCredential::Legacy(device, secret), _) => {
             persist_relay_device_credentials_locked(device, secret, Some(&identity_reservation))?;
             true
         }
-        None => false,
+        (ClaimRelayDeviceCredential::Prepared(_), _) => return Err(LocalApiError::StatePoisoned),
+        (ClaimRelayDeviceCredential::None, _) => false,
     };
     let response = daemon.complete_auth_with_account(
         &pending.claim_code,
@@ -2859,13 +3025,25 @@ fn auth_switch_account(
 ) -> Result<AuthCompleteResponse, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
     daemon.require_staged_account_switch(claim_code)?;
+    let staged_snapshot = daemon.staged_account_switch_snapshot(claim_code)?;
+    if let Some(preparation_id) = staged_snapshot
+        .relay_device_credential_preparation_id
+        .as_deref()
+    {
+        // This bit is only the user's durable approval. Cleanup remains a
+        // separate gate and is rerun immediately before every confirm,
+        // including startup recovery after a crash at the next instruction.
+        authorize_pending_device_credential_confirmation(preparation_id)?;
+    }
     // Keep the staged completion and current account/device reachable until
     // the browser has completed the exact grant DELETE + local confirmation.
     // This check must precede `take_staged_account_switch`, which mutates the
     // in-memory switch state.
     let identity_reservation = reserve_identity_mutation(true)?;
     let staged = daemon.take_staged_account_switch(claim_code)?;
-    disconnect_previous_binding_best_effort(daemon);
+    if staged.relay_device_credential_preparation_id.is_none() {
+        disconnect_previous_binding_best_effort(daemon);
+    }
     match install_staged_account_switch(daemon, &staged, &identity_reservation) {
         Ok(response) => Ok(response),
         Err(error) => {
@@ -2908,14 +3086,88 @@ fn install_staged_account_switch(
     staged: &StagedAccountSwitch,
     identity_reservation: &IdentityMutationReservation,
 ) -> Result<AuthCompleteResponse, LocalApiError> {
+    {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        // Defense in depth for direct/internal callers and for a grant
+        // transition that raced the earlier auth-switch preflight.
+        require_cloud_session_cleanup_before_identity_change(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+    }
+    let modern_credential = if let Some(preparation_id) =
+        staged.relay_device_credential_preparation_id.as_deref()
+    {
+        if staged.relay_device.is_some() || staged.relay_device_secret.is_some() {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        let pending_store = FilePendingDeviceCredentialStore::default();
+        let pending = pending_store
+            .load()
+            .map_err(|_| LocalApiError::StatePoisoned)?
+            .ok_or(LocalApiError::StatePoisoned)?;
+        if pending.preparation_id != preparation_id {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        let pending = authorize_pending_device_credential_confirmation(&pending.preparation_id)?;
+        let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)?;
+        let candidate_secret = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+        let confirmed_pending = if pending.confirmed_at.is_some() {
+            pending
+        } else {
+            let confirmed = confirm_device_credential_preparation(&pending, &candidate_secret)?;
+            mark_pending_device_credential_confirmed(
+                &pending,
+                &confirmed.confirmed_at,
+                &pending_store,
+            )?
+        };
+        // Only now may the old local/cloud binding be disconnected: every
+        // earlier failure cut retained usable old authority.
+        disconnect_previous_binding_best_effort(daemon);
+        Some((confirmed_pending, candidate_secret))
+    } else {
+        None
+    };
+    if let Some((pending, candidate_secret)) = modern_credential.as_ref() {
+        let _binding_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        let claim = pending
+            .claim_commit
+            .as_ref()
+            .ok_or(LocalApiError::StatePoisoned)?;
+        if claim.account != staged.new_account
+            || claim.connection.setup_run_id != staged.setup_run_id
+            || claim.connection.setup_run_token_expires_at != staged.setup_run_token_expires_at
+            || claim.connection.machine_id != staged.machine_id
+            || claim.connection.claim_code.as_deref() != Some(staged.claim_code.as_str())
+            || claim.backfill_policy != staged.backfill_policy
+            || claim.backfill_cutoff_at != staged.backfill_cutoff_at
+        {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        write_and_verify_pending_claim_commit(pending, candidate_secret)?;
+        let response = daemon.install_switched_account(
+            staged.new_account.clone(),
+            staged.setup_run_id.clone(),
+            staged.setup_run_token_expires_at.clone(),
+            staged.machine_id.clone(),
+            &staged.claim_code,
+        )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+        request_snapshot_sync_after_device_registration(daemon);
+        return Ok(response);
+    }
     let _binding_lock = lock_setup_run_binding();
     identity_reservation.validate_locked()?;
-    // Defense in depth for direct/internal callers and for a grant transition
-    // that raced the earlier auth-switch preflight. No account/device file is
-    // changed before this second fail-closed check.
-    require_cloud_session_cleanup_before_identity_change(
-        &crate::cloud_sessions::CloudSessionGrantStore::default(),
-    )?;
     reset_local_account_files_locked(Some(identity_reservation))?;
     let _ = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).delete();
     let _ = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).delete();
@@ -2936,12 +3188,18 @@ fn install_staged_account_switch(
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
         .map_err(|_| LocalApiError::StatePoisoned)?;
-    let relay_credentials_persisted = match (&staged.relay_device, &staged.relay_device_secret) {
-        (Some(device), Some(secret)) => {
+    let relay_credentials_persisted = match (
+        &staged.relay_device,
+        &staged.relay_device_secret,
+        modern_credential.as_ref(),
+    ) {
+        (Some(device), Some(secret), None) => {
             persist_relay_device_credentials_locked(device, secret, Some(identity_reservation))?;
             true
         }
-        _ => false,
+        (None, None, Some(_)) => return Err(LocalApiError::StatePoisoned),
+        (None, None, None) => false,
+        _ => return Err(LocalApiError::StatePoisoned),
     };
     let response = daemon.install_switched_account(
         staged.new_account.clone(),
@@ -3044,21 +3302,42 @@ fn auth_complete_log_endpoint(endpoint: &str) -> String {
     )
 }
 
-/// Validate and materialize the relay-device credentials from a claim
-/// completion without persisting anything. `Ok(None)` means the completion
-/// legitimately carried no relay device.
+enum ClaimRelayDeviceCredential {
+    None,
+    Legacy(LocalDeviceBinding, String),
+    Prepared(DeviceCredentialPreparationApiResponse),
+}
+
+/// Validate and materialize the relay-device credential transition from a
+/// claim completion without persisting anything. Modern and legacy forms are
+/// mutually exclusive so a malformed response cannot silently downgrade after
+/// the server has created a preparation.
 fn relay_device_credentials_from_claim_completion(
     completed: &SetupClaimCompleteResponse,
-) -> Result<Option<(LocalDeviceBinding, String)>, LocalApiError> {
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<ClaimRelayDeviceCredential, LocalApiError> {
+    if let Some(prepared) = &completed.relay_device_credential_preparation {
+        if completed.relay_device.is_some() || completed.relay_device_secret.is_some() {
+            return Err(claim_completion_response_unexpected(
+                "claim completion mixed prepared and active relay-device credentials",
+            ));
+        }
+        validate_device_credential_preparation(
+            "/api/v1/setup-claims/[claim]/local-client/complete",
+            prepared,
+            prior,
+        )?;
+        return Ok(ClaimRelayDeviceCredential::Prepared(prepared.clone()));
+    }
     match (&completed.relay_device, &completed.relay_device_secret) {
-        (None, None) => Ok(None),
+        (None, None) => Ok(ClaimRelayDeviceCredential::None),
         (Some(device), Some(device_secret)) => {
             if device.sources.is_empty() || device_secret.trim().is_empty() {
                 return Err(claim_completion_response_unexpected(
                     "claim completion returned incomplete relay-device credentials",
                 ));
             }
-            Ok(Some((
+            Ok(ClaimRelayDeviceCredential::Legacy(
                 LocalDeviceBinding {
                     device_id: device.id.clone(),
                     machine_id: device
@@ -3068,7 +3347,7 @@ fn relay_device_credentials_from_claim_completion(
                     sources: device.sources.clone(),
                 },
                 device_secret.clone(),
-            )))
+            ))
         }
         _ => Err(claim_completion_response_unexpected(
             "claim completion returned partial relay-device credentials",
@@ -3090,11 +3369,711 @@ fn persist_relay_device_credentials_locked(
     device_secret: &str,
     reservation: Option<&IdentityMutationReservation>,
 ) -> Result<(), LocalApiError> {
-    save_relay_device_binding_locked(device, reservation)?;
-    KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+    require_identity_mutation_reservation(reservation)?;
+    let device_store = FileDeviceStore::default();
+    let current_device = device_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    require_relay_device_binding_change_cleanup(current_device.as_ref(), device)?;
+
+    let secret_store = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+    let current_secret = match current_device {
+        Some(_) => match secret_store.load() {
+            Ok(secret) => Some(secret),
+            Err(TokenStoreError::Missing) => None,
+            Err(_) => return Err(LocalApiError::StatePoisoned),
+        },
+        // With no active device binding, a stray old secret is not usable
+        // authority and does not need to be read for rollback. This also lets
+        // first registration use the owner-only fallback when Keychain reads
+        // are transiently unavailable.
+        None => None,
+    };
+    secret_store
         .save(device_secret)
         .map_err(|_| LocalApiError::StatePoisoned)?;
+    if device_store.save(device).is_ok() {
+        return Ok(());
+    }
+
+    // The device binding is an atomic file replace, but the credential spans
+    // that file and Keychain. Restore the exact prior secret on any file-side
+    // failure so callers never observe a durably half-rotated pair.
+    let rollback = match current_secret {
+        Some(secret) => secret_store.save(&secret),
+        None => secret_store.delete(),
+    };
+    if rollback.is_err() {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Err(LocalApiError::StatePoisoned)
+}
+
+fn pending_device_credential_from_preparation(
+    api_base_url: &str,
+    prepared: &DeviceCredentialPreparationApiResponse,
+    confirmation_authorized: bool,
+    claim_commit: Option<PendingClaimCredentialCommit>,
+    request_authority: PendingDeviceCredentialRequestAuthority,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    Ok(PendingDeviceCredentialPreparation {
+        schema_version: PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION,
+        capability: prepared.capability.clone(),
+        preparation_id: prepared.preparation_id.clone(),
+        api_base_url: validated_api_base_url(Some(api_base_url))?,
+        expires_at: prepared.expires_at.clone(),
+        credential_generation: prepared.credential_generation,
+        secret_commitment_sha256: secret_sha256(&prepared.candidate_secret),
+        request_authority: Some(request_authority),
+        device: LocalDeviceBinding {
+            device_id: prepared.device.id.clone(),
+            machine_id: prepared.device.machine_id.clone(),
+            sources: prepared.device.sources.clone(),
+        },
+        confirmation_authorized,
+        preconfirm_guards_passed: false,
+        claim_commit,
+        confirmed_at: None,
+    })
+}
+
+fn authorize_pending_device_credential_confirmation(
+    preparation_id: &str,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    let store = FilePendingDeviceCredentialStore::default();
+    let mut pending = store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if pending.preparation_id != preparation_id {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    if pending.confirmation_authorized {
+        return Ok(pending);
+    }
+    pending.confirmation_authorized = true;
+    store
+        .save(&pending)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&pending)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(pending)
+}
+
+fn mark_pending_device_credential_guards_passed(
+    pending: &PendingDeviceCredentialPreparation,
+    pending_store: &FilePendingDeviceCredentialStore,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    if pending.confirmed_at.is_some() {
+        return if pending.confirmation_authorized && pending.preconfirm_guards_passed {
+            Ok(pending.clone())
+        } else {
+            Err(LocalApiError::StatePoisoned)
+        };
+    }
+    if !pending.confirmation_authorized {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let current = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if current != *pending {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let mut guarded = pending.clone();
+    guarded.preconfirm_guards_passed = true;
+    pending_store
+        .save(&guarded)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&guarded)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(guarded)
+}
+
+fn stage_pending_device_credential(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    stage_pending_device_credential_with_stores(
+        pending,
+        candidate_secret,
+        &FilePendingDeviceCredentialStore::default(),
+        &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
+}
+
+fn stage_pending_device_credential_with_stores(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.preparation_id.trim().is_empty()
+        || pending.credential_generation == 0
+        || validate_pending_prior_credential_binding(pending).is_err()
+        || validate_pending_candidate_secret(pending, candidate_secret).is_err()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let existing = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let effective_pending = if let Some(current) = existing.as_ref() {
+        // An idempotent server retry must reproduce the entire immutable
+        // preparation and candidate. Never replace a same-ID candidate or
+        // mutate its account commit merely because the identifier matches.
+        let mut immutable = current.clone();
+        immutable.confirmation_authorized = pending.confirmation_authorized;
+        immutable.preconfirm_guards_passed = pending.preconfirm_guards_passed;
+        immutable.confirmed_at = pending.confirmed_at.clone();
+        if immutable != *pending {
+            return Err(LocalApiError::IdentityMutationInProgress);
+        }
+        match pending_secret_store.load() {
+            Ok(stored) if stored == candidate_secret => return Ok(()),
+            Ok(_) => return Err(LocalApiError::StatePoisoned),
+            Err(TokenStoreError::Missing) => {}
+            Err(_) => return Err(LocalApiError::StatePoisoned),
+        }
+        current
+    } else {
+        pending
+    };
+
+    pending_secret_store
+        .save(candidate_secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store.save(effective_pending).is_err() {
+        // A newly written orphan candidate is not active authority. Remove it
+        // when possible; if deletion itself fails, the active credential and
+        // device binding are still unchanged and usable.
+        if existing.is_none() {
+            let _ = pending_secret_store.delete();
+        }
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let stored_secret = pending_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let stored_pending = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if stored_secret != candidate_secret || stored_pending.as_ref() != Some(effective_pending) {
+        return Err(LocalApiError::StatePoisoned);
+    }
     Ok(())
+}
+
+fn stage_pending_setup_run_token(
+    pending: &PendingDeviceCredentialPreparation,
+    setup_run_token: &str,
+) -> Result<(), LocalApiError> {
+    let store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+    stage_pending_setup_run_token_with_store(pending, setup_run_token, &store)
+}
+
+fn stage_pending_setup_run_token_with_store<S: ControlTokenStore + ?Sized>(
+    pending: &PendingDeviceCredentialPreparation,
+    setup_run_token: &str,
+    store: &S,
+) -> Result<(), LocalApiError> {
+    let claim = pending
+        .claim_commit
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if setup_run_token.trim().is_empty()
+        || claim.setup_run_token_sha256 != secret_sha256(setup_run_token)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    match store.load() {
+        Ok(current) if current == setup_run_token => return Ok(()),
+        // A different value cannot belong to this hash-bound journal. It is
+        // an inert orphan from a cut before the journal write and is safe to
+        // replace with the exact server-reproduced token.
+        // The same recovery is safe when the old value cannot be read (for
+        // example, while macOS is re-resolving a replaced login Keychain):
+        // the exact journal-bound value is written and then read back before
+        // this function succeeds.
+        Ok(_) | Err(_) => {}
+    }
+    store
+        .save(setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if store.load().map_err(|_| LocalApiError::StatePoisoned)? != setup_run_token {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn secret_sha256(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn constant_work_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn validate_pending_candidate_secret(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    let candidate_commitment = secret_sha256(candidate_secret);
+    if candidate_secret.trim().is_empty()
+        || !valid_secret_commitment(&pending.secret_commitment_sha256)
+        || !constant_work_eq(
+            pending.secret_commitment_sha256.as_bytes(),
+            candidate_commitment.as_bytes(),
+        )
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn valid_secret_commitment(commitment: &str) -> bool {
+    commitment.len() == 71
+        && commitment.starts_with("sha256:")
+        && commitment[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_pending_prior_credential_binding(
+    pending: &PendingDeviceCredentialPreparation,
+) -> Result<(), LocalApiError> {
+    let Some(authority) = pending.request_authority.as_ref() else {
+        // Additive compatibility for a v2 journal created by an older binary.
+        return Ok(());
+    };
+    if !matches!(authority.flow.as_str(), "register" | "setup_claim")
+        || !valid_secret_commitment(&authority.credential_preparation_idempotency_key)
+        || authority.machine_id.trim().is_empty()
+        || authority.installation_id.trim().is_empty()
+        || authority
+            .identity_continuity_capability
+            .as_deref()
+            .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    match (
+        authority.prior_device_id.as_deref(),
+        authority.prior_device_sources.as_deref(),
+        authority.prior_secret_commitment_sha256.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(device_id), Some(sources), Some(commitment))
+            if !device_id.trim().is_empty()
+                && !sources.is_empty()
+                && authority.identity_continuity_capability.as_deref()
+                    == Some(IDENTITY_CONTINUITY_CAPABILITY)
+                && valid_secret_commitment(commitment) =>
+        {
+            Ok(())
+        }
+        _ => Err(LocalApiError::StatePoisoned),
+    }
+}
+
+fn mark_pending_device_credential_confirmed(
+    pending: &PendingDeviceCredentialPreparation,
+    confirmed_at: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    if !pending.confirmation_authorized || !pending.preconfirm_guards_passed {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let current = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if current != *pending {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let mut confirmed = pending.clone();
+    confirmed.confirmed_at = Some(confirmed_at.to_string());
+    pending_store
+        .save(&confirmed)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+        .as_ref()
+        != Some(&confirmed)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(confirmed)
+}
+
+fn write_and_verify_active_device_credential(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    device_store: &FileDeviceStore,
+    active_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    if pending.confirmed_at.is_none()
+        || !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let expected_binding = LocalDeviceCredentialBinding {
+        device: pending.device.clone(),
+        credential_generation: pending.credential_generation,
+    };
+
+    active_secret_store
+        .save(candidate_secret)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    device_store
+        .save_with_credential_generation(&expected_binding)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+
+    let active_secret = active_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_binding = device_store
+        .load_with_credential_generation()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if active_secret != candidate_secret || active_binding.as_ref() != Some(&expected_binding) {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn clear_pending_device_credential(
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    pending_store
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let _ = pending_secret_store.delete();
+    let _ = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).delete();
+    Ok(())
+}
+
+fn promote_pending_device_credential_with_stores(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+    device_store: &FileDeviceStore,
+    active_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    // After server confirmation the old active secret may already be invalid.
+    // Never roll it back on a file-side failure: keep the separately staged
+    // candidate intact so restart recovery can finish the same generation.
+    write_and_verify_active_device_credential(
+        pending,
+        candidate_secret,
+        device_store,
+        active_secret_store,
+    )?;
+
+    // Delete metadata first. A crash between these operations leaves only an
+    // inert orphan Keychain entry while the verified active pair keeps working.
+    clear_pending_device_credential(pending_store, pending_secret_store)
+}
+
+fn backend_error_has_status(error: &LocalApiError, status: u16) -> bool {
+    matches!(error, LocalApiError::Backend(details) if details.status == Some(status))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrunedDeviceCredentialProbe {
+    Confirmed,
+    Inactive,
+}
+
+fn pending_device_credential_is_past_expiry(pending: &PendingDeviceCredentialPreparation) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(&pending.expires_at, &Rfc3339)
+        .is_ok_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+}
+
+fn probe_pruned_device_credential_authority(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<PrunedDeviceCredentialProbe, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/devices/{}/relay-token",
+            pending.device.device_id
+        ),
+    );
+    let source = pending
+        .device
+        .sources
+        .first()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let body = relay_token_request_payload(&pending.device, source);
+    match backend_post_json::<serde_json::Value>(
+        &url,
+        &body,
+        &[("X-Ottto-Device-Secret", candidate_secret)],
+    ) {
+        Ok(_) => Ok(PrunedDeviceCredentialProbe::Confirmed),
+        Err(error)
+            if matches!(
+                &error,
+                LocalApiError::Backend(details) if details.status == Some(401)
+            ) && pending_device_credential_is_past_expiry(pending) =>
+        {
+            Ok(PrunedDeviceCredentialProbe::Inactive)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn discard_server_inactive_pending_device_credential(
+    pending_store: &FilePendingDeviceCredentialStore,
+    pending_secret_store: &impl ControlTokenStore,
+) -> Result<(), LocalApiError> {
+    clear_pending_device_credential(pending_store, pending_secret_store)
+}
+
+fn write_and_verify_pending_claim_commit(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<(), LocalApiError> {
+    let claim = pending
+        .claim_commit
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if pending.confirmed_at.is_none()
+        || !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+        || claim.target_user_id.trim().is_empty()
+        || claim.connection.setup_run_id.trim().is_empty()
+        || claim
+            .connection
+            .claim_code
+            .as_deref()
+            .map_or(true, str::is_empty)
+        || claim
+            .account
+            .user
+            .as_ref()
+            .map_or(true, |user| user.id != claim.target_user_id)
+        || validated_api_base_url(Some(&claim.connection.api_base_url))?
+            != claim.connection.api_base_url
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let pending_setup_token_store = KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT);
+    let setup_run_token = pending_setup_token_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if claim.setup_run_token_sha256 != secret_sha256(&setup_run_token) {
+        return Err(LocalApiError::StatePoisoned);
+    }
+
+    // The attribution boundary must become durable before any credential or
+    // account binding from the new claim. This operation is idempotent.
+    persist_claim_backfill_policy(
+        claim.backfill_policy.as_deref(),
+        claim.backfill_cutoff_at.as_deref(),
+        &claim.target_user_id,
+    )?;
+    write_and_verify_active_device_credential(
+        pending,
+        candidate_secret,
+        &FileDeviceStore::default(),
+        &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+    )?;
+    KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .save(&setup_run_token)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileAccountStore::default()
+        .save(&claim.account)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    FileConnectionStore::default()
+        .save(&claim.connection)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+
+    let active_setup_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_account = FileAccountStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let active_connection = FileConnectionStore::default()
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if active_setup_token != setup_run_token
+        || active_account != claim.account
+        || active_connection.as_ref() != Some(&claim.connection)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+/// Resume an exact prepared generation before relays start. Local wall-clock
+/// expiry never deletes a pending candidate: only a definitive server 410 can
+/// prove an unconfirmed preparation is safe to discard.
+pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiError> {
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let pending_secret_store = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
+    let Some(pending) = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(false);
+    };
+    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+        || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || pending.preparation_id.trim().is_empty()
+        || pending.credential_generation == 0
+        || validate_pending_prior_credential_binding(&pending).is_err()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let candidate_secret = pending_secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    validate_pending_candidate_secret(&pending, &candidate_secret)?;
+    if pending.confirmed_at.is_none() && !pending.confirmation_authorized {
+        return match inspect_device_credential_preparation(&pending, &candidate_secret) {
+            Ok(status) if status.status == "pending" => Ok(false),
+            Ok(status) if matches!(status.status.as_str(), "expired" | "superseded") => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                Ok(false)
+            }
+            // A server-confirmed switch that was never locally authorized is
+            // an invariant violation. Retain both halves for operator recovery;
+            // never silently install or discard it.
+            Ok(_) => Err(LocalApiError::StatePoisoned),
+            Err(error) if backend_error_has_status(&error, 410) => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                Ok(false)
+            }
+            Err(error) if backend_error_has_status(&error, 404) => {
+                match probe_pruned_device_credential_authority(&pending, &candidate_secret)? {
+                    PrunedDeviceCredentialProbe::Confirmed => Err(LocalApiError::StatePoisoned),
+                    PrunedDeviceCredentialProbe::Inactive => {
+                        discard_server_inactive_pending_device_credential(
+                            &pending_store,
+                            &pending_secret_store,
+                        )?;
+                        Ok(false)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+    }
+    if pending.confirmed_at.is_some()
+        && (!pending.confirmation_authorized || !pending.preconfirm_guards_passed)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let identity_reservation = reserve_identity_mutation(false)?;
+    // A persisted guard bit records the prior process's cut, but it is never
+    // authority to confirm. Re-run cleanup under a fresh reservation at the
+    // last possible point before confirm/promotion.
+    let pending = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        require_cloud_session_cleanup_before_identity_change_without_pause(
+            &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        if pending.confirmed_at.is_none() {
+            mark_pending_device_credential_guards_passed(&pending, &pending_store)?
+        } else {
+            pending
+        }
+    };
+    let confirmed = if pending.confirmed_at.is_some() {
+        pending
+    } else {
+        match confirm_device_credential_preparation(&pending, &candidate_secret) {
+            Ok(receipt) => mark_pending_device_credential_confirmed(
+                &pending,
+                &receipt.confirmed_at,
+                &pending_store,
+            )?,
+            Err(error) if backend_error_has_status(&error, 410) => {
+                discard_server_inactive_pending_device_credential(
+                    &pending_store,
+                    &pending_secret_store,
+                )?;
+                return Ok(false);
+            }
+            Err(error) if backend_error_has_status(&error, 404) => {
+                match probe_pruned_device_credential_authority(&pending, &candidate_secret)? {
+                    PrunedDeviceCredentialProbe::Confirmed => {
+                        mark_pending_device_credential_confirmed(
+                            &pending,
+                            &current_rfc3339_timestamp(),
+                            &pending_store,
+                        )?
+                    }
+                    PrunedDeviceCredentialProbe::Inactive => {
+                        discard_server_inactive_pending_device_credential(
+                            &pending_store,
+                            &pending_secret_store,
+                        )?;
+                        return Ok(false);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let _identity_lifecycle_lock = lock_setup_run_binding();
+    identity_reservation.validate_locked()?;
+    require_cloud_session_cleanup_before_identity_change_without_pause(
+        &crate::cloud_sessions::CloudSessionGrantStore::default(),
+    )?;
+    if confirmed.claim_commit.is_some() {
+        write_and_verify_pending_claim_commit(&confirmed, &candidate_secret)?;
+        clear_pending_device_credential(&pending_store, &pending_secret_store)?;
+    } else {
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate_secret,
+            &pending_store,
+            &pending_secret_store,
+            &FileDeviceStore::default(),
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        )?;
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -3103,6 +4082,7 @@ fn save_relay_device_binding(device: &LocalDeviceBinding) -> Result<(), LocalApi
     save_relay_device_binding_locked(device, None)
 }
 
+#[cfg(test)]
 fn save_relay_device_binding_locked(
     device: &LocalDeviceBinding,
     reservation: Option<&IdentityMutationReservation>,
@@ -3110,6 +4090,14 @@ fn save_relay_device_binding_locked(
     require_identity_mutation_reservation(reservation)?;
     let store = FileDeviceStore::default();
     let current = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    require_relay_device_binding_change_cleanup(current.as_ref(), device)?;
+    store.save(device).map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn require_relay_device_binding_change_cleanup(
+    current: Option<&LocalDeviceBinding>,
+    device: &LocalDeviceBinding,
+) -> Result<(), LocalApiError> {
     let changes_cleanup_authority = match current.as_ref() {
         Some(existing) => {
             existing.device_id != device.device_id
@@ -3123,7 +4111,7 @@ fn save_relay_device_binding_locked(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
     }
-    store.save(device).map_err(|_| LocalApiError::StatePoisoned)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3192,6 +4180,10 @@ fn auth_reset(
         identity_reservation.validate_locked()?;
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
+        )?;
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
         )?;
         reset_local_account_files_locked(Some(&identity_reservation))?;
     }
@@ -3318,6 +4310,8 @@ struct SetupClaimCompleteResponse {
     machine_id: Option<String>,
     relay_device: Option<SetupClaimCompleteRelayDevice>,
     relay_device_secret: Option<String>,
+    #[serde(default)]
+    relay_device_credential_preparation: Option<DeviceCredentialPreparationApiResponse>,
     connected_at: String,
     user: SetupClaimCompleteUser,
     organization: SetupClaimCompleteOrganization,
@@ -3328,6 +4322,15 @@ struct SetupClaimCompleteResponse {
     /// Server-UTC takeover moment accompanying `backfill_policy: "from"`.
     #[serde(default)]
     backfill_cutoff_at: Option<String>,
+}
+
+/// Claim completion plus the exact prior authority snapshot used to authorize
+/// it. Deliberately has no `Debug` implementation because it owns a Keychain
+/// secret until the non-secret recovery journal is staged.
+struct SetupClaimCompletion {
+    response: SetupClaimCompleteResponse,
+    prior_device_credential: Option<PriorDeviceCredential>,
+    request_authority: PendingDeviceCredentialRequestAuthority,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3384,26 +4387,86 @@ fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json
 fn complete_setup_claim(
     claim: &PendingAuthClaim,
     machine: &MachineIdentity,
-) -> Result<SetupClaimCompleteResponse, LocalApiError> {
+    identity_reservation: Option<&IdentityMutationReservation>,
+) -> Result<SetupClaimCompletion, LocalApiError> {
     let url = api_url(&format!(
         "/api/v1/setup-claims/{}/local-client/complete",
         claim.claim_code
     ));
+    // Snapshot established file + Keychain authority under the identity
+    // lifecycle fence. Network I/O runs without the mutex, while the
+    // reservation prevents legitimate local writers from rotating authority.
+    let prior_device_credential = {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        match identity_reservation {
+            Some(reservation) => reservation.validate_locked()?,
+            None => require_identity_mutation_reservation(None)?,
+        }
+        prior_device_credential_for_registration()?
+    };
+    let request_authority = device_credential_request_authority(
+        "setup_claim",
+        &claim.claim_code,
+        machine,
+        prior_device_credential.as_ref(),
+        prior_device_credential
+            .as_ref()
+            .map(|_| IDENTITY_CONTINUITY_CAPABILITY),
+    );
     let mut body = setup_claim_complete_body(claim, machine);
-    if let Some(device) = FileDeviceStore::default()
-        .load()
-        .map_err(|_| LocalApiError::StatePoisoned)?
-    {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "credential_preparation_capability".to_string(),
+            json!(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY),
+        );
+        object.insert(
+            "credential_preparation_idempotency_key".to_string(),
+            json!(request_authority
+                .credential_preparation_idempotency_key
+                .clone()),
+        );
+    }
+    if let Some(prior) = prior_device_credential.as_ref() {
         if let Some(object) = body.as_object_mut() {
-            object.insert("relay_device_id".to_string(), json!(device.device_id));
-            object.insert("relay_device_sources".to_string(), json!(device.sources));
+            object.insert(
+                "identity_continuity_capability".to_string(),
+                json!(IDENTITY_CONTINUITY_CAPABILITY),
+            );
+            object.insert("relay_device_id".to_string(), json!(prior.device_id));
+            object.insert(
+                "relay_device_sources".to_string(),
+                json!(prior.device_sources),
+            );
+            object.insert(
+                "prior_device_secret".to_string(),
+                json!(prior.device_secret),
+            );
         }
     }
-    backend_post_json(
+    let response = backend_post_json(
         &url,
         &body,
         &[("X-Ottto-Setup-Claim-Token", claim.claim_token.as_str())],
-    )
+    )?;
+    // Revalidate immediately after the remote preparation and before any
+    // journal write. This catches out-of-band Keychain mutation in addition
+    // to file/account mutations fenced by the reservation snapshot.
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        match identity_reservation {
+            Some(reservation) => reservation.validate_locked()?,
+            None => require_identity_mutation_reservation(None)?,
+        }
+        let current = prior_device_credential_for_registration()?;
+        if !same_prior_device_authority(prior_device_credential.as_ref(), current.as_ref()) {
+            return Err(LocalApiError::StatePoisoned);
+        }
+    }
+    Ok(SetupClaimCompletion {
+        response,
+        prior_device_credential,
+        request_authority,
+    })
 }
 
 fn setup_claim_complete_body(
@@ -4690,6 +5753,8 @@ fn refresh_setup_run_token_via_device_secret(
     // touching the device secret. Fail closed: both callers map an `Err` to a
     // reconnect/backend error, so an untrusted base never releases the secret.
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
+        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()
         .load()
         .map_err(|_| LocalApiError::StatePoisoned)?
@@ -4745,6 +5810,8 @@ fn setup_run_token_for_connection(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<SetupRunCredentials, LocalApiError> {
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
+        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     match KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT).load() {
         Ok(token) => Ok(SetupRunCredentials {
             setup_run_token: token,
@@ -5511,35 +6578,56 @@ fn run_install_source_action(
             device_id: None,
         },
     )?;
-    // Device registration can rotate/revoke backend device credentials. Hold
-    // a panic-safe reservation across that remote side effect and the exact
-    // local identity install, while leaving the lifecycle mutex free during
-    // network I/O.
+    // Resolve any previously confirmed-but-not-promoted generation before
+    // beginning another identity mutation. Uncertain pending state fails
+    // closed; it is never overwritten by a modern-to-legacy fallback.
+    recover_pending_device_credential_at_startup()?;
+    // Preparation is server-side non-authoritative. Hold a panic-safe local
+    // reservation across prepare, local durable staging, confirm, and exact
+    // promotion while leaving the lifecycle mutex free during network I/O.
     let identity_reservation = reserve_identity_mutation(true)?;
-    let registered = register_telemetry_device(api_base_url, &install_session, machine)?;
-    let device_id = registered.device.id.clone();
-    let device = LocalDeviceBinding {
-        device_id: registered.device.id.clone(),
-        machine_id: registered
-            .device
-            .machine_id
-            .clone()
-            .or_else(|| credentials.connection.machine_id.clone())
-            .or_else(|| Some(machine.machine_id.clone())),
-        sources: registered.device.sources.clone(),
-    };
+    let (prepared, _prior, request_authority) =
+        prepare_telemetry_device_registration(api_base_url, &install_session, machine)?;
+    let pending = pending_device_credential_from_preparation(
+        api_base_url,
+        &prepared,
+        true,
+        None,
+        request_authority,
+    )?;
+    stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
     {
         let _identity_lifecycle_lock = lock_setup_run_binding();
         identity_reservation.validate_locked()?;
         require_cloud_session_cleanup_before_identity_change_without_pause(
             &crate::cloud_sessions::CloudSessionGrantStore::default(),
         )?;
-        persist_relay_device_credentials_locked(
-            &device,
-            &registered.device_secret,
-            Some(&identity_reservation),
+    }
+    let pending = mark_pending_device_credential_guards_passed(
+        &pending,
+        &FilePendingDeviceCredentialStore::default(),
+    )?;
+    let confirmed = confirm_device_credential_preparation(&pending, &prepared.candidate_secret)?;
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let pending = mark_pending_device_credential_confirmed(
+        &pending,
+        &confirmed.confirmed_at,
+        &pending_store,
+    )?;
+    {
+        let _identity_lifecycle_lock = lock_setup_run_binding();
+        identity_reservation.validate_locked()?;
+        promote_pending_device_credential_with_stores(
+            &pending,
+            &prepared.candidate_secret,
+            &pending_store,
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+            &FileDeviceStore::default(),
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
         )?;
     }
+    let device = pending.device;
+    let device_id = device.device_id.clone();
     drop(identity_reservation);
     // The local device binding + secret are now durable. Wake the snapshot
     // collector before any backend completion/event call that can transiently
@@ -6277,13 +7365,83 @@ struct InstallSessionApiResponse {
     install_session_token: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+#[derive(Deserialize)]
 struct TelemetryDeviceRegisterApiResponse {
     device: TelemetryDeviceApiResponse,
     device_secret: String,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    #[serde(default)]
+    credential_rotation_performed: Option<bool>,
+    #[serde(default)]
+    rotated_prior_device_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
+struct DeviceCredentialPreparationApiResponse {
+    preparation_id: String,
+    capability: String,
+    expires_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    candidate_secret: String,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    credential_rotation_planned: bool,
+    #[serde(default)]
+    prior_device_id: Option<String>,
+}
+
+impl std::fmt::Debug for DeviceCredentialPreparationApiResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceCredentialPreparationApiResponse")
+            .field("preparation_id", &"[redacted]")
+            .field("capability", &self.capability)
+            .field("expires_at", &self.expires_at)
+            .field("credential_generation", &self.credential_generation)
+            .field("device", &"[redacted]")
+            .field("candidate_secret", &"[redacted]")
+            .field(
+                "identity_continuity_capability",
+                &self.identity_continuity_capability,
+            )
+            .field(
+                "credential_rotation_planned",
+                &self.credential_rotation_planned,
+            )
+            .field("prior_device_id", &self.prior_device_id)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct DeviceCredentialConfirmationApiResponse {
+    preparation_id: String,
+    status: String,
+    confirmed_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    #[serde(default)]
+    identity_continuity_capability: Option<String>,
+    credential_rotation_performed: bool,
+    #[serde(default)]
+    rotated_prior_device_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceCredentialPreparationStatusApiResponse {
+    preparation_id: String,
+    status: String,
+    expires_at: String,
+    credential_generation: u64,
+    device: TelemetryDeviceApiResponse,
+    #[serde(default)]
+    confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TelemetryDeviceApiResponse {
     id: String,
     machine_id: Option<String>,
@@ -6299,21 +7457,406 @@ struct InstallSessionEvent<'a> {
     device_id: Option<&'a str>,
 }
 
-fn register_telemetry_device(
+#[allow(dead_code)]
+fn register_telemetry_device_legacy(
     api_base_url: &str,
     install_session: &InstallSessionApiResponse,
     machine: &MachineIdentity,
 ) -> Result<TelemetryDeviceRegisterApiResponse, LocalApiError> {
     let url = api_url_with_base(api_base_url, "/api/v1/telemetry/devices/register");
-    let body = telemetry_device_register_body(install_session, machine);
-    backend_post_json(&url, &body, &[])
+    let prior = prior_device_credential_for_registration()?;
+    let body = telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
+    let registered = backend_post_json(&url, &body, &[])?;
+    validate_registration_continuity_response(&url, &registered, prior.as_ref())?;
+    Ok(registered)
 }
 
+fn prepare_telemetry_device_registration(
+    api_base_url: &str,
+    install_session: &InstallSessionApiResponse,
+    machine: &MachineIdentity,
+) -> Result<
+    (
+        DeviceCredentialPreparationApiResponse,
+        Option<PriorDeviceCredential>,
+        PendingDeviceCredentialRequestAuthority,
+    ),
+    LocalApiError,
+> {
+    let url = api_url_with_base(
+        api_base_url,
+        "/api/v1/telemetry/devices/registration-preparations",
+    );
+    let prior = prior_device_credential_for_registration()?;
+    let request_authority = device_credential_request_authority(
+        "register",
+        &install_session.install_session_id,
+        machine,
+        prior.as_ref(),
+        Some(IDENTITY_CONTINUITY_CAPABILITY),
+    );
+    let mut body =
+        telemetry_device_register_body_with_prior(install_session, machine, prior.as_ref());
+    body["credential_preparation_capability"] = json!(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY);
+    body["credential_preparation_idempotency_key"] = json!(request_authority
+        .credential_preparation_idempotency_key
+        .clone());
+    let prepared = backend_post_json(&url, &body, &[])?;
+    validate_device_credential_preparation(&url, &prepared, prior.as_ref())?;
+    Ok((prepared, prior, request_authority))
+}
+
+fn confirm_device_credential_preparation(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<DeviceCredentialConfirmationApiResponse, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    if !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+        || pending.confirmed_at.is_some()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    // The pending file is local state, not authority. Revalidate its base
+    // before releasing the candidate secret in a request header.
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/device-credential-preparations/{}/confirm",
+            pending.preparation_id
+        ),
+    );
+    let body = json!({
+        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+        "credential_generation": pending.credential_generation,
+    });
+    let confirmed = backend_post_json(
+        &url,
+        &body,
+        &[(
+            DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER,
+            candidate_secret,
+        )],
+    )?;
+    validate_device_credential_confirmation(&url, pending, &confirmed)?;
+    Ok(confirmed)
+}
+
+fn inspect_device_credential_preparation(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate_secret: &str,
+) -> Result<DeviceCredentialPreparationStatusApiResponse, LocalApiError> {
+    validate_pending_candidate_secret(pending, candidate_secret)?;
+    let api_base_url = validated_api_base_url(Some(&pending.api_base_url))?;
+    let url = api_url_with_base(
+        &api_base_url,
+        &format!(
+            "/api/v1/telemetry/device-credential-preparations/{}",
+            pending.preparation_id
+        ),
+    );
+    let status = backend_get_json(
+        &url,
+        &[(
+            DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER,
+            candidate_secret,
+        )],
+    )?;
+    validate_device_credential_status(&url, pending, &status)?;
+    Ok(status)
+}
+
+fn device_credential_preparation_idempotency_key(
+    flow: &str,
+    operation_id: &str,
+    installation_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+        flow,
+        operation_id,
+        installation_id,
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn device_credential_request_authority(
+    flow: &str,
+    operation_id: &str,
+    machine: &MachineIdentity,
+    prior: Option<&PriorDeviceCredential>,
+    identity_continuity_capability: Option<&str>,
+) -> PendingDeviceCredentialRequestAuthority {
+    PendingDeviceCredentialRequestAuthority {
+        flow: flow.to_string(),
+        credential_preparation_idempotency_key: device_credential_preparation_idempotency_key(
+            flow,
+            operation_id,
+            &machine.installation_id,
+        ),
+        machine_id: machine.machine_id.clone(),
+        installation_id: machine.installation_id.clone(),
+        hardware_uuid: machine.hardware_uuid.clone(),
+        account_scope: machine.account_scope.clone(),
+        identity_continuity_capability: identity_continuity_capability.map(str::to_string),
+        prior_device_id: prior.map(|value| value.device_id.clone()),
+        prior_device_sources: prior.map(|value| value.device_sources.clone()),
+        prior_secret_commitment_sha256: prior.map(|value| secret_sha256(&value.device_secret)),
+    }
+}
+
+fn same_prior_device_authority(
+    expected: Option<&PriorDeviceCredential>,
+    actual: Option<&PriorDeviceCredential>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            let expected_secret_commitment = secret_sha256(&expected.device_secret);
+            let actual_secret_commitment = secret_sha256(&actual.device_secret);
+            expected.device_id == actual.device_id
+                && expected.device_sources == actual.device_sources
+                && constant_work_eq(
+                    expected_secret_commitment.as_bytes(),
+                    actual_secret_commitment.as_bytes(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// The operation id is server-issued and survives a daemon crash. Retrying the
+/// same install session or claim therefore reuses one idempotency key. An
+/// expired attempt obtains a new boundary only by obtaining a new server
+/// install session or setup claim; the daemon never spins on a locally minted
+/// replacement key after a definitive 410.
+fn validate_device_credential_preparation(
+    url: &str,
+    prepared: &DeviceCredentialPreparationApiResponse,
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<(), LocalApiError> {
+    if prepared.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        || prepared.preparation_id.trim().is_empty()
+        || prepared.expires_at.trim().is_empty()
+        || prepared.credential_generation == 0
+        || prepared.device.id.trim().is_empty()
+        || prepared.device.sources.is_empty()
+        || prepared.candidate_secret.trim().is_empty()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an incomplete credential preparation".to_string(),
+        ));
+    }
+    if prepared
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an unsupported identity continuity capability"
+                .to_string(),
+        ));
+    }
+    match prior {
+        Some(prior)
+            if !prepared.credential_rotation_planned
+                || prepared.identity_continuity_capability.as_deref()
+                    != Some(IDENTITY_CONTINUITY_CAPABILITY)
+                || prepared.prior_device_id.as_deref() != Some(prior.device_id.as_str()) =>
+        {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned inconsistent credential rotation preparation"
+                    .to_string(),
+            ))
+        }
+        None if prepared.credential_rotation_planned || prepared.prior_device_id.is_some() => {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration planned a prior-device rotation without prior authority"
+                    .to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_device_credential_confirmation(
+    url: &str,
+    pending: &PendingDeviceCredentialPreparation,
+    confirmed: &DeviceCredentialConfirmationApiResponse,
+) -> Result<(), LocalApiError> {
+    if confirmed.preparation_id != pending.preparation_id
+        || confirmed.status != "confirmed"
+        || confirmed.confirmed_at.trim().is_empty()
+        || confirmed.credential_generation != pending.credential_generation
+        || confirmed.device.id != pending.device.device_id
+        || confirmed.device.machine_id != pending.device.machine_id
+        || confirmed.device.sources != pending.device.sources
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential confirmation did not match the staged preparation".to_string(),
+        ));
+    }
+    if confirmed
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+        || confirmed.credential_rotation_performed != confirmed.rotated_prior_device_id.is_some()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential confirmation returned inconsistent rotation proof".to_string(),
+        ));
+    }
+    if let Some(prior_device_id) = pending
+        .request_authority
+        .as_ref()
+        .and_then(|authority| authority.prior_device_id.as_deref())
+    {
+        if confirmed.identity_continuity_capability.as_deref()
+            != Some(IDENTITY_CONTINUITY_CAPABILITY)
+            || !confirmed.credential_rotation_performed
+            || confirmed.rotated_prior_device_id.as_deref() != Some(prior_device_id)
+        {
+            return Err(backend_response_unexpected(
+                url,
+                "credential confirmation did not match the journaled prior authority".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_device_credential_status(
+    url: &str,
+    pending: &PendingDeviceCredentialPreparation,
+    status: &DeviceCredentialPreparationStatusApiResponse,
+) -> Result<(), LocalApiError> {
+    if status.preparation_id != pending.preparation_id
+        || status.expires_at != pending.expires_at
+        || status.credential_generation != pending.credential_generation
+        || status.device.id != pending.device.device_id
+        || status.device.machine_id != pending.device.machine_id
+        || status.device.sources != pending.device.sources
+        || !matches!(
+            status.status.as_str(),
+            "pending" | "confirmed" | "expired" | "superseded"
+        )
+        || (status.status == "confirmed") != status.confirmed_at.is_some()
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "credential preparation status did not match the staged generation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration_continuity_response(
+    url: &str,
+    registered: &TelemetryDeviceRegisterApiResponse,
+    prior: Option<&PriorDeviceCredential>,
+) -> Result<(), LocalApiError> {
+    if registered
+        .identity_continuity_capability
+        .as_deref()
+        .is_some_and(|value| value != IDENTITY_CONTINUITY_CAPABILITY)
+    {
+        return Err(backend_response_unexpected(
+            url,
+            "telemetry registration returned an unsupported identity continuity capability"
+                .to_string(),
+        ));
+    }
+    match registered.credential_rotation_performed {
+        Some(true)
+            if registered.identity_continuity_capability.as_deref()
+                != Some(IDENTITY_CONTINUITY_CAPABILITY)
+                || prior.is_none()
+                || registered.rotated_prior_device_id.as_deref()
+                    != prior.map(|value| value.device_id.as_str()) =>
+        {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned inconsistent credential rotation proof"
+                    .to_string(),
+            ))
+        }
+        Some(false) | None if registered.rotated_prior_device_id.is_some() => {
+            Err(backend_response_unexpected(
+                url,
+                "telemetry registration returned a prior device without rotation".to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
+
+struct PriorDeviceCredential {
+    device_id: String,
+    device_sources: Vec<String>,
+    device_secret: String,
+}
+
+fn prior_device_credential_for_registration() -> Result<Option<PriorDeviceCredential>, LocalApiError>
+{
+    prior_device_credential_with_stores(
+        &FileDeviceStore::default(),
+        &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+    )
+}
+
+fn prior_device_credential_with_stores(
+    device_store: &FileDeviceStore,
+    secret_store: &impl ControlTokenStore,
+) -> Result<Option<PriorDeviceCredential>, LocalApiError> {
+    let Some(device) = device_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(None);
+    };
+    let device_secret = secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if device.device_id.trim().is_empty()
+        || device.sources.is_empty()
+        || device_secret.trim().is_empty()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(Some(PriorDeviceCredential {
+        device_id: device.device_id,
+        device_sources: device.sources,
+        device_secret,
+    }))
+}
+
+#[cfg(test)]
 fn telemetry_device_register_body(
     install_session: &InstallSessionApiResponse,
     machine: &MachineIdentity,
 ) -> serde_json::Value {
-    json!({
+    telemetry_device_register_body_with_prior(install_session, machine, None)
+}
+
+fn telemetry_device_register_body_with_prior(
+    install_session: &InstallSessionApiResponse,
+    machine: &MachineIdentity,
+    prior: Option<&PriorDeviceCredential>,
+) -> serde_json::Value {
+    let mut body = json!({
         "install_session_id": install_session.install_session_id,
         "install_session_token": install_session.install_session_token,
         "machine_name": machine.display_name,
@@ -6324,7 +7867,13 @@ fn telemetry_device_register_body(
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
-    })
+        "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+    });
+    if let Some(prior) = prior {
+        body["prior_device_id"] = json!(prior.device_id);
+        body["prior_device_secret"] = json!(prior.device_secret);
+    }
+    body
 }
 
 fn record_install_session_event(
@@ -7599,54 +9148,207 @@ fn local_session_observed(before_session_count: Option<usize>) -> Option<bool> {
 }
 
 fn pi_session_file_count() -> usize {
-    pi_session_files().len()
+    pi_session_files().map_or(0, |files| files.len())
 }
 
-fn pi_session_files() -> BTreeSet<PathBuf> {
-    pi_session_files_in(&home_path(".pi/agent/sessions"))
+struct PiSessionCensus {
+    root: OpenPiSessionRoot,
+    files: BTreeSet<PathBuf>,
 }
 
-fn pi_session_files_in(root: &Path) -> BTreeSet<PathBuf> {
+#[derive(Clone, Copy)]
+struct PiSessionSafetyLimits {
+    max_depth: usize,
+    max_entries: usize,
+    max_files: usize,
+    max_file_bytes: u64,
+    max_aggregate_bytes: u64,
+    max_multipart_field_bytes: usize,
+    max_multipart_body_bytes: usize,
+}
+
+const PI_SESSION_SAFETY_LIMITS: PiSessionSafetyLimits = PiSessionSafetyLimits {
+    max_depth: PI_SESSION_MAX_DEPTH,
+    max_entries: PI_SESSION_MAX_ENTRIES,
+    max_files: PI_SESSION_MAX_FILES,
+    max_file_bytes: PI_SESSION_MAX_FILE_BYTES,
+    max_aggregate_bytes: PI_SESSION_MAX_AGGREGATE_BYTES,
+    max_multipart_field_bytes: PI_MULTIPART_MAX_FIELD_BYTES,
+    max_multipart_body_bytes: PI_MULTIPART_MAX_BODY_BYTES,
+};
+
+fn pi_session_files() -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    Ok(pi_session_census()?
+        .map(|census| census.files)
+        .unwrap_or_default())
+}
+
+fn pi_session_census() -> Result<Option<PiSessionCensus>, LocalApiError> {
+    let Some(root) = open_pi_session_root()? else {
+        return Ok(None);
+    };
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    Ok(Some(PiSessionCensus { root, files }))
+}
+
+fn prepare_pi_live_session_census() -> Result<PiSessionCensus, LocalApiError> {
+    let root = open_or_create_pi_session_root()?;
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    Ok(PiSessionCensus { root, files })
+}
+
+#[cfg(test)]
+fn pi_session_files_in(root: &Path) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    pi_session_files_in_with_limits(root, PI_SESSION_SAFETY_LIMITS)
+}
+
+#[cfg(test)]
+fn pi_session_files_in_with_limits(
+    root: &Path,
+    limits: PiSessionSafetyLimits,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    let Some(root) = open_pi_session_root_direct(root)? else {
+        return Ok(BTreeSet::new());
+    };
+    pi_session_files_for_root(&root, limits)
+}
+
+fn pi_session_files_for_root(
+    root: &OpenPiSessionRoot,
+    limits: PiSessionSafetyLimits,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    verify_pi_session_root_path_identity(root)?;
     let mut files = BTreeSet::new();
-    collect_pi_session_files(root, &mut files);
-    files
+    let mut entries_seen = 0;
+    collect_pi_session_files(&root.path, 0, &mut entries_seen, &mut files, limits)?;
+    verify_pi_session_root_path_identity(root)?;
+    validate_discovered_pi_session_files(root, files)
 }
 
-fn collect_pi_session_files(path: &Path, files: &mut BTreeSet<PathBuf>) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
+fn validate_discovered_pi_session_files(
+    root: &OpenPiSessionRoot,
+    files: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, LocalApiError> {
+    let mut validated = BTreeSet::new();
+    for path in files {
+        let file = open_pi_session_file_beneath_root(root, &path).map_err(|_| {
+            pi_session_import_refused("session tree changed during bounded discovery")
+        })?;
+        let metadata = file.metadata().map_err(|_| {
+            pi_session_import_refused("session tree changed during bounded discovery")
+        })?;
+        if !metadata.is_file() {
+            return Err(pi_session_import_refused(
+                "session tree changed during bounded discovery",
+            ));
+        }
+        validated.insert(path);
+    }
+    verify_pi_session_root_path_identity(root)?;
+    Ok(validated)
+}
+
+#[cfg(unix)]
+fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), LocalApiError> {
+    let opened = root
+        .directory
+        .metadata()
+        .map_err(|_| pi_session_import_refused("session root identity could not be verified"))?;
+    let current = fs::metadata(&root.path)
+        .map_err(|_| pi_session_import_refused("session root changed during bounded discovery"))?;
+    if !current.is_dir() || opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Err(pi_session_import_refused(
+            "session root changed during bounded discovery",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_pi_session_root_path_identity(root: &OpenPiSessionRoot) -> Result<(), LocalApiError> {
+    let _ = root;
+    require_pi_session_import_platform_support()
+}
+
+fn collect_pi_session_files(
+    path: &Path,
+    depth: usize,
+    entries_seen: &mut usize,
+    files: &mut BTreeSet<PathBuf>,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    if depth > limits.max_depth {
+        return Err(pi_session_import_refused(
+            "session traversal exceeded the maximum depth",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        pi_session_import_refused("session traversal could not inspect a directory entry")
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
     };
     if metadata.is_file() {
         if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+            if files.len() >= limits.max_files {
+                return Err(pi_session_import_refused(
+                    "session traversal exceeded the maximum file count",
+                ));
+            }
             files.insert(path.to_path_buf());
         }
-        return;
+        return Ok(());
     }
     if !metadata.is_dir() {
-        return;
+        return Ok(());
     }
-    let Ok(entries) = fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        collect_pi_session_files(&entry.path(), files);
+    let entries = fs::read_dir(path)
+        .map_err(|_| pi_session_import_refused("session traversal could not open a directory"))?;
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            pi_session_import_refused("session traversal could not read a directory entry")
+        })?;
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > limits.max_entries {
+            return Err(pi_session_import_refused(
+                "session traversal exceeded the maximum entry count",
+            ));
+        }
+        collect_pi_session_files(&entry.path(), depth + 1, entries_seen, files, limits)?;
     }
+    Ok(())
 }
 
 fn import_new_pi_route_sessions(
     api_base_url: &str,
     route: &PiModelRoute,
-    before_session_files: &BTreeSet<PathBuf>,
+    before: &PiSessionCensus,
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    let session_files = pi_session_files()
-        .difference(before_session_files)
-        .cloned()
-        .collect::<Vec<_>>();
+    // Keep the pre-smoke descriptor as the authority across the whole live
+    // verification. Reopening the pathname here would let an entirely different
+    // real directory generation reclassify its pre-existing transcripts as new.
+    let session_files = new_pi_route_session_files(before)?;
     if session_files.is_empty() {
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, &session_files).map(Some)
+    upload_pi_import_run(
+        api_base_url,
+        &relay_token,
+        route,
+        &before.root,
+        &session_files,
+    )
+    .map(Some)
+}
+
+fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
+    Ok(
+        pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
+            .difference(&before.files)
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Upload local Pi session files modified at or after `since` for `route`. Used
@@ -7655,20 +9357,37 @@ fn import_new_pi_route_sessions(
 /// local session transcripts (via `upload_pi_import_run`) — it never runs `pi`,
 /// so it can't burn the rotating OAuth token. The `since` mtime bound keeps each
 /// verify from re-uploading the user's entire session history.
-fn recent_pi_session_files(since: SystemTime) -> Vec<PathBuf> {
-    pi_session_files_modified_since(pi_session_files(), since)
+struct PiSessionSelection {
+    root: OpenPiSessionRoot,
+    files: Vec<PathBuf>,
+}
+
+fn recent_pi_session_files(since: SystemTime) -> Result<Option<PiSessionSelection>, LocalApiError> {
+    let Some(root) = open_pi_session_root()? else {
+        return Ok(None);
+    };
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    let files = pi_session_files_modified_since(&root, files, since)?;
+    Ok(Some(PiSessionSelection { root, files }))
 }
 
 fn import_pi_route_session_files(
     api_base_url: &str,
     route: &PiModelRoute,
-    session_files: &[PathBuf],
+    selection: &PiSessionSelection,
 ) -> Result<Option<serde_json::Value>, LocalApiError> {
-    if session_files.is_empty() {
+    if selection.files.is_empty() {
         return Ok(None);
     }
     let relay_token = issue_pi_relay_token(api_base_url)?;
-    upload_pi_import_run(api_base_url, &relay_token, route, session_files).map(Some)
+    upload_pi_import_run(
+        api_base_url,
+        &relay_token,
+        route,
+        &selection.root,
+        &selection.files,
+    )
+    .map(Some)
 }
 
 /// Keep only session files whose on-disk mtime is at or after `since`. Files
@@ -7677,18 +9396,285 @@ fn import_pi_route_session_files(
 /// bound used by the passive Pi route verifier is unit-testable without the
 /// relay-token / upload network calls.
 fn pi_session_files_modified_since(
+    root: &OpenPiSessionRoot,
     files: impl IntoIterator<Item = PathBuf>,
     since: SystemTime,
-) -> Vec<PathBuf> {
-    files
-        .into_iter()
-        .filter(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .map(|modified| modified >= since)
-                .unwrap_or(false)
-        })
-        .collect()
+) -> Result<Vec<PathBuf>, LocalApiError> {
+    let mut recent = Vec::new();
+    for path in files {
+        let file = match open_pi_session_file_beneath_root(root, &path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(pi_session_import_refused(
+                    "session tree changed during recent-file selection",
+                ))
+            }
+        };
+        let modified = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|_| {
+                pi_session_import_refused("session tree changed during recent-file selection")
+            })?;
+        if modified >= since {
+            recent.push(path);
+        }
+    }
+    verify_pi_session_root_path_identity(root)?;
+    Ok(recent)
+}
+
+fn pi_session_import_refused(reason: &str) -> LocalApiError {
+    LocalApiError::LocalOperationFailed(format!("Pi session import refused: {reason}"))
+}
+
+const fn pi_session_import_supported_on_target() -> bool {
+    cfg!(unix)
+}
+
+fn require_pi_session_import_platform_support() -> Result<(), LocalApiError> {
+    if pi_session_import_supported_on_target() {
+        Ok(())
+    } else {
+        Err(pi_session_import_refused(
+            PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON,
+        ))
+    }
+}
+
+struct OpenPiSessionRoot {
+    path: PathBuf,
+    directory: fs::File,
+}
+
+fn open_pi_session_root() -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    let home = home_path("");
+    open_pi_session_root_from_home(&home)
+}
+
+fn open_or_create_pi_session_root() -> Result<OpenPiSessionRoot, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    let home = home_path("");
+    open_or_create_pi_session_root_from_home_io(&home)
+        .map_err(|_| pi_session_import_refused("session root could not be safely established"))
+}
+
+#[cfg(test)]
+fn open_pi_session_root_direct(root: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    match open_pi_session_root_direct_io(root) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
+    }
+}
+
+fn open_pi_session_root_from_home(home: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    match open_pi_session_root_from_home_io(home) {
+        Ok(root) => Ok(Some(root)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LocalApiError::LocalOperationFailed(error.to_string())),
+    }
+}
+
+#[cfg(unix)]
+fn open_pi_session_root_direct_io(root: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = options.open(root)?;
+    Ok(OpenPiSessionRoot {
+        path: root.to_path_buf(),
+        directory,
+    })
+}
+
+#[cfg(unix)]
+fn open_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let trusted_home = open_pi_session_root_direct_io(home)?;
+    let mut directory = trusted_home.directory;
+    let mut path = home.to_path_buf();
+    for component in [".pi", "agent", "sessions"] {
+        directory = open_pi_directory_component(&directory, component.as_ref())?;
+        path.push(component);
+    }
+    Ok(OpenPiSessionRoot { path, directory })
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let trusted_home = open_pi_session_root_direct_io(home)?;
+    let mut directory = trusted_home.directory;
+    let mut path = home.to_path_buf();
+    for component in [".pi", "agent", "sessions"] {
+        directory = open_or_create_pi_directory_component(&directory, component.as_ref())?;
+        path.push(component);
+    }
+    Ok(OpenPiSessionRoot { path, directory })
+}
+
+#[cfg(unix)]
+fn open_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory contains a NUL byte",
+        )
+    })?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    open_or_create_pi_directory_component_with(directory, name, mkdir_pi_directory_component)
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_directory_component_with<Mkdir>(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    mkdir: Mkdir,
+) -> std::io::Result<fs::File>
+where
+    Mkdir: FnOnce(&fs::File, &std::ffi::OsStr) -> std::io::Result<()>,
+{
+    match open_pi_directory_component(directory, name) {
+        Ok(opened) => Ok(opened),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(create_error) = mkdir(directory, name) {
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(create_error);
+                }
+            }
+            // Always reopen through the held parent descriptor. This accepts a
+            // benign EEXIST race only when the winner created a real directory;
+            // O_NOFOLLOW refuses a symlink or other replacement.
+            open_pi_directory_component(directory, name)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn mkdir_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory contains a NUL byte",
+        )
+    })?;
+    let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn open_or_create_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(unix)]
+fn open_pi_session_file_beneath_root(
+    root: &OpenPiSessionRoot,
+    path: &Path,
+) -> std::io::Result<fs::File> {
+    let relative = path.strip_prefix(&root.path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Pi session file escaped its session root",
+        )
+    })?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Pi session file is not root-relative",
+        ));
+    }
+
+    let mut directory = root.directory.try_clone()?;
+    for (position, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("components validated above")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Pi session file contains a NUL byte",
+            )
+        })?;
+        let is_final = position + 1 == components.len();
+        let flags = if is_final {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { fs::File::from_raw_fd(fd) };
+        if is_final {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    unreachable!("non-empty component list returns its final object")
+}
+
+#[cfg(not(unix))]
+fn open_pi_session_file_beneath_root(
+    _root: &OpenPiSessionRoot,
+    _path: &Path,
+) -> std::io::Result<fs::File> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn pi_session_import_unsupported_io_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -7877,23 +9863,17 @@ fn upload_pi_import_run(
     api_base_url: &str,
     relay_token: &str,
     route: &PiModelRoute,
+    session_root: &OpenPiSessionRoot,
     session_files: &[PathBuf],
 ) -> Result<serde_json::Value, LocalApiError> {
     let boundary = format!("ottto-pi-route-{}", current_millis());
-    let mut body = Vec::new();
-    for (field, value) in pi_route_import_defaults(route) {
-        append_multipart_text_field(&mut body, &boundary, field, &value);
-    }
-    for path in session_files {
-        let content = fs::read(path)
-            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("session.jsonl");
-        append_multipart_file_field(&mut body, &boundary, "files", file_name, &content);
-    }
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let body = build_pi_import_multipart(
+        route,
+        session_root,
+        session_files,
+        &boundary,
+        PI_SESSION_SAFETY_LIMITS,
+    )?;
     let url = api_url_with_base(api_base_url, "/api/v1/pi/import-runs");
     let response = ureq::post(&url)
         .set("Accept", "application/json")
@@ -7910,40 +9890,138 @@ fn upload_pi_import_run(
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))
 }
 
-fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, String)> {
+struct OpenPiSessionUpload {
+    file: fs::File,
+    file_name: String,
+    metadata_len: u64,
+}
+
+fn build_pi_import_multipart(
+    route: &PiModelRoute,
+    session_root: &OpenPiSessionRoot,
+    session_files: &[PathBuf],
+    boundary: &str,
+    limits: PiSessionSafetyLimits,
+) -> Result<Vec<u8>, LocalApiError> {
+    if session_files.len() > limits.max_files {
+        return Err(pi_session_import_refused(
+            "upload exceeded the maximum file count",
+        ));
+    }
+    let mut body = Vec::new();
+    for (field, value) in pi_route_import_defaults(route) {
+        append_multipart_text_field(&mut body, boundary, field, value, limits)?;
+    }
+    let mut aggregate_metadata_bytes = 0_u64;
+    let mut aggregate_session_bytes = 0_u64;
+    for path in session_files {
+        let mut upload = open_pi_session_upload(session_root, path, limits)?;
+        aggregate_metadata_bytes = aggregate_metadata_bytes
+            .checked_add(upload.metadata_len)
+            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
+        if aggregate_metadata_bytes > limits.max_aggregate_bytes {
+            return Err(pi_session_import_refused(
+                "session files exceeded the maximum aggregate byte size",
+            ));
+        }
+        append_multipart_file_field(
+            &mut body,
+            boundary,
+            "files",
+            &upload.file_name,
+            &mut upload.file,
+            &mut aggregate_session_bytes,
+            limits,
+        )?;
+    }
+    append_pi_multipart_bytes(&mut body, format!("--{boundary}--\r\n").as_bytes(), limits)?;
+    Ok(body)
+}
+
+fn open_pi_session_upload(
+    session_root: &OpenPiSessionRoot,
+    path: &Path,
+    limits: PiSessionSafetyLimits,
+) -> Result<OpenPiSessionUpload, LocalApiError> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return Err(pi_session_import_refused(
+            "upload contained a non-jsonl session file",
+        ));
+    }
+    let file = open_pi_session_file_beneath_root(session_root, path)
+        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(pi_session_import_refused(
+            "upload target was not a regular file",
+        ));
+    }
+    if metadata.len() > limits.max_file_bytes {
+        return Err(pi_session_import_refused(
+            "session file exceeded the maximum byte size",
+        ));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session.jsonl")
+        .to_string();
+    Ok(OpenPiSessionUpload {
+        file,
+        file_name,
+        metadata_len: metadata.len(),
+    })
+}
+
+fn pi_route_import_defaults(route: &PiModelRoute) -> Vec<(&'static str, &str)> {
     let mut defaults = Vec::new();
-    if let Some(value) = route.classification.billing_provider.clone() {
+    if let Some(value) = route.classification.billing_provider.as_deref() {
         defaults.push(("billing_provider", value));
     }
-    if let Some(value) = route.classification.model_provider.clone() {
+    if let Some(value) = route.classification.model_provider.as_deref() {
         defaults.push(("model_provider", value));
     }
-    if let Some(value) = route.classification.billing_channel.clone() {
+    if let Some(value) = route.classification.billing_channel.as_deref() {
         defaults.push(("billing_channel", value));
     }
-    if let Some(value) = route.classification.auth_mode.clone() {
+    if let Some(value) = route.classification.auth_mode.as_deref() {
         defaults.push(("auth_mode", value));
     }
-    if let Some(value) = route.classification.gateway_provider.clone() {
+    if let Some(value) = route.classification.gateway_provider.as_deref() {
         defaults.push(("gateway_provider", value));
     }
-    if let Some(value) = route.classification.subscription_product.clone() {
+    if let Some(value) = route.classification.subscription_product.as_deref() {
         defaults.push(("subscription_product", value));
     }
     defaults
 }
 
-fn append_multipart_text_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
+fn append_multipart_text_field(
+    body: &mut Vec<u8>,
+    boundary: &str,
+    name: &str,
+    value: &str,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    if value.len() > limits.max_multipart_field_bytes {
+        return Err(pi_session_import_refused(
+            "route metadata exceeded the multipart field byte cap",
+        ));
+    }
+    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
+    append_pi_multipart_bytes(
+        body,
         format!(
             "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
             multipart_token(name)
         )
         .as_bytes(),
-    );
-    body.extend_from_slice(value.as_bytes());
-    body.extend_from_slice(b"\r\n");
+        limits,
+    )?;
+    append_pi_multipart_bytes(body, value.as_bytes(), limits)?;
+    append_pi_multipart_bytes(body, b"\r\n", limits)
 }
 
 fn append_multipart_file_field(
@@ -7951,20 +10029,72 @@ fn append_multipart_file_field(
     boundary: &str,
     name: &str,
     file_name: &str,
-    content: &[u8],
-) {
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
+    file: &mut fs::File,
+    aggregate_session_bytes: &mut u64,
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    append_pi_multipart_bytes(body, format!("--{boundary}\r\n").as_bytes(), limits)?;
+    append_pi_multipart_bytes(
+        body,
         format!(
             "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
             multipart_token(name),
             multipart_token(file_name),
         )
         .as_bytes(),
-    );
-    body.extend_from_slice(b"Content-Type: application/x-ndjson\r\n\r\n");
-    body.extend_from_slice(content);
-    body.extend_from_slice(b"\r\n");
+        limits,
+    )?;
+    append_pi_multipart_bytes(body, b"Content-Type: application/x-ndjson\r\n\r\n", limits)?;
+
+    let mut file_bytes = 0_u64;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        let read = read as u64;
+        file_bytes = file_bytes
+            .checked_add(read)
+            .ok_or_else(|| pi_session_import_refused("session file byte count overflowed"))?;
+        if file_bytes > limits.max_file_bytes {
+            return Err(pi_session_import_refused(
+                "session file exceeded the maximum byte size while reading",
+            ));
+        }
+        *aggregate_session_bytes = (*aggregate_session_bytes)
+            .checked_add(read)
+            .ok_or_else(|| pi_session_import_refused("aggregate byte count overflowed"))?;
+        if *aggregate_session_bytes > limits.max_aggregate_bytes {
+            return Err(pi_session_import_refused(
+                "session files exceeded the maximum aggregate byte size while reading",
+            ));
+        }
+        append_pi_multipart_bytes(body, &buffer[..read as usize], limits)?;
+    }
+    append_pi_multipart_bytes(body, b"\r\n", limits)
+}
+
+fn append_pi_multipart_bytes(
+    body: &mut Vec<u8>,
+    bytes: &[u8],
+    limits: PiSessionSafetyLimits,
+) -> Result<(), LocalApiError> {
+    let next_len = body
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| pi_session_import_refused("multipart byte count overflowed"))?;
+    if next_len > limits.max_multipart_body_bytes {
+        return Err(pi_session_import_refused(
+            "multipart body exceeded the maximum byte size",
+        ));
+    }
+    body.try_reserve(bytes.len())
+        .map_err(|_| pi_session_import_refused("multipart allocation failed"))?;
+    body.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn multipart_token(value: &str) -> String {
@@ -9372,14 +11502,16 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let before_session_files = pi_session_files();
-    let smoke_after = current_rfc3339();
-    let smoke = run_pi_route_smoke_prompt(route, Some(before_session_files.len()));
+    let (before_session_census, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
+        Ok(ready) => ready,
+        Err(failed) => return *failed,
+    };
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
     }
-    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_files) {
+    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
         eprintln!("Pi route smoke session import failed: {error}");
+        return pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error);
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -9404,6 +11536,148 @@ fn run_one_pi_route_verification(
     ) {
         Ok(verification) => pi_route_result_from_verification(route, &smoke, verification),
         Err(error) => pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error),
+    }
+}
+
+fn run_pi_route_pre_smoke(
+    route: &PiModelRoute,
+) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>> {
+    run_pi_route_pre_smoke_with(
+        route,
+        prepare_pi_live_session_census,
+        run_pi_route_smoke_prompt,
+    )
+}
+
+fn run_pi_route_pre_smoke_with<Prepare, RunSmoke>(
+    route: &PiModelRoute,
+    prepare: Prepare,
+    run_smoke: RunSmoke,
+) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>>
+where
+    Prepare: FnOnce() -> Result<PiSessionCensus, LocalApiError>,
+    RunSmoke: FnOnce(&PiModelRoute, Option<usize>) -> SmokeResult,
+{
+    let before_session_census = match prepare() {
+        Ok(census) => census,
+        Err(_) => {
+            eprintln!("Pi route pre-smoke session safety check failed.");
+            return Err(Box::new(pi_route_pre_smoke_census_failure(route)));
+        }
+    };
+    let smoke_after = current_rfc3339();
+    let before_session_count = Some(before_session_census.files.len());
+    let mut smoke = run_smoke(route, before_session_count);
+    if !smoke.succeeded {
+        // A failed command is already terminal for this route. Its generic
+        // pathname count is not authoritative and a second filesystem error
+        // must not replace the real smoke diagnostic.
+        smoke.local_session_observed = None;
+        return Ok((before_session_census, smoke_after, smoke));
+    }
+    // `run_bounded_command` retains its generic count-based Pi observation for
+    // older callers, but that count reopens the pathname. Live route Verify
+    // already owns a held pre-smoke root descriptor, so only a post-smoke
+    // difference derived through that same descriptor can authorize local-only
+    // success. A replaced/unreadable root fails before backend polling instead
+    // of reclassifying another directory's pre-existing transcripts as smoke
+    // evidence.
+    let local_session_observed = match new_pi_route_session_files(&before_session_census) {
+        Ok(files) => !files.is_empty(),
+        Err(_) => {
+            eprintln!("Pi route post-smoke session safety check failed.");
+            return Err(Box::new(pi_route_post_smoke_census_failure(
+                route,
+                &smoke,
+                smoke_after,
+            )));
+        }
+    };
+    smoke.local_session_observed = Some(local_session_observed);
+    Ok((before_session_census, smoke_after, smoke))
+}
+
+fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerificationResult {
+    let identity = pi_route_billing_identity_hints(route);
+    SourceRouteVerificationResult {
+        provider: pi_route_provider(route),
+        model: pi_route_model(route),
+        model_provider: route.classification.model_provider.clone(),
+        billing_provider: route.classification.billing_provider.clone(),
+        billing_channel: route.classification.billing_channel.clone(),
+        auth_mode: route.classification.auth_mode.clone(),
+        gateway_provider: route.classification.gateway_provider.clone(),
+        subscription_product: route.classification.subscription_product.clone(),
+        source_category: route.classification.source_category.clone(),
+        account_identifier_hash: identity.account_identifier_hash,
+        organization_identifier_hash: identity.organization_identifier_hash,
+        credential_fingerprint_hash: identity.credential_fingerprint_hash,
+        billing_identity_evidence: identity.billing_identity_evidence,
+        billing_identity_confidence: identity.billing_identity_confidence,
+        status: SourceVerificationStatus::Failed,
+        verified: false,
+        records_seen: 0,
+        last_record_id: None,
+        last_received_at: None,
+        smoke_after: None,
+        command_found: false,
+        command_succeeded: false,
+        exit_status: None,
+        duration_ms: 0,
+        diagnostic: None,
+        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
+        local_session_observed: None,
+        message: StableMessage {
+            code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
+            text: format!(
+                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                pi_route_label(route)
+            ),
+        },
+    }
+}
+
+fn pi_route_post_smoke_census_failure(
+    route: &PiModelRoute,
+    smoke: &SmokeResult,
+    smoke_after: String,
+) -> SourceRouteVerificationResult {
+    let identity = pi_route_billing_identity_hints(route);
+    SourceRouteVerificationResult {
+        provider: pi_route_provider(route),
+        model: pi_route_model(route),
+        model_provider: route.classification.model_provider.clone(),
+        billing_provider: route.classification.billing_provider.clone(),
+        billing_channel: route.classification.billing_channel.clone(),
+        auth_mode: route.classification.auth_mode.clone(),
+        gateway_provider: route.classification.gateway_provider.clone(),
+        subscription_product: route.classification.subscription_product.clone(),
+        source_category: route.classification.source_category.clone(),
+        account_identifier_hash: identity.account_identifier_hash,
+        organization_identifier_hash: identity.organization_identifier_hash,
+        credential_fingerprint_hash: identity.credential_fingerprint_hash,
+        billing_identity_evidence: identity.billing_identity_evidence,
+        billing_identity_confidence: identity.billing_identity_confidence,
+        status: SourceVerificationStatus::Failed,
+        verified: false,
+        records_seen: 0,
+        last_record_id: None,
+        last_received_at: None,
+        smoke_after: Some(smoke_after),
+        command_found: smoke.command_found,
+        command_succeeded: smoke.succeeded,
+        exit_status: smoke.exit_status,
+        duration_ms: smoke.duration_ms.try_into().unwrap_or(u64::MAX),
+        diagnostic: smoke.diagnostic.clone(),
+        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
+        local_session_observed: None,
+        message: StableMessage {
+            code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
+            text: format!(
+                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                pi_route_label(route)
+            ),
+        },
     }
 }
 
@@ -9466,11 +11740,21 @@ fn verify_pi_subscription_oauth_route_passively(
             u64::from(PI_PASSIVE_LOOKBACK_HOURS) * 3600,
         ))
         .unwrap_or(UNIX_EPOCH);
-    let recent_session_files = recent_pi_session_files(import_since);
-    if let Err(error) = import_pi_route_session_files(api_base_url, route, &recent_session_files) {
-        eprintln!("Pi passive route session import failed (non-fatal): {error}");
+    let recent_session_selection = match recent_pi_session_files(import_since) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("Pi passive route session discovery failed (non-fatal): {error}");
+            None
+        }
+    };
+    if let Some(selection) = recent_session_selection.as_ref() {
+        if let Err(error) = import_pi_route_session_files(api_base_url, route, selection) {
+            eprintln!("Pi passive route session import failed (non-fatal): {error}");
+        }
     }
-    let recent_local_session_observed = !recent_session_files.is_empty();
+    let recent_local_session_observed = recent_session_selection
+        .as_ref()
+        .is_some_and(|selection| !selection.files.is_empty());
     let local_session_observed = Some(recent_local_session_observed);
     let local_evidence_observed = pi_route_has_local_verification_evidence(
         &pi_route_billing_identity_hints(route),
@@ -9860,6 +12144,10 @@ fn pi_route_aggregate_result(
         live_passed == 0 && local_only_passed == 0 && hard_failed == 0 && reauth_pending > 0;
     let all_local_only =
         live_passed == 0 && local_only_passed > 0 && hard_failed == 0 && reauth_pending == 0;
+    let all_census_failed = total > 0
+        && route_results
+            .iter()
+            .all(|route| route.error_code.as_deref() == Some(PI_SESSION_CENSUS_FAILED_CODE));
     let (code, text): (&str, String) = match status {
         SourceVerificationStatus::Verified => {
             ("verified", format!("Verified {total} Pi model routes."))
@@ -9886,6 +12174,11 @@ fn pi_route_aggregate_result(
                     "Pi has {total} model routes awaiting review; re-sign in if a provider asks."
                 )
             },
+        ),
+        SourceVerificationStatus::Failed if all_census_failed => (
+            PI_SESSION_CENSUS_FAILED_CODE,
+            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+                .to_string(),
         ),
         _ => (
             "pi_route_smoke_failed",
@@ -10529,7 +12822,28 @@ fn backend_response_unexpected(url: &str, detail: String) -> LocalApiError {
 }
 
 fn safe_backend_endpoint(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
+    let endpoint = url.split('?').next().unwrap_or(url);
+    for (marker, replacement) in [
+        (
+            "/api/v1/telemetry/device-credential-preparations/",
+            "[preparation]",
+        ),
+        ("/api/v1/telemetry/devices/", "[device]"),
+    ] {
+        let Some(start) = endpoint.find(marker) else {
+            continue;
+        };
+        let identifier_start = start + marker.len();
+        let suffix = endpoint[identifier_start..]
+            .find('/')
+            .map(|offset| &endpoint[identifier_start + offset..])
+            .unwrap_or_default();
+        if marker == "/api/v1/telemetry/devices/" && suffix != "/relay-token" {
+            continue;
+        }
+        return format!("{}{}{}", &endpoint[..identifier_start], replacement, suffix);
+    }
+    endpoint.to_string()
 }
 
 fn safe_backend_body_excerpt(body: &str) -> Option<String> {
@@ -10657,6 +12971,52 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_body_excerpt_redacts_compact_json_secret_fields() {
+        let prior = format!("prior-{}", "value".repeat(4));
+        let install = format!("install-{}", "value".repeat(4));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let body = serde_json::json!({
+            "detail": "registration rejected",
+            "prior_device_secret": prior,
+            "candidate_secret": candidate,
+            "nested": {"install_session_token": install},
+        })
+        .to_string();
+
+        let excerpt = super::safe_backend_body_excerpt(&body).expect("non-empty excerpt");
+        let parsed: serde_json::Value = serde_json::from_str(&excerpt).expect("valid JSON excerpt");
+        assert_eq!(parsed["detail"], "registration rejected");
+        assert_eq!(parsed["prior_device_secret"], "[REDACTED]");
+        assert_eq!(parsed["candidate_secret"], "[REDACTED]");
+        assert_eq!(parsed["nested"]["install_session_token"], "[REDACTED]");
+        assert!(!excerpt.contains(&prior));
+        assert!(!excerpt.contains(&install));
+        assert!(!excerpt.contains(&candidate));
+    }
+
+    #[test]
+    fn backend_endpoint_redacts_device_credential_preparation_id() {
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/device-credential-preparations/private-preparation-id/confirm?x=1"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/device-credential-preparations/[preparation]/confirm"
+        );
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/devices/private-device-id/relay-token"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/devices/[device]/relay-token"
+        );
+        assert_eq!(
+            super::safe_backend_endpoint(
+                "https://api.ottto.net/api/v1/telemetry/devices/registration-preparations"
+            ),
+            "https://api.ottto.net/api/v1/telemetry/devices/registration-preparations"
+        );
+    }
+
     #[test]
     fn managed_config_preview_extracts_and_redacts_fence_region() {
         // Assembled at runtime so no token-shaped literal lands in the
@@ -10945,9 +13305,18 @@ mod tests {
         }
     }
 
+    fn live_pi_route() -> PiModelRoute {
+        let mut route = subscription_oauth_route();
+        route.classification.auth_mode = Some("api_key".to_string());
+        route.classification.billing_channel = Some("usage".to_string());
+        route.classification.subscription_product = None;
+        route
+    }
+
     #[test]
     fn subscription_oauth_routes_are_detected_and_others_are_not() {
         assert!(route_is_subscription_oauth(&subscription_oauth_route()));
+        assert!(!route_is_subscription_oauth(&live_pi_route()));
 
         let mut api_key = subscription_oauth_route();
         api_key.classification.auth_mode = Some("api_key".to_string());
@@ -11080,7 +13449,7 @@ mod tests {
     use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     // The per-file Mutex below serializes tests within control.rs that mutate
@@ -11180,6 +13549,1409 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         create_control_test_dir(&root);
         root
+    }
+
+    fn open_pi_test_root(path: &Path) -> OpenPiSessionRoot {
+        open_pi_session_root_direct(path)
+            .expect("open Pi test root")
+            .expect("Pi test root exists")
+    }
+
+    fn test_pending_device_credential(
+        preparation_id: &str,
+        confirmation_authorized: bool,
+    ) -> PendingDeviceCredentialPreparation {
+        let candidate_secret = format!("candidate-{}", "value".repeat(4));
+        PendingDeviceCredentialPreparation {
+            schema_version: PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION,
+            capability: DEVICE_CREDENTIAL_PREPARATION_CAPABILITY.to_string(),
+            preparation_id: preparation_id.to_string(),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            expires_at: "2026-08-01T00:00:00Z".to_string(),
+            credential_generation: 4,
+            secret_commitment_sha256: secret_sha256(&candidate_secret),
+            request_authority: None,
+            device: LocalDeviceBinding {
+                device_id: "device-prepared".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            confirmation_authorized,
+            preconfirm_guards_passed: confirmation_authorized,
+            claim_commit: None,
+            confirmed_at: None,
+        }
+    }
+
+    fn test_setup_claim_request_authority(
+        prior_secret: &str,
+    ) -> PendingDeviceCredentialRequestAuthority {
+        let machine = MachineIdentity {
+            hardware_uuid: Some("hardware-test".to_string()),
+            ..test_machine()
+        };
+        let prior = PriorDeviceCredential {
+            device_id: "device-prior".to_string(),
+            device_sources: vec!["codex".to_string(), "pi".to_string()],
+            device_secret: prior_secret.to_string(),
+        };
+        device_credential_request_authority(
+            "setup_claim",
+            "claim-immutable",
+            &machine,
+            Some(&prior),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        )
+    }
+
+    #[test]
+    fn credential_preparation_idempotency_is_stable_and_server_operation_bounded() {
+        let first = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-one",
+            "installation-one",
+        );
+        let replay = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-one",
+            "installation-one",
+        );
+        let new_claim_after_expiry = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim-two",
+            "installation-one",
+        );
+
+        assert_eq!(first, replay);
+        assert_ne!(first, new_claim_after_expiry);
+        assert!(first.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn confirmation_receipt_must_match_journaled_prior_device() {
+        let mut pending = test_pending_device_credential("preparation-confirm-prior", true);
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-confirm-proof"));
+        let exact: DeviceCredentialConfirmationApiResponse = serde_json::from_value(json!({
+            "preparation_id": pending.preparation_id,
+            "status": "confirmed",
+            "confirmed_at": "2026-07-31T20:00:00Z",
+            "credential_generation": pending.credential_generation,
+            "device": {
+                "id": pending.device.device_id,
+                "machine_id": pending.device.machine_id,
+                "sources": pending.device.sources,
+            },
+            "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+            "credential_rotation_performed": true,
+            "rotated_prior_device_id": "device-prior",
+        }))
+        .expect("parse exact confirmation");
+        validate_device_credential_confirmation("https://api.test/confirm", &pending, &exact)
+            .expect("exact prior confirmation");
+
+        let mismatched: DeviceCredentialConfirmationApiResponse = serde_json::from_value(json!({
+            "preparation_id": pending.preparation_id,
+            "status": "confirmed",
+            "confirmed_at": "2026-07-31T20:00:00Z",
+            "credential_generation": pending.credential_generation,
+            "device": {
+                "id": pending.device.device_id,
+                "machine_id": pending.device.machine_id,
+                "sources": pending.device.sources,
+            },
+            "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+            "credential_rotation_performed": true,
+            "rotated_prior_device_id": "device-other",
+        }))
+        .expect("parse mismatched confirmation");
+        assert!(validate_device_credential_confirmation(
+            "https://api.test/confirm",
+            &pending,
+            &mismatched,
+        )
+        .is_err());
+
+        let wrong_generation: DeviceCredentialConfirmationApiResponse =
+            serde_json::from_value(json!({
+                "preparation_id": pending.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:00:00Z",
+                "credential_generation": pending.credential_generation + 1,
+                "device": {
+                    "id": pending.device.device_id,
+                    "machine_id": pending.device.machine_id,
+                    "sources": pending.device.sources,
+                },
+                "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+                "credential_rotation_performed": true,
+                "rotated_prior_device_id": "device-prior",
+            }))
+            .expect("parse wrong-generation confirmation");
+        assert!(validate_device_credential_confirmation(
+            "https://api.test/confirm",
+            &pending,
+            &wrong_generation,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn prepared_candidate_stages_without_changing_active_authority() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-stage-old-authority");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let old_device = LocalDeviceBinding {
+            device_id: "device-old".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let old_secret = format!("old-{}", "value".repeat(4));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        device_store.save(&old_device).expect("save old device");
+        active_secret.save(&old_secret).expect("save old secret");
+        let pending = test_pending_device_credential("preparation-one", true);
+
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+
+        assert_eq!(
+            device_store.load().expect("load old device"),
+            Some(old_device)
+        );
+        assert_eq!(active_secret.load().expect("load old secret"), old_secret);
+        assert_eq!(pending_secret.load().expect("load candidate"), candidate);
+        assert_eq!(pending_store.load().expect("load pending"), Some(pending));
+    }
+
+    #[test]
+    fn same_preparation_id_cannot_replace_the_staged_candidate_or_binding() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-same-id-immutable");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let first_candidate = format!("candidate-{}", "first".repeat(4));
+        let prior_secret = format!("prior-{}", "authority".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-immutable", true);
+        pending.secret_commitment_sha256 = secret_sha256(&first_candidate);
+        pending.request_authority = Some(test_setup_claim_request_authority(&prior_secret));
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &first_candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage first candidate");
+
+        let replacement_candidate = format!("candidate-{}", "second".repeat(4));
+        assert_eq!(
+            stage_pending_device_credential_with_stores(
+                &pending,
+                &replacement_candidate,
+                &pending_store,
+                &pending_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        let assert_rebound = |rebound: PendingDeviceCredentialPreparation| {
+            assert_eq!(
+                stage_pending_device_credential_with_stores(
+                    &rebound,
+                    &first_candidate,
+                    &pending_store,
+                    &pending_secret,
+                ),
+                Err(LocalApiError::IdentityMutationInProgress)
+            );
+        };
+        let mut rebound = pending.clone();
+        rebound.device.device_id = "device-rebound".to_string();
+        assert_rebound(rebound);
+
+        let mut mutations = Vec::new();
+        for field in [
+            "prior_device_id",
+            "prior_secret_commitment",
+            "prior_sources",
+            "continuity_capability",
+            "account_scope",
+            "installation_id",
+            "machine_id",
+            "hardware_uuid",
+        ] {
+            let mut rebound = pending.clone();
+            let authority = rebound
+                .request_authority
+                .as_mut()
+                .expect("request authority");
+            match field {
+                "prior_device_id" => authority.prior_device_id = Some("device-other".to_string()),
+                "prior_secret_commitment" => {
+                    authority.prior_secret_commitment_sha256 = Some(secret_sha256("prior-other"));
+                }
+                "prior_sources" => {
+                    authority.prior_device_sources = Some(vec!["claude_code".to_string()]);
+                }
+                "continuity_capability" => {
+                    authority.identity_continuity_capability = Some("other-capability".to_string());
+                }
+                "account_scope" => authority.account_scope = Some("account-other".to_string()),
+                "installation_id" => authority.installation_id = "install-other".to_string(),
+                "machine_id" => authority.machine_id = "machine-other".to_string(),
+                "hardware_uuid" => authority.hardware_uuid = Some("hardware-other".to_string()),
+                _ => unreachable!(),
+            }
+            mutations.push((field, rebound));
+        }
+        for (field, rebound) in mutations {
+            let result = stage_pending_device_credential_with_stores(
+                &rebound,
+                &first_candidate,
+                &pending_store,
+                &pending_secret,
+            );
+            if field == "continuity_capability" {
+                assert_eq!(result, Err(LocalApiError::StatePoisoned));
+            } else {
+                assert_eq!(
+                    result,
+                    Err(LocalApiError::IdentityMutationInProgress),
+                    "same-ID request authority rebound for {field}"
+                );
+            }
+        }
+        assert_eq!(
+            pending_secret.load().expect("original candidate retained"),
+            first_candidate
+        );
+        assert_eq!(
+            pending_store.load().expect("original binding retained"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn new_claim_discards_abandoned_unauthorized_account_switch_preparation() {
+        let support_root = telemetry_key_store_root("credential-abandoned-switch");
+        let secret_root = telemetry_key_store_root("credential-abandoned-switch-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let setup_run_token = format!("setup-{}", "abandoned".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-abandoned", false);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: connected_account(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup-abandoned".to_string(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                claim_code: Some("claim-abandoned".to_string()),
+                api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            },
+            target_user_id: "user_test".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_run_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        stage_pending_device_credential(&pending, &candidate).expect("stage abandoned candidate");
+        stage_pending_setup_run_token(&pending, &setup_run_token)
+            .expect("stage abandoned setup token");
+
+        discard_abandoned_unconfirmed_claim_credential().expect("discard abandoned claim");
+
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load cleared journal")
+            .is_none());
+        assert!(matches!(
+            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT).load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert!(matches!(
+            KeychainSecretStore::new(OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT).load(),
+            Err(TokenStoreError::Missing)
+        ));
+
+        let replacement = test_pending_device_credential("preparation-replacement", false);
+        stage_pending_device_credential(&replacement, &candidate)
+            .expect("new claim can stage a distinct preparation");
+        clear_pending_device_credential(
+            &FilePendingDeviceCredentialStore::default(),
+            &KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT),
+        )
+        .expect("clear replacement");
+        let _ = fs::remove_dir_all(support_root);
+        let _ = fs::remove_dir_all(secret_root);
+    }
+
+    #[test]
+    fn pending_setup_token_repairs_an_unreadable_orphan_with_exact_journal_value() {
+        struct FailFirstLoadStore {
+            loads: AtomicUsize,
+            value: Mutex<Option<String>>,
+        }
+
+        impl ControlTokenStore for FailFirstLoadStore {
+            fn load(&self) -> Result<String, TokenStoreError> {
+                if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(TokenStoreError::Store(
+                        "simulated transient read failure".to_string(),
+                    ));
+                }
+                self.value
+                    .lock()
+                    .expect("token value lock")
+                    .clone()
+                    .ok_or(TokenStoreError::Missing)
+            }
+
+            fn save(&self, token: &str) -> Result<(), TokenStoreError> {
+                *self.value.lock().expect("token value lock") = Some(token.to_string());
+                Ok(())
+            }
+
+            fn delete(&self) -> Result<(), TokenStoreError> {
+                *self.value.lock().expect("token value lock") = None;
+                Ok(())
+            }
+        }
+
+        let setup_token = format!("setup-{}", "recovery".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-token-recovery", true);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: connected_account(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "setup-token-recovery".to_string(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                claim_code: Some("claim-token-recovery".to_string()),
+                api_base_url: DEFAULT_API_BASE_URL.to_string(),
+            },
+            target_user_id: "user_test".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let store = FailFirstLoadStore {
+            loads: AtomicUsize::new(0),
+            value: Mutex::new(Some("unreadable-orphan".to_string())),
+        };
+
+        stage_pending_setup_run_token_with_store(&pending, &setup_token, &store)
+            .expect("replace unreadable orphan with exact journal token");
+
+        assert_eq!(
+            store.value.lock().expect("token value lock").as_deref(),
+            Some(setup_token.as_str())
+        );
+    }
+
+    #[test]
+    fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-promote-file-failure");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let blocked_parent = root.join("blocked-parent");
+        fs::write(&blocked_parent, b"not-a-directory").expect("create blocker");
+        let device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let pending = test_pending_device_credential("preparation-two", true);
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark confirmed");
+
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            pending_store.load().expect("pending survives"),
+            Some(confirmed.clone())
+        );
+        assert_eq!(
+            pending_secret.load().expect("candidate survives"),
+            candidate
+        );
+        assert_eq!(
+            active_secret.load().expect("active candidate write"),
+            candidate
+        );
+
+        fs::remove_file(&blocked_parent).expect("remove blocker");
+        fs::create_dir(&blocked_parent).expect("create device parent");
+        promote_pending_device_credential_with_stores(
+            &confirmed,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+            &device_store,
+            &active_secret,
+        )
+        .expect("retry promotion");
+
+        assert!(pending_store.load().expect("pending cleared").is_none());
+        assert!(matches!(
+            pending_secret.load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert_eq!(
+            device_store
+                .load_with_credential_generation()
+                .expect("load active binding")
+                .expect("active binding")
+                .credential_generation,
+            4
+        );
+    }
+
+    #[test]
+    fn confirmed_journal_rejects_a_replaced_candidate_secret_before_promotion() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-confirmed-secret-binding");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let replacement = format!("candidate-{}", "replaced".repeat(4));
+        let old_secret = format!("old-{}", "authority".repeat(3));
+        active_secret.save(&old_secret).expect("save old authority");
+        let pending = test_pending_device_credential("preparation-secret-binding", true);
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark confirmed");
+
+        // Mutation oracle: simulate a stale/corrupted Keychain value after the
+        // server confirmation receipt became durable.
+        pending_secret
+            .save(&replacement)
+            .expect("replace staged secret");
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &replacement,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            active_secret.load().expect("old authority retained"),
+            old_secret
+        );
+        assert_eq!(
+            pending_store.load().expect("journal retained"),
+            Some(confirmed)
+        );
+        assert!(device_store
+            .load()
+            .expect("device remains absent")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
+        let support_root = telemetry_key_store_root("credential-rotation-recovery");
+        let secret_root = telemetry_key_store_root("credential-rotation-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+
+        let old_device = LocalDeviceBinding {
+            device_id: "device-old".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let old_secret = format!("old-{}", "authority".repeat(3));
+        FileDeviceStore::default()
+            .save(&old_device)
+            .expect("save old device");
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &old_secret,
+        )
+        .expect("save old secret fallback");
+
+        let pending_store = FilePendingDeviceCredentialStore::default();
+        let pending_secret = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
+        let active_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        let candidate = format!("candidate-{}", "rotation".repeat(3));
+        let mut pending = test_pending_device_credential("preparation-regular-rotation", true);
+        pending.preconfirm_guards_passed = false;
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        pending.request_authority = Some(device_credential_request_authority(
+            "register",
+            "install-regular-rotation",
+            &test_machine(),
+            Some(&PriorDeviceCredential {
+                device_id: old_device.device_id.clone(),
+                device_sources: old_device.sources.clone(),
+                device_secret: old_secret.clone(),
+            }),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        stage_pending_device_credential(&pending, &candidate).expect("stage rotation candidate");
+
+        // Preparing alone never invalidates the old authority.
+        assert_eq!(
+            crate::snapshot_client::load_snapshot_device_credentials()
+                .expect("old authority remains admissible before confirmation"),
+            (old_device.clone(), old_secret)
+        );
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+
+        let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)
+            .expect("persist pre-confirm crash boundary");
+        // Once the confirm request can be sent, a lost response is ambiguous:
+        // the server may already have revoked the prior generation.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+
+        let confirmed = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &pending_store,
+        )
+        .expect("mark rotation confirmed");
+        let blocked_parent = support_root.join("blocked-rotation-parent");
+        fs::write(&blocked_parent, b"not-a-directory").expect("create promotion blocker");
+        let blocked_device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &confirmed,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &blocked_device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("old device remains"),
+            Some(old_device)
+        );
+
+        // Server confirmation can revoke the old generation. Even though its
+        // local files still exist, neither snapshots nor cached OTLP admission
+        // may use it across this crash cut.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert!(pending_store.load().expect("pending cleared").is_none());
+        assert_eq!(
+            crate::snapshot_client::load_snapshot_device_credentials()
+                .expect("promoted authority admitted"),
+            (confirmed.device, candidate)
+        );
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() {
+        let support_root = telemetry_key_store_root("credential-claim-commit-recovery");
+        let secret_root = telemetry_key_store_root("credential-claim-commit-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup-recover".to_string(),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine-one".to_string()),
+            claim_code: Some("claim-recover".to_string()),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        let setup_token = format!("setup-{}", "claim".repeat(4));
+        let mut pending = test_pending_device_credential("preparation-claim-recover", true);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            target_user_id: account.user.as_ref().expect("connected user").id.clone(),
+            account: account.clone(),
+            connection: connection.clone(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let candidate = format!("candidate-{}", "claim".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        stage_pending_device_credential(&pending, &candidate).expect("stage claim candidate");
+        stage_pending_setup_run_token(&pending, &setup_token).expect("stage claim setup token");
+        pending = mark_pending_device_credential_confirmed(
+            &pending,
+            "2026-07-31T20:00:00Z",
+            &FilePendingDeviceCredentialStore::default(),
+        )
+        .expect("mark claim confirmed");
+
+        let blocked_connection = support_root.join("connection.json");
+        fs::create_dir(&blocked_connection).expect("block connection file");
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("claim journal retained"),
+            Some(pending.clone())
+        );
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
+        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(matches!(
+            setup_run_token_for_connection(DEFAULT_API_BASE_URL, &connection),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        fs::remove_dir(&blocked_connection).expect("unblock connection file");
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert_eq!(
+            FileAccountStore::default().load().expect("active account"),
+            account
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("active connection"),
+            Some(connection)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .expect("active setup token"),
+            setup_token
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("active device candidate"),
+            candidate
+        );
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("claim journal cleared")
+            .is_none());
+        // Pending-secret deletion is deliberately best-effort after the
+        // verified active commit. A Keychain cleanup failure may leave an
+        // inert orphan, but without the journal it is neither discoverable nor
+        // authority and the next exact journal-bound stage replaces it.
+        assert!(crate::snapshot_client::load_snapshot_device_credentials().is_ok());
+        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+    }
+
+    #[test]
+    fn unconfirmed_or_unauthorized_candidate_cannot_promote() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("credential-promote-unauthorized");
+        let pending_store = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+        let pending_secret = MemoryTokenStore::new();
+        let active_secret = MemoryTokenStore::new();
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        let pending = test_pending_device_credential("preparation-three", false);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        stage_pending_device_credential_with_stores(
+            &pending,
+            &candidate,
+            &pending_store,
+            &pending_secret,
+        )
+        .expect("stage candidate");
+
+        assert_eq!(
+            promote_pending_device_credential_with_stores(
+                &pending,
+                &candidate,
+                &pending_store,
+                &pending_secret,
+                &device_store,
+                &active_secret,
+            ),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert!(matches!(
+            active_secret.load(),
+            Err(TokenStoreError::Missing)
+        ));
+        assert_eq!(
+            pending_store.load().expect("pending remains"),
+            Some(pending)
+        );
+    }
+
+    fn seed_pending_recovery_fixture(
+        api_base_url: String,
+        confirmation_authorized: bool,
+        expires_at: &str,
+        secret_root: &Path,
+    ) -> (PendingDeviceCredentialPreparation, String) {
+        use ottto_core::token_store::FileControlTokenStore;
+
+        let mut pending =
+            test_pending_device_credential("preparation-recovery", confirmation_authorized);
+        pending.api_base_url = api_base_url;
+        pending.expires_at = expires_at.to_string();
+        let candidate = format!("candidate-{}", "recovery".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save pending recovery fixture");
+        FileControlTokenStore::new(secret_root.join(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT))
+            .save(&candidate)
+            .expect("save pending candidate fallback");
+        (pending, candidate)
+    }
+
+    #[test]
+    #[serial]
+    fn startup_recovery_rejects_a_confirmed_journal_with_a_mismatched_secret() {
+        use ottto_core::token_store::FileControlTokenStore;
+
+        let support_root = telemetry_key_store_root("credential-recovery-secret-binding");
+        let secret_root = telemetry_key_store_root("credential-recovery-secret-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let (mut pending, _) = seed_pending_recovery_fixture(
+            unused_loopback_base_url(),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.confirmed_at = Some("2026-07-31T20:00:00Z".to_string());
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save confirmed journal");
+        FileControlTokenStore::new(secret_root.join(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT))
+            .save(&format!("candidate-{}", "replaced".repeat(4)))
+            .expect("replace pending candidate");
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::StatePoisoned)
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("journal retained"),
+            Some(pending)
+        );
+        assert!(FileDeviceStore::default()
+            .load()
+            .expect("device remains absent")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn pending_status_preserves_exact_request_authority_and_candidate() {
+        let support_root = telemetry_key_store_root("credential-status-authority-binding");
+        let secret_root = telemetry_key_store_root("credential-status-authority-binding-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind status backend");
+        let address = listener.local_addr().expect("status backend address");
+        let (mut pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-status-proof"));
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save authority-bound status journal");
+        let pending_for_server = pending.clone();
+        let server = thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pending status");
+            let request = read_complete_http_request(&mut status);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "pending",
+                "expires_at": pending_for_server.expires_at,
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                }
+            });
+            write_json_response(&mut status, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        server.join().expect("status server");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("pending journal"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn confirmed_pruned_preparation_recovers_via_normal_device_auth() {
+        let support_root = telemetry_key_store_root("credential-pruned-confirmed");
+        let secret_root = telemetry_key_store_root("credential-pruned-confirmed-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let api_base_url = format!("http://{address}");
+        let (mut pending, _) =
+            seed_pending_recovery_fixture(api_base_url, true, "2026-08-01T00:00:00Z", &secret_root);
+        pending.request_authority = Some(test_setup_claim_request_authority("prior-pruned-proof"));
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save authority-bound pruned journal");
+        thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept pruned confirm");
+            let _ = read_complete_http_request(&mut confirm);
+            write_json_response(&mut confirm, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 200, "OK", r#"{"relay_token":"issued"}"#);
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+        let active = FileDeviceStore::default()
+            .load_with_credential_generation()
+            .expect("load active")
+            .expect("active generation");
+        assert_eq!(active.device, pending.device);
+        assert_eq!(active.credential_generation, pending.credential_generation);
+    }
+
+    #[test]
+    #[serial]
+    fn expired_pruned_preparation_clears_only_after_normal_auth_rejection() {
+        let support_root = telemetry_key_store_root("credential-pruned-expired");
+        let secret_root = telemetry_key_store_root("credential-pruned-expired-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        );
+        thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pruned status");
+            let _ = read_complete_http_request(&mut status);
+            write_json_response(&mut status, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept rejected relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 401, "Unauthorized", r#"{"detail":"invalid"}"#);
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn expired_pruned_preparation_preserves_candidate_after_forbidden_probe() {
+        let support_root = telemetry_key_store_root("credential-pruned-forbidden");
+        let secret_root = telemetry_key_store_root("credential-pruned-forbidden-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let (pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        );
+        let server = thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept pruned status");
+            let _ = read_complete_http_request(&mut status);
+            write_json_response(&mut status, 404, "Not Found", r#"{"detail":"pruned"}"#);
+            let (mut probe, _) = listener.accept().expect("accept forbidden relay probe");
+            let _ = read_complete_http_request(&mut probe);
+            write_json_response(&mut probe, 403, "Forbidden", r#"{"detail":"policy"}"#);
+        });
+
+        assert!(matches!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::Backend(details)) if details.status == Some(403)
+        ));
+        server.join().expect("recovery server");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("load pending candidate"),
+            candidate
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn superseded_preparation_status_clears_the_unauthorized_waiter() {
+        let support_root = telemetry_key_store_root("credential-superseded");
+        let secret_root = telemetry_key_store_root("credential-superseded-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let (pending, _) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            false,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        thread::spawn(move || {
+            let (mut status, _) = listener.accept().expect("accept superseded status");
+            let _ = read_complete_http_request(&mut status);
+            let body = json!({
+                "preparation_id": pending.preparation_id,
+                "status": "superseded",
+                "expires_at": pending.expires_at,
+                "credential_generation": pending.credential_generation,
+                "device": {
+                    "id": pending.device.device_id,
+                    "machine_id": pending.device.machine_id,
+                    "sources": pending.device.sources,
+                }
+            });
+            write_json_response(&mut status, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(false));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load pending")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn offline_past_retention_keeps_pending_candidate() {
+        let support_root = telemetry_key_store_root("credential-offline-retained");
+        let secret_root = telemetry_key_store_root("credential-offline-retained-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let pending = seed_pending_recovery_fixture(
+            unused_loopback_base_url(),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        )
+        .0;
+
+        assert!(recover_pending_device_credential_at_startup().is_err());
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn confirm_server_failure_keeps_authorized_pending_candidate() {
+        let support_root = telemetry_key_store_root("credential-confirm-uncertain");
+        let secret_root = telemetry_key_store_root("credential-confirm-uncertain-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
+        let address = listener.local_addr().expect("recovery backend address");
+        let pending = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        )
+        .0;
+        thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept uncertain confirm");
+            let _ = read_complete_http_request(&mut confirm);
+            write_json_response(&mut confirm, 503, "Unavailable", r#"{"detail":"retry"}"#);
+        });
+
+        assert!(recover_pending_device_credential_at_startup().is_err());
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load pending"),
+            Some(pending)
+        );
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
+    }
+
+    fn seed_active_default_cloud_session_grant() -> crate::cloud_sessions::CloudSessionGrantStore {
+        let grants = crate::cloud_sessions::CloudSessionGrantStore::default();
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        grants
+            .enable(
+                &crate::cloud_sessions::CloudSessionGrantSetup {
+                    installation_id: device_id.to_string(),
+                    organization_scope: "org_guard".to_string(),
+                    effective_user_scope: "user_guard".to_string(),
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("enable cleanup guard");
+        grants
+            .grant_create_request(device_id)
+            .expect("prepare cleanup grant");
+        let local = grants.load().expect("load cleanup grant").expect("grant");
+        let enabled = cloud_control_backend_grant(&local, device_id, "enabled", 1);
+        grants
+            .bind_backend_grant(&enabled, device_id)
+            .expect("bind cleanup grant");
+        grants
+    }
+
+    fn confirm_default_cloud_session_cleanup(
+        grants: &crate::cloud_sessions::CloudSessionGrantStore,
+    ) {
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        grants
+            .revoke(time::OffsetDateTime::now_utc())
+            .expect("revoke cleanup grant");
+        let local = grants.load().expect("load revoked grant").expect("grant");
+        let revoked = cloud_control_backend_grant(&local, device_id, "revoked", 2);
+        grants
+            .apply_backend_revocation(&revoked, device_id)
+            .expect("confirm cleanup revocation");
+    }
+
+    #[test]
+    #[serial]
+    fn restart_guard_failure_never_confirms_authorized_preparation() {
+        let support_root = telemetry_key_store_root("credential-restart-guard-blocked");
+        let secret_root = telemetry_key_store_root("credential-restart-guard-blocked-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind guarded backend");
+        let address = listener.local_addr().expect("guarded backend address");
+        let (mut pending, _) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.preconfirm_guards_passed = false;
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save unguarded pending");
+        let _grants = seed_active_default_cloud_session_grant();
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        listener
+            .set_nonblocking(true)
+            .expect("make guarded listener nonblocking");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load guarded pending"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn restart_confirms_once_only_after_cleanup_later_clears() {
+        let support_root = telemetry_key_store_root("credential-restart-guard-clears");
+        let secret_root = telemetry_key_store_root("credential-restart-guard-clears-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind later-clear backend");
+        let address = listener.local_addr().expect("later-clear backend address");
+        let (mut pending, candidate) = seed_pending_recovery_fixture(
+            format!("http://{address}"),
+            true,
+            "2099-01-01T00:00:00Z",
+            &secret_root,
+        );
+        pending.preconfirm_guards_passed = false;
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .expect("save unguarded pending");
+        let grants = seed_active_default_cloud_session_grant();
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        confirm_default_cloud_session_cleanup(&grants);
+
+        let confirms = Arc::new(AtomicUsize::new(0));
+        let confirms_for_server = confirms.clone();
+        let pending_for_server = pending.clone();
+        let server = thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept one confirm");
+            let request = read_complete_http_request(&mut confirm);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            confirms_for_server.fetch_add(1, Ordering::SeqCst);
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:00:00Z",
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                },
+                "credential_rotation_performed": false,
+            });
+            write_json_response(&mut confirm, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        server.join().expect("confirm server");
+        assert_eq!(confirms.load(Ordering::SeqCst), 1);
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending cleared")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn user_approved_switch_survives_crash_before_cleanup_and_recovers_exact_claim() {
+        let support_root = telemetry_key_store_root("credential-switch-intent-recovery");
+        let secret_root = telemetry_key_store_root("credential-switch-intent-recovery-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind switch recovery backend");
+        let address = listener.local_addr().expect("switch recovery address");
+        let old_account = connected_account();
+        FileAccountStore::default()
+            .save(&old_account)
+            .expect("save old account");
+        let old_device = LocalDeviceBinding {
+            device_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            machine_id: Some("machine-old".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileDeviceStore::default()
+            .save(&old_device)
+            .expect("save old device");
+        let new_account = LocalAccountBinding {
+            state: LocalAccountState::Connected,
+            user: Some(LocalAccountUser {
+                id: "user_switch_new".to_string(),
+                email: "new@example.com".to_string(),
+                display_name: None,
+            }),
+            organization: Some(LocalAccountOrganization {
+                id: "org_switch_new".to_string(),
+                name: "New Org".to_string(),
+            }),
+            connected_at: Some("2026-07-31T20:00:00Z".to_string()),
+            last_refreshed_at: Some("2026-07-31T20:00:00Z".to_string()),
+            message: None,
+        };
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup-switch-new".to_string(),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+            machine_id: Some("machine-new".to_string()),
+            claim_code: Some("claim-switch-new".to_string()),
+            api_base_url: DEFAULT_API_BASE_URL.to_string(),
+        };
+        let setup_token = format!("setup-{}", "switch".repeat(4));
+        let mut pending = test_pending_device_credential("preparation-switch-new", false);
+        pending.api_base_url = format!("http://{address}");
+        pending.device.device_id = "device-switch-new".to_string();
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account: new_account.clone(),
+            connection: connection.clone(),
+            target_user_id: "user_switch_new".to_string(),
+            setup_run_token_sha256: secret_sha256(&setup_token),
+            backfill_policy: None,
+            backfill_cutoff_at: None,
+        });
+        let candidate = format!("candidate-{}", "switch".repeat(4));
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        stage_pending_device_credential(&pending, &candidate).expect("stage switch candidate");
+        stage_pending_setup_run_token(&pending, &setup_token).expect("stage switch setup token");
+        let daemon = daemon().with_account(old_account.clone());
+        daemon
+            .stage_account_switch_if_user_mismatch(StagedAccountSwitch {
+                claim_code: "claim-switch-new".to_string(),
+                new_account: new_account.clone(),
+                setup_run_id: "setup-switch-new".to_string(),
+                setup_run_token: setup_token.clone(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine-new".to_string()),
+                relay_device: None,
+                relay_device_secret: None,
+                relay_device_credential_preparation_id: Some("preparation-switch-new".to_string()),
+                backfill_policy: None,
+                backfill_cutoff_at: None,
+            })
+            .expect("stage account switch")
+            .expect("different user switch");
+        let grants = seed_active_default_cloud_session_grant();
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        assert_eq!(
+            auth_switch_account(&daemon, &authorization, "claim-switch-new"),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        let authorized = FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("load authorized switch")
+            .expect("pending switch");
+        assert!(authorized.confirmation_authorized);
+        assert!(!authorized.preconfirm_guards_passed);
+        assert_eq!(
+            FileAccountStore::default().load().expect("old account"),
+            old_account
+        );
+        drop(daemon);
+
+        assert_eq!(
+            recover_pending_device_credential_at_startup(),
+            Err(LocalApiError::CloudSessionCleanupRequired)
+        );
+        confirm_default_cloud_session_cleanup(&grants);
+        let pending_for_server = authorized.clone();
+        let server = thread::spawn(move || {
+            let (mut confirm, _) = listener.accept().expect("accept switch confirm");
+            let request = read_complete_http_request(&mut confirm);
+            assert!(request.contains(&format!(
+                "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+            )));
+            let body = json!({
+                "preparation_id": pending_for_server.preparation_id,
+                "status": "confirmed",
+                "confirmed_at": "2026-07-31T20:01:00Z",
+                "credential_generation": pending_for_server.credential_generation,
+                "device": {
+                    "id": pending_for_server.device.device_id,
+                    "machine_id": pending_for_server.device.machine_id,
+                    "sources": pending_for_server.device.sources,
+                },
+                "credential_rotation_performed": false,
+            });
+            write_json_response(&mut confirm, 200, "OK", &body.to_string());
+        });
+
+        assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
+        server.join().expect("switch confirm server");
+        assert_eq!(
+            FileAccountStore::default().load().expect("new account"),
+            new_account
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .load()
+                .expect("new connection"),
+            Some(connection)
+        );
+        assert_eq!(
+            FileDeviceStore::default()
+                .load()
+                .expect("new device")
+                .expect("device"),
+            pending.device
+        );
     }
 
     fn create_control_test_dir(path: &Path) {
@@ -11513,6 +15285,60 @@ mod tests {
 
     #[test]
     #[serial]
+    fn logout_fails_before_active_reset_when_recovery_journal_cannot_be_invalidated() {
+        let support_root = telemetry_key_store_root("logout-pending-invalidation");
+        let secret_root = telemetry_key_store_root("logout-pending-invalidation-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let account = connected_account();
+        let device = LocalDeviceBinding {
+            device_id: "device-logout-preserved".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        FileAccountStore::default()
+            .save(&account)
+            .expect("save active account");
+        FileDeviceStore::default()
+            .save(&device)
+            .expect("save active device");
+        fs::create_dir_all(ottto_core::default_pending_device_credential_path())
+            .expect("make pending journal unreadable as a file");
+        let daemon = daemon().with_account(account.clone());
+
+        let response = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_logout_pending_invalidation".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::Cli),
+                client_install_owner: None,
+                command: LocalControlCommand::AuthReset { local_only: true },
+            },
+        );
+
+        assert!(!response.ok);
+        assert_eq!(
+            FileAccountStore::default().load().expect("active account"),
+            account
+        );
+        assert_eq!(
+            FileDeviceStore::default().load().expect("active device"),
+            Some(device)
+        );
+        assert_eq!(
+            daemon.status("token").expect("daemon status").account.state,
+            LocalAccountState::Connected
+        );
+        let _ = fs::remove_dir_all(support_root);
+        let _ = fs::remove_dir_all(secret_root);
+    }
+
+    #[test]
+    #[serial]
     fn local_reset_file_cleanup_clears_relay_device_binding() {
         let support_root = telemetry_key_store_root("local-reset-device-binding");
         let _support_guard =
@@ -11570,8 +15396,8 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let (device, secret) =
-            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+        let credentials = relay_device_credentials_from_claim_completion(
+            &SetupClaimCompleteResponse {
                 setup_run_id: "setup_claim".to_string(),
                 setup_run_token: "otsr_claim".to_string(),
                 setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -11586,6 +15412,7 @@ mod tests {
                     ],
                 }),
                 relay_device_secret: Some("otdev_rotated_claim".to_string()),
+                relay_device_credential_preparation: None,
                 connected_at: "2026-05-05T09:20:00Z".to_string(),
                 user: SetupClaimCompleteUser {
                     id: "user_claim".to_string(),
@@ -11598,9 +15425,13 @@ mod tests {
                 },
                 backfill_policy: None,
                 backfill_cutoff_at: None,
-            })
-            .expect("materialize claim relay device")
-            .expect("relay device credentials present");
+            },
+            None,
+        )
+        .expect("materialize claim relay device");
+        let ClaimRelayDeviceCredential::Legacy(device, secret) = credentials else {
+            panic!("legacy relay device credentials present");
+        };
         persist_relay_device_credentials(&device, &secret).expect("persist claim relay device");
         assert_eq!(
             FileDeviceStore::default()
@@ -11635,14 +15466,15 @@ mod tests {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
         let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
-        let credentials =
-            relay_device_credentials_from_claim_completion(&SetupClaimCompleteResponse {
+        let credentials = relay_device_credentials_from_claim_completion(
+            &SetupClaimCompleteResponse {
                 setup_run_id: "setup_claim".to_string(),
                 setup_run_token: "otsr_claim".to_string(),
                 setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
                 machine_id: Some("machine_claim".to_string()),
                 relay_device: None,
                 relay_device_secret: None,
+                relay_device_credential_preparation: None,
                 connected_at: "2026-05-05T09:20:00Z".to_string(),
                 user: SetupClaimCompleteUser {
                     id: "user_claim".to_string(),
@@ -11655,14 +15487,84 @@ mod tests {
                 },
                 backfill_policy: None,
                 backfill_cutoff_at: None,
-            })
-            .expect("materialize no claim relay device");
+            },
+            None,
+        )
+        .expect("materialize no claim relay device");
 
-        assert!(credentials.is_none());
+        assert!(matches!(credentials, ClaimRelayDeviceCredential::None));
         assert_eq!(
             FileDeviceStore::default().load().expect("load device"),
             None
         );
+    }
+
+    #[test]
+    #[serial]
+    fn claim_completion_accepts_only_the_modern_prepared_credential_shape() {
+        let support_root = telemetry_key_store_root("claim-complete-prepared-device");
+        let secret_root = telemetry_key_store_root("claim-complete-prepared-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let completed: SetupClaimCompleteResponse = serde_json::from_value(json!({
+            "setup_run_id": "setup_claim",
+            "setup_run_token": "setup-token",
+            "setup_run_token_expires_at": "2026-08-01T00:00:00Z",
+            "machine_id": "machine-one",
+            "relay_device_credential_preparation": {
+                "preparation_id": "preparation-modern",
+                "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                "expires_at": "2026-08-01T00:00:00Z",
+                "credential_generation": 2,
+                "device": {"id": "device-modern", "machine_id": "machine-one", "sources": ["codex"]},
+                "candidate_secret": candidate.clone(),
+                "credential_rotation_planned": false
+            },
+            "connected_at": "2026-07-31T20:00:00Z",
+            "user": {"id": "user-one", "email": "user@example.com", "display_name": null},
+            "organization": {"id": "org-one", "name": "Org"}
+        }))
+        .expect("parse modern completion");
+
+        let credentials = relay_device_credentials_from_claim_completion(&completed, None)
+            .expect("validate modern completion");
+        let ClaimRelayDeviceCredential::Prepared(prepared) = credentials else {
+            panic!("modern preparation expected");
+        };
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains(&candidate));
+        assert!(!debug.contains("preparation-modern"));
+
+        let mut mixed: serde_json::Value = serde_json::to_value(json!({
+            "setup_run_id": "setup_claim",
+            "setup_run_token": "setup-token",
+            "setup_run_token_expires_at": "2026-08-01T00:00:00Z",
+            "machine_id": "machine-one",
+            "relay_device": {"id": "device-active", "machine_id": "machine-one", "sources": ["codex"]},
+            "relay_device_secret": "legacy-secret",
+            "relay_device_credential_preparation": {
+                "preparation_id": "preparation-modern",
+                "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                "expires_at": "2026-08-01T00:00:00Z",
+                "credential_generation": 2,
+                "device": {"id": "device-modern", "machine_id": "machine-one", "sources": ["codex"]},
+                "candidate_secret": "candidate-secret",
+                "credential_rotation_planned": false
+            },
+            "connected_at": "2026-07-31T20:00:00Z",
+            "user": {"id": "user-one", "email": "user@example.com", "display_name": null},
+            "organization": {"id": "org-one", "name": "Org"}
+        }))
+        .expect("serialize mixed completion");
+        // Keep the value mutable to make it explicit this is a wire-shape
+        // rejection test, not a typed constructor accidentally omitting data.
+        mixed["backfill_policy"] = serde_json::Value::Null;
+        let mixed: SetupClaimCompleteResponse =
+            serde_json::from_value(mixed).expect("parse mixed completion");
+        assert!(relay_device_credentials_from_claim_completion(&mixed, None).is_err());
     }
 
     #[test]
@@ -11694,6 +15596,151 @@ mod tests {
                 Some("install_test")
             );
         }
+    }
+
+    #[test]
+    fn telemetry_registration_declares_continuity_and_sends_proof_only_as_a_pair() {
+        let machine = test_machine();
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install_session_continuity".to_string(),
+            install_session_token: "install_token_continuity".to_string(),
+        };
+        let first = telemetry_device_register_body(&install_session, &machine);
+        assert_eq!(
+            first["identity_continuity_capability"],
+            IDENTITY_CONTINUITY_CAPABILITY
+        );
+        assert!(first.get("prior_device_id").is_none());
+        assert!(first.get("prior_device_secret").is_none());
+
+        let prior = PriorDeviceCredential {
+            device_id: "device_prior".to_string(),
+            device_sources: vec!["codex".to_string()],
+            device_secret: "secret_prior".to_string(),
+        };
+        let repeat =
+            telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
+        assert_eq!(repeat["prior_device_id"], "device_prior");
+        assert_eq!(repeat["prior_device_secret"], "secret_prior");
+    }
+
+    #[test]
+    fn telemetry_registration_response_keeps_old_backend_tolerance_and_checks_rotation() {
+        let url = "https://api.ottto.net/api/v1/telemetry/devices/register";
+        let prior = PriorDeviceCredential {
+            device_id: "device_prior".to_string(),
+            device_sources: vec!["codex".to_string()],
+            device_secret: "secret_prior".to_string(),
+        };
+        let old: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
+            r#"{"device":{"id":"device","machine_id":"machine","sources":["codex"]},"device_secret":"secret"}"#,
+        )
+        .expect("old backend response");
+        validate_registration_continuity_response(url, &old, Some(&prior))
+            .expect("additive response fields stay optional");
+
+        let rotated: TelemetryDeviceRegisterApiResponse = serde_json::from_str(
+            r#"{"device":{"id":"device_new","machine_id":"machine","sources":["codex"]},"device_secret":"secret_new","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_prior"}"#,
+        )
+        .expect("rotation response");
+        validate_registration_continuity_response(url, &rotated, Some(&prior))
+            .expect("matching rotation proof");
+
+        validate_registration_continuity_response(url, &rotated, None)
+            .expect_err("first registration cannot claim a prior rotation");
+    }
+
+    #[test]
+    #[serial]
+    fn modern_registration_prepare_and_confirm_use_the_additive_contract() {
+        let support_root = telemetry_key_store_root("device-prepare-wire");
+        let secret_root = telemetry_key_store_root("device-prepare-wire-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind prepare backend");
+        let address = listener.local_addr().expect("prepare backend address");
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let candidate_for_server = candidate.clone();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_server = captured.clone();
+        thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept credential request");
+                let request = read_complete_http_request(&mut stream);
+                captured_for_server
+                    .lock()
+                    .expect("captured request lock")
+                    .push(request);
+                let body = if index == 0 {
+                    json!({
+                        "preparation_id": "preparation-wire",
+                        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                        "expires_at": "2026-08-01T00:00:00Z",
+                        "credential_generation": 3,
+                        "device": {"id": "device-wire", "machine_id": "machine_test", "sources": ["codex"]},
+                        "candidate_secret": candidate_for_server.clone(),
+                        "credential_rotation_planned": false
+                    })
+                } else {
+                    json!({
+                        "preparation_id": "preparation-wire",
+                        "status": "confirmed",
+                        "confirmed_at": "2026-07-31T20:00:00Z",
+                        "credential_generation": 3,
+                        "device": {"id": "device-wire", "machine_id": "machine_test", "sources": ["codex"]},
+                        "credential_rotation_performed": false
+                    })
+                };
+                write_json_response(&mut stream, 200, "OK", &body.to_string());
+            }
+        });
+        let api_base_url = format!("http://{address}");
+        let install_session = InstallSessionApiResponse {
+            install_session_id: "install-session-wire".to_string(),
+            install_session_token: "install-token-wire".to_string(),
+        };
+        let (prepared, _prior, request_authority) =
+            prepare_telemetry_device_registration(&api_base_url, &install_session, &test_machine())
+                .expect("prepare registration");
+        let mut pending = pending_device_credential_from_preparation(
+            &api_base_url,
+            &prepared,
+            true,
+            None,
+            request_authority,
+        )
+        .expect("materialize pending");
+        pending.preconfirm_guards_passed = true;
+        confirm_device_credential_preparation(&pending, &candidate).expect("confirm registration");
+
+        let requests = captured.lock().expect("captured requests");
+        let prepare_request = &requests[0];
+        assert!(prepare_request
+            .starts_with("POST /api/v1/telemetry/devices/registration-preparations HTTP/1.1"));
+        let prepare_body: serde_json::Value =
+            serde_json::from_str(http_request_body(prepare_request)).expect("prepare body");
+        assert_eq!(
+            prepare_body["credential_preparation_capability"],
+            DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
+        );
+        assert_eq!(
+            prepare_body["credential_preparation_idempotency_key"],
+            device_credential_preparation_idempotency_key(
+                "register",
+                "install-session-wire",
+                "install_test"
+            )
+        );
+        let confirm_request = &requests[1];
+        assert!(confirm_request.starts_with(
+            "POST /api/v1/telemetry/device-credential-preparations/preparation-wire/confirm HTTP/1.1"
+        ));
+        assert!(confirm_request.contains(&format!(
+            "{DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER}: {candidate}"
+        )));
+        assert!(!confirm_request.contains("/telemetry/devices/register "));
     }
 
     /// Every backend payload that already carries install-scoped identity must
@@ -11747,10 +15794,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn claim_completion_request_includes_existing_relay_device_identity() {
+    fn claim_completion_request_sends_existing_keychain_proof_stably_across_retries() {
         let support_root = telemetry_key_store_root("claim-complete-request-device");
+        let secret_root = telemetry_key_store_root("claim-complete-request-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
         let _support_guard =
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
         FileDeviceStore::default()
             .save(&LocalDeviceBinding {
                 device_id: "device_existing_claim".to_string(),
@@ -11758,45 +15808,86 @@ mod tests {
                 sources: vec!["codex".to_string(), "pi".to_string()],
             })
             .expect("persist existing relay device");
+        let prior_secret = format!("prior-{}", "claim-proof".repeat(3));
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &prior_secret,
+        )
+        .expect("persist existing relay secret fallback");
+        let candidate_secret = format!("candidate-{}", "claim".repeat(4));
 
-        let captured_request = Arc::new(Mutex::new(None));
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind claim backend");
         let address = listener.local_addr().expect("claim backend address");
-        let captured_request_for_thread = captured_request.clone();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept claim complete");
-            let request = read_complete_http_request(&mut stream);
-            *captured_request_for_thread
-                .lock()
-                .expect("captured request lock") = Some(request);
-            write_json_response(
-                &mut stream,
-                200,
-                "OK",
-                r#"{"setup_run_id":"setup_claim","setup_run_token":"otsr_claim","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_claim","email":"claim@example.com","display_name":null},"organization":{"id":"org_claim","name":"Claim Org"}}"#,
-            );
+        let captured_requests_for_thread = captured_requests.clone();
+        let candidate_for_server = candidate_secret.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept claim complete");
+                let request = read_complete_http_request(&mut stream);
+                captured_requests_for_thread
+                    .lock()
+                    .expect("captured request lock")
+                    .push(request);
+                let response = json!({
+                    "setup_run_id": "setup_claim",
+                    "setup_run_token": "otsr_claim",
+                    "setup_run_token_expires_at": "2026-05-05T10:30:00Z",
+                    "machine_id": "machine_test",
+                    "relay_device_credential_preparation": {
+                        "preparation_id": "preparation-claim-existing",
+                        "capability": DEVICE_CREDENTIAL_PREPARATION_CAPABILITY,
+                        "expires_at": "2099-01-01T00:00:00Z",
+                        "credential_generation": 7,
+                        "device": {
+                            "id": "device_claim_next",
+                            "machine_id": "machine_test",
+                            "sources": ["codex", "pi"],
+                        },
+                        "candidate_secret": candidate_for_server.clone(),
+                        "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+                        "credential_rotation_planned": true,
+                        "prior_device_id": "device_existing_claim",
+                    },
+                    "connected_at": "2026-05-05T09:20:00Z",
+                    "user": {
+                        "id": "user_claim",
+                        "email": "claim@example.com",
+                        "display_name": null,
+                    },
+                    "organization": {"id": "org_claim", "name": "Claim Org"},
+                });
+                write_json_response(&mut stream, 200, "OK", &response.to_string());
+            }
         });
         let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
 
-        complete_setup_claim(
-            &PendingAuthClaim {
-                claim_code: "claim_existing".to_string(),
-                claim_token: "token_existing".to_string(),
-                nonce: "nonce_existing".to_string(),
-                claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
-                expires_at: "2026-05-05T09:30:00Z".to_string(),
-            },
-            &test_machine(),
-        )
-        .expect("complete setup claim");
+        let claim = PendingAuthClaim {
+            claim_code: "claim_existing".to_string(),
+            claim_token: "token_existing".to_string(),
+            nonce: "nonce_existing".to_string(),
+            claim_url: "https://ottto.net/setup/claim?code=claim_existing".to_string(),
+            expires_at: "2026-05-05T09:30:00Z".to_string(),
+        };
+        let mut completions = Vec::new();
+        for _ in 0..2 {
+            completions.push(
+                complete_setup_claim(&claim, &test_machine(), None).expect("complete setup claim"),
+            );
+        }
+        server.join().expect("claim server");
 
-        let request = captured_request
-            .lock()
-            .expect("captured request lock")
-            .clone()
-            .expect("request captured");
+        let requests = captured_requests.lock().expect("captured request lock");
+        assert_eq!(requests.len(), 2);
+        let request = &requests[0];
         let body: serde_json::Value =
-            serde_json::from_str(http_request_body(&request)).expect("claim request json");
+            serde_json::from_str(http_request_body(request)).expect("claim request json");
+        let retry_body: serde_json::Value =
+            serde_json::from_str(http_request_body(&requests[1])).expect("retry request json");
+        assert_eq!(
+            retry_body, body,
+            "retry must reproduce the exact proof body"
+        );
         assert_eq!(
             body.get("relay_device_id")
                 .and_then(serde_json::Value::as_str),
@@ -11812,6 +15903,16 @@ mod tests {
             Some(vec!["codex", "pi"])
         );
         assert_eq!(
+            body.get("identity_continuity_capability")
+                .and_then(serde_json::Value::as_str),
+            Some(IDENTITY_CONTINUITY_CAPABILITY)
+        );
+        assert_eq!(
+            body.get("prior_device_secret")
+                .and_then(serde_json::Value::as_str),
+            Some(prior_secret.as_str())
+        );
+        assert_eq!(
             body.get("installation_id")
                 .and_then(serde_json::Value::as_str),
             Some("install_test"),
@@ -11822,6 +15923,280 @@ mod tests {
             Some(&serde_json::Value::Null),
             "claim completion must send hardware_uuid when known and null otherwise"
         );
+        assert_eq!(
+            body.get("credential_preparation_capability")
+                .and_then(serde_json::Value::as_str),
+            Some(DEVICE_CREDENTIAL_PREPARATION_CAPABILITY)
+        );
+        let expected_idempotency_key = device_credential_preparation_idempotency_key(
+            "setup_claim",
+            "claim_existing",
+            "install_test",
+        );
+        assert_eq!(
+            body.get("credential_preparation_idempotency_key")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_idempotency_key.as_str())
+        );
+
+        let completion = completions.pop().expect("claim completion");
+        let credentials = relay_device_credentials_from_claim_completion(
+            &completion.response,
+            completion.prior_device_credential.as_ref(),
+        )
+        .expect("validate prepared claim credential");
+        let ClaimRelayDeviceCredential::Prepared(prepared) = credentials else {
+            panic!("prepared claim credential");
+        };
+        let pending = pending_device_credential_from_preparation(
+            &format!("http://{address}"),
+            &prepared,
+            false,
+            None,
+            completion.request_authority,
+        )
+        .expect("materialize exact pending claim credential");
+        let authority = pending
+            .request_authority
+            .as_ref()
+            .expect("request authority journal");
+        assert_eq!(authority.flow, "setup_claim");
+        assert_eq!(
+            authority.prior_device_id.as_deref(),
+            Some("device_existing_claim")
+        );
+        assert_eq!(
+            authority.prior_device_sources.as_deref(),
+            Some(["codex".to_string(), "pi".to_string()].as_slice())
+        );
+        let prior_secret_commitment = secret_sha256(&prior_secret);
+        assert_eq!(
+            authority.prior_secret_commitment_sha256.as_deref(),
+            Some(prior_secret_commitment.as_str())
+        );
+        assert_eq!(
+            pending.secret_commitment_sha256,
+            secret_sha256(&candidate_secret)
+        );
+        let raw_journal = serde_json::to_string(&pending).expect("serialize pending journal");
+        assert!(!raw_journal.contains(&prior_secret));
+        assert!(!raw_journal.contains(&candidate_secret));
+        stage_pending_device_credential(&pending, &candidate_secret)
+            .expect("stage exact pending candidate");
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .expect("load exact pending candidate"),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn first_device_claim_completion_omits_prior_credential_proof() {
+        let support_root = telemetry_key_store_root("claim-complete-first-device");
+        let secret_root = telemetry_key_store_root("claim-complete-first-device-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let captured = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind first claim backend");
+        let address = listener.local_addr().expect("first claim address");
+        let captured_for_server = captured.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept first claim");
+            *captured_for_server.lock().expect("captured request lock") =
+                Some(read_complete_http_request(&mut stream));
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_first","setup_run_token":"otsr_first","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_first","email":"first@example.com","display_name":null},"organization":{"id":"org_first","name":"First Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_first".to_string(),
+                claim_token: "token_first".to_string(),
+                nonce: "nonce_first".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_first".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        )
+        .expect("complete first setup claim");
+        server.join().expect("first claim server");
+
+        let request = captured
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("first request");
+        let body: serde_json::Value =
+            serde_json::from_str(http_request_body(&request)).expect("first request body");
+        for field in [
+            "relay_device_id",
+            "relay_device_sources",
+            "prior_device_secret",
+            "identity_continuity_capability",
+        ] {
+            assert!(body.get(field).is_none(), "unexpected first-device {field}");
+        }
+    }
+
+    #[test]
+    fn existing_device_with_missing_secret_fails_closed() {
+        use ottto_core::token_store::MemoryTokenStore;
+
+        let root = control_test_root("claim-prior-secret-missing");
+        let device_store = FileDeviceStore::new(root.join("device.json"));
+        device_store
+            .save(&LocalDeviceBinding {
+                device_id: "device-existing".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save existing device");
+        let missing_secret = MemoryTokenStore::new();
+
+        assert!(matches!(
+            prior_device_credential_with_stores(&device_store, &missing_secret),
+            Err(LocalApiError::StatePoisoned)
+        ));
+        assert!(device_store
+            .load()
+            .expect("existing binding remains readable")
+            .is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn rejected_prior_proof_preserves_active_authority_and_no_pending_candidate() {
+        let support_root = telemetry_key_store_root("claim-prior-proof-rejected");
+        let secret_root = telemetry_key_store_root("claim-prior-proof-rejected-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let active_device = LocalDeviceBinding {
+            device_id: "device-rejected-proof".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            sources: vec!["codex".to_string()],
+        };
+        let rejected_secret = format!("rejected-{}", "proof".repeat(4));
+        FileDeviceStore::default()
+            .save(&active_device)
+            .expect("save active binding");
+        fs::write(
+            secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+            &rejected_secret,
+        )
+        .expect("save rejected proof fallback");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rejecting backend");
+        let address = listener.local_addr().expect("rejecting backend address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept rejected proof");
+            let _ = read_complete_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                401,
+                "Unauthorized",
+                r#"{"detail":"invalid prior device credential"}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        let result = complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_rejected".to_string(),
+                claim_token: "token_rejected".to_string(),
+                nonce: "nonce_rejected".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_rejected".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        );
+        server.join().expect("rejecting backend");
+
+        assert!(matches!(
+            result,
+            Err(LocalApiError::Backend(details)) if details.status == Some(401)
+        ));
+        assert_eq!(
+            FileDeviceStore::default().load().expect("active binding"),
+            Some(active_device)
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .expect("active proof"),
+            rejected_secret
+        );
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending journal")
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn prior_secret_rotation_during_claim_http_is_detected_before_journaling() {
+        let support_root = telemetry_key_store_root("claim-prior-proof-race");
+        let secret_root = telemetry_key_store_root("claim-prior-proof-race-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device-proof-race".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["codex".to_string()],
+            })
+            .expect("save active binding");
+        let secret_path = secret_root.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT);
+        fs::write(&secret_path, "prior-proof-before").expect("save initial proof");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind proof race backend");
+        let address = listener.local_addr().expect("proof race address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept proof race");
+            let request = read_complete_http_request(&mut stream);
+            let body: serde_json::Value =
+                serde_json::from_str(http_request_body(&request)).expect("proof race body");
+            assert_eq!(body["prior_device_secret"], "prior-proof-before");
+            fs::write(secret_path, "prior-proof-after").expect("rotate proof out of band");
+            write_json_response(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"setup_run_id":"setup_race","setup_run_token":"otsr_race","setup_run_token_expires_at":"2026-05-05T10:30:00Z","machine_id":"machine_test","connected_at":"2026-05-05T09:20:00Z","user":{"id":"user_race","email":"race@example.com","display_name":null},"organization":{"id":"org_race","name":"Race Org"}}"#,
+            );
+        });
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &format!("http://{address}"));
+
+        let result = complete_setup_claim(
+            &PendingAuthClaim {
+                claim_code: "claim_race".to_string(),
+                claim_token: "token_race".to_string(),
+                nonce: "nonce_race".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_race".to_string(),
+                expires_at: "2026-05-05T09:30:00Z".to_string(),
+            },
+            &test_machine(),
+            None,
+        );
+        server.join().expect("proof race server");
+
+        assert!(matches!(result, Err(LocalApiError::StatePoisoned)));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .expect("pending journal")
+            .is_none());
     }
 
     #[test]
@@ -13285,6 +17660,7 @@ mod tests {
                 machine_id: Some("machine_new".to_string()),
                 relay_device: None,
                 relay_device_secret: None,
+                relay_device_credential_preparation_id: None,
                 backfill_policy: None,
                 backfill_cutoff_at: None,
             })
@@ -13697,6 +18073,9 @@ mod tests {
         };
         FileAccountStore::default().save(&account).unwrap();
         FileDeviceStore::default().save(&old_device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("otdev_old_claim")
+            .unwrap();
         let pending = PendingAuthClaim {
             claim_code: "claim_reserved".to_string(),
             claim_token: "claim_token_reserved".to_string(),
@@ -13904,6 +18283,9 @@ mod tests {
         };
         FileAccountStore::default().save(&account).unwrap();
         FileDeviceStore::default().save(&old_device).unwrap();
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("otdev_old_install")
+            .unwrap();
         let (api_base, register_seen, allow_register) = controlled_install_registration_server();
         let connection = LocalConnectionBinding {
             setup_run_id: "setup_install_reserved".to_string(),
@@ -15488,6 +19870,362 @@ mod tests {
     }
 
     #[test]
+    fn pi_session_import_platform_support_matches_rooted_open_contract() {
+        assert_eq!(pi_session_import_supported_on_target(), cfg!(unix));
+        assert_eq!(
+            require_pi_session_import_platform_support().is_ok(),
+            cfg!(unix)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_first_use_establishes_held_empty_census_before_smoke() {
+        let root = control_test_root("pi-live-first-use");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\nprintf '{}\\n' > \"$HOME/.pi/agent/sessions/first.jsonl\"\n",
+        )
+        .expect("write first-use Pi smoke");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Pi executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake Pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+
+        let (before, _, smoke) = match run_pi_route_pre_smoke(&live_pi_route()) {
+            Ok(ready) => ready,
+            Err(failed) => panic!("first-use pre-smoke failed: {}", failed.message.text),
+        };
+
+        assert!(before.files.is_empty(), "baseline must precede the smoke");
+        assert!(smoke.succeeded, "fake Pi smoke failed: {}", smoke.message);
+        let selected = new_pi_route_session_files(&before).expect("select first-use transcript");
+        assert_eq!(selected, vec![home.join(".pi/agent/sessions/first.jsonl")]);
+        let mut upload =
+            open_pi_session_upload(&before.root, &selected[0], PI_SESSION_SAFETY_LIMITS)
+                .expect("first-use transcript is import-ready beneath held root");
+        let mut bytes = Vec::new();
+        upload
+            .file
+            .read_to_end(&mut bytes)
+            .expect("read first-use transcript");
+        assert_eq!(bytes, b"{}\n");
+        for path in [
+            home.join(".pi"),
+            home.join(".pi/agent"),
+            home.join(".pi/agent/sessions"),
+        ] {
+            let mode = fs::metadata(path)
+                .expect("created Pi directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "new Pi directories must be owner-only");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_census_error_returns_failed_without_spawning_smoke() {
+        let root = control_test_root("pi-live-census-error");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let smoke_ran = std::cell::Cell::new(false);
+        let private_error = "/Users/private/operator/pi-census";
+
+        let result = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            || {
+                Err(LocalApiError::LocalOperationFailed(
+                    private_error.to_string(),
+                ))
+            },
+            |_, _| {
+                smoke_ran.set(true);
+                panic!("smoke must not run after a census error")
+            },
+        );
+        let failed = match result {
+            Ok(_) => panic!("census error must fail before smoke"),
+            Err(failed) => *failed,
+        };
+
+        assert!(!smoke_ran.get());
+        assert_eq!(failed.status, SourceVerificationStatus::Failed);
+        assert!(!failed.verified);
+        assert!(!failed.command_succeeded);
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(PI_SESSION_CENSUS_FAILED_CODE)
+        );
+        assert_eq!(failed.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!failed.message.text.contains(private_error));
+        assert!(!failed.message.text.contains("/Users/"));
+        assert!(failed.message.text.contains("~/.pi/agent/sessions"));
+        let aggregate = pi_route_aggregate_result(vec![failed]);
+        assert_eq!(aggregate.status, SourceVerificationStatus::Failed);
+        assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!aggregate.message.text.contains(private_error));
+        assert!(!aggregate.message.text.contains("/Users/"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_root_replacement_during_smoke_cannot_verify_from_reopened_count() {
+        let root = control_test_root("pi-live-root-replaced-during-smoke");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let sessions = home.join(".pi/agent/sessions");
+        let original = home.join(".pi/agent/sessions-original");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let result = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            prepare_pi_live_session_census,
+            |_, before_session_count| {
+                fs::rename(&sessions, &original).expect("move held pre-smoke root");
+                fs::create_dir(&sessions).expect("create replacement session root");
+                fs::write(sessions.join("preexisting-a.jsonl"), b"{}\n")
+                    .expect("write first replacement transcript");
+                fs::write(sessions.join("preexisting-b.jsonl"), b"{}\n")
+                    .expect("write second replacement transcript");
+                assert_eq!(
+                    local_session_observed(before_session_count),
+                    Some(true),
+                    "the legacy pathname count would misclassify replacement files as smoke evidence"
+                );
+                SmokeResult {
+                    command_found: true,
+                    succeeded: true,
+                    exit_status: Some(0),
+                    duration_ms: 1,
+                    message: "fake Pi smoke completed".to_string(),
+                    diagnostic: None,
+                    error_code: None,
+                    local_session_observed: Some(true),
+                }
+            },
+        );
+        let failed = match result {
+            Ok(_) => panic!("a replaced root must fail before route evidence is accepted"),
+            Err(failed) => *failed,
+        };
+
+        assert_eq!(failed.status, SourceVerificationStatus::Failed);
+        assert!(!failed.verified);
+        assert!(failed.command_found);
+        assert!(failed.command_succeeded);
+        assert_eq!(failed.exit_status, Some(0));
+        assert_eq!(failed.duration_ms, 1);
+        assert!(failed.smoke_after.is_some());
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(PI_SESSION_CENSUS_FAILED_CODE)
+        );
+        assert_eq!(failed.local_session_observed, None);
+        assert!(failed.message.text.contains("completed smoke"));
+        assert!(!failed.message.text.contains("could not run a smoke"));
+        let aggregate = pi_route_aggregate_result(vec![failed]);
+        assert_eq!(aggregate.status, SourceVerificationStatus::Failed);
+        assert!(!aggregate.verified);
+        assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!aggregate.message.text.contains("stopped before smoke"));
+        assert!(aggregate.message.text.contains("before or after smoke"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn failed_live_pi_smoke_remains_primary_when_root_changes() {
+        let root = control_test_root("pi-live-root-replaced-after-failed-smoke");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let sessions = home.join(".pi/agent/sessions");
+        let original = home.join(".pi/agent/sessions-original");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let (_, _, smoke) = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            prepare_pi_live_session_census,
+            |_, _| {
+                fs::rename(&sessions, &original).expect("move held pre-smoke root");
+                fs::create_dir(&sessions).expect("create replacement session root");
+                SmokeResult {
+                    command_found: true,
+                    succeeded: false,
+                    exit_status: Some(23),
+                    duration_ms: 2,
+                    message: "fake Pi smoke failed".to_string(),
+                    diagnostic: Some("synthetic smoke failure".to_string()),
+                    error_code: Some("smoke_command_failed".to_string()),
+                    local_session_observed: Some(true),
+                }
+            },
+        )
+        .expect("failed smoke remains the primary route result");
+
+        assert!(!smoke.succeeded);
+        assert_eq!(smoke.exit_status, Some(23));
+        assert_eq!(smoke.error_code.as_deref(), Some("smoke_command_failed"));
+        assert_eq!(smoke.local_session_observed, None);
+        assert_eq!(smoke.message, "fake Pi smoke failed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_refuses_symlink_without_creating_beyond_it() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-live-root-symlink");
+        let outside = control_test_root("pi-live-root-symlink-outside");
+        symlink(&outside, home.join(".pi")).expect("symlink .pi outside HOME");
+
+        assert!(open_or_create_pi_session_root_from_home_io(&home).is_err());
+        assert!(!outside.join("agent").exists());
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_securely_reopens_an_eexist_race_winner() {
+        let home = control_test_root("pi-live-root-eexist");
+        let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
+        let pi = home.join(".pi");
+
+        let opened = open_or_create_pi_directory_component_with(
+            &held_home.directory,
+            ".pi".as_ref(),
+            |_, _| {
+                fs::create_dir(&pi).expect("race winner creates a real directory");
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            },
+        )
+        .expect("secure reopen accepts a real EEXIST race winner");
+
+        let opened_metadata = opened.metadata().expect("opened race winner metadata");
+        let path_metadata = fs::metadata(&pi).expect("race winner path metadata");
+        assert!(opened_metadata.is_dir());
+        assert_eq!(opened_metadata.dev(), path_metadata.dev());
+        assert_eq!(opened_metadata.ino(), path_metadata.ino());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_refuses_a_symlink_eexist_race_winner() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-live-root-eexist-symlink");
+        let outside = control_test_root("pi-live-root-eexist-symlink-outside");
+        let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
+
+        let result = open_or_create_pi_directory_component_with(
+            &held_home.directory,
+            ".pi".as_ref(),
+            |_, _| {
+                symlink(&outside, home.join(".pi")).expect("race winner creates symlink");
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!outside.join("agent").exists());
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_preserves_existing_component_mode() {
+        let home = control_test_root("pi-live-existing-mode");
+        let pi = home.join(".pi");
+        fs::create_dir(&pi).expect("create existing .pi");
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o750)).expect("set existing .pi mode");
+
+        let opened = open_or_create_pi_session_root_from_home_io(&home)
+            .expect("securely complete existing Pi tree");
+
+        assert_eq!(
+            fs::metadata(&pi)
+                .expect("existing .pi metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750,
+            "live Verify must not change an existing Pi directory mode"
+        );
+        assert_eq!(
+            opened
+                .directory
+                .metadata()
+                .expect("held sessions descriptor")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn passive_pi_session_selection_does_not_create_missing_root() {
+        let root = control_test_root("pi-passive-missing-root");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let selection =
+            recent_pi_session_files(UNIX_EPOCH).expect("passive missing root remains no data");
+
+        assert!(selection.is_none());
+        assert!(!home.join(".pi").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn pi_session_import_refuses_unsupported_non_unix_target_before_path_access() {
+        let absent = Path::new("definitely-absent-pi-session-root");
+        for result in [
+            open_pi_session_root_from_home(absent),
+            open_pi_session_root_direct(absent),
+        ] {
+            let error = match result {
+                Ok(_) => panic!("non-Unix Pi session access must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON),
+                "unexpected refusal: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pi_session_files_include_nested_workspace_sessions() {
         let root = std::env::temp_dir().join(format!(
             "ottto-pi-session-files-{}-{}",
@@ -15499,13 +20237,471 @@ mod tests {
         fs::write(nested.join("session.jsonl"), "{}\n").expect("write nested session");
         fs::write(root.join("ignore.txt"), "ignored").expect("write ignored file");
 
-        let files = pi_session_files_in(&root);
+        let files = pi_session_files_in(&root).expect("discover nested Pi session");
 
         assert_eq!(files.len(), 1);
         assert!(files.contains(&nested.join("session.jsonl")));
+
+        let opened_root = open_pi_test_root(&root);
+        let body = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[nested.join("session.jsonl")],
+            "test-boundary",
+            PiSessionSafetyLimits {
+                max_depth: 4,
+                max_entries: 16,
+                max_files: 4,
+                max_file_bytes: 64,
+                max_aggregate_bytes: 128,
+                max_multipart_field_bytes: 64,
+                max_multipart_body_bytes: 4 * 1024,
+            },
+        )
+        .expect("build bounded nested Pi multipart");
+        assert!(body.windows(3).any(|window| window == b"{}\n"));
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_discovery_skips_symlink_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-symlinks");
+        let outside = control_test_root("pi-session-symlinks-outside");
+        let real = root.join("real.jsonl");
+        fs::write(&real, b"inside\n").expect("write real session");
+        fs::write(outside.join("outside.jsonl"), b"outside\n").expect("write outside session");
+        symlink(outside.join("outside.jsonl"), root.join("file-link.jsonl"))
+            .expect("create file symlink");
+        symlink(&outside, root.join("directory-link")).expect("create directory symlink");
+
+        let files = pi_session_files_in(&root).expect("bounded symlink-safe discovery");
+
+        assert_eq!(files, BTreeSet::from([real]));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_missing_root_remains_no_data() {
+        let root = control_test_root("pi-session-missing-root");
+        fs::remove_dir_all(&root).expect("remove Pi session root");
+
+        let files = pi_session_files_in(&root).expect("missing top-level root is no data");
+
+        assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_traversal_refuses_a_vanished_candidate() {
+        let root = control_test_root("pi-session-vanished-candidate");
+        let vanished = root.join("vanished.jsonl");
+        let mut entries_seen = 0;
+        let mut files = BTreeSet::new();
+
+        let error = collect_pi_session_files(
+            &vanished,
+            1,
+            &mut entries_seen,
+            &mut files,
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("a candidate that vanished after enumeration must refuse the census");
+
+        assert!(error.to_string().contains("could not inspect"));
+        assert!(files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_before_smoke_census_cannot_reclassify_existing_files_as_new() {
+        let root = control_test_root("pi-session-unreadable-before-smoke");
+        let blocked = root.join("blocked");
+        let preexisting = blocked.join("preexisting.jsonl");
+        fs::create_dir(&blocked).expect("create blocked session directory");
+        fs::write(&preexisting, b"preexisting\n").expect("write pre-existing session");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))
+            .expect("make session directory unreadable");
+
+        // Privileged Unix users may bypass mode bits. Exercise the portable
+        // permission-denied contract when this platform enforces them.
+        if fs::read_dir(&blocked).is_ok() {
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+                .expect("restore readable session directory");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let before = pi_session_files_in(&root);
+        assert!(
+            before.is_err(),
+            "an unreadable before-smoke subtree must not yield a partial baseline"
+        );
+
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore readable session directory");
+        let after = pi_session_files_in(&root).expect("read restored session tree");
+        assert_eq!(after, BTreeSet::from([preexisting]));
+        assert!(
+            before.ok().is_none(),
+            "failed baseline leaves no set from which pre-existing files can appear new"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_root_walk_rejects_pi_and_agent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-session-root-symlink-home");
+        let outside = control_test_root("pi-session-root-symlink-outside");
+        fs::create_dir_all(outside.join("agent/sessions")).expect("create outside session tree");
+        fs::write(
+            outside.join("agent/sessions/outside.jsonl"),
+            b"outside-secret\n",
+        )
+        .expect("write outside session");
+
+        symlink(&outside, home.join(".pi")).expect("symlink .pi outside home");
+        assert!(matches!(
+            open_pi_session_root_from_home(&home),
+            Err(LocalApiError::LocalOperationFailed(_))
+        ));
+
+        fs::remove_file(home.join(".pi")).expect("remove .pi symlink");
+        fs::create_dir(home.join(".pi")).expect("create real .pi");
+        symlink(outside.join("agent"), home.join(".pi/agent")).expect("symlink agent outside .pi");
+        assert!(matches!(
+            open_pi_session_root_from_home(&home),
+            Err(LocalApiError::LocalOperationFailed(_))
+        ));
+
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_discovery_refuses_root_replacement_after_open() {
+        let parent = control_test_root("pi-session-root-replacement");
+        let root = parent.join("sessions");
+        let original = parent.join("sessions-original");
+        fs::create_dir(&root).expect("create session root");
+        fs::write(root.join("inside.jsonl"), b"inside\n").expect("write inside session");
+        let opened_root = open_pi_test_root(&root);
+
+        fs::rename(&root, &original).expect("move opened session root");
+        fs::create_dir(&root).expect("create replacement session root");
+        fs::write(root.join("outside.jsonl"), b"outside-secret\n")
+            .expect("write replacement session");
+
+        let error = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect_err("count/selection must refuse a replaced root");
+        assert!(error.to_string().contains("session root changed"));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_live_import_refuses_root_replacement_between_censuses() {
+        let parent = control_test_root("pi-session-live-root-replacement");
+        let root = parent.join("sessions");
+        let original = parent.join("sessions-original");
+        fs::create_dir(&root).expect("create pre-smoke session root");
+        let baseline_session = root.join("baseline.jsonl");
+        fs::write(&baseline_session, b"baseline\n").expect("write baseline session");
+        let opened_root = open_pi_test_root(&root);
+        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("capture complete pre-smoke census");
+        let before = PiSessionCensus {
+            root: opened_root,
+            files,
+        };
+
+        fs::rename(&root, &original).expect("move pre-smoke root generation");
+        fs::create_dir(&root).expect("create replacement root generation");
+        let replacement_session = root.join("preexisting-in-replacement.jsonl");
+        fs::write(&replacement_session, b"pre-existing\n")
+            .expect("write pre-existing replacement session");
+
+        let error = import_new_pi_route_sessions(
+            "http://127.0.0.1:1",
+            &subscription_oauth_route(),
+            &before,
+        )
+        .expect_err("a different real root generation must be refused before selection or upload");
+
+        assert!(error.to_string().contains("session root changed"));
+        assert!(replacement_session.exists());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_selection_refuses_descendant_swap_after_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-selection-swap");
+        let outside = control_test_root("pi-session-selection-swap-outside");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).expect("create nested session directory");
+        let session = nested.join("session.jsonl");
+        fs::write(&session, b"inside\n").expect("write inside session");
+        fs::write(outside.join("session.jsonl"), b"outside-secret\n")
+            .expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let files = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover and validate inside session");
+
+        fs::rename(&nested, root.join("nested-original")).expect("move nested directory");
+        symlink(&outside, &nested).expect("replace nested directory with symlink");
+        let error = pi_session_files_modified_since(&opened_root, files, UNIX_EPOCH)
+            .expect_err("recent-file selection must refuse a descendant swap");
+        assert!(error.to_string().contains("session tree changed"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_rejects_file_and_directory_symlink_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-swap");
+        let outside = control_test_root("pi-session-swap-outside");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested session directory");
+        let nested_session = nested.join("session.jsonl");
+        let outside_session = outside.join("session.jsonl");
+        fs::write(&nested_session, b"inside\n").expect("write nested session");
+        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover nested session");
+
+        fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
+        symlink(&outside, &nested).expect("swap directory for symlink");
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &discovered.into_iter().collect::<Vec<_>>(),
+            "test-boundary",
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("component-wise no-follow open must reject directory swap");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+
+        fs::remove_file(&nested).expect("remove directory symlink");
+        let final_session = root.join("final.jsonl");
+        fs::write(&final_session, b"inside-final\n").expect("write final session");
+        let discovered = pi_session_files_for_root(&opened_root, PI_SESSION_SAFETY_LIMITS)
+            .expect("discover final session");
+        fs::remove_file(&final_session).expect("remove discovered final session");
+        symlink(&outside_session, &final_session).expect("swap file for symlink");
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &discovered
+                .into_iter()
+                .filter(|path| path == &final_session)
+                .collect::<Vec<_>>(),
+            "test-boundary",
+            PI_SESSION_SAFETY_LIMITS,
+        )
+        .expect_err("no-follow open must reject final-component swap");
+        assert!(matches!(error, LocalApiError::LocalOperationFailed(_)));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_reads_held_descriptor_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = control_test_root("pi-session-held-open");
+        let outside = control_test_root("pi-session-held-open-outside");
+        let session = root.join("session.jsonl");
+        let moved = root.join("session-original.jsonl");
+        let outside_session = outside.join("session.jsonl");
+        fs::write(&session, b"inside\n").expect("write inside session");
+        fs::write(&outside_session, b"outside-secret\n").expect("write outside session");
+        let opened_root = open_pi_test_root(&root);
+        let mut opened = open_pi_session_upload(&opened_root, &session, PI_SESSION_SAFETY_LIMITS)
+            .expect("open and verify session beneath root");
+
+        fs::rename(&session, &moved).expect("move verified session");
+        symlink(&outside_session, &session).expect("replace verified path with symlink");
+        let mut bytes = Vec::new();
+        opened
+            .file
+            .read_to_end(&mut bytes)
+            .expect("read held descriptor");
+
+        assert_eq!(bytes, b"inside\n");
+        assert!(!bytes.windows(14).any(|window| window == b"outside-secret"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_processes_large_file_sets_without_holding_all_descriptors() {
+        let root = control_test_root("pi-session-sequential-descriptors");
+        let mut files = Vec::new();
+        for index in 0..300 {
+            let path = root.join(format!("{index}.jsonl"));
+            fs::write(&path, b"{}\n").expect("write session file");
+            files.push(path);
+        }
+        let opened_root = open_pi_test_root(&root);
+        let limits = PiSessionSafetyLimits {
+            max_files: 512,
+            max_file_bytes: 16,
+            max_aggregate_bytes: 4 * 1024,
+            max_multipart_body_bytes: 128 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+
+        let body = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &files,
+            "test-boundary",
+            limits,
+        )
+        .expect("sequential descriptor use must support more than 256 session files");
+
+        assert!(body.ends_with(b"--test-boundary--\r\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_traversal_refuses_deep_and_wide_trees() {
+        let root = control_test_root("pi-session-traversal-caps");
+        let deep = root.join("one").join("two");
+        fs::create_dir_all(&deep).expect("create deep tree");
+        fs::write(deep.join("session.jsonl"), b"{}\n").expect("write deep session");
+        let limits = PiSessionSafetyLimits {
+            max_depth: 1,
+            max_entries: 16,
+            max_files: 16,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = pi_session_files_in_with_limits(&root, limits)
+            .expect_err("deep traversal must be refused");
+        assert!(error.to_string().contains("maximum depth"));
+
+        let wide = control_test_root("pi-session-file-cap");
+        for index in 0..3 {
+            fs::write(wide.join(format!("{index}.jsonl")), b"{}\n").expect("write wide session");
+        }
+        let limits = PiSessionSafetyLimits {
+            max_depth: 4,
+            max_entries: 16,
+            max_files: 2,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = pi_session_files_in_with_limits(&wide, limits)
+            .expect_err("wide traversal must be refused");
+        assert!(error.to_string().contains("maximum file count"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(wide);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_upload_refuses_file_aggregate_and_multipart_caps() {
+        let root = control_test_root("pi-session-upload-caps");
+        let first = root.join("first.jsonl");
+        let second = root.join("second.jsonl");
+        fs::write(&first, b"12345").expect("write oversized session");
+        fs::write(&second, b"6789").expect("write aggregate session");
+        let opened_root = open_pi_test_root(&root);
+
+        let per_file_limits = PiSessionSafetyLimits {
+            max_file_bytes: 4,
+            max_aggregate_bytes: 16,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            std::slice::from_ref(&first),
+            "test-boundary",
+            per_file_limits,
+        )
+        .expect_err("oversized file must be refused before reading");
+        assert!(error.to_string().contains("maximum byte size"));
+
+        let aggregate_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[first.clone(), second],
+            "test-boundary",
+            aggregate_limits,
+        )
+        .expect_err("aggregate oversize must be refused before body construction");
+        assert!(error.to_string().contains("aggregate byte size"));
+
+        let mut route = subscription_oauth_route();
+        route.classification.billing_provider = Some("x".repeat(17));
+        let multipart_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_field_bytes: 16,
+            max_multipart_body_bytes: 4 * 1024,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &route,
+            &opened_root,
+            &[first],
+            "test-boundary",
+            multipart_limits,
+        )
+        .expect_err("oversized multipart metadata must be refused");
+        assert!(error.to_string().contains("multipart field byte cap"));
+
+        let body_limits = PiSessionSafetyLimits {
+            max_file_bytes: 8,
+            max_aggregate_bytes: 8,
+            max_multipart_field_bytes: 64,
+            max_multipart_body_bytes: 16,
+            ..PI_SESSION_SAFETY_LIMITS
+        };
+        let error = build_pi_import_multipart(
+            &subscription_oauth_route(),
+            &opened_root,
+            &[],
+            "test-boundary",
+            body_limits,
+        )
+        .expect_err("multipart framing must honor the total body cap");
+        assert!(error.to_string().contains("multipart body"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn pi_session_files_modified_since_filters_on_mtime() {
         let root = std::env::temp_dir().join(format!(
@@ -15519,19 +20715,24 @@ mod tests {
         let modified = fs::metadata(&session)
             .and_then(|metadata| metadata.modified())
             .expect("read session mtime");
+        let opened_root = open_pi_test_root(&root);
 
         // A boundary just after the file's mtime excludes it...
         let after = modified + Duration::from_secs(60);
         assert!(
-            pi_session_files_modified_since([session.clone()], after).is_empty(),
+            pi_session_files_modified_since(&opened_root, [session.clone()], after)
+                .expect("filter old Pi session")
+                .is_empty(),
             "file older than `since` must be filtered out"
         );
 
         // ...and a boundary before (or equal to) the mtime includes it.
         let before = modified - Duration::from_secs(60);
-        let included = pi_session_files_modified_since([session.clone()], before);
+        let included = pi_session_files_modified_since(&opened_root, [session.clone()], before)
+            .expect("include recent Pi session");
         assert_eq!(included, vec![session.clone()]);
-        let at = pi_session_files_modified_since([session.clone()], modified);
+        let at = pi_session_files_modified_since(&opened_root, [session.clone()], modified)
+            .expect("include Pi session at boundary");
         assert_eq!(
             at,
             vec![session.clone()],
@@ -15540,7 +20741,11 @@ mod tests {
 
         // Unreadable / missing paths are dropped, not panicked on.
         let missing = root.join("does-not-exist.jsonl");
-        assert!(pi_session_files_modified_since([missing], before).is_empty());
+        assert!(
+            pi_session_files_modified_since(&opened_root, [missing], before)
+                .expect("drop missing Pi session")
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -18184,12 +23389,14 @@ log_user_prompt = true
             r#"{"type":"session","id":"pi-slow-import","cwd":"/tmp/pi","version":1}"#,
         )
         .expect("write pi session file");
+        let opened_root = open_pi_test_root(&root);
 
         let started = Instant::now();
         let result = upload_pi_import_run(
             &api_base_url,
             "relay_test",
             &subscription_oauth_route(),
+            &opened_root,
             &[session_file],
         )
         .expect("Pi import POST should use Pi-specific timeout");
@@ -18398,12 +23605,23 @@ log_user_prompt = true
                 ) && request.contains("X-Ottto-Install-Session-Token: install_token_fresh")
                 {
                     write_json_response(&mut stream, 200, "OK", "{}");
-                } else if request.contains("/api/v1/telemetry/devices/register") {
+                } else if request.contains(
+                    "/api/v1/telemetry/devices/registration-preparations",
+                ) {
                     write_json_response(
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_secret_install"}"#,
+                        r#"{"preparation_id":"preparation_install_fresh","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_secret_install","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"device_existing"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/telemetry/device-credential-preparations/preparation_install_fresh/confirm",
+                ) {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"preparation_id":"preparation_install_fresh","status":"confirmed","confirmed_at":"2026-07-31T20:00:00Z","credential_generation":2,"device":{"id":"device_install_fresh","machine_id":"machine_test","sources":["pi"]},"identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"device_existing"}"#,
                     );
                 } else if request
                     .contains("/api/v1/setup-runs/setup_install_fresh/local-client/actions/action_install_pi/complete")
@@ -19120,7 +24338,7 @@ log_user_prompt = true
         let (register_seen_tx, register_seen_rx) = mpsc::channel();
         let (allow_register_tx, allow_register_rx) = mpsc::channel();
         thread::spawn(move || {
-            for _ in 0..6 {
+            for _ in 0..8 {
                 let (mut stream, _) = listener.accept().expect("accept install request");
                 let request = read_complete_http_request(&mut stream);
                 if request.contains("/local-client/install-sessions") {
@@ -19130,14 +24348,25 @@ log_user_prompt = true
                         "OK",
                         r#"{"install_session_id":"install_reserved","install_session_token":"install_token_reserved"}"#,
                     );
-                } else if request.contains("/api/v1/telemetry/devices/register") {
+                } else if request.contains(
+                    "/api/v1/telemetry/devices/registration-preparations",
+                ) {
                     register_seen_tx.send(()).unwrap();
                     allow_register_rx.recv().unwrap();
                     write_json_response(
                         &mut stream,
                         200,
                         "OK",
-                        r#"{"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_reserved_install"}"#,
+                        r#"{"preparation_id":"preparation_reserved_install","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_reserved_install","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
+                    );
+                } else if request.contains(
+                    "/api/v1/telemetry/device-credential-preparations/preparation_reserved_install/confirm",
+                ) {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        "OK",
+                        r#"{"preparation_id":"preparation_reserved_install","status":"confirmed","confirmed_at":"2026-07-31T20:00:00Z","credential_generation":2,"device":{"id":"device_reserved_install","machine_id":"machine_test","sources":["pi"]},"identity_continuity_capability":"prior_device_credential_v1","credential_rotation_performed":true,"rotated_prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
                     );
                 } else {
                     write_json_response(&mut stream, 200, "OK", "{}");
@@ -19169,12 +24398,14 @@ log_user_prompt = true
                                 "OK",
                                 r#"{"install_session_id":"install_blocked","install_session_token":"install_token_blocked"}"#,
                             );
-                        } else if request.contains("/api/v1/telemetry/devices/register") {
+                        } else if request
+                            .contains("/api/v1/telemetry/devices/registration-preparations")
+                        {
                             write_json_response(
                                 &mut stream,
                                 200,
                                 "OK",
-                                r#"{"device":{"id":"device_should_not_rotate","machine_id":"machine_test","sources":["pi"]},"device_secret":"relay_should_not_rotate"}"#,
+                                r#"{"preparation_id":"preparation_should_not_rotate","capability":"device_credential_prepare_confirm_v1","expires_at":"2099-01-01T00:00:00Z","credential_generation":2,"device":{"id":"device_should_not_rotate","machine_id":"machine_test","sources":["pi"]},"candidate_secret":"relay_should_not_rotate","identity_continuity_capability":"prior_device_credential_v1","credential_rotation_planned":true,"prior_device_id":"00000000-0000-4000-8000-000000000001"}"#,
                             );
                             observed_tx.send(true).unwrap();
                             return;

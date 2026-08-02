@@ -563,9 +563,16 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   labels, and tool/function names such as `exec_command` or `write_stdin`.
   Claude Code parser version `claude_code_jsonl:v4` carries
   `message.usage.speed`, service tier, residency, batch, and context aliases
-  into selector context. Pi parser version `pi_jsonl:v4` carries
-  `ottto-selector` / `ottto.selector` custom entries and per-message selector
-  aliases into subsequent assistant-message usage rows. All three parsers emit
+  into selector context. The Pi parser accepts both the current native
+  `session.id` plus nested `type: "message"` records and the historical
+  `session_id` plus `message_end` records. It carries `ottto-selector` /
+  `ottto.selector` custom entries and per-message selector aliases into
+  subsequent assistant-message usage rows. Provider response time is the
+  canonical usage clock even when a later envelope timestamp crosses an hour.
+  An exact response id deduplicates every matching `message` / `message_end`
+  compatibility occurrence; repeated same-shape or id-less responses remain
+  distinct, while unmatched divergent cross-shape reuse makes the file
+  retryable. All three parsers emit
   content-free hourly activity buckets from persisted request/usage event
   timestamps; polling cadence affects freshness only and no wall-clock activity
   is inferred. Parser build versions are provenance and do not trigger scans or
@@ -577,13 +584,26 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   semantic component hashes (usage, lifecycle, latency, context, display,
   attribution, and artifacts); collection time, parser build, file identity,
   and evidence-lineage metadata cannot manufacture a new snapshot. Semantic
-  no-ops are retained in the local index but omitted from upload. Historical
+  no-ops are retained in the local index but omitted from upload. A fully read,
+  valid file that truthfully parses to no snapshot joins the v2 index's explicit
+  confirmed-empty set, so unchanged empty transcripts cost no repeated parse
+  work and any file/scan-identity change reparses them. Positive allowlisted
+  consumption/request/cost evidence that produces no snapshot, or a positive
+  usage record with no valid activity bucket, instead increments content-free
+  traversal diagnostics and keeps that file retryable. The current frozen
+  generation retains those counters across bounded backoff; it never records
+  the lossy file as empty or advances its manifest contribution. Healthy files
+  continue through quarantine-not-fence. Snapshot audit and status requests
+  expose confirmed-empty, positive-usage-evidence, and dropped-usage counts.
+  Versions, limits, budgets, quotas, and unknown positive metadata do not
+  qualify as usage evidence.
+  Historical
   walks occur only for first bootstrap or an explicit reviewed replay revision.
   The daemon starts the
   snapshot sync loop beside the local OTLP relay,
   uses source-scoped relay tokens and backend activity hints, scans the last
   six months by default with stricter backend windows allowed, caps each
-  app/source at 1000 recent files, strips filtered session titles or path-free
+  app/source at 10,000 recent files, strips filtered session titles or path-free
   workspace labels before upload when the effective backend org/user activity
   hint disables them, uploads changed snapshots in schema-v5 batches, and
   reports collector status and cap-hit metadata without exposing local paths.

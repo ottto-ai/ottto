@@ -329,6 +329,9 @@ pub struct StagedAccountSwitch {
     pub relay_device: Option<LocalDeviceBinding>,
     /// Secret. In-memory only; redacted from `Debug`.
     pub relay_device_secret: Option<String>,
+    /// Modern two-phase relay credential staged durably outside this in-memory
+    /// switch record. Presence prohibits fallback to the legacy secret fields.
+    pub relay_device_credential_preparation_id: Option<String>,
     /// Additive backend backfill policy from the claim completion ("full" |
     /// "from"); `None` when the backend predates the field. Applied to the
     /// snapshot backfill state when the switch is confirmed and installed.
@@ -353,6 +356,10 @@ impl std::fmt::Debug for StagedAccountSwitch {
             .field(
                 "relay_device_secret",
                 &self.relay_device_secret.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "relay_device_credential_preparation_id",
+                &self.relay_device_credential_preparation_id,
             )
             .field("backfill_policy", &self.backfill_policy)
             .field("backfill_cutoff_at", &self.backfill_cutoff_at)
@@ -690,6 +697,23 @@ impl LocalDaemon {
         let state = self.state()?;
         match state.pending_switch.as_ref() {
             Some(staged) if staged.claim_code == claim_code => Ok(()),
+            Some(_) | None => Err(LocalApiError::InvalidRequest(
+                "no staged account switch for this sign-in claim; start Sign in again".to_string(),
+            )),
+        }
+    }
+
+    /// Return the exact user-approved switch candidate before any cleanup or
+    /// destructive consume step. The caller durably records confirmation of a
+    /// modern credential preparation from this snapshot so a process crash
+    /// cannot forget the user's explicit switch intent.
+    pub fn staged_account_switch_snapshot(
+        &self,
+        claim_code: &str,
+    ) -> Result<StagedAccountSwitch, LocalApiError> {
+        let state = self.state()?;
+        match state.pending_switch.as_ref() {
+            Some(staged) if staged.claim_code == claim_code => Ok(staged.clone()),
             Some(_) | None => Err(LocalApiError::InvalidRequest(
                 "no staged account switch for this sign-in claim; start Sign in again".to_string(),
             )),
@@ -6223,6 +6247,7 @@ mod tests {
             machine_id: Some("machine_test".to_string()),
             relay_device: None,
             relay_device_secret: None,
+            relay_device_credential_preparation_id: None,
             backfill_policy: None,
             backfill_cutoff_at: None,
         }

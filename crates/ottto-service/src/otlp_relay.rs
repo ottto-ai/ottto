@@ -679,6 +679,11 @@ struct ForwardResponse {
 }
 
 fn forward_otlp_request(source: SnapshotSource, request: &HttpRequest) -> Result<ForwardResponse> {
+    // Cached bearer tokens must not bypass a confirmed credential-promotion
+    // journal. Confirmation may invalidate the old server authority for an
+    // ordinary rotation as well as a cross-account claim, so every relay
+    // admission stays fenced until the local binding is fully promoted.
+    relay_admission_ready()?;
     let api_base_url = current_api_base_url();
     let relay_token = cached_relay_token(&api_base_url, source)?;
     let response = send_otlp_request(&api_base_url, &relay_token, request)?;
@@ -689,6 +694,10 @@ fn forward_otlp_request(source: SnapshotSource, request: &HttpRequest) -> Result
     evict_cached_relay_token(&api_base_url, source)?;
     let relay_token = cached_relay_token(&api_base_url, source)?;
     send_otlp_request(&api_base_url, &relay_token, request)
+}
+
+pub(crate) fn relay_admission_ready() -> Result<()> {
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
 }
 
 fn send_otlp_request(

@@ -1,0 +1,195 @@
+# 2026-07-31 — Snapshot replay and continuity controls
+
+## Outcome
+
+The public daemon replay path now fails closed on incomplete evidence instead
+of allowing an apparently healthy checkpoint or manifest. The change is
+daemon-first and additive; it does not enable replay, release a build, restart a
+daemon, or tighten the backend registration route.
+
+## Scan and parse boundary
+
+- Candidate discovery is a deterministic, bounded directory traversal with a
+  durable queue, frozen census boundary, and separately bounded deletion
+  reconciliation. One tick observes at most 10,000 directory entries plus its
+  one-entry boundary witness and parses at most 10,000 candidates. A single
+  directory wider than the discovery budget fails red without materializing
+  the tail. It rejects root and descendant symlinks, keeps per-path
+  unreadable/oversize/disappearance counts, and continues with healthy paths.
+  A configured root that has never existed remains optional. Once a root has
+  resolved, its durable content-free witness makes later disappearance fail
+  red while retaining prior entities; old indexes infer direct roots from
+  existing indexed paths and retain path-level unresolved witnesses for a
+  vanished configured symlink only when the prior traversal proves the same
+  root context. Those witnesses clear when the actual canonical root returns or
+  the configured root context changes, without promoting unrelated optional
+  roots. A restored root converges through a new authoritative census instead
+  of requiring local-state surgery.
+  File-age eligibility is evaluated against that frozen census boundary on
+  every later page; elapsed wall time cannot silently shrink the generation.
+- Watcher paths are coalesced, bounded, exact-path hints, never source-wide
+  completeness authority. An ordinary hint joins the durable census, is
+  revalidated through the same no-follow opened-object checks, and cannot
+  starve ordinary directory candidates even under a one-file test page. Queue
+  order is FIFO, and remove/rename hints delete the prior durable observation
+  without treating the now-missing path as census loss, so a continuously
+  active sibling cannot strand stale index entries or keep settlement red.
+  Hinted files pass the same frozen age-window check as directory-discovered
+  files, so a watcher event cannot widen collection beyond policy.
+  overflow or a watcher backend error is different: lost paths dirty the
+  current generation, and no terminal manifest can publish until a following
+  clean durable traversal. A terminal unhealthy generation retains its red
+  witness and retries on a bounded 1-minute-to-1-hour backoff instead of
+  rescanning history every tick, while healthy hinted siblings continue
+  through quarantine-not-fence.
+- The parser reads the exact `O_NOFOLLOW`-opened regular file. Its v2 identity
+  binds device/inode/change-time-nanoseconds plus bounded first/last content
+  samples; change time catches middle-only in-place rewrites whose size and
+  mtime were restored. The exact opened object's mtime is also rechecked against
+  the frozen lookback, closing the discovery-to-open replacement interval.
+  Nanosecond mtime remains in the scan fingerprint and `semantic_sync:v1`
+  remains unchanged.
+- Malformed JSON, invalid UTF-8, over-cap lines, or a recognized usage shape
+  that failed conversion make the file incomplete. An incomplete file is not
+  recorded as empty or settled. Confirmed-empty is a separate durable state.
+  Positive-usage drift detection traverses unknown provider envelopes, but
+  treats structurally identified authored-message and tool payload fields as
+  opaque so usage-shaped prompt, assistant example, or tool data cannot hold a
+  genuine empty file red.
+- Pi accepts both current nested `type=message` assistant usage and legacy
+  `message_end` usage. Provider response time has the same precedence in both
+  shapes; a later envelope write time cannot move usage across an hour. Every
+  exact duplicate response-id occurrence is reconciled by a canonical instant
+  plus usage digest, including multiple pairs under one reused id; unmatched
+  divergent cross-shape reuse makes the whole file retryable. Numeric
+  timestamps are accepted at either the message or top level, and current
+  nested user content arrays feed the safe title fallback.
+- Claude desktop titles are optional enrichment. CLI sessions without a title
+  and desktop-only titles without a CLI session id are complete no-ops, not
+  corrupt files. True parse/read/type failures retain prior durable titles,
+  keep the manifest red, and retry with the same bounded backoff. Recovery
+  starts a fresh transcript generation before completeness can publish.
+- Fingerprints, nullable activity clocks, and file entity sets are finalized
+  after enrichment, privacy policy, account cutoff, and historical replay
+  combination. The manifest is emitted only from committed final fingerprints;
+  census completeness/loss evidence remains in top-level status counts.
+  `snapshot_manifest:v2` is an exact seven-field
+  `semantic_activity_window`: membership uses the accepted entity's latest
+  usage/session activity clock in `[window_start, window_end)`, never local file
+  mtime, path, or `collected_at`. An explicit null witness keeps metadata-only
+  entities uploadable but outside the semantic manifest. Missing or malformed
+  persisted activity forces reparse/rebuild instead of silent omission. Its
+  length-prefixed, sorted-distinct fold is
+  pinned by `fixtures/snapshot-audit/snapshot-manifest-v2-golden.json` against
+  the backend Python implementation; the shared metadata-only golden pins the
+  upload-versus-manifest boundary.
+- Transcript deletion reconciliation precedes Codex's state-database-only
+  fallback. If a rollout disappears while its thread row remains, that same
+  complete generation emits the state-only replacement rather than briefly
+  publishing a manifest with neither representation.
+- Manifest-bearing terminal status has three states at the wire boundary: a
+  terminal receipt with a manifest publishes agreement; a terminal receipt
+  without one explicitly withdraws stale agreement after incomplete/error/
+  disabled collection; a nonterminal check-in without one is liveness-only and
+  preserves the last terminal outcome. The process cache recovers from mutex
+  poison so one caught panic cannot permanently suppress publication or
+  withdrawal. Disabled, indeterminate, and partially failed upload outcomes
+  withdraw the cached agreement before a concurrent heartbeat can repeat it; a
+  shed republishes only after its accepted/quarantined committable subset is
+  durable. The daemon never fabricates an empty manifest to represent unknown
+  evidence.
+
+## Durable state and quarantine
+
+Scan index and upload progress use v2-only paths so an old overlapping daemon
+cannot overwrite them. Both are process-locked, generation-CAS-written through
+an fsynced temporary file, atomically renamed, and followed by directory fsync.
+Upload-progress load/save/clear all take the same lock. Clear compares the
+loaded generation and destination, renames to a tombstone, fsyncs the parent,
+then removes it; a stale daemon cannot delete a winner. Invalid progress is
+moved to a unique corrupt sibling under the lock and rebuilt without overwriting
+the evidence. Syntactically valid corrupt activity clocks and quarantine retry
+deadlines beyond the bounded horizon are treated the same way.
+
+One-time legacy checkpoint adoption takes that same destination lock and
+rechecks the winner before copying, so overlapping upgraded daemons cannot
+replace an already-advanced generation. Frozen traversal context also binds the
+source scan identity, local index derivation, and exact-open identity; a restart
+after any reviewed derivation change begins a fresh bounded census instead of
+finishing a mixed-version queue.
+
+Per-entity permanent rejection is quarantine, not a source fence. The exact
+fingerprint is checkpointed locally with a content-free witness over collector,
+parser, scan identity, snapshot schema, and ACK contract, and excluded from the
+server-agreement manifest. A changed source produces a new fingerprint;
+changing repair code or a contract component automatically retries even the
+same semantic fingerprint. Unchanged backend-only failures retry on a
+deterministically staggered 6–12 hour clock, at most one 20-entity retry page per
+cycle; far-future or backward-clock-corrupted deadlines cannot fence forever.
+Before upload, quarantine revisions absent from the authoritative current index
+are pruned and checkpointed, so one long-lived poison item cannot make the
+hash-only progress ledger grow with every unrelated historical revision.
+Partial commits advance only files whose complete entity set is accepted or
+quarantined; an unsettled repair retry preserves the older mismatched witness so
+the following cycle retries again. A transcript that became confirmed-empty, a
+vanished transcript, or an absent Codex state-only entity retains its prior
+checkpoint until a complete cycle can make that absence authoritative; any
+associated quarantine witness is retained with it.
+
+## Batch/ACK contract
+
+Every request declares `snapshot_entity_ack:v1`. A capable response must be an
+exact, disjoint partition of the request into accepted, unchanged, permanently
+rejected, or conflict occurrences. ACK rows carry `occurrence_count`, and direct
+duplicate ACK validation remains multiset-exact. The uploader coalesces every
+same-fingerprint occurrence to one representative. Whole item bytes may differ
+only in observation/inventory metadata that semantic identity deliberately
+excludes (for example collection time or a rotated file witness); daemon
+preflight still recomputes the fingerprint and rejects any changed semantic
+field before network I/O.
+Partial, short, foreign, zero-count, over-counted, or cross-classified ACKs
+settle nothing. Only an absent ACK-contract field selects legacy count-only
+compatibility; an unknown/future named contract fails closed before local
+progress advances. Legacy 422 handling is full-batch/no-write followed by bounded
+singleton isolation; timeouts retain bounded splits. Items are capped at 128
+KiB, exact uncompressed requests at 4 MiB, and conservative serialized-item
+packing keeps pages below that request boundary before exact preflight.
+
+Conflicts remain unsettled. Challenge/head-token field names and adoption rules
+must be frozen with the backend contract before the daemon adds them. A future
+challenge may be adopted only from a fresh complete scan, never from a partial
+census or cached body.
+
+## Reproducible revision witness
+
+The exact legacy `snapshot_revision:v1` fields remain for old-backend
+tolerance. Additive `snapshot_revision:v2` is SHA-256 over RFC 8785 canonical
+JSON with this explicit material:
+
+- contract/canonicalization, source and source session id;
+- parser and scan-identity versions;
+- opened/source-file fingerprint;
+- stable lifecycle fields (`status` and source activity timestamps);
+- stable provenance (`collector`, input-token scope, state token/archive
+  evidence), excluding mutable `source_file_count`;
+- upload policy and all post-policy semantic component hashes.
+
+It excludes `collected_at`, snapshot/content/revision hashes, semantic envelope,
+challenge/base fields, and source-wide inventory. Identical content observed on
+a later scan therefore keeps the same revision; parser, component, lifecycle,
+or opened-file witness changes move it. The v3 semantic-envelope golden carries
+all 60 canonical bodies and digests for cross-language reproduction.
+
+## Registration continuity rollout
+
+Registration always declares capability `prior_device_credential_v1`. A first
+registration sends no prior proof; a re-registration sends the currently
+persisted device id and secret together or fails locally. New response fields
+are optional for old-backend tolerance and rotation claims are consistency-
+checked before persistence. Device binding and returned secret are installed
+under the existing identity reservation, with rollback of the previous secret
+if the binding write fails.
+
+Rollout order is strict: release and upgrade the public daemon first; only then
+may the backend reject missing/partial proof and enforce active-installation
+continuity. This checkpoint does not perform either rollout step.

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub const ACCOUNT_FILE_NAME: &str = "account.json";
 pub const CONNECTION_FILE_NAME: &str = "connection.json";
 pub const DEVICE_FILE_NAME: &str = "device.json";
+pub const PENDING_DEVICE_CREDENTIAL_FILE_NAME: &str = "pending-device-credential.json";
 pub const MACHINE_FILE_NAME: &str = "machine.json";
 pub const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 
@@ -35,6 +36,10 @@ pub fn default_connection_path() -> PathBuf {
 
 pub fn default_device_path() -> PathBuf {
     default_support_dir().join(DEVICE_FILE_NAME)
+}
+
+pub fn default_pending_device_credential_path() -> PathBuf {
+    default_support_dir().join(PENDING_DEVICE_CREDENTIAL_FILE_NAME)
 }
 
 pub fn default_machine_path() -> PathBuf {
@@ -78,6 +83,95 @@ pub struct LocalDeviceBinding {
     pub device_id: String,
     pub machine_id: Option<String>,
     pub sources: Vec<String>,
+}
+
+/// Generation-bound device authority written by the two-phase credential
+/// installer. The flattened representation remains readable by released
+/// clients that deserialize [`LocalDeviceBinding`] and ignore unknown fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalDeviceCredentialBinding {
+    #[serde(flatten)]
+    pub device: LocalDeviceBinding,
+    pub credential_generation: u64,
+}
+
+/// Exact non-secret authority inputs used to request a prepared relay-device
+/// credential. Secret proof bytes remain in Keychain; only their commitment is
+/// durable here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDeviceCredentialRequestAuthority {
+    pub flow: String,
+    pub credential_preparation_idempotency_key: String,
+    pub machine_id: String,
+    pub installation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_continuity_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_device_sources: Option<Vec<String>>,
+    /// One-way binding to the established Keychain secret presented in the
+    /// preparation request. The prior secret itself is never journaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_secret_commitment_sha256: Option<String>,
+}
+
+/// Non-secret half of a prepared relay-device credential. The candidate
+/// secret lives in its own Keychain account so this crash-recovery journal can
+/// be inspected and rewritten without ever serializing the secret to JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDeviceCredentialPreparation {
+    pub schema_version: u16,
+    pub capability: String,
+    pub preparation_id: String,
+    pub api_base_url: String,
+    pub expires_at: String,
+    pub credential_generation: u64,
+    /// One-way binding for the separately staged candidate secret. Recovery
+    /// must never promote Keychain bytes that do not match the exact secret
+    /// issued for this preparation and generation.
+    pub secret_commitment_sha256: String,
+    /// Exact non-secret authority inputs used to create this preparation.
+    /// Older v2 journals may omit this additive field; all newly staged rows
+    /// include it and immutable-journal equality prevents rebinding on retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_authority: Option<PendingDeviceCredentialRequestAuthority>,
+    pub device: LocalDeviceBinding,
+    /// False while a different-account setup claim waits for explicit local
+    /// switch confirmation. Startup recovery must not confirm such a row.
+    #[serde(default)]
+    pub confirmation_authorized: bool,
+    /// Durable evidence that the local pre-confirm cleanup gate completed in
+    /// this process. Recovery still reruns the gate under a fresh identity
+    /// reservation immediately before any remote confirm.
+    #[serde(default)]
+    pub preconfirm_guards_passed: bool,
+    /// Complete non-secret local claim commit that must move atomically with
+    /// this device generation. Its setup-run token is staged separately in
+    /// Keychain and is never serialized here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_commit: Option<PendingClaimCredentialCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingClaimCredentialCommit {
+    pub account: LocalAccountBinding,
+    pub connection: LocalConnectionBinding,
+    pub target_user_id: String,
+    /// One-way binding for the separately staged setup-run token. This lets a
+    /// retry replace an inert orphan Keychain value without serializing the
+    /// token into the journal or accepting a changed server response.
+    pub setup_run_token_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_cutoff_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +373,31 @@ impl FileDeviceStore {
         write_user_only(&self.path, &body)
     }
 
+    pub fn load_with_credential_generation(&self) -> Result<Option<LocalDeviceCredentialBinding>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let body = fs::read_to_string(&self.path)
+            .with_context(|| format!("read device binding {}", self.path.display()))?;
+        serde_json::from_str(&body).with_context(|| {
+            format!(
+                "parse generation-bound device binding {}",
+                self.path.display()
+            )
+        })
+    }
+
+    pub fn save_with_credential_generation(
+        &self,
+        device: &LocalDeviceCredentialBinding,
+    ) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            create_secret_dir(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(device)?;
+        write_user_only(&self.path, &body)
+    }
+
     pub fn reset(&self) -> Result<Option<LocalDeviceBinding>> {
         if !self.path.exists() {
             return Ok(None);
@@ -293,6 +412,55 @@ impl FileDeviceStore {
 impl Default for FileDeviceStore {
     fn default() -> Self {
         Self::new(default_device_path())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePendingDeviceCredentialStore {
+    path: PathBuf,
+}
+
+impl FilePendingDeviceCredentialStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let body = fs::read_to_string(&self.path)
+            .with_context(|| format!("read pending device credential {}", self.path.display()))?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("parse pending device credential {}", self.path.display()))
+    }
+
+    pub fn save(&self, pending: &PendingDeviceCredentialPreparation) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            create_secret_dir(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(pending)?;
+        write_user_only(&self.path, &body)
+    }
+
+    pub fn reset(&self) -> Result<Option<PendingDeviceCredentialPreparation>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let existing = self.load()?;
+        fs::remove_file(&self.path)
+            .with_context(|| format!("remove pending device credential {}", self.path.display()))?;
+        Ok(existing)
+    }
+}
+
+impl Default for FilePendingDeviceCredentialStore {
+    fn default() -> Self {
+        Self::new(default_pending_device_credential_path())
     }
 }
 
@@ -461,6 +629,80 @@ mod tests {
         }
 
         assert_eq!(store.reset().expect("reset connection"), Some(connection));
+        assert_eq!(store.load().expect("load reset"), None);
+    }
+
+    #[test]
+    fn generation_bound_device_remains_legacy_readable() {
+        let path = temp_path("generation-device").with_file_name(DEVICE_FILE_NAME);
+        let store = FileDeviceStore::new(&path);
+        let generation_bound = LocalDeviceCredentialBinding {
+            device: LocalDeviceBinding {
+                device_id: "device-next".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            credential_generation: 7,
+        };
+
+        store
+            .save_with_credential_generation(&generation_bound)
+            .expect("save generation-bound device");
+
+        assert_eq!(
+            store.load().expect("legacy load"),
+            Some(generation_bound.device.clone())
+        );
+        assert_eq!(
+            store
+                .load_with_credential_generation()
+                .expect("generation load"),
+            Some(generation_bound)
+        );
+    }
+
+    #[test]
+    fn pending_device_credential_store_never_contains_candidate_secret() {
+        let path = temp_path("pending-device").with_file_name(PENDING_DEVICE_CREDENTIAL_FILE_NAME);
+        let store = FilePendingDeviceCredentialStore::new(&path);
+        let pending = PendingDeviceCredentialPreparation {
+            schema_version: 1,
+            capability: "device_credential_prepare_confirm_v1".to_string(),
+            preparation_id: "preparation-one".to_string(),
+            api_base_url: "https://api.ottto.net".to_string(),
+            expires_at: "2026-08-01T00:00:00Z".to_string(),
+            credential_generation: 9,
+            secret_commitment_sha256: format!("sha256:{}", "a".repeat(64)),
+            request_authority: Some(PendingDeviceCredentialRequestAuthority {
+                flow: "setup_claim".to_string(),
+                credential_preparation_idempotency_key: format!("sha256:{}", "b".repeat(64)),
+                machine_id: "machine-one".to_string(),
+                installation_id: "install-one".to_string(),
+                hardware_uuid: Some("hardware-one".to_string()),
+                account_scope: Some("account-one".to_string()),
+                identity_continuity_capability: Some("prior_device_credential_v1".to_string()),
+                prior_device_id: Some("device-prior".to_string()),
+                prior_device_sources: Some(vec!["codex".to_string()]),
+                prior_secret_commitment_sha256: Some(format!("sha256:{}", "c".repeat(64))),
+            }),
+            device: LocalDeviceBinding {
+                device_id: "device-next".to_string(),
+                machine_id: Some("machine-one".to_string()),
+                sources: vec!["codex".to_string()],
+            },
+            confirmation_authorized: true,
+            preconfirm_guards_passed: true,
+            claim_commit: None,
+            confirmed_at: None,
+        };
+
+        store.save(&pending).expect("save pending");
+        let raw = fs::read_to_string(&path).expect("read pending");
+        assert!(!raw.contains("candidate_secret"));
+        assert!(!raw.contains("prior_device_secret\""));
+        assert!(raw.contains("prior_secret_commitment_sha256"));
+        assert_eq!(store.load().expect("load pending"), Some(pending.clone()));
+        assert_eq!(store.reset().expect("reset pending"), Some(pending));
         assert_eq!(store.load().expect("load reset"), None);
     }
 

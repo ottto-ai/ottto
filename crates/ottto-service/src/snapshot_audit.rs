@@ -8,11 +8,12 @@
 
 use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
-    apply_upload_policy, collector_version, scan_source_roots_with_attribution,
-    snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
-    snapshot_semantic_envelope, ScanIndex, SnapshotBatchRequest, SnapshotItem, SnapshotSource,
-    SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    apply_upload_policy, collector_version, finalize_scan_after_policy,
+    scan_source_roots_with_attribution, snapshot_fingerprint_from_component_hashes,
+    snapshot_semantic_component_hashes, snapshot_semantic_envelope, ScanIndex,
+    SnapshotBatchRequest, SnapshotItem, SnapshotSource, SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS,
+    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -71,6 +72,9 @@ pub struct SnapshotAuditReport {
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
+    pub zero_snapshot_confirmed_count: usize,
+    pub zero_snapshot_usage_evidence_count: usize,
+    pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
     pub sessions: Vec<SnapshotAuditSession>,
 }
@@ -193,6 +197,8 @@ pub fn run_snapshot_audit<W: Write>(
         session_attribution_labels_enabled: false,
     };
     apply_upload_policy(options.source, &mut scan.snapshots, upload_policy);
+    let post_policy_snapshots = scan.snapshots.clone();
+    finalize_scan_after_policy(options.source, &mut scan, &mut index);
     let audit_upload_policy = SnapshotAuditUploadPolicy {
         session_titles_enabled: upload_policy.session_titles_enabled,
         workspace_labels_enabled: upload_policy.workspace_labels_enabled,
@@ -203,13 +209,21 @@ pub fn run_snapshot_audit<W: Write>(
     let parser_version = options.source.parser_version();
     let scan_identity_version = options.source.scan_identity_version();
 
-    let mut sessions = scan
-        .snapshots
+    let mut retained_snapshots = scan.snapshots.iter().peekable();
+    let mut sessions = post_policy_snapshots
         .iter()
         .zip(pre_policy_snapshots.iter())
-        .map(|(snapshot, pre_policy_snapshot)| {
+        .filter_map(|(snapshot, pre_policy_snapshot)| {
+            let retained = retained_snapshots.peek()?;
+            if retained.source_session_id != snapshot.source_session_id
+                || retained.snapshot_fingerprint != snapshot.snapshot_fingerprint
+                || retained.source_file_fingerprint != snapshot.source_file_fingerprint
+            {
+                return None;
+            }
+            retained_snapshots.next();
             let envelope = snapshot_semantic_envelope(options.source, snapshot, upload_policy);
-            SnapshotAuditSession {
+            Some(SnapshotAuditSession {
                 session_key: keyed_hex(
                     &audit_key,
                     &[
@@ -261,7 +275,7 @@ pub fn run_snapshot_audit<W: Write>(
                 request_count: snapshot.request_count,
                 model_usage_row_count: snapshot.model_usage.len(),
                 usage_bucket_count: snapshot.usage_buckets.len(),
-            }
+            })
         })
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.session_key.cmp(&right.session_key));
@@ -302,6 +316,9 @@ pub fn run_snapshot_audit<W: Write>(
         scanned_file_count: scan.scanned_file_count,
         scanned_session_count: scan.scanned_session_count,
         semantic_noop_count: scan.semantic_noop_count,
+        zero_snapshot_confirmed_count: scan.zero_snapshot_confirmed_count,
+        zero_snapshot_usage_evidence_count: scan.zero_snapshot_usage_evidence_count,
+        dropped_usage_record_count: scan.dropped_usage_record_count,
         emitted_session_count: sessions.len(),
         sessions,
     };
@@ -763,6 +780,46 @@ mod tests {
                 0o600
             );
         }
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn audit_index_settles_usage_transcripts_after_first_report() {
+        let home = temp_dir("settled-index");
+        let sessions = home.join(".pi").join("agent").join("sessions");
+        fs::create_dir_all(&sessions).expect("create sessions");
+        fs::write(
+            sessions.join("session.jsonl"),
+            include_str!("../../../fixtures/snapshot-audit/pi-session.jsonl"),
+        )
+        .expect("write transcript");
+        let key_path = home.join("audit.key");
+        let fixture = include_bytes!("../../../fixtures/snapshot-audit/pi-session.jsonl");
+        fs::write(&key_path, &fixture[..MIN_AUDIT_KEY_BYTES]).expect("write key");
+        let audit_state_dir = home.join("audit-state");
+        let options = SnapshotAuditOptions {
+            source: SnapshotSource::Pi,
+            roots: vec![sessions],
+            audit_state_dir: audit_state_dir.clone(),
+            audit_key_path: key_path,
+            session_attribution_hmac_key_path: attribution_key_file(&home),
+            attribution_home: Some(home.clone()),
+            machine_id: "fixture-machine".to_string(),
+            collected_at: "2026-07-22T08:02:00Z".to_string(),
+            backfill_window_days: BACKFILL_WINDOW_DAYS,
+            private_upload_payload_out: None,
+        };
+
+        let first = run_snapshot_audit(options.clone(), &mut Vec::new()).expect("first audit");
+        assert_eq!(first.emitted_session_count, 1);
+        let index = ScanIndex::load(&audit_state_dir.join(AUDIT_SCAN_INDEX_FILE))
+            .expect("load settled audit index");
+        assert_eq!(index.file_snapshot_fingerprints.len(), 1);
+        assert_eq!(index.snapshot_activity_at.len(), 1);
+
+        let second = run_snapshot_audit(options, &mut Vec::new()).expect("second audit");
+        assert_eq!(second.emitted_session_count, 0);
 
         let _ = fs::remove_dir_all(home);
     }

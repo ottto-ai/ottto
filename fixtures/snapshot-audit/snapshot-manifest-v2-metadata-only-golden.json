@@ -1,0 +1,16 @@
+{
+  "fixture_contract": "snapshot_manifest_metadata_only:v1",
+  "source_session_id": "fixture-metadata-only-session",
+  "snapshot_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "semantic_activity": null,
+  "expected_upload_ack_occurrence_count": 1,
+  "manifest": {
+    "contract_version": "snapshot_manifest:v2",
+    "scope": "semantic_activity_window",
+    "source": "codex",
+    "window_start": "2026-01-01T00:00:00Z",
+    "window_end": "2026-07-01T00:00:00Z",
+    "entity_count": 0,
+    "rolling_hash": "8d75c74bdd49ba33a742f24fcb2adc0b0dfd32587dca6a2f97ccbaddabe16ecb"
+  }
+}

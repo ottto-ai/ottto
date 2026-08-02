@@ -4,10 +4,15 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +34,7 @@ mod collector_version_tests {
 }
 
 pub const SNAPSHOT_SCHEMA_VERSION: u16 = 6;
+pub const SNAPSHOT_ENTITY_ACK_CONTRACT: &str = "snapshot_entity_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
 // cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
 // is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
@@ -165,7 +171,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // retaining support for transcripts that carry only one of the two shapes.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v25";
-pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
+// v13 makes the provider response timestamp authoritative for both Pi usage
+// record shapes and reconciles every exact cross-shape occurrence for a reused
+// response id. This prevents envelope write time from moving current records
+// into a different hour or turning a valid transitional pair into loss.
+pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 
 // Frozen scan-identity versions. They intentionally begin at the versions used
 // by the 0.1.91 baseline so upgrading to semantic sync does not itself select
@@ -192,11 +202,17 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v11";
 // already-known usage.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v25";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
-pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v11";
-const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v1";
+pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
+const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
+const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
+const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
+const FILE_CONTENT_SAMPLE_BYTES: usize = 4 * 1024;
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
+pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Hash epoch of the policy-neutral `content_hash`.
 ///
@@ -221,7 +237,9 @@ pub(crate) const POLICY_NEUTRAL_COMPONENTS: [&str; 4] = [
 /// Contract label folded into the scan-index manifest hash. It names both the
 /// fold and the entity grain, so a change to either changes the hash instead of
 /// silently changing its meaning.
-pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v1";
+pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v2";
+pub const SNAPSHOT_QUARANTINE_CONTRACT_VERSION: &str = "snapshot_quarantine:v1";
+pub const SNAPSHOT_QUARANTINE_RETRY_SECONDS: u64 = 6 * 60 * 60;
 
 /// What the manifest counts, declared on the wire rather than assumed.
 ///
@@ -232,7 +250,7 @@ pub const SNAPSHOT_MANIFEST_CONTRACT_VERSION: &str = "snapshot_manifest:v1";
 /// count against its whole stored set would therefore report a mismatch on a
 /// perfectly healthy machine — so the scope and the window travel with the
 /// count, and the comparison is the consumer's to scope.
-pub const SNAPSHOT_MANIFEST_SCOPE: &str = "live_scan_window";
+pub const SNAPSHOT_MANIFEST_SCOPE: &str = "semantic_activity_window";
 
 /// Effective per-turn input context (uncached input + cache reads + cache
 /// writes) above which a Claude turn could only have run with the "(1M
@@ -252,6 +270,14 @@ pub const CLAUDE_CONTEXT_BUCKET_LONG_THRESHOLD_TOKENS: u64 = 200_000;
 // streaming, so a larger history is a one-time backfill cost with bounded
 // memory. The finite caps still guard a pathological ~/.codex.
 pub const MAX_BACKFILL_FILES_PER_SOURCE: usize = 10_000;
+// Directory discovery has its own hard per-tick budget. Candidate parsing was
+// already capped, but recursively walking an arbitrarily large tree before
+// applying that cap made one tick O(all paths). The durable traversal below
+// consumes at most this many directory entries and then resumes next tick.
+pub const MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK: usize = 10_000;
+pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
+const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
+const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
@@ -433,6 +459,15 @@ pub struct SnapshotSemanticEnvelope {
     pub upload_policy: SnapshotUploadPolicy,
     pub component_hashes: BTreeMap<&'static str, String>,
     pub revision_hash: String,
+    /// Additive, server-reproducible revision witness. The v1 fields remain
+    /// byte-identical for old-backend tolerance; only this RFC 8785 witness is
+    /// eligible for a future conflict challenge because every input either
+    /// travels here or already travels in the post-policy snapshot body.
+    pub revision_v2_contract_version: &'static str,
+    pub revision_v2_canonicalization: &'static str,
+    pub revision_v2_parser_version: &'static str,
+    pub revision_v2_scan_identity_version: &'static str,
+    pub revision_v2_hash: String,
     /// Policy-neutral content identity: SHA-256 over the RFC 8785 canonical
     /// bytes of `snapshot_content_identity_body`. Write-only for now — the
     /// server stores it and does not key on it until its own cutover — which is
@@ -474,11 +509,15 @@ impl Serialize for SnapshotBatchRequest {
                 })
             })
             .collect::<Result<Vec<_>, S::Error>>()?;
-        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 6)?;
+        let mut state = serializer.serialize_struct("SnapshotBatchRequest", 7)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("source", &self.source)?;
         state.serialize_field("machine_id", &self.machine_id)?;
         state.serialize_field("collector_version", &self.collector_version)?;
+        // Daemon-first capability declaration. Older backends use a
+        // forward-tolerant ingest model and ignore it; capable backends echo it
+        // and may return a complete per-entity outcome partition.
+        state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
         state.serialize_field("snapshots", &snapshots)?;
         state.serialize_field("client_report", &self.client_report)?;
         state.end()
@@ -748,9 +787,100 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ScanTraversalPath {
+    scan_root: PathBuf,
+    path: PathBuf,
+    #[serde(default = "default_true")]
+    census_member: bool,
+    #[serde(default)]
+    watcher_hint: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ScanTraversalCounts {
+    discovered_file_count: usize,
+    directory_entry_cap_exceeded_count: usize,
+    symlink_rejected_count: usize,
+    unreadable_path_count: usize,
+    oversized_file_count: usize,
+    disappeared_file_count: usize,
+    malformed_json_line_count: usize,
+    invalid_utf8_line_count: usize,
+    over_line_cap_count: usize,
+    recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
+}
+
+impl ScanTraversalCounts {
+    fn has_errors(&self) -> bool {
+        self.symlink_rejected_count > 0
+            || self.directory_entry_cap_exceeded_count > 0
+            || self.unreadable_path_count > 0
+            || self.oversized_file_count > 0
+            || self.disappeared_file_count > 0
+            || self.malformed_json_line_count > 0
+            || self.invalid_utf8_line_count > 0
+            || self.over_line_cap_count > 0
+            || self.recognized_usage_drop_count > 0
+            || self.zero_snapshot_usage_evidence_count > 0
+            || self.dropped_usage_record_count > 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScanTraversalCheckpoint {
+    context_fingerprint: String,
+    census_window_end: String,
+    scan_roots: Vec<PathBuf>,
+    pending_directories: VecDeque<ScanTraversalPath>,
+    pending_candidates: VecDeque<ScanTraversalPath>,
+    observed_index_keys: BTreeSet<String>,
+    reconciliation_upper_bound: Option<String>,
+    reconciliation_after: Option<String>,
+    reconciliation_started: bool,
+    #[serde(default)]
+    watcher_hint_seen: bool,
+    #[serde(default)]
+    unhealthy_retry_attempt: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unhealthy_retry_not_before_unix_seconds: Option<u64>,
+    counts: ScanTraversalCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIndex {
+    #[serde(default = "scan_index_schema_version")]
+    pub schema_version: u16,
+    #[serde(default)]
+    pub generation: u64,
+    /// The exact privacy/attribution context under which every settled entity
+    /// fingerprint in this index was produced. A policy transition keeps the
+    /// policy-neutral entity identity but must force one complete correction
+    /// pass before this witness advances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_context_fingerprint: Option<String>,
     pub files: BTreeMap<String, ScanIndexEntry>,
+    /// Configured roots that have successfully resolved at least once for this
+    /// destination/source index. A root that never existed is optional, but a
+    /// root that disappears after contributing an authoritative census must
+    /// fail the generation red instead of reconciling every entity beneath it
+    /// away as if the directory had been observed empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    known_configured_scan_roots: BTreeSet<String>,
+    /// Pre-root-witness index paths not currently covered by any resolved root.
+    /// This is the upgrade-safe witness for a configured symlink whose old
+    /// canonical target cannot be reconstructed while the link is missing.
+    /// Inference requires a prior traversal with the same root-context proof;
+    /// paths clear when a resolved root covers them or the root context changes.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    legacy_unresolved_root_file_witnesses: BTreeSet<String>,
     /// Last accepted semantic fingerprint for Codex sessions that exist only
     /// in the local state database and have no usage-bearing rollout file.
     ///
@@ -760,6 +890,177 @@ pub struct ScanIndex {
     /// every later state-database observation into another upload.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
+    /// Durable, local-only index of Claude Desktop naming sidecars. Paging the
+    /// store without retaining these safe extracted fields would make titles
+    /// disappear whenever their file was outside the current bounded page.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_desktop_title_files: BTreeMap<String, ClaudeDesktopTitleIndexEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_desktop_store_cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_desktop_store_upper_bound: Option<String>,
+    #[serde(default)]
+    claude_desktop_store_sweep_had_errors: bool,
+    #[serde(default)]
+    claude_desktop_store_retry_attempt: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_desktop_store_retry_not_before_unix_seconds: Option<u64>,
+    /// Lexicographic path cursor for a bounded sweep when a source has more
+    /// eligible transcripts than one cycle may parse. Kept in the v2-only
+    /// index so an older daemon can neither clobber nor misread it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after_path: Option<String>,
+    /// Frozen lexicographic ceiling for the current bounded sweep. Files that
+    /// arrive after the sweep starts wait for the next generation instead of
+    /// keeping a hot tail full forever and starving older prefix keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_upper_bound_path: Option<String>,
+    /// Observation boundary paired with `resume_upper_bound_path`. A sweep
+    /// that spans cycles may publish only through the time at which its frozen
+    /// path generation was captured, never through the later finishing tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_census_window_end: Option<String>,
+    /// At least one earlier page in this frozen sweep was only partially
+    /// settled. The final page may finish discovery, but one clean follow-up
+    /// generation is still required before completeness or the policy epoch
+    /// can advance.
+    #[serde(default)]
+    bounded_sweep_had_unsettled_upload: bool,
+    /// Durable bounded filesystem census. It is intentionally destination-
+    /// scoped with the rest of the scan index: missed watcher events, daemon
+    /// restarts, deletions, and roots created after startup all converge via
+    /// this finite queue without an O(all paths) tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    traversal: Option<ScanTraversalCheckpoint>,
+    /// Destination-scoped historical bootstrap/replay generation currently
+    /// being paged. Matching generations resume; a new reviewed revision
+    /// clears only derived transcript settlement state once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    historical_replay_generation: Option<String>,
+    /// Files that were fully read and valid but intentionally produced no
+    /// snapshot. Separate from `last_snapshot_fingerprint=None`, which legacy
+    /// indexes can only treat as unknown/incomplete.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub confirmed_empty_files: BTreeSet<String>,
+    /// Final post-policy entity fingerprints produced by each transcript.
+    /// Most files contain one session; the set preserves exact entity grain
+    /// for split/provider files instead of hiding all but an arbitrary last.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub file_snapshot_fingerprints: BTreeMap<String, BTreeSet<String>>,
+    /// Server-reconstructible semantic activity clock for each final entity.
+    /// This mirrors the accepted-log `occurred_at` rule and never uses local
+    /// file mtime or the collector observation clock.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub snapshot_activity_at: BTreeMap<String, Option<String>>,
+    /// Rejected entities are quarantined under the exact daemon/parser/wire
+    /// contract that produced the rejection. They are excluded from the
+    /// server-agreement manifest while that witness is current, but are
+    /// automatically re-derived after a repair changes any witness component.
+    /// This isolates poison without turning quarantine into a permanent fence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quarantined_snapshot_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+    /// Runtime-only witness used to decide whether a persisted quarantine is
+    /// stale. It is reconstructed from the current source before every scan.
+    #[serde(skip)]
+    active_quarantine_witness: Option<SnapshotQuarantineWitness>,
+    /// Runtime-only desired upload context. It becomes durable only after a
+    /// complete census, so a bounded/failed sweep cannot skip untouched files.
+    #[serde(skip)]
+    active_upload_context_fingerprint: Option<String>,
+}
+
+impl Default for ScanIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: SCAN_INDEX_SCHEMA_VERSION,
+            generation: 0,
+            upload_context_fingerprint: None,
+            files: BTreeMap::new(),
+            known_configured_scan_roots: BTreeSet::new(),
+            legacy_unresolved_root_file_witnesses: BTreeSet::new(),
+            codex_state_only_snapshot_fingerprints: BTreeMap::new(),
+            claude_desktop_title_files: BTreeMap::new(),
+            claude_desktop_store_cursor: None,
+            claude_desktop_store_upper_bound: None,
+            claude_desktop_store_sweep_had_errors: false,
+            claude_desktop_store_retry_attempt: 0,
+            claude_desktop_store_retry_not_before_unix_seconds: None,
+            resume_after_path: None,
+            resume_upper_bound_path: None,
+            resume_census_window_end: None,
+            bounded_sweep_had_unsettled_upload: false,
+            traversal: None,
+            historical_replay_generation: None,
+            confirmed_empty_files: BTreeSet::new(),
+            file_snapshot_fingerprints: BTreeMap::new(),
+            snapshot_activity_at: BTreeMap::new(),
+            quarantined_snapshot_fingerprints: BTreeMap::new(),
+            active_quarantine_witness: None,
+            active_upload_context_fingerprint: None,
+        }
+    }
+}
+
+/// Content-free proof of the code and wire contract that rejected an entity.
+/// A semantic fingerprint alone is insufficient: a parser or validator fix
+/// can make the same entity acceptable without changing that fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotQuarantineWitness {
+    pub contract: String,
+    pub collector_version: String,
+    pub parser_version: String,
+    pub scan_identity_version: String,
+    pub snapshot_schema_version: u16,
+    pub entity_ack_contract: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotQuarantineRecord {
+    pub witness: SnapshotQuarantineWitness,
+    pub retry_after_unix_seconds: u64,
+}
+
+pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantineWitness {
+    SnapshotQuarantineWitness {
+        contract: SNAPSHOT_QUARANTINE_CONTRACT_VERSION.to_string(),
+        collector_version: collector_version(),
+        parser_version: source.parser_version().to_string(),
+        scan_identity_version: source.scan_identity_version().to_string(),
+        snapshot_schema_version: SNAPSHOT_SCHEMA_VERSION,
+        entity_ack_contract: SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+    }
+}
+
+pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineRecord {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    SnapshotQuarantineRecord {
+        witness: snapshot_quarantine_witness(source),
+        retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
+    }
+}
+
+pub(crate) fn snapshot_quarantine_deadline_is_bounded(record: &SnapshotQuarantineRecord) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    snapshot_quarantine_deadline_is_bounded_at(record, now)
+}
+
+fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord, now: u64) -> bool {
+    // Fresh quarantine is deterministically staggered across [6h, 12h).
+    // Anything further out is corrupt state or evidence the wall clock moved
+    // backwards. In either case local state must never become a permanent
+    // authority that fences a repaired backend forever.
+    record.retry_after_unix_seconds
+        <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+}
+
+fn scan_index_schema_version() -> u16 {
+    SCAN_INDEX_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -777,17 +1078,29 @@ pub struct ScanIndexEntry {
     pub scan_identity_version: Option<String>,
 }
 
-/// `{source, entity_count, rolling_hash}` — the scan-index manifest triple
-/// carried on collector check-ins, plus the two fields that make the triple
-/// comparable: what it covers and over how long. See [`ScanIndex::manifest`] for
-/// the fold, the entity grain, and the scope.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanParseOutcome {
+    /// Old indexes cannot distinguish an empty parse from an interrupted one.
+    #[default]
+    Unknown,
+    Snapshot,
+    ConfirmedEmpty,
+    PolicySuppressed,
+}
+
+/// Exact `snapshot_manifest:v2` wire contract carried on collector check-ins.
+/// Census diagnostics stay in the top-level status counters rather than
+/// masquerading as server proof inside this producer-side manifest.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotSourceManifest {
+    pub contract_version: &'static str,
+    pub scope: &'static str,
     pub source: String,
+    pub window_start: String,
+    pub window_end: String,
     pub entity_count: u64,
     pub rolling_hash: String,
-    pub scope: &'static str,
-    pub window_days: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -801,7 +1114,38 @@ pub struct SourceScanResult {
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
+    pub census_complete: bool,
+    pub census_window_end: String,
+    /// State-only Codex census is separate from transcript discovery. If an
+    /// existing SQLite source was unreadable, its previous durable map must be
+    /// retained even while healthy transcript siblings progress.
+    pub state_census_complete: bool,
+    /// Display/naming sidecars are optional enrichment, but a partial read
+    /// cannot publish a source-wide manifest or advance the upload context.
+    pub sidecar_census_complete: bool,
+    pub symlink_rejected_count: usize,
+    pub directory_entry_cap_exceeded_count: usize,
+    pub unreadable_path_count: usize,
+    pub oversized_file_count: usize,
+    pub disappeared_file_count: usize,
+    pub malformed_json_line_count: usize,
+    pub invalid_utf8_line_count: usize,
+    pub over_line_cap_count: usize,
+    pub recognized_usage_drop_count: usize,
+    pub zero_snapshot_confirmed_count: usize,
+    pub zero_snapshot_usage_evidence_count: usize,
+    pub dropped_usage_record_count: u64,
     pub snapshots: Vec<SnapshotItem>,
+    pending_finalization: Vec<PendingIndexFinalization>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingIndexFinalization {
+    index_key: String,
+    source_file_fingerprint: String,
+    previous_snapshot_fingerprint: Option<String>,
+    parse_complete: bool,
+    parsed_snapshot_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -885,6 +1229,163 @@ pub fn apply_upload_policy(
     }
 }
 
+/// Bind incremental state to the exact bytes/semantics that will go on the
+/// wire. This MUST run after every enrichment, privacy policy, and account
+/// cutoff. Parser-time fingerprints are provisional only: committing them
+/// earlier can suppress a later policy/enrichment correction forever.
+pub fn finalize_scan_after_policy(
+    source: SnapshotSource,
+    result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+) {
+    for snapshot in &mut result.snapshots {
+        snapshot.snapshot_fingerprint = snapshot_fingerprint(source, snapshot);
+        index.snapshot_activity_at.insert(
+            snapshot.snapshot_fingerprint.clone(),
+            snapshot_semantic_activity_at(snapshot),
+        );
+    }
+
+    let mut by_source_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for snapshot in &result.snapshots {
+        if let Some(source_file_fingerprint) = snapshot.source_file_fingerprint.as_ref() {
+            by_source_file
+                .entry(source_file_fingerprint.clone())
+                .or_default()
+                .insert(snapshot.snapshot_fingerprint.clone());
+        }
+    }
+
+    let mut noop_source_files = BTreeSet::new();
+    for pending in &result.pending_finalization {
+        if !pending.parse_complete {
+            continue;
+        }
+        let final_fingerprints = by_source_file
+            .get(&pending.source_file_fingerprint)
+            .cloned()
+            .unwrap_or_default();
+        let final_group_fingerprint = (!final_fingerprints.is_empty()).then(|| {
+            let mut digest = Sha256::new();
+            update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+            for fingerprint in &final_fingerprints {
+                update_length_prefixed(&mut digest, fingerprint.as_bytes());
+            }
+            format!("{:x}", digest.finalize())
+        });
+        let quarantine_retry_required = final_fingerprints
+            .iter()
+            .any(|fingerprint| index.quarantine_requires_retry(fingerprint));
+        if let Some(entry) = index.files.get_mut(&pending.index_key) {
+            entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
+        }
+        if final_fingerprints.is_empty() {
+            index.file_snapshot_fingerprints.remove(&pending.index_key);
+            index
+                .confirmed_empty_files
+                .insert(pending.index_key.clone());
+        } else {
+            index
+                .file_snapshot_fingerprints
+                .insert(pending.index_key.clone(), final_fingerprints);
+            index.confirmed_empty_files.remove(&pending.index_key);
+        }
+        if final_group_fingerprint.is_some()
+            && final_group_fingerprint == pending.previous_snapshot_fingerprint
+            && !quarantine_retry_required
+        {
+            noop_source_files.insert(pending.source_file_fingerprint.clone());
+            result.semantic_noop_count = result
+                .semantic_noop_count
+                .saturating_add(pending.parsed_snapshot_count);
+        }
+    }
+    result.snapshots.retain(|snapshot| {
+        snapshot
+            .source_file_fingerprint
+            .as_ref()
+            .map(|source_file| !noop_source_files.contains(source_file))
+            .unwrap_or(true)
+    });
+
+    // State-only Codex entities do not have a source-file fingerprint, so they
+    // cannot use the file finalization table above. Rebind their durable map to
+    // the final post-enrichment/post-policy/post-cutoff fingerprint here. This
+    // is also where no-op suppression belongs: parser-time equality is not
+    // authoritative when a privacy policy or account cutoff changed.
+    if source == SnapshotSource::Codex && result.state_census_complete {
+        let previous = index.codex_state_only_snapshot_fingerprints.clone();
+        let mut current = BTreeMap::new();
+        let mut noop_state_only = BTreeSet::new();
+        for snapshot in &result.snapshots {
+            if snapshot.source_file_fingerprint.is_none()
+                && snapshot.provenance.collector == "codex_state_sqlite"
+            {
+                let fingerprint = snapshot.snapshot_fingerprint.clone();
+                if previous.get(&snapshot.source_session_id) == Some(&fingerprint)
+                    && index.snapshot_activity_at.contains_key(&fingerprint)
+                    && !index.quarantine_requires_retry(&fingerprint)
+                {
+                    noop_state_only.insert(snapshot.source_session_id.clone());
+                    result.semantic_noop_count = result.semantic_noop_count.saturating_add(1);
+                }
+                current.insert(snapshot.source_session_id.clone(), fingerprint);
+            }
+        }
+        index.codex_state_only_snapshot_fingerprints = current;
+        result.snapshots.retain(|snapshot| {
+            snapshot.source_file_fingerprint.is_some()
+                || snapshot.provenance.collector != "codex_state_sqlite"
+                || !noop_state_only.contains(&snapshot.source_session_id)
+        });
+    }
+    if result.census_complete {
+        if !index.bounded_sweep_had_unsettled_upload {
+            index.upload_context_fingerprint = index.active_upload_context_fingerprint.clone();
+        }
+        index.bounded_sweep_had_unsettled_upload = false;
+    }
+    let current_fingerprints = index
+        .file_snapshot_fingerprints
+        .values()
+        .flat_map(BTreeSet::iter)
+        .chain(index.codex_state_only_snapshot_fingerprints.values())
+        .collect::<BTreeSet<_>>();
+    index
+        .snapshot_activity_at
+        .retain(|fingerprint, _| current_fingerprints.contains(fingerprint));
+}
+
+/// The producer-side event clock mirrored by the accepted-log append path.
+/// The maximum activity clock is stable across retries and reconstructible on
+/// both sides. `collected_at` is deliberately excluded because it is an
+/// observation clock; metadata-only entities without semantic activity do not
+/// participate in a v2 manifest.
+fn snapshot_semantic_activity_at(item: &SnapshotItem) -> Option<String> {
+    item.usage_buckets
+        .iter()
+        .flat_map(|bucket| {
+            [
+                Some(bucket.bucket_start.as_str()),
+                bucket.first_activity_at.as_deref(),
+                bucket.last_activity_at.as_deref(),
+            ]
+        })
+        .chain([
+            item.source_started_at.as_deref(),
+            item.source_ended_at.as_deref(),
+            item.source_last_activity_at.as_deref(),
+        ])
+        .flatten()
+        .filter_map(|value| {
+            OffsetDateTime::parse(value, &Rfc3339)
+                .ok()
+                .map(|parsed| (parsed, value))
+        })
+        .max_by_key(|(parsed, _)| *parsed)
+        .map(|(_, value)| value.to_string())
+}
+
 /// Split Claude transcript bucket rows by exact locally-reduced OTLP effort.
 ///
 /// The transcript remains authoritative for total tokens. Evidence is applied
@@ -920,14 +1421,20 @@ pub fn apply_claude_effort_evidence(
                 request_count: observed.request_count,
                 costs: UsageCosts::default(),
             };
-            grouped
+            let grouped_totals = grouped
                 .entry((
                     bucket_start,
                     normalized_evidence_model(&observed.model),
                     observed.effort.clone(),
                 ))
-                .or_default()
-                .add(&totals);
+                .or_default();
+            if !grouped_totals.add(&totals) {
+                // Supplemental effort evidence must never make the transcript's
+                // authoritative wire totals inexact. Ignore the whole evidence
+                // projection when its own counters are not representable.
+                grouped.clear();
+                break;
+            }
         }
 
         for bucket in &mut item.usage_buckets {
@@ -1102,12 +1609,14 @@ fn usage_totals_fit(observed: &UsageTotals, base: &UsageTotals) -> bool {
     base.is_monotonic_after(observed)
 }
 
-fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> UsageTotals {
+fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> Option<UsageTotals> {
     let mut total = UsageTotals::default();
     for (_, row) in rows {
-        total.add(row);
+        if !total.add(row) {
+            return None;
+        }
     }
-    total
+    Some(total)
 }
 
 /// Reconcile legacy cache evidence against the transcript's authoritative TTLs.
@@ -1121,7 +1630,7 @@ fn reconcile_effort_cache_creation(
     rows: &mut [(String, UsageTotals)],
     base: &UsageTotals,
 ) -> Option<UsageTotals> {
-    let observed = sum_effort_totals(rows);
+    let observed = sum_effort_totals(rows)?;
     if usage_totals_fit(&observed, base) {
         return Some(observed);
     }
@@ -1142,7 +1651,7 @@ fn reconcile_effort_cache_creation(
             totals.cache_creation_1h_tokens = 0;
         }
     }
-    let reconciled = sum_effort_totals(rows);
+    let reconciled = sum_effort_totals(rows)?;
     usage_totals_fit(&reconciled, base).then_some(reconciled)
 }
 
@@ -1518,6 +2027,51 @@ pub(crate) fn snapshot_revision_hash(
     ])
 }
 
+pub(crate) fn snapshot_revision_v2_body(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    upload_policy: SnapshotUploadPolicy,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> Value {
+    json!({
+        "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+        "contract": SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
+        "component_hashes": component_hashes,
+        "parser_version": source.parser_version(),
+        "scan_identity_version": source.scan_identity_version(),
+        "source": source.api_slug(),
+        "source_session_id": &item.source_session_id,
+        "source_file_fingerprint": &item.source_file_fingerprint,
+        "lifecycle": {
+            "status": &item.status,
+            "source_started_at": &item.source_started_at,
+            "source_ended_at": &item.source_ended_at,
+            "source_last_activity_at": &item.source_last_activity_at,
+        },
+        "provenance": {
+            "collector": &item.provenance.collector,
+            "input_token_scope": &item.provenance.input_token_scope,
+            "state_total_tokens": item.provenance.state_total_tokens,
+            "state_archived": item.provenance.state_archived,
+        },
+        "upload_policy": upload_policy,
+    })
+}
+
+pub(crate) fn snapshot_revision_v2_hash(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    upload_policy: SnapshotUploadPolicy,
+    component_hashes: &BTreeMap<&'static str, String>,
+) -> String {
+    let body = snapshot_revision_v2_body(source, item, upload_policy, component_hashes);
+    let canonical = crate::canonical_json::canonicalize(&body)
+        .expect("snapshot revision v2 body is canonicalizable");
+    let mut digest = Sha256::new();
+    digest.update(&canonical);
+    format!("{:x}", digest.finalize())
+}
+
 pub(crate) fn snapshot_semantic_envelope(
     source: SnapshotSource,
     item: &SnapshotItem,
@@ -1529,6 +2083,11 @@ pub(crate) fn snapshot_semantic_envelope(
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
         upload_policy,
         revision_hash: snapshot_revision_hash(source, item, &component_hashes),
+        revision_v2_contract_version: SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
+        revision_v2_canonicalization: crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+        revision_v2_parser_version: source.parser_version(),
+        revision_v2_scan_identity_version: source.scan_identity_version(),
+        revision_v2_hash: snapshot_revision_v2_hash(source, item, upload_policy, &component_hashes),
         content_hash: snapshot_content_hash(source, &item.source_session_id, &component_hashes),
         hash_epoch: SNAPSHOT_CONTENT_HASH_EPOCH,
         component_hashes,
@@ -1622,7 +2181,7 @@ impl UsageCosts {
 
 fn add_complete_cost(left: Option<u128>, right: Option<u128>) -> Option<u128> {
     match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
+        (Some(left), Some(right)) => left.checked_add(right),
         _ => None,
     }
 }
@@ -1646,11 +2205,11 @@ impl UsageTotals {
 
     fn total_tokens(&self) -> u64 {
         self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_5m_tokens
-            + self.cache_creation_1h_tokens
-            + self.unattributed_total_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
+            .saturating_add(self.unattributed_total_tokens)
     }
 
     /// Effective input context for one turn: the prompt size the model actually
@@ -1661,21 +2220,62 @@ impl UsageTotals {
     /// could only have come from the 1M-context window.
     fn effective_input_context(&self) -> u64 {
         self.input_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_5m_tokens
-            + self.cache_creation_1h_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_5m_tokens)
+            .saturating_add(self.cache_creation_1h_tokens)
     }
 
-    fn add(&mut self, other: &UsageTotals) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.cache_creation_5m_tokens += other.cache_creation_5m_tokens;
-        self.cache_creation_1h_tokens += other.cache_creation_1h_tokens;
-        self.reasoning_output_tokens += other.reasoning_output_tokens;
-        self.unattributed_total_tokens += other.unattributed_total_tokens;
-        self.request_count += other.request_count;
+    /// Add wire-carried counters atomically. Derived totals may saturate for
+    /// thresholding, but a wire field cannot: callers must preserve the prior
+    /// exact aggregate and expose the rejected record as loss.
+    fn add(&mut self, other: &UsageTotals) -> bool {
+        let Some(input_tokens) = self.input_tokens.checked_add(other.input_tokens) else {
+            return false;
+        };
+        let Some(output_tokens) = self.output_tokens.checked_add(other.output_tokens) else {
+            return false;
+        };
+        let Some(cache_read_tokens) = self.cache_read_tokens.checked_add(other.cache_read_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_5m_tokens) = self
+            .cache_creation_5m_tokens
+            .checked_add(other.cache_creation_5m_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_creation_1h_tokens) = self
+            .cache_creation_1h_tokens
+            .checked_add(other.cache_creation_1h_tokens)
+        else {
+            return false;
+        };
+        let Some(reasoning_output_tokens) = self
+            .reasoning_output_tokens
+            .checked_add(other.reasoning_output_tokens)
+        else {
+            return false;
+        };
+        let Some(unattributed_total_tokens) = self
+            .unattributed_total_tokens
+            .checked_add(other.unattributed_total_tokens)
+        else {
+            return false;
+        };
+        let Some(request_count) = self.request_count.checked_add(other.request_count) else {
+            return false;
+        };
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_creation_5m_tokens = cache_creation_5m_tokens;
+        self.cache_creation_1h_tokens = cache_creation_1h_tokens;
+        self.reasoning_output_tokens = reasoning_output_tokens;
+        self.unattributed_total_tokens = unattributed_total_tokens;
+        self.request_count = request_count;
         self.costs.add(&other.costs);
+        true
     }
 
     fn is_monotonic_after(&self, previous: &UsageTotals) -> bool {
@@ -1743,6 +2343,25 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
                 "snapshot[{index}] semantic_envelope is {envelope_size} bytes; maximum is {MAX_SEMANTIC_ENVELOPE_BYTES}"
             ));
         }
+        let item_size = serde_json::to_vec(&SnapshotItemWire {
+            snapshot: item,
+            semantic_envelope: envelope,
+        })
+        .map_err(|error| format!("snapshot[{index}] wire encoding: {error}"))?
+        .len();
+        if item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES {
+            return Err(format!(
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES}"
+            ));
+        }
+    }
+    let batch_size = serde_json::to_vec(request)
+        .map_err(|error| format!("snapshot batch wire encoding: {error}"))?
+        .len();
+    if batch_size > MAX_SNAPSHOT_BATCH_WIRE_BYTES {
+        return Err(format!(
+            "snapshot batch wire body is {batch_size} bytes; maximum is {MAX_SNAPSHOT_BATCH_WIRE_BYTES}"
+        ));
     }
     Ok(())
 }
@@ -1793,8 +2412,12 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
                 ));
             }
             let totals = usage_totals_from_model_usage(row);
-            bucket_totals.add(&totals);
-            bucket_rows.entry(row_key).or_default().add(&totals);
+            if !bucket_totals.add(&totals) || !bucket_rows.entry(row_key).or_default().add(&totals)
+            {
+                return Err(format!(
+                    "snapshot[{index}] usage_buckets counters overflow wire bounds"
+                ));
+            }
         }
     }
 
@@ -1917,6 +2540,10 @@ impl SelectorCapture {
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
+    /// True only when an existing state DB could not be read completely. A
+    /// missing DB means there is no state-only source and is complete-empty.
+    state_census_incomplete: bool,
+    sidecar_census_incomplete: bool,
     legacy_sidecar_fingerprint: String,
     /// The old index retained only config file stats, not content or affected
     /// session ids. Presence therefore requires one conservative corrective
@@ -1965,6 +2592,7 @@ struct ClaudeTitleMetadata {
     titles: BTreeMap<String, ClaudeTitleCandidate>,
     account_identifier_hashes: BTreeMap<String, BTreeSet<String>>,
     legacy_sidecar_fingerprint: String,
+    sidecar_census_incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1976,11 +2604,22 @@ struct ClaudeTitleCandidate {
     user_set: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClaudeDesktopTitleIndexEntry {
+    cli_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    user_set: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_identifier_hash: Option<String>,
+}
+
 // The desktop store holds one ~80KB JSON per session; both caps are far above
 // anything observed and exist only to bound a pathological store.
 const MAX_CLAUDE_DESKTOP_SESSION_FILES: usize = 5_000;
 const MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CLAUDE_DESKTOP_STORE_DEPTH: usize = 3;
+const MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN: usize = 10_000;
 
 impl ClaudeTitleMetadata {
     fn account_identifier_hash(&self, source_session_id: &str) -> Option<&str> {
@@ -2008,7 +2647,17 @@ impl ClaudeTitleMetadata {
         ])
     }
 
+    #[cfg(test)]
     fn load_from_roots(roots: &[PathBuf]) -> Self {
+        let mut index = ScanIndex::default();
+        Self::load_from_roots_with_index(roots, &mut index, "2026-07-31T00:00:00Z")
+    }
+
+    fn load_from_roots_with_index(
+        roots: &[PathBuf],
+        index: &mut ScanIndex,
+        collected_at: &str,
+    ) -> Self {
         let mut store_dirs = BTreeSet::new();
         for root in roots {
             // root is `<home>/.claude/projects`; the desktop store lives under
@@ -2023,26 +2672,136 @@ impl ClaudeTitleMetadata {
                     .join("claude-code-sessions"),
             );
         }
-        Self::load_from_store_dirs(&store_dirs)
+        Self::load_from_store_dirs_with_index(&store_dirs, index, collected_at)
     }
 
-    fn load_from_store_dirs(store_dirs: &BTreeSet<PathBuf>) -> Self {
-        let mut metadata = Self::default();
-        let mut session_files = Vec::new();
-        for dir in store_dirs {
-            let mut files = Vec::new();
-            collect_claude_desktop_session_files(dir, 0, &mut files);
-            session_files.extend(files.into_iter().map(|path| (dir.clone(), path)));
+    fn load_from_store_dirs_with_index(
+        store_dirs: &BTreeSet<PathBuf>,
+        index: &mut ScanIndex,
+        collected_at: &str,
+    ) -> Self {
+        let now = rfc3339_unix_seconds(collected_at);
+        let retry_due = match (
+            now,
+            index.claude_desktop_store_retry_not_before_unix_seconds,
+        ) {
+            (_, None) => true,
+            (Some(now), Some(deadline)) => {
+                now >= deadline || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+            }
+            (None, Some(_)) => true,
+        };
+        if !retry_due {
+            return Self::from_durable_index(index, true);
         }
-        session_files.sort();
-        session_files.truncate(MAX_CLAUDE_DESKTOP_SESSION_FILES);
-        for (store_dir, path) in &session_files {
-            load_claude_desktop_session_metadata(
-                store_dir,
-                path,
-                &mut metadata.titles,
-                &mut metadata.account_identifier_hashes,
+
+        let mut metadata = Self::default();
+        let mut selection = BoundedPathSelection::new(
+            index.claude_desktop_store_cursor.clone(),
+            index.claude_desktop_store_upper_bound.clone(),
+            MAX_CLAUDE_DESKTOP_SESSION_FILES,
+        );
+        let mut census = ClaudeDesktopStoreCensus::default();
+        let mut remaining_entries = MAX_CLAUDE_DESKTOP_STORE_ENTRIES_PER_SCAN;
+        for (position, dir) in store_dirs.iter().enumerate() {
+            collect_claude_desktop_session_files(
+                dir,
+                0,
+                &mut remaining_entries,
+                &mut selection,
+                &mut census,
             );
+            if remaining_entries == 0 {
+                if position + 1 < store_dirs.len() {
+                    census.entry_budget_exceeded_count += 1;
+                }
+                break;
+            }
+        }
+        let (session_files, sweep_complete, next_cursor, next_upper_bound) =
+            selection.finish(census.discovered_file_count);
+        for path in &session_files {
+            let account_identifier_hash = store_dirs
+                .iter()
+                .find_map(|store_dir| claude_desktop_account_identifier_hash(store_dir, path));
+            match load_claude_desktop_session_title(path, account_identifier_hash) {
+                Ok(Some(entry)) => {
+                    index
+                        .claude_desktop_title_files
+                        .insert(local_index_key(path), entry);
+                }
+                Ok(None) => {
+                    index
+                        .claude_desktop_title_files
+                        .remove(&local_index_key(path));
+                }
+                Err(_) => census.invalid_file_count += 1,
+            }
+        }
+        let sweep_had_errors = index.claude_desktop_store_sweep_had_errors || census.has_errors();
+        if sweep_complete && !sweep_had_errors {
+            index
+                .claude_desktop_title_files
+                .retain(|path, _| census.observed_paths.contains(path));
+        }
+        metadata.sidecar_census_incomplete = !sweep_complete || sweep_had_errors;
+        index.claude_desktop_store_cursor = next_cursor;
+        index.claude_desktop_store_upper_bound = next_upper_bound;
+        index.claude_desktop_store_sweep_had_errors = if sweep_complete {
+            false
+        } else {
+            sweep_had_errors
+        };
+
+        if metadata.sidecar_census_incomplete {
+            index.claude_desktop_store_retry_attempt =
+                index.claude_desktop_store_retry_attempt.saturating_add(1);
+            let now = now.unwrap_or_default();
+            index.claude_desktop_store_retry_not_before_unix_seconds = Some(now.saturating_add(
+                unhealthy_scan_retry_delay_seconds(index.claude_desktop_store_retry_attempt),
+            ));
+        } else {
+            index.claude_desktop_store_retry_attempt = 0;
+            index.claude_desktop_store_retry_not_before_unix_seconds = None;
+        }
+
+        Self::from_durable_index_with_metadata(index, metadata)
+    }
+
+    fn from_durable_index(index: &ScanIndex, sidecar_census_incomplete: bool) -> Self {
+        Self::from_durable_index_with_metadata(
+            index,
+            Self {
+                sidecar_census_incomplete,
+                ..Self::default()
+            },
+        )
+    }
+
+    fn from_durable_index_with_metadata(index: &ScanIndex, mut metadata: Self) -> Self {
+        for entry in index.claude_desktop_title_files.values() {
+            if let Some(account_identifier_hash) = &entry.account_identifier_hash {
+                metadata
+                    .account_identifier_hashes
+                    .entry(entry.cli_session_id.clone())
+                    .or_default()
+                    .insert(account_identifier_hash.clone());
+            }
+            let Some(title) = &entry.title else {
+                continue;
+            };
+            let candidate = ClaudeTitleCandidate {
+                title: title.clone(),
+                user_set: entry.user_set,
+            };
+            match metadata.titles.get(entry.cli_session_id.as_str()) {
+                Some(existing) if existing.user_set && !candidate.user_set => {}
+                _ => {
+                    metadata
+                        .titles
+                        .insert(entry.cli_session_id.clone(), candidate);
+                }
+            }
         }
         let sidecar_parts = metadata
             .titles
@@ -2054,51 +2813,161 @@ impl ClaudeTitleMetadata {
     }
 }
 
-fn collect_claude_desktop_session_files(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) {
+#[derive(Debug, Default)]
+struct ClaudeDesktopStoreCensus {
+    discovered_file_count: usize,
+    unreadable_path_count: usize,
+    symlink_rejected_count: usize,
+    depth_exceeded_count: usize,
+    invalid_file_count: usize,
+    entry_budget_exceeded_count: usize,
+    observed_paths: BTreeSet<String>,
+}
+
+impl ClaudeDesktopStoreCensus {
+    fn has_errors(&self) -> bool {
+        self.unreadable_path_count > 0
+            || self.symlink_rejected_count > 0
+            || self.depth_exceeded_count > 0
+            || self.invalid_file_count > 0
+            || self.entry_budget_exceeded_count > 0
+    }
+}
+
+#[derive(Debug)]
+struct BoundedPathSelection {
+    cursor: Option<String>,
+    upper_bound: Option<String>,
+    limit: usize,
+    selected: BTreeMap<String, PathBuf>,
+    observed_max: Option<String>,
+}
+
+impl BoundedPathSelection {
+    fn new(cursor: Option<String>, upper_bound: Option<String>, limit: usize) -> Self {
+        let cursor = cursor.filter(|_| upper_bound.is_some());
+        Self {
+            cursor,
+            upper_bound,
+            limit,
+            selected: BTreeMap::new(),
+            observed_max: None,
+        }
+    }
+
+    fn insert(&mut self, path: PathBuf) {
+        let key = local_index_key(&path);
+        if self
+            .observed_max
+            .as_ref()
+            .map_or(true, |maximum| key > *maximum)
+        {
+            self.observed_max = Some(key.clone());
+        }
+        if self.limit == 0
+            || self
+                .upper_bound
+                .as_ref()
+                .is_some_and(|upper_bound| key > *upper_bound)
+            || self.cursor.as_ref().is_some_and(|cursor| key <= *cursor)
+        {
+            return;
+        }
+        self.selected.insert(key, path);
+        if self.selected.len() > self.limit {
+            self.selected.pop_last();
+        }
+    }
+
+    fn finish(self, discovered: usize) -> (Vec<PathBuf>, bool, Option<String>, Option<String>) {
+        let upper_bound = self.upper_bound.or(self.observed_max);
+        let selected = self.selected.into_values().collect::<Vec<_>>();
+        let next_cursor = selected.last().map(|path| local_index_key(path));
+        let reached_upper_bound = next_cursor
+            .as_ref()
+            .zip(upper_bound.as_ref())
+            .is_some_and(|(cursor, upper_bound)| cursor >= upper_bound);
+        let complete = if self.limit == 0 {
+            discovered == 0
+        } else {
+            selected.len() < self.limit || reached_upper_bound
+        };
+        (
+            selected,
+            complete,
+            (!complete).then_some(next_cursor).flatten(),
+            (!complete).then_some(upper_bound).flatten(),
+        )
+    }
+}
+
+fn collect_claude_desktop_session_files(
+    dir: &Path,
+    depth: usize,
+    remaining_entries: &mut usize,
+    selection: &mut BoundedPathSelection,
+    census: &mut ClaudeDesktopStoreCensus,
+) {
     if depth > MAX_CLAUDE_DESKTOP_STORE_DEPTH {
+        census.depth_exceeded_count += 1;
         return;
     }
-    // Best-effort: a missing/unreadable store (non-macOS, app not installed)
-    // yields no titles and is never load-bearing for collection.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(entry_metadata) = entry.metadata() else {
-            continue;
+    for entry in entries {
+        if *remaining_entries == 0 {
+            census.entry_budget_exceeded_count += 1;
+            return;
+        }
+        *remaining_entries -= 1;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
         };
-        if entry_metadata.is_dir() {
-            collect_claude_desktop_session_files(&path, depth + 1, files);
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            census.symlink_rejected_count += 1;
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_claude_desktop_session_files(
+                &path,
+                depth + 1,
+                remaining_entries,
+                selection,
+                census,
+            );
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        if entry_metadata.len() > MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES {
-            continue;
-        }
-        files.push(path);
+        census.discovered_file_count += 1;
+        census.observed_paths.insert(local_index_key(&path));
+        selection.insert(path);
     }
 }
 
-fn load_claude_desktop_session_metadata(
-    store_dir: &Path,
-    path: &Path,
-    titles: &mut BTreeMap<String, ClaudeTitleCandidate>,
-    account_identifier_hashes: &mut BTreeMap<String, BTreeSet<String>>,
-) {
-    let Ok(bytes) = fs::read(path) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return;
-    };
-    // Non-session JSONs in the store (e.g. scheduled-tasks.json) lack these
-    // fields and fall out here.
-    let Some(cli_session_id) = string_at(&value, &["cliSessionId"]) else {
-        return;
-    };
+fn claude_desktop_account_identifier_hash(store_dir: &Path, path: &Path) -> Option<String> {
     let account_uuid = path
         .strip_prefix(store_dir)
         .ok()
@@ -2107,26 +2976,63 @@ fn load_claude_desktop_session_metadata(
             Component::Normal(value) => value.to_str(),
             _ => None,
         });
-    if let Some(account_hash) = account_uuid
-        .and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "account", uuid))
-    {
-        account_identifier_hashes
-            .entry(cli_session_id.clone())
-            .or_default()
-            .insert(account_hash);
+    account_uuid.and_then(|uuid| ottto_core::billing_identity_hash("anthropic", "account", uuid))
+}
+
+fn load_claude_desktop_session_title(
+    path: &Path,
+    account_identifier_hash: Option<String>,
+) -> Result<Option<ClaudeDesktopTitleIndexEntry>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = options
+        .open(path)
+        .context("open Claude desktop title sidecar")?;
+    let metadata = file
+        .metadata()
+        .context("stat Claude desktop title sidecar")?;
+    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES {
+        return Err(anyhow::anyhow!("Claude desktop title sidecar was invalid"));
     }
-    let Some(title) = string_at(&value, &["title"]) else {
-        return;
-    };
-    let user_set = string_at(&value, &["titleSource"]).as_deref() == Some("user");
-    // The same cliSessionId can appear in several store files (session reopened
-    // in another workspace); a user-set title wins over an auto one.
-    match titles.get(cli_session_id.as_str()) {
-        Some(existing) if existing.user_set && !user_set => {}
-        _ => {
-            titles.insert(cli_session_id, ClaudeTitleCandidate { title, user_set });
+    let mut bytes = Vec::new();
+    file.take(MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read Claude desktop title sidecar")?;
+    if bytes.len() as u64 > MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES {
+        return Err(anyhow::anyhow!("Claude desktop title sidecar exceeded cap"));
+    }
+    let value =
+        serde_json::from_slice::<Value>(&bytes).context("parse Claude desktop title sidecar")?;
+    // Non-session JSONs in the store (e.g. scheduled-tasks.json) lack these
+    // fields and fall out here.
+    let cli_session_id = match string_at(&value, &["cliSessionId"]) {
+        Some(cli_session_id) => cli_session_id,
+        None if value.get("cliSessionId").is_none() => return Ok(None),
+        None => {
+            return Err(anyhow::anyhow!(
+                "Claude desktop title sidecar session id was invalid"
+            ));
         }
-    }
+    };
+    let title = match string_at(&value, &["title"]) {
+        Some(title) => Some(title),
+        None if value.get("title").is_none() => None,
+        None => {
+            return Err(anyhow::anyhow!(
+                "Claude desktop title sidecar title was invalid"
+            ));
+        }
+    };
+    let user_set =
+        title.is_some() && string_at(&value, &["titleSource"]).as_deref() == Some("user");
+    Ok(Some(ClaudeDesktopTitleIndexEntry {
+        cli_session_id,
+        title,
+        user_set,
+        account_identifier_hash,
+    }))
 }
 
 /// Per-turn fast-mode signal lifted from Codex's undocumented `logs_2.sqlite`
@@ -2283,14 +3189,14 @@ struct UsageBucketState {
 impl UsageBucketState {
     fn note_activity_at(&mut self, timestamp: &str) {
         match self.first_activity_at.as_ref() {
-            Some(current) if timestamp < current.as_str() => {
+            Some(current) if timestamp_is_before(timestamp, current) => {
                 self.first_activity_at = Some(timestamp.to_string())
             }
             None => self.first_activity_at = Some(timestamp.to_string()),
             _ => {}
         }
         match self.last_activity_at.as_ref() {
-            Some(current) if timestamp > current.as_str() => {
+            Some(current) if timestamp_is_after(timestamp, current) => {
                 self.last_activity_at = Some(timestamp.to_string())
             }
             None => self.last_activity_at = Some(timestamp.to_string()),
@@ -2336,6 +3242,10 @@ struct SnapshotAccumulator {
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
+    // Exact sum of every usage record admitted to the wire projection. A
+    // provider record that would overflow any u64 wire field is refused before
+    // bucket mutation and counted as dropped, keeping the file retryable.
+    accepted_usage_totals: UsageTotals,
     usage_buckets: BTreeMap<String, UsageBucketState>,
     origin: SnapshotOrigin,
     artifacts: Vec<SessionArtifact>,
@@ -2364,6 +3274,19 @@ struct SnapshotAccumulator {
     // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
     // the set's lifetime matches one scan of one session file exactly.
     seen_claude_usage_keys: BTreeSet<String>,
+    // Current Pi transcripts carry usage on `type=message` assistant records;
+    // older exporters used `type=message_end`. When both representations are
+    // present, their response id is the exact occurrence key that prevents a
+    // compatibility parser from charging the same response twice.
+    // Each response id retains the unmatched digest multiset for both record
+    // shapes. A later opposite-shape exact match consumes one occurrence;
+    // repeated same-shape occurrences remain distinct. Keeping the multiset is
+    // required because transitional writers may reuse one response id for more
+    // than one paired occurrence.
+    seen_pi_usage_keys: BTreeMap<String, PiUsageDedupState>,
+    // Positive usage observations deliberately refused because their activity
+    // timestamp could not produce a truthful hourly bucket.
+    dropped_usage_record_count: u64,
     // Timestamp of the most recent Claude Code `type=user` record (a real user
     // prompt OR a tool_result — both are "model input available" moments). Each
     // assistant API response's first content-block record subtracts this to
@@ -2408,6 +3331,7 @@ impl SnapshotAccumulator {
             codex_turn_traces: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
+            accepted_usage_totals: UsageTotals::default(),
             usage_buckets: BTreeMap::new(),
             origin: SnapshotOrigin::default(),
             artifacts: Vec::new(),
@@ -2421,6 +3345,8 @@ impl SnapshotAccumulator {
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
+            seen_pi_usage_keys: BTreeMap::new(),
+            dropped_usage_record_count: 0,
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
@@ -2451,14 +3377,34 @@ impl SnapshotAccumulator {
         if self
             .started_at
             .as_ref()
-            .map_or(true, |current| timestamp < *current)
+            .map_or(true, |current| timestamp_is_before(&timestamp, current))
         {
             self.started_at = Some(timestamp.clone());
         }
         if self
             .last_activity_at
             .as_ref()
-            .map_or(true, |current| timestamp > *current)
+            .map_or(true, |current| timestamp_is_after(&timestamp, current))
+        {
+            self.last_activity_at = Some(timestamp);
+        }
+    }
+
+    fn note_pi_time(&mut self, timestamp: Option<String>) {
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+        if self
+            .started_at
+            .as_ref()
+            .map_or(true, |current| timestamp_is_before(&timestamp, current))
+        {
+            self.started_at = Some(timestamp.clone());
+        }
+        if self
+            .last_activity_at
+            .as_ref()
+            .map_or(true, |current| timestamp_is_after(&timestamp, current))
         {
             self.last_activity_at = Some(timestamp);
         }
@@ -2634,6 +3580,10 @@ impl SnapshotAccumulator {
         self.current_selector.merge(selector);
     }
 
+    fn note_dropped_usage(&mut self) {
+        self.dropped_usage_record_count = self.dropped_usage_record_count.saturating_add(1);
+    }
+
     /// True when the running turn (`latest_turn_id`) paid for Codex fast mode,
     /// per the `logs_2` request tier. Used to stamp `service_tier=priority` onto
     /// that turn's usage row only — never onto `current_selector`, so the signal
@@ -2671,13 +3621,19 @@ impl SnapshotAccumulator {
             .map(|value| value.to_string())
             .or_else(|| self.fallback_bucket_timestamp(None));
         let Some(bucket_input) = bucket_input else {
+            self.note_dropped_usage();
             return;
         };
         let Some((bucket_start, normalized_timestamp)) =
             activity_bucket_from_timestamp(&bucket_input)
         else {
+            self.note_dropped_usage();
             return;
         };
+        if !self.accepted_usage_totals.add(&usage) {
+            self.note_dropped_usage();
+            return;
+        }
 
         let mut merged = self.current_selector.clone();
         merged.merge(selector);
@@ -2691,7 +3647,8 @@ impl SnapshotAccumulator {
                 for (field, source) in reduced_sources {
                     row.selector_sources.insert(field, source);
                 }
-                row.usage.add(&usage);
+                let row_added = row.usage.add(&usage);
+                debug_assert!(row_added);
                 debug_assert_eq!(row.reasoning_effort, effort);
             }
             None => {
@@ -2738,8 +3695,12 @@ impl SnapshotAccumulator {
             Some(previous) if usage.is_monotonic_after(previous) => usage.delta_from(previous),
             Some(_) => {
                 // Non-monotonic: treat as a session restart. Clear all
-                // buckets because the cumulative was invalidated.
+                // buckets and their exact session-wide sum because the
+                // cumulative was invalidated. Keeping the pre-restart sum
+                // would detach the top-level totals from the replacement
+                // buckets and make this otherwise valid file fail preflight.
                 self.usage_buckets.clear();
+                self.accepted_usage_totals = UsageTotals::default();
                 usage.clone()
             }
             None => usage.clone(),
@@ -2901,6 +3862,7 @@ impl SnapshotAccumulator {
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
+        let totals = self.accepted_usage_totals.clone();
         let mut session_rows: BTreeMap<RowKey, BucketRowAccumulator> = BTreeMap::new();
         let mut usage_buckets: Vec<SnapshotUsageBucket> = Vec::new();
         for (bucket_start, bucket) in self.usage_buckets {
@@ -2935,10 +3897,6 @@ impl SnapshotAccumulator {
             for row in &mut bucket.model_usage {
                 row.account_identifier_hash = self.account_identifier_hash.clone();
             }
-        }
-        let mut totals = UsageTotals::default();
-        for row in session_rows.values() {
-            totals.add(&row.usage);
         }
         let (compaction_count, compaction_timestamps) = if self.source == SnapshotSource::ClaudeCode
         {
@@ -3085,7 +4043,8 @@ fn merge_session_row(
             for (field, source) in row.selector_sources {
                 existing.selector_sources.insert(field, source);
             }
-            existing.usage.add(&row.usage);
+            let row_added = existing.usage.add(&row.usage);
+            debug_assert!(row_added);
             debug_assert_eq!(existing.reasoning_effort, row.reasoning_effort);
         }
         None => {
@@ -3217,14 +4176,19 @@ pub fn scan_source_roots(
     // Convenience entry used by tests and non-policy-aware callers: artifacts
     // are scraped unconditionally. Production sync uses
     // `scan_source_roots_with_artifacts` to honor the org upload policy.
-    scan_source_roots_with_artifacts(
+    let mut result = scan_source_roots_with_artifacts(
         source,
         roots,
         index,
         collected_at,
         requested_backfill_window_days,
         true,
-    )
+    )?;
+    // This convenience entry has no later privacy/enrichment stage. Finalize
+    // immediately so its incremental state has the same final semantic entity
+    // sets as the production path, which explicitly finalizes after policy.
+    finalize_scan_after_policy(source, &mut result, index);
+    Ok(result)
 }
 
 /// Production scan entry: `artifacts_enabled` is the org's session-artifacts
@@ -3272,16 +4236,43 @@ pub fn scan_source_roots_with_attribution(
         artifacts_enabled,
         attribution_context,
         None,
+        &[],
+        false,
     )
 }
 
-/// Production scan entry that also tracks the local Claude OTLP sidecar.
-///
-/// Keeping the support directory explicit preserves the pure scan API for
-/// audits/backfills while ensuring a late provider identity re-selects an
-/// otherwise unchanged live transcript.
 #[allow(clippy::too_many_arguments)]
-pub fn scan_source_roots_with_attribution_and_claude_effort(
+pub fn scan_source_roots_with_attribution_and_hints(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    hinted_paths: &[PathBuf],
+    watcher_overflowed: bool,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        artifacts_enabled,
+        attribution_context,
+        None,
+        hinted_paths,
+        watcher_overflowed,
+    )
+}
+
+/// Production scan entry that tracks both the local Claude OTLP sidecar and
+/// bounded watcher hints. Keeping the support directory explicit preserves
+/// the pure scan API for audits and backfills.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
     source: SnapshotSource,
     roots: &[PathBuf],
     index: &mut ScanIndex,
@@ -3290,6 +4281,8 @@ pub fn scan_source_roots_with_attribution_and_claude_effort(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     claude_effort_support_dir: Option<&Path>,
+    hinted_paths: &[PathBuf],
+    watcher_overflowed: bool,
 ) -> Result<SourceScanResult> {
     scan_source_roots_with_limit_and_attribution(
         source,
@@ -3301,6 +4294,35 @@ pub fn scan_source_roots_with_attribution_and_claude_effort(
         artifacts_enabled,
         attribution_context,
         claude_effort_support_dir,
+        hinted_paths,
+        watcher_overflowed,
+    )
+}
+
+/// Compatibility entry retained for focused account-attribution and effort
+/// sidecar tests that do not exercise watcher hints.
+#[allow(clippy::too_many_arguments)]
+pub fn scan_source_roots_with_attribution_and_claude_effort(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    claude_effort_support_dir: Option<&Path>,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_attribution_and_claude_effort_and_hints(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        artifacts_enabled,
+        attribution_context,
+        claude_effort_support_dir,
+        &[],
+        false,
     )
 }
 
@@ -3325,6 +4347,29 @@ fn scan_source_roots_with_limit(
         artifacts_enabled,
         None,
         None,
+        &[],
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn scan_source_roots_with_test_limit(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    artifacts_enabled: bool,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        artifacts_enabled,
     )
 }
 
@@ -3339,18 +4384,41 @@ fn scan_source_roots_with_limit_and_attribution(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     claude_effort_support_dir: Option<&Path>,
+    hinted_paths: &[PathBuf],
+    watcher_overflowed: bool,
 ) -> Result<SourceScanResult> {
+    index.activate_quarantine_witness(source);
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
     let codex_title_metadata = if source == SnapshotSource::Codex {
         CodexTitleMetadata::load_from_roots(roots)
     } else {
         CodexTitleMetadata::default()
     };
+    let claude_sidecar_was_incomplete = source == SnapshotSource::ClaudeCode
+        && (index
+            .claude_desktop_store_retry_not_before_unix_seconds
+            .is_some()
+            || index.claude_desktop_store_cursor.is_some()
+            || index.claude_desktop_store_sweep_had_errors);
     let claude_title_metadata = if source == SnapshotSource::ClaudeCode {
-        ClaudeTitleMetadata::load_from_roots(roots)
+        ClaudeTitleMetadata::load_from_roots_with_index(roots, index, collected_at)
     } else {
         ClaudeTitleMetadata::default()
     };
+    let state_census_complete =
+        source != SnapshotSource::Codex || !codex_title_metadata.state_census_incomplete;
+    let sidecar_census_complete = match source {
+        SnapshotSource::Codex => !codex_title_metadata.sidecar_census_incomplete,
+        SnapshotSource::ClaudeCode => !claude_title_metadata.sidecar_census_incomplete,
+        SnapshotSource::Pi => true,
+    };
+    if claude_sidecar_was_incomplete && sidecar_census_complete {
+        // The prior transcript generation was intentionally held red while
+        // title discovery was partial. Start a fresh bounded transcript walk
+        // now so sidecar additions/removals are folded into each affected
+        // file fingerprint before a terminal manifest can publish.
+        index.traversal = None;
+    }
     // Read the per-turn fast-mode signal once per cycle (logs_2 is large); share
     // it read-only across every session file via Arc. Skipped when the local
     // opt-out is set.
@@ -3361,11 +4429,78 @@ fn scan_source_roots_with_limit_and_attribution(
                 backfill_window_days,
             ))
         });
-    let mut files = Vec::new();
-    for root in roots {
-        collect_recent_jsonl_files(source, root, &mut files, backfill_window_days)?;
+    ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    let traversal = index.traversal.as_mut().expect("traversal initialized");
+    enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
+    advance_bounded_directory_traversal(source, traversal, backfill_window_days);
+    let census_window_end = traversal.census_window_end.clone();
+    let discovered_file_count = traversal.counts.discovered_file_count;
+    let mut pending_paths = Vec::new();
+    // Watcher freshness must not starve the durable census when callers use a
+    // small page size. Production reserves almost the whole 10k page already,
+    // but the explicit slot also makes liveness independent of that ratio.
+    let ordinary_census_pending = traversal
+        .pending_candidates
+        .iter()
+        .any(|candidate| candidate.census_member && !candidate.watcher_hint);
+    let hinted_budget = file_limit
+        .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
+        .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
+    for _ in 0..hinted_budget {
+        let Some(position) = traversal
+            .pending_candidates
+            .iter()
+            .position(|candidate| candidate.watcher_hint)
+        else {
+            break;
+        };
+        if let Some(candidate) = traversal.pending_candidates.remove(position) {
+            pending_paths.push(candidate);
+        }
     }
+    while pending_paths.len() < file_limit {
+        let Some(position) = traversal
+            .pending_candidates
+            .iter()
+            .position(|candidate| candidate.census_member && !candidate.watcher_hint)
+        else {
+            break;
+        };
+        if let Some(candidate) = traversal.pending_candidates.remove(position) {
+            pending_paths.push(candidate);
+        }
+    }
+    while pending_paths.len() < file_limit {
+        let Some(candidate) = traversal.pending_candidates.pop_front() else {
+            break;
+        };
+        pending_paths.push(candidate);
+    }
+    index.resume_census_window_end = Some(census_window_end.clone());
+    let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
+    let mut census = ScanCensus::default();
+    let mut files = pending_paths
+        .into_iter()
+        .filter_map(|pending| {
+            candidate_from_traversal_path(
+                source,
+                pending,
+                &mut census,
+                census_unix_seconds,
+                backfill_window_days,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let legacy_sidecar_fingerprint = match source {
+        SnapshotSource::Codex => codex_title_metadata.legacy_sidecar_fingerprint.as_str(),
+        SnapshotSource::ClaudeCode => claude_title_metadata.legacy_sidecar_fingerprint.as_str(),
+        SnapshotSource::Pi => "",
+    };
     for candidate in &mut files {
+        // Sidecar contribution is path-derived and can be computed before the
+        // transcript opens. Transcript identity itself is filled from the
+        // exact opened object below, never from discovery metadata.
         let legacy_sidecar_fingerprint = match source {
             SnapshotSource::Codex => codex_title_metadata.legacy_sidecar_fingerprint.as_str(),
             SnapshotSource::ClaudeCode => claude_title_metadata.legacy_sidecar_fingerprint.as_str(),
@@ -3429,25 +4564,65 @@ fn scan_source_roots_with_limit_and_attribution(
             }
             SnapshotSource::Pi => String::new(),
         };
-        candidate.source_file_fingerprint = scan_file_fingerprint_with_context(
-            &candidate.path,
-            candidate.size_bytes,
-            candidate.modified_unix_nanos,
-            source.scan_identity_version(),
-            &sidecar_fingerprint,
-        );
+        // Temporarily retain the sidecar digest in the source fingerprint slot;
+        // the exact opened-object fingerprint replaces it immediately before
+        // candidate comparison and parsing.
+        candidate.source_file_fingerprint = sidecar_fingerprint;
     }
-    let discovered_file_count = files.len();
-    let skipped_file_count_due_to_limit = discovered_file_count.saturating_sub(file_limit);
-    files.sort_by_key(|file| Reverse(file.modified_unix_seconds));
-    files.truncate(file_limit);
-
     let mut snapshots = Vec::new();
     let mut scanned_file_count = 0;
     let mut scanned_session_count = 0;
     let mut semantic_noop_count = 0;
-    for candidate in files {
-        let source_context_changed = index.source_context_changed(&candidate);
+    let mut pending_finalization = Vec::new();
+    for mut candidate in files {
+        let opened_file = match open_candidate_file(source, &mut candidate) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                census.disappeared_file_count += 1;
+                continue;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    && candidate.size_bytes > max_jsonl_file_bytes(source) =>
+            {
+                census.oversized_file_count += 1;
+                continue;
+            }
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        if !opened_candidate_is_within_frozen_window(
+            &candidate,
+            census_unix_seconds,
+            backfill_window_days,
+        ) {
+            // The path can be atomically replaced after directory/candidate
+            // stat but before the no-follow open. Eligibility follows the
+            // exact opened object, not stale discovery metadata; otherwise an
+            // object outside the frozen lookback can enter this generation.
+            census
+                .removed_index_keys
+                .insert(local_index_key(&candidate.path));
+            continue;
+        }
+        let session_sidecar_fingerprint = std::mem::take(&mut candidate.source_file_fingerprint);
+        candidate.legacy_source_file_fingerprint = source_file_fingerprint_with_context(
+            &candidate.path,
+            candidate.size_bytes,
+            candidate.modified_unix_seconds,
+            source.parser_version(),
+            legacy_sidecar_fingerprint,
+        );
+        candidate.source_file_fingerprint = scan_file_fingerprint_with_opened_identity(
+            &candidate.path,
+            candidate.size_bytes,
+            candidate.modified_unix_nanos,
+            source.scan_identity_version(),
+            &session_sidecar_fingerprint,
+            &candidate.opened_object_identity,
+        );
         let decision = index.candidate_decision(&candidate);
         match decision {
             CandidateDecision::Skip => continue,
@@ -3460,32 +4635,63 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_file_count += 1;
         let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
-        let mut parsed = match source {
-            SnapshotSource::Codex => parse_codex_jsonl_file_with_title_metadata_and_attribution(
+        let parsed_file = match source {
+            SnapshotSource::Codex => parse_opened_jsonl_file(
+                opened_file,
+                &candidate.opened_object_identity,
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
-                &codex_title_metadata,
+                source,
+                apply_codex_line,
+                Some(&codex_title_metadata),
+                None,
                 codex_turn_traces.clone(),
+                true,
                 attribution_context,
-            )?,
-            SnapshotSource::ClaudeCode => {
-                parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
-                    &candidate.path,
-                    collected_at,
-                    source_file_fingerprint.clone(),
-                    &claude_title_metadata,
-                    artifacts_enabled,
-                    attribution_context,
-                )?
-            }
-            SnapshotSource::Pi => parse_pi_jsonl_file_with_attribution(
+            ),
+            SnapshotSource::ClaudeCode => parse_opened_jsonl_file(
+                opened_file,
+                &candidate.opened_object_identity,
                 &candidate.path,
                 collected_at,
                 source_file_fingerprint.clone(),
+                source,
+                apply_claude_code_line,
+                None,
+                Some(&claude_title_metadata),
+                None,
+                artifacts_enabled,
                 attribution_context,
-            )?,
+            ),
+            SnapshotSource::Pi => parse_opened_jsonl_file(
+                opened_file,
+                &candidate.opened_object_identity,
+                &candidate.path,
+                collected_at,
+                source_file_fingerprint.clone(),
+                source,
+                apply_pi_line,
+                None,
+                None,
+                None,
+                true,
+                attribution_context,
+            ),
         };
+        let parsed_file = match parsed_file {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        let parse_complete = parsed_file.complete();
+        let report = parsed_file.report;
+        let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
+        let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
+        let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
+        let mut parsed = parsed_file.snapshots;
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
@@ -3495,26 +4701,103 @@ fn scan_source_roots_with_limit_and_attribution(
         let last_snapshot_fingerprint = parsed
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
-        let is_semantic_noop = if decision == CandidateDecision::ReconcileLegacy {
-            // The legacy index cannot prove which rows inherited mutable config
-            // defaults. Emit the current provider-native snapshot once; after
-            // the index advances, config can never select history again.
-            false
-        } else {
-            last_snapshot_fingerprint.is_some()
-                && last_snapshot_fingerprint == previous_snapshot_fingerprint
-                && !source_context_changed
-        };
-        if source != SnapshotSource::Pi || last_snapshot_fingerprint.is_some() {
-            index.record(candidate, last_snapshot_fingerprint);
+        let parsed_snapshot_count = parsed.len();
+        let index_key = local_index_key(&candidate.path);
+        pending_finalization.push(PendingIndexFinalization {
+            index_key,
+            source_file_fingerprint: source_file_fingerprint.clone(),
+            previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy)
+                .then_some(previous_snapshot_fingerprint)
+                .flatten(),
+            parse_complete,
+            parsed_snapshot_count,
+        });
+        if parse_complete {
+            let outcome = if last_snapshot_fingerprint.is_some() {
+                ScanParseOutcome::Snapshot
+            } else {
+                ScanParseOutcome::ConfirmedEmpty
+            };
+            index.record(candidate, last_snapshot_fingerprint, outcome);
         }
-        if is_semantic_noop {
-            semantic_noop_count += parsed.len();
-        } else {
+        census.malformed_json_line_count += report.malformed_json_line_count;
+        census.invalid_utf8_line_count += report.invalid_utf8_line_count;
+        census.over_line_cap_count += report.over_line_cap_count;
+        census.recognized_usage_drop_count += recognized_usage_drop_count;
+        census.zero_snapshot_usage_evidence_count += usize::from(zero_snapshot_usage_evidence);
+        census.dropped_usage_record_count = census
+            .dropped_usage_record_count
+            .saturating_add(dropped_usage_record_count);
+        // A lossy file is one quarantined input, not a partially-authoritative
+        // entity. Healthy siblings continue, but none of this file's derived
+        // snapshots may reach upload/progress/manifest state until every line
+        // is readable and recognized.
+        if parse_complete {
             snapshots.extend(parsed);
         }
     }
+    if let Some(traversal) = index.traversal.as_mut() {
+        // Exact watcher remove/rename hints must amend the same durable
+        // observation set used by directory census reconciliation. Apply
+        // removals first so a valid observation later in this page wins.
+        for index_key in &census.removed_index_keys {
+            traversal.observed_index_keys.remove(index_key);
+        }
+        traversal
+            .observed_index_keys
+            .extend(census.observed_index_keys.iter().cloned());
+        traversal.counts.directory_entry_cap_exceeded_count +=
+            census.directory_entry_cap_exceeded_count;
+        traversal.counts.symlink_rejected_count += census.symlink_rejected_count;
+        traversal.counts.unreadable_path_count += census.unreadable_path_count;
+        traversal.counts.oversized_file_count += census.oversized_file_count;
+        traversal.counts.disappeared_file_count += census.disappeared_file_count;
+        traversal.counts.malformed_json_line_count += census.malformed_json_line_count;
+        traversal.counts.invalid_utf8_line_count += census.invalid_utf8_line_count;
+        traversal.counts.over_line_cap_count += census.over_line_cap_count;
+        traversal.counts.recognized_usage_drop_count += census.recognized_usage_drop_count;
+        traversal.counts.zero_snapshot_usage_evidence_count +=
+            census.zero_snapshot_usage_evidence_count;
+        traversal.counts.dropped_usage_record_count = traversal
+            .counts
+            .dropped_usage_record_count
+            .saturating_add(census.dropped_usage_record_count);
+    }
+    // A remove/rename hint can arrive after bounded reconciliation has already
+    // passed this key. Removing it only from `observed_index_keys` is then too
+    // late: the reconciliation cursor will never revisit the stale entry and a
+    // terminal manifest can still publish it. The hint was revalidated as
+    // absent beneath the configured root above, so retire the corresponding
+    // derived index state directly. Any recreation after this absence witness
+    // belongs to the next generation.
+    for index_key in &census.removed_index_keys {
+        index.remove_file_entry(index_key);
+    }
+    let traversal_snapshot = index
+        .traversal
+        .as_ref()
+        .cloned()
+        .expect("traversal remains active");
+    let traversal_discovery_done = traversal_snapshot.pending_directories.is_empty()
+        && traversal_snapshot.pending_candidates.is_empty();
+    let traversal_healthy = !traversal_snapshot.counts.has_errors();
+    let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
+    let reconciliation_complete = if traversal_discovery_done
+        && traversal_healthy
+        && clean_frozen_generation
+        && state_census_complete
+        && sidecar_census_complete
+    {
+        reconcile_missing_index_entries_bounded(index)
+    } else {
+        false
+    };
     if source == SnapshotSource::Codex {
+        // Reconcile authoritative transcript deletions before deciding which
+        // state-database threads are file-backed. Otherwise a vanished rollout
+        // remains "covered" for this whole generation, the state-only fallback
+        // is delayed one cycle, and a complete terminal manifest can briefly
+        // omit a thread the local state database still proves exists.
         let (state_only_scanned, state_only_noops) = append_codex_state_only_snapshots(
             &mut snapshots,
             &codex_title_metadata,
@@ -3524,17 +4807,91 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_session_count += state_only_scanned;
         semantic_noop_count += state_only_noops;
     }
+    let raw_census_complete = traversal_discovery_done
+        && traversal_healthy
+        && clean_frozen_generation
+        && state_census_complete
+        && sidecar_census_complete
+        && reconciliation_complete;
+    let needs_clean_followup = raw_census_complete && index.bounded_sweep_had_unsettled_upload;
+    let census_complete = raw_census_complete && !needs_clean_followup;
+    let reconciliation_pending = traversal_discovery_done
+        && traversal_healthy
+        && clean_frozen_generation
+        && state_census_complete
+        && sidecar_census_complete
+        && !reconciliation_complete;
+    let pending_work_count = index
+        .traversal
+        .as_ref()
+        .map(|traversal| {
+            traversal
+                .pending_candidates
+                .len()
+                .saturating_add(traversal.pending_directories.len())
+                .saturating_add(usize::from(reconciliation_pending))
+        })
+        .unwrap_or_default();
+    let skipped_file_count_due_to_limit = index
+        .traversal
+        .as_ref()
+        .map(|traversal| traversal.pending_candidates.len())
+        .unwrap_or_default();
+    let restart_after_hints =
+        traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
+    let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
+    if terminal_unhealthy {
+        let now = rfc3339_unix_seconds(collected_at).unwrap_or_default();
+        let traversal = index.traversal.as_mut().expect("traversal remains active");
+        if traversal.unhealthy_retry_not_before_unix_seconds.is_none() {
+            traversal.unhealthy_retry_attempt = traversal.unhealthy_retry_attempt.saturating_add(1);
+            traversal.unhealthy_retry_not_before_unix_seconds = Some(now.saturating_add(
+                unhealthy_scan_retry_delay_seconds(traversal.unhealthy_retry_attempt),
+            ));
+        }
+    }
+    let pending_work_count = pending_work_count
+        .saturating_add(usize::from(restart_after_hints))
+        .saturating_add(usize::from(terminal_unhealthy))
+        .saturating_add(usize::from(needs_clean_followup));
+    if raw_census_complete || restart_after_hints {
+        index.traversal = None;
+        index.resume_after_path = None;
+        index.resume_upper_bound_path = None;
+        index.resume_census_window_end = None;
+    }
+    let counts = traversal_snapshot.counts;
+    let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
+    let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
+    let dropped_usage_record_count = counts.dropped_usage_record_count;
     Ok(SourceScanResult {
         source,
         backfill_window_days,
         backfill_file_limit: file_limit,
         discovered_file_count,
         skipped_file_count_due_to_limit,
-        scan_cap_hit: skipped_file_count_due_to_limit > 0,
+        scan_cap_hit: pending_work_count > 0,
         scanned_file_count,
         scanned_session_count,
         semantic_noop_count,
+        census_complete,
+        census_window_end,
+        state_census_complete,
+        sidecar_census_complete,
+        symlink_rejected_count: counts.symlink_rejected_count,
+        directory_entry_cap_exceeded_count: counts.directory_entry_cap_exceeded_count,
+        unreadable_path_count: counts.unreadable_path_count,
+        oversized_file_count: counts.oversized_file_count,
+        disappeared_file_count: counts.disappeared_file_count,
+        malformed_json_line_count: counts.malformed_json_line_count,
+        invalid_utf8_line_count: counts.invalid_utf8_line_count,
+        over_line_cap_count: counts.over_line_cap_count,
+        recognized_usage_drop_count: counts.recognized_usage_drop_count,
+        zero_snapshot_confirmed_count,
+        zero_snapshot_usage_evidence_count,
+        dropped_usage_record_count,
         snapshots,
+        pending_finalization,
     })
 }
 
@@ -3580,10 +4937,7 @@ fn append_codex_state_only_snapshots(
         .filter(|(_, entry)| entry.last_snapshot_fingerprint.is_some())
         .filter_map(|(path, _)| codex_session_id_from_path(Path::new(path)))
         .collect();
-    let previous_fingerprints = &index.codex_state_only_snapshot_fingerprints;
-    let mut current_fingerprints = BTreeMap::new();
     let mut scanned_session_count = 0;
-    let mut semantic_noop_count = 0;
     for (source_session_id, thread) in &metadata.state_threads {
         if thread.tokens_used == 0
             || covered_session_ids.contains(source_session_id)
@@ -3593,18 +4947,13 @@ fn append_codex_state_only_snapshots(
         }
         let snapshot = codex_state_only_snapshot(source_session_id, thread, collected_at);
         scanned_session_count += 1;
-        current_fingerprints.insert(
-            source_session_id.clone(),
-            snapshot.snapshot_fingerprint.clone(),
-        );
-        if previous_fingerprints.get(source_session_id) == Some(&snapshot.snapshot_fingerprint) {
-            semantic_noop_count += 1;
-        } else {
-            snapshots.push(snapshot);
-        }
+        // The final fingerprint can still change during enrichment, privacy
+        // policy application, or account-cutoff filtering. Always carry the
+        // provisional item to `finalize_scan_after_policy`, which owns both
+        // durable state and semantic no-op suppression.
+        snapshots.push(snapshot);
     }
-    index.codex_state_only_snapshot_fingerprints = current_fingerprints;
-    (scanned_session_count, semantic_noop_count)
+    (scanned_session_count, 0)
 }
 
 fn codex_state_only_snapshot(
@@ -3764,6 +5113,25 @@ fn parse_codex_jsonl_file_with_title_metadata_and_attribution(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_codex_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        codex_turn_traces,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_codex_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &CodexTitleMetadata,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3833,6 +5201,25 @@ fn parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_claude_code_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        title_metadata,
+        artifacts_enabled,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_claude_code_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    title_metadata: &ClaudeTitleMetadata,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3861,6 +5248,21 @@ fn parse_pi_jsonl_file_with_attribution(
     source_file_fingerprint: String,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<Vec<SnapshotItem>> {
+    parse_pi_jsonl_file_with_diagnostics(
+        path,
+        collected_at,
+        source_file_fingerprint,
+        attribution_context,
+    )
+    .map(|parsed| parsed.snapshots)
+}
+
+fn parse_pi_jsonl_file_with_diagnostics(
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedSnapshotFile> {
     parse_jsonl_file(
         path,
         collected_at,
@@ -3876,6 +5278,11 @@ fn parse_pi_jsonl_file_with_attribution(
     )
 }
 
+#[derive(Debug)]
+struct ParsedSnapshotFile {
+    snapshots: Vec<SnapshotItem>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_jsonl_file(
     path: &Path,
@@ -3888,9 +5295,60 @@ fn parse_jsonl_file(
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
-) -> Result<Vec<SnapshotItem>> {
-    let file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
-    let reader = BufReader::new(file);
+) -> Result<ParsedSnapshotFile> {
+    let mut file = File::open(path).with_context(|| format!("open JSONL {}", path.display()))?;
+    let opened_identity = opened_object_identity(source, &mut file)
+        .with_context(|| format!("fingerprint opened JSONL {}", path.display()))?;
+    let parsed = parse_opened_jsonl_file(
+        file,
+        &opened_identity,
+        path,
+        collected_at,
+        source_file_fingerprint,
+        source,
+        apply_line,
+        codex_title_metadata,
+        claude_title_metadata,
+        codex_turn_traces,
+        artifacts_enabled,
+        attribution_context,
+    )?;
+    Ok(ParsedSnapshotFile {
+        snapshots: parsed.snapshots,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedJsonlFile {
+    snapshots: Vec<SnapshotItem>,
+    report: JsonlReadReport,
+    recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence: bool,
+    dropped_usage_record_count: u64,
+}
+
+impl ParsedJsonlFile {
+    fn complete(&self) -> bool {
+        self.report.complete() && self.recognized_usage_drop_count == 0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_opened_jsonl_file(
+    file: File,
+    expected_opened_object_identity: &str,
+    path: &Path,
+    collected_at: &str,
+    source_file_fingerprint: String,
+    source: SnapshotSource,
+    apply_line: fn(&Value, &mut SnapshotAccumulator),
+    codex_title_metadata: Option<&CodexTitleMetadata>,
+    claude_title_metadata: Option<&ClaudeTitleMetadata>,
+    codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> Result<ParsedJsonlFile> {
+    let mut reader = BufReader::new(file);
     // Snapshot semantics come from provider-native session evidence. Mutable
     // current config defaults are useful for live status display, but applying
     // today's defaults to cumulative historical usage would retroactively
@@ -3898,10 +5356,27 @@ fn parse_jsonl_file(
     let mut accumulator = SnapshotAccumulator::new(source);
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
-    read_bounded_jsonl_lines(reader, MAX_JSONL_LINE_BYTES, |value| {
+    let mut recognized_usage_drop_count = 0;
+    let mut positive_recognized_usage_count: usize = 0;
+    let mut positive_usage_evidence = false;
+    let report = read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, |value| {
+        if recognized_usage_shape_was_dropped(source, value) {
+            recognized_usage_drop_count += 1;
+        }
+        if recognized_positive_usage_shape(source, value) {
+            positive_recognized_usage_count += 1;
+        }
+        positive_usage_evidence |= json_has_positive_usage_evidence(value);
         apply_line(value, &mut accumulator);
     })
     .with_context(|| format!("read JSONL {}", path.display()))?;
+    let observed_after_read = opened_object_identity(source, reader.get_mut())
+        .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
+    if observed_after_read != expected_opened_object_identity {
+        return Err(anyhow::anyhow!(
+            "opened snapshot candidate changed while it was parsed"
+        ));
+    }
     if source == SnapshotSource::Codex {
         if let Some(metadata) = codex_title_metadata {
             accumulator.apply_codex_title_metadata(path, metadata);
@@ -3923,13 +5398,304 @@ fn parse_jsonl_file(
     }
     if source == SnapshotSource::Pi {
         accumulator.apply_first_prompt_fallback();
+        recognized_usage_drop_count += accumulator
+            .seen_pi_usage_keys
+            .values()
+            .filter(|state| state.has_cross_shape_conflict())
+            .count();
     }
-    Ok(accumulator.into_items(
+    let accumulator_dropped_usage_record_count = accumulator.dropped_usage_record_count as usize;
+    recognized_usage_drop_count =
+        recognized_usage_drop_count.saturating_add(accumulator_dropped_usage_record_count);
+    let snapshots = accumulator.into_items(
         path,
         collected_at,
         source_file_fingerprint,
         attribution_context,
-    ))
+    );
+    // A syntactically valid, positive provider usage record that yields no
+    // entity is still loss. Typical causes are an absent/unparseable activity
+    // timestamp or an identity shape the accumulator cannot settle. Treat the
+    // whole file as retryable instead of persisting it as confirmed-empty.
+    let zero_snapshot_usage_evidence = snapshots.is_empty() && positive_usage_evidence;
+    if snapshots.is_empty() {
+        recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(
+            positive_recognized_usage_count.saturating_sub(accumulator_dropped_usage_record_count),
+        );
+        if positive_usage_evidence && positive_recognized_usage_count == 0 {
+            recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(1);
+        }
+    }
+    Ok(ParsedJsonlFile {
+        snapshots,
+        report,
+        recognized_usage_drop_count,
+        zero_snapshot_usage_evidence,
+        dropped_usage_record_count: recognized_usage_drop_count as u64,
+    })
+}
+
+fn recognized_positive_usage_shape(source: SnapshotSource, value: &Value) -> bool {
+    match source {
+        SnapshotSource::Codex => codex_total_usage(value)
+            .map(|usage| !usage.is_zero())
+            .unwrap_or(false),
+        SnapshotSource::ClaudeCode => claude_code_delta_usage(value)
+            .map(|usage| !usage.is_zero())
+            .unwrap_or(false),
+        SnapshotSource::Pi => {
+            pi_usage_event(value)
+                && pi_message_usage(value)
+                    .map(|usage| !usage.is_zero())
+                    .unwrap_or(false)
+        }
+    }
+}
+
+fn recognized_usage_shape_was_dropped(source: SnapshotSource, value: &Value) -> bool {
+    match source {
+        SnapshotSource::Codex => {
+            let recognized = value
+                .pointer("/token_count/info/total_token_usage")
+                .is_some()
+                || value.pointer("/payload/info/total_token_usage").is_some()
+                || value.pointer("/payload/total_token_usage").is_some()
+                || value.pointer("/total_token_usage").is_some();
+            recognized && codex_total_usage(value).is_none()
+        }
+        SnapshotSource::ClaudeCode => {
+            let recognized = value.pointer("/message/usage").is_some()
+                || value.pointer("/usage").is_some()
+                || value.pointer("/payload/usage").is_some();
+            recognized && claude_code_delta_usage(value).is_none()
+        }
+        SnapshotSource::Pi => {
+            pi_usage_event(value)
+                && value.pointer("/message/usage").is_some()
+                && pi_message_usage(value).is_none()
+        }
+    }
+}
+
+fn json_has_positive_usage_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => {
+            let object_kind = json_usage_object_kind(values);
+            values.iter().any(|(name, value)| {
+                let normalized = normalized_usage_key(name);
+                if json_usage_child_is_opaque(&normalized, object_kind) {
+                    return false;
+                }
+                (is_recognized_usage_container(&normalized)
+                    && usage_container_has_positive_consumption(value, false))
+                    || json_has_positive_usage_evidence(value)
+            })
+        }
+        Value::Array(values) => values.iter().any(json_has_positive_usage_evidence),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonUsageObjectKind {
+    ProviderEnvelope,
+    AssistantMessage,
+    OpaqueAuthored,
+}
+
+fn json_usage_object_kind(values: &serde_json::Map<String, Value>) -> JsonUsageObjectKind {
+    let normalized = |key| {
+        values
+            .get(key)
+            .and_then(Value::as_str)
+            .map(normalized_usage_key)
+    };
+    if normalized("role").is_some_and(|role| matches!(role.as_str(), "assistant" | "model"))
+        || normalized("type")
+            .is_some_and(|kind| matches!(kind.as_str(), "assistantmessage" | "modelmessage"))
+    {
+        return JsonUsageObjectKind::AssistantMessage;
+    }
+    if normalized("role").is_some_and(|role| {
+        matches!(
+            role.as_str(),
+            "user" | "human" | "system" | "developer" | "tool"
+        )
+    }) || normalized("type").is_some_and(|kind| {
+        matches!(
+            kind.as_str(),
+            "user"
+                | "human"
+                | "system"
+                | "developer"
+                | "usermessage"
+                | "tool"
+                | "text"
+                | "inputtext"
+                | "outputtext"
+                | "thinking"
+                | "redactedthinking"
+                | "tooluse"
+                | "toolresult"
+                | "toolcall"
+                | "function"
+                | "functioncall"
+                | "functionresult"
+                | "image"
+                | "document"
+        )
+    }) {
+        return JsonUsageObjectKind::OpaqueAuthored;
+    }
+    JsonUsageObjectKind::ProviderEnvelope
+}
+
+fn json_usage_child_is_opaque(name: &str, object_kind: JsonUsageObjectKind) -> bool {
+    (object_kind == JsonUsageObjectKind::OpaqueAuthored && is_recognized_usage_container(name))
+        || (object_kind != JsonUsageObjectKind::ProviderEnvelope
+            && matches!(
+                name,
+                "content"
+                    | "contents"
+                    | "text"
+                    | "prompt"
+                    | "prompts"
+                    | "argument"
+                    | "arguments"
+                    | "args"
+                    | "toolinput"
+                    | "tooloutput"
+                    | "toolresult"
+                    | "message"
+                    | "payload"
+                    | "data"
+                    | "input"
+                    | "output"
+                    | "result"
+            ))
+}
+
+fn normalized_usage_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_recognized_usage_container(name: &str) -> bool {
+    matches!(
+        name,
+        "usage"
+            | "tokenusage"
+            | "totalusage"
+            | "totaltokenusage"
+            | "lasttokenusage"
+            | "billingusage"
+    )
+}
+
+fn is_consumption_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "input"
+            | "output"
+            | "inputtokens"
+            | "outputtokens"
+            | "prompttokens"
+            | "completiontokens"
+            | "cachedinputtokens"
+            | "cacheread"
+            | "cachereadtokens"
+            | "cachereadinputtokens"
+            | "cachewrite"
+            | "cachewritetokens"
+            | "cachecreationtokens"
+            | "cachecreationinputtokens"
+            | "reasoning"
+            | "reasoningtokens"
+            | "reasoningoutputtokens"
+            | "unattributedtotaltokens"
+            | "totaltokens"
+            | "requestcount"
+            | "requests"
+    )
+}
+
+fn is_cost_container(name: &str) -> bool {
+    matches!(
+        name,
+        "cost" | "costs" | "usagecost" | "usagecosts" | "billingcost" | "billingcosts"
+    )
+}
+
+fn is_cost_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "total"
+            | "amount"
+            | "usd"
+            | "totalcost"
+            | "inputcost"
+            | "outputcost"
+            | "cachereadcost"
+            | "cachewritecost"
+            | "reasoningcost"
+    )
+}
+
+fn is_nonconsumption_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "version"
+            | "schemaversion"
+            | "usageversion"
+            | "limit"
+            | "limits"
+            | "usagelimit"
+            | "usagelimits"
+            | "ratelimit"
+            | "ratelimits"
+            | "budget"
+            | "budgets"
+            | "quota"
+            | "quotas"
+            | "reset"
+            | "resetsat"
+            | "timestamp"
+            | "createdat"
+            | "updatedat"
+            | "maxtokens"
+    )
+}
+
+fn usage_container_has_positive_consumption(value: &Value, inside_cost: bool) -> bool {
+    match value {
+        Value::Object(values) => values.iter().any(|(name, value)| {
+            let normalized = normalized_usage_key(name);
+            if is_nonconsumption_metadata(&normalized) {
+                return false;
+            }
+            if is_consumption_metric(&normalized) || (inside_cost && is_cost_metric(&normalized)) {
+                return json_is_positive_number(value);
+            }
+            let child_inside_cost = inside_cost || is_cost_container(&normalized);
+            usage_container_has_positive_consumption(value, child_inside_cost)
+        }),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| usage_container_has_positive_consumption(value, inside_cost)),
+        _ => false,
+    }
+}
+
+fn json_is_positive_number(value: &Value) -> bool {
+    let Value::Number(value) = value else {
+        return false;
+    };
+    value.as_u64().is_some_and(|value| value > 0)
+        || value.as_i64().is_some_and(|value| value > 0)
+        || value.as_f64().is_some_and(|value| value > 0.0)
 }
 
 /// Stream a JSONL reader line-by-line with a hard per-line byte ceiling,
@@ -3946,12 +5712,30 @@ fn parse_jsonl_file(
 /// exactly for normal lines: an empty/whitespace line is skipped, a line that is
 /// not valid UTF-8 is skipped, and a line that does not parse as JSON is skipped
 /// — only genuine I/O errors surface as `Err`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JsonlReadReport {
+    physical_line_count: usize,
+    parsed_json_line_count: usize,
+    malformed_json_line_count: usize,
+    invalid_utf8_line_count: usize,
+    over_line_cap_count: usize,
+}
+
+impl JsonlReadReport {
+    fn complete(self) -> bool {
+        self.malformed_json_line_count == 0
+            && self.invalid_utf8_line_count == 0
+            && self.over_line_cap_count == 0
+    }
+}
+
 fn read_bounded_jsonl_lines(
     mut reader: impl BufRead,
     max_line_bytes: usize,
     mut on_value: impl FnMut(&Value),
-) -> std::io::Result<()> {
+) -> std::io::Result<JsonlReadReport> {
     let mut buf = Vec::new();
+    let mut report = JsonlReadReport::default();
     loop {
         buf.clear();
         // Accumulate one line, bounded to `max_line_bytes`. `line_complete`
@@ -3997,7 +5781,9 @@ fn read_bounded_jsonl_lines(
             // Clean EOF with no pending bytes.
             break;
         }
+        report.physical_line_count += 1;
         if overflowed {
+            report.over_line_cap_count += 1;
             // Drop the oversized line; its retained-capacity buffer is reset to
             // the cap so one huge line does not pin a large allocation.
             buf.clear();
@@ -4012,18 +5798,22 @@ fn read_bounded_jsonl_lines(
         if bytes.last() == Some(&b'\r') {
             bytes = &bytes[..bytes.len() - 1];
         }
-        if let Ok(line) = std::str::from_utf8(bytes) {
-            if !line.trim().is_empty() {
-                if let Ok(value) = serde_json::from_str::<Value>(line) {
+        match std::str::from_utf8(bytes) {
+            Ok(line) if line.trim().is_empty() => {}
+            Ok(line) => match serde_json::from_str::<Value>(line) {
+                Ok(value) => {
+                    report.parsed_json_line_count += 1;
                     on_value(&value);
                 }
-            }
+                Err(_) => report.malformed_json_line_count += 1,
+            },
+            Err(_) => report.invalid_utf8_line_count += 1,
         }
         if reached_eof {
             break;
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 fn raw_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -4431,7 +6221,7 @@ fn pi_selector_from_custom(value: &Value) -> Option<SelectorCapture> {
     (!selector.is_empty()).then_some(selector)
 }
 
-fn pi_selector_from_message_end(value: &Value) -> SelectorCapture {
+fn pi_selector_from_usage_message(value: &Value) -> SelectorCapture {
     let mut selector = SelectorCapture::default();
     selector.merge(selector_from_object(value, ""));
     if let Some(message) = raw_value_at(value, &["message"]) {
@@ -5169,6 +6959,27 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| value.pointer("/payload/info/total_token_usage"))
         .or_else(|| value.pointer("/payload/total_token_usage"))
         .or_else(|| value.pointer("/total_token_usage"))?;
+    if !usage_object_has_numeric_field(
+        root,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "output_tokens",
+            "outputTokens",
+            "cache_read_tokens",
+            "cached_input_tokens",
+            "cachedInputTokens",
+            "cache_write_tokens",
+            "cacheWriteTokens",
+            "cache_creation_tokens",
+            "cacheCreationInputTokens",
+            "reasoning_output_tokens",
+            "request_count",
+            "requests",
+        ],
+    ) {
+        return None;
+    }
     let input_details = root
         .get("input_tokens_details")
         .or_else(|| root.get("prompt_tokens_details"));
@@ -5251,45 +7062,142 @@ fn apply_pi_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             if let Some(selector) = pi_selector_from_custom(value) {
                 accumulator.set_selector(selector);
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("session") => {
             if accumulator.source_session_id.is_none() {
-                accumulator.source_session_id =
-                    string_at(value, &["session_id"]).or_else(|| string_at(value, &["sessionId"]));
+                accumulator.source_session_id = string_at(value, &["id"])
+                    .or_else(|| string_at(value, &["session_id"]))
+                    .or_else(|| string_at(value, &["sessionId"]));
             }
             accumulator.set_workspace_hash(string_at(value, &["cwd"]));
-            accumulator.note_time(string_at(value, &["timestamp"]));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         Some("message") => {
-            // Pi user prompts arrive as `type: "message"` with role: "user". The
-            // backend's message_end event omits prompt text, so this is the only
-            // chance to grab a first-prompt title fallback.
-            if string_eq_at(value, &["role"], "user") {
+            // Pi user prompts use both legacy top-level `role` and current
+            // nested `message.role`. This is the only chance to capture prompt
+            // text for a title fallback.
+            let role = pi_message_role(value);
+            if role.as_deref() == Some("user") {
                 accumulator.set_first_prompt_title(pi_message_text(value));
             }
-            accumulator.note_time(pi_timestamp_field(value));
+            let timestamp = pi_message_timestamp(value);
+            if role.as_deref() == Some("assistant")
+                && (timestamp.is_some() || !pi_message_timestamp_is_present(value))
+            {
+                apply_pi_usage_line(
+                    value,
+                    accumulator,
+                    timestamp.as_deref(),
+                    PiUsageRecordShape::Message,
+                );
+            } else if role.as_deref() == Some("assistant")
+                && pi_message_usage(value).is_some_and(|usage| !usage.is_zero())
+            {
+                accumulator.note_dropped_usage();
+            }
+            accumulator.note_pi_time(timestamp);
         }
         Some("message_end") => {
             let timestamp = pi_message_end_timestamp(value);
-            let model = string_at(value, &["message", "model"]);
-            accumulator.set_model(model.clone());
-            if let Some(usage) = pi_message_end_usage(value) {
-                let mut selector = accumulator.current_selector.clone();
-                selector.merge(pi_selector_from_message_end(value));
-                accumulator.add_usage_with_selector(
-                    model,
-                    usage,
-                    selector,
+            if timestamp.is_some() || !pi_message_timestamp_is_present(value) {
+                apply_pi_usage_line(
+                    value,
+                    accumulator,
                     timestamp.as_deref(),
-                    // Pi does not emit a per-turn reasoning effort tier.
-                    None,
+                    PiUsageRecordShape::MessageEnd,
                 );
+            } else if pi_message_usage(value).is_some_and(|usage| !usage.is_zero()) {
+                accumulator.note_dropped_usage();
             }
-            accumulator.note_time(timestamp);
+            accumulator.note_pi_time(timestamp);
+        }
+        Some("model_change") => {
+            accumulator
+                .set_model(string_at(value, &["modelId"]).or_else(|| string_at(value, &["model"])));
+            accumulator.note_pi_time(pi_timestamp_field(value));
         }
         _ => {}
     }
+}
+
+fn pi_message_role(value: &Value) -> Option<String> {
+    string_at(value, &["message", "role"]).or_else(|| string_at(value, &["role"]))
+}
+
+fn pi_usage_event(value: &Value) -> bool {
+    string_eq_at(value, &["type"], "message_end")
+        || (string_eq_at(value, &["type"], "message")
+            && pi_message_role(value).as_deref() == Some("assistant"))
+}
+
+fn pi_usage_dedup_key(value: &Value) -> Option<String> {
+    string_at(value, &["message", "responseId"])
+        .or_else(|| string_at(value, &["message", "response_id"]))
+        .or_else(|| string_at(value, &["responseId"]))
+        .or_else(|| string_at(value, &["response_id"]))
+}
+
+fn apply_pi_usage_line(
+    value: &Value,
+    accumulator: &mut SnapshotAccumulator,
+    timestamp: Option<&str>,
+    shape: PiUsageRecordShape,
+) {
+    let model = string_at(value, &["message", "model"]);
+    accumulator.set_model(model.clone());
+    if let Some(usage) = pi_message_usage(value) {
+        let mut selector = accumulator.current_selector.clone();
+        selector.merge(pi_selector_from_usage_message(value));
+        let occurrence_digest =
+            pi_usage_occurrence_digest(model.as_deref(), &usage, &selector, timestamp);
+        let is_new_occurrence = match pi_usage_dedup_key(value) {
+            Some(key) => accumulator
+                .seen_pi_usage_keys
+                .entry(key)
+                .or_default()
+                .record(shape, occurrence_digest),
+            None => true,
+        };
+        if is_new_occurrence {
+            accumulator.add_usage_with_selector(
+                model, usage, selector, timestamp,
+                // Pi does not emit a per-turn reasoning effort tier.
+                None,
+            );
+        }
+    }
+}
+
+fn pi_usage_occurrence_digest(
+    model: Option<&str>,
+    usage: &UsageTotals,
+    selector: &SelectorCapture,
+    timestamp: Option<&str>,
+) -> String {
+    let selector_context = serde_json::to_string(&selector.context).unwrap_or_default();
+    sha256_hex(&[
+        model.unwrap_or(""),
+        &timestamp
+            .and_then(pi_usage_timestamp_identity)
+            .unwrap_or_default(),
+        &usage.input_tokens.to_string(),
+        &usage.output_tokens.to_string(),
+        &usage.cache_read_tokens.to_string(),
+        &usage.cache_creation_5m_tokens.to_string(),
+        &usage.cache_creation_1h_tokens.to_string(),
+        &usage.reasoning_output_tokens.to_string(),
+        &usage.unattributed_total_tokens.to_string(),
+        &usage.request_count.to_string(),
+        &usage.costs.observed.to_string(),
+        &usage.costs.reported.to_string(),
+        &format!("{:?}", usage.costs.total),
+        &format!("{:?}", usage.costs.input),
+        &format!("{:?}", usage.costs.output),
+        &format!("{:?}", usage.costs.cache_read),
+        &format!("{:?}", usage.costs.cache_creation),
+        &selector_context,
+    ])
 }
 
 fn pi_message_text(value: &Value) -> Option<String> {
@@ -5297,18 +7205,126 @@ fn pi_message_text(value: &Value) -> Option<String> {
         .or_else(|| string_at(value, &["text"]))
         .or_else(|| string_at(value, &["message", "content"]))
         .or_else(|| text_from_array(value.get("content")))
+        .or_else(|| text_from_array(value.pointer("/message/content")))
 }
 
 fn pi_timestamp_field(value: &Value) -> Option<String> {
-    string_at(value, &["timestamp"])
-        .or_else(|| pi_ms_timestamp(value.get("timestamp")))
-        .or_else(|| pi_ms_timestamp(value.pointer("/message/timestamp")))
+    pi_timestamp_value(value.get("timestamp"))
+        .or_else(|| pi_timestamp_value(value.pointer("/message/timestamp")))
+}
+
+fn pi_message_timestamp(value: &Value) -> Option<String> {
+    // Current and transitional Pi records may carry a later envelope write
+    // time at the top level. Provider response time is the usage occurrence
+    // clock and is also what historical message_end records use.
+    pi_usage_record_timestamp(value)
 }
 
 fn pi_message_end_timestamp(value: &Value) -> Option<String> {
-    pi_ms_timestamp(value.pointer("/message/timestamp"))
-        .or_else(|| string_at(value, &["message", "timestamp"]))
-        .or_else(|| string_at(value, &["timestamp"]))
+    pi_usage_record_timestamp(value)
+}
+
+fn pi_usage_record_timestamp(value: &Value) -> Option<String> {
+    let provider_timestamp = value.pointer("/message/timestamp");
+    if provider_timestamp.is_some() {
+        // Present-but-invalid provider evidence is loss. Falling back to the
+        // envelope would silently turn a malformed occurrence clock into a
+        // different, often later, billable hour.
+        pi_timestamp_value(provider_timestamp)
+    } else {
+        pi_timestamp_value(value.get("timestamp"))
+    }
+}
+
+fn pi_message_timestamp_is_present(value: &Value) -> bool {
+    value.get("timestamp").is_some() || value.pointer("/message/timestamp").is_some()
+}
+
+fn pi_timestamp_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        if let Ok(parsed) = OffsetDateTime::parse(text, &Rfc3339) {
+            if (1..=9999).contains(&parsed.year()) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    pi_ms_timestamp(Some(value))
+}
+
+fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp_nanos().to_string())
+}
+
+fn timestamp_is_before(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate < current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate < current,
+    }
+}
+
+fn timestamp_is_after(candidate: &str, current: &str) -> bool {
+    match (
+        OffsetDateTime::parse(candidate, &Rfc3339),
+        OffsetDateTime::parse(current, &Rfc3339),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        (Ok(_), Err(_)) => true,
+        (Err(_), Ok(_)) => false,
+        (Err(_), Err(_)) => candidate > current,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiUsageRecordShape {
+    Message,
+    MessageEnd,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PiUsageDedupState {
+    message: BTreeMap<String, usize>,
+    message_end: BTreeMap<String, usize>,
+    paired_digests: BTreeSet<String>,
+}
+
+impl PiUsageDedupState {
+    /// Returns true when this record is a new billable occurrence. An exact
+    /// opposite-shape occurrence consumes one unmatched digest and is the
+    /// compatibility duplicate of the occurrence already counted.
+    fn record(&mut self, shape: PiUsageRecordShape, digest: String) -> bool {
+        let (same_shape, opposite_shape) = match shape {
+            PiUsageRecordShape::Message => (&mut self.message, &mut self.message_end),
+            PiUsageRecordShape::MessageEnd => (&mut self.message_end, &mut self.message),
+        };
+        if let Some(count) = opposite_shape.get_mut(&digest) {
+            self.paired_digests.insert(digest.clone());
+            *count -= 1;
+            if *count == 0 {
+                opposite_shape.remove(&digest);
+            }
+            return false;
+        }
+        *same_shape.entry(digest).or_default() += 1;
+        true
+    }
+
+    fn has_cross_shape_conflict(&self) -> bool {
+        (!self.message.is_empty() && !self.message_end.is_empty())
+            || (!self.paired_digests.is_empty()
+                && self
+                    .message
+                    .keys()
+                    .chain(self.message_end.keys())
+                    .any(|digest| !self.paired_digests.contains(digest)))
+    }
 }
 
 fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
@@ -5318,19 +7334,29 @@ fn pi_ms_timestamp(value: Option<&Value>) -> Option<String> {
         Value::String(text) => text.parse::<i64>().ok(),
         _ => None,
     }?;
-    Some(format_rfc3339_millis(ms))
+    bounded_rfc3339_millis(ms)
 }
 
-fn format_rfc3339_millis(ms: i64) -> String {
-    let total_secs = ms.div_euclid(1000);
-    let millis = ms.rem_euclid(1000) as u32;
-    let days = total_secs.div_euclid(86_400);
-    let time_of_day = total_secs.rem_euclid(86_400) as u32;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+fn bounded_rfc3339_millis(ms: i64) -> Option<String> {
+    let timestamp = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok()?;
+    // Python/Pydantic datetimes, and therefore the backend snapshot contract,
+    // admit only civil years 1..=9999. `time` deliberately supports a wider
+    // internal range, so validate before formatting instead of minting a
+    // superficially RFC3339-looking value that can poison an upload batch.
+    if !(1..=9999).contains(&timestamp.year()) {
+        return None;
+    }
+    let utc = timestamp.to_offset(time::UtcOffset::UTC);
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        utc.year(),
+        u8::from(utc.month()),
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+        utc.millisecond(),
+    ))
 }
 
 fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
@@ -5345,23 +7371,24 @@ fn activity_bucket_from_timestamp(value: &str) -> Option<(String, String)> {
     Some((bucket_start, normalized_timestamp))
 }
 
-// Howard Hinnant's civil_from_days. Returns (year, month, day) from days since 1970-01-01.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = if m <= 2 { y + 1 } else { y };
-    (year, m, d)
-}
-
-fn pi_message_end_usage(value: &Value) -> Option<UsageTotals> {
+fn pi_message_usage(value: &Value) -> Option<UsageTotals> {
     let usage = value.pointer("/message/usage")?;
+    if !usage_object_has_numeric_field(
+        usage,
+        &[
+            "input",
+            "output",
+            "cacheRead",
+            "cache_read",
+            "cacheWrite",
+            "cache_write",
+            "cacheWrite1h",
+            "cache_write_1h",
+            "reasoning",
+        ],
+    ) {
+        return None;
+    }
     // Pi is multi-provider (Anthropic / OpenAI / Gemini). When the underlying
     // model is Anthropic and Pi exposes the nested `cacheCreation` object with
     // ephemeral_5m / ephemeral_1h, prefer that. Otherwise the flat `cacheWrite`
@@ -5491,6 +7518,21 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         .pointer("/message/usage")
         .or_else(|| value.pointer("/usage"))
         .or_else(|| value.pointer("/payload/usage"))?;
+    if !usage_object_has_numeric_field(
+        root,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "output_tokens",
+            "outputTokens",
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_output_tokens",
+        ],
+    ) {
+        return None;
+    }
     let (cache_5m, cache_1h) = claude_code_cache_creation_split(root);
     let usage = UsageTotals {
         input_tokens: u64_at(root, &["input_tokens"])
@@ -5510,6 +7552,14 @@ fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
         costs: UsageCosts::default(),
     };
     Some(usage)
+}
+
+fn usage_object_has_numeric_field(root: &Value, fields: &[&str]) -> bool {
+    root.as_object().is_some_and(|object| {
+        fields
+            .iter()
+            .any(|field| object.get(*field).and_then(Value::as_u64).is_some())
+    })
 }
 
 // Anthropic exposes prompt-cache writes as `usage.cache_creation.ephemeral_5m_input_tokens`
@@ -5540,6 +7590,7 @@ fn claude_code_cache_creation_split(root: &Value) -> (u64, u64) {
 
 #[derive(Debug, Clone)]
 struct CandidateFile {
+    scan_root: PathBuf,
     path: PathBuf,
     size_bytes: u64,
     modified_unix_seconds: u64,
@@ -5547,6 +7598,105 @@ struct CandidateFile {
     source_file_fingerprint: String,
     legacy_source_file_fingerprint: String,
     legacy_config_reconciliation_required: bool,
+    opened_object_identity: String,
+}
+
+#[derive(Debug, Default)]
+struct ScanCensus {
+    #[cfg(test)]
+    discovered_file_count: usize,
+    directory_entry_cap_exceeded_count: usize,
+    symlink_rejected_count: usize,
+    unreadable_path_count: usize,
+    oversized_file_count: usize,
+    disappeared_file_count: usize,
+    malformed_json_line_count: usize,
+    invalid_utf8_line_count: usize,
+    over_line_cap_count: usize,
+    recognized_usage_drop_count: usize,
+    zero_snapshot_usage_evidence_count: usize,
+    dropped_usage_record_count: u64,
+    observed_index_keys: BTreeSet<String>,
+    removed_index_keys: BTreeSet<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BoundedCandidateSelection {
+    cursor: Option<String>,
+    upper_bound: Option<String>,
+    limit: usize,
+    selected: BTreeMap<String, CandidateFile>,
+    observed_max: Option<String>,
+}
+
+#[cfg(test)]
+impl BoundedCandidateSelection {
+    fn new(cursor: Option<String>, upper_bound: Option<String>, limit: usize) -> Self {
+        // Legacy indexes carried a cursor without a frozen ceiling. Restart a
+        // fresh bounded generation once rather than inheriting its starvation
+        // semantics.
+        let cursor = cursor.filter(|_| upper_bound.is_some());
+        Self {
+            cursor,
+            upper_bound,
+            limit,
+            selected: BTreeMap::new(),
+            observed_max: None,
+        }
+    }
+
+    fn insert(&mut self, candidate: CandidateFile) {
+        let key = local_index_key(&candidate.path);
+        if self
+            .observed_max
+            .as_ref()
+            .map_or(true, |maximum| key > *maximum)
+        {
+            self.observed_max = Some(key.clone());
+        }
+        if self.limit == 0 {
+            return;
+        }
+        if self
+            .upper_bound
+            .as_ref()
+            .is_some_and(|upper_bound| key > *upper_bound)
+            || self.cursor.as_ref().is_some_and(|cursor| key <= *cursor)
+        {
+            return;
+        }
+        self.selected.insert(key, candidate);
+        if self.selected.len() > self.limit {
+            self.selected.pop_last();
+        }
+    }
+
+    fn finish(
+        self,
+        discovered: usize,
+    ) -> (Vec<CandidateFile>, bool, Option<String>, Option<String>) {
+        let upper_bound = self.upper_bound.or(self.observed_max);
+        let selected = self.selected.into_values().collect::<Vec<_>>();
+        let next_cursor = selected
+            .last()
+            .map(|candidate| local_index_key(&candidate.path));
+        let reached_upper_bound = next_cursor
+            .as_ref()
+            .zip(upper_bound.as_ref())
+            .is_some_and(|(cursor, upper_bound)| cursor >= upper_bound);
+        let complete = if self.limit == 0 {
+            discovered == 0
+        } else {
+            selected.len() < self.limit || reached_upper_bound
+        };
+        (
+            selected,
+            complete,
+            (!complete).then_some(next_cursor).flatten(),
+            (!complete).then_some(upper_bound).flatten(),
+        )
+    }
 }
 
 impl CodexTitleMetadata {
@@ -5597,12 +7747,19 @@ impl CodexTitleMetadata {
 
             let state_path = codex_dir.join("state_5.sqlite");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&state_path));
-            load_codex_sqlite_titles(&state_path, &mut metadata.titles);
-            load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
+            let title_census = load_codex_sqlite_titles(&state_path, &mut metadata.titles);
+            let state_census =
+                load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
+            if title_census.is_err() || state_census.is_err() {
+                metadata.state_census_incomplete = true;
+                metadata.sidecar_census_incomplete = true;
+            }
 
             let index_path = codex_dir.join("session_index.jsonl");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
-            load_codex_session_index_titles(&index_path, &mut metadata.titles);
+            if load_codex_session_index_titles(&index_path, &mut metadata.titles).is_err() {
+                metadata.sidecar_census_incomplete = true;
+            }
         }
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&legacy_sidecar_parts);
         metadata
@@ -5753,59 +7910,76 @@ fn codex_logs2_span_field(prefix: &str, key: &str) -> Option<String> {
 fn load_codex_session_index_titles(
     path: &Path,
     titles: &mut BTreeMap<String, CodexTitleCandidate>,
-) {
-    let Ok(file) = File::open(path) else {
-        return;
+) -> Result<()> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("open Codex session index"),
     };
-    let reader = BufReader::new(file);
-    for line in reader.lines().map_while(|line| line.ok()) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(id) = string_at(&value, &["id"]) else {
-            continue;
+    let mut parsed = BTreeMap::new();
+    let mut invalid_shape = false;
+    let report = read_bounded_jsonl_lines(BufReader::new(file), MAX_JSONL_LINE_BYTES, |value| {
+        let Some(id) = string_at(value, &["id"]) else {
+            invalid_shape = true;
+            return;
         };
         insert_codex_sidecar_title(
-            titles,
+            &mut parsed,
             id,
-            string_at(&value, &["thread_name"])
-                .or_else(|| string_at(&value, &["title"]))
-                .or_else(|| string_at(&value, &["name"])),
+            string_at(value, &["thread_name"])
+                .or_else(|| string_at(value, &["title"]))
+                .or_else(|| string_at(value, &["name"])),
             "session_index",
             true,
         );
+    })
+    .context("read Codex session index")?;
+    if !report.complete() || invalid_shape {
+        return Err(anyhow::anyhow!("Codex session index census was incomplete"));
     }
+    titles.extend(parsed);
+    Ok(())
 }
 
-fn load_codex_sqlite_titles(path: &Path, titles: &mut BTreeMap<String, CodexTitleCandidate>) {
-    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return;
-    };
-    let Ok(mut statement) =
-        connection.prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
-    else {
-        return;
-    };
-    let Ok(rows) = statement.query_map([], |row| {
+fn load_codex_sqlite_titles(
+    path: &Path,
+    titles: &mut BTreeMap<String, CodexTitleCandidate>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open Codex title database")?;
+    let mut statement = connection
+        .prepare("SELECT id, title FROM threads WHERE title IS NOT NULL AND title != ''")
+        .context("prepare Codex title census")?;
+    let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) else {
-        return;
-    };
-    for row in rows.flatten() {
+    })?;
+    let mut loaded = Vec::new();
+    for row in rows {
+        loaded.push(row.context("read Codex title census row")?);
+    }
+    for row in loaded {
         insert_codex_sidecar_title(titles, row.0, Some(row.1), "session_index", false);
     }
+    Ok(())
 }
 
 fn load_codex_sqlite_state_threads(
     path: &Path,
     state_threads: &mut BTreeMap<String, CodexStateThread>,
-) {
-    let Ok(connection) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return;
-    };
-    let columns = sqlite_table_columns(&connection, "threads");
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open Codex state database")?;
+    let columns = sqlite_table_columns(&connection, "threads")?;
     if !columns.contains("id") || !columns.contains("tokens_used") {
-        return;
+        return Err(anyhow::anyhow!(
+            "Codex state database is missing required thread census columns"
+        ));
     }
 
     let sql = format!(
@@ -5819,18 +7993,16 @@ fn load_codex_sqlite_state_threads(
         sqlite_select_expr(&columns, "updated_at_ms", "NULL"),
         sqlite_select_expr(&columns, "model", "NULL"),
     );
-    let Ok(mut statement) = connection.prepare(sql.as_str()) else {
-        return;
-    };
-    let Ok(rows) = statement.query_map([], |row| {
+    let mut statement = connection
+        .prepare(sql.as_str())
+        .context("prepare Codex state thread census")?;
+    let rows = statement.query_map([], |row| {
         let id: String = row.get(0)?;
         let title: Option<String> = row.get(1)?;
-        let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2).unwrap_or_default());
-        let archived = row.get::<_, i64>(3).unwrap_or_default() != 0;
-        let created_at =
-            codex_state_timestamp(row.get(6).ok().flatten(), row.get(4).ok().flatten());
-        let updated_at =
-            codex_state_timestamp(row.get(7).ok().flatten(), row.get(5).ok().flatten());
+        let tokens_used = non_negative_i64_to_u64(row.get::<_, i64>(2)?);
+        let archived = row.get::<_, i64>(3)? != 0;
+        let created_at = codex_state_timestamp(row.get(6)?, row.get(4)?);
+        let updated_at = codex_state_timestamp(row.get(7)?, row.get(5)?);
         let model: Option<String> = row.get(8)?;
         Ok((
             id,
@@ -5843,23 +8015,25 @@ fn load_codex_sqlite_state_threads(
                 model,
             },
         ))
-    }) else {
-        return;
-    };
-    for (id, thread) in rows.flatten() {
+    })?;
+    let mut loaded = BTreeMap::new();
+    for row in rows {
+        let (id, thread) = row.context("read Codex state thread census row")?;
+        loaded.insert(id, thread);
+    }
+    for (id, thread) in loaded {
         state_threads.insert(id, thread);
     }
+    Ok(())
 }
 
-fn sqlite_table_columns(connection: &Connection, table_name: &str) -> BTreeSet<String> {
-    let Ok(mut statement) = connection.prepare(format!("PRAGMA table_info({table_name})").as_str())
-    else {
-        return BTreeSet::new();
-    };
-    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
-        return BTreeSet::new();
-    };
-    rows.flatten().collect()
+fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
+    let mut statement = connection
+        .prepare(format!("PRAGMA table_info({table_name})").as_str())
+        .context("prepare SQLite table census")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .context("read SQLite table census")
 }
 
 fn sqlite_select_expr(columns: &BTreeSet<String>, column: &str, fallback: &str) -> String {
@@ -5876,7 +8050,7 @@ fn non_negative_i64_to_u64(value: i64) -> u64 {
 
 fn codex_state_timestamp(ms: Option<i64>, seconds: Option<i64>) -> Option<String> {
     let timestamp_ms = ms.or_else(|| seconds.map(|value| value.saturating_mul(1_000)))?;
-    Some(format_rfc3339_millis(timestamp_ms))
+    bounded_rfc3339_millis(timestamp_ms)
 }
 
 fn load_codex_config_selector(path: &Path) -> SelectorCapture {
@@ -6379,24 +8553,618 @@ fn sidecar_stat_fingerprint(path: &Path) -> String {
     }
 }
 
+fn scan_traversal_context_fingerprint(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &ScanIndex,
+    backfill_window_days: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, b"ottto:snapshot-bounded-traversal:v1");
+    update_length_prefixed(&mut digest, source.api_slug().as_bytes());
+    // A persisted queue contains paths already consumed under the scanner that
+    // created it. Resuming that queue after an upgrade without binding these
+    // derivations can skip the consumed prefix under the new identity and
+    // publish a mixed old/new terminal census. Parser-only releases remain
+    // resumable; reviewed scan/open identity changes start a fresh bounded
+    // traversal so every pre-existing candidate is reconsidered.
+    update_length_prefixed(&mut digest, source.scan_identity_version().as_bytes());
+    update_length_prefixed(&mut digest, LOCAL_SCAN_INDEX_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, &backfill_window_days.to_be_bytes());
+    update_length_prefixed(
+        &mut digest,
+        index
+            .active_upload_context_fingerprint
+            .as_deref()
+            .unwrap_or("none")
+            .as_bytes(),
+    );
+    update_length_prefixed(
+        &mut digest,
+        index
+            .historical_replay_generation
+            .as_deref()
+            .unwrap_or("none")
+            .as_bytes(),
+    );
+    for root in roots {
+        update_length_prefixed(&mut digest, root.to_string_lossy().as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn rfc3339_unix_seconds(value: &str) -> Option<u64> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .unix_timestamp()
+        .try_into()
+        .ok()
+}
+
+fn unhealthy_scan_retry_delay_seconds(attempt: u8) -> u64 {
+    let exponent = u32::from(attempt.saturating_sub(1)).min(6);
+    UNHEALTHY_SCAN_RETRY_BASE_SECONDS
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+}
+
+fn ensure_bounded_traversal(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    backfill_window_days: u64,
+) {
+    let context_fingerprint =
+        scan_traversal_context_fingerprint(source, roots, index, backfill_window_days);
+    let prior_traversal_context_matches = index
+        .traversal
+        .as_ref()
+        .is_some_and(|traversal| traversal.context_fingerprint == context_fingerprint);
+    let retry_attempt = if let Some(traversal) = index
+        .traversal
+        .as_ref()
+        .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
+    {
+        let terminal_unhealthy = traversal.pending_directories.is_empty()
+            && traversal.pending_candidates.is_empty()
+            && traversal.counts.has_errors();
+        let retry_due = match rfc3339_unix_seconds(collected_at) {
+            Some(now) => traversal
+                .unhealthy_retry_not_before_unix_seconds
+                .is_some_and(|deadline| {
+                    now >= deadline
+                        || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                }),
+            // A malformed or backwards observation clock must not turn the
+            // durable red witness into a permanent fence. Retrying remains
+            // bounded by the per-tick traversal limits.
+            None => true,
+        };
+        if !terminal_unhealthy || !retry_due {
+            return;
+        }
+        traversal.unhealthy_retry_attempt
+    } else {
+        0
+    };
+
+    // A prior partially settled page may have advanced its traversal past an
+    // entity whose replacement was not accepted. Finishing that generation
+    // deliberately leaves this marker set and drops the traversal so the next
+    // cycle starts one clean follow-up walk. Reaching this point means that
+    // follow-up (or another explicit fresh generation) is now starting. Any
+    // new partial settlement stamps the marker again before persistence.
+    index.bounded_sweep_had_unsettled_upload = false;
+
+    let mut census = ScanCensus::default();
+    let resolved_roots = roots
+        .iter()
+        .map(|root| {
+            let problems_before = census
+                .unreadable_path_count
+                .saturating_add(census.disappeared_file_count);
+            let resolved = resolve_configured_scan_root(root, &mut census);
+            let problems_after = census
+                .unreadable_path_count
+                .saturating_add(census.disappeared_file_count);
+            (root, resolved, problems_after > problems_before)
+        })
+        .collect::<Vec<_>>();
+    let currently_resolved = resolved_roots
+        .iter()
+        .filter_map(|(_, resolved, _)| resolved.as_ref())
+        .collect::<Vec<_>>();
+    let missing_roots = resolved_roots
+        .iter()
+        .filter(|(_, resolved, _)| resolved.is_none())
+        .map(|(root, _, _)| *root)
+        .collect::<Vec<_>>();
+    let missing_root_reported_problem = resolved_roots
+        .iter()
+        .any(|(_, resolved, reported_problem)| resolved.is_none() && *reported_problem);
+    // Upgrade compatibility: indexes written before the durable root witness
+    // existed can still prove that a now-missing root was previously observed.
+    // Direct roots are inferred by lexical containment below. A vanished
+    // configured symlink has no recoverable canonical target, so retain the
+    // exact prior index paths until a future resolved root covers them. This
+    // avoids falsely promoting every unrelated optional root to required.
+    if prior_traversal_context_matches {
+        index.legacy_unresolved_root_file_witnesses.retain(|key| {
+            index.files.contains_key(key)
+                && !currently_resolved
+                    .iter()
+                    .any(|root| Path::new(key).starts_with(root))
+        });
+    } else {
+        // A changed root set is an explicit new census scope, not evidence that
+        // one of its absent optional roots owns every old out-of-scope path.
+        index.legacy_unresolved_root_file_witnesses.clear();
+    }
+    if prior_traversal_context_matches && !missing_roots.is_empty() {
+        index.legacy_unresolved_root_file_witnesses.extend(
+            index
+                .files
+                .keys()
+                .filter(|key| {
+                    !currently_resolved
+                        .iter()
+                        .any(|root| Path::new(key).starts_with(root))
+                        && !missing_roots
+                            .iter()
+                            .any(|root| Path::new(key).starts_with(root))
+                })
+                .cloned(),
+        );
+    }
+    let mut scan_roots = Vec::new();
+    let mut pending_directories = VecDeque::new();
+    for (root, resolved, resolver_reported_problem) in resolved_roots {
+        let root_key = local_index_key(root);
+        if let Some(scan_root) = resolved {
+            index.known_configured_scan_roots.insert(root_key);
+            scan_roots.push(scan_root.clone());
+            pending_directories.push_back(ScanTraversalPath {
+                scan_root: scan_root.clone(),
+                path: scan_root,
+                census_member: true,
+                watcher_hint: false,
+            });
+            continue;
+        }
+        let inferred_from_old_index = index
+            .files
+            .keys()
+            .any(|key| Path::new(key).starts_with(root));
+        if inferred_from_old_index {
+            index.known_configured_scan_roots.insert(root_key.clone());
+        }
+        if index.known_configured_scan_roots.contains(&root_key) && !resolver_reported_problem {
+            census.disappeared_file_count += 1;
+        }
+    }
+    if !index.legacy_unresolved_root_file_witnesses.is_empty() && !missing_root_reported_problem {
+        census.disappeared_file_count += 1;
+    }
+    let counts = ScanTraversalCounts {
+        directory_entry_cap_exceeded_count: census.directory_entry_cap_exceeded_count,
+        symlink_rejected_count: census.symlink_rejected_count,
+        unreadable_path_count: census.unreadable_path_count,
+        oversized_file_count: census.oversized_file_count,
+        disappeared_file_count: census.disappeared_file_count,
+        malformed_json_line_count: census.malformed_json_line_count,
+        invalid_utf8_line_count: census.invalid_utf8_line_count,
+        over_line_cap_count: census.over_line_cap_count,
+        recognized_usage_drop_count: census.recognized_usage_drop_count,
+        ..ScanTraversalCounts::default()
+    };
+    index.traversal = Some(ScanTraversalCheckpoint {
+        context_fingerprint,
+        census_window_end: collected_at.to_string(),
+        scan_roots,
+        pending_directories,
+        pending_candidates: VecDeque::new(),
+        observed_index_keys: BTreeSet::new(),
+        reconciliation_upper_bound: index.files.keys().next_back().cloned(),
+        reconciliation_after: None,
+        reconciliation_started: false,
+        watcher_hint_seen: false,
+        unhealthy_retry_attempt: retry_attempt,
+        unhealthy_retry_not_before_unix_seconds: None,
+        counts,
+    });
+}
+
+fn enqueue_watcher_hints(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    hinted_paths: &[PathBuf],
+    watcher_overflowed: bool,
+) {
+    // Ordinary, bounded watcher paths are exact path hints. They join the
+    // durable traversal census and are revalidated by the same no-follow open
+    // and post-read identity checks as directory-discovered candidates. Only
+    // overflow/backend loss makes the watcher evidence incomplete and forces a
+    // following clean generation.
+    traversal.watcher_hint_seen |= watcher_overflowed;
+    let mut pending = traversal
+        .pending_candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<BTreeSet<_>>();
+    for path in hinted_paths.iter().take(MAX_BACKFILL_FILES_PER_SOURCE) {
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            || (source == SnapshotSource::ClaudeCode
+                && claude_transcript_excluded_from_snapshots(path))
+            || !pending.insert(path.clone())
+        {
+            continue;
+        }
+        let Some(scan_root) = traversal
+            .scan_roots
+            .iter()
+            .find(|root| path.starts_with(root))
+            .cloned()
+        else {
+            continue;
+        };
+        // FIFO keeps an actively rewritten path from repeatedly jumping ahead
+        // of an older remove/rename hint in a small bounded page.
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root,
+            path: path.clone(),
+            census_member: true,
+            watcher_hint: true,
+        });
+    }
+}
+
+fn advance_bounded_directory_traversal(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    backfill_window_days: u64,
+) {
+    advance_bounded_directory_traversal_with_budget(
+        source,
+        traversal,
+        backfill_window_days,
+        MAX_SCAN_DIRECTORY_ENTRIES_PER_TICK,
+    );
+}
+
+fn advance_bounded_directory_traversal_with_budget(
+    source: SnapshotSource,
+    traversal: &mut ScanTraversalCheckpoint,
+    backfill_window_days: u64,
+    max_entries: usize,
+) {
+    // Eligibility belongs to the frozen census generation, not to whichever
+    // later tick happens to reach a directory. Otherwise a multi-page walk can
+    // silently age boundary files out while still publishing the earlier
+    // `census_window_end` as its agreement scope.
+    let census_unix_seconds = rfc3339_unix_seconds(&traversal.census_window_end);
+    let mut remaining = max_entries;
+    while remaining > 0 {
+        let Some(directory) = traversal.pending_directories.pop_front() else {
+            break;
+        };
+        let metadata = match fs::symlink_metadata(&directory.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                traversal.counts.disappeared_file_count += 1;
+                continue;
+            }
+            Err(_) => {
+                traversal.counts.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            traversal.counts.symlink_rejected_count += 1;
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(&directory.path) {
+            Ok(entries) => entries,
+            Err(_) => {
+                traversal.counts.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        // Read only the budget still available in this tick, plus one entry as
+        // a bounded proof that the directory must resume. If the full per-tick
+        // budget was available, that same extra entry proves the directory is
+        // too wide to scan truthfully and turns the generation red.
+        let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        if entries.len() > remaining {
+            if remaining == max_entries {
+                traversal.counts.directory_entry_cap_exceeded_count += 1;
+            } else {
+                traversal.pending_directories.push_front(directory);
+            }
+            break;
+        }
+        remaining -= entries.len();
+        entries.sort_by(|left, right| {
+            left.as_ref()
+                .map(|entry| entry.file_name())
+                .ok()
+                .cmp(&right.as_ref().map(|entry| entry.file_name()).ok())
+        });
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    traversal.counts.unreadable_path_count += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    traversal.counts.unreadable_path_count += 1;
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                traversal.counts.symlink_rejected_count += 1;
+                continue;
+            }
+            if file_type.is_dir() {
+                traversal.pending_directories.push_back(ScanTraversalPath {
+                    scan_root: directory.scan_root.clone(),
+                    path,
+                    census_member: true,
+                    watcher_hint: false,
+                });
+                continue;
+            }
+            if !file_type.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            if source == SnapshotSource::ClaudeCode
+                && claude_transcript_excluded_from_snapshots(&path)
+            {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    traversal.counts.disappeared_file_count += 1;
+                    continue;
+                }
+                Err(_) => {
+                    traversal.counts.unreadable_path_count += 1;
+                    continue;
+                }
+            };
+            let modified_unix_seconds = metadata
+                .modified()
+                .ok()
+                .and_then(unix_seconds)
+                .unwrap_or_default();
+            if census_unix_seconds.is_some_and(|now| {
+                !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
+            }) {
+                continue;
+            }
+            traversal.counts.discovered_file_count += 1;
+            traversal.observed_index_keys.insert(local_index_key(&path));
+            if metadata.len() > max_jsonl_file_bytes(source) {
+                traversal.counts.oversized_file_count += 1;
+                continue;
+            }
+            if let Some(existing) = traversal
+                .pending_candidates
+                .iter_mut()
+                .find(|candidate| candidate.path == path)
+            {
+                existing.census_member = true;
+            } else {
+                traversal.pending_candidates.push_back(ScanTraversalPath {
+                    scan_root: directory.scan_root.clone(),
+                    path,
+                    census_member: true,
+                    watcher_hint: false,
+                });
+            }
+        }
+    }
+}
+
+fn candidate_from_traversal_path(
+    source: SnapshotSource,
+    pending: ScanTraversalPath,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> Option<CandidateFile> {
+    let metadata = match fs::symlink_metadata(&pending.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if pending.watcher_hint {
+                // Remove/rename events legitimately name an object that no
+                // longer exists. They are not lossy census failures; remove an
+                // earlier observation so terminal reconciliation can delete
+                // the stale entry exactly.
+                census
+                    .removed_index_keys
+                    .insert(local_index_key(&pending.path));
+            } else if pending.census_member {
+                census.disappeared_file_count += 1;
+            }
+            return None;
+        }
+        Err(_) => {
+            if pending.census_member {
+                census.unreadable_path_count += 1;
+            }
+            return None;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if pending.census_member && metadata.file_type().is_symlink() {
+            census.symlink_rejected_count += 1;
+        }
+        return None;
+    }
+    if metadata.len() > max_jsonl_file_bytes(source) {
+        if pending.census_member {
+            census.oversized_file_count += 1;
+        }
+        return None;
+    }
+    let modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(unix_seconds)
+        .unwrap_or_default();
+    if census_unix_seconds
+        .is_some_and(|now| !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days))
+    {
+        // Watcher hints must not widen the configured activity window. The
+        // same revalidation also handles an ordinary candidate whose mtime was
+        // restored behind the cutoff after directory discovery.
+        if pending.census_member {
+            census
+                .removed_index_keys
+                .insert(local_index_key(&pending.path));
+        }
+        return None;
+    }
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(unix_nanos)
+        .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
+    if pending.census_member {
+        census
+            .observed_index_keys
+            .insert(local_index_key(&pending.path));
+    }
+    Some(CandidateFile {
+        scan_root: pending.scan_root,
+        source_file_fingerprint: String::new(),
+        path: pending.path,
+        size_bytes: metadata.len(),
+        modified_unix_seconds,
+        modified_unix_nanos,
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    })
+}
+
+fn reconcile_missing_index_entries_bounded(index: &mut ScanIndex) -> bool {
+    reconcile_missing_index_entries_with_limit(index, MAX_BACKFILL_FILES_PER_SOURCE)
+}
+
+fn reconcile_missing_index_entries_with_limit(index: &mut ScanIndex, limit: usize) -> bool {
+    let Some(snapshot) = index.traversal.as_ref() else {
+        return false;
+    };
+    let Some(upper_bound) = snapshot.reconciliation_upper_bound.clone() else {
+        return true;
+    };
+    let after = snapshot.reconciliation_after.clone();
+    let lower_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let page = index
+        .files
+        .range((lower_bound, std::ops::Bound::Included(upper_bound.clone())))
+        .take(limit)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    if page.is_empty() {
+        return true;
+    }
+    for key in &page {
+        let observed = index
+            .traversal
+            .as_ref()
+            .is_some_and(|traversal| traversal.observed_index_keys.contains(key));
+        if !observed {
+            index.files.remove(key);
+            index.confirmed_empty_files.remove(key);
+            index.file_snapshot_fingerprints.remove(key);
+        }
+    }
+    let done = page.last() == Some(&upper_bound) || page.len() < limit;
+    if let Some(traversal) = index.traversal.as_mut() {
+        traversal.reconciliation_started = true;
+        traversal.reconciliation_after = page.last().cloned();
+    }
+    done
+}
+
+#[cfg(test)]
 fn collect_recent_jsonl_files(
     source: SnapshotSource,
+    scan_root: &Path,
     root: &Path,
-    files: &mut Vec<CandidateFile>,
+    selection: &mut BoundedCandidateSelection,
+    census: &mut ScanCensus,
     backfill_window_days: u64,
-) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
+) {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return;
+        }
+    };
+    if root_metadata.file_type().is_symlink() {
+        census.symlink_rejected_count += 1;
+        return;
     }
-    for entry in fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))? {
-        let entry = entry.with_context(|| format!("read directory entry {}", root.display()))?;
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+    if !root_metadata.is_dir() {
+        return;
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
         };
-        if metadata.is_dir() {
-            collect_recent_jsonl_files(source, &path, files, backfill_window_days)?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            census.symlink_rejected_count += 1;
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_recent_jsonl_files(
+                source,
+                scan_root,
+                &path,
+                selection,
+                census,
+                backfill_window_days,
+            );
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
@@ -6408,6 +9176,17 @@ fn collect_recent_jsonl_files(
         {
             continue;
         }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                census.disappeared_file_count += 1;
+                continue;
+            }
+            Err(_) => {
+                census.unreadable_path_count += 1;
+                continue;
+            }
+        };
         let modified_unix_seconds = metadata
             .modified()
             .ok()
@@ -6421,32 +9200,31 @@ fn collect_recent_jsonl_files(
         if !is_recent_enough(modified_unix_seconds, backfill_window_days) {
             continue;
         }
+        census.discovered_file_count += 1;
+        census.observed_index_keys.insert(local_index_key(&path));
         // Skip pathologically large transcripts before they ever reach the
         // parser. metadata.len() is already read for fingerprinting, so this is
         // free; an oversized file is dropped from the candidate set rather than
         // opened, keeping the scan's memory bounded without aborting it.
         if metadata.len() > max_jsonl_file_bytes(source) {
+            census.oversized_file_count += 1;
             continue;
         }
-        files.push(CandidateFile {
-            source_file_fingerprint: scan_file_fingerprint_with_context(
-                &path,
-                metadata.len(),
-                modified_unix_nanos,
-                source.scan_identity_version(),
-                "",
-            ),
+        selection.insert(CandidateFile {
+            scan_root: scan_root.to_path_buf(),
+            source_file_fingerprint: String::new(),
             path,
             size_bytes: metadata.len(),
             modified_unix_seconds,
             modified_unix_nanos,
             legacy_source_file_fingerprint: String::new(),
             legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
         });
     }
-    Ok(())
 }
 
+#[cfg(test)]
 fn is_recent_enough(modified_unix_seconds: u64, backfill_window_days: u64) -> bool {
     let Some(now) = unix_seconds(SystemTime::now()) else {
         return true;
@@ -6463,6 +9241,16 @@ fn is_recent_enough_at(
     modified_unix_seconds >= now_unix_seconds.saturating_sub(window_seconds)
 }
 
+fn opened_candidate_is_within_frozen_window(
+    candidate: &CandidateFile,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+) -> bool {
+    census_unix_seconds.map_or(true, |now| {
+        is_recent_enough_at(candidate.modified_unix_seconds, now, backfill_window_days)
+    })
+}
+
 fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
@@ -6472,6 +9260,198 @@ fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
     }
+}
+
+/// Resolve one operator-configured root before discovery. A configured root
+/// may itself be a symlink (for example a relocated home/support directory),
+/// but every descendant remains subject to the component-wise `O_NOFOLLOW`
+/// open below. Canonicalizing once also prevents the discovered path and the
+/// later root-relative open from disagreeing about which root was trusted.
+fn resolve_configured_scan_root(root: &Path, census: &mut ScanCensus) -> Option<PathBuf> {
+    let configured = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return None;
+        }
+    };
+    if configured.is_dir() && !configured.file_type().is_symlink() {
+        return Some(root.to_path_buf());
+    }
+    if !configured.file_type().is_symlink() {
+        return None;
+    }
+    let resolved = match fs::canonicalize(root) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            census.disappeared_file_count += 1;
+            return None;
+        }
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            return None;
+        }
+    };
+    match fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Some(resolved),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            census.disappeared_file_count += 1;
+            None
+        }
+        Err(_) => {
+            census.unreadable_path_count += 1;
+            None
+        }
+    }
+}
+
+/// Open the exact transcript object without following a final-component
+/// symlink, capture its stable object identity and a bounded content witness,
+/// then rewind it for the parser. Discovery metadata is never trusted as the
+/// parse identity: a replacement between enumeration and open is reparsed.
+fn open_candidate_file(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+) -> std::io::Result<File> {
+    let mut file = open_candidate_beneath_root(candidate)?;
+    candidate.opened_object_identity = opened_object_identity(source, &mut file)?;
+    let metadata = file.metadata()?;
+    let modified = metadata.modified().ok();
+    candidate.size_bytes = metadata.len();
+    candidate.modified_unix_seconds = modified.and_then(unix_seconds).unwrap_or_default();
+    candidate.modified_unix_nanos = modified.and_then(unix_nanos).unwrap_or_else(|| {
+        candidate
+            .modified_unix_seconds
+            .saturating_mul(1_000_000_000)
+    });
+
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
+    let relative = candidate
+        .path
+        .strip_prefix(&candidate.scan_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot candidate escaped configured root",
+            )
+        })?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot candidate path is not root-relative",
+        ));
+    }
+
+    let mut root_options = fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut directory = root_options.open(&candidate.scan_root)?;
+    for (position, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("components validated above")
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot candidate contains a NUL byte",
+            )
+        })?;
+        let is_final = position + 1 == components.len();
+        let flags = if is_final {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { File::from_raw_fd(fd) };
+        if is_final {
+            return Ok(opened);
+        }
+        directory = opened;
+    }
+    unreachable!("non-empty component list returns its final object")
+}
+
+#[cfg(not(unix))]
+fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<File> {
+    let relative = candidate
+        .path
+        .strip_prefix(&candidate.scan_root)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "snapshot candidate escaped configured root",
+            )
+        })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "snapshot candidate path is not root-relative",
+        ));
+    }
+    fs::OpenOptions::new().read(true).open(&candidate.path)
+}
+
+fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot candidate is not a regular file",
+        ));
+    }
+    if metadata.len() > max_jsonl_file_bytes(source) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "snapshot candidate exceeds source file cap",
+        ));
+    }
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, &metadata.len().to_be_bytes());
+    #[cfg(unix)]
+    {
+        update_length_prefixed(&mut digest, &metadata.dev().to_be_bytes());
+        update_length_prefixed(&mut digest, &metadata.ino().to_be_bytes());
+        // ctime is an opened-object mutation witness, not business time. It
+        // catches an in-place middle rewrite even when size and mtime are
+        // deliberately restored and the bounded first/last samples are
+        // unchanged. Hash both signed fields byte-for-byte for nanosecond
+        // precision on macOS/Linux.
+        update_length_prefixed(&mut digest, &metadata.ctime().to_be_bytes());
+        update_length_prefixed(&mut digest, &metadata.ctime_nsec().to_be_bytes());
+    }
+    let mut sample = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
+    let first_len = file.read(&mut sample)?;
+    update_length_prefixed(&mut digest, &sample[..first_len]);
+    if metadata.len() > FILE_CONTENT_SAMPLE_BYTES as u64 {
+        file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
+        let last_len = file.read(&mut sample)?;
+        update_length_prefixed(&mut digest, &sample[..last_len]);
+    }
+    let identity = format!("{:x}", digest.finalize());
+    file.seek(SeekFrom::Start(0))?;
+    Ok(identity)
 }
 
 fn unix_seconds(value: SystemTime) -> Option<u64> {
@@ -6496,47 +9476,206 @@ enum CandidateDecision {
     Parse,
 }
 
+struct CheckpointLock {
+    file: File,
+}
+
+impl CheckpointLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create checkpoint directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .context("open local snapshot checkpoint lock")?;
+        #[cfg(unix)]
+        {
+            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("local snapshot checkpoint is owned by another daemon");
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for CheckpointLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn sync_checkpoint_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync checkpoint directory {}", parent.display()))
+}
+
+fn unique_checkpoint_sibling(path: &Path, kind: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
+}
+
+fn valid_snapshot_activity(value: &Option<String>) -> bool {
+    match value.as_deref() {
+        Some(timestamp) => OffsetDateTime::parse(timestamp, &Rfc3339).is_ok(),
+        None => true,
+    }
+}
+
+fn quarantine_invalid_scan_index(path: &Path) -> Result<ScanIndex> {
+    // The index is only a local incremental-scan optimization. A crash or
+    // corrupt semantic-clock witness must not permanently block collection,
+    // but never overwrite the unreadable witness in place.
+    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
+    fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
+    sync_checkpoint_parent(path)?;
+    eprintln!("local snapshot scan index was invalid and quarantined; rebuilding");
+    Ok(ScanIndex::default())
+}
+
 impl ScanIndex {
+    pub fn activate_upload_context(&mut self, fingerprint: String) {
+        self.active_upload_context_fingerprint = Some(fingerprint);
+    }
+
+    pub fn mark_bounded_sweep_unsettled(&mut self) {
+        self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    pub fn prepare_historical_replay(&mut self, generation: String) {
+        if self.historical_replay_generation.as_ref() == Some(&generation) {
+            return;
+        }
+        self.historical_replay_generation = Some(generation);
+        self.upload_context_fingerprint = None;
+        self.files.clear();
+        self.codex_state_only_snapshot_fingerprints.clear();
+        self.resume_after_path = None;
+        self.resume_upper_bound_path = None;
+        self.resume_census_window_end = None;
+        self.bounded_sweep_had_unsettled_upload = false;
+        self.traversal = None;
+        self.confirmed_empty_files.clear();
+        self.file_snapshot_fingerprints.clear();
+        self.snapshot_activity_at.clear();
+    }
+
+    fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
+        self.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
+    }
+
+    fn quarantine_requires_retry(&self, fingerprint: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        self.quarantined_snapshot_fingerprints
+            .get(fingerprint)
+            .zip(self.active_quarantine_witness.as_ref())
+            .is_some_and(|(persisted, active)| {
+                &persisted.witness != active || persisted.retry_after_unix_seconds <= now
+            })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
+        let _lock = CheckpointLock::acquire(path)?;
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
-        match serde_json::from_reader(file) {
-            Ok(index) => Ok(index),
-            Err(error) if !error.is_io() => {
-                // The index is only a local incremental-scan optimization. A
-                // crash or overlapping daemon shutdown must not permanently
-                // block collection because the JSON was left partial. Start
-                // from an empty index; the next successful scan rebuilds it
-                // from source files and replaces the bad file atomically.
-                eprintln!("local snapshot scan index was invalid; rebuilding");
-                Ok(Self::default())
+        match serde_json::from_reader::<_, Self>(file) {
+            Ok(index)
+                if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
+                    && index
+                        .snapshot_activity_at
+                        .values()
+                        .all(valid_snapshot_activity)
+                    && index
+                        .quarantined_snapshot_fingerprints
+                        .values()
+                        .all(snapshot_quarantine_deadline_is_bounded) =>
+            {
+                Ok(index)
             }
+            Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
+                quarantine_invalid_scan_index(path)
+            }
+            Ok(_) => Err(anyhow::anyhow!(
+                "unsupported local snapshot scan index schema"
+            )),
+            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path),
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
         }
-        // Never truncate the live index in place. The process id keeps a
-        // briefly overlapping old/new daemon pair from sharing a temp file;
-        // in-process snapshot scans are separately serialized.
+        let _lock = CheckpointLock::acquire(path)?;
+        if path.exists() {
+            let current: Self = serde_json::from_reader(
+                File::open(path).context("open current local snapshot scan index")?,
+            )
+            .context("parse current local snapshot scan index for compare-and-swap")?;
+            if current.schema_version != SCAN_INDEX_SCHEMA_VERSION
+                || current.generation != self.generation
+            {
+                return Err(anyhow::anyhow!(
+                    "local snapshot scan index changed concurrently"
+                ));
+            }
+        } else if self.generation != 0 {
+            return Err(anyhow::anyhow!(
+                "local snapshot scan index disappeared concurrently"
+            ));
+        }
+        let previous_generation = self.generation;
+        self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("local snapshot scan index generation overflow"))?;
+        // Never truncate the live index in place. The flock serializes new
+        // daemons; the v2-only path isolates this state from older daemons.
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file = File::create(&temp_path)
             .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
-        serde_json::to_writer_pretty(&mut file, self)
-            .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
-        fs::rename(&temp_path, path)
-            .with_context(|| format!("replace scan index {}", path.display()))
+        let result = (|| -> Result<()> {
+            serde_json::to_writer_pretty(&mut file, &self)
+                .with_context(|| format!("write scan index temp {}", temp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync scan index temp {}", temp_path.display()))?;
+            fs::rename(&temp_path, path)
+                .with_context(|| format!("replace scan index {}", path.display()))?;
+            sync_checkpoint_parent(path)
+        })();
+        if result.is_err() {
+            self.generation = previous_generation;
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     /// The scan-index manifest for `source`: how many entities this machine
@@ -6550,28 +9689,75 @@ impl ScanIndex {
     /// locally" is not derivable from anything the server already receives.
     ///
     /// Grain, stated precisely because a consumer cannot infer it: one entity
-    /// per indexed transcript that produced a snapshot, plus one per Codex
-    /// state-only session. A transcript that parses into several snapshots
-    /// contributes its LAST fingerprint, which is the same value the index uses
-    /// for no-op suppression.
+    /// per final snapshot fingerprint, including every entity when one indexed
+    /// transcript produces several snapshots, plus each Codex state-only
+    /// entity. The separate per-file group fingerprint is only an incremental
+    /// no-op witness and never substitutes for this exact entity set.
     ///
-    /// Scope, equally explicit: entities inside `window_days`, the scan window
-    /// this cycle was authorized for. Sessions older than the window were
-    /// uploaded once by the historical bootstrap from an index that is never
-    /// persisted, so they are NOT counted here (see [`SNAPSHOT_MANIFEST_SCOPE`]).
+    /// Scope is the exact half-open semantic activity window `[start, end)`.
+    /// Membership uses the same producer-side activity clock as accepted-log
+    /// `occurred_at`, never local path or file mtime.
     ///
     /// No local path, session id, title, or byte offset participates: the fold
     /// is over semantic fingerprints only, which are already on the wire.
-    pub fn manifest(&self, source: SnapshotSource, window_days: u64) -> SnapshotSourceManifest {
-        let fingerprints = self
-            .files
+    #[cfg(test)]
+    pub fn manifest(&self, source: SnapshotSource, _window_days: u64) -> SnapshotSourceManifest {
+        let mut index = self.clone();
+        let fingerprints = index
+            .file_snapshot_fingerprints
             .values()
-            .filter_map(|entry| entry.last_snapshot_fingerprint.as_deref())
+            .flat_map(BTreeSet::iter)
             .chain(
-                self.codex_state_only_snapshot_fingerprints
+                index
+                    .files
                     .values()
-                    .map(String::as_str),
+                    .filter_map(|entry| entry.last_snapshot_fingerprint.as_ref()),
             )
+            .chain(index.codex_state_only_snapshot_fingerprints.values())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for fingerprint in fingerprints {
+            index
+                .snapshot_activity_at
+                .entry(fingerprint)
+                .or_insert_with(|| Some("2050-01-01T00:00:00Z".to_string()));
+        }
+        index
+            .manifest_for_window(source, "2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .expect("static test manifest window is valid")
+    }
+
+    pub fn manifest_for_window(
+        &self,
+        source: SnapshotSource,
+        window_start: &str,
+        window_end: &str,
+    ) -> Result<SnapshotSourceManifest> {
+        let window_start_at = OffsetDateTime::parse(window_start, &Rfc3339)
+            .context("parse snapshot manifest window start")?;
+        let window_end_at = OffsetDateTime::parse(window_end, &Rfc3339)
+            .context("parse snapshot manifest window end")?;
+        if window_start_at >= window_end_at {
+            return Err(anyhow::anyhow!(
+                "snapshot manifest window must be non-empty and increasing"
+            ));
+        }
+        let all_fingerprints = self.current_snapshot_fingerprints();
+        let fingerprints = all_fingerprints
+            .iter()
+            .map(String::as_str)
+            .filter(|fingerprint| {
+                !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(*fingerprint)
+            })
+            .filter(|fingerprint| {
+                self.snapshot_activity_at
+                    .get(*fingerprint)
+                    .and_then(|activity| activity.as_deref())
+                    .and_then(|activity| OffsetDateTime::parse(activity, &Rfc3339).ok())
+                    .is_some_and(|activity| window_start_at <= activity && activity < window_end_at)
+            })
             .collect::<BTreeSet<_>>();
         let mut digest = Sha256::new();
         update_length_prefixed(&mut digest, SNAPSHOT_MANIFEST_CONTRACT_VERSION.as_bytes());
@@ -6580,13 +9766,52 @@ impl ScanIndex {
         for fingerprint in &fingerprints {
             update_length_prefixed(&mut digest, fingerprint.as_bytes());
         }
-        SnapshotSourceManifest {
+        if !all_fingerprints
+            .iter()
+            .filter(|fingerprint| {
+                !self
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(*fingerprint)
+            })
+            .all(|fingerprint| {
+                self.snapshot_activity_at
+                    .get(fingerprint)
+                    .is_some_and(valid_snapshot_activity)
+            })
+        {
+            return Err(anyhow::anyhow!(
+                "snapshot manifest semantic activity witness is incomplete"
+            ));
+        }
+        Ok(SnapshotSourceManifest {
+            contract_version: SNAPSHOT_MANIFEST_CONTRACT_VERSION,
+            scope: SNAPSHOT_MANIFEST_SCOPE,
             source: source.api_slug().to_string(),
+            window_start: window_start.to_string(),
+            window_end: window_end.to_string(),
             entity_count: fingerprints.len() as u64,
             rolling_hash: format!("{:x}", digest.finalize()),
-            scope: SNAPSHOT_MANIFEST_SCOPE,
-            window_days,
-        }
+        })
+    }
+
+    pub(crate) fn current_snapshot_fingerprints(&self) -> BTreeSet<String> {
+        let exact_file_fingerprints = self
+            .file_snapshot_fingerprints
+            .values()
+            .flat_map(|values| values.iter().cloned());
+        let legacy_file_fingerprints = self
+            .files
+            .iter()
+            .filter(|(key, _)| !self.file_snapshot_fingerprints.contains_key(*key))
+            .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.clone());
+        exact_file_fingerprints
+            .chain(legacy_file_fingerprints)
+            .chain(
+                self.codex_state_only_snapshot_fingerprints
+                    .values()
+                    .cloned(),
+            )
+            .collect()
     }
 
     /// The subset of this scan's index that is safe to commit when the upload
@@ -6612,32 +9837,66 @@ impl ScanIndex {
         &self,
         previous: &ScanIndex,
         accepted: &BTreeSet<String>,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> ScanIndex {
-        let safe = |key: &String, fingerprint: Option<&str>| match fingerprint {
-            None => true,
-            Some(fingerprint) => {
-                accepted.contains(fingerprint)
+        let settled = |fingerprint: &str| {
+            accepted.contains(fingerprint) || quarantined.contains_key(fingerprint)
+        };
+        let safe = |key: &String, fingerprint: Option<&str>| {
+            if self.confirmed_empty_files.contains(key) {
+                // A newly discovered empty file has no remote entity to lose.
+                // A file that PREVIOUSLY produced an entity is different: a
+                // shed/partial pass has not acknowledged removal of that old
+                // server entity, so retain the prior checkpoint and retry the
+                // complete generation instead of publishing false agreement.
+                let previous_had_entity = previous
+                    .file_snapshot_fingerprints
+                    .get(key)
+                    .is_some_and(|fingerprints| !fingerprints.is_empty())
                     || previous
                         .files
                         .get(key)
-                        .and_then(|entry| entry.last_snapshot_fingerprint.as_deref())
-                        == Some(fingerprint)
+                        .and_then(|entry| entry.last_snapshot_fingerprint.as_ref())
+                        .is_some();
+                return !previous_had_entity;
+            }
+            if let Some(exact) = self.file_snapshot_fingerprints.get(key) {
+                return exact.iter().all(|fingerprint| settled(fingerprint));
+            }
+            match fingerprint {
+                None => true,
+                Some(fingerprint) => {
+                    settled(fingerprint)
+                        || previous
+                            .files
+                            .get(key)
+                            .and_then(|entry| entry.last_snapshot_fingerprint.as_deref())
+                            == Some(fingerprint)
+                }
             }
         };
         let mut files = BTreeMap::new();
+        let mut safe_keys = BTreeSet::new();
         for (key, entry) in &self.files {
             if safe(key, entry.last_snapshot_fingerprint.as_deref()) {
                 files.insert(key.clone(), entry.clone());
+                safe_keys.insert(key.clone());
             } else if let Some(committed) = previous.files.get(key) {
                 files.insert(key.clone(), committed.clone());
             }
+        }
+        // A complete census may prune vanished/aged paths from `self`, but a
+        // partial upload must never make that deletion durable. Only the final
+        // all-accepted save may publish pruning.
+        for (key, entry) in &previous.files {
+            files.entry(key.clone()).or_insert_with(|| entry.clone());
         }
         let mut codex_state_only_snapshot_fingerprints = BTreeMap::new();
         for (session_id, fingerprint) in &self.codex_state_only_snapshot_fingerprints {
             let committed = previous
                 .codex_state_only_snapshot_fingerprints
                 .get(session_id);
-            if accepted.contains(fingerprint) || committed == Some(fingerprint) {
+            if settled(fingerprint) || committed == Some(fingerprint) {
                 codex_state_only_snapshot_fingerprints
                     .insert(session_id.clone(), fingerprint.clone());
             } else if let Some(committed) = committed {
@@ -6645,10 +9904,114 @@ impl ScanIndex {
                     .insert(session_id.clone(), committed.clone());
             }
         }
-        ScanIndex {
-            files,
-            codex_state_only_snapshot_fingerprints,
+        // A partial upload cannot make an absent state-only entity authoritative
+        // any more than it can publish a vanished transcript. No request in
+        // this pass settled deletion of the old server entity, so preserve it
+        // until a fully completed census can commit the absence.
+        for (session_id, fingerprint) in &previous.codex_state_only_snapshot_fingerprints {
+            codex_state_only_snapshot_fingerprints
+                .entry(session_id.clone())
+                .or_insert_with(|| fingerprint.clone());
         }
+        let mut confirmed_empty_files = previous.confirmed_empty_files.clone();
+        let mut file_snapshot_fingerprints = previous.file_snapshot_fingerprints.clone();
+        for key in &safe_keys {
+            if self.confirmed_empty_files.contains(key) {
+                confirmed_empty_files.insert(key.clone());
+            } else {
+                confirmed_empty_files.remove(key);
+            }
+            match self.file_snapshot_fingerprints.get(key) {
+                Some(fingerprints) => {
+                    file_snapshot_fingerprints.insert(key.clone(), fingerprints.clone());
+                }
+                None => {
+                    file_snapshot_fingerprints.remove(key);
+                }
+            }
+        }
+        let committable_fingerprints = file_snapshot_fingerprints
+            .values()
+            .flat_map(BTreeSet::iter)
+            .chain(codex_state_only_snapshot_fingerprints.values())
+            .collect::<BTreeSet<_>>();
+        let mut retained_quarantine = quarantined.clone();
+        // If an old quarantine was retried under a newer contract but this
+        // pass stopped before settlement, preserve the old witness. Its
+        // mismatch is the durable instruction to retry again next cycle.
+        for (fingerprint, witness) in &previous.quarantined_snapshot_fingerprints {
+            if committable_fingerprints.contains(fingerprint)
+                && !accepted.contains(fingerprint)
+                && !quarantined.contains_key(fingerprint)
+            {
+                retained_quarantine.insert(fingerprint.clone(), witness.clone());
+            }
+        }
+        let mut snapshot_activity_at = BTreeMap::new();
+        for fingerprint in committable_fingerprints {
+            if let Some(activity_at) = self
+                .snapshot_activity_at
+                .get(fingerprint)
+                .or_else(|| previous.snapshot_activity_at.get(fingerprint))
+            {
+                snapshot_activity_at.insert(fingerprint.clone(), activity_at.clone());
+            }
+        }
+        let mut result = ScanIndex {
+            schema_version: SCAN_INDEX_SCHEMA_VERSION,
+            generation: previous.generation,
+            upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
+            files,
+            known_configured_scan_roots: self.known_configured_scan_roots.clone(),
+            legacy_unresolved_root_file_witnesses: self
+                .legacy_unresolved_root_file_witnesses
+                .clone(),
+            codex_state_only_snapshot_fingerprints,
+            claude_desktop_title_files: self.claude_desktop_title_files.clone(),
+            claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
+            claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
+            claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
+            claude_desktop_store_retry_attempt: self.claude_desktop_store_retry_attempt,
+            claude_desktop_store_retry_not_before_unix_seconds: self
+                .claude_desktop_store_retry_not_before_unix_seconds,
+            resume_after_path: self.resume_after_path.clone(),
+            resume_upper_bound_path: self.resume_upper_bound_path.clone(),
+            resume_census_window_end: self.resume_census_window_end.clone(),
+            bounded_sweep_had_unsettled_upload: self.bounded_sweep_had_unsettled_upload,
+            traversal: self.traversal.clone(),
+            historical_replay_generation: self.historical_replay_generation.clone(),
+            confirmed_empty_files,
+            file_snapshot_fingerprints,
+            snapshot_activity_at,
+            quarantined_snapshot_fingerprints: retained_quarantine.clone(),
+            active_quarantine_witness: self.active_quarantine_witness.clone(),
+            active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),
+        };
+        result.retain_quarantined_fingerprints(&retained_quarantine);
+        result
+    }
+
+    pub fn retain_quarantined_fingerprints(
+        &mut self,
+        quarantined: &BTreeMap<String, SnapshotQuarantineRecord>,
+    ) {
+        let current = self
+            .file_snapshot_fingerprints
+            .values()
+            .flat_map(BTreeSet::iter)
+            .chain(self.codex_state_only_snapshot_fingerprints.values())
+            .collect::<BTreeSet<_>>();
+        self.quarantined_snapshot_fingerprints = quarantined
+            .iter()
+            .filter(|(fingerprint, _)| current.contains(*fingerprint))
+            .map(|(fingerprint, witness)| (fingerprint.clone(), witness.clone()))
+            .collect();
+    }
+
+    fn remove_file_entry(&mut self, key: &str) {
+        self.files.remove(key);
+        self.confirmed_empty_files.remove(key);
+        self.file_snapshot_fingerprints.remove(key);
     }
 
     fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
@@ -6656,6 +10019,24 @@ impl ScanIndex {
         let Some(entry) = self.files.get(&key) else {
             return CandidateDecision::Parse;
         };
+        if self.upload_context_fingerprint != self.active_upload_context_fingerprint {
+            return CandidateDecision::Parse;
+        }
+        if self
+            .file_snapshot_fingerprints
+            .get(&key)
+            .is_some_and(|fingerprints| {
+                fingerprints.iter().any(|fingerprint| {
+                    !self
+                        .snapshot_activity_at
+                        .get(fingerprint)
+                        .is_some_and(valid_snapshot_activity)
+                        || self.quarantine_requires_retry(fingerprint)
+                })
+            })
+        {
+            return CandidateDecision::Parse;
+        }
         let transcript_changed = entry.size_bytes != candidate.size_bytes
             || entry.modified_unix_seconds != candidate.modified_unix_seconds
             || entry
@@ -6664,7 +10045,20 @@ impl ScanIndex {
         if transcript_changed {
             return CandidateDecision::Parse;
         }
-        if entry.last_snapshot_fingerprint.is_none() {
+        if entry.last_snapshot_fingerprint.is_none() && !self.confirmed_empty_files.contains(&key) {
+            return CandidateDecision::Parse;
+        }
+        if !self.file_snapshot_fingerprints.contains_key(&key)
+            && entry
+                .last_snapshot_fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| {
+                    !self
+                        .snapshot_activity_at
+                        .get(fingerprint)
+                        .is_some_and(valid_snapshot_activity)
+                })
+        {
             return CandidateDecision::Parse;
         }
         if entry.scan_identity_version.as_deref() != Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) {
@@ -6687,20 +10081,6 @@ impl ScanIndex {
         } else {
             CandidateDecision::Skip
         }
-    }
-
-    fn source_context_changed(&self, candidate: &CandidateFile) -> bool {
-        self.files
-            .get(&local_index_key(&candidate.path))
-            .is_some_and(|entry| {
-                entry.size_bytes == candidate.size_bytes
-                    && entry.modified_unix_seconds == candidate.modified_unix_seconds
-                    && entry
-                        .modified_unix_nanos
-                        .map(|value| value == candidate.modified_unix_nanos)
-                        .unwrap_or(true)
-                    && entry.source_file_fingerprint != candidate.source_file_fingerprint
-            })
     }
 
     fn last_snapshot_fingerprint(&self, candidate: &CandidateFile) -> Option<String> {
@@ -6728,9 +10108,15 @@ impl ScanIndex {
         );
     }
 
-    fn record(&mut self, candidate: CandidateFile, last_snapshot_fingerprint: Option<String>) {
+    fn record(
+        &mut self,
+        candidate: CandidateFile,
+        last_snapshot_fingerprint: Option<String>,
+        parse_outcome: ScanParseOutcome,
+    ) {
+        let key = local_index_key(&candidate.path);
         self.files.insert(
-            local_index_key(&candidate.path),
+            key.clone(),
             ScanIndexEntry {
                 size_bytes: candidate.size_bytes,
                 modified_unix_seconds: candidate.modified_unix_seconds,
@@ -6740,6 +10126,14 @@ impl ScanIndex {
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
+        match parse_outcome {
+            ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
+                self.confirmed_empty_files.insert(key);
+            }
+            ScanParseOutcome::Snapshot | ScanParseOutcome::Unknown => {
+                self.confirmed_empty_files.remove(&key);
+            }
+        }
     }
 }
 
@@ -6774,6 +10168,7 @@ fn source_file_fingerprint_with_context(
     ])
 }
 
+#[cfg(test)]
 fn scan_file_fingerprint_with_context(
     path: &Path,
     size_bytes: u64,
@@ -6787,6 +10182,24 @@ fn scan_file_fingerprint_with_context(
         &modified_unix_nanos.to_string(),
         scan_identity_version,
         session_sidecar_fingerprint,
+    ])
+}
+
+fn scan_file_fingerprint_with_opened_identity(
+    path: &Path,
+    size_bytes: u64,
+    modified_unix_nanos: u64,
+    scan_identity_version: &str,
+    session_sidecar_fingerprint: &str,
+    opened_object_identity: &str,
+) -> String {
+    sha256_hex(&[
+        &path.to_string_lossy(),
+        &size_bytes.to_string(),
+        &modified_unix_nanos.to_string(),
+        scan_identity_version,
+        session_sidecar_fingerprint,
+        opened_object_identity,
     ])
 }
 
@@ -7586,6 +10999,27 @@ mod tests {
         path
     }
 
+    fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalCheckpoint {
+        ScanTraversalCheckpoint {
+            context_fingerprint,
+            census_window_end: "2026-07-31T00:00:00Z".to_string(),
+            scan_roots: Vec::new(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            unhealthy_retry_attempt: 1,
+            unhealthy_retry_not_before_unix_seconds: Some(0),
+            counts: ScanTraversalCounts {
+                disappeared_file_count: 1,
+                ..ScanTraversalCounts::default()
+            },
+        }
+    }
+
     #[test]
     fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
         let root = temp_dir("scan-index-recovery");
@@ -7595,7 +11029,7 @@ mod tests {
         let recovered = ScanIndex::load(&path).expect("truncated index should self-heal");
         assert!(recovered.files.is_empty());
 
-        let replacement = ScanIndex {
+        let mut replacement = ScanIndex {
             files: BTreeMap::from([(
                 "content-free-key".to_string(),
                 ScanIndexEntry {
@@ -7624,7 +11058,542 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scan_index_adopts_unchanged_transcript_without_reparse() {
+    fn scan_index_quarantines_syntactically_valid_corrupt_activity_witness() {
+        let root = temp_dir("scan-index-corrupt-activity");
+        let path = root.join("codex-scan-index-v2.json");
+        let fingerprint = "a".repeat(64);
+        let mut corrupt = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "content-free-key".to_string(),
+                BTreeSet::from([fingerprint.clone()]),
+            )]),
+            snapshot_activity_at: BTreeMap::from([(
+                fingerprint,
+                Some("syntactically-json-but-not-rfc3339".to_string()),
+            )]),
+            ..ScanIndex::default()
+        };
+        corrupt.save(&path).expect("persist corrupt semantic clock");
+
+        let recovered = ScanIndex::load(&path).expect("corrupt semantic clock should self-heal");
+        assert!(recovered.file_snapshot_fingerprints.is_empty());
+        assert!(recovered.snapshot_activity_at.is_empty());
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("read quarantine directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_deadline_never_becomes_authoritative_after_clock_rollback() {
+        let original_now = 1_000_000;
+        let record = SnapshotQuarantineRecord {
+            witness: snapshot_quarantine_witness(SnapshotSource::Codex),
+            retry_after_unix_seconds: original_now
+                + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
+        };
+        assert!(snapshot_quarantine_deadline_is_bounded_at(
+            &record,
+            original_now
+        ));
+        assert!(!snapshot_quarantine_deadline_is_bounded_at(
+            &record,
+            original_now - 1
+        ));
+        let far_future = SnapshotQuarantineRecord {
+            retry_after_unix_seconds: u64::MAX,
+            ..record
+        };
+        assert!(!snapshot_quarantine_deadline_is_bounded_at(
+            &far_future,
+            original_now
+        ));
+    }
+
+    #[test]
+    fn scan_index_compare_and_swap_rejects_a_stale_overlapping_daemon() {
+        let root = temp_dir("scan-index-cas");
+        let path = root.join("codex-scan-index-v2.json");
+        let mut initial = ScanIndex::default();
+        initial.save(&path).expect("save initial generation");
+        assert_eq!(initial.generation, 1);
+
+        let mut stale = ScanIndex::load(&path).expect("load stale view");
+        let mut winner = ScanIndex::load(&path).expect("load winning view");
+        winner.resume_after_path = Some("winner".to_string());
+        winner.save(&path).expect("winner advances generation");
+        stale.resume_after_path = Some("stale".to_string());
+        stale
+            .save(&path)
+            .expect_err("stale generation must not clobber winner");
+
+        let observed = ScanIndex::load(&path).expect("load winner");
+        assert_eq!(observed.generation, 2);
+        assert_eq!(observed.resume_after_path.as_deref(), Some("winner"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_candidate(path: PathBuf) -> CandidateFile {
+        let scan_root = path
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        CandidateFile {
+            scan_root,
+            path,
+            size_bytes: 0,
+            modified_unix_seconds: 0,
+            modified_unix_nanos: 0,
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_candidate_selection_is_lexicographic_and_resumes_after_cursor() {
+        let root = Path::new("/opaque-root");
+        let mut first = BoundedCandidateSelection::new(None, None, 2);
+        for name in ["c.jsonl", "a.jsonl", "b.jsonl"] {
+            first.insert(test_candidate(root.join(name)));
+        }
+        let (selected, complete, cursor, upper_bound) = first.finish(3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["a.jsonl", "b.jsonl"]
+        );
+        assert!(!complete);
+
+        let mut resumed = BoundedCandidateSelection::new(cursor, upper_bound, 2);
+        for name in ["z-new.jsonl", "c.jsonl", "a.jsonl", "b.jsonl"] {
+            resumed.insert(test_candidate(root.join(name)));
+        }
+        let (selected, complete, cursor, upper_bound) = resumed.finish(4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["c.jsonl"]
+        );
+        assert!(complete, "the frozen preexisting range completes");
+        assert!(cursor.is_none());
+        assert!(upper_bound.is_none());
+
+        let mut next_generation = BoundedCandidateSelection::new(None, None, 2);
+        for name in ["z-new.jsonl", "c.jsonl", "a.jsonl", "b.jsonl"] {
+            next_generation.insert(test_candidate(root.join(name)));
+        }
+        let (selected, complete, _, _) = next_generation.finish(4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.path.file_name().unwrap().to_string_lossy())
+                .collect::<Vec<_>>(),
+            ["a.jsonl", "b.jsonl"]
+        );
+        assert!(!complete);
+    }
+
+    #[test]
+    fn frozen_sweep_visits_every_preexisting_key_despite_sustained_tail_churn() {
+        let root = Path::new("/opaque-root");
+        let preexisting = [
+            "a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl", "e.jsonl", "f.jsonl",
+        ];
+        let mut cursor = None;
+        let mut upper_bound = None;
+        let mut visited = BTreeSet::new();
+        for cycle in 0..3 {
+            let mut selection =
+                BoundedCandidateSelection::new(cursor.clone(), upper_bound.clone(), 2);
+            for name in preexisting {
+                selection.insert(test_candidate(root.join(name)));
+            }
+            for tail in 0..cycle {
+                selection.insert(test_candidate(root.join(format!("z-{tail}.jsonl"))));
+            }
+            let (selected, complete, next_cursor, next_upper_bound) =
+                selection.finish(preexisting.len() + cycle);
+            visited.extend(selected.into_iter().filter_map(|candidate| {
+                candidate
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            }));
+            cursor = next_cursor;
+            upper_bound = next_upper_bound;
+            assert_eq!(complete, cycle == 2);
+        }
+        assert_eq!(
+            visited,
+            preexisting.into_iter().map(str::to_string).collect()
+        );
+    }
+
+    #[test]
+    fn upload_context_transition_forces_a_complete_a_b_a_reparse() {
+        let root = temp_dir("upload-context-aba");
+        let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+
+        let mut scan_with_context = |context: &str| {
+            index.activate_upload_context(context.to_string());
+            let mut result = scan_source_roots_with_limit(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("scan");
+            finalize_scan_after_policy(SnapshotSource::Pi, &mut result, &mut index);
+            result
+        };
+
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 0);
+        assert_eq!(scan_with_context("context-b").scanned_file_count, 1);
+        assert_eq!(scan_with_context("context-a").scanned_file_count, 1);
+        assert_eq!(
+            index.upload_context_fingerprint.as_deref(),
+            Some("context-a")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn historical_replay_generation_clears_once_then_resumes_its_frozen_cursor() {
+        let mut index = ScanIndex {
+            files: BTreeMap::from([("old.jsonl".to_string(), manifest_index_entry(Some("old")))]),
+            resume_after_path: Some("page-one.jsonl".to_string()),
+            resume_upper_bound_path: Some("page-three.jsonl".to_string()),
+            ..ScanIndex::default()
+        };
+        index.prepare_historical_replay("replay-v1".to_string());
+        assert!(index.files.is_empty());
+        assert!(index.resume_after_path.is_none());
+
+        index.files.insert(
+            "page-one.jsonl".to_string(),
+            manifest_index_entry(Some("accepted-page-one")),
+        );
+        index.resume_after_path = Some("page-one.jsonl".to_string());
+        index.resume_upper_bound_path = Some("page-three.jsonl".to_string());
+        index.prepare_historical_replay("replay-v1".to_string());
+        assert!(index.files.contains_key("page-one.jsonl"));
+        assert_eq!(
+            index.resume_after_path.as_deref(),
+            Some("page-one.jsonl"),
+            "a restart of the same replay generation resumes instead of clearing"
+        );
+
+        index.prepare_historical_replay("replay-v2".to_string());
+        assert!(index.files.is_empty());
+        assert!(index.resume_after_path.is_none());
+    }
+
+    #[test]
+    fn opened_object_identity_moves_when_same_inode_content_sample_changes() {
+        let root = temp_dir("opened-object-sample");
+        let path = root.join("session.jsonl");
+        fs::write(&path, b"aaaaaaaa\n").expect("write first content");
+        let mut first = test_candidate(path.clone());
+        open_candidate_file(SnapshotSource::ClaudeCode, &mut first).expect("open first content");
+
+        fs::write(&path, b"bbbbbbbb\n").expect("replace content on same inode");
+        let mut second = test_candidate(path);
+        open_candidate_file(SnapshotSource::ClaudeCode, &mut second).expect("open second content");
+        assert_ne!(first.opened_object_identity, second.opened_object_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opened_replacement_is_rechecked_against_the_frozen_lookback_window() {
+        let root = temp_dir("opened-object-age-recheck");
+        let path = root.join("session.jsonl");
+        fs::write(&path, b"{}\n").expect("write recent discovery object");
+        let census_at = rfc3339_unix_seconds("2026-07-31T00:00:00Z");
+        let mut census = ScanCensus::default();
+        let mut candidate = candidate_from_traversal_path(
+            SnapshotSource::Pi,
+            ScanTraversalPath {
+                scan_root: root.clone(),
+                path: path.clone(),
+                census_member: true,
+                watcher_hint: false,
+            },
+            &mut census,
+            census_at,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("recent path is discovered");
+
+        let replacement = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open replacement");
+        replacement
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+            )
+            .expect("restore replacement to old mtime");
+        drop(replacement);
+        open_candidate_file(SnapshotSource::Pi, &mut candidate)
+            .expect("open exact replacement object");
+
+        assert!(
+            !opened_candidate_is_within_frozen_window(&candidate, census_at, BACKFILL_WINDOW_DAYS,),
+            "eligibility must follow the opened object's mtime"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_object_identity_moves_on_middle_rewrite_with_size_and_mtime_restored() {
+        use std::io::Write;
+
+        let root = temp_dir("opened-object-middle-rewrite");
+        let path = root.join("session.jsonl");
+        fs::write(&path, vec![b'a'; FILE_CONTENT_SAMPLE_BYTES * 3])
+            .expect("write original content");
+        let original_metadata = fs::metadata(&path).expect("original metadata");
+        let mut first = test_candidate(path.clone());
+        open_candidate_file(SnapshotSource::ClaudeCode, &mut first).expect("open first content");
+
+        let mut rewrite = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open middle rewrite");
+        rewrite
+            .seek(SeekFrom::Start((FILE_CONTENT_SAMPLE_BYTES + 128) as u64))
+            .expect("seek middle");
+        rewrite
+            .write_all(b"changed-middle")
+            .expect("rewrite middle");
+        rewrite.sync_all().expect("sync middle rewrite");
+        let times = [
+            libc::timespec {
+                tv_sec: original_metadata.atime(),
+                tv_nsec: original_metadata.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: original_metadata.mtime(),
+                tv_nsec: original_metadata.mtime_nsec(),
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::futimens(rewrite.as_raw_fd(), times.as_ptr()) },
+            0
+        );
+        drop(rewrite);
+
+        let mut second = test_candidate(path);
+        open_candidate_file(SnapshotSource::ClaudeCode, &mut second).expect("open rewritten file");
+        assert_eq!(first.size_bytes, second.size_bytes);
+        assert_eq!(first.modified_unix_nanos, second.modified_unix_nanos);
+        assert_ne!(first.opened_object_identity, second.opened_object_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_rejects_symlinks_without_crossing_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("scan-symlink-root");
+        let outside = temp_dir("scan-symlink-outside");
+        fs::write(outside.join("session.jsonl"), b"{}\n").expect("outside transcript");
+        symlink(&outside, root.join("escape")).expect("create directory symlink");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("symlink is quarantined per path");
+        assert_eq!(scan.symlink_rejected_count, 1);
+        assert_eq!(scan.discovered_file_count, 0);
+        assert!(!scan.census_complete);
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_allows_one_configured_root_symlink_but_not_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("scan-configured-root-symlink");
+        let real_root = parent.join("real-sessions");
+        let configured_root = parent.join("configured-sessions");
+        fs::create_dir_all(&real_root).expect("create real scan root");
+        fs::write(
+            real_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write transcript");
+        symlink(&real_root, &configured_root).expect("create configured root symlink");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&configured_root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("trusted configured root is resolved once");
+        assert!(scan.census_complete);
+        assert_eq!(scan.symlink_rejected_count, 0);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(index.files.len(), 1);
+
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_candidate_cannot_escape_through_replaced_intermediate_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("scan-intermediate-root");
+        let outside = temp_dir("scan-intermediate-outside");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("nested root");
+        fs::write(nested.join("session.jsonl"), b"{}\n").expect("inside transcript");
+        fs::write(outside.join("session.jsonl"), b"{\"outside\":true}\n")
+            .expect("outside transcript");
+        let mut candidate = test_candidate(nested.join("session.jsonl"));
+        candidate.scan_root = root.clone();
+
+        fs::rename(&nested, root.join("nested-original")).expect("move discovered directory");
+        symlink(&outside, &nested).expect("replace intermediate component with symlink");
+        open_candidate_file(SnapshotSource::ClaudeCode, &mut candidate)
+            .expect_err("component-wise O_NOFOLLOW must reject the escape");
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn quarantined_entities_are_excluded_from_non_vacuous_manifest() {
+        let keep = "a".repeat(64);
+        let quarantine = "b".repeat(64);
+        let mut index = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([(
+                "opaque-file".to_string(),
+                BTreeSet::from([keep.clone(), quarantine.clone()]),
+            )]),
+            snapshot_activity_at: BTreeMap::from([(
+                keep.clone(),
+                Some("2050-01-01T00:00:00Z".to_string()),
+            )]),
+            quarantined_snapshot_fingerprints: BTreeMap::from([(
+                quarantine.clone(),
+                snapshot_quarantine_record(SnapshotSource::Codex),
+            )]),
+            ..ScanIndex::default()
+        };
+        let manifest = index.manifest(SnapshotSource::Codex, 183);
+        assert_eq!(manifest.entity_count, 1);
+
+        index
+            .snapshot_activity_at
+            .insert(quarantine.clone(), Some("2050-01-01T00:00:00Z".to_string()));
+        index.retain_quarantined_fingerprints(&BTreeMap::new());
+        assert_eq!(index.manifest(SnapshotSource::Codex, 183).entity_count, 2);
+    }
+
+    #[test]
+    fn scan_index_retries_same_fingerprint_after_quarantine_contract_upgrade() {
+        let path = PathBuf::from("/opaque/session.jsonl");
+        let fingerprint = "e".repeat(64);
+        let candidate = CandidateFile {
+            scan_root: PathBuf::from("/opaque"),
+            path: path.clone(),
+            size_bytes: 42,
+            modified_unix_seconds: 7,
+            modified_unix_nanos: 7_000_000_001,
+            source_file_fingerprint: "same-source-file".to_string(),
+            legacy_source_file_fingerprint: "legacy".to_string(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".to_string(),
+        };
+        let mut stale_witness = snapshot_quarantine_witness(SnapshotSource::Codex);
+        stale_witness.collector_version.push_str("-old");
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: candidate.size_bytes,
+                    modified_unix_seconds: candidate.modified_unix_seconds,
+                    modified_unix_nanos: Some(candidate.modified_unix_nanos),
+                    source_file_fingerprint: candidate.source_file_fingerprint.clone(),
+                    last_snapshot_fingerprint: Some("group".to_string()),
+                    scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                },
+            )]),
+            file_snapshot_fingerprints: BTreeMap::from([(
+                local_index_key(&path),
+                BTreeSet::from([fingerprint.clone()]),
+            )]),
+            snapshot_activity_at: BTreeMap::from([(
+                fingerprint.clone(),
+                Some("2050-01-01T00:00:00Z".to_string()),
+            )]),
+            quarantined_snapshot_fingerprints: BTreeMap::from([(
+                fingerprint,
+                SnapshotQuarantineRecord {
+                    witness: stale_witness,
+                    retry_after_unix_seconds: u64::MAX,
+                },
+            )]),
+            ..ScanIndex::default()
+        };
+        index.activate_quarantine_witness(SnapshotSource::Codex);
+        assert_eq!(
+            index.candidate_decision(&candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
+    fn legacy_scan_index_reparses_once_to_establish_semantic_activity_witness() {
         let root = temp_dir("scan-index-migration");
         let path = root.join("rollout-019e253c-6666-7000-9000-ffffffffffff.jsonl");
         fs::write(
@@ -7672,18 +11641,24 @@ mod tests {
             BACKFILL_WINDOW_DAYS,
         )
         .expect("scan");
-        assert_eq!(scan.scanned_file_count, 0);
-        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.scanned_file_count, 1);
+        assert_eq!(scan.snapshots.len(), 1);
         let migrated = index.files.get(&local_index_key(&path)).expect("entry");
         assert_eq!(
             migrated.scan_identity_version.as_deref(),
             Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
         );
-        assert_eq!(
+        assert_ne!(
             migrated.last_snapshot_fingerprint.as_deref(),
             Some("legacy-snapshot-fingerprint")
         );
         assert!(migrated.modified_unix_nanos.is_some());
+        assert!(index
+            .file_snapshot_fingerprints
+            .get(&local_index_key(&path))
+            .expect("exact entity set")
+            .iter()
+            .all(|fingerprint| index.snapshot_activity_at.contains_key(fingerprint)));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -7766,6 +11741,7 @@ mod tests {
     fn nanosecond_mtime_change_forces_parse_inside_same_second() {
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
+            scan_root: PathBuf::from("/redacted"),
             path: path.clone(),
             size_bytes: 42,
             modified_unix_seconds: 1_777_777_777,
@@ -7773,6 +11749,7 @@ mod tests {
             source_file_fingerprint: "new".to_string(),
             legacy_source_file_fingerprint: "legacy".to_string(),
             legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".to_string(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -7788,6 +11765,9 @@ mod tests {
             )]),
             ..ScanIndex::default()
         };
+        // A legacy row has no nullable semantic-activity witness. A narrow
+        // config reconciliation cannot manufacture one, so v2 requires the
+        // one-time full parse before it can publish a complete manifest.
         assert_eq!(
             index.candidate_decision(&candidate),
             CandidateDecision::Parse
@@ -7798,6 +11778,7 @@ mod tests {
     fn legacy_index_reparses_when_old_sidecar_identity_cannot_be_proven() {
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
+            scan_root: PathBuf::from("/redacted"),
             path: path.clone(),
             size_bytes: 42,
             modified_unix_seconds: 1_777_777_777,
@@ -7805,6 +11786,7 @@ mod tests {
             source_file_fingerprint: "semantic-sync".to_string(),
             legacy_source_file_fingerprint: "legacy-current-sidecar".to_string(),
             legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".to_string(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -7830,6 +11812,7 @@ mod tests {
     fn legacy_index_targets_config_derived_rows_for_reconciliation() {
         let path = PathBuf::from("/redacted/session.jsonl");
         let candidate = CandidateFile {
+            scan_root: PathBuf::from("/redacted"),
             path: path.clone(),
             size_bytes: 42,
             modified_unix_seconds: 1_777_777_777,
@@ -7837,6 +11820,7 @@ mod tests {
             source_file_fingerprint: "semantic-sync".to_string(),
             legacy_source_file_fingerprint: "legacy-matching-sidecar".to_string(),
             legacy_config_reconciliation_required: true,
+            opened_object_identity: "opened".to_string(),
         };
         let index = ScanIndex {
             files: BTreeMap::from([(
@@ -7854,7 +11838,7 @@ mod tests {
         };
         assert_eq!(
             index.candidate_decision(&candidate),
-            CandidateDecision::ReconcileLegacy
+            CandidateDecision::Parse
         );
     }
 
@@ -7915,6 +11899,52 @@ mod tests {
     }
 
     #[test]
+    fn due_quarantine_retry_is_not_suppressed_as_a_semantic_noop() {
+        let root = temp_dir("semantic-noop-quarantine-retry");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        let fingerprint = first.snapshots[0].snapshot_fingerprint.clone();
+        index.quarantined_snapshot_fingerprints.insert(
+            fingerprint.clone(),
+            SnapshotQuarantineRecord {
+                witness: snapshot_quarantine_witness(SnapshotSource::Pi),
+                retry_after_unix_seconds: 0,
+            },
+        );
+
+        let retry = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("due quarantine retry");
+        assert_eq!(retry.scanned_file_count, 1);
+        assert_eq!(retry.semantic_noop_count, 0);
+        assert_eq!(retry.snapshots.len(), 1);
+        assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn backfill_window_defaults_to_two_years_and_starts_from_now_when_zero() {
         let now = 1_800_000_000;
         let day_seconds = 24 * 60 * 60;
@@ -7953,7 +11983,7 @@ mod tests {
         }
 
         let mut index = ScanIndex::default();
-        let scan = scan_source_roots_with_limit(
+        let first = scan_source_roots_with_limit(
             SnapshotSource::Codex,
             std::slice::from_ref(&root),
             &mut index,
@@ -7964,14 +11994,1007 @@ mod tests {
         )
         .expect("scan");
 
-        assert_eq!(scan.backfill_window_days, BACKFILL_WINDOW_DAYS);
-        assert_eq!(scan.backfill_file_limit, file_limit);
-        assert_eq!(scan.discovered_file_count, file_limit + 1);
-        assert_eq!(scan.skipped_file_count_due_to_limit, 1);
-        assert!(scan.scan_cap_hit);
-        assert_eq!(scan.scanned_file_count, file_limit);
+        assert_eq!(first.backfill_window_days, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first.backfill_file_limit, file_limit);
+        assert_eq!(first.discovered_file_count, file_limit + 1);
+        assert_eq!(first.skipped_file_count_due_to_limit, 1);
+        assert!(first.scan_cap_hit);
+        assert!(!first.census_complete);
+        assert_eq!(first.scanned_file_count, file_limit);
+        assert_eq!(first.census_window_end, "2026-05-14T10:04:00Z");
+
+        let second = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:09:00Z",
+            BACKFILL_WINDOW_DAYS,
+            file_limit,
+            true,
+        )
+        .expect("complete frozen sweep");
+        assert!(second.census_complete);
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(
+            second.census_window_end, "2026-05-14T10:04:00Z",
+            "a multi-cycle manifest cannot claim through its later finishing tick"
+        );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wide_single_directory_fails_red_without_materializing_past_budget() {
+        let root = temp_dir("bounded-wide-directory");
+        for index in 0..4 {
+            fs::write(root.join(format!("session-{index}.jsonl")), b"{}\n")
+                .expect("write wide directory fixture");
+        }
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().expect("traversal");
+        advance_bounded_directory_traversal_with_budget(
+            SnapshotSource::Pi,
+            traversal,
+            BACKFILL_WINDOW_DAYS,
+            3,
+        );
+        assert_eq!(traversal.counts.directory_entry_cap_exceeded_count, 1);
+        assert!(traversal.pending_candidates.is_empty());
+        assert!(traversal.counts.has_errors());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn traversal_restart_after_scan_derivation_upgrade_revisits_consumed_prefix() {
+        let root = temp_dir("bounded-traversal-derivation-upgrade");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write traversal fixture");
+        let roots = vec![root.clone()];
+        let mut index = ScanIndex::default();
+
+        // Exact pre-repair context: it bound scope/policy but not the scan,
+        // local-index, or exact-open derivations. Its empty queue represents a
+        // prefix already consumed by the older daemon before restart.
+        let mut legacy = Sha256::new();
+        update_length_prefixed(&mut legacy, b"ottto:snapshot-bounded-traversal:v1");
+        update_length_prefixed(&mut legacy, SnapshotSource::Pi.api_slug().as_bytes());
+        update_length_prefixed(&mut legacy, &BACKFILL_WINDOW_DAYS.to_be_bytes());
+        update_length_prefixed(&mut legacy, b"none");
+        update_length_prefixed(&mut legacy, b"none");
+        for scan_root in &roots {
+            update_length_prefixed(&mut legacy, scan_root.to_string_lossy().as_bytes());
+        }
+        index.traversal = Some(ScanTraversalCheckpoint {
+            context_fingerprint: format!("{:x}", legacy.finalize()),
+            census_window_end: "2026-07-31T00:00:00Z".to_string(),
+            scan_roots: roots.clone(),
+            pending_directories: VecDeque::new(),
+            pending_candidates: VecDeque::new(),
+            observed_index_keys: BTreeSet::new(),
+            reconciliation_upper_bound: None,
+            reconciliation_after: None,
+            reconciliation_started: false,
+            watcher_hint_seen: false,
+            unhealthy_retry_attempt: 0,
+            unhealthy_retry_not_before_unix_seconds: None,
+            counts: ScanTraversalCounts::default(),
+        });
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan derivation change starts a fresh bounded traversal");
+
+        assert_eq!(scan.census_window_end, "2026-07-31T00:05:00Z");
+        assert_eq!(scan.discovered_file_count, 1);
+        assert_eq!(scan.scanned_file_count, 1);
+        assert!(scan.census_complete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_traversal_resumes_after_scan_index_restart() {
+        let root = temp_dir("bounded-traversal-restart");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{},\"output\":1}}}}}}\n",
+                    index + 1
+                ),
+            )
+            .expect("write traversal fixture");
+        }
+        let index_path = root.join("scan-index.json");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("first page");
+        assert!(!first.census_complete);
+        assert_eq!(first.scanned_file_count, 3);
+        index.save(&index_path).expect("save traversal checkpoint");
+
+        let mut resumed = ScanIndex::load(&index_path).expect("reload traversal checkpoint");
+        let second = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut resumed,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("resume second page");
+        assert!(second.census_complete);
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.census_window_end, "2026-07-31T00:00:00Z");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsettled_bounded_page_requires_one_clean_followup_generation() {
+        let root = temp_dir("bounded-traversal-unsettled-followup");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{},\"output\":1}}}}}}\n",
+                    index + 1
+                ),
+            )
+            .expect("write traversal fixture");
+        }
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("first page");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
+        assert!(!first.census_complete);
+
+        // Model the shed branch's durable partial checkpoint. Its traversal
+        // cursor has consumed this page, but not every replacement entity was
+        // accepted, so the final page cannot become terminal authority.
+        index.mark_bounded_sweep_unsettled();
+        let mut final_page = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("finish unsettled generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut final_page, &mut index);
+        assert!(!final_page.census_complete);
+        assert!(final_page.scan_cap_hit);
+        assert!(index.traversal.is_none());
+        assert!(index.bounded_sweep_had_unsettled_upload);
+
+        let mut clean_followup = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+            4,
+            true,
+        )
+        .expect("run clean follow-up generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut clean_followup, &mut index);
+        assert!(clean_followup.census_complete);
+        assert!(!clean_followup.scan_cap_hit);
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn census_window_is_pinned_only_while_traversal_scope_matches() {
+        let first_root = temp_dir("bounded-traversal-pinned-scope-first");
+        let second_root = temp_dir("bounded-traversal-pinned-scope-second");
+        let mut index = ScanIndex::default();
+
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&first_root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&first_root),
+            &mut index,
+            "2027-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .expect("matching traversal resumes")
+                .census_window_end,
+            "2026-07-31T00:00:00Z",
+            "elapsed wall time cannot move a resumed census boundary"
+        );
+
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&second_root),
+            &mut index,
+            "2027-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let restarted = index
+            .traversal
+            .as_ref()
+            .expect("changed root scope starts a new traversal");
+        assert_eq!(restarted.census_window_end, "2027-07-31T00:05:00Z");
+        assert_eq!(restarted.scan_roots, vec![second_root.clone()]);
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn new_tail_waits_for_next_bounded_traversal_generation() {
+        let root = temp_dir("bounded-traversal-new-tail");
+        let fixture = |tokens: usize| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("session-{index}.jsonl")),
+                fixture(index + 1),
+            )
+            .expect("write frozen generation fixture");
+        }
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("first page");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
+        assert!(!first.census_complete);
+        fs::write(root.join("session-4.jsonl"), fixture(5)).expect("write new tail");
+
+        let mut second = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("finish frozen generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut second, &mut index);
+        assert!(second.census_complete);
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.census_window_end, "2026-07-31T00:00:00Z");
+
+        let mut third = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("next generation sees tail");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut third, &mut index);
+        assert!(!third.census_complete);
+        assert_eq!(third.discovered_file_count, 5);
+        let fourth = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:15:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("next generation drains tail");
+        assert!(fourth.census_complete);
+        assert_eq!(fourth.scanned_file_count, 1);
+        assert_eq!(fourth.snapshots.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deletion_reconciliation_is_bounded_and_resumable() {
+        let mut index = ScanIndex {
+            files: ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|key| (key.to_string(), manifest_index_entry(Some(key))))
+                .collect(),
+            traversal: Some(ScanTraversalCheckpoint {
+                context_fingerprint: "context".to_string(),
+                census_window_end: "2026-07-31T00:00:00Z".to_string(),
+                scan_roots: Vec::new(),
+                pending_directories: VecDeque::new(),
+                pending_candidates: VecDeque::new(),
+                observed_index_keys: ["b".to_string(), "d".to_string()].into_iter().collect(),
+                reconciliation_upper_bound: Some("d".to_string()),
+                reconciliation_after: None,
+                reconciliation_started: false,
+                watcher_hint_seen: false,
+                unhealthy_retry_attempt: 0,
+                unhealthy_retry_not_before_unix_seconds: None,
+                counts: ScanTraversalCounts::default(),
+            }),
+            ..ScanIndex::default()
+        };
+        assert!(!reconcile_missing_index_entries_with_limit(&mut index, 2));
+        assert_eq!(
+            index.files.keys().cloned().collect::<Vec<_>>(),
+            ["b", "c", "d"]
+        );
+        assert!(reconcile_missing_index_entries_with_limit(&mut index, 2));
+        assert_eq!(index.files.keys().cloned().collect::<Vec<_>>(), ["b", "d"]);
+    }
+
+    #[test]
+    fn bounded_watcher_hint_joins_complete_durable_census() {
+        let root = temp_dir("bounded-watcher-hint");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":1}}}\n",
+        )
+        .expect("write watcher fixture");
+        let mut index = ScanIndex::default();
+        let mut hinted = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+            None,
+            None,
+            std::slice::from_ref(&path),
+            false,
+        )
+        .expect("hinted scan");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut hinted, &mut index);
+        assert_eq!(hinted.snapshots.len(), 1);
+        assert!(hinted.census_complete);
+        assert!(!hinted.scan_cap_hit);
+        assert!(index.traversal.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_watcher_hints_cannot_starve_bounded_census() {
+        let root = temp_dir("bounded-repeated-watcher-hint");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let active_path = root.join("a-active.jsonl");
+        fs::write(&active_path, fixture(1)).expect("write active fixture");
+        fs::write(root.join("b.jsonl"), fixture(2)).expect("write second fixture");
+        fs::write(root.join("c.jsonl"), fixture(3)).expect("write third fixture");
+        let mut index = ScanIndex::default();
+
+        for tick in 0..3 {
+            let scan = scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                &format!("2026-07-31T00:0{tick}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                None,
+                None,
+                std::slice::from_ref(&active_path),
+                false,
+            )
+            .expect("bounded hinted scan");
+            if tick < 2 {
+                assert!(!scan.census_complete);
+                assert_eq!(scan.census_window_end, "2026-07-31T00:00:00Z");
+            } else {
+                assert!(scan.census_complete);
+                assert!(index.traversal.is_none());
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rename_hint_removes_old_index_key_despite_repeated_active_hints() {
+        let root = temp_dir("bounded-watcher-rename");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let old_path = root.join("a-old.jsonl");
+        let new_path = root.join("b-new.jsonl");
+        let active_path = root.join("c-active.jsonl");
+        fs::write(&old_path, fixture(1)).expect("write old fixture");
+        fs::write(&active_path, fixture(2)).expect("write active fixture");
+        let mut index = ScanIndex::default();
+
+        let initial = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("initial complete scan");
+        assert!(initial.census_complete);
+        assert!(index.files.contains_key(&local_index_key(&old_path)));
+
+        fs::rename(&old_path, &new_path).expect("rename fixture");
+        let initial_hints = vec![old_path.clone(), new_path.clone(), active_path.clone()];
+        let mut completed = false;
+        for tick in 1..=6 {
+            let hints = if tick == 1 {
+                initial_hints.as_slice()
+            } else {
+                std::slice::from_ref(&active_path)
+            };
+            let mut scan = scan_source_roots_with_limit_and_attribution(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                &format!("2026-07-31T00:0{tick}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+                None,
+                None,
+                hints,
+                false,
+            )
+            .expect("bounded rename scan");
+            finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+            assert_eq!(scan.disappeared_file_count, 0);
+            if scan.census_complete {
+                completed = true;
+                break;
+            }
+        }
+
+        assert!(completed, "rename/remove hint must settle under activity");
+        assert!(!index.files.contains_key(&local_index_key(&old_path)));
+        assert!(index.files.contains_key(&local_index_key(&new_path)));
+        assert!(index.files.contains_key(&local_index_key(&active_path)));
+        assert_eq!(index.files.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_remove_hint_retires_key_already_passed_by_reconciliation() {
+        let root = temp_dir("bounded-watcher-late-remove");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        let removed_path = root.join("a-removed.jsonl");
+        let retained_path = root.join("b-retained.jsonl");
+        fs::write(&removed_path, fixture(1)).expect("write removed fixture");
+        fs::write(&retained_path, fixture(2)).expect("write retained fixture");
+        let mut index = ScanIndex::default();
+
+        let initial = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("initial complete scan");
+        assert!(initial.census_complete);
+
+        let removed_key = local_index_key(&removed_path);
+        let retained_key = local_index_key(&retained_path);
+        ensure_bounded_traversal(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        let traversal = index.traversal.as_mut().expect("traversal");
+        traversal.pending_directories.clear();
+        traversal.pending_candidates.clear();
+        traversal.observed_index_keys = BTreeSet::from([removed_key.clone(), retained_key.clone()]);
+        traversal.reconciliation_upper_bound = Some(retained_key.clone());
+        traversal.reconciliation_after = Some(removed_key.clone());
+        traversal.reconciliation_started = true;
+
+        fs::remove_file(&removed_path).expect("remove already-reconciled fixture");
+        let scan = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            None,
+            std::slice::from_ref(&removed_path),
+            false,
+        )
+        .expect("settle late remove hint");
+
+        assert!(scan.census_complete);
+        assert!(!index.files.contains_key(&removed_key));
+        assert!(index.files.contains_key(&retained_key));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_overflow_dirties_generation_and_clean_sweep_repairs_missed_change() {
+        let root = temp_dir("bounded-watcher-overflow");
+        let first_path = root.join("a.jsonl");
+        let second_path = root.join("b.jsonl");
+        let fixture = |tokens: u64| {
+            format!(
+                "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{tokens},\"output\":1}}}}}}\n"
+            )
+        };
+        fs::write(&first_path, fixture(1)).expect("write first fixture");
+        fs::write(&second_path, fixture(2)).expect("write second fixture");
+        let mut index = ScanIndex::default();
+
+        let mut first = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .expect("start frozen generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
+        assert!(!first.census_complete);
+        assert_eq!(first.snapshots[0].input_tokens, 1);
+
+        // The raw watcher overflow loses this exact path after its directory
+        // was already traversed. The overflow witness must prevent the current
+        // generation from publishing a terminal manifest.
+        fs::write(&first_path, fixture(99)).expect("change already traversed file");
+        let mut overflowed = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:30Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            None,
+            &[],
+            true,
+        )
+        .expect("finish dirty generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut overflowed, &mut index);
+        assert!(!overflowed.census_complete);
+        assert!(overflowed.scan_cap_hit);
+        assert!(index.traversal.is_none());
+
+        let mut repaired = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .expect("clean repair generation");
+        assert_eq!(repaired.snapshots.len(), 1);
+        assert_eq!(repaired.snapshots[0].input_tokens, 99);
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut repaired, &mut index);
+        assert!(!repaired.census_complete);
+
+        let final_page = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:01:30Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+            None,
+            None,
+            &[],
+            false,
+        )
+        .expect("finish clean repair generation");
+        assert!(final_page.census_complete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unhealthy_generation_retries_with_backoff_while_hints_still_progress() {
+        let root = temp_dir("bounded-unhealthy-retry");
+        let malformed = root.join("a-malformed.jsonl");
+        fs::write(
+            &malformed,
+            concat!(
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+                "not-json\n"
+            ),
+        )
+        .expect("write malformed fixture");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first unhealthy scan");
+        assert_eq!(first.scanned_file_count, 1);
+        assert!(!first.census_complete);
+        assert!(index.traversal.is_some(), "red witness stays durable");
+
+        let quiet = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("retry remains backed off");
+        assert_eq!(quiet.scanned_file_count, 0);
+        assert!(!quiet.census_complete);
+
+        let sibling = root.join("z-healthy.jsonl");
+        fs::write(
+            &sibling,
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":7,\"output\":1}}}\n",
+        )
+        .expect("write healthy sibling");
+        let hinted = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:40Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+            None,
+            None,
+            std::slice::from_ref(&sibling),
+            false,
+        )
+        .expect("healthy hint progresses under red witness");
+        assert_eq!(hinted.snapshots.len(), 1);
+        assert_eq!(hinted.snapshots[0].input_tokens, 7);
+        assert!(!hinted.census_complete);
+
+        let retried = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("bounded retry becomes due");
+        assert_eq!(retried.scanned_file_count, 2);
+        assert!(!retried.census_complete);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn periodic_scan_discovers_root_created_after_watcher_startup() {
+        let parent = temp_dir("late-scan-root-parent");
+        let root = parent.join("sessions-created-later");
+        let mut index = ScanIndex::default();
+        let absent = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("missing optional root is complete-empty");
+        assert!(absent.census_complete);
+        assert!(index.known_configured_scan_roots.is_empty());
+
+        fs::create_dir_all(&root).expect("create root after watcher startup");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write late session");
+        let found = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("periodic scan finds late root");
+        assert!(found.census_complete);
+        assert_eq!(found.snapshots.len(), 1);
+        assert!(index
+            .known_configured_scan_roots
+            .contains(&local_index_key(&root)));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn previously_observed_root_disappearance_fails_red_until_root_returns() {
+        let parent = temp_dir("disappearing-scan-root-parent");
+        let root = parent.join("sessions");
+        fs::create_dir_all(&root).expect("create observed root");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":3,\"output\":1}}}\n",
+        )
+        .expect("write observed entity");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("observe configured root");
+        assert!(first.census_complete);
+        assert_eq!(index.files.len(), 1);
+
+        fs::remove_dir_all(&root).expect("temporarily remove configured root");
+        let missing = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("missing root is a source-local red witness");
+        assert!(!missing.census_complete);
+        assert_eq!(missing.disappeared_file_count, 1);
+        assert_eq!(index.files.len(), 1, "prior entities remain authoritative");
+
+        fs::create_dir_all(&root).expect("restore configured root empty");
+        let restored = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("restored root converges through a fresh complete census");
+        assert!(restored.census_complete);
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn old_index_without_root_witness_infers_missing_previously_observed_root() {
+        let parent = temp_dir("old-index-missing-root");
+        let root = parent.join("sessions");
+        let index_path = parent.join("scan-index.json");
+        let prior_path = root.join("session.jsonl");
+        let mut old_index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        old_index
+            .save(&index_path)
+            .expect("write pre-witness index");
+        let serialized: Value =
+            serde_json::from_slice(&fs::read(&index_path).expect("read pre-witness index"))
+                .expect("parse pre-witness index");
+        assert!(serialized.get("known_configured_scan_roots").is_none());
+        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness index");
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut upgraded,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("upgrade inference remains source-local");
+
+        assert!(!scan.census_complete);
+        assert_eq!(scan.disappeared_file_count, 1);
+        assert!(upgraded.files.contains_key(&local_index_key(&prior_path)));
+        assert!(upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&root)));
+        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_vanished_symlink_witness_does_not_promote_optional_roots() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_dir("legacy-vanished-symlink-root");
+        let target = parent.join("relocated-sessions");
+        let configured_link = parent.join("configured-sessions");
+        let optional_root = parent.join("optional-sessions");
+        fs::create_dir_all(&target).expect("create prior canonical target");
+        let prior_path = fs::canonicalize(&target)
+            .expect("canonicalize prior target")
+            .join("session.jsonl");
+        fs::remove_dir_all(&target).expect("remove prior canonical target");
+        let index_path = parent.join("scan-index.json");
+        let mut old_index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        let roots = vec![optional_root.clone(), configured_link.clone()];
+        old_index.traversal = Some(terminal_unhealthy_traversal(
+            scan_traversal_context_fingerprint(
+                SnapshotSource::Pi,
+                &roots,
+                &old_index,
+                BACKFILL_WINDOW_DAYS,
+            ),
+        ));
+        old_index
+            .save(&index_path)
+            .expect("write pre-witness symlink index");
+        let mut upgraded = ScanIndex::load(&index_path).expect("load pre-witness symlink index");
+
+        let missing = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut upgraded,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unresolved legacy symlink remains source-local");
+
+        assert!(!missing.census_complete);
+        assert_eq!(missing.disappeared_file_count, 1);
+        assert_eq!(
+            upgraded.legacy_unresolved_root_file_witnesses,
+            BTreeSet::from([local_index_key(&prior_path)])
+        );
+        assert!(!upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&optional_root)));
+
+        fs::create_dir_all(&target).expect("restore canonical target");
+        symlink(&target, &configured_link).expect("restore configured symlink");
+        let restored = scan_source_roots(
+            SnapshotSource::Pi,
+            &roots,
+            &mut upgraded,
+            "2026-07-31T00:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("restored symlink covers its durable legacy witness");
+
+        assert_eq!(
+            restored.disappeared_file_count,
+            0,
+            "legacy_witnesses={} optional_known={} link_known={}",
+            upgraded.legacy_unresolved_root_file_witnesses.len(),
+            upgraded
+                .known_configured_scan_roots
+                .contains(&local_index_key(&optional_root)),
+            upgraded
+                .known_configured_scan_roots
+                .contains(&local_index_key(&configured_link)),
+        );
+        assert!(restored.census_complete, "restored scan: {restored:#?}");
+        assert!(upgraded.files.is_empty());
+        assert!(upgraded.legacy_unresolved_root_file_witnesses.is_empty());
+        assert!(upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&configured_link)));
+        assert!(!upgraded
+            .known_configured_scan_roots
+            .contains(&local_index_key(&optional_root)));
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn legacy_root_context_change_does_not_claim_unrelated_optional_root() {
+        let parent = temp_dir("legacy-root-context-change");
+        let old_root = parent.join("old-sessions");
+        let new_optional_root = parent.join("new-optional-sessions");
+        let prior_path = old_root.join("session.jsonl");
+        let mut index = ScanIndex {
+            files: BTreeMap::from([(
+                local_index_key(&prior_path),
+                manifest_index_entry(Some("prior-entity")),
+            )]),
+            ..ScanIndex::default()
+        };
+        let old_roots = vec![old_root];
+        index.traversal = Some(terminal_unhealthy_traversal(
+            scan_traversal_context_fingerprint(
+                SnapshotSource::Pi,
+                &old_roots,
+                &index,
+                BACKFILL_WINDOW_DAYS,
+            ),
+        ));
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&new_optional_root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("changed root context starts a fresh authoritative scope");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.disappeared_file_count, 0);
+        assert!(index.files.is_empty());
+        assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
+        assert!(!index
+            .known_configured_scan_roots
+            .contains(&local_index_key(&new_optional_root)));
+        let _ = fs::remove_dir_all(parent);
     }
 
     #[test]
@@ -7985,7 +13008,7 @@ mod tests {
         assert!(input.len() > cap * 4, "oversized line must exceed the cap");
 
         let mut seen = Vec::new();
-        read_bounded_jsonl_lines(input.as_bytes(), cap, |value| {
+        let report = read_bounded_jsonl_lines(input.as_bytes(), cap, |value| {
             seen.push(value.clone());
         })
         .expect("bounded read");
@@ -7995,6 +13018,8 @@ mod tests {
         assert_eq!(seen[1], json!({ "n": 2 }));
         // The dropped line never reaches the callback as a (truncated) value.
         assert!(seen.iter().all(|value| value.get("big").is_none()));
+        assert_eq!(report.over_line_cap_count, 1);
+        assert!(!report.complete());
     }
 
     #[test]
@@ -8004,7 +13029,7 @@ mod tests {
         // trailing newline.
         let input = "{\"type\":\"a\",\"v\":1}\n{\"type\":\"b\",\"v\":2}\n{\"type\":\"c\",\"v\":3}";
         let mut seen = Vec::new();
-        read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
+        let report = read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
             seen.push(value.clone());
         })
         .expect("bounded read");
@@ -8017,6 +13042,7 @@ mod tests {
                 json!({ "type": "c", "v": 3 }),
             ]
         );
+        assert!(report.complete());
     }
 
     #[test]
@@ -8025,12 +13051,14 @@ mod tests {
         // before; a trailing newline does not emit a spurious empty value.
         let input = "\n   \n{\"ok\":true}\nnot json at all\n\n{\"ok\":false}\n";
         let mut seen = Vec::new();
-        read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
+        let report = read_bounded_jsonl_lines(input.as_bytes(), MAX_JSONL_LINE_BYTES, |value| {
             seen.push(value.clone());
         })
         .expect("bounded read");
 
         assert_eq!(seen, vec![json!({ "ok": true }), json!({ "ok": false })],);
+        assert_eq!(report.malformed_json_line_count, 1);
+        assert!(!report.complete());
     }
 
     #[test]
@@ -8059,12 +13087,244 @@ mod tests {
         )
         .expect("scan must not abort on an oversized file");
 
-        // The oversized file is never a candidate, so it is not discovered or
-        // scanned; the scan completes without panic.
-        assert_eq!(scan.discovered_file_count, 0);
+        // The census sees the path, records the explicit oversized reason, and
+        // never admits it to the bounded parse candidate set.
+        assert_eq!(scan.discovered_file_count, 1);
         assert_eq!(scan.scanned_file_count, 0);
         assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.oversized_file_count, 1);
+        assert!(!scan.census_complete);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_traversal_uses_frozen_census_time_for_age_cutoff() {
+        let root = temp_dir("bounded-frozen-age-cutoff");
+        fs::write(
+            root.join("session.jsonl"),
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+        )
+        .expect("write age-cutoff fixture");
+        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&Rfc3339)
+            .expect("format future frozen boundary");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            &future_boundary,
+            1,
+        )
+        .expect("scan against frozen future boundary");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.discovered_file_count, 0);
+        assert!(scan.snapshots.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn watcher_hint_cannot_widen_the_frozen_age_scope() {
+        let root = temp_dir("bounded-watcher-age-cutoff");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+        )
+        .expect("write watcher age-cutoff fixture");
+        let future_boundary = (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&Rfc3339)
+            .expect("format future frozen boundary");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            &future_boundary,
+            1,
+            1,
+            true,
+            None,
+            None,
+            std::slice::from_ref(&path),
+            false,
+        )
+        .expect("scan out-of-scope watcher hint");
+
+        assert!(scan.census_complete);
+        assert!(scan.snapshots.is_empty());
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incomplete_jsonl_never_settles_the_scan_index() {
+        let root = temp_dir("scan-incomplete-jsonl");
+        let path = root.join("session-incomplete.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n",
+                "this is not valid json\n"
+            ),
+        )
+        .expect("write incomplete transcript");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("scan quarantines parse loss");
+        assert_eq!(scan.malformed_json_line_count, 1);
+        assert!(!scan.census_complete);
+        assert_eq!(scan.scanned_session_count, 1);
+        assert!(
+            scan.snapshots.is_empty(),
+            "a partial entity from a lossy file must never reach upload"
+        );
+        assert!(index.files.is_empty(), "incomplete file stays retryable");
+        assert!(index.confirmed_empty_files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_lossy_line_class_quarantines_the_whole_file_entity() {
+        let session = "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n";
+        let usage = "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n";
+        let cases = ["invalid-utf8", "over-line-cap", "recognized-drop"];
+        for case in cases {
+            let root = temp_dir(case);
+            let path = root.join("session.jsonl");
+            let mut bytes = format!("{session}{usage}").into_bytes();
+            match case {
+                "invalid-utf8" => bytes.extend_from_slice(&[0xff, b'\n']),
+                "over-line-cap" => {
+                    bytes.extend_from_slice(b"{\"ignored\":\"");
+                    bytes.extend(std::iter::repeat(b'x').take(MAX_JSONL_LINE_BYTES + 1));
+                    bytes.extend_from_slice(b"\"}\n");
+                }
+                "recognized-drop" => bytes.extend_from_slice(
+                    b"{\"type\":\"message_end\",\"message\":{\"usage\":{\"input\":\"invalid\"}}}\n",
+                ),
+                _ => unreachable!(),
+            }
+            fs::write(&path, bytes).expect("write lossy fixture");
+            let mut index = ScanIndex::default();
+            let scan = scan_source_roots_with_limit(
+                SnapshotSource::Pi,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-07-22T08:02:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("lossy file is isolated");
+            assert!(!scan.census_complete, "{case}");
+            assert!(scan.snapshots.is_empty(), "{case}");
+            assert!(index.files.is_empty(), "{case}");
+            match case {
+                "invalid-utf8" => assert_eq!(scan.invalid_utf8_line_count, 1),
+                "over-line-cap" => assert_eq!(scan.over_line_cap_count, 1),
+                "recognized-drop" => assert_eq!(scan.recognized_usage_drop_count, 1),
+                _ => unreachable!(),
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn positive_usage_without_an_emittable_entity_stays_retryable() {
+        let root = temp_dir("positive-usage-without-entity");
+        fs::write(
+            root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"019e2700-1111-7000-9000-111111111111\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"usage\":{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}\n"
+            ),
+        )
+        .expect("write positive usage without an activity timestamp");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("lossy positive usage remains retryable");
+
+        assert_eq!(scan.recognized_usage_drop_count, 1);
+        assert!(!scan.census_complete);
+        assert!(scan.snapshots.is_empty());
+        assert!(index.files.is_empty());
+        assert!(index.confirmed_empty_files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lossy_file_has_no_finalization_side_effects_while_healthy_sibling_progresses() {
+        let root = temp_dir("scan-lossy-with-healthy-sibling");
+        let valid_session = |session_id: &str| {
+            format!(
+                concat!(
+                    "{{\"type\":\"session\",\"session_id\":\"{}\",\"cwd\":\"/tmp/ottto\",\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n",
+                    "{{\"type\":\"message_end\",\"message\":{{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"api\":\"responses\",\"timestamp\":1784707201000,\"usage\":{{\"input\":12,\"output\":4,\"cacheRead\":0,\"cacheWrite\":0}}}}}}\n"
+                ),
+                session_id
+            )
+        };
+        fs::write(
+            root.join("a-healthy.jsonl"),
+            valid_session("019e2700-1111-7000-9000-111111111111"),
+        )
+        .expect("write healthy sibling");
+        fs::write(
+            root.join("b-lossy.jsonl"),
+            format!(
+                "{}this is not valid json\n",
+                valid_session("019e2700-2222-7000-9000-222222222222")
+            ),
+        )
+        .expect("write lossy sibling");
+
+        let mut index = ScanIndex::default();
+        let mut scan = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("lossy sibling is isolated");
+        assert!(!scan.census_complete);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.file_snapshot_fingerprints.len(), 0);
+
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut index);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(index.files.len(), 1);
+        assert_eq!(index.file_snapshot_fingerprints.len(), 1);
+        assert_eq!(index.snapshot_activity_at.len(), 1);
+        assert!(index
+            .files
+            .keys()
+            .all(|path| path.ends_with("a-healthy.jsonl")));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8137,7 +13397,7 @@ mod tests {
         let mut index = ScanIndex::default();
         let scan = scan_source_roots(
             SnapshotSource::Codex,
-            &[sessions_dir, archived_dir],
+            &[sessions_dir.clone(), archived_dir.clone()],
             &mut index,
             "2026-05-14T12:00:00Z",
             BACKFILL_WINDOW_DAYS,
@@ -8804,6 +14064,59 @@ mod tests {
     }
 
     #[test]
+    fn malformed_codex_session_index_discards_partial_titles_without_blocking_usage() {
+        let codex_dir = temp_dir("codex-session-index-partial");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(
+            sessions_dir.join(
+                "rollout-2026-05-14T10-00-00-019e253c-2222-7000-9000-bbbbbbbbbbbb.jsonl",
+            ),
+            concat!(
+                "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-2222-7000-9000-bbbbbbbbbbbb\"}}\n",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":5},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            concat!(
+                "{\"id\":\"019e253c-2222-7000-9000-bbbbbbbbbbbb\",\"thread_name\":\"Must not partially settle\"}\n",
+                "{not valid json}\n"
+            ),
+        )
+        .expect("write partial sidecar");
+
+        let mut index = ScanIndex {
+            upload_context_fingerprint: Some("prior-context".to_string()),
+            ..ScanIndex::default()
+        };
+        index.activate_upload_context("next-context".to_string());
+        let mut scan = scan_source_roots(
+            SnapshotSource::Codex,
+            &[sessions_dir],
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("malformed sidecar is quarantined without fencing usage");
+        assert!(!scan.sidecar_census_complete);
+        assert!(!scan.census_complete);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots[0].input_tokens, 20);
+        assert_ne!(
+            scan.snapshots[0].session_display_name.as_deref(),
+            Some("Must not partially settle")
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        assert_eq!(
+            index.upload_context_fingerprint.as_deref(),
+            Some("prior-context")
+        );
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
     fn codex_state_sqlite_sidecar_supplies_title_when_session_index_has_none() {
         let codex_dir = temp_dir("codex-state-sqlite");
         let sessions_dir = codex_dir.join("sessions");
@@ -8932,7 +14245,7 @@ mod tests {
         let mut index = ScanIndex::default();
         let scan = scan_source_roots(
             SnapshotSource::Codex,
-            &[sessions_dir, archived_dir],
+            &[sessions_dir.clone(), archived_dir.clone()],
             &mut index,
             "2026-05-14T10:04:00Z",
             BACKFILL_WINDOW_DAYS,
@@ -8974,7 +14287,144 @@ mod tests {
             state_only.session_display_name.as_deref(),
             Some("Archived State Only")
         );
+        assert_eq!(
+            index
+                .codex_state_only_snapshot_fingerprints
+                .get(&state_only.source_session_id),
+            Some(&state_only.snapshot_fingerprint),
+            "durable state-only witness must use the final emitted fingerprint"
+        );
 
+        let no_titles_context = "policy-no-titles".to_string();
+        index.activate_upload_context(no_titles_context.clone());
+        let mut suppressed = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[sessions_dir.clone(), archived_dir.clone()],
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("privacy suppression scan");
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut suppressed.snapshots,
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut suppressed, &mut index);
+        let suppressed_state = suppressed
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.provenance.collector == "codex_state_sqlite")
+            .expect("state-only privacy correction");
+        assert!(suppressed_state.session_display_name.is_none());
+        assert_eq!(
+            index
+                .codex_state_only_snapshot_fingerprints
+                .get(&suppressed_state.source_session_id),
+            Some(&suppressed_state.snapshot_fingerprint)
+        );
+
+        index.activate_upload_context("policy-titles-restored".to_string());
+        let mut restored = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[sessions_dir, archived_dir],
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("privacy restoration scan");
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            &mut restored.snapshots,
+            SnapshotUploadPolicy::default(),
+        );
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut restored, &mut index);
+        assert!(restored.snapshots.iter().any(|snapshot| {
+            snapshot.provenance.collector == "codex_state_sqlite"
+                && snapshot.session_display_name.as_deref() == Some("Archived State Only")
+        }));
+
+        index.activate_upload_context("account-cutoff".to_string());
+        let mut cutoff = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[
+                codex_dir.join("sessions"),
+                codex_dir.join("archived_sessions"),
+            ],
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("account cutoff scan");
+        cutoff.snapshots.clear();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut cutoff, &mut index);
+        assert!(
+            index.codex_state_only_snapshot_fingerprints.is_empty(),
+            "a cutoff-filtered state-only entity must not remain in the manifest index"
+        );
+
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn unreadable_codex_state_census_preserves_prior_durable_state_only_entities() {
+        let codex_dir = temp_dir("codex-state-census-failure");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(codex_dir.join("state_5.sqlite"), b"not a sqlite database")
+            .expect("write corrupt state fixture");
+
+        let session_id = "019e253c-8888-7000-9000-bbbbbbbbbbbb";
+        let fingerprint = "a".repeat(64);
+        let activity = Some("2026-05-14T10:03:00Z".to_string());
+        let mut index = ScanIndex {
+            upload_context_fingerprint: Some("prior-context".to_string()),
+            codex_state_only_snapshot_fingerprints: BTreeMap::from([(
+                session_id.to_string(),
+                fingerprint.clone(),
+            )]),
+            snapshot_activity_at: BTreeMap::from([(fingerprint.clone(), activity.clone())]),
+            ..ScanIndex::default()
+        };
+        index.activate_upload_context("next-context".to_string());
+
+        let mut scan = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[sessions_dir],
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .expect("state DB failure is source-local evidence, not a process failure");
+        assert!(!scan.state_census_complete);
+        assert!(!scan.census_complete);
+        assert!(scan.snapshots.is_empty());
+
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        assert_eq!(
+            index.codex_state_only_snapshot_fingerprints,
+            BTreeMap::from([(session_id.to_string(), fingerprint.clone())])
+        );
+        assert_eq!(
+            index.snapshot_activity_at.get(&fingerprint),
+            Some(&activity)
+        );
+        assert_eq!(
+            index.upload_context_fingerprint.as_deref(),
+            Some("prior-context"),
+            "an incomplete state census cannot advance the policy/cutoff epoch"
+        );
         let _ = fs::remove_dir_all(codex_dir);
     }
 
@@ -9074,6 +14524,80 @@ mod tests {
             .as_deref()
             != Some("total_only")));
 
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn codex_state_only_replaces_a_deleted_rollout_in_the_same_complete_census() {
+        let codex_dir = temp_dir("codex-state-deleted-rollout");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_id = "019e253c-bbbb-7000-9000-ffffffffffff";
+        let rollout = sessions_dir.join(format!("rollout-2026-05-14T10-00-00-{session_id}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\"}}}}\n{{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":50,\"output_tokens\":9}},\"model\":\"gpt-5.5\"}}}}}}\n"
+            ),
+        )
+        .expect("write rollout");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    session_id,
+                    "Deleted Rollout",
+                    59_i64,
+                    0_i64,
+                    1_777_777_000_i64,
+                    1_777_777_100_i64,
+                    1_777_777_000_000_i64,
+                    1_777_777_100_000_i64,
+                    "gpt-5.5",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-05-14T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan file-backed session");
+        assert!(first.census_complete);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.snapshots[0].unattributed_total_tokens, 0);
+
+        fs::remove_file(&rollout).expect("remove rollout while state row remains");
+        let replacement = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("reconcile deletion and state fallback together");
+
+        assert!(replacement.census_complete);
+        assert!(index.files.is_empty());
+        let state_only = replacement
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_session_id == session_id)
+            .expect("same complete generation emits the state-only replacement");
+        assert_eq!(state_only.unattributed_total_tokens, 59);
+        assert_eq!(
+            state_only.provenance.input_token_scope.as_deref(),
+            Some("total_only")
+        );
         let _ = fs::remove_dir_all(codex_dir);
     }
 
@@ -9208,7 +14732,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_scan_retries_zero_parsed_file_until_usage_arrives() {
+    fn scan_checkpoints_pi_zero_parsed_file_until_it_changes() {
         let root = temp_dir("pi-retry-zero-parsed");
         let path = root.join("session-019e2700-1111-7000-9000-111111111111.jsonl");
         fs::write(
@@ -9227,6 +14751,22 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 0);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+
+        let unchanged_empty = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unchanged empty scan");
+        assert_eq!(unchanged_empty.snapshots.len(), 0);
+        assert_eq!(unchanged_empty.scanned_file_count, 0);
+        assert_eq!(unchanged_empty.scanned_session_count, 0);
+        assert_eq!(unchanged_empty.zero_snapshot_usage_evidence_count, 0);
 
         fs::write(
             &path,
@@ -9260,6 +14800,434 @@ mod tests {
         )
         .expect("third scan");
         assert_eq!(third.snapshots.len(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scan_checkpoints_codex_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("codex-retry-zero-parsed");
+        let path =
+            root.join("rollout-2026-05-14T10-00-00-019e2700-3333-7000-9000-333333333333.jsonl");
+        let session_meta = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e2700-3333-7000-9000-333333333333\"}}\n";
+        fs::write(&path, session_meta).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_meta}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":40,\"output_tokens\":8},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zero_snapshot_usage_evidence_stays_visible_across_bounded_retries() {
+        let root = temp_dir("pi-zero-snapshot-usage-evidence");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"assistant_v2\",\"message\":{\"billing\":{\"usage\":{\"input\":12,\"output\":4}}}}\n",
+            ),
+        )
+        .expect("write schema-drift fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first schema-drift scan");
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 1);
+
+        let retry = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("bounded schema-drift retry");
+        assert_eq!(retry.scanned_file_count, 1);
+        assert_eq!(retry.scanned_session_count, 0);
+        assert_eq!(retry.zero_snapshot_usage_evidence_count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn usage_evidence_is_structural_and_ignores_metadata_limits_and_budgets() {
+        let positive = [
+            serde_json::json!({"token_count": {"info": {"total_token_usage": {"input_tokens": 12}}}}),
+            serde_json::json!({"message": {"usage": {"output_tokens": 4}}}),
+            serde_json::json!({"message": {"usage": {"input": 2, "cost": {"total": 0.01}}}}),
+            serde_json::json!({"unknown": {"nested": {"usage": {"future": {"request_count": 1}}}}}),
+            serde_json::json!({"provider_response": {"content": {"billing": {"usage": {"input_tokens": 7}}}}}),
+            serde_json::json!({"message": {"role": "assistant", "content": {"example": true}, "usage": {"output_tokens": 5}}}),
+        ];
+        for value in positive {
+            assert!(
+                json_has_positive_usage_evidence(&value),
+                "recognized consumption must stay visible"
+            );
+        }
+
+        let negative = [
+            serde_json::json!({"usage_version": 25}),
+            serde_json::json!({"usage_limit": 1000}),
+            serde_json::json!({"usage": {"version": 25, "limits": {"input_tokens": 1000}}}),
+            serde_json::json!({"usage": {"budget": {"usd": 500}, "timestamp": 1784707201000_i64}}),
+            serde_json::json!({"usage": {"future": {"opaque_positive": 99}}}),
+            serde_json::json!({"billing_usage": {"quota": {"requests": 100}}}),
+            serde_json::json!({"message": {"role": "user", "content": {"usage": {"input_tokens": 12}}}}),
+            serde_json::json!({"message": {"role": "user", "usage": {"input_tokens": 12}}}),
+            serde_json::json!({"message": {"role": "assistant", "content": {"usage": {"output_tokens": 4}}}}),
+            serde_json::json!({"type": "tool_result", "payload": {"usage": {"output_tokens": 4}}}),
+        ];
+        for value in negative {
+            assert!(
+                !json_has_positive_usage_evidence(&value),
+                "metadata and unknown numerics must not page"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_usage_shaped_content_does_not_hold_empty_transcript_red() {
+        let root = temp_dir("pi-authored-usage-content");
+        fs::write(
+            root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"example\"},{\"type\":\"tool_result\",\"content\":{\"usage\":{\"input_tokens\":12}}}]}}\n",
+            ),
+        )
+        .expect("write authored-content fixture");
+        let mut index = ScanIndex::default();
+
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan authored-content fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+        assert!(scan.census_complete);
+        assert_eq!(scan.zero_snapshot_confirmed_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_parser_quarantines_hostile_partial_timestamps_until_corrected() {
+        let root = temp_dir("pi-hostile-timestamps");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-max\",\"model\":\"gpt-5.4\",\"timestamp\":9223372036854775807,\"usage\":{\"input\":100,\"output\":10}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-min\",\"model\":\"gpt-5.4\",\"timestamp\":-9223372036854775808,\"usage\":{\"input\":200,\"output\":20}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-text\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"healthy\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write hostile timestamp fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 3);
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
+
+        let mixed_settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled mixed scan");
+        assert_eq!(mixed_settled.scanned_file_count, 0);
+        assert_eq!(mixed_settled.dropped_usage_record_count, 3);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"bad-only\",\"model\":\"gpt-5.4\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":300,\"output\":30}}}\n",
+            ),
+        )
+        .expect("rewrite with nonzero usage behind a malformed timestamp");
+        let regressed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan malformed-only usage");
+        assert!(regressed.snapshots.is_empty());
+        assert_eq!(regressed.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(regressed.dropped_usage_record_count, 1);
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0,
+            "the incomplete file never advances the durable manifest"
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled malformed-usage checkpoint");
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 1);
+        assert_eq!(settled.dropped_usage_record_count, 1);
+
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"message\":{\"responseId\":\"corrected\",\"model\":\"gpt-5.4\",\"timestamp\":\"1784707201000\",\"usage\":{\"input\":30,\"output\":3}}}\n",
+            ),
+        )
+        .expect("correct malformed timestamp");
+        let corrected = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:08:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("corrected scan");
+        assert_eq!(corrected.snapshots.len(), 1);
+        assert_eq!(corrected.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(corrected.dropped_usage_record_count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_invalid_provider_timestamp_does_not_fall_back_to_envelope_time() {
+        let root = temp_dir("pi-invalid-provider-valid-envelope");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T09:00:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"bad-provider-time\",\"timestamp\":\"not-a-time\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write invalid provider timestamp fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T09:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan invalid provider timestamp fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert!(!scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(index.files.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_and_claude_partial_timestamp_loss_stays_visible() {
+        let codex_root = temp_dir("codex-partial-timestamp-loss");
+        let codex_path = codex_root.join("rollout-019e253c-6666-7000-9000-aaaaaaaaaaaa.jsonl");
+        fs::write(
+            &codex_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e253c-6666-7000-9000-aaaaaaaaaaaa\"}}\n",
+                "{\"timestamp\":\"not-a-time\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":15,\"output_tokens\":3},\"model\":\"gpt-5.5\"}}}\n",
+            ),
+        )
+        .expect("write Codex partial-loss fixture");
+        let mut codex_index = ScanIndex::default();
+        let codex = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&codex_root),
+            &mut codex_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Codex partial-loss fixture");
+        assert!(codex.snapshots.is_empty());
+        assert!(!codex.census_complete);
+        assert_eq!(codex.dropped_usage_record_count, 1);
+
+        let claude_root = temp_dir("claude-partial-timestamp-loss");
+        let claude_path = claude_root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        fs::write(
+            &claude_path,
+            concat!(
+                "{\"timestamp\":\"2026-07-22T08:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n",
+                "{\"timestamp\":\"not-a-time\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"bad\",\"message\":{\"id\":\"bad\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-07-22T08:01:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"requestId\":\"good\",\"message\":{\"id\":\"good\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n",
+            ),
+        )
+        .expect("write Claude partial-loss fixture");
+        let mut claude_index = ScanIndex::default();
+        let claude = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&claude_root),
+            &mut claude_index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan Claude partial-loss fixture");
+        assert!(claude.snapshots.is_empty());
+        assert!(!claude.census_complete);
+        assert_eq!(claude.dropped_usage_record_count, 1);
+
+        let _ = fs::remove_dir_all(codex_root);
+        let _ = fs::remove_dir_all(claude_root);
+    }
+
+    #[test]
+    fn scan_checkpoints_claude_zero_parsed_file_until_it_changes() {
+        let root = temp_dir("claude-retry-zero-parsed");
+        let path = root.join("019e2700-4444-7000-9000-444444444444.jsonl");
+        let session_header = "{\"timestamp\":\"2026-05-14T10:00:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"system\"}\n";
+        fs::write(&path, session_header).expect("write empty usage fixture");
+
+        let mut index = ScanIndex::default();
+        let first_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first empty scan");
+        assert_eq!(first_empty.snapshots.len(), 0);
+        assert_eq!(first_empty.scanned_file_count, 1);
+        assert_eq!(first_empty.scanned_session_count, 0);
+
+        let settled_empty = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled empty scan");
+        assert_eq!(settled_empty.snapshots.len(), 0);
+        assert_eq!(settled_empty.scanned_file_count, 0);
+        assert_eq!(settled_empty.scanned_session_count, 0);
+
+        fs::write(
+            &path,
+            format!(
+                "{session_header}{}",
+                "{\"timestamp\":\"2026-05-14T10:03:00Z\",\"sessionId\":\"019e2700-4444-7000-9000-444444444444\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write usage fixture");
+
+        let populated = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("populated scan");
+        assert_eq!(populated.snapshots.len(), 1);
+        assert_eq!(populated.scanned_session_count, 1);
+
+        let settled = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-05-14T10:07:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.snapshots.len(), 0);
+        assert_eq!(settled.scanned_file_count, 0);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9324,16 +15292,11 @@ mod tests {
             .expect("index entry");
         assert!(entry.last_snapshot_fingerprint.is_some());
         assert_ne!(entry.source_file_fingerprint, v6_key);
-        assert_eq!(
-            entry.source_file_fingerprint,
-            scan_file_fingerprint_with_context(
-                &path,
-                size_bytes,
-                entry.modified_unix_nanos.expect("nanosecond mtime"),
-                PI_SCAN_IDENTITY_VERSION,
-                "",
-            )
-        );
+        assert_eq!(entry.source_file_fingerprint.len(), 64);
+        assert!(entry
+            .source_file_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(
             entry.scan_identity_version.as_deref(),
             Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
@@ -12239,9 +18202,17 @@ mod tests {
         )
         .expect("write agent transcript");
 
-        let mut files = Vec::new();
-        collect_recent_jsonl_files(SnapshotSource::ClaudeCode, &root, &mut files, u64::MAX)
-            .expect("collect");
+        let mut selection = BoundedCandidateSelection::new(None, None, 10);
+        let mut census = ScanCensus::default();
+        collect_recent_jsonl_files(
+            SnapshotSource::ClaudeCode,
+            &root,
+            &root,
+            &mut selection,
+            &mut census,
+            u64::MAX,
+        );
+        let (files, _, _, _) = selection.finish(census.discovered_file_count);
         assert!(
             files.iter().all(|candidate| candidate
                 .path
@@ -12251,6 +18222,28 @@ mod tests {
             "workflow journals must not become scan candidates"
         );
         assert_eq!(files.len(), 1, "only the agent transcript is a candidate");
+
+        let journal = first.join("journal.jsonl");
+        let mut hinted_index = ScanIndex::default();
+        let hinted = scan_source_roots_with_limit_and_attribution(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut hinted_index,
+            "2026-07-24T12:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+            None,
+            None,
+            std::slice::from_ref(&journal),
+            false,
+        )
+        .expect("scan with workflow journal hint");
+        assert!(hinted_index
+            .files
+            .keys()
+            .all(|path| !path.ends_with("journal.jsonl")));
+        assert_eq!(hinted.scanned_file_count, 1);
 
         // Even through the public parse entry point the journal yields nothing,
         // so `<parent>_journal` can never exist.
@@ -13892,7 +19885,7 @@ mod tests {
         .expect("write transcript");
 
         let mut index = ScanIndex::default();
-        let first = scan_source_roots_with_attribution_and_claude_effort(
+        let mut first = scan_source_roots_with_attribution_and_claude_effort(
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&projects_root),
             &mut index,
@@ -13904,6 +19897,7 @@ mod tests {
         )
         .expect("first scan");
         assert_eq!(first.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut first, &mut index);
 
         let body = format!(
             "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785492120000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{session_id}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"35\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"8\"}}}}]}}]}}]}}]}}"
@@ -13939,6 +19933,7 @@ mod tests {
         )
         .expect("load account evidence");
         apply_claude_effort_evidence(&mut second.snapshots, &evidence);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut second, &mut index);
         let expected_hash = ottto_core::billing_identity_hash(
             "anthropic",
             "account",
@@ -14206,6 +20201,259 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_desktop_store_pages_past_five_thousand_and_resumes_correction() {
+        let session_id = "late-prefix-session";
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-paged-title",
+            session_id,
+            "{}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"late-prefix-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":35,\"output_tokens\":8}}}\n",
+        );
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace");
+        fs::remove_file(store_dir.join("local_desktop-1.json")).expect("remove base sidecar");
+        for value in 0..MAX_CLAUDE_DESKTOP_SESSION_FILES {
+            fs::write(store_dir.join(format!("{value:05}.json")), b"{}")
+                .expect("write bounded filler sidecar");
+        }
+        fs::write(
+            store_dir.join("zzzzz-late.json"),
+            format!(
+                "{{\"cliSessionId\":\"{session_id}\",\"title\":\"Recovered late desktop title\",\"titleSource\":\"user\"}}"
+            ),
+        )
+        .expect("write late-prefix title");
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first bounded sidecar page");
+        assert!(!first.sidecar_census_complete);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_ne!(
+            first.snapshots[0].session_display_name.as_deref(),
+            Some("Recovered late desktop title")
+        );
+
+        let checkpoint = home.join("scanner-index.json");
+        index
+            .save(&checkpoint)
+            .expect("persist sidecar page cursor");
+        let mut resumed = ScanIndex::load(&checkpoint).expect("resume sidecar page cursor");
+        let second = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut resumed,
+            "2026-07-10T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second bounded sidecar page");
+        assert!(second.sidecar_census_complete);
+        assert_eq!(second.snapshots.len(), 1);
+        assert_eq!(
+            second.snapshots[0].session_display_name.as_deref(),
+            Some("Recovered late desktop title")
+        );
+
+        let third = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut resumed,
+            "2026-07-10T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("unchanged correction is a semantic no-op");
+        assert!(third.snapshots.is_empty());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn malformed_claude_title_file_preserves_prior_title_and_marks_census_incomplete() {
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-malformed-retain",
+            "retain-session",
+            "{\"cliSessionId\":\"retain-session\",\"title\":\"Known durable title\",\"titleSource\":\"user\"}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"retain-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+        );
+        let store_file = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace")
+            .join("local_desktop-1.json");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("seed durable title");
+        assert_eq!(
+            first.snapshots[0].session_display_name.as_deref(),
+            Some("Known durable title")
+        );
+
+        fs::write(&store_file, b"{not valid json}").expect("corrupt title sidecar");
+        let second = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("malformed title is isolated");
+        assert!(!second.sidecar_census_complete);
+        assert!(!second.census_complete);
+        assert!(
+            second.snapshots.is_empty(),
+            "the retained title keeps the transcript a semantic no-op"
+        );
+        assert_eq!(
+            index
+                .claude_desktop_title_files
+                .values()
+                .next()
+                .and_then(|entry| entry.title.as_deref()),
+            Some("Known durable title")
+        );
+
+        fs::write(
+            &store_file,
+            "{\"cliSessionId\":\"retain-session\",\"title\":\"Recovered durable title\",\"titleSource\":\"user\"}",
+        )
+        .expect("repair title sidecar");
+        let backed_off = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:05:30Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("sidecar retry remains bounded");
+        assert!(!backed_off.sidecar_census_complete);
+        assert!(backed_off.snapshots.is_empty());
+
+        let recovered = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:06:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("sidecar retry recovers on deadline");
+        assert!(recovered.sidecar_census_complete);
+        assert!(recovered.census_complete);
+        assert_eq!(recovered.snapshots.len(), 1);
+        assert_eq!(
+            recovered.snapshots[0].session_display_name.as_deref(),
+            Some("Recovered durable title")
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn one_sided_claude_title_shapes_preserve_account_only_mapping() {
+        let (home, _transcript_path, projects_root) = claude_desktop_fixture(
+            "claude-desktop-one-sided",
+            "no-title-session",
+            "{\"cliSessionId\":\"no-title-session\",\"sessionId\":\"desktop-session\"}",
+            "{\"timestamp\":\"2026-07-10T10:01:00Z\",\"sessionId\":\"no-title-session\",\"message\":{\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n",
+        );
+        let store_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude-code-sessions")
+            .join("account-ctx")
+            .join("workspace");
+        fs::write(
+            store_dir.join("desktop-only.json"),
+            "{\"sessionId\":\"desktop-only\",\"title\":\"Desktop only title\"}",
+        )
+        .expect("write desktop-only title");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&projects_root),
+            &mut index,
+            "2026-07-10T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan one-sided optional title shapes");
+        assert!(scan.sidecar_census_complete);
+        assert!(scan.census_complete);
+        assert_eq!(index.claude_desktop_title_files.len(), 1);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert!(scan.snapshots[0].session_display_name.is_none());
+        let expected_hash =
+            ottto_core::billing_identity_hash("anthropic", "account", "account-ctx")
+                .expect("account hash");
+        assert!(scan.snapshots[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(expected_hash.as_str())));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_title_store_entry_budget_fails_red_without_unbounded_walk() {
+        let root = temp_dir("claude-title-entry-budget");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("session-{index}.json")),
+                format!("{{\"cliSessionId\":\"session-{index}\",\"title\":\"Title {index}\"}}"),
+            )
+            .expect("write title budget fixture");
+        }
+        let mut selection = BoundedPathSelection::new(None, None, 10);
+        let mut census = ClaudeDesktopStoreCensus::default();
+        let mut remaining_entries = 3;
+        collect_claude_desktop_session_files(
+            &root,
+            0,
+            &mut remaining_entries,
+            &mut selection,
+            &mut census,
+        );
+        assert_eq!(remaining_entries, 0);
+        assert_eq!(census.entry_budget_exceeded_count, 1);
+        assert_eq!(census.discovered_file_count, 3);
+        assert!(census.has_errors());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_claude_store_directory_marks_sidecar_census_incomplete() {
+        let root = temp_dir("claude-desktop-unreadable-directory");
+        let not_a_directory = root.join("store-file");
+        fs::write(&not_a_directory, b"not a directory").expect("write directory impostor");
+        let mut index = ScanIndex::default();
+        let metadata = ClaudeTitleMetadata::load_from_store_dirs_with_index(
+            &BTreeSet::from([not_a_directory]),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+        );
+        assert!(metadata.sidecar_census_incomplete);
+        assert!(metadata.titles.is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -14631,7 +20879,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_parser_sums_message_end_usage_and_extracts_session_meta() {
+    fn pi_parser_sums_legacy_message_end_usage_and_extracts_session_meta() {
         let path = temp_file("pi-basic");
         fs::write(
             &path,
@@ -14713,6 +20961,538 @@ mod tests {
     }
 
     #[test]
+    fn pi_usage_overflow_is_counted_and_keeps_the_file_retryable() {
+        let root = temp_dir("pi-extreme-usage");
+        let path = root.join("session.jsonl");
+        let first = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "model": "gpt-5.4",
+                "timestamp": 1784707201000_u64,
+                "usage": {"input": u64::MAX, "output": 1, "cacheRead": u64::MAX}
+            }
+        });
+        let second = serde_json::json!({
+            "type": "message_end",
+            "message": {
+                "model": "gpt-5.4",
+                "timestamp": 1784707202000_u64,
+                "usage": {"input": 1, "output": u64::MAX, "cacheRead": 1}
+            }
+        });
+        fs::write(&path, format!("{first}\n{second}\n")).expect("write extreme usage fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-03T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("overflow remains a bounded scanner outcome");
+        assert!(
+            scan.snapshots.is_empty(),
+            "an exact prefix from a lossy file cannot reach upload"
+        );
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(!scan.census_complete);
+        assert!(!index.files.contains_key(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_legacy_message_end_prefers_provider_timestamp_over_envelope_time() {
+        let path = temp_file("pi-legacy-timestamp-precedence");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"session_id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
+                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write legacy timestamp precedence fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
+        assert_eq!(
+            item.usage_buckets[0].last_activity_at.as_deref(),
+            Some("2026-07-22T10:59:59Z")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_reads_current_nested_message_shape() {
+        let path = temp_file("pi-current-message");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
+        )
+        .expect("write current Pi fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(
+            item.source_session_id,
+            "fixture-session-019e2700-1111-7000-9000-111111111111"
+        );
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.model_usage.len(), 1);
+        assert_eq!(item.model_usage[0].model, "gpt-5.4");
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("Summarize the fixture change")
+        );
+        assert_eq!(
+            item.session_display_name_source.as_deref(),
+            Some("first_prompt")
+        );
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-07-22T08:00:00Z")
+        );
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-07-22T08:00:01.000Z")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_dedupes_transitional_message_and_message_end_records() {
+        let path = temp_file("pi-current-legacy-dedup");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write transitional fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 4);
+        assert_eq!(item.request_count, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_transitional_pair_uses_provider_time_across_hour_boundary() {
+        let path = temp_file("pi-provider-time-dedup");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T10:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T11:00:01Z\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":\"2026-07-22T10:59:59Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":\"2026-07-22T11:00:02Z\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":\"2026-07-22T10:59:59.000Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write provider-time fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T11:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-07-22T10:00:00Z");
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-07-22T10:59:59Z")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_reused_response_id_reconciles_every_cross_shape_occurrence() {
+        let root = temp_dir("pi-reused-response-id-pairs");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"usage\":{\"input\":20,\"output\":5}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:01.000Z\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"reused-response\",\"timestamp\":\"2026-07-22T08:00:02.000Z\",\"usage\":{\"input\":20,\"output\":5}}}\n",
+            ),
+        )
+        .expect("write reused response-id fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan reused response-id fixture");
+
+        assert!(scan.census_complete);
+        assert_eq!(scan.dropped_usage_record_count, 0);
+        assert_eq!(scan.snapshots.len(), 1);
+        assert_eq!(scan.snapshots[0].input_tokens, 32);
+        assert_eq!(scan.snapshots[0].output_tokens, 9);
+        assert_eq!(scan.snapshots[0].request_count, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_divergent_cross_shape_response_id_quarantines_the_file() {
+        let root = temp_dir("pi-divergent-response-id");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":99,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write divergent response-id fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan divergent response-id fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(!scan.census_complete);
+        assert!(index.files.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_unmatched_divergence_after_exact_pair_quarantines_the_file() {
+        let root = temp_dir("pi-divergent-response-id-after-pair");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707202000,\"usage\":{\"input\":99,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write partially paired divergent response-id fixture");
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan partially paired divergent response-id fixture");
+
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.dropped_usage_record_count, 1);
+        assert!(!scan.census_complete);
+        assert!(index.files.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_repeated_identical_occurrence_survives_one_compatibility_pair() {
+        let path = temp_file("pi-repeated-identical-with-pair");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated identical occurrence fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_does_not_dedupe_repeated_same_shape_response_ids() {
+        let path = temp_file("pi-same-shape-response-id");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"responseId\":\"response-1\",\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated same-shape fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:03:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_parser_keeps_identical_usage_without_response_ids_distinct() {
+        let path = temp_file("pi-no-id-distinct");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{\"input\":12,\"output\":4}}}\n",
+            ),
+        )
+        .expect("write repeated id-less fixture");
+
+        let item = parse_pi_jsonl_file(&path, "2026-07-22T08:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.input_tokens, 24);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
+        assert!(timestamp_is_before(
+            "2026-07-22T08:00:00Z",
+            "2026-07-22T08:00:00.500Z"
+        ));
+        assert!(timestamp_is_after(
+            "2026-07-22T08:00:00.500Z",
+            "2026-07-22T08:00:00Z"
+        ));
+        assert!(timestamp_is_before("invalid-a", "invalid-b"));
+        assert!(timestamp_is_after("invalid-b", "invalid-a"));
+        assert!(!timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
+        assert!(!timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
+        assert!(timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
+        assert!(timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
+    }
+
+    #[test]
+    fn pi_current_shape_scan_populates_manifest_and_settles_idempotently() {
+        let root = temp_dir("pi-current-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            include_str!("../../../fixtures/snapshot-audit/pi-session-current.jsonl"),
+        )
+        .expect("write current Pi fixture");
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        let first_manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first.discovered_file_count, 1);
+        assert_eq!(first.scanned_file_count, 1);
+        assert_eq!(first.scanned_session_count, 1);
+        assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first_manifest.entity_count, 1);
+
+        let second = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(second.discovered_file_count, 1);
+        assert_eq!(second.scanned_file_count, 0);
+        assert_eq!(second.scanned_session_count, 0);
+        assert!(second.snapshots.is_empty());
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            first_manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_scan_settles_the_observed_populated_and_genuine_empty_mix() {
+        const POPULATED: usize = 426;
+        const EMPTY: usize = 30;
+        let root = temp_dir("pi-observed-populated-empty-mix");
+        for index in 0..POPULATED + EMPTY {
+            let session_id = format!("fixture-session-{index:04}");
+            let content = if index < POPULATED {
+                format!(
+                    concat!(
+                        "{{\"type\":\"session\",\"id\":\"{session_id}\",",
+                        "\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n",
+                        "{{\"type\":\"message\",\"timestamp\":\"2026-07-22T08:00:01Z\",",
+                        "\"message\":{{\"role\":\"assistant\",\"provider\":\"openai\",",
+                        "\"model\":\"gpt-5.4\",\"usage\":{{\"input\":12,\"output\":4}}}}}}\n"
+                    ),
+                    session_id = session_id,
+                )
+            } else {
+                format!(
+                    "{{\"type\":\"session\",\"id\":\"{session_id}\",\"timestamp\":\"2026-07-22T08:00:00Z\"}}\n"
+                )
+            };
+            fs::write(root.join(format!("session-{index:04}.jsonl")), content)
+                .expect("write observed-shape fixture");
+        }
+        let mut index = ScanIndex::default();
+
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("first scan");
+        assert_eq!(first.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_file_count, POPULATED + EMPTY);
+        assert_eq!(first.scanned_session_count, POPULATED);
+        assert_eq!(first.snapshots.len(), POPULATED);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(index.confirmed_empty_files.len(), EMPTY);
+        let manifest = index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS);
+        assert_eq!(manifest.entity_count, POPULATED as u64);
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled scan");
+        assert_eq!(settled.discovered_file_count, POPULATED + EMPTY);
+        assert_eq!(settled.scanned_file_count, 0);
+        assert_eq!(settled.scanned_session_count, 0);
+        assert!(settled.snapshots.is_empty());
+        assert_eq!(settled.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(
+            index.manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS),
+            manifest
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parser_identity_change_that_yields_zero_clears_the_manifest_contribution() {
+        let root = temp_dir("pi-parser-regression-clears-manifest");
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"id\":\"fixture-session\",\"timestamp\":\"2026-07-22T08:00:00Z\"}\n",
+        )
+        .expect("write genuine empty transcript");
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:02:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("establish empty checkpoint");
+        assert_eq!(first.scanned_file_count, 1);
+        let key = path.to_string_lossy().to_string();
+        index.confirmed_empty_files.remove(&key);
+        let entry = index.files.get_mut(&key).expect("index entry");
+        entry.last_snapshot_fingerprint = Some("previous-server-snapshot".to_string());
+        entry.source_file_fingerprint = "previous-parser-identity".to_string();
+
+        let reparsed = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:03:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("reparse after identity change");
+        assert_eq!(reparsed.scanned_file_count, 1);
+        assert_eq!(reparsed.scanned_session_count, 0);
+        let entry = &index.files[&key];
+        assert!(entry.last_snapshot_fingerprint.is_none());
+        assert!(index.confirmed_empty_files.contains(&key));
+        assert_eq!(
+            index
+                .manifest(SnapshotSource::Pi, BACKFILL_WINDOW_DAYS)
+                .entity_count,
+            0
+        );
+
+        let settled = scan_source_roots(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-22T08:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("settled regression scan");
+        assert_eq!(settled.scanned_file_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn pi_parser_handles_multi_model_sessions() {
         let path = temp_file("pi-multimodel");
         fs::write(
@@ -14763,19 +21543,24 @@ mod tests {
     }
 
     #[test]
-    fn pi_ms_timestamp_formats_rfc3339_with_millis() {
+    fn pi_ms_timestamp_formats_bounded_rfc3339() {
         // Anchor on epoch 0 and a verifiable mid-2024 date.
-        assert_eq!(format_rfc3339_millis(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            bounded_rfc3339_millis(0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
         // 2024-01-01T00:00:00.000Z = 1_704_067_200 s = 1_704_067_200_000 ms
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_000),
-            "2024-01-01T00:00:00.000Z"
+            bounded_rfc3339_millis(1_704_067_200_000).as_deref(),
+            Some("2024-01-01T00:00:00.000Z")
         );
         // Sub-second granularity is preserved.
         assert_eq!(
-            format_rfc3339_millis(1_704_067_200_123),
-            "2024-01-01T00:00:00.123Z"
+            bounded_rfc3339_millis(1_704_067_200_123).as_deref(),
+            Some("2024-01-01T00:00:00.123Z")
         );
+        assert_eq!(bounded_rfc3339_millis(i64::MIN), None);
+        assert_eq!(bounded_rfc3339_millis(i64::MAX), None);
     }
 
     #[test]
@@ -15156,8 +21941,8 @@ mod tests {
             concat!(
                 "{\"type\":\"session\",\"timestamp\":\"2026-05-20T09:00:00Z\",\"sessionId\":\"pi-multi\",\"cwd\":\"/work\"}\n",
                 "{\"type\":\"message_end\",\"timestamp\":1747731600000,\"gatewayProvider\":\"anthropic\",\"modelProvider\":\"anthropic\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input\":12,\"output\":4}}}\n",
-                "{\"type\":\"message_end\",\"timestamp\":1747731660000,\"gatewayProvider\":\"openai\",\"modelProvider\":\"openai\",\"message\":{\"model\":\"gpt-5.5\",\"usage\":{\"input\":8,\"output\":6}}}\n",
-                "{\"type\":\"message_end\",\"timestamp\":1747731720000,\"gatewayProvider\":\"google\",\"modelProvider\":\"google\",\"message\":{\"model\":\"gemini-2.5\",\"usage\":{\"input\":3,\"output\":7}}}\n"
+                "{\"type\":\"message_end\",\"timestamp\":1747735200000,\"gatewayProvider\":\"openai\",\"modelProvider\":\"openai\",\"message\":{\"model\":\"gpt-5.5\",\"usage\":{\"input\":8,\"output\":6}}}\n",
+                "{\"type\":\"message_end\",\"timestamp\":1747738800000,\"gatewayProvider\":\"google\",\"modelProvider\":\"google\",\"message\":{\"model\":\"gemini-2.5\",\"usage\":{\"input\":3,\"output\":7}}}\n"
             ),
         )
         .expect("write fixture");
@@ -15189,6 +21974,17 @@ mod tests {
         for row in &item.model_usage {
             assert!(row.subscription_product.is_none());
         }
+        assert_eq!(
+            item.usage_buckets
+                .iter()
+                .map(|bucket| bucket.bucket_start.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2025-05-20T09:00:00Z",
+                "2025-05-20T10:00:00Z",
+                "2025-05-20T11:00:00Z",
+            ]
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -15271,6 +22067,93 @@ mod tests {
             "post-rollover gets only the delta"
         );
         assert_eq!(post.model_usage[0].output_tokens, 15);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_cumulative_restart_replaces_exact_totals_with_replacement_buckets() {
+        let path = temp_file("codex-cumulative-restart");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T23:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-restart-session\"}}\n",
+                "{\"timestamp\":\"2026-05-31T23:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":40,\"request_count\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-06-01T00:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":8,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_codex_jsonl_file(
+            &path,
+            "2026-06-01T00:35:00Z",
+            "restart-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.input_tokens, 20);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-06-01T00:00:00Z");
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: SnapshotSource::Codex.api_slug().to_string(),
+            machine_id: "otm_test".to_string(),
+            collector_version: Some(collector_version()),
+            snapshots: items,
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        validate_snapshot_batch_request(&request)
+            .expect("replacement cumulative and buckets remain preflight-consistent");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_fractional_timestamps_keep_chronological_lifecycle_and_bucket_extrema() {
+        let path = temp_file("codex-fractional-timestamp-order");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-fractional-session\"}}\n",
+                "{\"timestamp\":\"2026-05-31T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-05-31T10:00:00.900Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":8,\"request_count\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-31T10:01:00Z",
+            "fractional-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-05-31T10:00:00Z")
+        );
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-05-31T10:00:00.900Z")
+        );
+        let bucket = &item.usage_buckets[0];
+        let first = OffsetDateTime::parse(
+            bucket.first_activity_at.as_deref().expect("first activity"),
+            &Rfc3339,
+        )
+        .expect("parse first activity");
+        let last = OffsetDateTime::parse(
+            bucket.last_activity_at.as_deref().expect("last activity"),
+            &Rfc3339,
+        )
+        .expect("parse last activity");
+        assert!(first < last);
 
         let _ = fs::remove_file(path);
     }
@@ -15679,6 +22562,20 @@ mod tests {
     }
 
     #[test]
+    fn v6_snapshot_preflight_rejects_wire_counter_overflow() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = u64::MAX;
+        let mut second_bucket = request.snapshots[0].usage_buckets[0].clone();
+        second_bucket.bucket_start = "2026-07-20T13:00:00Z".to_string();
+        second_bucket.model_usage[0].input_tokens = 1;
+        request.snapshots[0].usage_buckets.push(second_bucket);
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("counters overflow wire bounds"), "{error}");
+    }
+
+    #[test]
     fn v6_snapshot_preflight_rejects_top_level_row_mismatch() {
         let mut request = valid_v6_batch_request();
         request.snapshots[0].model_usage[0].gateway_provider = Some("anthropic".to_string());
@@ -15787,6 +22684,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preflight_enforces_item_and_batch_wire_byte_caps() {
+        let source = SnapshotSource::ClaudeCode;
+        let mut oversized_item = valid_v6_batch_request();
+        oversized_item.snapshots[0].session_display_name =
+            Some("x".repeat(MAX_SNAPSHOT_ITEM_WIRE_BYTES));
+        oversized_item.snapshots[0].snapshot_fingerprint =
+            snapshot_fingerprint(source, &oversized_item.snapshots[0]);
+        let item_error = validate_snapshot_batch_request(&oversized_item)
+            .expect_err("oversized item fails before network I/O");
+        assert!(item_error.contains("wire body"), "{item_error}");
+
+        let mut batch = valid_v6_batch_request();
+        let mut items = Vec::new();
+        for index in 0..40 {
+            let mut item = batch.snapshots[0].clone();
+            item.source_session_id = format!("large-session-{index}");
+            item.session_display_name = Some("y".repeat(110 * 1024));
+            item.snapshot_fingerprint = snapshot_fingerprint(source, &item);
+            items.push(item);
+        }
+        batch.snapshots = items;
+        let batch_error = validate_snapshot_batch_request(&batch)
+            .expect_err("oversized batch fails before network I/O");
+        assert!(batch_error.contains("batch wire body"), "{batch_error}");
+    }
+
+    #[test]
     fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
         let mut base = valid_v6_batch_request()
             .snapshots
@@ -15833,6 +22757,8 @@ mod tests {
                 );
                 let canonical_bytes = crate::canonical_json::canonicalize(&content_body)
                     .expect("canonicalize content identity body");
+                let revision_v2_body =
+                    snapshot_revision_v2_body(source, &item, policy, &envelope.component_hashes);
                 cases.push(json!({
                     "source": source.api_slug(),
                     "source_session_id": item.source_session_id,
@@ -15845,6 +22771,8 @@ mod tests {
                         policy_neutral_component_hashes(&envelope.component_hashes),
                     "snapshot_fingerprint": item.snapshot_fingerprint,
                     "revision_hash": envelope.revision_hash,
+                    "revision_v2_body": revision_v2_body,
+                    "revision_v2_hash": envelope.revision_v2_hash,
                     "content_hash": envelope.content_hash,
                     "hash_epoch": envelope.hash_epoch,
                     "content_canonical_bytes": canonical_bytes.len(),
@@ -15853,9 +22781,10 @@ mod tests {
             }
         }
         let actual = json!({
-            "schema_version": "semantic_envelope_golden:v2",
+            "schema_version": "semantic_envelope_golden:v3",
             "component_contract_version": SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
             "revision_contract_version": SNAPSHOT_REVISION_CONTRACT_VERSION,
+            "revision_v2_contract_version": SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
             "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
             "content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
             "policy_neutral_components": POLICY_NEUTRAL_COMPONENTS,
@@ -16022,6 +22951,87 @@ mod tests {
     }
 
     #[test]
+    fn revision_v2_ignores_retry_clock_and_unrelated_inventory_but_binds_entity_witness() {
+        let source = SnapshotSource::Codex;
+        let policy = SnapshotUploadPolicy::default();
+        let mut base = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        let hashes = snapshot_semantic_component_hashes(source, &base);
+        let expected = snapshot_revision_v2_hash(source, &base, policy, &hashes);
+
+        base.collected_at = "2030-01-01T00:00:00Z".to_string();
+        base.provenance.source_file_count = 9_999;
+        assert_eq!(
+            snapshot_revision_v2_hash(source, &base, policy, &hashes),
+            expected,
+            "retry wall clock and unrelated transcript inventory are not revision evidence"
+        );
+
+        base.source_file_fingerprint = Some("changed-opened-object-witness".to_string());
+        assert_ne!(
+            snapshot_revision_v2_hash(source, &base, policy, &hashes),
+            expected,
+            "the exact opened/source-file witness is revision evidence"
+        );
+    }
+
+    #[test]
+    fn revision_v2_projection_is_explicit_non_recursive_and_version_sensitive() {
+        let source = SnapshotSource::Codex;
+        let policy = SnapshotUploadPolicy::default();
+        let item = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        let hashes = snapshot_semantic_component_hashes(source, &item);
+        let body = snapshot_revision_v2_body(source, &item, policy, &hashes);
+        let object = body.as_object().expect("revision body object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "canonicalization",
+                "component_hashes",
+                "contract",
+                "lifecycle",
+                "parser_version",
+                "provenance",
+                "scan_identity_version",
+                "source",
+                "source_file_fingerprint",
+                "source_session_id",
+                "upload_policy",
+            ])
+        );
+        let encoded = serde_json::to_string(&body).expect("revision body JSON");
+        for forbidden in [
+            "semantic_envelope",
+            "revision_hash",
+            "content_hash",
+            "snapshot_fingerprint",
+            "collected_at",
+            "source_file_count",
+            "challenge",
+        ] {
+            assert!(!encoded.contains(forbidden), "forbidden field {forbidden}");
+        }
+
+        let mut changed_parser = body;
+        changed_parser["parser_version"] = json!("codex_jsonl:future");
+        let canonical = crate::canonical_json::canonicalize(&changed_parser)
+            .expect("changed parser body canonicalizes");
+        let mut digest = Sha256::new();
+        digest.update(canonical);
+        assert_ne!(
+            format!("{:x}", digest.finalize()),
+            snapshot_revision_v2_hash(source, &item, policy, &hashes)
+        );
+    }
+
+    #[test]
     fn content_hash_moves_with_every_policy_neutral_component() {
         let source = SnapshotSource::ClaudeCode;
         let base = valid_v6_batch_request()
@@ -16090,6 +23100,22 @@ mod tests {
             "pending.jsonl".to_string(),
             manifest_index_entry(Some("old")),
         );
+        committed.files.insert(
+            "became-empty.jsonl".to_string(),
+            manifest_index_entry(Some("old-empty-entity")),
+        );
+        committed.file_snapshot_fingerprints.insert(
+            "became-empty.jsonl".to_string(),
+            BTreeSet::from(["old-empty-entity".to_string()]),
+        );
+        committed.codex_state_only_snapshot_fingerprints.insert(
+            "removed-state-only".to_string(),
+            "old-state-entity".to_string(),
+        );
+        committed.quarantined_snapshot_fingerprints.insert(
+            "old-state-entity".to_string(),
+            snapshot_quarantine_record(SnapshotSource::Codex),
+        );
 
         let mut scanned = committed.clone();
         // A semantic no-op: same fingerprint as the committed entry, so the
@@ -16116,9 +23142,26 @@ mod tests {
         scanned
             .files
             .insert("empty.jsonl".to_string(), manifest_index_entry(None));
+        scanned
+            .confirmed_empty_files
+            .insert("empty.jsonl".to_string());
+        // This file and state-only row previously had server entities. Their
+        // absence cannot become authoritative during a shed/partial commit.
+        scanned
+            .files
+            .insert("became-empty.jsonl".to_string(), manifest_index_entry(None));
+        scanned
+            .confirmed_empty_files
+            .insert("became-empty.jsonl".to_string());
+        scanned
+            .file_snapshot_fingerprints
+            .remove("became-empty.jsonl");
+        scanned
+            .codex_state_only_snapshot_fingerprints
+            .remove("removed-state-only");
 
         let accepted = BTreeSet::from(["bb".to_string()]);
-        let committable = scanned.committable_subset(&committed, &accepted);
+        let committable = scanned.committable_subset(&committed, &accepted, &BTreeMap::new());
 
         assert_eq!(
             committable.files["unchanged.jsonl"].size_bytes, 42,
@@ -16126,6 +23169,25 @@ mod tests {
         );
         assert!(committable.files.contains_key("accepted.jsonl"));
         assert!(committable.files.contains_key("empty.jsonl"));
+        assert_eq!(
+            committable.files["became-empty.jsonl"]
+                .last_snapshot_fingerprint
+                .as_deref(),
+            Some("old-empty-entity")
+        );
+        assert!(!committable
+            .confirmed_empty_files
+            .contains("became-empty.jsonl"));
+        assert_eq!(
+            committable
+                .codex_state_only_snapshot_fingerprints
+                .get("removed-state-only")
+                .map(String::as_str),
+            Some("old-state-entity")
+        );
+        assert!(committable
+            .quarantined_snapshot_fingerprints
+            .contains_key("old-state-entity"));
         assert_eq!(
             committable.files["pending.jsonl"]
                 .last_snapshot_fingerprint
@@ -16140,8 +23202,65 @@ mod tests {
         fresh
             .files
             .insert("new.jsonl".to_string(), manifest_index_entry(Some("dd")));
-        let committable = fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new());
+        let committable =
+            fresh.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
         assert!(committable.files.is_empty());
+    }
+
+    #[test]
+    fn partial_commit_preserves_old_upload_context_and_forces_full_policy_reparse() {
+        let mut previous = ScanIndex {
+            upload_context_fingerprint: Some("context-a".to_string()),
+            ..ScanIndex::default()
+        };
+        previous.files.insert(
+            "/opaque/accepted.jsonl".to_string(),
+            manifest_index_entry(Some("old-accepted")),
+        );
+        previous.files.insert(
+            "/opaque/pending.jsonl".to_string(),
+            manifest_index_entry(Some("old-pending")),
+        );
+
+        let mut scanned = previous.clone();
+        scanned.upload_context_fingerprint = Some("context-b".to_string());
+        scanned.activate_upload_context("context-b".to_string());
+        scanned.files.insert(
+            "/opaque/accepted.jsonl".to_string(),
+            manifest_index_entry(Some("new-accepted")),
+        );
+        scanned.files.insert(
+            "/opaque/pending.jsonl".to_string(),
+            manifest_index_entry(Some("new-pending")),
+        );
+        let mut committable = scanned.committable_subset(
+            &previous,
+            &BTreeSet::from(["new-accepted".to_string()]),
+            &BTreeMap::new(),
+        );
+        committable.mark_bounded_sweep_unsettled();
+        assert_eq!(
+            committable.upload_context_fingerprint.as_deref(),
+            Some("context-a"),
+            "a shed/partial save cannot advance the global policy epoch"
+        );
+
+        committable.activate_upload_context("context-b".to_string());
+        let mut candidate = test_candidate(PathBuf::from("/opaque/accepted.jsonl"));
+        let entry = committable
+            .files
+            .get("/opaque/accepted.jsonl")
+            .expect("accepted file is safely checkpointed");
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap_or_default();
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        assert_eq!(
+            committable.candidate_decision(&candidate),
+            CandidateDecision::Parse,
+            "even an accepted page is re-derived because untouched siblings still owe the policy transition"
+        );
+        assert!(committable.bounded_sweep_had_unsettled_upload);
     }
 
     #[test]
@@ -16168,8 +23287,11 @@ mod tests {
             .codex_state_only_snapshot_fingerprints
             .insert("session-new".to_string(), "dd".to_string());
 
-        let committable =
-            scanned.committable_subset(&committed, &BTreeSet::from(["bb".to_string()]));
+        let committable = scanned.committable_subset(
+            &committed,
+            &BTreeSet::from(["bb".to_string()]),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(
             committable.codex_state_only_snapshot_fingerprints,
@@ -16178,6 +23300,49 @@ mod tests {
                 ("session-pending".to_string(), "old".to_string()),
                 ("session-accepted".to_string(), "bb".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
+        let accepted = "a".repeat(64);
+        let quarantined = "b".repeat(64);
+        let mut scanned = ScanIndex::default();
+        scanned.files.insert(
+            "split.jsonl".to_string(),
+            manifest_index_entry(Some("set-hash")),
+        );
+        scanned.file_snapshot_fingerprints.insert(
+            "split.jsonl".to_string(),
+            BTreeSet::from([accepted.clone(), quarantined.clone()]),
+        );
+
+        let committable = scanned.committable_subset(
+            &ScanIndex::default(),
+            &BTreeSet::from([accepted]),
+            &BTreeMap::from([(
+                quarantined.clone(),
+                snapshot_quarantine_record(SnapshotSource::Codex),
+            )]),
+        );
+        assert!(committable.files.contains_key("split.jsonl"));
+        assert_eq!(
+            committable.file_snapshot_fingerprints["split.jsonl"].len(),
+            2
+        );
+        assert_eq!(
+            committable.quarantined_snapshot_fingerprints,
+            BTreeMap::from([(
+                quarantined,
+                snapshot_quarantine_record(SnapshotSource::Codex),
+            )])
+        );
+        assert_eq!(
+            committable
+                .manifest(SnapshotSource::Codex, 183)
+                .entity_count,
+            1,
+            "quarantine is checkpointed but never advertised as server-held"
         );
     }
 
@@ -16207,7 +23372,6 @@ mod tests {
         // their authorized windows differ, and the window is what lets a
         // consumer scope its own set before comparing.
         assert_eq!(manifest.scope, SNAPSHOT_MANIFEST_SCOPE);
-        assert_eq!(manifest.window_days, 183);
         assert_eq!(
             manifest.rolling_hash,
             index.manifest(SnapshotSource::Codex, 730).rolling_hash
@@ -16218,6 +23382,125 @@ mod tests {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(manifest, index.manifest(SnapshotSource::Codex, 183));
+    }
+
+    #[test]
+    fn snapshot_manifest_v2_matches_python_golden_byte_for_byte() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/snapshot-manifest-v2-golden.json"
+        ))
+        .expect("parse shared manifest golden");
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "late-sidecar.jsonl".to_string(),
+            BTreeSet::from(["bb".to_string(), "aa".to_string()]),
+        );
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("state-only".to_string(), "aa".to_string());
+        index.snapshot_activity_at = BTreeMap::from([
+            ("aa".to_string(), Some("2026-01-01T00:00:00Z".to_string())),
+            ("bb".to_string(), Some("2026-06-30T23:59:59Z".to_string())),
+        ]);
+        let manifest = index
+            .manifest_for_window(
+                SnapshotSource::Codex,
+                golden["window_start"].as_str().unwrap(),
+                golden["window_end"].as_str().unwrap(),
+            )
+            .expect("golden window");
+        assert_eq!(serde_json::to_value(&manifest).unwrap(), golden);
+    }
+
+    #[test]
+    fn snapshot_manifest_v2_omits_explicit_metadata_only_activity() {
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/snapshot-manifest-v2-metadata-only-golden.json"
+        ))
+        .expect("parse shared metadata-only golden");
+        let fingerprint = golden["snapshot_fingerprint"].as_str().unwrap().to_string();
+        let mut item = sample_session_artifact_item();
+        item.source_session_id = golden["source_session_id"].as_str().unwrap().to_string();
+        item.snapshot_fingerprint = fingerprint.clone();
+        assert_eq!(
+            snapshot_semantic_activity_at(&item),
+            golden["semantic_activity"].as_str().map(str::to_string)
+        );
+
+        let mut index = ScanIndex::default();
+        index.file_snapshot_fingerprints.insert(
+            "metadata-only.jsonl".to_string(),
+            BTreeSet::from([fingerprint.clone()]),
+        );
+        index
+            .snapshot_activity_at
+            .insert(fingerprint, snapshot_semantic_activity_at(&item));
+        let expected = &golden["manifest"];
+        let manifest = index
+            .manifest_for_window(
+                SnapshotSource::Codex,
+                expected["window_start"].as_str().unwrap(),
+                expected["window_end"].as_str().unwrap(),
+            )
+            .expect("metadata-only manifest");
+        assert_eq!(serde_json::to_value(manifest).unwrap(), *expected);
+    }
+
+    #[test]
+    fn snapshot_manifest_v2_uses_semantic_half_open_window_not_file_mtime() {
+        let inside_start = "a".repeat(64);
+        let inside_late_sidecar = "b".repeat(64);
+        let excluded_end = "c".repeat(64);
+        let excluded_old_modified_now = "d".repeat(64);
+        let mut index = ScanIndex {
+            file_snapshot_fingerprints: BTreeMap::from([
+                (
+                    "old-file-modified-now.jsonl".to_string(),
+                    BTreeSet::from([excluded_old_modified_now.clone()]),
+                ),
+                (
+                    "late-sidecar.jsonl".to_string(),
+                    BTreeSet::from([inside_late_sidecar.clone(), excluded_end.clone()]),
+                ),
+            ]),
+            ..ScanIndex::default()
+        };
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert("state-only".to_string(), inside_start.clone());
+        index.snapshot_activity_at = BTreeMap::from([
+            (inside_start, Some("2026-01-01T00:00:00Z".to_string())),
+            (
+                inside_late_sidecar,
+                Some("2026-06-30T23:59:59.999999999Z".to_string()),
+            ),
+            (excluded_end, Some("2026-07-01T00:00:00Z".to_string())),
+            (
+                excluded_old_modified_now,
+                Some("2025-12-31T23:59:59Z".to_string()),
+            ),
+        ]);
+        // Deliberately future local mtime: it cannot admit an old semantic
+        // entity into the server-reconstructible activity window.
+        index.files.insert(
+            "old-file-modified-now.jsonl".to_string(),
+            ScanIndexEntry {
+                size_bytes: 1,
+                modified_unix_seconds: u64::MAX,
+                modified_unix_nanos: Some(u64::MAX),
+                source_file_fingerprint: "local-mtime-is-not-membership".to_string(),
+                last_snapshot_fingerprint: Some("group".to_string()),
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+            },
+        );
+        let manifest = index
+            .manifest_for_window(
+                SnapshotSource::Codex,
+                "2026-01-01T00:00:00Z",
+                "2026-07-01T00:00:00Z",
+            )
+            .expect("semantic window");
+        assert_eq!(manifest.entity_count, 2);
     }
 
     #[test]
