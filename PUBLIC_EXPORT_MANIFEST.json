@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 303,
-  "content_sha256": "818fc3fb967c074e5887ff67f5a9b6d4fae6c628e79bf31e72c5e0740747c253",
+  "candidate_file_count": 304,
+  "content_sha256": "9e48a964edd9821d1450af8ab225877452abce03b6de3fd80a41958f99f72c84",
   "files": [
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "8b09dc60330ba32f6cd33b3f72e50c21fafa945bc83223e26ec4ef7c3798930a",
-      "size_bytes": 912274
+      "sha256": "d892f0719d3f826b49a6ba7d53bfe15d1df395a1b478a8074998f3098296363d",
+      "size_bytes": 945747
     },
     {
       "executable": false,
@@ -1247,6 +1247,13 @@
       "path": "docs/session-2026-08-01-setup-claim-credential-continuity.md",
       "sha256": "06aa117acef4319310a8a6ade33c19d454683b9b6c3a515a35295e2c17a40fdc",
       "size_bytes": 3079
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-02-pi-verify-upload-sandbox.md",
+      "sha256": "e8bfc2cc6b4182576fd8ef107c5241815496ec5811909d5ffe19f9b5fb55dfdb",
+      "size_bytes": 3114
     },
     {
       "executable": false,
@@ -2124,9 +2131,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T04:16:53+00:00",
+  "generated_at": "2026-08-02T05:20:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 304,
+  "output_file_count": 305,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2160,5 +2167,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b683be4c63191838c1ad45f85e787be3625c407b"
+  "source_commit": "47b968f541f87ad0cbb9b81a7f45ff0d3740e899"
 }
