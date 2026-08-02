@@ -40,10 +40,35 @@ new exact hash. For an SDK-only session, checked events must exactly cover the
 snapshot's request count and all token totals; one post-upgrade request cannot
 claim older usage by itself.
 
-The per-session sidecar fingerprint includes the selected hash. A Desktop-store
-mapping that arrives after the transcript was first scanned therefore reselects
-that one session. The hash also participates in the policy-scoped attribution
-component so semantic no-op suppression cannot discard the reparsed snapshot.
+Claude Code reports Task and Workflow API requests under the root session id,
+while the transcript scanner correctly emits each child as its own session.
+Those provider and transcript boundaries make the root-only token totals differ
+even when collection is complete. The daemon now treats the explicit
+parent/root references as one account-evidence family only when every locally
+observed request has one checked account hash and the sidecar request count
+exactly equals the request-count sum across every root and child proven by a
+complete filesystem census. A local hash-only family witness then preserves
+that proof for child-only incremental reparses; a bounded scan page is never
+treated as the complete family. For a census spanning pages, request counts are
+accumulated under the frozen census boundary; after the terminal page proves
+the whole family, earlier members are reselected once to emit the correction.
+Provider output-token accounting may differ
+from child transcript accounting, so it is
+not an identity discriminator for this family fallback. Missing family members,
+unattributed transcript tokens, incomplete identity checks, or conflicting
+hashes keep the entire family unknown.
+
+The per-session sidecar fingerprint includes the selected hash. Every explicit
+child fingerprint also includes its root's OTLP sidecar fingerprint, ensuring
+late identity evidence reselects already-indexed parent and child transcripts
+together. The root fingerprint contract also advances once so an upgrade with
+already-complete evidence reselects both sides without a fleet-wide transcript
+replay. Family proof is resolved locally before optional attribution facts are
+stripped by upload policy; disabling display attribution therefore does not
+discard billing identity evidence. A Desktop-store mapping that arrives after
+the transcript was first scanned therefore reselects that one session. The hash
+also participates in the policy-scoped attribution component so semantic no-op
+suppression cannot discard the reparsed snapshot.
 It remains outside released hash-epoch-1 content identity, avoiding a fleet-wide
 content remint. The local OTLP sidecar's stat fingerprint also participates in
 candidate selection, so identity arriving after a transcript's final write
@@ -55,8 +80,10 @@ reselects that session without reopening unrelated transcripts.
 - Repeated files under the same account remain one exact match.
 - The same session id found under different accounts is ambiguous and emits no
   account hash.
-- Subagent transcripts never borrow the root's Desktop-store identity; the
-  backend's parent/root profile inheritance remains their evidence path.
+- Subagent transcripts never borrow the root's Desktop-store identity. They may
+  share root-scoped OTLP identity only through the exact request-complete family
+  proof above; backend parent/root profile inheritance remains an independent
+  evidence path.
 - Direct API/cloud sessions, missing/malformed UUIDs, partially identified
   sessions, and sessions with multiple locally observed account hashes remain
   explicitly unattributed.
@@ -86,5 +113,11 @@ sessions intentionally carry no Claude account UUID and also remain unknown.
 - One consistently observed SDK account stamps every usage row; a second
   account or any request without a valid hash clears the identity (negative
   control proves the conflict guard is load-bearing).
+- A request-complete Task/Workflow family with one checked hash stamps parent
+  and child rows despite provider/transcript token-boundary differences;
+  incomplete request coverage or multiple hashes leaves every family member
+  unattributed.
+- Late root-scoped OTLP evidence changes both root and child scan fingerprints,
+  so previously indexed children are reconsidered without a fleet-wide replay.
 - The snapshot test suite and cross-language semantic-envelope golden retain
   released hash-epoch-1 semantics with or without the optional field.
