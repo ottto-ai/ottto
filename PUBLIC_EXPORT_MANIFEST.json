@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 304,
-  "content_sha256": "7840f0a4c108b4267023b7b248c8ea22d04f188ab49b51a628d1b15d58a7baf5",
+  "candidate_file_count": 305,
+  "content_sha256": "6e277d997f348d4607d1d162013e900ed627f860772ad24798193a9af5b464aa",
   "files": [
     {
       "executable": false,
@@ -883,6 +883,13 @@
       "path": "docs/agent-adapters.md",
       "sha256": "1bb9e53bcba706eaec61864f0999670336325bd628f81392425dd4fba0f5c799",
       "size_bytes": 2499
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/claude-accounts.md",
+      "sha256": "c5fc44b51aadc7bd0eb894847a818b69470366cdf27db4ecece78e0081b3b360",
+      "size_bytes": 3633
     },
     {
       "executable": false,
@@ -2133,7 +2140,7 @@
   ],
   "generated_at": "2026-08-02T08:56:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 305,
+  "output_file_count": 306,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
