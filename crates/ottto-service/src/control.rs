@@ -102,6 +102,7 @@ const PI_MULTIPART_MAX_FIELD_BYTES: usize = 4 * 1024;
 const PI_MULTIPART_MAX_BODY_BYTES: usize = 132 * 1024 * 1024;
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
+const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
 // Poll long enough for slow-arriving agent telemetry (codex batches + flushes
 // its token records, then the relay forwards them) to reach the backend before
 // we give up — claude/pi still return early on success. Kept under
@@ -9190,6 +9191,12 @@ fn pi_session_census() -> Result<Option<PiSessionCensus>, LocalApiError> {
     Ok(Some(PiSessionCensus { root, files }))
 }
 
+fn prepare_pi_live_session_census() -> Result<PiSessionCensus, LocalApiError> {
+    let root = open_or_create_pi_session_root()?;
+    let files = pi_session_files_for_root(&root, PI_SESSION_SAFETY_LIMITS)?;
+    Ok(PiSessionCensus { root, files })
+}
+
 #[cfg(test)]
 fn pi_session_files_in(root: &Path) -> Result<BTreeSet<PathBuf>, LocalApiError> {
     pi_session_files_in_with_limits(root, PI_SESSION_SAFETY_LIMITS)
@@ -9320,10 +9327,7 @@ fn import_new_pi_route_sessions(
     // Keep the pre-smoke descriptor as the authority across the whole live
     // verification. Reopening the pathname here would let an entirely different
     // real directory generation reclassify its pre-existing transcripts as new.
-    let session_files = pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
-        .difference(&before.files)
-        .cloned()
-        .collect::<Vec<_>>();
+    let session_files = new_pi_route_session_files(before)?;
     if session_files.is_empty() {
         return Ok(None);
     }
@@ -9336,6 +9340,15 @@ fn import_new_pi_route_sessions(
         &session_files,
     )
     .map(Some)
+}
+
+fn new_pi_route_session_files(before: &PiSessionCensus) -> Result<Vec<PathBuf>, LocalApiError> {
+    Ok(
+        pi_session_files_for_root(&before.root, PI_SESSION_SAFETY_LIMITS)?
+            .difference(&before.files)
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Upload local Pi session files modified at or after `since` for `route`. Used
@@ -9440,6 +9453,13 @@ fn open_pi_session_root() -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     open_pi_session_root_from_home(&home)
 }
 
+fn open_or_create_pi_session_root() -> Result<OpenPiSessionRoot, LocalApiError> {
+    require_pi_session_import_platform_support()?;
+    let home = home_path("");
+    open_or_create_pi_session_root_from_home_io(&home)
+        .map_err(|_| pi_session_import_refused("session root could not be safely established"))
+}
+
 #[cfg(test)]
 fn open_pi_session_root_direct(root: &Path) -> Result<Option<OpenPiSessionRoot>, LocalApiError> {
     require_pi_session_import_platform_support()?;
@@ -9485,6 +9505,18 @@ fn open_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessi
 }
 
 #[cfg(unix)]
+fn open_or_create_pi_session_root_from_home_io(home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    let trusted_home = open_pi_session_root_direct_io(home)?;
+    let mut directory = trusted_home.directory;
+    let mut path = home.to_path_buf();
+    for component in [".pi", "agent", "sessions"] {
+        directory = open_or_create_pi_directory_component(&directory, component.as_ref())?;
+        path.push(component);
+    }
+    Ok(OpenPiSessionRoot { path, directory })
+}
+
+#[cfg(unix)]
 fn open_pi_directory_component(
     directory: &fs::File,
     name: &std::ffi::OsStr,
@@ -9508,6 +9540,59 @@ fn open_pi_directory_component(
     Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
+#[cfg(unix)]
+fn open_or_create_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<fs::File> {
+    open_or_create_pi_directory_component_with(directory, name, mkdir_pi_directory_component)
+}
+
+#[cfg(unix)]
+fn open_or_create_pi_directory_component_with<Mkdir>(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    mkdir: Mkdir,
+) -> std::io::Result<fs::File>
+where
+    Mkdir: FnOnce(&fs::File, &std::ffi::OsStr) -> std::io::Result<()>,
+{
+    match open_pi_directory_component(directory, name) {
+        Ok(opened) => Ok(opened),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(create_error) = mkdir(directory, name) {
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(create_error);
+                }
+            }
+            // Always reopen through the held parent descriptor. This accepts a
+            // benign EEXIST race only when the winner created a real directory;
+            // O_NOFOLLOW refuses a symlink or other replacement.
+            open_pi_directory_component(directory, name)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn mkdir_pi_directory_component(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Pi session directory contains a NUL byte",
+        )
+    })?;
+    let created = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+    if created < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(not(unix))]
 fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
@@ -9515,6 +9600,11 @@ fn open_pi_session_root_direct_io(_root: &Path) -> std::io::Result<OpenPiSession
 
 #[cfg(not(unix))]
 fn open_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
+    Err(pi_session_import_unsupported_io_error())
+}
+
+#[cfg(not(unix))]
+fn open_or_create_pi_session_root_from_home_io(_home: &Path) -> std::io::Result<OpenPiSessionRoot> {
     Err(pi_session_import_unsupported_io_error())
 }
 
@@ -11412,29 +11502,15 @@ fn run_one_pi_route_verification(
         return verify_pi_subscription_oauth_route_passively(api_base_url, credentials, route);
     }
 
-    let before_session_census = match pi_session_census() {
-        Ok(census) => census,
-        Err(error) => {
-            eprintln!("Pi route pre-smoke session discovery failed: {error}");
-            None
-        }
+    let (before_session_census, smoke_after, smoke) = match run_pi_route_pre_smoke(route) {
+        Ok(ready) => ready,
+        Err(failed) => return *failed,
     };
-    let smoke_after = current_rfc3339();
-    let smoke = run_pi_route_smoke_prompt(
-        route,
-        before_session_census
-            .as_ref()
-            .map(|census| census.files.len()),
-    );
     if !smoke.succeeded {
         return pi_route_result_from_smoke(route, &smoke, Some(smoke_after));
     }
-    if let Some(before_session_census) = before_session_census {
-        if let Err(error) =
-            import_new_pi_route_sessions(api_base_url, route, &before_session_census)
-        {
-            eprintln!("Pi route smoke session import failed: {error}");
-        }
+    if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
+        eprintln!("Pi route smoke session import failed: {error}");
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -11459,6 +11535,78 @@ fn run_one_pi_route_verification(
     ) {
         Ok(verification) => pi_route_result_from_verification(route, &smoke, verification),
         Err(error) => pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error),
+    }
+}
+
+fn run_pi_route_pre_smoke(
+    route: &PiModelRoute,
+) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>> {
+    run_pi_route_pre_smoke_with(
+        route,
+        prepare_pi_live_session_census,
+        run_pi_route_smoke_prompt,
+    )
+}
+
+fn run_pi_route_pre_smoke_with<Prepare, RunSmoke>(
+    route: &PiModelRoute,
+    prepare: Prepare,
+    run_smoke: RunSmoke,
+) -> Result<(PiSessionCensus, String, SmokeResult), Box<SourceRouteVerificationResult>>
+where
+    Prepare: FnOnce() -> Result<PiSessionCensus, LocalApiError>,
+    RunSmoke: FnOnce(&PiModelRoute, Option<usize>) -> SmokeResult,
+{
+    let before_session_census = match prepare() {
+        Ok(census) => census,
+        Err(_) => {
+            eprintln!("Pi route pre-smoke session safety check failed.");
+            return Err(Box::new(pi_route_pre_smoke_census_failure(route)));
+        }
+    };
+    let smoke_after = current_rfc3339();
+    let before_session_count = Some(before_session_census.files.len());
+    let smoke = run_smoke(route, before_session_count);
+    Ok((before_session_census, smoke_after, smoke))
+}
+
+fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerificationResult {
+    let identity = pi_route_billing_identity_hints(route);
+    SourceRouteVerificationResult {
+        provider: pi_route_provider(route),
+        model: pi_route_model(route),
+        model_provider: route.classification.model_provider.clone(),
+        billing_provider: route.classification.billing_provider.clone(),
+        billing_channel: route.classification.billing_channel.clone(),
+        auth_mode: route.classification.auth_mode.clone(),
+        gateway_provider: route.classification.gateway_provider.clone(),
+        subscription_product: route.classification.subscription_product.clone(),
+        source_category: route.classification.source_category.clone(),
+        account_identifier_hash: identity.account_identifier_hash,
+        organization_identifier_hash: identity.organization_identifier_hash,
+        credential_fingerprint_hash: identity.credential_fingerprint_hash,
+        billing_identity_evidence: identity.billing_identity_evidence,
+        billing_identity_confidence: identity.billing_identity_confidence,
+        status: SourceVerificationStatus::Failed,
+        verified: false,
+        records_seen: 0,
+        last_record_id: None,
+        last_received_at: None,
+        smoke_after: None,
+        command_found: false,
+        command_succeeded: false,
+        exit_status: None,
+        duration_ms: 0,
+        diagnostic: None,
+        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
+        local_session_observed: None,
+        message: StableMessage {
+            code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
+            text: format!(
+                "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                pi_route_label(route)
+            ),
+        },
     }
 }
 
@@ -11925,6 +12073,10 @@ fn pi_route_aggregate_result(
         live_passed == 0 && local_only_passed == 0 && hard_failed == 0 && reauth_pending > 0;
     let all_local_only =
         live_passed == 0 && local_only_passed > 0 && hard_failed == 0 && reauth_pending == 0;
+    let all_census_failed = total > 0
+        && route_results
+            .iter()
+            .all(|route| route.error_code.as_deref() == Some(PI_SESSION_CENSUS_FAILED_CODE));
     let (code, text): (&str, String) = match status {
         SourceVerificationStatus::Verified => {
             ("verified", format!("Verified {total} Pi model routes."))
@@ -11951,6 +12103,11 @@ fn pi_route_aggregate_result(
                     "Pi has {total} model routes awaiting review; re-sign in if a provider asks."
                 )
             },
+        ),
+        SourceVerificationStatus::Failed if all_census_failed => (
+            PI_SESSION_CENSUS_FAILED_CODE,
+            "Pi verification stopped before smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+                .to_string(),
         ),
         _ => (
             "pi_route_smoke_failed",
@@ -13077,9 +13234,18 @@ mod tests {
         }
     }
 
+    fn live_pi_route() -> PiModelRoute {
+        let mut route = subscription_oauth_route();
+        route.classification.auth_mode = Some("api_key".to_string());
+        route.classification.billing_channel = Some("usage".to_string());
+        route.classification.subscription_product = None;
+        route
+    }
+
     #[test]
     fn subscription_oauth_routes_are_detected_and_others_are_not() {
         assert!(route_is_subscription_oauth(&subscription_oauth_route()));
+        assert!(!route_is_subscription_oauth(&live_pi_route()));
 
         let mut api_key = subscription_oauth_route();
         api_key.classification.auth_mode = Some("api_key".to_string());
@@ -19639,6 +19805,226 @@ mod tests {
             require_pi_session_import_platform_support().is_ok(),
             cfg!(unix)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_first_use_establishes_held_empty_census_before_smoke() {
+        let root = control_test_root("pi-live-first-use");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\nprintf '{}\\n' > \"$HOME/.pi/agent/sessions/first.jsonl\"\n",
+        )
+        .expect("write first-use Pi smoke");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755))
+            .expect("mark fake Pi executable");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let _search_guard = EnvVarGuard::set_os(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            fake_pi
+                .parent()
+                .expect("fake Pi parent")
+                .as_os_str()
+                .to_os_string(),
+        );
+
+        let (before, _, smoke) = match run_pi_route_pre_smoke(&live_pi_route()) {
+            Ok(ready) => ready,
+            Err(failed) => panic!("first-use pre-smoke failed: {}", failed.message.text),
+        };
+
+        assert!(before.files.is_empty(), "baseline must precede the smoke");
+        assert!(smoke.succeeded, "fake Pi smoke failed: {}", smoke.message);
+        let selected = new_pi_route_session_files(&before).expect("select first-use transcript");
+        assert_eq!(selected, vec![home.join(".pi/agent/sessions/first.jsonl")]);
+        let mut upload =
+            open_pi_session_upload(&before.root, &selected[0], PI_SESSION_SAFETY_LIMITS)
+                .expect("first-use transcript is import-ready beneath held root");
+        let mut bytes = Vec::new();
+        upload
+            .file
+            .read_to_end(&mut bytes)
+            .expect("read first-use transcript");
+        assert_eq!(bytes, b"{}\n");
+        for path in [
+            home.join(".pi"),
+            home.join(".pi/agent"),
+            home.join(".pi/agent/sessions"),
+        ] {
+            let mode = fs::metadata(path)
+                .expect("created Pi directory metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "new Pi directories must be owner-only");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_census_error_returns_failed_without_spawning_smoke() {
+        let root = control_test_root("pi-live-census-error");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+        let smoke_ran = std::cell::Cell::new(false);
+        let private_error = "/Users/private/operator/pi-census";
+
+        let result = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            || {
+                Err(LocalApiError::LocalOperationFailed(
+                    private_error.to_string(),
+                ))
+            },
+            |_, _| {
+                smoke_ran.set(true);
+                panic!("smoke must not run after a census error")
+            },
+        );
+        let failed = match result {
+            Ok(_) => panic!("census error must fail before smoke"),
+            Err(failed) => *failed,
+        };
+
+        assert!(!smoke_ran.get());
+        assert_eq!(failed.status, SourceVerificationStatus::Failed);
+        assert!(!failed.verified);
+        assert!(!failed.command_succeeded);
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(PI_SESSION_CENSUS_FAILED_CODE)
+        );
+        assert_eq!(failed.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!failed.message.text.contains(private_error));
+        assert!(!failed.message.text.contains("/Users/"));
+        assert!(failed.message.text.contains("~/.pi/agent/sessions"));
+        let aggregate = pi_route_aggregate_result(vec![failed]);
+        assert_eq!(aggregate.status, SourceVerificationStatus::Failed);
+        assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!aggregate.message.text.contains(private_error));
+        assert!(!aggregate.message.text.contains("/Users/"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_refuses_symlink_without_creating_beyond_it() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-live-root-symlink");
+        let outside = control_test_root("pi-live-root-symlink-outside");
+        symlink(&outside, home.join(".pi")).expect("symlink .pi outside HOME");
+
+        assert!(open_or_create_pi_session_root_from_home_io(&home).is_err());
+        assert!(!outside.join("agent").exists());
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_securely_reopens_an_eexist_race_winner() {
+        let home = control_test_root("pi-live-root-eexist");
+        let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
+        let pi = home.join(".pi");
+
+        let opened = open_or_create_pi_directory_component_with(
+            &held_home.directory,
+            ".pi".as_ref(),
+            |_, _| {
+                fs::create_dir(&pi).expect("race winner creates a real directory");
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            },
+        )
+        .expect("secure reopen accepts a real EEXIST race winner");
+
+        let opened_metadata = opened.metadata().expect("opened race winner metadata");
+        let path_metadata = fs::metadata(&pi).expect("race winner path metadata");
+        assert!(opened_metadata.is_dir());
+        assert_eq!(opened_metadata.dev(), path_metadata.dev());
+        assert_eq!(opened_metadata.ino(), path_metadata.ino());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_refuses_a_symlink_eexist_race_winner() {
+        use std::os::unix::fs::symlink;
+
+        let home = control_test_root("pi-live-root-eexist-symlink");
+        let outside = control_test_root("pi-live-root-eexist-symlink-outside");
+        let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
+
+        let result = open_or_create_pi_directory_component_with(
+            &held_home.directory,
+            ".pi".as_ref(),
+            |_, _| {
+                symlink(&outside, home.join(".pi")).expect("race winner creates symlink");
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!outside.join("agent").exists());
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_root_establishment_preserves_existing_component_mode() {
+        let home = control_test_root("pi-live-existing-mode");
+        let pi = home.join(".pi");
+        fs::create_dir(&pi).expect("create existing .pi");
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o750)).expect("set existing .pi mode");
+
+        let opened = open_or_create_pi_session_root_from_home_io(&home)
+            .expect("securely complete existing Pi tree");
+
+        assert_eq!(
+            fs::metadata(&pi)
+                .expect("existing .pi metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750,
+            "live Verify must not change an existing Pi directory mode"
+        );
+        assert_eq!(
+            opened
+                .directory
+                .metadata()
+                .expect("held sessions descriptor")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn passive_pi_session_selection_does_not_create_missing_root() {
+        let root = control_test_root("pi-passive-missing-root");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let selection =
+            recent_pi_session_files(UNIX_EPOCH).expect("passive missing root remains no data");
+
+        assert!(selection.is_none());
+        assert!(!home.join(".pi").exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(not(unix))]

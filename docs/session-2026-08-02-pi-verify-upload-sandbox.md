@@ -44,6 +44,24 @@ trees and large files could also drive unbounded traversal and allocation.
   subscription-OAuth import failures are logged but do not become a hard Verify
   failure.
 
+## Final caller repair
+
+The final clean-room review found that the rooted helpers were fail-closed but
+the explicit live-Verify caller was not. A missing pre-smoke sessions root and
+an actual census error both became `None`; the caller still spawned Pi and then
+skipped the held-root import branch. That lost the first transcript on a fresh
+Pi installation and weakened the census error boundary.
+
+Non-OAuth live Verify now establishes only missing `.pi`, `agent`, and
+`sessions` directories before smoke. It holds `HOME`, uses `mkdirat(0700)` plus
+component-wise `openat(O_DIRECTORY | O_NOFOLLOW)`, securely reopens an EEXIST
+race winner, and never changes an existing directory's mode. The resulting
+empty or populated sessions descriptor is the normal pre-smoke census authority.
+Any establishment or census error returns the stable
+`pi_session_census_failed` route failure before Pi can spawn. Passive
+subscription-OAuth Verify keeps the read-only opener and never creates the Pi
+tree.
+
 ## Validation
 
 - Focused Pi session tests cover normal nested uploads, symlinked files and
@@ -58,7 +76,14 @@ trees and large files could also drive unbounded traversal and allocation.
   proves the import refuses it before file selection or upload. A target-platform
   helper and non-Unix-only refusal test keep the unsupported-platform contract
   compilable.
-- Full `ottto-service` tests pass (1,234 library tests and 10 binary tests); the
+- Caller-level regressions prove a fresh live Verify captures a held empty
+  census before a fake Pi creates its first import-ready transcript, while an
+  injected census error returns a path-safe failed route without invoking the
+  smoke closure. Root-establishment tests cover owner-only creation, preservation
+  of existing modes, ordinary symlink refusal, and real-directory versus symlink
+  EEXIST race winners. A passive missing-root regression proves that OAuth
+  selection remains read-only.
+- Full `ottto-service` tests pass (1,239 library tests and 10 binary tests); the
   two explicitly real-local-data service tests remain ignored. `ottto-core`
   passes 83 tests, `ottto-cli` passes 80 tests, and workspace all-target Clippy
   passes with warnings denied.
