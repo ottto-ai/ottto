@@ -69,7 +69,7 @@ transcript a request landed in.
 A turn whose request was never captured stays effort-unknown. That is the honest
 answer, and it is covered by a test.
 
-`CLAUDE_CODE_SNAPSHOT_PARSER_VERSION` moves to `claude_code_jsonl:v26`. Scan
+`CLAUDE_CODE_SNAPSHOT_PARSER_VERSION` moves to `claude_code_jsonl:v27`. Scan
 identity does **not** move: which session a file maps to is unchanged, and
 `claude_effort_sidecar_fingerprint` already re-selects a transcript whose
 evidence grew after its final write.
@@ -80,7 +80,7 @@ evidence grew after its final write.
   Explore subagent: all 6 records joined exactly, the 4 `query_source=sdk`
   requests to the parent transcript and the 2 `agent:builtin:Explore` requests
   to the sidechain transcript. Zero ambiguity, zero misses.
-- `cargo test --workspace`: 1470 tests pass, including six new ones covering
+- `cargo test --workspace`: 1472 tests pass, including six new ones covering
   per-request splitting, subagent routing, uncaptured turns staying unknown, the
   legacy aggregate path being left alone, index construction across a parent and
   its subagent, and legacy rows being excluded from the index.

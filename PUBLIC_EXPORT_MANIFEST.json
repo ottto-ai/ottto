@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 306,
-  "content_sha256": "16abff50b7acc0cbf57cbd22ed398ee697619377a9a4037978f00267d80f4132",
+  "content_sha256": "d4a2f1cd4ffa8e560ca5a696051a6fd0c21311103bd1bcd8fef69e3d767e1516",
   "files": [
     {
       "executable": false,
@@ -1259,7 +1259,7 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-02-claude-effort-per-request-attribution.md",
-      "sha256": "5a51dcbcf75589e93afe242f1a3f3e78f6e2d7354fcae20d7c743fb21943ce48",
+      "sha256": "f65db96e9dd451478c2717ac49f60ea2866b23666ddc012c45732401fe58c957",
       "size_bytes": 5108
     },
     {
@@ -2145,7 +2145,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T19:14:15+00:00",
+  "generated_at": "2026-08-02T19:16:03+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 307,
   "public_roots": [
