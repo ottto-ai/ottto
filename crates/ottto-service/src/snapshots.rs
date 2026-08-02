@@ -173,7 +173,9 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // `state_5.sqlite.thread_spawn_edges`, while many rollout headers expose only
 // `thread_source=subagent` and omit the parent object. Join that bounded local
 // sidecar so existing Codex child sessions emit exact parent/root/depth facts.
-// claude_code v26: attribute reasoning effort per API request instead of
+// Codex v27 / Claude Code v26 add privacy-safe hourly Browser, Chrome, and
+// Computer Use activity to the existing content-free activity summary.
+// claude_code v27: attribute reasoning effort per API request instead of
 // reconciling hourly aggregates. Claude Code stamps the top-level `session.id`
 // on subagent OTLP records, so evidence keyed by session id alone never reached
 // a sidechain transcript -- every subagent session reported effort-unknown --
@@ -183,8 +185,8 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // takes its own observed tier. Scan identity does NOT move: which session a file
 // maps to is unchanged, and the effort sidecar fingerprint already re-selects a
 // transcript whose evidence grew after its final write.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v26";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v26";
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v27";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -214,8 +216,12 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // forever. The one-time revisit stays bounded: an unchanged session re-parses
 // to a new title but is otherwise a semantic no-op-sized re-upload of
 // already-known usage.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v26";
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
+// Capability activity changes transcript-derived session semantics. Advance
+// scan identity so already-indexed local history is revisited once; unchanged
+// files still converge through the semantic no-op path after the new summary
+// has been uploaded.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v27";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v24";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -586,10 +592,31 @@ pub struct SnapshotActivityCount {
     pub count: u64,
 }
 
+/// One privacy-safe agent capability count. The identifiers are collector-owned
+/// constants; raw tool arguments, results, URLs, browser ids, and screenshots
+/// never enter this shape.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotCapabilityCount {
+    pub capability_id: String,
+    pub raw_origin: String,
+    pub count: u64,
+}
+
+/// Hourly capability activity used by the backend's bounded GOLD projection.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotCapabilityBucket {
+    pub bucket_start: String,
+    pub capability_id: String,
+    pub raw_origin: String,
+    pub call_count: u64,
+}
+
 /// Content-free local activity evidence derived from Codex rollout records.
 /// Commands, arguments, paths, patches, and tool output never leave the Mac.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotActivitySummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_collection_version: Option<String>,
     pub tool_calls: u64,
     pub shell_commands: u64,
     pub patch_operations: u64,
@@ -603,6 +630,10 @@ pub struct SnapshotActivitySummary {
     pub tool_counts: Vec<SnapshotActivityCount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_tool_counts: Vec<SnapshotActivityCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_counts: Vec<SnapshotCapabilityCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_buckets: Vec<SnapshotCapabilityBucket>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }
@@ -2349,7 +2380,7 @@ pub(crate) fn snapshot_semantic_component_hashes(
             }),
         );
     }
-    if source == SnapshotSource::Codex {
+    if item.activity_summary.is_some() {
         insert("activity_summary", json!(&item.activity_summary));
     }
     insert(
@@ -3738,6 +3769,8 @@ struct SnapshotAccumulator {
     activity_tool_counts: BTreeMap<String, u64>,
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
+    activity_capability_buckets: BTreeMap<(String, String, String), u64>,
+    seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
     activity_changed_file_hashes: BTreeSet<String>,
     activity_patch_operations: u64,
@@ -3838,6 +3871,8 @@ impl SnapshotAccumulator {
             activity_tool_counts: BTreeMap::new(),
             activity_call_tools: BTreeMap::new(),
             activity_mcp_tool_counts: BTreeMap::new(),
+            activity_capability_buckets: BTreeMap::new(),
+            seen_claude_capability_tool_uses: BTreeSet::new(),
             activity_skills: BTreeSet::new(),
             activity_changed_file_hashes: BTreeSet::new(),
             activity_patch_operations: 0,
@@ -3916,22 +3951,81 @@ impl SnapshotAccumulator {
         }
     }
 
+    fn note_capability_call(
+        &mut self,
+        timestamp: Option<&str>,
+        capability_id: &str,
+        raw_origin: &str,
+    ) {
+        let Some((bucket_start, _)) = timestamp.and_then(activity_bucket_from_timestamp) else {
+            return;
+        };
+        *self
+            .activity_capability_buckets
+            .entry((
+                bucket_start,
+                capability_id.to_string(),
+                raw_origin.to_string(),
+            ))
+            .or_default() += 1;
+    }
+
     fn activity_summary(&self) -> Option<SnapshotActivitySummary> {
-        if self.source != SnapshotSource::Codex {
-            return None;
+        let capability_buckets = self
+            .activity_capability_buckets
+            .iter()
+            .map(|((bucket_start, capability_id, raw_origin), call_count)| {
+                SnapshotCapabilityBucket {
+                    bucket_start: bucket_start.clone(),
+                    capability_id: capability_id.clone(),
+                    raw_origin: raw_origin.clone(),
+                    call_count: *call_count,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut capability_totals: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for bucket in &capability_buckets {
+            *capability_totals
+                .entry((bucket.capability_id.clone(), bucket.raw_origin.clone()))
+                .or_default() += bucket.call_count;
         }
-        let tool_calls = self
+        let capability_counts = capability_totals
+            .into_iter()
+            .map(
+                |((capability_id, raw_origin), count)| SnapshotCapabilityCount {
+                    capability_id,
+                    raw_origin,
+                    count,
+                },
+            )
+            .collect::<Vec<_>>();
+        let codex_tool_calls = self
             .activity_tool_counts
             .values()
             .copied()
             .sum::<u64>()
             .saturating_add(self.activity_mcp_calls);
-        let has_activity = tool_calls > 0
+        // Codex already has a complete local tool-action classifier. Claude's
+        // new capability classifier is intentionally narrower, so do not
+        // present its allowlisted subset as the session's total tool/MCP use.
+        let tool_calls = if self.source == SnapshotSource::Codex {
+            codex_tool_calls
+        } else {
+            0
+        };
+        let capability_collection_version = matches!(
+            self.source,
+            SnapshotSource::Codex | SnapshotSource::ClaudeCode
+        )
+        .then(|| "agent_capability_usage:v1".to_string());
+        let has_activity = capability_collection_version.is_some()
+            || tool_calls > 0
             || self.activity_patch_operations > 0
             || self.activity_web_searches > 0
             || self.activity_subagent_spawns > 0
             || !self.activity_skills.is_empty();
         has_activity.then(|| SnapshotActivitySummary {
+            capability_collection_version,
             tool_calls,
             shell_commands: self
                 .activity_tool_counts
@@ -3947,6 +4041,8 @@ impl SnapshotAccumulator {
             subagent_spawns: self.activity_subagent_spawns,
             tool_counts: bounded_activity_counts(&self.activity_tool_counts, 64),
             mcp_tool_counts: bounded_activity_counts(&self.activity_mcp_tool_counts, 32),
+            capability_counts,
+            capability_buckets,
             skills: self.activity_skills.iter().take(32).cloned().collect(),
         })
     }
@@ -7188,6 +7284,13 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             Some("web_search_end") => accumulator.activity_web_searches += 1,
             Some("mcp_tool_call_end") => {
                 accumulator.activity_mcp_calls += 1;
+                if let Some((capability_id, raw_origin)) = codex_tool_surface_capability(value) {
+                    accumulator.note_capability_call(
+                        timestamp.as_deref(),
+                        capability_id,
+                        raw_origin,
+                    );
+                }
                 if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
                     accumulator.reclassify_activity_call_as_mcp(&call_id);
                 }
@@ -7228,6 +7331,22 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             accumulator.latency_ttft_ms_count += 1;
             accumulator.latency_ttft_ms_max = accumulator.latency_ttft_ms_max.max(ttft_ms);
         }
+    }
+}
+
+fn codex_tool_surface_capability(value: &Value) -> Option<(&'static str, &'static str)> {
+    let meta = value
+        .pointer("/payload/result/Ok/_meta")
+        .or_else(|| value.pointer("/result/Ok/_meta"))?;
+    let surface = meta.get("codex/toolSurface")?;
+    match (
+        surface.get("kind").and_then(Value::as_str),
+        surface.get("backend").and_then(Value::as_str),
+    ) {
+        (Some("browserUse"), Some("chrome")) => Some(("browser.chrome", "browser:chrome")),
+        (Some("browserUse"), Some("iab")) => Some(("browser.in_app", "browser:iab")),
+        (Some("computerUse"), _) => Some(("computer.use", "computer-use")),
+        _ => None,
     }
 }
 
@@ -7452,6 +7571,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     let timestamp = string_at(value, &["timestamp"])
         .or_else(|| string_at(value, &["created_at"]))
         .or_else(|| string_at(value, &["message", "created_at"]));
+    note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs records
     // within the provider's millisecond-scale emission window while preserving
@@ -7601,6 +7721,53 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         if !artifacts.is_empty() {
             accumulator.add_artifacts(artifacts);
         }
+    }
+}
+
+fn claude_capability_from_tool_name(name: &str) -> Option<(&'static str, &'static str)> {
+    let normalized = name.to_ascii_lowercase();
+    if normalized.starts_with("mcp__claude-in-chrome__") {
+        return Some(("browser.chrome", "claude-in-chrome"));
+    }
+    if normalized.starts_with("mcp__claude_browser__") {
+        return Some(("browser.claude_browser", "Claude_Browser"));
+    }
+    if normalized.starts_with("mcp__computer-use__") {
+        return Some(("computer.use", "computer-use"));
+    }
+    None
+}
+
+fn note_claude_capability_calls(
+    value: &Value,
+    timestamp: Option<&str>,
+    accumulator: &mut SnapshotAccumulator,
+) {
+    if !string_eq_at(value, &["message", "role"], "assistant") {
+        return;
+    }
+    let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in blocks {
+        if !string_eq_at(block, &["type"], "tool_use") {
+            continue;
+        }
+        let Some(name) = string_at(block, &["name"]) else {
+            continue;
+        };
+        let Some((capability_id, raw_origin)) = claude_capability_from_tool_name(&name) else {
+            continue;
+        };
+        let occurrence = string_at(block, &["id"])
+            .unwrap_or_else(|| format!("{name}:{}", timestamp.unwrap_or_default()));
+        if !accumulator
+            .seen_claude_capability_tool_uses
+            .insert(occurrence)
+        {
+            continue;
+        }
+        accumulator.note_capability_call(timestamp, capability_id, raw_origin);
     }
 }
 
@@ -12073,6 +12240,108 @@ mod tests {
             .is_empty());
         assert_ne!(labels_disabled.snapshot_fingerprint, original_fingerprint);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_capability_activity_uses_only_allowlisted_tool_surface_metadata() {
+        let path = temp_file("codex-capability-activity");
+        let lines = vec![
+            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"capability-session"}}),
+            json!({"timestamp":"2026-08-02T06:05:00Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"node_repl","tool":"js","arguments":{"secret":"never upload"}},"result":{"Ok":{"_meta":{"codex/toolSurface":{"kind":"browserUse","backend":"chrome"},"browserId":"private-browser"},"content":[{"type":"image","data":"private-image"}]}}}}),
+            json!({"timestamp":"2026-08-02T07:05:00Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"node_repl","tool":"js"},"result":{"Ok":{"_meta":{"codex/toolSurface":{"kind":"browserUse","backend":"iab"}}}}}}),
+            json!({"timestamp":"2026-08-02T07:06:00Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","invocation":{"server":"node_repl","tool":"js"},"result":{"Ok":{"_meta":{"codex/toolSurface":{"kind":"computerUse","backend":null}}}}}}),
+            json!({"timestamp":"2026-08-02T07:10:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T07:11:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        assert_eq!(summary.tool_calls, 3);
+        assert_eq!(summary.mcp_calls, 3);
+        assert_eq!(summary.capability_counts.len(), 3);
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "browser.chrome"
+                && row.raw_origin == "browser:chrome"
+                && row.count == 1
+        }));
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "browser.in_app"
+                && row.raw_origin == "browser:iab"
+                && row.count == 1
+        }));
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "computer.use"
+                && row.raw_origin == "computer-use"
+                && row.count == 1
+        }));
+        assert_eq!(summary.capability_buckets.len(), 3);
+        let encoded = serde_json::to_string(summary).expect("serialize");
+        assert!(!encoded.contains("never upload"));
+        assert!(!encoded.contains("private-browser"));
+        assert!(!encoded.contains("private-image"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_capability_activity_normalizes_built_in_mcp_names_and_dedupes_tool_use_ids() {
+        let path = temp_file("claude-capability-activity");
+        let lines = vec![
+            json!({"timestamp":"2026-08-02T06:00:00Z","type":"user","sessionId":"claude-capability-session","message":{"role":"user","content":"open the page"}}),
+            json!({"timestamp":"2026-08-02T06:01:00Z","type":"assistant","sessionId":"claude-capability-session","requestId":"req-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"tool_use","id":"tool-1","name":"mcp__claude-in-chrome__navigate","input":{"url":"https://private.example"}}]}}),
+            json!({"timestamp":"2026-08-02T06:01:00Z","type":"assistant","sessionId":"claude-capability-session","requestId":"req-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"tool_use","id":"tool-1","name":"mcp__claude-in-chrome__navigate","input":{"url":"https://private.example"}}]}}),
+            json!({"timestamp":"2026-08-02T07:01:00Z","type":"assistant","sessionId":"claude-capability-session","requestId":"req-2","message":{"id":"msg-2","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":5,"output_tokens":1},"content":[{"type":"tool_use","id":"tool-2","name":"mcp__Claude_Browser__computer","input":{"screenshot":"private"}},{"type":"tool_use","id":"tool-3","name":"mcp__computer-use__computer_batch","input":{"actions":["private"]}}]}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        assert_eq!(summary.tool_calls, 0);
+        assert_eq!(summary.mcp_calls, 0);
+        assert_eq!(summary.capability_counts.len(), 3);
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "browser.chrome"
+                && row.raw_origin == "claude-in-chrome"
+                && row.count == 1
+        }));
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "browser.claude_browser"
+                && row.raw_origin == "Claude_Browser"
+                && row.count == 1
+        }));
+        assert!(summary.capability_counts.iter().any(|row| {
+            row.capability_id == "computer.use"
+                && row.raw_origin == "computer-use"
+                && row.count == 1
+        }));
+        let encoded = serde_json::to_string(summary).expect("serialize");
+        assert!(!encoded.contains("private.example"));
+        assert!(!encoded.contains("screenshot"));
+        assert!(!encoded.contains("actions"));
         let _ = fs::remove_file(path);
     }
 
@@ -23988,6 +24257,7 @@ mod tests {
             compaction_count: Some(0),
             compaction_timestamps: Vec::new(),
             activity_summary: Some(SnapshotActivitySummary {
+                capability_collection_version: Some("agent_capability_usage:v1".to_string()),
                 tool_calls: 3,
                 shell_commands: 1,
                 patch_operations: 1,
@@ -24005,6 +24275,8 @@ mod tests {
                     name: "GitHub.get_pr_info".to_string(),
                     count: 1,
                 }],
+                capability_counts: Vec::new(),
+                capability_buckets: Vec::new(),
                 skills: vec!["repo-task-lifecycle".to_string()],
             }),
             model_usage: vec![vertex_row.clone()],

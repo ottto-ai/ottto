@@ -131,6 +131,16 @@ struct McpServerInput {
     tools: Vec<McpToolInput>,
 }
 
+/// Explicit machine-level capability state discovered without executing the
+/// capability. Only allowlisted identifiers and booleans leave the machine.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct McpCapabilityInput {
+    capability_id: String,
+    raw_origin: String,
+    availability_state: String,
+    evidence_source: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct McpInventoryIngestRequest {
     agent_source: String,
@@ -138,6 +148,8 @@ struct McpInventoryIngestRequest {
     machine_id: Option<String>,
     context_window_tokens: i64,
     servers: Vec<McpServerInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<McpCapabilityInput>,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +342,65 @@ fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
         }
     }
     servers.into_values().collect()
+}
+
+fn discover_codex_capabilities(home: &Path) -> Vec<McpCapabilityInput> {
+    let path = home.join(".codex").join("config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(plugins) = document.get("plugins").and_then(|item| item.as_table()) else {
+        return Vec::new();
+    };
+    let known = [
+        (
+            "chrome@openai-bundled",
+            "browser.chrome",
+            "chrome@openai-bundled",
+        ),
+        (
+            "browser@openai-bundled",
+            "browser.in_app",
+            "browser@openai-bundled",
+        ),
+        (
+            "computer-use@openai-bundled",
+            "computer.use",
+            "computer-use@openai-bundled",
+        ),
+    ];
+    let mut capabilities = Vec::new();
+    for (plugin_key, capability_id, raw_origin) in known {
+        let Some(plugin) = plugins.get(plugin_key) else {
+            continue;
+        };
+        let enabled = plugin
+            .get("enabled")
+            .and_then(toml_edit::Item::as_value)
+            .and_then(toml_edit::Value::as_bool);
+        let availability_state = match enabled {
+            Some(true) => "enabled",
+            Some(false) => "disabled",
+            None => "unknown",
+        };
+        capabilities.push(McpCapabilityInput {
+            capability_id: capability_id.to_string(),
+            raw_origin: raw_origin.to_string(),
+            availability_state: availability_state.to_string(),
+            evidence_source: "agent_config".to_string(),
+        });
+    }
+    capabilities
+}
+
+fn discover_capabilities(home: &Path, source: SnapshotSource) -> Vec<McpCapabilityInput> {
+    match source {
+        SnapshotSource::Codex => discover_codex_capabilities(home),
+        SnapshotSource::ClaudeCode | SnapshotSource::Pi => Vec::new(),
+    }
 }
 
 /// Convert a `toml_edit` item into a `serde_json::Value` for the shared
@@ -721,6 +792,7 @@ fn build_inventory(
     let started = Instant::now();
     let loading_mode = loading_mode_for(source);
     let configured = discover_servers(home, source);
+    let capabilities = discover_capabilities(home, source);
     let spawn_env = SpawnEnv::resolve();
     let (servers, throttled) = harvest_servers(&configured, loading_mode, deadline, &spawn_env);
     let reachable = servers.iter().filter(|s| s.reachable).count();
@@ -739,6 +811,7 @@ fn build_inventory(
             machine_id: machine_id.map(str::to_string),
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
             servers,
+            capabilities,
         },
         metrics,
     }
@@ -959,13 +1032,13 @@ fn write_cache(path: &Path, entry: &InventoryCacheEntry) {
 }
 
 /// SHA-256 over the inventory's meaningful content. `machine_id` and
-/// `context_window_tokens` are constant per machine, so only `agent_source` and
-/// the harvested `servers` participate — the hash changes exactly when the user's
-/// configured MCP surface (servers, reachability, tool schemas) changes.
+/// `context_window_tokens` are constant per machine, so only `agent_source`,
+/// the harvested servers, and allowlisted capability states participate.
 fn inventory_hash(inventory: &McpInventoryIngestRequest) -> Result<String> {
     let canonical = serde_json::to_vec(&json!({
         "agent_source": inventory.agent_source,
         "servers": inventory.servers,
+        "capabilities": inventory.capabilities,
     }))
     .map_err(|error| anyhow!("hash encode failed: {error}"))?;
     let mut hasher = Sha256::new();
@@ -1358,6 +1431,15 @@ args = ["mcp-server-fetch"]
 
 [mcp_servers.remote]
 url = "https://remote.test/mcp"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+
+[plugins."browser@openai-bundled"]
+enabled = false
+
+[plugins."computer-use@openai-bundled"]
+enabled = true
 "#,
         )
         .unwrap();
@@ -1381,6 +1463,17 @@ url = "https://remote.test/mcp"
                 url: "https://remote.test/mcp".to_string()
             }
         );
+        let capabilities = discover_codex_capabilities(&home);
+        assert_eq!(capabilities.len(), 3);
+        assert!(capabilities.iter().any(|row| {
+            row.capability_id == "browser.chrome" && row.availability_state == "enabled"
+        }));
+        assert!(capabilities.iter().any(|row| {
+            row.capability_id == "browser.in_app" && row.availability_state == "disabled"
+        }));
+        assert!(capabilities.iter().any(|row| {
+            row.capability_id == "computer.use" && row.availability_state == "enabled"
+        }));
 
         let _ = fs::remove_dir_all(&home);
     }
@@ -1509,6 +1602,12 @@ url = "https://remote.test/mcp"
                     description: "Fetch a URL".to_string(),
                     input_schema: json!({ "type": "object" }),
                 }],
+            }],
+            capabilities: vec![McpCapabilityInput {
+                capability_id: "browser.chrome".to_string(),
+                raw_origin: "chrome@openai-bundled".to_string(),
+                availability_state: "enabled".to_string(),
+                evidence_source: "agent_config".to_string(),
             }],
         };
         let value = serde_json::to_value(&inventory).unwrap();
@@ -1746,6 +1845,7 @@ done
                     input_schema: json!({ "type": "object" }),
                 }],
             }],
+            capabilities: Vec::new(),
         }
     }
 
