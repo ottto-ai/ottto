@@ -11511,6 +11511,7 @@ fn run_one_pi_route_verification(
     }
     if let Err(error) = import_new_pi_route_sessions(api_base_url, route, &before_session_census) {
         eprintln!("Pi route smoke session import failed: {error}");
+        return pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error);
     }
 
     let filters = if pi_route_is_unscoped(route) {
@@ -11566,7 +11567,33 @@ where
     };
     let smoke_after = current_rfc3339();
     let before_session_count = Some(before_session_census.files.len());
-    let smoke = run_smoke(route, before_session_count);
+    let mut smoke = run_smoke(route, before_session_count);
+    if !smoke.succeeded {
+        // A failed command is already terminal for this route. Its generic
+        // pathname count is not authoritative and a second filesystem error
+        // must not replace the real smoke diagnostic.
+        smoke.local_session_observed = None;
+        return Ok((before_session_census, smoke_after, smoke));
+    }
+    // `run_bounded_command` retains its generic count-based Pi observation for
+    // older callers, but that count reopens the pathname. Live route Verify
+    // already owns a held pre-smoke root descriptor, so only a post-smoke
+    // difference derived through that same descriptor can authorize local-only
+    // success. A replaced/unreadable root fails before backend polling instead
+    // of reclassifying another directory's pre-existing transcripts as smoke
+    // evidence.
+    let local_session_observed = match new_pi_route_session_files(&before_session_census) {
+        Ok(files) => !files.is_empty(),
+        Err(_) => {
+            eprintln!("Pi route post-smoke session safety check failed.");
+            return Err(Box::new(pi_route_post_smoke_census_failure(
+                route,
+                &smoke,
+                smoke_after,
+            )));
+        }
+    };
+    smoke.local_session_observed = Some(local_session_observed);
     Ok((before_session_census, smoke_after, smoke))
 }
 
@@ -11604,6 +11631,50 @@ fn pi_route_pre_smoke_census_failure(route: &PiModelRoute) -> SourceRouteVerific
             code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
             text: format!(
                 "Pi route {} could not run a smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
+                pi_route_label(route)
+            ),
+        },
+    }
+}
+
+fn pi_route_post_smoke_census_failure(
+    route: &PiModelRoute,
+    smoke: &SmokeResult,
+    smoke_after: String,
+) -> SourceRouteVerificationResult {
+    let identity = pi_route_billing_identity_hints(route);
+    SourceRouteVerificationResult {
+        provider: pi_route_provider(route),
+        model: pi_route_model(route),
+        model_provider: route.classification.model_provider.clone(),
+        billing_provider: route.classification.billing_provider.clone(),
+        billing_channel: route.classification.billing_channel.clone(),
+        auth_mode: route.classification.auth_mode.clone(),
+        gateway_provider: route.classification.gateway_provider.clone(),
+        subscription_product: route.classification.subscription_product.clone(),
+        source_category: route.classification.source_category.clone(),
+        account_identifier_hash: identity.account_identifier_hash,
+        organization_identifier_hash: identity.organization_identifier_hash,
+        credential_fingerprint_hash: identity.credential_fingerprint_hash,
+        billing_identity_evidence: identity.billing_identity_evidence,
+        billing_identity_confidence: identity.billing_identity_confidence,
+        status: SourceVerificationStatus::Failed,
+        verified: false,
+        records_seen: 0,
+        last_record_id: None,
+        last_received_at: None,
+        smoke_after: Some(smoke_after),
+        command_found: smoke.command_found,
+        command_succeeded: smoke.succeeded,
+        exit_status: smoke.exit_status,
+        duration_ms: smoke.duration_ms.try_into().unwrap_or(u64::MAX),
+        diagnostic: smoke.diagnostic.clone(),
+        error_code: Some(PI_SESSION_CENSUS_FAILED_CODE.to_string()),
+        local_session_observed: None,
+        message: StableMessage {
+            code: PI_SESSION_CENSUS_FAILED_CODE.to_string(),
+            text: format!(
+                "Pi route {} completed smoke, but Ottto could not safely establish complete post-smoke local session evidence. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify.",
                 pi_route_label(route)
             ),
         },
@@ -12106,7 +12177,7 @@ fn pi_route_aggregate_result(
         ),
         SourceVerificationStatus::Failed if all_census_failed => (
             PI_SESSION_CENSUS_FAILED_CODE,
-            "Pi verification stopped before smoke because Ottto could not safely establish a complete local session baseline. Check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
+            "Pi verification could not safely establish complete local session evidence before or after smoke. No local session evidence was accepted; check that ~/.pi/agent/sessions is a real, readable directory, then retry Verify."
                 .to_string(),
         ),
         _ => (
@@ -19910,6 +19981,111 @@ mod tests {
         assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
         assert!(!aggregate.message.text.contains(private_error));
         assert!(!aggregate.message.text.contains("/Users/"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn live_pi_root_replacement_during_smoke_cannot_verify_from_reopened_count() {
+        let root = control_test_root("pi-live-root-replaced-during-smoke");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let sessions = home.join(".pi/agent/sessions");
+        let original = home.join(".pi/agent/sessions-original");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let result = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            prepare_pi_live_session_census,
+            |_, before_session_count| {
+                fs::rename(&sessions, &original).expect("move held pre-smoke root");
+                fs::create_dir(&sessions).expect("create replacement session root");
+                fs::write(sessions.join("preexisting-a.jsonl"), b"{}\n")
+                    .expect("write first replacement transcript");
+                fs::write(sessions.join("preexisting-b.jsonl"), b"{}\n")
+                    .expect("write second replacement transcript");
+                assert_eq!(
+                    local_session_observed(before_session_count),
+                    Some(true),
+                    "the legacy pathname count would misclassify replacement files as smoke evidence"
+                );
+                SmokeResult {
+                    command_found: true,
+                    succeeded: true,
+                    exit_status: Some(0),
+                    duration_ms: 1,
+                    message: "fake Pi smoke completed".to_string(),
+                    diagnostic: None,
+                    error_code: None,
+                    local_session_observed: Some(true),
+                }
+            },
+        );
+        let failed = match result {
+            Ok(_) => panic!("a replaced root must fail before route evidence is accepted"),
+            Err(failed) => *failed,
+        };
+
+        assert_eq!(failed.status, SourceVerificationStatus::Failed);
+        assert!(!failed.verified);
+        assert!(failed.command_found);
+        assert!(failed.command_succeeded);
+        assert_eq!(failed.exit_status, Some(0));
+        assert_eq!(failed.duration_ms, 1);
+        assert!(failed.smoke_after.is_some());
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some(PI_SESSION_CENSUS_FAILED_CODE)
+        );
+        assert_eq!(failed.local_session_observed, None);
+        assert!(failed.message.text.contains("completed smoke"));
+        assert!(!failed.message.text.contains("could not run a smoke"));
+        let aggregate = pi_route_aggregate_result(vec![failed]);
+        assert_eq!(aggregate.status, SourceVerificationStatus::Failed);
+        assert!(!aggregate.verified);
+        assert_eq!(aggregate.message.code, PI_SESSION_CENSUS_FAILED_CODE);
+        assert!(!aggregate.message.text.contains("stopped before smoke"));
+        assert!(aggregate.message.text.contains("before or after smoke"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn failed_live_pi_smoke_remains_primary_when_root_changes() {
+        let root = control_test_root("pi-live-root-replaced-after-failed-smoke");
+        let home = root.join("home");
+        create_control_test_dir(&home);
+        let sessions = home.join(".pi/agent/sessions");
+        let original = home.join(".pi/agent/sessions-original");
+        let _home_guard = EnvVarGuard::set_path("HOME", &home);
+
+        let (_, _, smoke) = run_pi_route_pre_smoke_with(
+            &live_pi_route(),
+            prepare_pi_live_session_census,
+            |_, _| {
+                fs::rename(&sessions, &original).expect("move held pre-smoke root");
+                fs::create_dir(&sessions).expect("create replacement session root");
+                SmokeResult {
+                    command_found: true,
+                    succeeded: false,
+                    exit_status: Some(23),
+                    duration_ms: 2,
+                    message: "fake Pi smoke failed".to_string(),
+                    diagnostic: Some("synthetic smoke failure".to_string()),
+                    error_code: Some("smoke_command_failed".to_string()),
+                    local_session_observed: Some(true),
+                }
+            },
+        )
+        .expect("failed smoke remains the primary route result");
+
+        assert!(!smoke.succeeded);
+        assert_eq!(smoke.exit_status, Some(23));
+        assert_eq!(smoke.error_code.as_deref(), Some("smoke_command_failed"));
+        assert_eq!(smoke.local_session_observed, None);
+        assert_eq!(smoke.message, "fake Pi smoke failed");
         let _ = fs::remove_dir_all(root);
     }
 
