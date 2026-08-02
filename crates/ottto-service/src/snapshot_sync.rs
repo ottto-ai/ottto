@@ -2273,8 +2273,8 @@ fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadEr
 }
 
 fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
-    if let Some(preflight) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
-        return preflight.reason.starts_with("snapshot[");
+    if is_item_specific_local_preflight_failure(error) {
+        return true;
     }
     error
         .downcast_ref::<BatchRejected>()
@@ -2283,6 +2283,18 @@ fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
             body.contains("\"loc\":[\"body\",\"snapshots\"")
                 || body.contains("'loc': ['body', 'snapshots'")
         })
+}
+
+fn is_item_specific_local_preflight_failure(error: &anyhow::Error) -> bool {
+    item_specific_local_preflight_index(error).is_some()
+}
+
+fn item_specific_local_preflight_index(error: &anyhow::Error) -> Option<usize> {
+    error
+        .downcast_ref::<SnapshotBatchPreflightRejected>()
+        .and_then(|preflight| preflight.reason.strip_prefix("snapshot["))
+        .and_then(|suffix| suffix.split_once(']'))
+        .and_then(|(index, _)| index.parse().ok())
 }
 
 /// True when the backend shed this request rather than failing it.
@@ -2476,6 +2488,40 @@ where
                     })
                 })?;
                 *accepted = accepted.saturating_add(response.accepted);
+            }
+            Err(error) if is_item_specific_local_preflight_failure(&error) => {
+                // The daemon validator names the exact request-local item. It
+                // has already proved those bytes cannot fit or satisfy the
+                // current wire contract, so quarantine that entity directly
+                // and retry only its siblings. This avoids spending remote
+                // adaptive-request budget or turning one bad item into twenty
+                // one-item network requests.
+                let request_index = item_specific_local_preflight_index(&error)
+                    .expect("local item preflight guard parsed an index");
+                let Some(poison_index) = indices.get(request_index).copied() else {
+                    return Err(error.context("local snapshot preflight index was out of bounds"));
+                };
+                let poison_fingerprint = fingerprint(&items[poison_index]);
+                let progress_before_quarantine = progress.clone();
+                progress.quarantine([fingerprint(&items[poison_index])]);
+                if persist(progress).is_err() {
+                    *progress = progress_before_quarantine;
+                    return Err(anyhow::Error::new(SnapshotLocalStateRejected {
+                        operation: "save local preflight quarantine",
+                    }));
+                }
+                // Count the loss only after its quarantine is durable. A local
+                // save failure must leave both the settlement and the once-set
+                // untouched so a successful retry can report the real loss.
+                record_poison_loss_once(poison_scope, poison_fingerprint);
+                let remaining = indices
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| (index != request_index).then_some(item))
+                    .collect::<Vec<_>>();
+                if !remaining.is_empty() {
+                    batches.push_front((remaining, false));
+                }
             }
             Err(error)
                 if indices.len() > 1
@@ -3436,6 +3482,189 @@ mod tests {
     }
 
     #[test]
+    #[serial(client_report)]
+    fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
+        use crate::client_report::reset_for_test;
+
+        reset_for_test();
+        let poison_scope = &unique_poison_scope();
+        let root = test_dir("snapshot-local-preflight-traversal");
+        std::fs::create_dir_all(&root).expect("create traversal fixture root");
+        for index in 0..3 {
+            std::fs::write(
+                root.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{},\"output\":1}}}}}}\n",
+                    index + 1
+                ),
+            )
+            .expect("write traversal fixture");
+        }
+
+        let index_path = root.join("pi-scan-index-v3.json");
+        let progress_path = root.join("pi-upload-progress-v2.json");
+        let mut index = ScanIndex::default();
+        let mut first = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            183,
+            2,
+            true,
+        )
+        .expect("scan first bounded page");
+        assert!(!first.census_complete);
+        assert_eq!(first.scanned_file_count, 2);
+        assert_eq!(first.snapshots.len(), 2);
+        let first_page_sessions = first
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.source_session_id.clone())
+            .collect::<BTreeSet<_>>();
+
+        // Model a long-lived session with enough ordinary hourly usage buckets
+        // to exceed the daemon/backend per-item wire cap. Keep every aggregate
+        // internally consistent so the only preflight failure is the byte cap.
+        let bucket_count = 1_000_u64;
+        let bucket_start =
+            OffsetDateTime::parse("2026-06-01T00:00:00Z", &Rfc3339).expect("parse bucket start");
+        let mut bucket_template = first.snapshots[0].usage_buckets[0].clone();
+        assert_eq!(bucket_template.model_usage.len(), 1);
+        let usage_buckets = (0..bucket_count)
+            .map(|hour| {
+                let timestamp = (bucket_start + TimeDuration::hours(hour as i64))
+                    .format(&Rfc3339)
+                    .expect("format bucket timestamp");
+                bucket_template.bucket_start = timestamp.clone();
+                bucket_template.first_activity_at = Some(timestamp.clone());
+                bucket_template.last_activity_at = Some(timestamp);
+                let row = &mut bucket_template.model_usage[0];
+                row.input_tokens = 1;
+                row.output_tokens = 1;
+                row.cache_read_tokens = 0;
+                row.cache_creation_5m_tokens = 0;
+                row.cache_creation_1h_tokens = 0;
+                row.reasoning_output_tokens = 0;
+                row.unattributed_total_tokens = 0;
+                row.request_count = 1;
+                bucket_template.clone()
+            })
+            .collect::<Vec<_>>();
+        let poison = &mut first.snapshots[0];
+        assert_eq!(poison.model_usage.len(), 1);
+        poison.input_tokens = bucket_count;
+        poison.output_tokens = bucket_count;
+        poison.cache_read_tokens = 0;
+        poison.cache_creation_5m_tokens = 0;
+        poison.cache_creation_1h_tokens = 0;
+        poison.reasoning_output_tokens = 0;
+        poison.unattributed_total_tokens = 0;
+        poison.request_count = bucket_count;
+        let top_row = &mut poison.model_usage[0];
+        top_row.input_tokens = bucket_count;
+        top_row.output_tokens = bucket_count;
+        top_row.cache_read_tokens = 0;
+        top_row.cache_creation_5m_tokens = 0;
+        top_row.cache_creation_1h_tokens = 0;
+        top_row.reasoning_output_tokens = 0;
+        top_row.unattributed_total_tokens = 0;
+        top_row.request_count = bucket_count;
+        poison.usage_buckets = usage_buckets;
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
+        let poison_fingerprint = first.snapshots[0].snapshot_fingerprint.clone();
+        let healthy_fingerprint = first.snapshots[1].snapshot_fingerprint.clone();
+        let poison_probe = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: SnapshotSource::Pi.api_slug().to_string(),
+            machine_id: "machine-preflight-test".to_string(),
+            collector_version: Some(collector_version()),
+            snapshots: vec![first.snapshots[0].clone()],
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let poison_reason = validate_snapshot_batch_request(&poison_probe)
+            .expect_err("long-lived session exceeds the item wire cap");
+        assert!(poison_reason.contains("wire body"), "{poison_reason}");
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut network_uploads = Vec::new();
+        let result = upload_resumable_batches(
+            &first.snapshots,
+            poison_scope,
+            &mut progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            |snapshots| {
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: SnapshotSource::Pi.api_slug().to_string(),
+                    machine_id: "machine-preflight-test".to_string(),
+                    collector_version: Some(collector_version()),
+                    snapshots,
+                    upload_policy: SnapshotUploadPolicy::default(),
+                    client_report: crate::client_report::ClientReport::empty(),
+                };
+                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                        reason,
+                    }));
+                }
+                network_uploads.extend(
+                    request
+                        .snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.snapshot_fingerprint.clone()),
+                );
+                Ok(accepted_batch(request.snapshots.len()))
+            },
+            |state| state.save(&progress_path),
+        )
+        .expect("deterministic local poison is settled by quarantine");
+
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(accepted, 1);
+        assert_eq!(network_uploads, vec![healthy_fingerprint.clone()]);
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&healthy_fingerprint));
+        assert!(progress
+            .quarantined_fingerprints
+            .contains_key(&poison_fingerprint));
+        assert!(progress_path.is_file(), "quarantine must be durable first");
+
+        // Mirror the completed caller boundary: the server-held sibling and
+        // quarantined poison become durable together with the traversal cursor,
+        // then the redundant upload ledger may be cleared.
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index
+            .save(&index_path)
+            .expect("save settled traversal page");
+        progress
+            .clear(&progress_path)
+            .expect("clear redundant upload progress");
+
+        let mut resumed = ScanIndex::load(&index_path).expect("reload traversal cursor");
+        let second = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut resumed,
+            "2026-07-31T00:05:00Z",
+            183,
+            2,
+            true,
+        )
+        .expect("scan later bounded page");
+        assert!(second.census_complete);
+        assert_eq!(second.scanned_file_count, 1);
+        assert_eq!(second.snapshots.len(), 1);
+        assert!(!first_page_sessions.contains(&second.snapshots[0].source_session_id));
+
+        let _ = std::fs::remove_dir_all(root);
+        reset_for_test();
+    }
+
+    #[test]
     fn metadata_only_snapshot_still_uploads_and_settles_after_manifest_omission() {
         let golden: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/snapshot-audit/snapshot-manifest-v2-metadata-only-golden.json"
@@ -3974,6 +4203,46 @@ mod tests {
     }
 
     #[test]
+    #[serial(client_report)]
+    fn local_preflight_quarantine_persist_failure_stays_unsettled() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+
+        reset_for_test();
+        let items = test_fingerprints(1);
+        let poison_scope = unique_poison_scope();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let error = upload_resumable_batches(
+            &items,
+            &poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                    reason: format!(
+                        "snapshot[0] wire body exceeds {} bytes",
+                        crate::snapshots::MAX_SNAPSHOT_ITEM_WIRE_BYTES
+                    ),
+                }))
+            },
+            |_| Err(anyhow!("checkpoint unavailable")),
+        )
+        .expect_err("an undurable quarantine cannot settle the source");
+
+        assert_eq!(
+            snapshot_upload_error_class(&error),
+            Some(SnapshotUploadErrorClass::LocalState)
+        );
+        assert_eq!(accepted, 0);
+        assert!(progress.accepted_fingerprints.is_empty());
+        assert!(progress.quarantined_fingerprints.is_empty());
+        assert!(counted_poison_fingerprints_for_test(&poison_scope).is_empty());
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+        reset_for_test();
+    }
+
+    #[test]
     fn accepted_count_mismatch_is_backend_response_not_transport() {
         let poison_scope = &unique_poison_scope();
         let items = test_fingerprints(1);
@@ -4180,6 +4449,7 @@ mod tests {
         assert!(is_item_specific_validation_failure(&error));
         assert_eq!(accepted, 24);
         assert_eq!(progress.accepted_fingerprints.len(), 24);
+        assert!(progress.quarantined_fingerprints.is_empty());
         assert!(!progress.contains(&items[19]));
         let uploaded = uploaded.lock().expect("capture lock");
         assert_eq!(uploaded.len(), 24);

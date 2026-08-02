@@ -4286,6 +4286,27 @@ fn scan_source_roots_with_limit(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn scan_source_roots_with_test_limit(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    artifacts_enabled: bool,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        artifacts_enabled,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source_roots_with_limit_and_attribution(
     source: SnapshotSource,
