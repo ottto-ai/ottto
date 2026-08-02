@@ -5728,8 +5728,6 @@ fn refresh_setup_run_token_via_device_secret(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
 ) -> Result<RefreshedSetupRunToken, LocalApiError> {
-    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
-        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     // SECURITY: this path POSTs the long-lived relay device_secret to the
     // backend. `connection.api_base_url` is deserialized from on-disk
     // connection.json (see `LocalConnectionBinding`) and is not trusted — a
@@ -5739,6 +5737,8 @@ fn refresh_setup_run_token_via_device_secret(
     // touching the device secret. Fail closed: both callers map an `Err` to a
     // reconnect/backend error, so an untrusted base never releases the secret.
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
+    crate::snapshot_client::ensure_no_incomplete_device_credential_promotion()
+        .map_err(|_| LocalApiError::IdentityMutationInProgress)?;
     let device = FileDeviceStore::default()
         .load()
         .map_err(|_| LocalApiError::StatePoisoned)?

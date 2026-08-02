@@ -141,9 +141,12 @@ associated quarantine witness is retained with it.
 Every request declares `snapshot_entity_ack:v1`. A capable response must be an
 exact, disjoint partition of the request into accepted, unchanged, permanently
 rejected, or conflict occurrences. ACK rows carry `occurrence_count`, and direct
-duplicate ACK validation remains multiset-exact. The uploader coalesces byte-
-equal same-fingerprint bodies to one representative; divergent bodies under one
-fingerprint are corruption and are quarantined while healthy siblings continue.
+duplicate ACK validation remains multiset-exact. The uploader coalesces every
+same-fingerprint occurrence to one representative. Whole item bytes may differ
+only in observation/inventory metadata that semantic identity deliberately
+excludes (for example collection time or a rotated file witness); daemon
+preflight still recomputes the fingerprint and rejects any changed semantic
+field before network I/O.
 Partial, short, foreign, zero-count, over-counted, or cross-classified ACKs
 settle nothing. Only an absent ACK-contract field selects legacy count-only
 compatibility; an unknown/future named contract fails closed before local

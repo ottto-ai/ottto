@@ -2358,47 +2358,32 @@ where
     }
 
     let mut pending_by_fingerprint: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
-    let mut divergent_fingerprints = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
         if !progress.contains(fingerprint(item)) {
-            let body = serde_json::to_vec(item).map_err(|_| {
-                anyhow::Error::new(SnapshotLocalStateRejected {
-                    operation: "serialize snapshot for duplicate proof",
-                })
-            })?;
             match pending_by_fingerprint.entry(fingerprint(item).to_string()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
+                    let body = serde_json::to_vec(item).map_err(|_| {
+                        anyhow::Error::new(SnapshotLocalStateRejected {
+                            operation: "serialize snapshot for batch packing",
+                        })
+                    })?;
                     entry.insert((index, body));
                 }
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    if entry.get().1 != body {
-                        divergent_fingerprints.insert(entry.key().clone());
-                    }
-                    // Exact byte-equal duplicates are one semantic entity.
-                    // Upload one representative rather than letting a burst of
-                    // identical local observations exceed the page limit.
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    // The finalized fingerprint covers every post-policy
+                    // semantic field and production preflight recomputes it
+                    // before upload. Observation/inventory fields deliberately
+                    // excluded from that identity (for example collected_at or
+                    // source_file_fingerprint after a rotate/recopy) may make
+                    // whole item bytes differ without creating another remote
+                    // entity. Upload one representative for that semantic
+                    // identity; every local file entry settles from the same
+                    // accepted fingerprint.
                 }
             }
         }
     }
-    for fingerprint in &divergent_fingerprints {
-        pending_by_fingerprint.remove(fingerprint);
-    }
     let mut deferred_validation_error = None;
-    if !divergent_fingerprints.is_empty() {
-        progress.quarantine(divergent_fingerprints.iter().map(String::as_str));
-        persist(progress).map_err(|_| {
-            anyhow::Error::new(SnapshotLocalStateRejected {
-                operation: "save divergent duplicate quarantine",
-            })
-        })?;
-        for fingerprint in &divergent_fingerprints {
-            record_poison_loss_once(poison_scope, fingerprint);
-        }
-        deferred_validation_error = Some(anyhow::Error::new(SnapshotLocalStateRejected {
-            operation: "quarantine divergent duplicate fingerprint bodies",
-        }));
-    }
     let mut batches = VecDeque::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
@@ -3550,7 +3535,7 @@ mod tests {
 
     #[test]
     #[serial(client_report)]
-    fn snapshot_upload_quarantines_divergent_duplicate_bodies_and_continues() {
+    fn snapshot_upload_coalesces_duplicate_semantics_with_distinct_observation_metadata() {
         use crate::client_report::{observe, reset_for_test, ClientReportReason};
 
         reset_for_test();
@@ -3560,7 +3545,7 @@ mod tests {
         let items = vec![
             SizedUploadItem {
                 fingerprint: duplicate.clone(),
-                body: "first".to_string(),
+                body: "source-file-observation-a".to_string(),
             },
             SizedUploadItem {
                 fingerprint: valid.clone(),
@@ -3568,13 +3553,13 @@ mod tests {
             },
             SizedUploadItem {
                 fingerprint: duplicate.clone(),
-                body: "divergent".to_string(),
+                body: "source-file-observation-b".to_string(),
             },
         ];
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let mut uploaded = Vec::new();
-        let error = upload_resumable_batches(
+        upload_resumable_batches(
             &items,
             &poison_scope,
             &mut progress,
@@ -3586,21 +3571,15 @@ mod tests {
             },
             |_| Ok(()),
         )
-        .expect_err("one fingerprint cannot alias divergent bodies");
+        .expect("observation-only differences keep one semantic entity");
 
-        assert_eq!(uploaded, vec![valid.clone()]);
-        assert_eq!(accepted, 1);
+        assert_eq!(uploaded, vec![duplicate.clone(), valid.clone()]);
+        assert_eq!(accepted, 2);
+        assert!(progress.accepted_fingerprints.contains(&duplicate));
         assert!(progress.accepted_fingerprints.contains(&valid));
-        assert!(progress.quarantined_fingerprints.contains_key(&duplicate));
-        assert_eq!(
-            snapshot_upload_error_class(&error),
-            Some(SnapshotUploadErrorClass::LocalState)
-        );
-        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 1);
-        assert_eq!(
-            counted_poison_fingerprints_for_test(&poison_scope),
-            BTreeSet::from([duplicate])
-        );
+        assert!(progress.quarantined_fingerprints.is_empty());
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+        assert!(counted_poison_fingerprints_for_test(&poison_scope).is_empty());
         reset_for_test();
     }
 

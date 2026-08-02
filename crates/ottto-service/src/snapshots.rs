@@ -922,7 +922,8 @@ pub struct ScanIndex {
     pub resume_census_window_end: Option<String>,
     /// At least one earlier page in this frozen sweep was only partially
     /// settled. The final page may finish discovery, but one clean follow-up
-    /// generation is still required before the policy epoch can advance.
+    /// generation is still required before completeness or the policy epoch
+    /// can advance.
     #[serde(default)]
     bounded_sweep_had_unsettled_upload: bool,
     /// Durable bounded filesystem census. It is intentionally destination-
@@ -3188,14 +3189,14 @@ struct UsageBucketState {
 impl UsageBucketState {
     fn note_activity_at(&mut self, timestamp: &str) {
         match self.first_activity_at.as_ref() {
-            Some(current) if timestamp < current.as_str() => {
+            Some(current) if timestamp_is_before(timestamp, current) => {
                 self.first_activity_at = Some(timestamp.to_string())
             }
             None => self.first_activity_at = Some(timestamp.to_string()),
             _ => {}
         }
         match self.last_activity_at.as_ref() {
-            Some(current) if timestamp > current.as_str() => {
+            Some(current) if timestamp_is_after(timestamp, current) => {
                 self.last_activity_at = Some(timestamp.to_string())
             }
             None => self.last_activity_at = Some(timestamp.to_string()),
@@ -3376,14 +3377,14 @@ impl SnapshotAccumulator {
         if self
             .started_at
             .as_ref()
-            .map_or(true, |current| timestamp < *current)
+            .map_or(true, |current| timestamp_is_before(&timestamp, current))
         {
             self.started_at = Some(timestamp.clone());
         }
         if self
             .last_activity_at
             .as_ref()
-            .map_or(true, |current| timestamp > *current)
+            .map_or(true, |current| timestamp_is_after(&timestamp, current))
         {
             self.last_activity_at = Some(timestamp);
         }
@@ -3396,14 +3397,14 @@ impl SnapshotAccumulator {
         if self
             .started_at
             .as_ref()
-            .map_or(true, |current| pi_timestamp_is_before(&timestamp, current))
+            .map_or(true, |current| timestamp_is_before(&timestamp, current))
         {
             self.started_at = Some(timestamp.clone());
         }
         if self
             .last_activity_at
             .as_ref()
-            .map_or(true, |current| pi_timestamp_is_after(&timestamp, current))
+            .map_or(true, |current| timestamp_is_after(&timestamp, current))
         {
             self.last_activity_at = Some(timestamp);
         }
@@ -3694,8 +3695,12 @@ impl SnapshotAccumulator {
             Some(previous) if usage.is_monotonic_after(previous) => usage.delta_from(previous),
             Some(_) => {
                 // Non-monotonic: treat as a session restart. Clear all
-                // buckets because the cumulative was invalidated.
+                // buckets and their exact session-wide sum because the
+                // cumulative was invalidated. Keeping the pre-restart sum
+                // would detach the top-level totals from the replacement
+                // buckets and make this otherwise valid file fail preflight.
                 self.usage_buckets.clear();
+                self.accepted_usage_totals = UsageTotals::default();
                 usage.clone()
             }
             None => usage.clone(),
@@ -4802,12 +4807,14 @@ fn scan_source_roots_with_limit_and_attribution(
         scanned_session_count += state_only_scanned;
         semantic_noop_count += state_only_noops;
     }
-    let census_complete = traversal_discovery_done
+    let raw_census_complete = traversal_discovery_done
         && traversal_healthy
         && clean_frozen_generation
         && state_census_complete
         && sidecar_census_complete
         && reconciliation_complete;
+    let needs_clean_followup = raw_census_complete && index.bounded_sweep_had_unsettled_upload;
+    let census_complete = raw_census_complete && !needs_clean_followup;
     let reconciliation_pending = traversal_discovery_done
         && traversal_healthy
         && clean_frozen_generation
@@ -4845,8 +4852,9 @@ fn scan_source_roots_with_limit_and_attribution(
     }
     let pending_work_count = pending_work_count
         .saturating_add(usize::from(restart_after_hints))
-        .saturating_add(usize::from(terminal_unhealthy));
-    if census_complete || restart_after_hints {
+        .saturating_add(usize::from(terminal_unhealthy))
+        .saturating_add(usize::from(needs_clean_followup));
+    if raw_census_complete || restart_after_hints {
         index.traversal = None;
         index.resume_after_path = None;
         index.resume_upper_bound_path = None;
@@ -7250,7 +7258,7 @@ fn pi_usage_timestamp_identity(value: &str) -> Option<String> {
         .map(|timestamp| timestamp.unix_timestamp_nanos().to_string())
 }
 
-fn pi_timestamp_is_before(candidate: &str, current: &str) -> bool {
+fn timestamp_is_before(candidate: &str, current: &str) -> bool {
     match (
         OffsetDateTime::parse(candidate, &Rfc3339),
         OffsetDateTime::parse(current, &Rfc3339),
@@ -7262,7 +7270,7 @@ fn pi_timestamp_is_before(candidate: &str, current: &str) -> bool {
     }
 }
 
-fn pi_timestamp_is_after(candidate: &str, current: &str) -> bool {
+fn timestamp_is_after(candidate: &str, current: &str) -> bool {
     match (
         OffsetDateTime::parse(candidate, &Rfc3339),
         OffsetDateTime::parse(current, &Rfc3339),
@@ -8641,6 +8649,14 @@ fn ensure_bounded_traversal(
     } else {
         0
     };
+
+    // A prior partially settled page may have advanced its traversal past an
+    // entity whose replacement was not accepted. Finishing that generation
+    // deliberately leaves this marker set and drops the traversal so the next
+    // cycle starts one clean follow-up walk. Reaching this point means that
+    // follow-up (or another explicit fresh generation) is now starting. Any
+    // new partial settlement stamps the marker again before persistence.
+    index.bounded_sweep_had_unsettled_upload = false;
 
     let mut census = ScanCensus::default();
     let resolved_roots = roots
@@ -12133,6 +12149,71 @@ mod tests {
         assert!(second.census_complete);
         assert_eq!(second.scanned_file_count, 1);
         assert_eq!(second.census_window_end, "2026-07-31T00:00:00Z");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsettled_bounded_page_requires_one_clean_followup_generation() {
+        let root = temp_dir("bounded-traversal-unsettled-followup");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{{\"type\":\"message_end\",\"message\":{{\"model\":\"gpt-5.4\",\"timestamp\":1784707201000,\"usage\":{{\"input\":{},\"output\":1}}}}}}\n",
+                    index + 1
+                ),
+            )
+            .expect("write traversal fixture");
+        }
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("first page");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut first, &mut index);
+        assert!(!first.census_complete);
+
+        // Model the shed branch's durable partial checkpoint. Its traversal
+        // cursor has consumed this page, but not every replacement entity was
+        // accepted, so the final page cannot become terminal authority.
+        index.mark_bounded_sweep_unsettled();
+        let mut final_page = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            3,
+            true,
+        )
+        .expect("finish unsettled generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut final_page, &mut index);
+        assert!(!final_page.census_complete);
+        assert!(final_page.scan_cap_hit);
+        assert!(index.traversal.is_none());
+        assert!(index.bounded_sweep_had_unsettled_upload);
+
+        let mut clean_followup = scan_source_roots_with_limit(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-07-31T00:10:00Z",
+            BACKFILL_WINDOW_DAYS,
+            4,
+            true,
+        )
+        .expect("run clean follow-up generation");
+        finalize_scan_after_policy(SnapshotSource::Pi, &mut clean_followup, &mut index);
+        assert!(clean_followup.census_complete);
+        assert!(!clean_followup.scan_cap_hit);
+        assert!(!index.bounded_sweep_had_unsettled_upload);
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -21226,20 +21307,20 @@ mod tests {
 
     #[test]
     fn pi_timestamp_order_handles_fractional_rfc3339_and_invalid_fallbacks() {
-        assert!(pi_timestamp_is_before(
+        assert!(timestamp_is_before(
             "2026-07-22T08:00:00Z",
             "2026-07-22T08:00:00.500Z"
         ));
-        assert!(pi_timestamp_is_after(
+        assert!(timestamp_is_after(
             "2026-07-22T08:00:00.500Z",
             "2026-07-22T08:00:00Z"
         ));
-        assert!(pi_timestamp_is_before("invalid-a", "invalid-b"));
-        assert!(pi_timestamp_is_after("invalid-b", "invalid-a"));
-        assert!(!pi_timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
-        assert!(!pi_timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
-        assert!(pi_timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
-        assert!(pi_timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
+        assert!(timestamp_is_before("invalid-a", "invalid-b"));
+        assert!(timestamp_is_after("invalid-b", "invalid-a"));
+        assert!(!timestamp_is_before("invalid-a", "2026-07-22T08:00:00Z"));
+        assert!(!timestamp_is_after("invalid-b", "2026-07-22T08:00:00Z"));
+        assert!(timestamp_is_before("2026-07-22T08:00:00Z", "invalid-a"));
+        assert!(timestamp_is_after("2026-07-22T08:00:00Z", "invalid-b"));
     }
 
     #[test]
@@ -21986,6 +22067,93 @@ mod tests {
             "post-rollover gets only the delta"
         );
         assert_eq!(post.model_usage[0].output_tokens, 15);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_cumulative_restart_replaces_exact_totals_with_replacement_buckets() {
+        let path = temp_file("codex-cumulative-restart");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T23:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-restart-session\"}}\n",
+                "{\"timestamp\":\"2026-05-31T23:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":40,\"request_count\":2},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-06-01T00:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":8,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let items = parse_codex_jsonl_file(
+            &path,
+            "2026-06-01T00:35:00Z",
+            "restart-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.input_tokens, 20);
+        assert_eq!(item.output_tokens, 8);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(item.usage_buckets[0].bucket_start, "2026-06-01T00:00:00Z");
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: SnapshotSource::Codex.api_slug().to_string(),
+            machine_id: "otm_test".to_string(),
+            collector_version: Some(collector_version()),
+            snapshots: items,
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        validate_snapshot_batch_request(&request)
+            .expect("replacement cumulative and buckets remain preflight-consistent");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_fractional_timestamps_keep_chronological_lifecycle_and_bucket_extrema() {
+        let path = temp_file("codex-fractional-timestamp-order");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-05-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-fractional-session\"}}\n",
+                "{\"timestamp\":\"2026-05-31T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":4,\"request_count\":1},\"model\":\"gpt-5.5\"}}}\n",
+                "{\"timestamp\":\"2026-05-31T10:00:00.900Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"output_tokens\":8,\"request_count\":2},\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_codex_jsonl_file(
+            &path,
+            "2026-05-31T10:01:00Z",
+            "fractional-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-05-31T10:00:00Z")
+        );
+        assert_eq!(
+            item.source_last_activity_at.as_deref(),
+            Some("2026-05-31T10:00:00.900Z")
+        );
+        let bucket = &item.usage_buckets[0];
+        let first = OffsetDateTime::parse(
+            bucket.first_activity_at.as_deref().expect("first activity"),
+            &Rfc3339,
+        )
+        .expect("parse first activity");
+        let last = OffsetDateTime::parse(
+            bucket.last_activity_at.as_deref().expect("last activity"),
+            &Rfc3339,
+        )
+        .expect("parse last activity");
+        assert!(first < last);
 
         let _ = fs::remove_file(path);
     }
