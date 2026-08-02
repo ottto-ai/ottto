@@ -687,6 +687,7 @@ mod tests {
             peak_context_fill_tokens: posture.1,
             compaction_count: posture.2,
             compaction_timestamps: Vec::new(),
+            activity_summary: None,
             model_usage,
             usage_buckets: Vec::new(),
             cost: None,

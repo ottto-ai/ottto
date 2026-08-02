@@ -169,7 +169,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // `compact_boundary` system record and a legacy `isCompactSummary` user record
 // a few milliseconds apart. Pair those provider records into one event while
 // retaining support for transcripts that carry only one of the two shapes.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v25";
+// codex v26: Codex Desktop persists the authoritative parent -> child graph in
+// `state_5.sqlite.thread_spawn_edges`, while many rollout headers expose only
+// `thread_source=subagent` and omit the parent object. Join that bounded local
+// sidecar so existing Codex child sessions emit exact parent/root/depth facts.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v26";
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v25";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
@@ -200,7 +204,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // forever. The one-time revisit stays bounded: an unchanged session re-parses
 // to a new title but is otherwise a semantic no-op-sized re-upload of
 // already-known usage.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v25";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v26";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v23";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
@@ -566,6 +570,33 @@ pub struct SnapshotOrigin {
     pub parent_session_ref: Option<String>, // Provider-native parent session id when present
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotActivityCount {
+    pub name: String,
+    pub count: u64,
+}
+
+/// Content-free local activity evidence derived from Codex rollout records.
+/// Commands, arguments, paths, patches, and tool output never leave the Mac.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotActivitySummary {
+    pub tool_calls: u64,
+    pub shell_commands: u64,
+    pub patch_operations: u64,
+    pub changed_files: u64,
+    pub lines_added: u64,
+    pub lines_deleted: u64,
+    pub web_searches: u64,
+    pub mcp_calls: u64,
+    pub subagent_spawns: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_counts: Vec<SnapshotActivityCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tool_counts: Vec<SnapshotActivityCount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+}
+
 impl SnapshotOrigin {
     fn is_empty(&self) -> bool {
         self.thread_source.is_none()
@@ -640,6 +671,8 @@ pub struct SnapshotItem {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_summary: Option<SnapshotActivitySummary>,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1222,6 +1255,14 @@ pub fn apply_upload_policy(
             && crate::session_attribution::strip_display_labels(&mut item.attribution_facts)
         {
             fingerprint_needs_refresh = true;
+        }
+        if !policy.session_attribution_labels_enabled {
+            if let Some(summary) = item.activity_summary.as_mut() {
+                if !summary.skills.is_empty() {
+                    summary.skills.clear();
+                    fingerprint_needs_refresh = true;
+                }
+            }
         }
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
@@ -1872,6 +1913,9 @@ pub(crate) fn snapshot_semantic_component_hashes(
                 "compaction_timestamps": &item.compaction_timestamps,
             }),
         );
+    }
+    if source == SnapshotSource::Codex {
+        insert("activity_summary", json!(&item.activity_summary));
     }
     insert(
         "display_identity",
@@ -2540,6 +2584,7 @@ impl SelectorCapture {
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
+    spawn_parents: BTreeMap<String, String>,
     /// True only when an existing state DB could not be read completely. A
     /// missing DB means there is no state-only source and is complete-empty.
     state_census_incomplete: bool,
@@ -3248,6 +3293,19 @@ struct SnapshotAccumulator {
     accepted_usage_totals: UsageTotals,
     usage_buckets: BTreeMap<String, UsageBucketState>,
     origin: SnapshotOrigin,
+    codex_root_session_ref: Option<String>,
+    codex_spawn_depth: Option<u64>,
+    activity_tool_counts: BTreeMap<String, u64>,
+    activity_call_tools: BTreeMap<String, String>,
+    activity_mcp_tool_counts: BTreeMap<String, u64>,
+    activity_skills: BTreeSet<String>,
+    activity_changed_file_hashes: BTreeSet<String>,
+    activity_patch_operations: u64,
+    activity_lines_added: u64,
+    activity_lines_deleted: u64,
+    activity_web_searches: u64,
+    activity_mcp_calls: u64,
+    activity_subagent_spawns: u64,
     artifacts: Vec<SessionArtifact>,
     /// Whether VCS artifact scraping runs for this session. Defaults to ``true``
     /// (see ``new``); the production scan path sets it from the org upload
@@ -3334,6 +3392,19 @@ impl SnapshotAccumulator {
             accepted_usage_totals: UsageTotals::default(),
             usage_buckets: BTreeMap::new(),
             origin: SnapshotOrigin::default(),
+            codex_root_session_ref: None,
+            codex_spawn_depth: None,
+            activity_tool_counts: BTreeMap::new(),
+            activity_call_tools: BTreeMap::new(),
+            activity_mcp_tool_counts: BTreeMap::new(),
+            activity_skills: BTreeSet::new(),
+            activity_changed_file_hashes: BTreeSet::new(),
+            activity_patch_operations: 0,
+            activity_lines_added: 0,
+            activity_lines_deleted: 0,
+            activity_web_searches: 0,
+            activity_mcp_calls: 0,
+            activity_subagent_spawns: 0,
             artifacts: Vec::new(),
             // Default on so direct parse-function callers (mostly tests) keep
             // extracting; the production scan path overrides this from policy.
@@ -3368,6 +3439,75 @@ impl SnapshotAccumulator {
                 self.artifacts.push(artifact);
             }
         }
+    }
+
+    fn note_activity_tool(&mut self, name: &str) {
+        let Some(name) = bounded_activity_label(name) else {
+            return;
+        };
+        // `exec` is Codex Desktop's transport wrapper. Its nested `tools.*`
+        // calls are counted separately so the UI reports actions, not protocol.
+        if name == "exec" {
+            return;
+        }
+        *self.activity_tool_counts.entry(name).or_default() += 1;
+    }
+
+    fn reclassify_activity_call_as_mcp(&mut self, call_id: &str) {
+        let Some(name) = self.activity_call_tools.remove(call_id) else {
+            return;
+        };
+        let Some(count) = self.activity_tool_counts.get_mut(&name) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.activity_tool_counts.remove(&name);
+        }
+    }
+
+    fn note_activity_material(&mut self, material: &str) {
+        for name in nested_unified_exec_tools(material) {
+            self.note_activity_tool(&name);
+        }
+        for skill in skill_names_from_material(material) {
+            self.activity_skills.insert(skill);
+        }
+    }
+
+    fn activity_summary(&self) -> Option<SnapshotActivitySummary> {
+        if self.source != SnapshotSource::Codex {
+            return None;
+        }
+        let tool_calls = self
+            .activity_tool_counts
+            .values()
+            .copied()
+            .sum::<u64>()
+            .saturating_add(self.activity_mcp_calls);
+        let has_activity = tool_calls > 0
+            || self.activity_patch_operations > 0
+            || self.activity_web_searches > 0
+            || self.activity_subagent_spawns > 0
+            || !self.activity_skills.is_empty();
+        has_activity.then(|| SnapshotActivitySummary {
+            tool_calls,
+            shell_commands: self
+                .activity_tool_counts
+                .get("exec_command")
+                .copied()
+                .unwrap_or_default(),
+            patch_operations: self.activity_patch_operations,
+            changed_files: self.activity_changed_file_hashes.len() as u64,
+            lines_added: self.activity_lines_added,
+            lines_deleted: self.activity_lines_deleted,
+            web_searches: self.activity_web_searches,
+            mcp_calls: self.activity_mcp_calls,
+            subagent_spawns: self.activity_subagent_spawns,
+            tool_counts: bounded_activity_counts(&self.activity_tool_counts, 64),
+            mcp_tool_counts: bounded_activity_counts(&self.activity_mcp_tool_counts, 32),
+            skills: self.activity_skills.iter().take(32).cloned().collect(),
+        })
     }
 
     fn note_time(&mut self, timestamp: Option<String>) {
@@ -3491,9 +3631,6 @@ impl SnapshotAccumulator {
     }
 
     fn apply_codex_title_metadata(&mut self, path: &Path, metadata: &CodexTitleMetadata) {
-        if self.title.is_some() {
-            return;
-        }
         let session_id = self
             .source_session_id
             .clone()
@@ -3501,6 +3638,16 @@ impl SnapshotAccumulator {
         let Some(session_id) = session_id else {
             return;
         };
+        if let Some((parent, root, depth)) = metadata.family_position(session_id.as_str()) {
+            self.origin.thread_source = Some("subagent".to_string());
+            self.origin.source_subagent = Some(true);
+            self.origin.parent_session_ref = Some(parent);
+            self.codex_root_session_ref = Some(root);
+            self.codex_spawn_depth = Some(depth);
+        }
+        if self.title.is_some() {
+            return;
+        }
         if let Some(title) = metadata.titles.get(session_id.as_str()) {
             self.set_title_if_absent(Some(title.title.clone()), title.source.as_str());
         }
@@ -3806,6 +3953,15 @@ impl SnapshotAccumulator {
             collected_at,
             self.source.parser_version(),
         );
+        if let Some(root_session_ref) = self.codex_root_session_ref.as_deref() {
+            attribution_facts.extend(crate::session_attribution::codex_subagent_facts(
+                root_session_ref,
+                &source_session_id,
+                self.codex_spawn_depth,
+                collected_at,
+                self.source.parser_version(),
+            ));
+        }
         // Subagent identity rides immediately behind the direct provider facts
         // and ahead of the grouping facts: `enforce_fact_limits` trims from the
         // tail, so the tree edges and the agent identity outrank the derived
@@ -3859,6 +4015,7 @@ impl SnapshotAccumulator {
             SnapshotSource::ClaudeCode => Some("uncached".to_string()),
             SnapshotSource::Pi => Some("uncached".to_string()),
         };
+        let activity_summary = self.activity_summary();
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
@@ -3950,6 +4107,7 @@ impl SnapshotAccumulator {
             } else {
                 Vec::new()
             },
+            activity_summary,
             model_usage,
             usage_buckets,
             cost: totals.costs.snapshot_cost(),
@@ -5039,6 +5197,7 @@ fn codex_state_only_snapshot(
         first_turn_context_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
+        activity_summary: None,
         model_usage,
         usage_buckets,
         cost: None,
@@ -6233,6 +6392,79 @@ fn pi_selector_from_usage_message(value: &Value) -> SelectorCapture {
     selector
 }
 
+fn bounded_activity_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn nested_unified_exec_tools(material: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut remaining = material;
+    while let Some(index) = remaining.find("tools.") {
+        remaining = &remaining[index + "tools.".len()..];
+        let end = remaining
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .unwrap_or(remaining.len());
+        let candidate = &remaining[..end];
+        let suffix = remaining[end..].trim_start();
+        if suffix.starts_with('(') {
+            if let Some(name) = bounded_activity_label(candidate) {
+                names.push(name);
+            }
+        }
+        remaining = &remaining[end..];
+    }
+    names
+}
+
+fn skill_names_from_material(material: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut remaining = material;
+    while let Some(index) = remaining.find("/skills/") {
+        remaining = &remaining[index + "/skills/".len()..];
+        let Some(end) = remaining.find("/SKILL.md") else {
+            break;
+        };
+        let candidate = &remaining[..end];
+        if !candidate.contains('/') {
+            if let Some(name) = bounded_activity_label(candidate) {
+                names.push(name);
+            }
+        }
+        remaining = &remaining[end + "/SKILL.md".len()..];
+    }
+    names
+}
+
+fn bounded_activity_counts(
+    counts: &BTreeMap<String, u64>,
+    limit: usize,
+) -> Vec<SnapshotActivityCount> {
+    let mut rows = counts
+        .iter()
+        .map(|(name, count)| SnapshotActivityCount {
+            name: name.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows.truncate(limit);
+    rows
+}
+
 fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["session_meta", "payload", "id"])
@@ -6377,6 +6609,83 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
             implicit_request_count,
             accumulator.latest_reasoning_effort.clone(),
         );
+    }
+    if string_eq_at(value, &["type"], "response_item") {
+        let payload_type = string_at(value, &["payload", "type"]);
+        if matches!(
+            payload_type.as_deref(),
+            Some("function_call" | "custom_tool_call")
+        ) {
+            if let Some(name) = string_at(value, &["payload", "name"]) {
+                accumulator.note_activity_tool(&name);
+                if payload_type.as_deref() == Some("function_call") {
+                    if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
+                        accumulator.activity_call_tools.insert(call_id, name);
+                    }
+                }
+            }
+            if let Some(material) = string_at(value, &["payload", "arguments"])
+                .or_else(|| string_at(value, &["payload", "input"]))
+            {
+                accumulator.note_activity_material(&material);
+            }
+        }
+        if payload_type.as_deref() == Some("function_call_output") {
+            if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
+                accumulator.activity_call_tools.remove(&call_id);
+            }
+        }
+    }
+    if matches!(
+        string_at(value, &["type"]).as_deref(),
+        Some("event_msg" | "response_item")
+    ) {
+        match string_at(value, &["payload", "type"]).as_deref() {
+            Some("patch_apply_end") => {
+                accumulator.activity_patch_operations += 1;
+                if let Some(changes) =
+                    raw_value_at(value, &["payload", "changes"]).and_then(Value::as_object)
+                {
+                    for (path, change) in changes {
+                        accumulator
+                            .activity_changed_file_hashes
+                            .insert(sha256_hex(&[path]));
+                        if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
+                            for line in diff.lines() {
+                                if line.starts_with('+') && !line.starts_with("+++") {
+                                    accumulator.activity_lines_added += 1;
+                                } else if line.starts_with('-') && !line.starts_with("---") {
+                                    accumulator.activity_lines_deleted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("web_search_end") => accumulator.activity_web_searches += 1,
+            Some("mcp_tool_call_end") => {
+                accumulator.activity_mcp_calls += 1;
+                if let Some(call_id) = string_at(value, &["payload", "call_id"]) {
+                    accumulator.reclassify_activity_call_as_mcp(&call_id);
+                }
+                let server = string_at(value, &["payload", "app_name"])
+                    .or_else(|| string_at(value, &["payload", "invocation", "server"]));
+                let tool = string_at(value, &["payload", "action_name"])
+                    .or_else(|| string_at(value, &["payload", "invocation", "tool"]));
+                if let (Some(server), Some(tool)) = (server, tool) {
+                    if let Some(name) = bounded_activity_label(&format!("{server}.{tool}")) {
+                        *accumulator
+                            .activity_mcp_tool_counts
+                            .entry(name)
+                            .or_default() += 1;
+                    }
+                }
+            }
+            Some("sub_agent_activity") if string_eq_at(value, &["payload", "kind"], "started") => {
+                accumulator.activity_subagent_spawns += 1;
+            }
+            _ => {}
+        }
     }
     // Per-turn latency from the rollout `task_complete` event. Codex emits
     // `duration_ms` + `time_to_first_token_ms` only here (never over OTLP), so
@@ -7700,11 +8009,27 @@ impl BoundedCandidateSelection {
 }
 
 impl CodexTitleMetadata {
+    fn family_position(&self, child: &str) -> Option<(String, String, u64)> {
+        let parent = self.spawn_parents.get(child)?.clone();
+        let mut root = parent.clone();
+        let mut depth = 1_u64;
+        let mut seen = BTreeSet::from([child.to_string()]);
+        while let Some(next) = self.spawn_parents.get(root.as_str()) {
+            if !seen.insert(root.clone()) || depth >= 128 {
+                return None;
+            }
+            root = next.clone();
+            depth += 1;
+        }
+        Some((parent, root, depth))
+    }
+
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
         let title = self.titles.get(source_session_id);
         let thread = self.state_threads.get(source_session_id);
+        let family = self.family_position(source_session_id);
         sha256_hex(&[
-            "codex_session_sidecar:v1",
+            "codex_session_sidecar:v2",
             source_session_id,
             title.map(|value| value.title.as_str()).unwrap_or(""),
             title.map(|value| value.source.as_str()).unwrap_or(""),
@@ -7727,6 +8052,19 @@ impl CodexTitleMetadata {
             thread
                 .and_then(|value| value.model.as_deref())
                 .unwrap_or(""),
+            family
+                .as_ref()
+                .map(|(parent, _, _)| parent.as_str())
+                .unwrap_or(""),
+            family
+                .as_ref()
+                .map(|(_, root, _)| root.as_str())
+                .unwrap_or(""),
+            &family
+                .as_ref()
+                .map(|(_, _, depth)| *depth)
+                .unwrap_or_default()
+                .to_string(),
         ])
     }
 
@@ -7750,7 +8088,9 @@ impl CodexTitleMetadata {
             let title_census = load_codex_sqlite_titles(&state_path, &mut metadata.titles);
             let state_census =
                 load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
-            if title_census.is_err() || state_census.is_err() {
+            let spawn_census =
+                load_codex_sqlite_spawn_edges(&state_path, &mut metadata.spawn_parents);
+            if title_census.is_err() || state_census.is_err() || spawn_census.is_err() {
                 metadata.state_census_incomplete = true;
                 metadata.sidecar_census_incomplete = true;
             }
@@ -8023,6 +8363,37 @@ fn load_codex_sqlite_state_threads(
     }
     for (id, thread) in loaded {
         state_threads.insert(id, thread);
+    }
+    Ok(())
+}
+
+fn load_codex_sqlite_spawn_edges(
+    path: &Path,
+    spawn_parents: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open Codex spawn-edge database")?;
+    let columns = sqlite_table_columns(&connection, "thread_spawn_edges")?;
+    if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")
+        .context("prepare Codex spawn-edge census")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut loaded = Vec::new();
+    for row in rows {
+        loaded.push(row.context("read Codex spawn-edge census row")?);
+    }
+    for (parent, child) in loaded {
+        if !parent.is_empty() && !child.is_empty() && parent != child {
+            spawn_parents.insert(child, parent);
+        }
     }
     Ok(())
 }
@@ -11018,6 +11389,143 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
         }
+    }
+
+    #[test]
+    fn codex_sqlite_spawn_edges_restore_nested_subagent_lineage() {
+        let home = temp_dir("codex-spawn-lineage");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        let database = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+        database
+            .execute_batch(
+                "CREATE TABLE thread_spawn_edges (\
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
+                );\
+                INSERT INTO thread_spawn_edges VALUES ('root-session', 'child-session');\
+                INSERT INTO thread_spawn_edges VALUES ('child-session', 'grandchild-session');",
+            )
+            .expect("seed spawn edges");
+        drop(database);
+        let path = sessions_dir.join("rollout-grandchild-session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"grandchild-session\",\"thread_source\":\"subagent\"}}\n",
+                "{\"timestamp\":\"2026-08-02T06:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1},\"model\":\"gpt-5.6\"}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-08-02T06:02:00Z",
+            "fingerprint".to_string(),
+            &metadata,
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let origin = item.origin.as_ref().expect("subagent origin");
+        assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(origin.parent_session_ref.as_deref(), Some("child-session"));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "root_session_ref" && fact.value == "root-session" }));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "spawn_depth" && fact.value == "2" }));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| { fact.field == "agent_ref" && fact.value == "grandchild-session" }));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_activity_summary_counts_actions_without_uploading_content() {
+        let path = temp_file("codex-activity-summary");
+        let lines = vec![
+            json!({"timestamp":"2026-08-02T06:00:00Z","type":"session_meta","payload":{"id":"activity-session"}}),
+            json!({"timestamp":"2026-08-02T06:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"secret command\"}"}}),
+            json!({"timestamp":"2026-08-02T06:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({}); await tools.write_stdin({}); /skills/repo-task-lifecycle/SKILL.md"}}),
+            json!({"timestamp":"2026-08-02T06:00:03Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"private patch content"}}),
+            json!({"timestamp":"2026-08-02T06:00:04Z","type":"event_msg","payload":{"type":"patch_apply_end","changes":{"src/private.rs":{"unified_diff":"--- a/src/private.rs\n+++ b/src/private.rs\n-old\n+new\n"},"tests/secret.rs":{"unified_diff":"--- /dev/null\n+++ b/tests/secret.rs\n+test\n"}}}}),
+            json!({"timestamp":"2026-08-02T06:00:05Z","type":"response_item","payload":{"type":"web_search_end"}}),
+            json!({"timestamp":"2026-08-02T06:00:05.500Z","type":"response_item","payload":{"type":"function_call","name":"_get_pr_info","call_id":"mcp-call","arguments":"{}"}}),
+            json!({"timestamp":"2026-08-02T06:00:06Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"mcp-call","app_name":"GitHub","action_name":"get_pr_info"}}),
+            json!({"timestamp":"2026-08-02T06:00:06.500Z","type":"response_item","payload":{"type":"mcp_tool_call_end","invocation":{"server":"chrome_devtools","tool":"take_snapshot"},"result":{"Ok":{"content":[]}}}}),
+            json!({"timestamp":"2026-08-02T06:00:07Z","type":"event_msg","payload":{"type":"sub_agent_activity","kind":"started"}}),
+            json!({"timestamp":"2026-08-02T06:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"request_count":1},"model":"gpt-5.6"}}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let summary = item.activity_summary.as_ref().expect("activity summary");
+        assert_eq!(summary.tool_calls, 6);
+        assert_eq!(summary.shell_commands, 2);
+        assert_eq!(summary.patch_operations, 1);
+        assert_eq!(summary.changed_files, 2);
+        assert_eq!(summary.lines_added, 2);
+        assert_eq!(summary.lines_deleted, 1);
+        assert_eq!(summary.web_searches, 1);
+        assert_eq!(summary.mcp_calls, 2);
+        assert_eq!(summary.subagent_spawns, 1);
+        assert_eq!(summary.skills, vec!["repo-task-lifecycle"]);
+        assert!(summary
+            .mcp_tool_counts
+            .iter()
+            .any(|row| row.name == "GitHub.get_pr_info" && row.count == 1));
+        assert!(summary
+            .mcp_tool_counts
+            .iter()
+            .any(|row| row.name == "chrome_devtools.take_snapshot" && row.count == 1));
+        let encoded = serde_json::to_string(summary).expect("serialize");
+        assert!(!encoded.contains("src/private.rs"));
+        assert!(!encoded.contains("secret command"));
+        assert!(!encoded.contains("private patch content"));
+
+        let original_fingerprint = item.snapshot_fingerprint.clone();
+        let mut labels_disabled = item.clone();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut labels_disabled),
+            SnapshotUploadPolicy {
+                session_titles_enabled: true,
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: false,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
+        assert!(labels_disabled
+            .activity_summary
+            .as_ref()
+            .expect("activity summary")
+            .skills
+            .is_empty());
+        assert_ne!(labels_disabled.snapshot_fingerprint, original_fingerprint);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -15848,6 +16356,7 @@ mod tests {
             first_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            activity_summary: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             cost: None,
@@ -22233,6 +22742,7 @@ mod tests {
             "first_turn_context_tokens",
             "compaction_count",
             "compaction_timestamps",
+            "activity_summary",
             "model_usage",
             "usage_buckets",
             "cost",
@@ -22383,6 +22893,26 @@ mod tests {
             first_turn_context_tokens: Some(105),
             compaction_count: Some(0),
             compaction_timestamps: Vec::new(),
+            activity_summary: Some(SnapshotActivitySummary {
+                tool_calls: 3,
+                shell_commands: 1,
+                patch_operations: 1,
+                changed_files: 1,
+                lines_added: 2,
+                lines_deleted: 1,
+                web_searches: 0,
+                mcp_calls: 1,
+                subagent_spawns: 0,
+                tool_counts: vec![SnapshotActivityCount {
+                    name: "exec_command".to_string(),
+                    count: 1,
+                }],
+                mcp_tool_counts: vec![SnapshotActivityCount {
+                    name: "GitHub.get_pr_info".to_string(),
+                    count: 1,
+                }],
+                skills: vec!["repo-task-lifecycle".to_string()],
+            }),
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
@@ -22643,6 +23173,7 @@ mod tests {
                 first_turn_context_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
+                activity_summary: None,
                 model_usage: vec![row.clone()],
                 usage_buckets: vec![SnapshotUsageBucket {
                     bucket_start: "2026-05-28T17:00:00Z".to_string(),
