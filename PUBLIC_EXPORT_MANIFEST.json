@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 301,
-  "content_sha256": "13443cf93262b04bd9903cfbf7ca284b388821c4bc4e9cf8e2340b06abee9776",
+  "candidate_file_count": 302,
+  "content_sha256": "109c40b3a7fbd425c1d5301eccc19e660dada90afa735c643e9c1b33e243f227",
   "files": [
     {
       "executable": false,
@@ -832,8 +832,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "83952f349225b9f5e5b1d5320937f773016f495cf26df4961f26e651f05eb430",
-      "size_bytes": 240922
+      "sha256": "bee2a6435d3ead75e83e066aa348682b3f69157eada35bff38cc4fd0fb1157c1",
+      "size_bytes": 253210
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "75b40a289f8e3f519096e2b2b6e133608ac3db2cae8df4aa84ca596919e908b1",
-      "size_bytes": 972480
+      "sha256": "d6311123f27398f91eab798f601a4077501f6998ec281389674f05793c97d837",
+      "size_bytes": 972967
     },
     {
       "executable": false,
@@ -1247,6 +1247,13 @@
       "path": "docs/session-2026-08-01-setup-claim-credential-continuity.md",
       "sha256": "06aa117acef4319310a8a6ade33c19d454683b9b6c3a515a35295e2c17a40fdc",
       "size_bytes": 3079
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-02-scanner-preflight-poison-liveness.md",
+      "sha256": "e4dc7d6c2845259c9c170c536f689ba2592c776d875b42a50557bcd90513bdee",
+      "size_bytes": 1529
     },
     {
       "executable": false,
@@ -2110,9 +2117,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-01T20:22:13+00:00",
+  "generated_at": "2026-08-02T01:23:07+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 302,
+  "output_file_count": 303,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2146,5 +2153,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "bf8c0b4e11bcb1af510cf95e6dfdfbca776a6259"
+  "source_commit": "a83d613a8adac64e7bd1ec46fd328e1b68f3b7b4"
 }
