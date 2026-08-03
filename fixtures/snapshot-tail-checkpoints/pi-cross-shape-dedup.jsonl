@@ -1,0 +1,4 @@
+{"type":"session","id":"tail-pi-dedup","timestamp":"2026-08-01T13:00:00Z"}
+{"type":"message","timestamp":"2026-08-01T13:01:00Z","message":{"role":"assistant","model":"pi-model-a","responseId":"response-a","timestamp":"2026-08-01T13:01:00Z","usage":{"input":12,"output":3}}}
+{"type":"message_end","timestamp":"2026-08-01T13:01:00Z","message":{"model":"pi-model-a","responseId":"response-a","timestamp":"2026-08-01T13:01:00Z","usage":{"input":12,"output":3}}}
+{"type":"message","timestamp":"2026-08-01T13:02:00Z","message":{"role":"assistant","model":"pi-model-b","responseId":"response-b","timestamp":"2026-08-01T13:02:00Z","usage":{"input":7,"output":5}}}

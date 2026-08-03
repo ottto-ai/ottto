@@ -19,6 +19,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use toml_edit::{DocumentMut, Item};
 
+/// JSON object keys cannot represent structured accumulator keys. Persist
+/// those ordered maps as entry arrays without changing their in-memory shape.
+mod ordered_map_entries {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<K, V, S>(value: &BTreeMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize + Ord,
+        V: Serialize,
+        S: Serializer,
+    {
+        value.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Vec::<(K, V)>::deserialize(deserializer).map(|entries| entries.into_iter().collect())
+    }
+}
+
 pub fn collector_version() -> String {
     ottto_core::compiled_release_version()
 }
@@ -227,6 +252,9 @@ const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
 const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
 const FILE_CONTENT_SAMPLE_BYTES: usize = 4 * 1024;
+const TAIL_PARSE_CHECKPOINT_VERSION: u16 = 1;
+const TAIL_PARSE_PREFIX_GUARD_VERSION: &str = "tail_prefix_guard:v1";
+const TAIL_PARSE_CHECKPOINT_ENV: &str = "OTTTO_TAIL_PARSE_CHECKPOINTS";
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
 pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
 pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
@@ -315,13 +343,13 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
 
 const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 enum ClaudeCompactionKind {
     LegacySummary,
     CurrentBoundary,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaudeCompactionObservation {
     kind: ClaudeCompactionKind,
     timestamp: Option<String>,
@@ -560,7 +588,7 @@ const ROW_BILLING_FIELDS: &[&str] = &[
 /// and the Claude Code JSONL header. Forwarded so the BACKEND derives the
 /// initiator itself (single source of truth) -- mirrors the backend
 /// `AgentSessionSnapshotOrigin`. Every field optional; a source fills what it exposes.
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SnapshotOrigin {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_source: Option<String>, // Codex: user/subagent/automation (authoritative)
@@ -848,7 +876,7 @@ pub struct SnapshotProvenance {
 /// canonical and content-free by construction (clean authority, no credentials/
 /// query/percent-encoding, path truncated at the numeric id) so the backend
 /// accepts them unchanged.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SessionArtifact {
     pub kind: String,
     pub value: String,
@@ -890,6 +918,8 @@ struct ScanTraversalCounts {
     recognized_usage_drop_count: usize,
     zero_snapshot_usage_evidence_count: usize,
     dropped_usage_record_count: u64,
+    /// Parser bytes bypassed by validated tail checkpoints in this census.
+    tail_checkpoint_bytes_skipped: u64,
 }
 
 impl ScanTraversalCounts {
@@ -1147,6 +1177,42 @@ fn scan_index_schema_version() -> u16 {
     SCAN_INDEX_SCHEMA_VERSION
 }
 
+/// Dark-launch gate for tail parsing. Omitted and false-like values preserve
+/// the historical full-file parse on every transcript change.
+fn tail_parse_checkpoints_enabled() -> bool {
+    tail_parse_checkpoints_enabled_from(std::env::var(TAIL_PARSE_CHECKPOINT_ENV).ok().as_deref())
+}
+
+fn tail_parse_checkpoints_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes" | "enabled"
+        )
+    })
+}
+
+/// Parser state is kept as an opaque JSON value so an accumulator-field change
+/// cannot make the whole scan index unreadable. The parser/version witnesses
+/// are checked before deserializing it; any mismatch or malformed value simply
+/// falls back to a full parse and replaces this rebuildable optimization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TailParseCheckpoint {
+    checkpoint_version: u16,
+    parser_version: String,
+    scan_identity_version: String,
+    context_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inode: Option<u64>,
+    byte_offset: u64,
+    prefix_guard: String,
+    positive_recognized_usage_count: usize,
+    positive_usage_evidence: bool,
+    accumulator: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanIndexEntry {
     pub size_bytes: u64,
@@ -1160,6 +1226,14 @@ pub struct ScanIndexEntry {
     /// when transcript size and mtime are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_identity_version: Option<String>,
+    /// Per-source parser provenance. `None` is adopted once for existing v2
+    /// entries; a later mismatch always forces a full parse for this source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parser_version: Option<String>,
+    /// Default-off, local-only tail parser state. No raw prompt, workspace
+    /// path, or pre-HMAC skill material is allowed in this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tail_parse_checkpoint: Option<TailParseCheckpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1235,6 +1309,9 @@ pub struct SourceScanResult {
     pub zero_snapshot_confirmed_count: usize,
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
+    /// Local-only performance census; intentionally absent from protocol
+    /// request structs while the checkpoint feature is dark.
+    pub tail_checkpoint_bytes_skipped: u64,
     pub snapshots: Vec<SnapshotItem>,
     pending_finalization: Vec<PendingIndexFinalization>,
 }
@@ -2604,7 +2681,7 @@ pub(crate) fn snapshot_semantic_envelope(
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UsageTotals {
     input_tokens: u64,
     output_tokens: u64,
@@ -2619,7 +2696,7 @@ struct UsageTotals {
 
 const USD_PICO_SCALE: u128 = 1_000_000_000_000;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct UsageCosts {
     observed: bool,
     reported: bool,
@@ -3020,7 +3097,7 @@ fn row_key_from_model_usage(row: &SnapshotModelUsage) -> RowKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct SelectorCapture {
     context: BTreeMap<String, String>,
     sources: BTreeMap<String, String>,
@@ -3570,6 +3647,15 @@ impl CodexTurnTraceMap {
     fn is_priority_turn(&self, turn_id: &str) -> bool {
         self.priority_turns.contains(turn_id)
     }
+
+    fn checkpoint_fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        update_length_prefixed(&mut digest, b"codex_turn_traces:v1");
+        for turn_id in &self.priority_turns {
+            update_length_prefixed(&mut digest, turn_id.as_bytes());
+        }
+        format!("{:x}", digest.finalize())
+    }
 }
 
 /// Local opt-out for the experimental Codex fast-mode trace read. Defaults on;
@@ -3667,7 +3753,7 @@ fn claude_workflows_dir_has_manifest(dir: &Path) -> bool {
 // this, two rows that differ only in plan_window_bucket would distinct on
 // the daemon, then collide on the backend (which strips plan_window_bucket
 // during normalization) and trip "duplicate model selector rows".
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct RowKey {
     model: String,
     selector_hash: String,
@@ -3680,7 +3766,7 @@ struct RowKey {
     subscription_product: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BucketRowAccumulator {
     selector_context: BTreeMap<String, String>,
     selector_sources: BTreeMap<String, String>,
@@ -3690,8 +3776,9 @@ struct BucketRowAccumulator {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct UsageBucketState {
+    #[serde(with = "ordered_map_entries")]
     rows: BTreeMap<RowKey, BucketRowAccumulator>,
     first_activity_at: Option<String>,
     last_activity_at: Option<String>,
@@ -3716,7 +3803,7 @@ impl UsageBucketState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotAccumulator {
     source: SnapshotSource,
     source_session_id: Option<String>,
@@ -3727,10 +3814,12 @@ struct SnapshotAccumulator {
     // In-memory only: bounded first-user text used to derive opaque template,
     // schedule, and explicit slash-skill facts. The source text is never copied
     // into SnapshotItem; at most a separately sanitized 96-byte prefix is.
+    #[serde(skip)]
     first_prompt_material: Option<String>,
     // In-memory only: provider-native skill names. HMACed before facts are
     // produced; an allowlisted short name may also become a private display
     // label, which upload policy strips unless title consent is active.
+    #[serde(skip)]
     provider_skills: BTreeSet<String>,
     started_at: Option<String>,
     ended_at: Option<String>,
@@ -3738,7 +3827,14 @@ struct SnapshotAccumulator {
     workspace_hash: Option<String>,
     // In-memory only: used to derive privacy-safe repository identity. The raw
     // path is never copied into SnapshotItem or uploaded.
+    #[serde(skip)]
     workspace_path: Option<PathBuf>,
+    /// Content-free replacement for `workspace_path`, materialized before a
+    /// checkpoint is serialized and reused by resumed parses.
+    repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+    /// HMACed/allowlisted attribution results derived before raw prompt and
+    /// skill material is discarded for persistence.
+    checkpoint_grouping_facts: Vec<crate::session_attribution::SessionAttributionFact>,
     latest_model: Option<String>,
     // Most-recently-observed Codex per-turn reasoning effort tier. Updated as
     // lines stream past so the next usage row picks up the effort co-located
@@ -3750,11 +3846,13 @@ struct SnapshotAccumulator {
     latest_turn_id: Option<String>,
     // Per-turn fast-mode signal read once per scan from `logs_2.sqlite`. Shared
     // read-only across every session file in the cycle via `Arc`.
+    #[serde(skip)]
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     // Claude per-request reasoning effort, reduced once per scan from the local
     // OTLP sidecar and shared read-only via `Arc`. Keyed by Anthropic request
     // id because Claude Code reports the top-level session id even for subagent
     // requests, so session id alone cannot route effort to the right transcript.
+    #[serde(skip)]
     claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
@@ -3769,6 +3867,7 @@ struct SnapshotAccumulator {
     activity_tool_counts: BTreeMap<String, u64>,
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
+    #[serde(with = "ordered_map_entries")]
     activity_capability_buckets: BTreeMap<(String, String, String), u64>,
     seen_claude_capability_tool_uses: BTreeSet<String>,
     activity_skills: BTreeSet<String>,
@@ -3856,6 +3955,8 @@ impl SnapshotAccumulator {
             last_activity_at: None,
             workspace_hash: None,
             workspace_path: None,
+            repository_identity: None,
+            checkpoint_grouping_facts: Vec::new(),
             latest_model: None,
             latest_reasoning_effort: None,
             latest_turn_id: None,
@@ -4417,6 +4518,72 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
+    fn resolved_source_session_id(&self, path: &Path) -> Option<String> {
+        let base = self
+            .source_session_id
+            .clone()
+            .or_else(|| {
+                (self.source == SnapshotSource::Codex)
+                    .then(|| codex_session_id_from_path(path))
+                    .flatten()
+            })
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_string)
+            })?;
+        if self.source == SnapshotSource::ClaudeCode {
+            if let Some(identity) = claude_subagent_identity(path) {
+                return Some(identity.source_session_id());
+            }
+        }
+        Some(base)
+    }
+
+    /// Replace content-bearing parse material with the exact safe derivations
+    /// needed by a resumed accumulator. This is the only value serialized into
+    /// a tail checkpoint; the three cleared fields are additionally guarded by
+    /// `#[serde(skip)]` so a future call site cannot persist them accidentally.
+    fn into_content_free_checkpoint(
+        mut self,
+        path: &Path,
+        collected_at: &str,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    ) -> Self {
+        if self.repository_identity.is_none() {
+            self.repository_identity = self
+                .workspace_path
+                .as_deref()
+                .map(cached_repository_identity);
+        }
+        if let (Some(context), Some(source_session_id)) =
+            (attribution_context, self.resolved_source_session_id(path))
+        {
+            let facts = context.grouping_facts(
+                crate::session_attribution::SessionAttributionGroupingInput {
+                    source: self.source,
+                    origin: Some(&self.origin),
+                    source_session_id: &source_session_id,
+                    observed_at: collected_at,
+                    source_version: self.source.parser_version(),
+                    first_prompt: self.first_prompt_material.as_deref(),
+                    provider_skills: &self.provider_skills,
+                    repository_hash: self
+                        .repository_identity
+                        .as_ref()
+                        .and_then(|identity| identity.repository_hash.as_deref()),
+                    source_started_at: self.started_at.as_deref(),
+                    transcript_path: path,
+                },
+            );
+            merge_checkpoint_grouping_facts(&mut self.checkpoint_grouping_facts, facts);
+        }
+        self.first_prompt_material = None;
+        self.workspace_path = None;
+        self.provider_skills.clear();
+        self
+    }
+
     fn into_items(
         mut self,
         path: &Path,
@@ -4432,20 +4599,7 @@ impl SnapshotAccumulator {
         {
             return Vec::new();
         }
-        let Some(source_session_id) = self
-            .source_session_id
-            .clone()
-            .or_else(|| {
-                (self.source == SnapshotSource::Codex)
-                    .then(|| codex_session_id_from_path(path))
-                    .flatten()
-            })
-            .or_else(|| {
-                path.file_stem()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.to_string())
-            })
-        else {
+        let Some(source_session_id) = self.resolved_source_session_id(path) else {
             return Vec::new();
         };
         // A Claude Code subagent transcript (Task tool or Workflow tool) shares
@@ -4456,10 +4610,6 @@ impl SnapshotAccumulator {
         let claude_subagent = (self.source == SnapshotSource::ClaudeCode)
             .then(|| claude_subagent_identity(path))
             .flatten();
-        let source_session_id = match claude_subagent.as_ref() {
-            Some(identity) => identity.source_session_id(),
-            None => source_session_id,
-        };
         // Subagent tree position, read from the provider's own sidecar. Absent
         // or malformed metadata simply leaves the derived facts absent.
         let claude_agent_meta = claude_subagent
@@ -4490,10 +4640,11 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
-        let repository_identity = self
-            .workspace_path
-            .as_deref()
-            .map(cached_repository_identity);
+        let repository_identity = self.repository_identity.clone().or_else(|| {
+            self.workspace_path
+                .as_deref()
+                .map(cached_repository_identity)
+        });
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
@@ -4528,8 +4679,16 @@ impl SnapshotAccumulator {
                 self.source.parser_version(),
             ));
         }
+        let mut grouping_facts = self.checkpoint_grouping_facts.clone();
+        crate::session_attribution::rebind_checkpoint_facts(
+            &mut grouping_facts,
+            &source_session_id,
+            collected_at,
+            self.source.parser_version(),
+        );
         if let Some(context) = attribution_context {
-            attribution_facts.extend(
+            merge_checkpoint_grouping_facts(
+                &mut grouping_facts,
                 context.grouping_facts(
                     crate::session_attribution::SessionAttributionGroupingInput {
                         source: self.source,
@@ -4548,6 +4707,7 @@ impl SnapshotAccumulator {
                 ),
             );
         }
+        attribution_facts.extend(grouping_facts);
         // Unconditional: `direct_provider_facts` bounds only its own output, so
         // anything appended after it (subagent identity, grouping ids) has to be
         // re-bounded here or an item could exceed the payload budget the backend
@@ -4709,6 +4869,38 @@ impl SnapshotAccumulator {
         };
         item.snapshot_fingerprint = snapshot_fingerprint(self.source, &item);
         vec![item]
+    }
+}
+
+fn merge_checkpoint_grouping_facts(
+    existing: &mut Vec<crate::session_attribution::SessionAttributionFact>,
+    incoming: Vec<crate::session_attribution::SessionAttributionFact>,
+) {
+    let mut seen = existing
+        .iter()
+        .map(|fact| {
+            (
+                fact.field.clone(),
+                fact.value.clone(),
+                fact.display_label.clone(),
+                fact.display_label_source.clone(),
+                fact.evidence.kind.clone(),
+                fact.evidence.strength.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    for fact in incoming {
+        let key = (
+            fact.field.clone(),
+            fact.value.clone(),
+            fact.display_label.clone(),
+            fact.display_label_source.clone(),
+            fact.evidence.kind.clone(),
+            fact.evidence.strength.clone(),
+        );
+        if seen.insert(key) {
+            existing.push(fact);
+        }
     }
 }
 
@@ -5135,6 +5327,10 @@ fn scan_source_roots_with_limit_and_attribution(
                 backfill_window_days,
             ))
         });
+    let codex_turn_trace_checkpoint_fingerprint = codex_turn_traces
+        .as_deref()
+        .map(CodexTurnTraceMap::checkpoint_fingerprint)
+        .unwrap_or_default();
     ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
     let traversal = index.traversal.as_mut().expect("traversal initialized");
     enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
@@ -5316,6 +5512,7 @@ fn scan_source_roots_with_limit_and_attribution(
     let mut scanned_session_count = 0;
     let mut semantic_noop_count = 0;
     let mut pending_finalization = Vec::new();
+    let tail_checkpoints_enabled = tail_parse_checkpoints_enabled();
     for mut candidate in files {
         let opened_file = match open_candidate_file(source, &mut candidate) {
             Ok(file) => file,
@@ -5365,11 +5562,29 @@ fn scan_source_roots_with_limit_and_attribution(
             &session_sidecar_fingerprint,
             &candidate.opened_object_identity,
         );
-        let decision = index.candidate_decision(&candidate);
+        let index_key = local_index_key(&candidate.path);
+        let tail_checkpoint_context = tail_checkpoints_enabled.then(|| {
+            tail_checkpoint_context_fingerprint(
+                source,
+                &session_sidecar_fingerprint,
+                &codex_turn_trace_checkpoint_fingerprint,
+                artifacts_enabled,
+                attribution_context,
+            )
+        });
+        let previous_tail_checkpoint = tail_checkpoints_enabled
+            .then(|| {
+                index
+                    .files
+                    .get(&index_key)
+                    .and_then(|entry| entry.tail_parse_checkpoint.clone())
+            })
+            .flatten();
+        let decision = index.candidate_decision(source, &candidate);
         match decision {
             CandidateDecision::Skip => continue,
             CandidateDecision::Migrate => {
-                index.migrate(candidate);
+                index.migrate(source, candidate);
                 continue;
             }
             CandidateDecision::ReconcileLegacy | CandidateDecision::Parse => {}
@@ -5392,6 +5607,8 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 true,
                 attribution_context,
+                previous_tail_checkpoint.as_ref(),
+                tail_checkpoint_context.as_deref(),
             ),
             SnapshotSource::ClaudeCode => parse_opened_jsonl_file(
                 opened_file,
@@ -5407,6 +5624,8 @@ fn scan_source_roots_with_limit_and_attribution(
                 claude_effort_by_request.clone(),
                 artifacts_enabled,
                 attribution_context,
+                previous_tail_checkpoint.as_ref(),
+                tail_checkpoint_context.as_deref(),
             ),
             SnapshotSource::Pi => parse_opened_jsonl_file(
                 opened_file,
@@ -5422,6 +5641,8 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 true,
                 attribution_context,
+                previous_tail_checkpoint.as_ref(),
+                tail_checkpoint_context.as_deref(),
             ),
         };
         let parsed_file = match parsed_file {
@@ -5436,6 +5657,8 @@ fn scan_source_roots_with_limit_and_attribution(
         let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
         let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
         let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
+        let tail_parse_checkpoint = parsed_file.tail_parse_checkpoint;
+        let tail_checkpoint_bytes_skipped = parsed_file.tail_checkpoint_bytes_skipped;
         let mut parsed = parsed_file.snapshots;
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
@@ -5447,7 +5670,6 @@ fn scan_source_roots_with_limit_and_attribution(
             .last()
             .map(|snapshot| snapshot.snapshot_fingerprint.clone());
         let parsed_snapshot_count = parsed.len();
-        let index_key = local_index_key(&candidate.path);
         pending_finalization.push(PendingIndexFinalization {
             index_key,
             source_file_fingerprint: source_file_fingerprint.clone(),
@@ -5463,7 +5685,13 @@ fn scan_source_roots_with_limit_and_attribution(
             } else {
                 ScanParseOutcome::ConfirmedEmpty
             };
-            index.record(candidate, last_snapshot_fingerprint, outcome);
+            index.record(
+                source,
+                candidate,
+                last_snapshot_fingerprint,
+                outcome,
+                tail_parse_checkpoint,
+            );
         }
         census.malformed_json_line_count += report.malformed_json_line_count;
         census.invalid_utf8_line_count += report.invalid_utf8_line_count;
@@ -5473,6 +5701,9 @@ fn scan_source_roots_with_limit_and_attribution(
         census.dropped_usage_record_count = census
             .dropped_usage_record_count
             .saturating_add(dropped_usage_record_count);
+        census.tail_checkpoint_bytes_skipped = census
+            .tail_checkpoint_bytes_skipped
+            .saturating_add(tail_checkpoint_bytes_skipped);
         // A lossy file is one quarantined input, not a partially-authoritative
         // entity. Healthy siblings continue, but none of this file's derived
         // snapshots may reach upload/progress/manifest state until every line
@@ -5507,6 +5738,10 @@ fn scan_source_roots_with_limit_and_attribution(
             .counts
             .dropped_usage_record_count
             .saturating_add(census.dropped_usage_record_count);
+        traversal.counts.tail_checkpoint_bytes_skipped = traversal
+            .counts
+            .tail_checkpoint_bytes_skipped
+            .saturating_add(census.tail_checkpoint_bytes_skipped);
     }
     // A remove/rename hint can arrive after bounded reconciliation has already
     // passed this key. Removing it only from `observed_index_keys` is then too
@@ -5609,6 +5844,7 @@ fn scan_source_roots_with_limit_and_attribution(
     let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
     let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
     let dropped_usage_record_count = counts.dropped_usage_record_count;
+    let tail_checkpoint_bytes_skipped = counts.tail_checkpoint_bytes_skipped;
     Ok(SourceScanResult {
         source,
         backfill_window_days,
@@ -5635,6 +5871,7 @@ fn scan_source_roots_with_limit_and_attribution(
         zero_snapshot_confirmed_count,
         zero_snapshot_usage_evidence_count,
         dropped_usage_record_count,
+        tail_checkpoint_bytes_skipped,
         snapshots,
         pending_finalization,
     })
@@ -6088,6 +6325,8 @@ fn parse_jsonl_file(
         claude_effort_by_request,
         artifacts_enabled,
         attribution_context,
+        None,
+        None,
     )?;
     Ok(ParsedSnapshotFile {
         snapshots: parsed.snapshots,
@@ -6101,6 +6340,8 @@ struct ParsedJsonlFile {
     recognized_usage_drop_count: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
+    tail_parse_checkpoint: Option<TailParseCheckpoint>,
+    tail_checkpoint_bytes_skipped: u64,
 }
 
 impl ParsedJsonlFile {
@@ -6124,19 +6365,37 @@ fn parse_opened_jsonl_file(
     claude_effort_by_request: Option<Arc<ClaudeEffortByRequest>>,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    tail_parse_checkpoint: Option<&TailParseCheckpoint>,
+    tail_checkpoint_context: Option<&str>,
 ) -> Result<ParsedJsonlFile> {
+    let mut file = file;
+    let restored = tail_checkpoint_context.and_then(|context| {
+        restore_tail_parse_checkpoint(&mut file, source, context, tail_parse_checkpoint)
+    });
+    let (
+        mut accumulator,
+        parse_start_offset,
+        mut positive_recognized_usage_count,
+        mut positive_usage_evidence,
+    ) = match restored {
+        Some(restored) => (
+            restored.accumulator,
+            restored.byte_offset,
+            restored.positive_recognized_usage_count,
+            restored.positive_usage_evidence,
+        ),
+        None => (SnapshotAccumulator::new(source), 0, 0, false),
+    };
+    file.seek(SeekFrom::Start(parse_start_offset))?;
     let mut reader = BufReader::new(file);
     // Snapshot semantics come from provider-native session evidence. Mutable
     // current config defaults are useful for live status display, but applying
     // today's defaults to cumulative historical usage would retroactively
     // rewrite old sessions and make a config edit a global replay trigger.
-    let mut accumulator = SnapshotAccumulator::new(source);
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
     accumulator.claude_effort_by_request = claude_effort_by_request;
     let mut recognized_usage_drop_count = 0;
-    let mut positive_recognized_usage_count: usize = 0;
-    let mut positive_usage_evidence = false;
     let report = read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, |value| {
         if recognized_usage_shape_was_dropped(source, value) {
             recognized_usage_drop_count += 1;
@@ -6185,6 +6444,43 @@ fn parse_opened_jsonl_file(
     let accumulator_dropped_usage_record_count = accumulator.dropped_usage_record_count as usize;
     recognized_usage_drop_count =
         recognized_usage_drop_count.saturating_add(accumulator_dropped_usage_record_count);
+    let tail_parse_checkpoint = tail_checkpoint_context.and_then(|context_fingerprint| {
+        if !report.complete()
+            || !report.ended_at_complete_line_boundary()
+            || recognized_usage_drop_count != 0
+        {
+            return None;
+        }
+        let byte_offset = parse_start_offset.saturating_add(report.bytes_consumed);
+        let metadata = reader.get_ref().metadata().ok()?;
+        if byte_offset == 0 || byte_offset != metadata.len() {
+            return None;
+        }
+        let safe_accumulator = accumulator.clone().into_content_free_checkpoint(
+            path,
+            collected_at,
+            attribution_context,
+        );
+        let accumulator = serde_json::to_value(safe_accumulator).ok()?;
+        let (device_id, inode) = opened_file_device_inode(reader.get_ref()).ok()?;
+        if device_id.is_none() || inode.is_none() {
+            return None;
+        }
+        let prefix_guard = tail_parse_prefix_guard(reader.get_mut(), byte_offset).ok()?;
+        Some(TailParseCheckpoint {
+            checkpoint_version: TAIL_PARSE_CHECKPOINT_VERSION,
+            parser_version: source.parser_version().to_string(),
+            scan_identity_version: source.scan_identity_version().to_string(),
+            context_fingerprint: context_fingerprint.to_string(),
+            device_id,
+            inode,
+            byte_offset,
+            prefix_guard,
+            positive_recognized_usage_count,
+            positive_usage_evidence,
+            accumulator,
+        })
+    });
     let snapshots = accumulator.into_items(
         path,
         collected_at,
@@ -6210,6 +6506,8 @@ fn parse_opened_jsonl_file(
         recognized_usage_drop_count,
         zero_snapshot_usage_evidence,
         dropped_usage_record_count: recognized_usage_drop_count as u64,
+        tail_parse_checkpoint,
+        tail_checkpoint_bytes_skipped: parse_start_offset,
     })
 }
 
@@ -6497,6 +6795,8 @@ struct JsonlReadReport {
     malformed_json_line_count: usize,
     invalid_utf8_line_count: usize,
     over_line_cap_count: usize,
+    bytes_consumed: u64,
+    trailing_partial_line: bool,
 }
 
 impl JsonlReadReport {
@@ -6504,6 +6804,10 @@ impl JsonlReadReport {
         self.malformed_json_line_count == 0
             && self.invalid_utf8_line_count == 0
             && self.over_line_cap_count == 0
+    }
+
+    fn ended_at_complete_line_boundary(self) -> bool {
+        !self.trailing_partial_line
     }
 }
 
@@ -6539,6 +6843,8 @@ fn read_bounded_jsonl_lines(
                         buf.extend_from_slice(&available[..take]);
                     }
                     reader.consume(offset + 1);
+                    report.bytes_consumed =
+                        report.bytes_consumed.saturating_add((offset + 1) as u64);
                     line_complete = true;
                     break false;
                 }
@@ -6552,6 +6858,7 @@ fn read_bounded_jsonl_lines(
                         buf.extend_from_slice(&available[..take]);
                     }
                     reader.consume(len);
+                    report.bytes_consumed = report.bytes_consumed.saturating_add(len as u64);
                 }
             }
         };
@@ -6560,6 +6867,7 @@ fn read_bounded_jsonl_lines(
             break;
         }
         report.physical_line_count += 1;
+        report.trailing_partial_line |= !line_complete;
         if overflowed {
             report.over_line_cap_count += 1;
             // Drop the oversized line; its retained-capacity buffer is reset to
@@ -8292,7 +8600,7 @@ enum PiUsageRecordShape {
     MessageEnd,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PiUsageDedupState {
     message: BTreeMap<String, usize>,
     message_end: BTreeMap<String, usize>,
@@ -8620,6 +8928,7 @@ struct ScanCensus {
     recognized_usage_drop_count: usize,
     zero_snapshot_usage_evidence_count: usize,
     dropped_usage_record_count: u64,
+    tail_checkpoint_bytes_skipped: u64,
     observed_index_keys: BTreeSet<String>,
     removed_index_keys: BTreeSet<String>,
 }
@@ -10520,6 +10829,117 @@ fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::R
     Ok(identity)
 }
 
+fn tail_checkpoint_context_fingerprint(
+    source: SnapshotSource,
+    sidecar_fingerprint: &str,
+    codex_turn_trace_fingerprint: &str,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+) -> String {
+    sha256_hex(&[
+        "tail_parse_context:v2",
+        source.api_slug(),
+        source.parser_version(),
+        source.scan_identity_version(),
+        sidecar_fingerprint,
+        codex_turn_trace_fingerprint,
+        if artifacts_enabled {
+            "artifacts:on"
+        } else {
+            "artifacts:off"
+        },
+        attribution_context
+            .map(|context| context.checkpoint_namespace())
+            .as_deref()
+            .unwrap_or("attribution:none"),
+    ])
+}
+
+fn opened_file_device_inode(file: &File) -> std::io::Result<(Option<u64>, Option<u64>)> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        Ok((Some(metadata.dev()), Some(metadata.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok((None, None))
+    }
+}
+
+/// Hash bounded witnesses at both ends of the already-parsed prefix. The tail
+/// sample catches the append-vs-rewrite boundary; the first sample catches
+/// replacement/early mutation. Device/inode and strict growth checks cover
+/// rotation and truncation before this guard is consulted.
+fn tail_parse_prefix_guard(file: &mut File, byte_offset: u64) -> std::io::Result<String> {
+    let metadata = file.metadata()?;
+    if byte_offset > metadata.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "tail checkpoint offset exceeds opened file",
+        ));
+    }
+    let sample_len = byte_offset.min(FILE_CONTENT_SAMPLE_BYTES as u64) as usize;
+    let mut first = vec![0_u8; sample_len];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut first)?;
+    let tail_start = byte_offset.saturating_sub(FILE_CONTENT_SAMPLE_BYTES as u64);
+    let tail_len = (byte_offset - tail_start) as usize;
+    let mut tail = vec![0_u8; tail_len];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut tail)?;
+    let mut digest = Sha256::new();
+    update_length_prefixed(&mut digest, TAIL_PARSE_PREFIX_GUARD_VERSION.as_bytes());
+    update_length_prefixed(&mut digest, &byte_offset.to_be_bytes());
+    update_length_prefixed(&mut digest, &first);
+    update_length_prefixed(&mut digest, &tail);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+struct TailParseResume {
+    accumulator: SnapshotAccumulator,
+    byte_offset: u64,
+    positive_recognized_usage_count: usize,
+    positive_usage_evidence: bool,
+}
+
+fn restore_tail_parse_checkpoint(
+    file: &mut File,
+    source: SnapshotSource,
+    context_fingerprint: &str,
+    checkpoint: Option<&TailParseCheckpoint>,
+) -> Option<TailParseResume> {
+    let checkpoint = checkpoint?;
+    if checkpoint.checkpoint_version != TAIL_PARSE_CHECKPOINT_VERSION
+        || checkpoint.parser_version != source.parser_version()
+        || checkpoint.scan_identity_version != source.scan_identity_version()
+        || checkpoint.context_fingerprint != context_fingerprint
+        || checkpoint.byte_offset == 0
+        || checkpoint.byte_offset >= file.metadata().ok()?.len()
+    {
+        return None;
+    }
+    let (device_id, inode) = opened_file_device_inode(file).ok()?;
+    if device_id.is_none()
+        || inode.is_none()
+        || checkpoint.device_id != device_id
+        || checkpoint.inode != inode
+        || tail_parse_prefix_guard(file, checkpoint.byte_offset).ok()? != checkpoint.prefix_guard
+    {
+        return None;
+    }
+    let accumulator = serde_json::from_value::<SnapshotAccumulator>(checkpoint.accumulator.clone())
+        .ok()
+        .filter(|accumulator| accumulator.source == source)?;
+    Some(TailParseResume {
+        accumulator,
+        byte_offset: checkpoint.byte_offset,
+        positive_recognized_usage_count: checkpoint.positive_recognized_usage_count,
+        positive_usage_evidence: checkpoint.positive_usage_evidence,
+    })
+}
+
 fn unix_seconds(value: SystemTime) -> Option<u64> {
     value
         .duration_since(UNIX_EPOCH)
@@ -11082,7 +11502,11 @@ impl ScanIndex {
         self.file_snapshot_fingerprints.remove(key);
     }
 
-    fn candidate_decision(&self, candidate: &CandidateFile) -> CandidateDecision {
+    fn candidate_decision(
+        &self,
+        source: SnapshotSource,
+        candidate: &CandidateFile,
+    ) -> CandidateDecision {
         let key = local_index_key(&candidate.path);
         let Some(entry) = self.files.get(&key) else {
             return CandidateDecision::Parse;
@@ -11144,6 +11568,16 @@ impl ScanIndex {
                 CandidateDecision::Parse
             };
         }
+        if entry.parser_version.is_none() {
+            return if entry.source_file_fingerprint == candidate.source_file_fingerprint {
+                CandidateDecision::Migrate
+            } else {
+                CandidateDecision::Parse
+            };
+        }
+        if entry.parser_version.as_deref() != Some(source.parser_version()) {
+            return CandidateDecision::Parse;
+        }
         if entry.source_file_fingerprint != candidate.source_file_fingerprint {
             CandidateDecision::Parse
         } else {
@@ -11157,7 +11591,7 @@ impl ScanIndex {
             .and_then(|entry| entry.last_snapshot_fingerprint.clone())
     }
 
-    fn migrate(&mut self, candidate: CandidateFile) {
+    fn migrate(&mut self, source: SnapshotSource, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
         let last_snapshot_fingerprint = self
             .files
@@ -11172,15 +11606,19 @@ impl ScanIndex {
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                parser_version: Some(source.parser_version().to_string()),
+                tail_parse_checkpoint: None,
             },
         );
     }
 
     fn record(
         &mut self,
+        source: SnapshotSource,
         candidate: CandidateFile,
         last_snapshot_fingerprint: Option<String>,
         parse_outcome: ScanParseOutcome,
+        tail_parse_checkpoint: Option<TailParseCheckpoint>,
     ) {
         let key = local_index_key(&candidate.path);
         self.files.insert(
@@ -11192,6 +11630,8 @@ impl ScanIndex {
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                parser_version: Some(source.parser_version().to_string()),
+                tail_parse_checkpoint,
             },
         );
         match parse_outcome {
@@ -12066,6 +12506,7 @@ pub fn paths_from_events(paths: impl IntoIterator<Item = PathBuf>) -> BTreeSet<P
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use std::io::Write as _;
 
     fn temp_file(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -12104,6 +12545,471 @@ mod tests {
                 ..ScanTraversalCounts::default()
             },
         }
+    }
+
+    fn parse_tail_fixture(
+        source: SnapshotSource,
+        path: &Path,
+        checkpoint: Option<&TailParseCheckpoint>,
+    ) -> ParsedJsonlFile {
+        let mut file = File::open(path).expect("open tail fixture");
+        let opened_identity =
+            opened_object_identity(source, &mut file).expect("fingerprint tail fixture");
+        let codex_titles = CodexTitleMetadata::default();
+        let claude_titles = ClaudeTitleMetadata::default();
+        let context = format!("tail-equivalence:{}", source.api_slug());
+        parse_opened_jsonl_file(
+            file,
+            &opened_identity,
+            path,
+            "2026-08-01T14:00:00Z",
+            "tail-equivalence-final-fingerprint".to_string(),
+            source,
+            match source {
+                SnapshotSource::Codex => apply_codex_line,
+                SnapshotSource::ClaudeCode => apply_claude_code_line,
+                SnapshotSource::Pi => apply_pi_line,
+            },
+            (source == SnapshotSource::Codex).then_some(&codex_titles),
+            (source == SnapshotSource::ClaudeCode).then_some(&claude_titles),
+            None,
+            None,
+            false,
+            None,
+            checkpoint,
+            Some(&context),
+        )
+        .expect("parse tail fixture")
+    }
+
+    fn randomized_resume_equivalence(
+        source: SnapshotSource,
+        fixture_name: &str,
+        fixture: &[u8],
+    ) -> (u64, usize) {
+        let mut split_offsets = fixture
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| {
+                (*byte == b'\n' && index + 1 < fixture.len()).then_some(index + 1)
+            })
+            .collect::<Vec<_>>();
+        // Deterministic pseudo-random order makes failures reproduce exactly
+        // while exercising every complete-line split as a property sweep.
+        let mut state = 0x6a09_e667_f3bc_c909_u64 ^ fixture.len() as u64;
+        for index in (1..split_offsets.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            split_offsets.swap(index, (state as usize) % (index + 1));
+        }
+
+        let mut bytes_skipped = 0_u64;
+        for split_offset in &split_offsets {
+            let path = temp_file(fixture_name);
+            fs::write(&path, &fixture[..*split_offset]).expect("write fixture prefix");
+            let prefix = parse_tail_fixture(source, &path, None);
+            assert!(prefix.complete(), "prefix parse must be checkpointable");
+            let checkpoint = prefix
+                .tail_parse_checkpoint
+                .as_ref()
+                .expect("complete prefix checkpoint");
+            assert_eq!(checkpoint.byte_offset, *split_offset as u64);
+
+            let mut append = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open fixture append");
+            append
+                .write_all(&fixture[*split_offset..])
+                .expect("append fixture suffix");
+            append.sync_all().expect("sync fixture append");
+
+            let resumed = parse_tail_fixture(source, &path, Some(checkpoint));
+            let full = parse_tail_fixture(source, &path, None);
+            assert_eq!(
+                serde_json::to_value(&resumed.snapshots).expect("serialize resumed snapshots"),
+                serde_json::to_value(&full.snapshots).expect("serialize full snapshots"),
+                "resume diverged at {fixture_name} byte {split_offset}"
+            );
+            assert_eq!(
+                resumed.recognized_usage_drop_count,
+                full.recognized_usage_drop_count
+            );
+            assert_eq!(
+                resumed.zero_snapshot_usage_evidence,
+                full.zero_snapshot_usage_evidence
+            );
+            assert_eq!(
+                resumed.dropped_usage_record_count,
+                full.dropped_usage_record_count
+            );
+            assert_eq!(resumed.tail_checkpoint_bytes_skipped, *split_offset as u64);
+            bytes_skipped = bytes_skipped.saturating_add(resumed.tail_checkpoint_bytes_skipped);
+            let _ = fs::remove_file(path);
+        }
+        (bytes_skipped, split_offsets.len())
+    }
+
+    #[test]
+    fn tail_checkpoint_resume_matches_full_reparse_at_randomized_fixture_splits() {
+        let corpus = [
+            (
+                SnapshotSource::Codex,
+                "codex-stateful",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../fixtures/snapshot-tail-checkpoints/codex-stateful.jsonl"
+                ))
+                .as_slice(),
+            ),
+            (
+                SnapshotSource::ClaudeCode,
+                "claude-response-dedup",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../fixtures/snapshot-tail-checkpoints/claude-response-dedup.jsonl"
+                ))
+                .as_slice(),
+            ),
+            (
+                SnapshotSource::Pi,
+                "pi-cross-shape-dedup",
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../fixtures/snapshot-tail-checkpoints/pi-cross-shape-dedup.jsonl"
+                ))
+                .as_slice(),
+            ),
+        ];
+        let mut total_saved = 0_u64;
+        let mut split_count = 0_usize;
+        for (source, name, fixture) in corpus {
+            let (saved, splits) = randomized_resume_equivalence(source, name, fixture);
+            total_saved = total_saved.saturating_add(saved);
+            split_count += splits;
+        }
+        eprintln!(
+            "tail checkpoint fixture property sweep: {split_count} splits, {total_saved} parser bytes skipped"
+        );
+        assert!(split_count >= 10);
+        assert!(total_saved >= 8_000);
+    }
+
+    #[test]
+    fn tail_checkpoint_corpus_retains_named_stateful_hazards() {
+        let codex_path = temp_file("tail-codex-hazards");
+        fs::write(
+            &codex_path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/snapshot-tail-checkpoints/codex-stateful.jsonl"
+            )),
+        )
+        .expect("write codex hazard fixture");
+        let codex = parse_tail_fixture(SnapshotSource::Codex, &codex_path, None);
+        let codex_item = codex.snapshots.first().expect("codex snapshot");
+        assert_eq!(
+            codex_item.input_tokens, 35,
+            "cumulative reset must clear old buckets"
+        );
+        assert_eq!(codex_item.output_tokens, 10);
+        assert_eq!(
+            codex_item
+                .model_usage
+                .iter()
+                .map(|row| row.model.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["gpt-5.6"]),
+            "model switch before reset must not leak the old model"
+        );
+        assert_eq!(
+            codex_item
+                .model_usage
+                .iter()
+                .filter_map(|row| row.subscription_product.as_deref())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["pro", "team"]),
+            "post-reset plan switch must retain separate rows"
+        );
+
+        let claude_path = temp_file("tail-claude-hazards");
+        fs::write(
+            &claude_path,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/snapshot-tail-checkpoints/claude-response-dedup.jsonl"
+            )),
+        )
+        .expect("write Claude hazard fixture");
+        let claude = parse_tail_fixture(SnapshotSource::ClaudeCode, &claude_path, None);
+        let claude_item = claude.snapshots.first().expect("Claude snapshot");
+        assert_eq!(
+            claude_item.request_count, 2,
+            "repeated response blocks dedupe"
+        );
+        assert_eq!(
+            claude_item
+                .model_usage
+                .iter()
+                .map(|row| row.model.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["claude-opus-5", "claude-sonnet-5"])
+        );
+        let _ = fs::remove_file(codex_path);
+        let _ = fs::remove_file(claude_path);
+    }
+
+    #[test]
+    fn tail_checkpoint_serialization_excludes_all_content_fields() {
+        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+        accumulator.source_session_id = Some("safe-session-id".to_string());
+        accumulator.first_prompt_material = Some("raw prompt must never persist".to_string());
+        accumulator.workspace_path = Some(PathBuf::from("/raw/private/workspace"));
+        accumulator
+            .provider_skills
+            .insert("private-pre-hmac-skill".to_string());
+        accumulator.latest_model = Some("gpt-5.6".to_string());
+        let value = serde_json::to_value(accumulator).expect("serialize accumulator checkpoint");
+        let object = value.as_object().expect("accumulator object");
+        assert!(!object.contains_key("first_prompt_material"));
+        assert!(!object.contains_key("workspace_path"));
+        assert!(!object.contains_key("provider_skills"));
+        assert!(!object.contains_key("codex_turn_traces"));
+        assert!(!object.contains_key("claude_effort_by_request"));
+        assert_eq!(object["source_session_id"], "safe-session-id");
+        assert_eq!(object["latest_model"], "gpt-5.6");
+        let serialized = value.to_string();
+        for forbidden in [
+            "raw prompt must never persist",
+            "/raw/private/workspace",
+            "private-pre-hmac-skill",
+        ] {
+            assert!(!serialized.contains(forbidden), "persisted {forbidden}");
+        }
+    }
+
+    #[test]
+    fn tail_checkpoint_is_dark_by_default() {
+        assert!(!tail_parse_checkpoints_enabled_from(None));
+        for disabled in ["", "0", "off", "false", "no", "disabled"] {
+            assert!(!tail_parse_checkpoints_enabled_from(Some(disabled)));
+        }
+        for enabled in ["1", "on", "true", "yes", "enabled"] {
+            assert!(tail_parse_checkpoints_enabled_from(Some(enabled)));
+        }
+    }
+
+    #[test]
+    fn tail_checkpoint_validation_falls_back_for_parser_prefix_truncate_and_replace_changes() {
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/snapshot-tail-checkpoints/codex-stateful.jsonl"
+        ));
+        let split = fixture
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(2)
+            .map(|(index, _)| index + 1)
+            .expect("third line boundary");
+
+        let prepare = || {
+            let path = temp_file("tail-validation");
+            fs::write(&path, &fixture[..split]).expect("write validation prefix");
+            let parsed = parse_tail_fixture(SnapshotSource::Codex, &path, None);
+            let checkpoint = parsed.tail_parse_checkpoint.expect("validation checkpoint");
+            (path, checkpoint)
+        };
+
+        let (parser_path, mut parser_checkpoint) = prepare();
+        parser_checkpoint.parser_version.push_str("-stale");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&parser_path)
+            .expect("open parser append")
+            .write_all(&fixture[split..])
+            .expect("append parser fixture");
+        assert_eq!(
+            parse_tail_fixture(
+                SnapshotSource::Codex,
+                &parser_path,
+                Some(&parser_checkpoint)
+            )
+            .tail_checkpoint_bytes_skipped,
+            0,
+            "parser-version mismatch must full reparse"
+        );
+
+        let (prefix_path, prefix_checkpoint) = prepare();
+        let mut prefix_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&prefix_path)
+            .expect("open prefix mutation");
+        prefix_file.seek(SeekFrom::Start(1)).expect("seek mutation");
+        prefix_file.write_all(b" ").expect("mutate guarded prefix");
+        prefix_file.seek(SeekFrom::End(0)).expect("seek append");
+        prefix_file
+            .write_all(&fixture[split..])
+            .expect("append prefix fixture");
+        assert_eq!(
+            parse_tail_fixture(
+                SnapshotSource::Codex,
+                &prefix_path,
+                Some(&prefix_checkpoint)
+            )
+            .tail_checkpoint_bytes_skipped,
+            0,
+            "prefix-guard mismatch must full reparse"
+        );
+
+        let (truncated_path, truncated_checkpoint) = prepare();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated_path)
+            .expect("open truncate fixture")
+            .set_len((split / 2) as u64)
+            .expect("truncate fixture");
+        assert_eq!(
+            parse_tail_fixture(
+                SnapshotSource::Codex,
+                &truncated_path,
+                Some(&truncated_checkpoint)
+            )
+            .tail_checkpoint_bytes_skipped,
+            0,
+            "truncated/rewritten file must full reparse"
+        );
+
+        let (replaced_path, replaced_checkpoint) = prepare();
+        let replaced_old = replaced_path.with_extension("old");
+        fs::rename(&replaced_path, &replaced_old).expect("rotate fixture");
+        fs::write(&replaced_path, fixture).expect("write replacement fixture");
+        assert_eq!(
+            parse_tail_fixture(
+                SnapshotSource::Codex,
+                &replaced_path,
+                Some(&replaced_checkpoint)
+            )
+            .tail_checkpoint_bytes_skipped,
+            0,
+            "replacement inode must full reparse"
+        );
+
+        for path in [
+            parser_path,
+            prefix_path,
+            truncated_path,
+            replaced_path,
+            replaced_old,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn scan_entry_parser_version_mismatch_is_source_scoped_and_forces_parse() {
+        let path = temp_file("parser-version-invalidation");
+        let candidate = CandidateFile {
+            scan_root: path.parent().expect("temp parent").to_path_buf(),
+            path: path.clone(),
+            size_bytes: 12,
+            modified_unix_seconds: 34,
+            modified_unix_nanos: 56,
+            source_file_fingerprint: "same".to_string(),
+            legacy_source_file_fingerprint: "same".to_string(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".to_string(),
+        };
+        let index = ScanIndex {
+            upload_context_fingerprint: Some("context".to_string()),
+            active_upload_context_fingerprint: Some("context".to_string()),
+            files: BTreeMap::from([(
+                local_index_key(&path),
+                ScanIndexEntry {
+                    size_bytes: candidate.size_bytes,
+                    modified_unix_seconds: candidate.modified_unix_seconds,
+                    modified_unix_nanos: Some(candidate.modified_unix_nanos),
+                    source_file_fingerprint: candidate.source_file_fingerprint.clone(),
+                    last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    parser_version: Some("codex_jsonl:stale".to_string()),
+                    tail_parse_checkpoint: None,
+                },
+            )]),
+            ..ScanIndex::default()
+        };
+        assert_eq!(
+            index.candidate_decision(SnapshotSource::Codex, &candidate),
+            CandidateDecision::Parse
+        );
+        // A Codex parser witness is never interpreted as another source's
+        // current version; invalidation stays on the source-scoped index/call.
+        assert_eq!(
+            index.candidate_decision(SnapshotSource::ClaudeCode, &candidate),
+            CandidateDecision::Parse
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(tail_checkpoint_env)]
+    fn enabled_scanner_persists_checkpoint_and_reports_resumed_bytes() {
+        let previous = std::env::var_os(TAIL_PARSE_CHECKPOINT_ENV);
+        std::env::set_var(TAIL_PARSE_CHECKPOINT_ENV, "enabled");
+        let root = temp_dir("tail-enabled-scan");
+        let path = root.join("rollout-tail-enabled.jsonl");
+        let fixture = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/snapshot-tail-checkpoints/codex-stateful.jsonl"
+        ));
+        let split = fixture
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(2)
+            .map(|(index, _)| index + 1)
+            .expect("third line boundary");
+        fs::write(&path, &fixture[..split]).expect("write enabled prefix");
+        let mut index = ScanIndex::default();
+        let mut first = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-03T12:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan enabled prefix");
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut first, &mut index);
+        let first_checkpoint = index
+            .files
+            .get(&local_index_key(&path))
+            .and_then(|entry| entry.tail_parse_checkpoint.as_ref())
+            .expect("persisted first checkpoint");
+        assert_eq!(first_checkpoint.byte_offset, split as u64);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open enabled append")
+            .write_all(&fixture[split..])
+            .expect("append enabled suffix");
+        let second = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-03T12:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan enabled append");
+        assert_eq!(second.tail_checkpoint_bytes_skipped, split as u64);
+        assert_eq!(second.scanned_file_count, 1);
+
+        match previous {
+            Some(value) => std::env::set_var(TAIL_PARSE_CHECKPOINT_ENV, value),
+            None => std::env::remove_var(TAIL_PARSE_CHECKPOINT_ENV),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -12364,6 +13270,8 @@ mod tests {
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -12891,6 +13799,8 @@ mod tests {
                     source_file_fingerprint: candidate.source_file_fingerprint.clone(),
                     last_snapshot_fingerprint: Some("group".to_string()),
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+                    tail_parse_checkpoint: None,
                 },
             )]),
             file_snapshot_fingerprints: BTreeMap::from([(
@@ -12912,7 +13822,7 @@ mod tests {
         };
         index.activate_quarantine_witness(SnapshotSource::Codex);
         assert_eq!(
-            index.candidate_decision(&candidate),
+            index.candidate_decision(SnapshotSource::Codex, &candidate),
             CandidateDecision::Parse
         );
     }
@@ -12953,6 +13863,8 @@ mod tests {
                     source_file_fingerprint: legacy_source_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
                     scan_identity_version: None,
+                    parser_version: None,
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -13036,6 +13948,8 @@ mod tests {
                     source_file_fingerprint: legacy_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
                     scan_identity_version: None,
+                    parser_version: None,
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -13086,6 +14000,8 @@ mod tests {
                     source_file_fingerprint: "old".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                    parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -13094,7 +14010,7 @@ mod tests {
         // config reconciliation cannot manufacture one, so v2 requires the
         // one-time full parse before it can publish a complete manifest.
         assert_eq!(
-            index.candidate_decision(&candidate),
+            index.candidate_decision(SnapshotSource::Codex, &candidate),
             CandidateDecision::Parse
         );
     }
@@ -13123,12 +14039,14 @@ mod tests {
                     source_file_fingerprint: "legacy-previous-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     scan_identity_version: None,
+                    parser_version: None,
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
         };
         assert_eq!(
-            index.candidate_decision(&candidate),
+            index.candidate_decision(SnapshotSource::Codex, &candidate),
             CandidateDecision::Parse
         );
     }
@@ -13157,12 +14075,14 @@ mod tests {
                     source_file_fingerprint: "legacy-matching-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
                     scan_identity_version: None,
+                    parser_version: None,
+                    tail_parse_checkpoint: None,
                 },
             )]),
             ..ScanIndex::default()
         };
         assert_eq!(
-            index.candidate_decision(&candidate),
+            index.candidate_decision(SnapshotSource::Codex, &candidate),
             CandidateDecision::Parse
         );
     }
@@ -16587,6 +17507,8 @@ mod tests {
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
             scan_identity_version: None,
+            parser_version: None,
+            tail_parse_checkpoint: None,
         };
 
         let mut index = ScanIndex {
@@ -24983,6 +25905,8 @@ mod tests {
             source_file_fingerprint: "source".to_string(),
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
             scan_identity_version: Some("semantic_sync:v1".to_string()),
+            parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+            tail_parse_checkpoint: None,
         }
     }
 
@@ -25153,7 +26077,7 @@ mod tests {
         candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap_or_default();
         candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
         assert_eq!(
-            committable.candidate_decision(&candidate),
+            committable.candidate_decision(SnapshotSource::Codex, &candidate),
             CandidateDecision::Parse,
             "even an accepted page is re-derived because untouched siblings still owe the policy transition"
         );
@@ -25388,6 +26312,8 @@ mod tests {
                 source_file_fingerprint: "local-mtime-is-not-membership".to_string(),
                 last_snapshot_fingerprint: Some("group".to_string()),
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+                parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
+                tail_parse_checkpoint: None,
             },
         );
         let manifest = index

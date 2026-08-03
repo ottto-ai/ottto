@@ -13,7 +13,7 @@
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -56,7 +56,7 @@ const MAX_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS: usize = 96;
 const MIN_PROVIDER_SCHEDULE_PROMPT_SIGNATURE_CHARS: usize = 24;
 const PROVIDER_SCHEDULE_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionFieldEvidence {
     pub kind: String,
     pub strength: String,
@@ -65,7 +65,7 @@ pub struct SessionFieldEvidence {
     pub evidence_ref: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionAttributionFact {
     pub field: String,
     pub value: String,
@@ -1263,6 +1263,22 @@ fn evidence_ref(source_session_id: &str, field: &str, value: &str) -> String {
     digest.update(b"\0");
     digest.update(value.as_bytes());
     format!("sha256:{:x}", digest.finalize())
+}
+
+/// Rebind content-free grouping facts restored from a parser checkpoint to the
+/// current observation. Values and labels stay unchanged; only evidence fields
+/// that are intentionally observation/session/version relative are rebuilt.
+pub(crate) fn rebind_checkpoint_facts(
+    facts: &mut [SessionAttributionFact],
+    source_session_id: &str,
+    observed_at: &str,
+    source_version: &str,
+) {
+    for fact in facts {
+        fact.evidence.observed_at = observed_at.to_string();
+        fact.evidence.source_version = source_version.to_string();
+        fact.evidence.evidence_ref = evidence_ref(source_session_id, &fact.field, &fact.value);
+    }
 }
 
 #[cfg(test)]
