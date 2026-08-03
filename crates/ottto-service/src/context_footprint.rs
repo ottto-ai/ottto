@@ -106,7 +106,7 @@ struct WorkspaceCandidate {
     last_seen: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RepositoryIdentity {
     pub(crate) repository_hash: Option<String>,
     pub(crate) repository_label: Option<String>,

@@ -65,6 +65,18 @@ daemon prunes accepted hashes that are no longer present in the current scan, so
 a permanently invalid session cannot make the checkpoint grow with every
 historical revision.
 
+The snapshot scan index also supports a dark, default-off tail-parser
+checkpoint (`OTTTO_TAIL_PARSE_CHECKPOINTS=enabled`). It stores file device and
+inode identity, a completed-line byte offset, bounded prefix hashes, and the
+content-free parser accumulator in the existing destination/source index. Raw
+first-prompt material, raw workspace paths, and provider skill names before
+HMAC derivation are explicitly excluded from serialization; runtime-only
+sidecar maps are reconstructed each scan. Repository identity and attribution
+grouping are reduced to the same privacy-safe derived forms used by snapshots
+before the raw in-memory fields are discarded. A parser/context mismatch,
+replacement, truncation, or prefix-guard mismatch ignores the checkpoint and
+performs the historical full-file parse.
+
 The optional Codex Cloud Sessions collector is experimental and disabled by
 default. It uses an officially documented, upstream-experimental Codex CLI
 surface. Its single daemon supervisor starts normally but remains inert until

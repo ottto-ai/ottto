@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 306,
-  "content_sha256": "d4a2f1cd4ffa8e560ca5a696051a6fd0c21311103bd1bcd8fef69e3d767e1516",
+  "candidate_file_count": 310,
+  "content_sha256": "fa9956b79e9e34d0a1c168891db919508503cba1b760837bf7e79df67e691a98",
   "files": [
     {
       "executable": false,
@@ -699,8 +699,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "6be65628e124a414fe4b8b940bf4786c23c8435827242f597f7e39348d83ca3a",
-      "size_bytes": 52079
+      "sha256": "e025fb35355338427ddbfdc846cbd11ccd68f07c662894e26ceb6a74334da775",
+      "size_bytes": 52117
     },
     {
       "executable": false,
@@ -811,8 +811,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/session_attribution.rs",
-      "sha256": "dc9289070249138ddc6379eba791a56e40eb3af28ae7d29a8d95661c75cfd472",
-      "size_bytes": 74562
+      "sha256": "7836e461d022dcac23c30ba5f01847f33175e5b67e178a933f0d333cde96e6e2",
+      "size_bytes": 75260
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8733220707a37858c1e6c17993c7221de078f6175eb841098ebea222cef695a9",
-      "size_bytes": 1068328
+      "sha256": "d7af09bf93836f9c9fafdd3432fc7d64e122f24da8ac23379956f827071c1913",
+      "size_bytes": 1105766
     },
     {
       "executable": false,
@@ -930,8 +930,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/privacy.md",
-      "sha256": "404a7ae57114d67a362c248fb0f679904d412656d0dbc7ca2e85a69ff588efcf",
-      "size_bytes": 15461
+      "sha256": "9b461840a35cf63caf00d17d8a97532726168a41dec493d8227a486e2730d11c",
+      "size_bytes": 16263
     },
     {
       "executable": false,
@@ -1282,6 +1282,13 @@
       "path": "docs/session-2026-08-02-scanner-preflight-poison-liveness.md",
       "sha256": "e4dc7d6c2845259c9c170c536f689ba2592c776d875b42a50557bcd90513bdee",
       "size_bytes": 1529
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-03-tail-parse-checkpoints.md",
+      "sha256": "65e137e74e3dfa4b2a38aecbb6263c106a9a5a53ca14a767b403329a652b7573",
+      "size_bytes": 3425
     },
     {
       "executable": false,
@@ -1660,6 +1667,27 @@
       "path": "fixtures/snapshot-audit/v2-golden-keys.json",
       "sha256": "29d6e6591f2c80c074ccced4747a0c84c2f8d343f93fcdc875b8173ae69b1221",
       "size_bytes": 1055
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-tail-checkpoints/claude-response-dedup.jsonl",
+      "sha256": "f14e91bf17ecdf9de68b6a46491c847b2c55c078d7554bfbf614690d0b33efb7",
+      "size_bytes": 1315
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-tail-checkpoints/codex-stateful.jsonl",
+      "sha256": "5abae442b8fe22feb7a8fe3e3e0a4f258aea1e989139e2355d939e6722cf0c82",
+      "size_bytes": 1588
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "fixtures/snapshot-tail-checkpoints/pi-cross-shape-dedup.jsonl",
+      "sha256": "8183e4ca608f62c4248ece371f4565339def603f2fcd61006db44efb95341fdb",
+      "size_bytes": 656
     },
     {
       "executable": false,
@@ -2145,9 +2173,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-02T19:16:03+00:00",
+  "generated_at": "2026-08-03T12:42:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 307,
+  "output_file_count": 311,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2181,5 +2209,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cd8a65ef99c618a4430b458dfea9151d0a2514a8"
+  "source_commit": "b83e7da75a8eafc29dd66e07a485745df433c21e"
 }
