@@ -74,6 +74,8 @@ const LOOKBACK_DAYS: i64 = 120;
 /// Local grant-file schema. Independent of the wire schema on purpose: the
 /// on-disk shape may change without the contract changing.
 const GRANT_FILE_SCHEMA_VERSION: &str = "codex_daily_aggregates_grant.v1";
+// Additive state fields are serde-defaulted, so v1 files remain compatible and
+// retain their cadence/breaker history across upgrades.
 const STATE_FILE_SCHEMA_VERSION: u16 = 1;
 
 // ---------------------------------------------------------------------------
@@ -951,6 +953,12 @@ struct CollectorState {
     last_fetch_epoch_seconds: u64,
     #[serde(default)]
     last_success_epoch_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_observed_row_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_coverage_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_coverage_end: Option<String>,
     #[serde(default)]
     auth_failures: u32,
     #[serde(default)]
@@ -1067,7 +1075,14 @@ fn state_after_failure(
 
 /// Clear the failure counters after one clean answer. The thresholds are about
 /// *consecutive* failures.
-fn state_after_success(mut state: CollectorState, identity: &str, now: u64) -> CollectorState {
+fn state_after_success(
+    mut state: CollectorState,
+    identity: &str,
+    now: u64,
+    observed_row_count: usize,
+    coverage_start: &str,
+    coverage_end: &str,
+) -> CollectorState {
     state.schema_version = STATE_FILE_SCHEMA_VERSION;
     state.identity = identity.to_string();
     state.auth_failures = 0;
@@ -1077,6 +1092,9 @@ fn state_after_success(mut state: CollectorState, identity: &str, now: u64) -> C
     state.opened_by = String::new();
     state.last_error_category = None;
     state.last_success_epoch_seconds = now;
+    state.last_observed_row_count = Some(observed_row_count);
+    state.last_coverage_start = Some(coverage_start.to_string());
+    state.last_coverage_end = Some(coverage_end.to_string());
     state
 }
 
@@ -1857,6 +1875,9 @@ pub enum CycleOutcome {
 #[derive(Debug, Clone)]
 pub struct Cycle {
     pub outcome: CycleOutcome,
+    /// Normalized scalar rows observed when the provider read reached that
+    /// stage. `None` means no provider window was observed this cycle.
+    pub normalized_row_count: Option<usize>,
     pub diagnostics: Vec<AgentStatusDiagnostic>,
 }
 
@@ -1864,6 +1885,7 @@ impl Cycle {
     fn new(outcome: CycleOutcome) -> Self {
         Self {
             outcome,
+            normalized_row_count: None,
             diagnostics: Vec::new(),
         }
     }
@@ -1871,6 +1893,7 @@ impl Cycle {
     fn with(outcome: CycleOutcome, diagnostic: AgentStatusDiagnostic) -> Self {
         Self {
             outcome,
+            normalized_row_count: None,
             diagnostics: vec![diagnostic],
         }
     }
@@ -2077,6 +2100,7 @@ fn collect_once(
     // The payload has served its purpose; nothing derived from it beyond the
     // normalized scalars may outlive this point.
     drop(payload);
+    let normalized_row_count = normalized.rows.len();
 
     let mut diagnostics = Vec::new();
     if normalized.dropped_model_rows > 0 {
@@ -2101,6 +2125,7 @@ fn collect_once(
             ));
             return Cycle {
                 outcome: CycleOutcome::Failed,
+                normalized_row_count: Some(normalized_row_count),
                 diagnostics,
             };
         }
@@ -2139,6 +2164,7 @@ fn collect_once(
                 ));
                 return Cycle {
                     outcome: CycleOutcome::Failed,
+                    normalized_row_count: Some(normalized_row_count),
                     diagnostics,
                 };
             }
@@ -2154,6 +2180,7 @@ fn collect_once(
             let _ = state_store.save(&state);
             return Cycle {
                 outcome: CycleOutcome::Failed,
+                normalized_row_count: Some(normalized_row_count),
                 diagnostics,
             };
         }
@@ -2169,6 +2196,7 @@ fn collect_once(
                     let _ = state_store.save(&state);
                     return Cycle {
                         outcome: CycleOutcome::Failed,
+                        normalized_row_count: Some(normalized_row_count),
                         diagnostics,
                     };
                 }
@@ -2187,6 +2215,7 @@ fn collect_once(
                 ));
                 return Cycle {
                     outcome: CycleOutcome::NotAdmitted,
+                    normalized_row_count: Some(normalized_row_count),
                     diagnostics,
                 };
             }
@@ -2203,17 +2232,37 @@ fn collect_once(
                 ));
                 return Cycle {
                     outcome: CycleOutcome::Failed,
+                    normalized_row_count: Some(normalized_row_count),
                     diagnostics,
                 };
             }
         }
     }
 
-    let state = state_after_success(state, &identity, now_seconds);
+    let diagnostic_code = if normalized_row_count == 0 {
+        "codex_daily_aggregates_window_empty"
+    } else {
+        "codex_daily_aggregates_window_collected"
+    };
+    diagnostics.push(info(
+        diagnostic_code,
+        &format!(
+            "Observed Codex daily aggregate window {window_start} through {window_end}; normalized {normalized_row_count} rows."
+        ),
+    ));
+    let state = state_after_success(
+        state,
+        &identity,
+        now_seconds,
+        normalized_row_count,
+        &window_start,
+        &window_end,
+    );
     let _ = state_store.save(&state);
     let _ = grants.record_health(Some(&collected_at), None);
     Cycle {
         outcome: CycleOutcome::Uploaded,
+        normalized_row_count: Some(normalized_row_count),
         diagnostics,
     }
 }
@@ -2562,11 +2611,7 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
         .spawn(|| loop {
             let cycle = collect_composed_once(OffsetDateTime::now_utc());
             if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
-                eprintln!(
-                    "codex_daily_aggregates_collector outcome={:?} diagnostics={}",
-                    cycle.outcome,
-                    cycle.diagnostics.len()
-                );
+                eprintln!("{}", cycle_summary_log(&cycle));
             }
             thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
@@ -2575,6 +2620,18 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
         return Err(anyhow!("spawn Codex daily aggregates collector: {error}"));
     }
     Ok(CollectorStartup::Started)
+}
+
+fn cycle_summary_log(cycle: &Cycle) -> String {
+    let rows = cycle
+        .normalized_row_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "codex_daily_aggregates_collector outcome={:?} rows={rows} diagnostics={}",
+        cycle.outcome,
+        cycle.diagnostics.len()
+    )
 }
 
 fn cycle_jitter() -> Duration {
@@ -4008,10 +4065,49 @@ mod tests {
             );
         }
         assert_eq!(state.auth_failures, 2);
-        let state = state_after_success(state, "identity", 20);
+        let state = state_after_success(state, "identity", 20, 4, "2026-03-29", "2026-07-26");
         assert_eq!(state.auth_failures, 0);
         assert_eq!(state.reopen_after_epoch_seconds, 0);
         assert_eq!(state.last_error_category, None);
+        assert_eq!(state.last_observed_row_count, Some(4));
+        assert_eq!(state.last_coverage_start.as_deref(), Some("2026-03-29"));
+        assert_eq!(state.last_coverage_end.as_deref(), Some("2026-07-26"));
+    }
+
+    #[test]
+    fn old_state_without_observation_fields_loads_with_defaults() {
+        let state = StateStore::new(temp_dir("old-state").join("state.json"));
+        let identity = "compatible-state-identity";
+        fs::create_dir_all(state.path().parent().expect("state parent")).expect("create parent");
+        fs::write(
+            state.path(),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": STATE_FILE_SCHEMA_VERSION,
+                "identity": identity,
+                "last_fetch_epoch_seconds": 42,
+                "last_success_epoch_seconds": 40,
+                "auth_failures": 1,
+                "shape_failures": 0,
+                "rate_limit_failures": 0,
+                "reopen_after_epoch_seconds": 0,
+                "opened_by": "",
+                "last_error_category": "provider_auth_rejected"
+            }))
+            .expect("encode old state"),
+        )
+        .expect("write old state");
+
+        let loaded = state.load(identity);
+        assert_eq!(loaded.last_fetch_epoch_seconds, 42);
+        assert_eq!(loaded.last_success_epoch_seconds, 40);
+        assert_eq!(loaded.auth_failures, 1);
+        assert_eq!(
+            loaded.last_error_category.as_deref(),
+            Some("provider_auth_rejected")
+        );
+        assert_eq!(loaded.last_observed_row_count, None);
+        assert_eq!(loaded.last_coverage_start, None);
+        assert_eq!(loaded.last_coverage_end, None);
     }
 
     #[test]
@@ -4103,6 +4199,80 @@ mod tests {
     }
 
     // -- upload ------------------------------------------------------------
+
+    #[test]
+    fn successful_empty_window_is_diagnostic_and_recorded_in_state() {
+        let collector = collector("successful-empty-window");
+        let grant = enabled(&collector);
+        let reader = StaticReader::new(json!({
+            "results": [{"date": "2026-07-26", "clients": []}]
+        }));
+        let transport = RecordingTransport::default();
+
+        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
+        assert_eq!(cycle.normalized_row_count, Some(0));
+        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(
+            diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
+            AgentDiagnosticSeverity::Info
+        );
+        assert_eq!(
+            cycle_summary_log(&cycle),
+            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=1"
+        );
+
+        let state = collector.state.load(&state_identity(&grant, false));
+        let (window_start, window_end) = collection_window(now());
+        assert_eq!(state.last_observed_row_count, Some(0));
+        assert_eq!(state.last_coverage_start.as_deref(), Some(&*window_start));
+        assert_eq!(state.last_coverage_end.as_deref(), Some(&*window_end));
+        assert_eq!(transport.batches.borrow()[0]["rows"], json!([]));
+    }
+
+    #[test]
+    fn successful_nonempty_window_is_diagnostic_and_recorded_in_state() {
+        let collector = collector("successful-nonempty-window");
+        let grant = enabled(&collector);
+        let reader = StaticReader::new(json!({
+            "results": [{
+                "date": "2026-07-26",
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "text_total_tokens": 7
+                }]
+            }]
+        }));
+        let transport = RecordingTransport::default();
+
+        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
+        assert_eq!(cycle.normalized_row_count, Some(1));
+        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(
+            diagnostic(&cycle, "codex_daily_aggregates_window_collected").severity,
+            AgentDiagnosticSeverity::Info
+        );
+        assert_eq!(
+            cycle_summary_log(&cycle),
+            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=1"
+        );
+
+        let state = collector.state.load(&state_identity(&grant, false));
+        let (window_start, window_end) = collection_window(now());
+        assert_eq!(state.last_observed_row_count, Some(1));
+        assert_eq!(state.last_coverage_start.as_deref(), Some(&*window_start));
+        assert_eq!(state.last_coverage_end.as_deref(), Some(&*window_end));
+        assert_eq!(
+            transport.batches.borrow()[0]["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn a_not_admitted_answer_is_typed_expected_and_never_trips_the_breaker() {
