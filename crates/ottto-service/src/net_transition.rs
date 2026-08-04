@@ -169,6 +169,11 @@ fn observe_route_socket(socket: RouteSocket) {
         crate::net_resilience::force_rebuild_upstream_agents(
             "a macOS network transition (interface/address change)",
         );
+        // Sleep/wake and restored network state are a lazy catch-up
+        // opportunity. The coalesced collection worker shares the cadence
+        // sync lock; consent/off-switch and the durable per-slot claim remain
+        // the final command boundaries.
+        crate::snapshot_sync::spawn_claude_agent_status_refresh("wake");
     }
 }
 

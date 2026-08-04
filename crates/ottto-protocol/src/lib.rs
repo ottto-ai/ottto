@@ -2524,8 +2524,50 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     pub has_scoped_limits: bool,
     #[serde(default)]
     pub has_credit_balances: bool,
+    /// Safe, machine-local witness for the most recent consented upkeep
+    /// decision. This never contains credential material or a config path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep: Option<ClaudeConfigSlotUpkeepStatusV1>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotUpkeepStatusV1 {
+    pub result: ClaudeConfigSlotUpkeepResultV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_access_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempted_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_allowed_attempt_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotUpkeepResultV1 {
+    #[default]
+    NotRequired,
+    RefreshDue,
+    Refreshed,
+    UpkeepNotConsented,
+    CollectionPaused,
+    UpkeepDisabled,
+    Backoff,
+    MissingBinary,
+    SpawnFailed,
+    TimedOut,
+    NonzeroExit,
+    CredentialUnreadable,
+    ExpiryUnchanged,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
+    InProgress,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2543,6 +2585,12 @@ pub enum ClaudeConfigSlotCollectionStateV1 {
     CollectionInProgress,
     DuplicateAccount,
     CapacityExceeded,
+    RefreshDue,
+    UpkeepNotConsented,
+    StaleAccessToken,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2563,6 +2611,13 @@ pub enum ClaudeConfigSlotDiagnosticCodeV1 {
     CollectionInProgress,
     DuplicateAccount,
     CapacityExceeded,
+    RefreshDue,
+    UpkeepNotConsented,
+    StaleAccessToken,
+    ProbeFailed,
+    ReloginApproaching,
+    NeedsLogin,
+    UpkeepDisabled,
 }
 
 /// Safe evidence for an account that cannot yet be associated with a config

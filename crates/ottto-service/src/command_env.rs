@@ -39,6 +39,46 @@ pub(crate) fn executable_path(program: &str) -> Option<PathBuf> {
         })
 }
 
+/// Hardened Claude-only resolver. Every candidate comes from an absolute
+/// search directory, remains an absolute path even when the file is an
+/// official-install symlink, and must be executable by at least one class.
+pub(crate) fn claude_executable_path(effective_home: &Path) -> Option<PathBuf> {
+    claude_search_dirs(effective_home)
+        .into_iter()
+        .map(|dir| dir.join("claude"))
+        .find(|candidate| is_absolute_executable(candidate))
+}
+
+pub(crate) fn claude_path_env(effective_home: &Path) -> Option<OsString> {
+    env::join_paths(claude_search_dirs(effective_home)).ok()
+}
+
+fn claude_search_dirs(effective_home: &Path) -> Vec<PathBuf> {
+    let dirs = if let Some(path_var) = env::var_os(COMMAND_SEARCH_PATH_ENV) {
+        executable_search_dirs_from(Some(path_var), None, false)
+    } else {
+        executable_search_dirs_for_program_with_home(
+            "claude",
+            Some(effective_home.as_os_str().to_os_string()),
+        )
+    };
+    dirs.into_iter().filter(|dir| dir.is_absolute()).collect()
+}
+
+#[cfg(unix)]
+fn is_absolute_executable(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    candidate.is_absolute()
+        && std::fs::metadata(candidate).ok().is_some_and(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
+}
+
+#[cfg(not(unix))]
+fn is_absolute_executable(candidate: &Path) -> bool {
+    candidate.is_absolute() && candidate.is_file()
+}
+
 fn executable_search_dirs_for_program(program: &str) -> Vec<PathBuf> {
     if let Some(path_var) = env::var_os(COMMAND_SEARCH_PATH_ENV) {
         return executable_search_dirs_from(Some(path_var), None, false);
@@ -334,6 +374,7 @@ fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -424,6 +465,32 @@ mod tests {
             .find(|candidate| candidate.is_file());
 
         assert_eq!(found, Some(claude));
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn claude_resolver_requires_absolute_executable_and_accepts_official_style_symlink() {
+        let home = scratch_home("hardened-claude-resolver");
+        let bin = home.join(".local/bin");
+        let versions = home.join(".local/share/claude/versions");
+        fs::create_dir_all(&bin).expect("bin");
+        fs::create_dir_all(&versions).expect("versions");
+
+        let target = versions.join("2.1.202");
+        fs::write(&target, "#!/bin/sh\n").expect("target");
+        let mut permissions = fs::metadata(&target).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&target, permissions).expect("chmod");
+        let shim = bin.join("claude");
+        symlink(&target, &shim).expect("symlink");
+
+        assert!(is_absolute_executable(&shim));
+        assert!(!is_absolute_executable(Path::new("relative/claude")));
+
+        fs::remove_file(&shim).expect("remove shim");
+        fs::write(&shim, "#!/bin/sh\n").expect("non-executable shim");
+        assert!(!is_absolute_executable(&shim));
 
         fs::remove_dir_all(&home).ok();
     }
