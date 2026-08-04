@@ -105,6 +105,7 @@ const FETCH_INTERVAL_JITTER_SECONDS: u64 = 15 * 60;
 const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_LOGGED_DIAGNOSTICS_PER_CYCLE: usize = 20;
 
 const BREAKER_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 const BREAKER_AUTH_THRESHOLD: u32 = 3;
@@ -2903,6 +2904,9 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
             let cycle = collect_composed_once(OffsetDateTime::now_utc());
             if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
                 eprintln!("{}", cycle_summary_log(&cycle));
+                for line in cycle_diagnostic_log_lines(&cycle.diagnostics) {
+                    eprintln!("{line}");
+                }
             }
             thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
@@ -2923,6 +2927,28 @@ fn cycle_summary_log(cycle: &Cycle) -> String {
         cycle.outcome,
         cycle.diagnostics.len()
     )
+}
+
+fn cycle_diagnostic_log_lines(diagnostics: &[AgentStatusDiagnostic]) -> Vec<String> {
+    let mut lines = diagnostics
+        .iter()
+        .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
+        .map(|diagnostic| {
+            format!(
+                "codex_daily_aggregates_collector_diagnostic severity={:?} code={} message={:?}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>();
+    let suppressed = diagnostics
+        .len()
+        .saturating_sub(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE);
+    if suppressed > 0 {
+        lines.push(format!(
+            "codex_daily_aggregates_collector_diagnostics_suppressed count={suppressed}"
+        ));
+    }
+    lines
 }
 
 fn cycle_jitter() -> Duration {
@@ -4699,6 +4725,39 @@ mod tests {
     }
 
     // -- upload ------------------------------------------------------------
+
+    #[test]
+    fn diagnostic_log_lines_include_codes_and_cap_output() {
+        let diagnostics = vec![
+            info("first_code", "count=1"),
+            warning("second_code", "date=\"2026-07-26\""),
+        ];
+
+        assert_eq!(
+            cycle_diagnostic_log_lines(&diagnostics),
+            vec![
+                "codex_daily_aggregates_collector_diagnostic severity=Info code=first_code message=\"count=1\"",
+                "codex_daily_aggregates_collector_diagnostic severity=Warning code=second_code message=\"date=\\\"2026-07-26\\\"\"",
+            ]
+        );
+
+        let capped = (0..MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 3)
+            .map(|index| info(&format!("code_{index}"), "count=1"))
+            .collect::<Vec<_>>();
+        let lines = cycle_diagnostic_log_lines(&capped);
+        assert_eq!(lines.len(), MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 1);
+        for (index, line) in lines
+            .iter()
+            .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
+            .enumerate()
+        {
+            assert!(line.contains(&format!("code=code_{index} ")));
+        }
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("codex_daily_aggregates_collector_diagnostics_suppressed count=3")
+        );
+    }
 
     #[test]
     fn successful_empty_window_is_diagnostic_and_recorded_in_state() {
