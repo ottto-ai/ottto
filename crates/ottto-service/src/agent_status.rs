@@ -11113,10 +11113,12 @@ for line in sys.stdin:
 
         // A previously fetched payload remains local and keeps its original
         // observation time while the sentinel pauses all network reads.
+        let account_hash = "off-switch-account";
+        let organization_hash = "off-switch-organization";
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: String::new(),
-            organization_identifier_hash: String::new(),
+            account_identifier_hash: account_hash.to_string(),
+            organization_identifier_hash: organization_hash.to_string(),
             observed_at_epoch_seconds: current_unix_seconds(),
             next_refresh_after_epoch_seconds: current_unix_seconds() + 60,
             windows: vec![AgentQuotaWindow {
@@ -11125,6 +11127,8 @@ for line in sys.stdin:
                 status: AgentQuotaWindowStatus::Ok,
                 freshness: AgentQuotaWindowFreshness::Fresh,
                 used_percent: Some(25),
+                account_identifier_hash: Some(account_hash.to_string()),
+                organization_identifier_hash: Some(organization_hash.to_string()),
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
@@ -11138,8 +11142,15 @@ for line in sys.stdin:
         )
         .expect("write sentinel");
         assert!(claude_oauth_usage_network_disabled());
+        let provider_calls_before =
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
 
-        let outcome = collect_claude_oauth_usage(&claude_oauth_account_identifier_hash(), None);
+        let outcome = collect_claude_oauth_usage_with_access_token(
+            account_hash,
+            organization_hash,
+            None,
+            true,
+        );
         assert!(outcome.result.is_err());
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(
@@ -11150,14 +11161,24 @@ for line in sys.stdin:
             outcome.diagnostics[0].severity,
             AgentDiagnosticSeverity::Info
         );
-        assert!(claude_oauth_usage_cache_path("").exists());
+        assert!(claude_oauth_usage_cache_path(account_hash).exists());
 
         std::fs::remove_file(support_dir.join("claude-oauth-usage-network-disabled"))
             .expect("re-enable collection");
-        let resumed = collect_claude_oauth_usage(&claude_oauth_account_identifier_hash(), None);
+        let resumed = collect_claude_oauth_usage_with_access_token(
+            account_hash,
+            organization_hash,
+            None,
+            true,
+        );
         assert!(
             resumed.result.is_ok(),
             "the retained fresh cache resumes without another prompt"
+        );
+        assert_eq!(
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            provider_calls_before,
+            "the off-switch and cache-only resume must never admit a provider call"
         );
 
         let _ = std::fs::remove_dir_all(&support_dir);
