@@ -335,7 +335,8 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
 - typed diagnostics bundles with explicit redaction reports
 - typed local control request/response envelopes
 - authenticated `claude_accounts_status`, `claude_account_prepare`,
-  `claude_account_check`, `claude_account_stop_waiting`,
+  `claude_account_reconnect`, `claude_account_check`,
+  `claude_account_stop_waiting`,
   `claude_account_set_upkeep_consent`, `claude_account_register_path`, and
   `claude_account_remove` operations for one bounded, versioned machine-local
   registry. The true default `CLAUDE_CONFIG_DIR`-unset slot is always present;
@@ -344,10 +345,17 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   explicit consent bit governs future background upkeep for the whole registry.
   Advanced path registration is external ownership. Managed prepare creates a
   private `0700` directory and returns an exact Claude Code launch command;
-  customer-owned `/login` remains entirely inside official Claude Code. Exact
-  checks are single-flight, stop is durable until explicit prepare replay, and
-  these protocol-v18 operations perform no login automation, token refresh,
-  inference, credential write, or Keychain write.
+  customer-owned `/login` remains entirely inside official Claude Code.
+  `claude_account_prepare` remains the managed first-connect operation; exact
+  reconnect reuses one already-registered custom slot and its exact launch
+  command without creating a directory or duplicate registration. Exact checks
+  are single-flight, stop is durable until explicit prepare/reconnect replay,
+  and these protocol-v18 operations perform no login automation, token refresh,
+  inference, credential write, or Keychain write. Authenticated local status
+  includes each exact slot's already-collected session, weekly, scoped-limit,
+  and usage-credit values with captured/provider observation times plus typed
+  fresh, stale, or partial state; this additive machine-local view does not
+  change the backend snapshot wire.
 - consented background freshness upkeep for registered custom Claude slots.
   On daemon startup, macOS wake/network restoration, and normal quota
   collection opportunities, an expired access credential with a still-valid

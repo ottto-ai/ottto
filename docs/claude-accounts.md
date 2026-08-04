@@ -35,7 +35,11 @@ limit. This is the most complete view Claude exposes, and it is only
 readable while that slot's credential stays valid. Each quota window and
 credit balance carries strong hashes of both the provider account and
 organization. If identity cannot be proved, that slot contributes no full
-meters.
+meters. Authenticated machine-local account status returns the same already
+collected values per exact slot, together with when Ottto captured the local
+snapshot, the oldest provider/cache observation represented, and a typed
+`fresh`, `stale`, or `partial` state. It never returns a token, credential blob,
+or Desktop state.
 
 **Status line renders - a partial view.** Claude Code's status line reports
 only the session and weekly percentages. It carries no per-model limits and
@@ -72,6 +76,10 @@ login changes, and slots beyond the ten-account cap stay machine-local as typed
 diagnostics. One failed slot does not stop healthy siblings. A same-account
 and same-organization cached reading may remain visible for up to 24 hours with
 stale freshness; it is never borrowed or relabeled under another organization.
+When a same-slot read temporarily fails, Ottto may retain that slot's last full
+values only if both its strong account and organization hashes still match;
+the retained values and every meter are marked stale. Identity mismatch,
+another organization, or another slot never inherits them.
 
 ## Connecting another account
 
@@ -89,6 +97,19 @@ delete a registration, or erase credentials. A queued check cannot silently
 resume a stopped operation. Replaying prepare for the same operation explicitly
 resumes it on the same path. Removing a managed registration also preserves its
 directory; customers remain in control of credential deletion.
+
+When an already registered custom slot reaches `needs_login`, Reconnect starts
+a new persisted observation for that exact opaque slot and returns the same
+carefully quoted `CLAUDE_CONFIG_DIR='<exact path>' claude` launch command. It
+does not create another config directory or registration. Spaces, quotes,
+shell metacharacters, Unicode spelling, and a trailing slash remain data in the
+exact stored string; reconnect never normalizes or substitutes a sibling slot.
+The customer opens official Claude Code and types `/login`. Reconnect refuses
+the default slot, an unknown or removed registration, a weak/missing account
+binding, and a login that resolves to a different strong account. Stop Waiting
+and daemon restart retain the same operation/slot binding. After completion,
+another reconnect may start for the same slot; prior operation ids remain
+retired in bounded fail-closed state and can never be rebound.
 
 When the machine off-switch is enabled, exact-slot usage collection reports
 `collection_paused`, makes no provider request, and retains registrations,

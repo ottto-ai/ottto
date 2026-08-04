@@ -9,9 +9,9 @@
 
 use anyhow::Result;
 use ottto_protocol::{
-    ClaudeAccountCapacityV1, ClaudeAccountSetupOperationState, ClaudeAccountSetupOperationV1,
-    ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1, ClaudeConfigSlotCollectionStatusV1,
-    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotOwnership,
+    ClaudeAccountCapacityV1, ClaudeAccountSetupOperationKind, ClaudeAccountSetupOperationState,
+    ClaudeAccountSetupOperationV1, ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1,
+    ClaudeConfigSlotCollectionStatusV1, ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotOwnership,
     CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -26,10 +26,13 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const CLAUDE_OAUTH_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME: &str = "claude-config-slots.json";
+const CLAUDE_RETIRED_RECONNECT_FILTER_FILE_SUFFIX: &str = "reconnect-retired-v1.json";
 pub const CLAUDE_MANAGED_ACCOUNTS_DIR_NAME: &str = "claude-accounts";
 pub const MAX_CLAUDE_ACCOUNT_SLOTS: usize = 10;
 pub const MAX_REGISTERED_CLAUDE_CONFIG_SLOTS: usize = MAX_CLAUDE_ACCOUNT_SLOTS - 1;
 pub const MAX_CLAUDE_CONFIG_DIR_BYTES: usize = 4096;
+const RETIRED_RECONNECT_FILTER_WORDS: usize = 512;
+const RETIRED_RECONNECT_FILTER_HASHES: usize = 8;
 
 static CLAUDE_CONFIG_SLOT_SETTINGS_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 static CLAUDE_SETUP_OPERATION_LOCKS: OnceLock<Mutex<BTreeMap<String, &'static Mutex<()>>>> =
@@ -157,6 +160,15 @@ struct PersistedClaudeConfigSlotSettingsV1 {
     registered_slots: Vec<PersistedClaudeConfigSlotV1>,
     #[serde(default)]
     setup_operations: Vec<PersistedClaudeAccountSetupOperationV1>,
+    /// Kept outside the legacy setup array so an older daemon ignores
+    /// reconnect observation state while still loading every registration.
+    #[serde(default)]
+    reconnect_operations: Vec<PersistedClaudeAccountSetupOperationV1>,
+    /// Fixed-size fail-closed Bloom filter for operation ids retired after a
+    /// terminal reconnect or slot removal. False positives only refuse a new
+    /// id; a retired id can never be rebound while storage remains bounded.
+    #[serde(default)]
+    retired_reconnect_operation_filter: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +180,12 @@ struct PersistedClaudeConfigSlotV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedClaudeAccountSetupOperationV1 {
+    #[serde(default)]
+    kind: ClaudeAccountSetupOperationKind,
+    /// Monotonic creation order across managed setup and reconnect arrays.
+    /// Legacy rows decode as zero; a new row always sorts after them.
+    #[serde(default)]
+    created_sequence: u64,
     operation_id: String,
     slot_id: String,
     config_dir: String,
@@ -190,6 +208,8 @@ impl Default for PersistedClaudeConfigSlotSettingsV1 {
             background_upkeep_consent: false,
             registered_slots: Vec::new(),
             setup_operations: Vec::new(),
+            reconnect_operations: Vec::new(),
+            retired_reconnect_operation_filter: Vec::new(),
         }
     }
 }
@@ -277,6 +297,16 @@ impl FileClaudeConfigSlotSettingsStore {
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
 
+        if persisted
+            .reconnect_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+        {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "setup operation id is already bound to a reconnect".to_string(),
+            ));
+        }
+
         if let Some(existing) = persisted
             .setup_operations
             .iter()
@@ -342,6 +372,12 @@ impl FileClaudeConfigSlotSettingsStore {
             return self.finalize_preparing_operation(&mut persisted, &operation_id);
         }
 
+        if reconnect_operation_id_is_retired(&persisted, &operation_id) {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "setup operation id was retired by reconnect and cannot be rebound".to_string(),
+            ));
+        }
+
         let reserved_slots = persisted.registered_slots.len()
             + persisted
                 .setup_operations
@@ -368,9 +404,12 @@ impl FileClaudeConfigSlotSettingsStore {
             )
         })?;
         validate_registered_config_dir(config_dir)?;
+        let created_sequence = next_operation_sequence(&persisted);
         persisted
             .setup_operations
             .push(PersistedClaudeAccountSetupOperationV1 {
+                kind: ClaudeAccountSetupOperationKind::ConnectManagedAccount,
+                created_sequence,
                 operation_id: operation_id.clone(),
                 slot_id,
                 config_dir: config_dir.to_string(),
@@ -384,6 +423,146 @@ impl FileClaudeConfigSlotSettingsStore {
         validate_persisted(&persisted)?;
         self.write_persisted(&persisted)?;
         self.finalize_preparing_operation(&mut persisted, &operation_id)
+    }
+
+    /// Start or replay customer-owned official login for one exact registered
+    /// custom slot. Unlike managed prepare, this never allocates or creates a
+    /// path. The immutable operation binding makes restart, stop, and check
+    /// use the same descriptor without relying on a caller-supplied path.
+    pub fn begin_registered_slot_reconnect(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+        slot_id: &str,
+        expected_account_identifier_hash: String,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        validate_setup_operation_id(&operation_id)?;
+        validate_opaque_slot_id(slot_id)?;
+        validate_expected_account_hash(Some(&expected_account_identifier_hash))?;
+        let _transaction = self.settings_transaction_lock()?;
+        validate_schema_version(schema_version)?;
+        let mut persisted = self.load_persisted()?;
+
+        if persisted
+            .setup_operations
+            .iter()
+            .any(|operation| operation.operation_id == operation_id)
+        {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "reconnect operation id is already bound to managed setup".to_string(),
+            ));
+        }
+        if let Some(existing) = persisted
+            .reconnect_operations
+            .iter()
+            .find(|operation| operation.operation_id == operation_id)
+            .cloned()
+        {
+            if existing.kind != ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+                || existing.slot_id != slot_id
+                || existing
+                    .requested_expected_account_identifier_hash
+                    .as_deref()
+                    != Some(expected_account_identifier_hash.as_str())
+            {
+                return Err(ClaudeConfigSlotSettingsError::Invalid(
+                    "reconnect operation does not match its original slot/account binding"
+                        .to_string(),
+                ));
+            }
+            let slot = persisted
+                .registered_slots
+                .iter()
+                .find(|slot| slot.slot_id == existing.slot_id)
+                .ok_or_else(|| {
+                    ClaudeConfigSlotSettingsError::Invalid(
+                        "reconnect slot is no longer registered".to_string(),
+                    )
+                })?;
+            if slot.config_dir != existing.config_dir {
+                return Err(ClaudeConfigSlotSettingsError::State(
+                    "reconnect operation no longer names its exact registered slot".to_string(),
+                ));
+            }
+            if existing.state == ClaudeAccountSetupOperationState::SetupStopped {
+                let operation = persisted
+                    .reconnect_operations
+                    .iter_mut()
+                    .find(|candidate| candidate.operation_id == operation_id)
+                    .expect("existing reconnect remains present");
+                operation.state = ClaudeAccountSetupOperationState::WaitingForUserLogin;
+                operation.message = Some(
+                    "Reconnect observation resumed for this same registered Claude Code directory."
+                        .to_string(),
+                );
+                self.write_persisted(&persisted)?;
+            }
+            return Ok(status_contract_for_operation(&persisted, &operation_id));
+        }
+        if reconnect_operation_id_is_retired(&persisted, &operation_id) {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "reconnect operation id was retired and cannot be rebound".to_string(),
+            ));
+        }
+
+        let slot = persisted
+            .registered_slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| {
+                ClaudeConfigSlotSettingsError::Invalid(format!(
+                    "unknown registered Claude account slot_id {slot_id}"
+                ))
+            })?;
+        if let Some(existing) = persisted.setup_operations.iter().find(|operation| {
+            operation.slot_id == slot_id && !operation_allows_reconnect_successor(operation)
+        }) {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
+                "slot already has persisted operation {}; replay that operation id",
+                existing.operation_id
+            )));
+        }
+        if let Some(existing) = persisted
+            .reconnect_operations
+            .iter()
+            .find(|operation| operation.slot_id == slot_id)
+            .cloned()
+        {
+            if !operation_allows_reconnect_successor(&existing) {
+                return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
+                    "slot already has active reconnect operation {}; replay that operation id",
+                    existing.operation_id
+                )));
+            }
+            retire_reconnect_operation_id(&mut persisted, &existing.operation_id);
+            persisted
+                .reconnect_operations
+                .retain(|operation| operation.operation_id != existing.operation_id);
+        }
+        let created_sequence = next_operation_sequence(&persisted);
+        persisted
+            .reconnect_operations
+            .push(PersistedClaudeAccountSetupOperationV1 {
+                kind: ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot,
+                created_sequence,
+                operation_id: operation_id.clone(),
+                slot_id: slot.slot_id,
+                config_dir: slot.config_dir,
+                state: ClaudeAccountSetupOperationState::WaitingForUserLogin,
+                requested_expected_account_identifier_hash: Some(
+                    expected_account_identifier_hash.clone(),
+                ),
+                expected_account_identifier_hash: Some(expected_account_identifier_hash.clone()),
+                account_identifier_hash: Some(expected_account_identifier_hash),
+                message: Some(
+                    "Waiting for the customer to complete official Claude Code /login in this exact registered directory."
+                        .to_string(),
+                ),
+            });
+        validate_persisted(&persisted)?;
+        self.write_persisted(&persisted)?;
+        Ok(status_contract_for_operation(&persisted, &operation_id))
     }
 
     pub fn setup_operation(
@@ -540,20 +719,28 @@ impl FileClaudeConfigSlotSettingsStore {
         let _transaction = self.settings_transaction_lock()?;
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
-        let registered = {
+        let (registered, kind) = {
             let operation = require_setup_operation(&persisted, operation_id)?;
-            persisted
-                .registered_slots
-                .iter()
-                .any(|slot| slot.slot_id == operation.slot_id)
+            (
+                persisted
+                    .registered_slots
+                    .iter()
+                    .any(|slot| slot.slot_id == operation.slot_id),
+                operation.kind,
+            )
         };
         let operation = persisted
             .setup_operations
             .iter_mut()
+            .chain(persisted.reconnect_operations.iter_mut())
             .find(|candidate| candidate.operation_id == operation_id)
             .expect("validated setup operation remains present");
-        if operation.state != ClaudeAccountSetupOperationState::Complete {
-            if !registered {
+        if !matches!(
+            operation.state,
+            ClaudeAccountSetupOperationState::Complete
+                | ClaudeAccountSetupOperationState::SetupStopped
+        ) {
+            if !registered && kind == ClaudeAccountSetupOperationKind::ConnectManagedAccount {
                 // Cleanup is empty-only. If Claude wrote anything during the
                 // crash window, preserve it for the deterministic resume.
                 let _ = fs::remove_dir(Path::new(&operation.config_dir));
@@ -611,6 +798,18 @@ impl FileClaudeConfigSlotSettingsStore {
             settings
                 .setup_operations
                 .retain(|operation| operation.slot_id != slot_id);
+            let retired_ids = settings
+                .reconnect_operations
+                .iter()
+                .filter(|operation| operation.slot_id == slot_id)
+                .map(|operation| operation.operation_id.clone())
+                .collect::<Vec<_>>();
+            for operation_id in retired_ids {
+                retire_reconnect_operation_id(settings, &operation_id);
+            }
+            settings
+                .reconnect_operations
+                .retain(|operation| operation.slot_id != slot_id);
             Ok(())
         })
     }
@@ -618,7 +817,7 @@ impl FileClaudeConfigSlotSettingsStore {
     fn load_persisted(
         &self,
     ) -> Result<PersistedClaudeConfigSlotSettingsV1, ClaudeConfigSlotSettingsError> {
-        let persisted = if self.path.exists() {
+        let mut persisted = if self.path.exists() {
             let body = fs::read_to_string(&self.path).map_err(|error| {
                 ClaudeConfigSlotSettingsError::State(format!("read settings: {error}"))
             })?;
@@ -628,6 +827,19 @@ impl FileClaudeConfigSlotSettingsStore {
         } else {
             PersistedClaudeConfigSlotSettingsV1::default()
         };
+        if let Some(sidecar) = self.read_retired_reconnect_filter()? {
+            if persisted.retired_reconnect_operation_filter.is_empty() {
+                persisted.retired_reconnect_operation_filter = sidecar;
+            } else {
+                for (destination, source) in persisted
+                    .retired_reconnect_operation_filter
+                    .iter_mut()
+                    .zip(sidecar)
+                {
+                    *destination |= source;
+                }
+            }
+        }
         validate_persisted(&persisted)?;
         Ok(persisted)
     }
@@ -659,16 +871,32 @@ impl FileClaudeConfigSlotSettingsStore {
         let _transaction = self.settings_transaction_lock()?;
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
-        let operation = persisted
-            .setup_operations
-            .iter_mut()
-            .find(|operation| operation.operation_id == operation_id)
-            .ok_or_else(|| {
-                ClaudeConfigSlotSettingsError::Invalid(format!(
-                    "unknown Claude setup operation_id {operation_id}"
-                ))
-            })?;
-        mutation(operation)?;
+        let retire_terminal_reconnect = {
+            let operation = persisted
+                .setup_operations
+                .iter_mut()
+                .chain(persisted.reconnect_operations.iter_mut())
+                .find(|operation| operation.operation_id == operation_id)
+                .ok_or_else(|| {
+                    ClaudeConfigSlotSettingsError::Invalid(format!(
+                        "unknown Claude setup operation_id {operation_id}"
+                    ))
+                })?;
+            let was_terminal_reconnect = operation.kind
+                == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+                && operation_allows_reconnect_successor(operation);
+            mutation(operation)?;
+            !was_terminal_reconnect
+                && operation.kind == ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+                && operation_allows_reconnect_successor(operation)
+        };
+        if retire_terminal_reconnect {
+            // Keep the live row so exact same-binding status/replay remains
+            // available, but retire the id before persisting the terminal
+            // transition. The sidecar is written first, so an older daemon
+            // that later drops additive reconnect fields cannot rebind it.
+            retire_reconnect_operation_id(&mut persisted, operation_id);
+        }
         validate_persisted(&persisted)?;
         self.write_persisted(&persisted)?;
         Ok(status_contract_for_operation(&persisted, operation_id))
@@ -678,12 +906,52 @@ impl FileClaudeConfigSlotSettingsStore {
         &self,
         persisted: &PersistedClaudeConfigSlotSettingsV1,
     ) -> Result<(), ClaudeConfigSlotSettingsError> {
+        if !persisted.retired_reconnect_operation_filter.is_empty() {
+            let filter = serde_json::to_vec(&persisted.retired_reconnect_operation_filter)
+                .map_err(|error| {
+                    ClaudeConfigSlotSettingsError::State(format!(
+                        "serialize retired reconnect filter: {error}"
+                    ))
+                })?;
+            crate::write_owner_only_file_atomic(&self.retired_reconnect_filter_path(), &filter)
+                .map_err(|error| {
+                    ClaudeConfigSlotSettingsError::State(format!(
+                        "write retired reconnect filter: {error}"
+                    ))
+                })?;
+        }
         let body = serde_json::to_vec_pretty(persisted).map_err(|error| {
             ClaudeConfigSlotSettingsError::State(format!("serialize settings: {error}"))
         })?;
         crate::write_owner_only_file_atomic(&self.path, &body).map_err(|error| {
             ClaudeConfigSlotSettingsError::State(format!("write settings: {error}"))
         })
+    }
+
+    fn retired_reconnect_filter_path(&self) -> PathBuf {
+        self.path
+            .with_extension(CLAUDE_RETIRED_RECONNECT_FILTER_FILE_SUFFIX)
+    }
+
+    fn read_retired_reconnect_filter(
+        &self,
+    ) -> Result<Option<Vec<u64>>, ClaudeConfigSlotSettingsError> {
+        let path = self.retired_reconnect_filter_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let body = fs::read(&path).map_err(|error| {
+            ClaudeConfigSlotSettingsError::State(format!("read retired reconnect filter: {error}"))
+        })?;
+        let filter = serde_json::from_slice::<Vec<u64>>(&body).map_err(|error| {
+            ClaudeConfigSlotSettingsError::State(format!("parse retired reconnect filter: {error}"))
+        })?;
+        if filter.len() != RETIRED_RECONNECT_FILTER_WORDS {
+            return Err(ClaudeConfigSlotSettingsError::State(
+                "retired reconnect filter has invalid capacity".to_string(),
+            ));
+        }
+        Ok(Some(filter))
     }
 
     fn finalize_preparing_operation(
@@ -851,13 +1119,42 @@ fn validate_persisted(
             "Claude setup operation count exceeds capacity".to_string(),
         ));
     }
+    if !settings.retired_reconnect_operation_filter.is_empty()
+        && settings.retired_reconnect_operation_filter.len() != RETIRED_RECONNECT_FILTER_WORDS
+    {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "retired reconnect operation filter has invalid capacity".to_string(),
+        ));
+    }
+    if settings.reconnect_operations.len() > MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "active Claude reconnect operation count exceeds capacity".to_string(),
+        ));
+    }
+    if settings
+        .setup_operations
+        .iter()
+        .any(|operation| operation.kind != ClaudeAccountSetupOperationKind::ConnectManagedAccount)
+        || settings.reconnect_operations.iter().any(|operation| {
+            operation.kind != ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+        })
+    {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "Claude operation kind does not match its persisted collection".to_string(),
+        ));
+    }
     let mut operation_ids = BTreeSet::new();
+    let mut reconnect_slot_ids = BTreeSet::new();
     let registered_slot_ids = settings
         .registered_slots
         .iter()
         .map(|slot| slot.slot_id.as_str())
         .collect::<BTreeSet<_>>();
-    for operation in &settings.setup_operations {
+    for operation in settings
+        .setup_operations
+        .iter()
+        .chain(settings.reconnect_operations.iter())
+    {
         validate_setup_operation_id(&operation.operation_id)?;
         validate_opaque_slot_id(&operation.slot_id)?;
         validate_registered_config_dir(&operation.config_dir)?;
@@ -873,35 +1170,73 @@ fn validate_persisted(
                 "Claude setup operation ids must be unique".to_string(),
             ));
         }
-        if !registered_slot_ids.contains(operation.slot_id.as_str())
-            && !matches!(
-                operation.state,
-                ClaudeAccountSetupOperationState::Preparing
-                    | ClaudeAccountSetupOperationState::SetupStopped
-            )
-        {
-            return Err(ClaudeConfigSlotSettingsError::Invalid(
-                "only a preparing Claude setup operation may precede registration".to_string(),
-            ));
-        }
-        if let Some(slot) = settings
+        let registered_slot = settings
             .registered_slots
             .iter()
-            .find(|slot| slot.slot_id == operation.slot_id)
-        {
-            if slot.ownership != ClaudeConfigSlotOwnership::Managed
-                || slot.config_dir != operation.config_dir
-            {
-                return Err(ClaudeConfigSlotSettingsError::Invalid(
-                    "Claude setup operation must match its managed registration".to_string(),
-                ));
+            .find(|slot| slot.slot_id == operation.slot_id);
+        match operation.kind {
+            ClaudeAccountSetupOperationKind::ConnectManagedAccount => {
+                if registered_slot.is_none()
+                    && !matches!(
+                        operation.state,
+                        ClaudeAccountSetupOperationState::Preparing
+                            | ClaudeAccountSetupOperationState::SetupStopped
+                    )
+                {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "only a preparing managed Claude operation may precede registration"
+                            .to_string(),
+                    ));
+                }
+                if let Some(slot) = registered_slot {
+                    if slot.ownership != ClaudeConfigSlotOwnership::Managed
+                        || slot.config_dir != operation.config_dir
+                    {
+                        return Err(ClaudeConfigSlotSettingsError::Invalid(
+                            "managed Claude operation must match its managed registration"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot => {
+                if !reconnect_slot_ids.insert(operation.slot_id.as_str()) {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "only one reconnect operation may be retained per slot".to_string(),
+                    ));
+                }
+                if let Some(slot) = registered_slot {
+                    if slot.config_dir != operation.config_dir {
+                        return Err(ClaudeConfigSlotSettingsError::Invalid(
+                            "reconnect operation must retain its exact registered directory"
+                                .to_string(),
+                        ));
+                    }
+                } else if operation.state != ClaudeAccountSetupOperationState::SetupStopped {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "only a stopped reconnect tombstone may outlive its registered custom slot"
+                            .to_string(),
+                    ));
+                }
+                if operation
+                    .requested_expected_account_identifier_hash
+                    .is_none()
+                    || operation.expected_account_identifier_hash.is_none()
+                {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "reconnect operation requires a strong account binding".to_string(),
+                    ));
+                }
             }
         }
     }
     let preparing_count = settings
         .setup_operations
         .iter()
-        .filter(|operation| !registered_slot_ids.contains(operation.slot_id.as_str()))
+        .filter(|operation| {
+            operation.kind == ClaudeAccountSetupOperationKind::ConnectManagedAccount
+                && !registered_slot_ids.contains(operation.slot_id.as_str())
+        })
         .count();
     if settings.registered_slots.len() + preparing_count > MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
         return Err(ClaudeConfigSlotSettingsError::Invalid(
@@ -918,6 +1253,7 @@ fn require_setup_operation<'a>(
     settings
         .setup_operations
         .iter()
+        .chain(settings.reconnect_operations.iter())
         .find(|operation| operation.operation_id == operation_id)
         .ok_or_else(|| {
             ClaudeConfigSlotSettingsError::Invalid(format!(
@@ -1145,6 +1481,74 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn next_operation_sequence(settings: &PersistedClaudeConfigSlotSettingsV1) -> u64 {
+    settings
+        .setup_operations
+        .iter()
+        .chain(settings.reconnect_operations.iter())
+        .map(|operation| operation.created_sequence)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
+fn operation_allows_reconnect_successor(
+    operation: &PersistedClaudeAccountSetupOperationV1,
+) -> bool {
+    matches!(
+        operation.state,
+        ClaudeAccountSetupOperationState::Complete
+            | ClaudeAccountSetupOperationState::SetupFailed
+            | ClaudeAccountSetupOperationState::IdentityMismatch
+    )
+}
+
+fn retired_reconnect_filter_indexes(
+    operation_id: &str,
+) -> [usize; RETIRED_RECONNECT_FILTER_HASHES] {
+    let digest = Sha256::digest(operation_id.as_bytes());
+    std::array::from_fn(|index| {
+        let offset = index * 4;
+        let value = u32::from_be_bytes(
+            digest[offset..offset + 4]
+                .try_into()
+                .expect("SHA-256 chunk is four bytes"),
+        );
+        value as usize % (RETIRED_RECONNECT_FILTER_WORDS * u64::BITS as usize)
+    })
+}
+
+fn reconnect_operation_id_is_retired(
+    settings: &PersistedClaudeConfigSlotSettingsV1,
+    operation_id: &str,
+) -> bool {
+    if settings.retired_reconnect_operation_filter.is_empty() {
+        return false;
+    }
+    retired_reconnect_filter_indexes(operation_id)
+        .into_iter()
+        .all(|bit| {
+            settings.retired_reconnect_operation_filter[bit / u64::BITS as usize]
+                & (1_u64 << (bit % u64::BITS as usize))
+                != 0
+        })
+}
+
+fn retire_reconnect_operation_id(
+    settings: &mut PersistedClaudeConfigSlotSettingsV1,
+    operation_id: &str,
+) {
+    if settings.retired_reconnect_operation_filter.is_empty() {
+        settings
+            .retired_reconnect_operation_filter
+            .resize(RETIRED_RECONNECT_FILTER_WORDS, 0);
+    }
+    for bit in retired_reconnect_filter_indexes(operation_id) {
+        settings.retired_reconnect_operation_filter[bit / u64::BITS as usize] |=
+            1_u64 << (bit % u64::BITS as usize);
+    }
+}
+
 fn launch_command(config_dir: &str) -> String {
     format!(
         "CLAUDE_CONFIG_DIR={} claude",
@@ -1185,18 +1589,30 @@ fn status_contract_with_selected_operation(
             persisted
                 .setup_operations
                 .iter()
+                .chain(persisted.reconnect_operations.iter())
                 .find(|operation| operation.operation_id == operation_id)
         })
-        .or_else(|| persisted.setup_operations.last());
+        .or_else(|| {
+            persisted
+                .setup_operations
+                .iter()
+                .chain(persisted.reconnect_operations.iter())
+                .max_by_key(|operation| operation.created_sequence)
+        });
     let setup_operation = selected_operation
         .map(|operation| {
-            let config_dir = persisted
+            let registered_config_dir = persisted
                 .registered_slots
                 .iter()
                 .find(|slot| slot.slot_id == operation.slot_id)
-                .map(|slot| slot.config_dir.as_str())
-                .unwrap_or(operation.config_dir.as_str());
+                .map(|slot| slot.config_dir.as_str());
+            let launch_command = match (operation.kind, registered_config_dir) {
+                (ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot, None) => None,
+                (_, Some(config_dir)) => Some(launch_command(config_dir)),
+                (_, None) => Some(launch_command(&operation.config_dir)),
+            };
             ClaudeAccountSetupOperationV1 {
+                kind: operation.kind,
                 state: operation.state.clone(),
                 operation_id: Some(operation.operation_id.clone()),
                 slot_id: Some(operation.slot_id.clone()),
@@ -1204,11 +1620,12 @@ fn status_contract_with_selected_operation(
                     .expected_account_identifier_hash
                     .clone(),
                 account_identifier_hash: operation.account_identifier_hash.clone(),
-                launch_command: Some(launch_command(config_dir)),
+                launch_command,
                 message: operation.message.clone(),
             }
         })
         .unwrap_or(ClaudeAccountSetupOperationV1 {
+            kind: ClaudeAccountSetupOperationKind::ConnectManagedAccount,
             state: ClaudeAccountSetupOperationState::Idle,
             operation_id: None,
             slot_id: None,
@@ -1544,6 +1961,602 @@ mod tests {
     }
 
     #[test]
+    fn launch_command_quotes_exact_adversarial_config_strings_without_injection() {
+        let root = temp_path("launch-quoting");
+        let root = root.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).expect("root");
+        let sentinel = root.join("must-not-exist");
+        let composed = format!("{}/caf\u{e9}", root.display());
+        let decomposed = format!("{}/cafe\u{301}", root.display());
+        let values = [
+            format!("{}/space dir", root.display()),
+            format!("{}/single'quote", root.display()),
+            format!(
+                "{}/$(touch {}) ; `touch {}` $HOME *",
+                root.display(),
+                sentinel.display(),
+                sentinel.display()
+            ),
+            format!("{}/trailing/", root.display()),
+            composed.clone(),
+            decomposed.clone(),
+        ];
+        for value in values {
+            let command = launch_command(&value);
+            assert!(!command.contains("/login"));
+            let script = format!(
+                "set -eu\nclaude() {{ /usr/bin/printf '%s' \"$CLAUDE_CONFIG_DIR\"; }}\n{command}"
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("run quoted launch command");
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).expect("utf8"), value);
+            assert!(!sentinel.exists(), "shell metacharacters must stay data");
+        }
+        assert_ne!(launch_command(&composed), launch_command(&decomposed));
+        assert_ne!(
+            launch_command(&format!("{}/trailing", root.display())),
+            launch_command(&format!("{}/trailing/", root.display()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_reuses_exact_registered_slot_and_persists_stop_restart_lifecycle() {
+        let path = temp_path("registered-reconnect");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let config_dir = format!("{}/existing slot/'quoted/", root.display());
+        let registered = store
+            .register_path(1, config_dir.clone())
+            .expect("register exact external slot");
+        let slot_id = registered.external_slots[0].slot_id.clone();
+        let operation_id = "claude_setup_11111111111111111111111111111111";
+        let account_hash = "a".repeat(64);
+        let begun = store
+            .begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                account_hash.clone(),
+            )
+            .expect("begin reconnect");
+        assert_eq!(
+            begun.setup_operation.kind,
+            ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+        );
+        assert_eq!(
+            begun.setup_operation.state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
+        assert_eq!(
+            begun.setup_operation.slot_id.as_deref(),
+            Some(slot_id.as_str())
+        );
+        assert_eq!(begun.external_slots.len(), 1, "no duplicate registration");
+        assert!(begun.managed_slots.is_empty());
+        assert_eq!(
+            begun.external_slots[0].config_dir.as_deref(),
+            Some(config_dir.as_str())
+        );
+        assert_eq!(
+            begun.setup_operation.launch_command.as_deref(),
+            Some(launch_command(&config_dir).as_str())
+        );
+
+        let stopped = store.stop_waiting(1, operation_id).expect("stop");
+        assert_eq!(
+            stopped.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupStopped
+        );
+        let restarted = FileClaudeConfigSlotSettingsStore::new(&path)
+            .begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                account_hash.clone(),
+            )
+            .expect("restart and replay exact reconnect");
+        assert_eq!(
+            restarted.setup_operation.state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
+        assert_eq!(restarted.external_slots.len(), 1);
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                "b".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                "claude_setup_22222222222222222222222222222222".to_string(),
+                &slot_id,
+                account_hash,
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let durable = store
+            .setup_operation(operation_id)
+            .expect("original operation id remains durably bound");
+        assert_eq!(
+            durable
+                .setup_operation
+                .expected_account_identifier_hash
+                .as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        let mut downgrade: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read reconnect settings"))
+                .expect("settings json");
+        assert!(downgrade["setup_operations"]
+            .as_array()
+            .expect("legacy setup array")
+            .is_empty());
+        assert_eq!(
+            downgrade["reconnect_operations"]
+                .as_array()
+                .expect("additive reconnect array")
+                .len(),
+            1
+        );
+        downgrade
+            .as_object_mut()
+            .expect("settings object")
+            .remove("reconnect_operations");
+        downgrade
+            .as_object_mut()
+            .expect("settings object")
+            .remove("retired_reconnect_operation_filter");
+        crate::write_owner_only_file_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&downgrade).expect("downgrade settings"),
+        )
+        .expect("simulate older daemon rewrite");
+        let downgraded = store.load().expect("old daemon-compatible settings");
+        assert_eq!(
+            downgraded.setup_operation.state,
+            ClaudeAccountSetupOperationState::Idle
+        );
+        assert_eq!(downgraded.external_slots.len(), 1);
+        assert_eq!(
+            downgraded.external_slots[0].config_dir.as_deref(),
+            Some(config_dir.as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconnect_refuses_default_weak_unknown_and_removed_slots() {
+        let path = temp_path("registered-reconnect-refusals");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let registered = store
+            .register_path(1, format!("{}/external", root.display()))
+            .expect("register");
+        let slot_id = registered.external_slots[0].slot_id.clone();
+        let operation_id = "claude_setup_33333333333333333333333333333333";
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                "default",
+                "a".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                "weak".to_string(),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        store
+            .remove(1, &slot_id)
+            .expect("remove exact registration");
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &slot_id,
+                "a".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ordinary_status_selects_newest_operation_across_setup_and_reconnect() {
+        let path = temp_path("cross-kind-operation-order");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let registered = store
+            .register_path(1, format!("{}/external", root.display()))
+            .expect("register external slot");
+        let slot_id = registered.external_slots[0].slot_id.clone();
+        let reconnect_id = "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        store
+            .begin_registered_slot_reconnect(1, reconnect_id.to_string(), &slot_id, "a".repeat(64))
+            .expect("persist reconnect");
+
+        let managed_id = "claude_setup_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        store
+            .prepare_managed_account(1, managed_id.to_string(), None)
+            .expect("persist newer managed setup");
+        let ordinary = store.load().expect("ordinary status");
+        assert_eq!(
+            ordinary.setup_operation.operation_id.as_deref(),
+            Some(managed_id)
+        );
+        assert_eq!(
+            ordinary.setup_operation.kind,
+            ClaudeAccountSetupOperationKind::ConnectManagedAccount
+        );
+        let selected_reconnect = store
+            .setup_operation(reconnect_id)
+            .expect("old binding remains");
+        assert_eq!(
+            selected_reconnect.setup_operation.kind,
+            ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removed_slot_retires_reconnect_operation_id_without_unbounded_tombstone_or_rebinding() {
+        let path = temp_path("removed-reconnect-tombstone");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let first = store
+            .register_path(1, format!("{}/first", root.display()))
+            .expect("register first slot");
+        let first_slot_id = first.external_slots[0].slot_id.clone();
+        let operation_id = "claude_setup_cccccccccccccccccccccccccccccccc";
+        store
+            .begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &first_slot_id,
+                "a".repeat(64),
+            )
+            .expect("persist reconnect binding");
+        store.remove(1, &first_slot_id).expect("remove first slot");
+
+        assert!(matches!(
+            store.setup_operation(operation_id),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let idle = store
+            .load()
+            .expect("removed slot has no actionable operation");
+        assert_eq!(
+            idle.setup_operation.state,
+            ClaudeAccountSetupOperationState::Idle
+        );
+
+        let second = store
+            .register_path(1, format!("{}/second", root.display()))
+            .expect("register second slot");
+        let second_slot_id = second.external_slots[0].slot_id.clone();
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &second_slot_id,
+                "b".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.prepare_managed_account(1, operation_id.to_string(), None),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_slot_supports_first_and_repeated_terminal_reconnects_with_bounded_replay_guard() {
+        let path = temp_path("managed-repeated-reconnect");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let account_hash = "a".repeat(64);
+        let managed_id = "claude_setup_11111111111111111111111111111111";
+        let prepared = store
+            .prepare_managed_account(1, managed_id.to_string(), None)
+            .expect("prepare managed slot");
+        let slot_id = prepared.managed_slots[0].slot_id.clone();
+        store
+            .transition_setup_operation(
+                1,
+                managed_id,
+                None,
+                ClaudeAccountSetupOperationState::Complete,
+                Some(&account_hash),
+                Some("complete"),
+            )
+            .expect("complete managed setup");
+
+        let first_reconnect = "claude_setup_22222222222222222222222222222222";
+        store
+            .begin_registered_slot_reconnect(
+                1,
+                first_reconnect.to_string(),
+                &slot_id,
+                account_hash.clone(),
+            )
+            .expect("first managed-slot reconnect");
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                "claude_setup_33333333333333333333333333333333".to_string(),
+                &slot_id,
+                account_hash.clone(),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        store
+            .transition_setup_operation(
+                1,
+                first_reconnect,
+                Some(&account_hash),
+                ClaudeAccountSetupOperationState::Complete,
+                Some(&account_hash),
+                Some("complete"),
+            )
+            .expect("complete first reconnect");
+
+        let second_reconnect = "claude_setup_44444444444444444444444444444444";
+        let second = store
+            .begin_registered_slot_reconnect(
+                1,
+                second_reconnect.to_string(),
+                &slot_id,
+                account_hash,
+            )
+            .expect("second reconnect after terminal first");
+        assert_eq!(
+            second.setup_operation.operation_id.as_deref(),
+            Some(second_reconnect)
+        );
+        assert_eq!(second.managed_slots.len(), 1, "never duplicate the slot");
+        assert!(matches!(
+            store.setup_operation(first_reconnect),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(store.setup_operation(managed_id).is_ok());
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("settings json");
+        assert_eq!(
+            persisted["reconnect_operations"]
+                .as_array()
+                .expect("current reconnects")
+                .len(),
+            1
+        );
+        assert_eq!(
+            persisted["retired_reconnect_operation_filter"]
+                .as_array()
+                .expect("bounded replay filter")
+                .len(),
+            RETIRED_RECONNECT_FILTER_WORDS
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_reconnect_is_retired_before_successor_and_survives_legacy_field_rewrite() {
+        let path = temp_path("terminal-reconnect-downgrade-retirement");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let first = store
+            .register_path(1, format!("{}/first", root.display()))
+            .expect("register first slot");
+        let first_slot_id = first.external_slots[0].slot_id.clone();
+        let second = store
+            .register_path(1, format!("{}/second", root.display()))
+            .expect("register second slot");
+        let second_slot_id = second
+            .external_slots
+            .iter()
+            .find(|slot| slot.slot_id != first_slot_id)
+            .expect("second slot")
+            .slot_id
+            .clone();
+        let account_hash = "a".repeat(64);
+        let operation_id = "claude_setup_55555555555555555555555555555555";
+        store
+            .begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &first_slot_id,
+                account_hash.clone(),
+            )
+            .expect("begin reconnect");
+        store
+            .transition_setup_operation(
+                1,
+                operation_id,
+                Some(&account_hash),
+                ClaudeAccountSetupOperationState::Complete,
+                Some(&account_hash),
+                Some("complete"),
+            )
+            .expect("complete reconnect");
+
+        let completed = store.load_persisted().expect("completed settings");
+        assert!(reconnect_operation_id_is_retired(&completed, operation_id));
+        assert_eq!(completed.reconnect_operations.len(), 1);
+        assert!(store.retired_reconnect_filter_path().is_file());
+        let sidecar_filter: Vec<u64> = serde_json::from_slice(
+            &fs::read(store.retired_reconnect_filter_path()).expect("retirement sidecar"),
+        )
+        .expect("retirement sidecar json");
+        assert_eq!(sidecar_filter.len(), RETIRED_RECONNECT_FILTER_WORDS);
+
+        let replay = store
+            .begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &first_slot_id,
+                account_hash.clone(),
+            )
+            .expect("same binding replays before retirement refusal");
+        assert_eq!(
+            replay.setup_operation.operation_id.as_deref(),
+            Some(operation_id)
+        );
+        assert_eq!(
+            replay.setup_operation.state,
+            ClaudeAccountSetupOperationState::Complete
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("settings json");
+        let legacy_object = legacy.as_object_mut().expect("settings object");
+        legacy_object.remove("reconnect_operations");
+        legacy_object.remove("retired_reconnect_operation_filter");
+        crate::write_owner_only_file_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&legacy).expect("legacy settings"),
+        )
+        .expect("simulate older daemon rewrite");
+
+        let upgraded = store.load_persisted().expect("upgrade legacy settings");
+        assert!(upgraded.reconnect_operations.is_empty());
+        assert!(reconnect_operation_id_is_retired(&upgraded, operation_id));
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &second_slot_id,
+                account_hash.clone(),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                operation_id.to_string(),
+                &first_slot_id,
+                "b".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.prepare_managed_account(1, operation_id.to_string(), None),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_register_reconnect_remove_keeps_fixed_retirement_capacity_and_decodes_without_it() {
+        let path = temp_path("bounded-reconnect-retirement");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let first_operation_id = "claude_setup_00000000000000000000000000000001";
+        for index in 1_u128..=64 {
+            let registered = store
+                .register_path(1, format!("{}/slot-{index}", root.display()))
+                .expect("register cycle slot");
+            let slot_id = registered.external_slots[0].slot_id.clone();
+            let operation_id = format!("claude_setup_{index:032x}");
+            store
+                .begin_registered_slot_reconnect(1, operation_id, &slot_id, "a".repeat(64))
+                .expect("begin cycle reconnect");
+            store.remove(1, &slot_id).expect("remove cycle slot");
+        }
+        let final_slot = store
+            .register_path(1, format!("{}/final", root.display()))
+            .expect("register final slot");
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                first_operation_id.to_string(),
+                &final_slot.external_slots[0].slot_id,
+                "b".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("settings")).expect("settings json");
+        assert!(persisted["reconnect_operations"]
+            .as_array()
+            .expect("current reconnects")
+            .is_empty());
+        assert_eq!(
+            persisted["retired_reconnect_operation_filter"]
+                .as_array()
+                .expect("fixed retirement filter")
+                .len(),
+            RETIRED_RECONNECT_FILTER_WORDS
+        );
+        persisted
+            .as_object_mut()
+            .expect("settings object")
+            .remove("retired_reconnect_operation_filter");
+        crate::write_owner_only_file_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&persisted).expect("downgrade settings"),
+        )
+        .expect("simulate older daemon rewrite");
+        let downgraded = store.load().expect("legacy settings remain readable");
+        assert_eq!(downgraded.external_slots.len(), 1);
+        let sidecar_filter: Vec<u64> = serde_json::from_slice(
+            &fs::read(store.retired_reconnect_filter_path()).expect("retirement sidecar"),
+        )
+        .expect("retirement sidecar json");
+        assert_eq!(sidecar_filter.len(), RETIRED_RECONNECT_FILTER_WORDS);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(store.retired_reconnect_filter_path())
+                    .expect("sidecar metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(matches!(
+            store.begin_registered_slot_reconnect(
+                1,
+                first_operation_id.to_string(),
+                &downgraded.external_slots[0].slot_id,
+                "b".repeat(64),
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.prepare_managed_account(1, first_operation_id.to_string(), None),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn setup_operation_binds_first_strong_account_retries_and_stop_preserves_registration() {
         let path = temp_path("setup-state-machine");
         let root = path.parent().expect("parent");
@@ -1747,6 +2760,8 @@ mod tests {
         let config_dir = root.join(CLAUDE_MANAGED_ACCOUNTS_DIR_NAME).join(slot_id);
         let persisted = PersistedClaudeConfigSlotSettingsV1 {
             setup_operations: vec![PersistedClaudeAccountSetupOperationV1 {
+                kind: ClaudeAccountSetupOperationKind::ConnectManagedAccount,
+                created_sequence: 1,
                 operation_id: operation_id.to_string(),
                 slot_id: slot_id.to_string(),
                 config_dir: config_dir.to_string_lossy().into_owned(),
