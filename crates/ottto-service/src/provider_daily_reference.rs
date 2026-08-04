@@ -20,9 +20,10 @@
 //!   `wham/analytics/daily-workspace-usage-counts` is read. `wham/tasks/*`,
 //!   `teleport-events`, and `/v1/sessions` are permanently out of scope.
 //! * **The credential and the raw response body never leave the machine.**
-//! * **Dark by default.** No grant, no sentinel-free support directory, no
-//!   approved server policy, or an unadmitted collector version each stop the
-//!   cycle before a socket is opened.
+//! * **Dark by default.** No grant, no sentinel-free support directory, or no
+//!   approved server policy each stop the cycle before a socket is opened.
+//!   The backend separately applies its collector-build admission list to each
+//!   upload and stores nothing from an unadmitted build.
 
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
@@ -35,7 +36,7 @@ use ottto_protocol::{AgentDiagnosticSeverity, AgentStatusDiagnostic, LocalAccoun
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -104,6 +105,7 @@ const FETCH_INTERVAL_JITTER_SECONDS: u64 = 15 * 60;
 const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_LOGGED_DIAGNOSTICS_PER_CYCLE: usize = 20;
 
 const BREAKER_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 const BREAKER_AUTH_THRESHOLD: u32 = 3;
@@ -320,8 +322,9 @@ pub struct DailyReferenceGrant {
     pub schema_version: String,
     pub source: String,
     pub collector_id: String,
-    /// Server-owned. Only [`GrantStore::bind_backend_grant`] writes it, and a
-    /// binary whose release version differs is refused at runtime.
+    /// Informational build recorded from the backend grant response. Only
+    /// [`GrantStore::bind_backend_grant`] writes it; uploads independently
+    /// report the running build for backend admission.
     pub collector_version: String,
     pub release_lane: String,
     pub disclosure_version: String,
@@ -456,8 +459,7 @@ impl GrantStore {
     }
 
     /// Record local consent. The grant is not live until the backend binds it:
-    /// `collector_version` stays empty and `backend_create_pending` is set, so
-    /// [`grant_runtime_ready`] refuses it.
+    /// `backend_create_pending` is set, so [`grant_runtime_ready`] refuses it.
     pub fn enable(&self, setup: &GrantSetup, now: OffsetDateTime) -> Result<DailyReferenceGrant> {
         if !is_uuid(&setup.installation_id) {
             return Err(anyhow!("installation id is not a device uuid"));
@@ -529,8 +531,8 @@ impl GrantStore {
     }
 
     /// Bind the server's answer. This is the only writer of `collector_version`
-    /// and of the backend binding: the server owns admission, the client only
-    /// compares the answer to its own release.
+    /// and of the backend binding. Build governance remains server-owned: each
+    /// upload reports the running release for backend admission.
     pub fn bind_backend_grant(
         &self,
         response: &GrantResponse,
@@ -713,22 +715,51 @@ fn validate_grant_response(
 
 /// The single answer to "may this build collect right now".
 ///
-/// Note the `collector_version` check: the server states which build it
-/// admitted, and a daemon upgrade therefore makes the stored grant ineligible
-/// until the customer re-consents on the new build. Consent is per build.
+/// `disclosure_version` remains the local "what is read" gate and must match.
+/// Collector build governance lives in the backend admission list, so a daemon
+/// upgrade does not make stored consent ineligible or require re-consent.
 pub fn grant_runtime_ready(grant: &DailyReferenceGrant) -> bool {
-    grant.status == GrantStatus::Enabled
-        && grant.schema_version == SCHEMA_VERSION
-        && grant.source == SOURCE
-        && grant.collector_id == COLLECTOR_ID
-        && grant.disclosure_version == DISCLOSURE_VERSION
-        && grant.collector_version == compiled_release_version()
-        && !grant.backend_create_pending
-        && grant.backend_binding.as_ref().is_some_and(|binding| {
-            !binding.backend_revoked
-                && binding.server_policy_state == ServerPolicyState::Approved
-                && binding.grant_version >= 1
-        })
+    grant_runtime_block_reason(grant).is_none()
+}
+
+/// Which single condition stops a stored grant from collecting, if any.
+///
+/// `grant_runtime_ready` is the boolean this answers. Kept separate so a
+/// refusal can name its own cause: a grant that exists but cannot collect used
+/// to end the cycle in silence, which reads exactly like "nothing to report".
+/// Returns a fixed vocabulary, never grant contents.
+pub fn grant_runtime_block_reason(grant: &DailyReferenceGrant) -> Option<&'static str> {
+    if grant.status != GrantStatus::Enabled {
+        return Some("grant_not_enabled");
+    }
+    if grant.schema_version != SCHEMA_VERSION {
+        return Some("schema_version_mismatch");
+    }
+    if grant.source != SOURCE {
+        return Some("source_mismatch");
+    }
+    if grant.collector_id != COLLECTOR_ID {
+        return Some("collector_id_mismatch");
+    }
+    if grant.disclosure_version != DISCLOSURE_VERSION {
+        return Some("disclosure_version_mismatch");
+    }
+    if grant.backend_create_pending {
+        return Some("backend_create_pending");
+    }
+    let Some(binding) = grant.backend_binding.as_ref() else {
+        return Some("no_backend_binding");
+    };
+    if binding.backend_revoked {
+        return Some("backend_revoked");
+    }
+    if binding.server_policy_state != ServerPolicyState::Approved {
+        return Some("server_policy_not_approved");
+    }
+    if binding.grant_version < 1 {
+        return Some("grant_version_below_one");
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -740,8 +771,8 @@ pub const COLLECTOR_STATUS_SCHEMA_VERSION: &str = "provider_daily_reference_coll
 
 /// What the capability is actually doing right now, as opposed to what the
 /// stored grant says. `grant_status` is the persisted consent record;
-/// `runtime_state` folds in the local off-switch, server policy, and the
-/// per-build admission rule.
+/// `runtime_state` folds in the local off-switch and server policy. Build
+/// admission remains a backend upload decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeState {
@@ -799,11 +830,6 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
                     || binding.server_policy_state != ServerPolicyState::Approved
             })
     });
-    let version_rebind_required = stored.as_ref().is_some_and(|grant| {
-        grant.status == GrantStatus::Enabled
-            && !grant.backend_create_pending
-            && grant.collector_version != compiled_release_version()
-    });
     let runtime_ready = stored.as_ref().is_some_and(grant_runtime_ready);
     let provider_read_permitted = runtime_ready && !network_disabled;
 
@@ -819,11 +845,6 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
         (
             RuntimeState::ConsentRequired,
             "backend_grant_reconciliation_required",
-        )
-    } else if version_rebind_required {
-        (
-            RuntimeState::ConsentRequired,
-            "collector_version_rebind_required",
         )
     } else if runtime_ready {
         (RuntimeState::Enabled, "enabled")
@@ -1370,30 +1391,164 @@ fn credits_at(value: &Value, keys: &[&str]) -> Option<f64> {
 fn counters_at(value: &Value, include_credits: bool) -> Counters {
     Counters {
         credits_used: include_credits
-            .then(|| credits_at(value, &["credits"]))
+            .then(|| {
+                credits_at(
+                    value,
+                    &["credits", "credits_used", "credit_usage", "total_credits"],
+                )
+            })
             .flatten(),
         uncached_input_tokens: counter_at(
             value,
-            &["uncached_text_input_tokens", "uncached_input_tokens"],
+            &[
+                "uncached_text_input_tokens",
+                "uncached_input_tokens",
+                "input_tokens_uncached",
+                "text_input_tokens_uncached",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         cached_input_tokens: counter_at(
             value,
-            &["cached_text_input_tokens", "cached_input_tokens"],
+            &[
+                "cached_text_input_tokens",
+                "cached_input_tokens",
+                "input_tokens_cached",
+                "text_input_tokens_cached",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         output_tokens: counter_at(
             value,
-            &["text_output_tokens", "output_tokens"],
+            &[
+                "text_output_tokens",
+                "output_tokens",
+                "completion_tokens",
+                "generated_tokens",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         total_tokens: counter_at(
             value,
-            &["text_total_tokens", "total_tokens"],
+            &[
+                "text_total_tokens",
+                "total_tokens",
+                "token_count",
+                "total_token_count",
+                "tokens",
+            ],
             MAX_TOKEN_COUNTER,
         ),
-        thread_count: counter_at(value, &["threads", "thread_count"], MAX_EVENT_COUNTER),
-        turn_count: counter_at(value, &["turns", "turn_count"], MAX_EVENT_COUNTER),
+        thread_count: counter_at(
+            value,
+            &["threads", "thread_count", "threads_count", "total_threads"],
+            MAX_EVENT_COUNTER,
+        ),
+        turn_count: counter_at(
+            value,
+            &["turns", "turn_count", "turns_count", "total_turns"],
+            MAX_EVENT_COUNTER,
+        ),
+    }
+}
+
+const DAY_DATE_KEYS: &[&str] = &[
+    "date",
+    "day",
+    "usage_date",
+    "bucket_start",
+    "start_date",
+    "timestamp",
+    "created_at",
+    "start",
+    "period_start",
+];
+const CLIENT_ARRAY_KEYS: &[&str] = &[
+    "clients",
+    "client_breakdown",
+    "by_client",
+    "per_client",
+    "client_counts",
+    "breakdown",
+    "surfaces",
+    "clients_data",
+    "client_data",
+];
+const CLIENT_ID_KEYS: &[&str] = &["client_id", "client", "id", "name", "surface", "surface_id"];
+const MODEL_ARRAY_KEYS: &[&str] = &[
+    "models",
+    "model_breakdown",
+    "by_model",
+    "per_model",
+    "model_list",
+    "models_data",
+    "model_data",
+];
+const MODEL_NAME_KEYS: &[&str] = &[
+    "model",
+    "model_id",
+    "model_slug",
+    "name",
+    "model_name",
+    "identifier",
+    "slug",
+];
+const COUNTER_KEYS: &[&str] = &[
+    "credits",
+    "credits_used",
+    "credit_usage",
+    "total_credits",
+    "uncached_text_input_tokens",
+    "uncached_input_tokens",
+    "input_tokens_uncached",
+    "text_input_tokens_uncached",
+    "cached_text_input_tokens",
+    "cached_input_tokens",
+    "input_tokens_cached",
+    "text_input_tokens_cached",
+    "text_output_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "generated_tokens",
+    "text_total_tokens",
+    "total_tokens",
+    "token_count",
+    "total_token_count",
+    "tokens",
+    "threads",
+    "thread_count",
+    "threads_count",
+    "total_threads",
+    "turns",
+    "turn_count",
+    "turns_count",
+    "total_turns",
+];
+const MAX_UNRECOGNIZED_KEYS: usize = 12;
+const MAX_REPORTED_KEY_CHARS: usize = 40;
+
+fn record_unrecognized_keys(
+    value: &Value,
+    recognized_groups: &[&[&str]],
+    unrecognized: &mut BTreeSet<String>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in object.keys() {
+        if recognized_groups
+            .iter()
+            .any(|group| group.contains(&key.as_str()))
+        {
+            continue;
+        }
+        let bounded: String = key.chars().take(MAX_REPORTED_KEY_CHARS).collect();
+        unrecognized.insert(bounded);
+        if unrecognized.len() > MAX_UNRECOGNIZED_KEYS {
+            if let Some(last) = unrecognized.iter().next_back().cloned() {
+                unrecognized.remove(&last);
+            }
+        }
     }
 }
 
@@ -1440,6 +1595,23 @@ pub struct NormalizedWindow {
     /// Model identifiers the contract's slug cannot represent. Counted, never
     /// coerced, and never uploaded.
     pub dropped_model_rows: usize,
+    pub days_seen: usize,
+    pub days_recognized: usize,
+    pub days_out_of_window: usize,
+    pub days_no_client_breakdown: usize,
+    pub days_used_fallback: usize,
+    pub days_missing_date: usize,
+    pub clients_seen: usize,
+    pub clients_missing_id: usize,
+    pub clients_no_model_breakdown: usize,
+    pub models_seen: usize,
+    pub models_missing_id: usize,
+    pub entries_empty_counters: usize,
+    /// Structure-only provider shape hints. These sets contain bounded key
+    /// names, never the corresponding values or account identifiers.
+    pub unrecognized_day_keys: BTreeSet<String>,
+    pub unrecognized_client_keys: BTreeSet<String>,
+    pub unrecognized_model_keys: BTreeSet<String>,
 }
 
 /// Normalize a provider payload into contract rows.
@@ -1475,80 +1647,116 @@ pub fn normalize_provider_window(
 
     let mut grouped: BTreeMap<(String, Surface, String), Counters> = BTreeMap::new();
     let mut dropped_model_rows = 0_usize;
-    let mut recognized_days = 0_usize;
+    let mut days_recognized = 0_usize;
+    let days_seen = days.len();
+    let mut days_out_of_window = 0_usize;
+    let mut days_no_client_breakdown = 0_usize;
+    let mut days_used_fallback = 0_usize;
+    let mut days_missing_date = 0_usize;
+    let mut clients_seen = 0_usize;
+    let mut clients_missing_id = 0_usize;
+    let mut clients_no_model_breakdown = 0_usize;
+    let mut models_seen = 0_usize;
+    let mut models_missing_id = 0_usize;
+    let mut entries_empty_counters = 0_usize;
+    let mut unrecognized_day_keys = BTreeSet::new();
+    let mut unrecognized_client_keys = BTreeSet::new();
+    let mut unrecognized_model_keys = BTreeSet::new();
 
     for day in days {
-        let Some(day_key) = first_string(
+        record_unrecognized_keys(
             day,
-            &["date", "day", "usage_date", "bucket_start", "start_date"],
-        )
-        .and_then(provider_day) else {
+            &[DAY_DATE_KEYS, CLIENT_ARRAY_KEYS, COUNTER_KEYS],
+            &mut unrecognized_day_keys,
+        );
+        let Some(day_key) = first_string(day, DAY_DATE_KEYS).and_then(provider_day) else {
+            days_missing_date += 1;
             continue;
         };
-        recognized_days += 1;
+        days_recognized += 1;
         // A provider day outside the window we asked for is not evidence for
         // this batch; the contract rejects it and so do we.
         if day_key.as_str() < coverage_start || day_key.as_str() > coverage_end {
+            days_out_of_window += 1;
             continue;
         }
-        let Some(clients) = first_array(
-            day,
-            &[
-                "clients",
-                "client_breakdown",
-                "by_client",
-                "per_client",
-                "client_counts",
-                "breakdown",
-            ],
-        ) else {
-            continue;
-        };
-        for client in clients {
-            let Some(client_id) = first_string(client, &["client_id", "client", "id", "name"])
-            else {
-                continue;
-            };
-            let surface = surface_for_client_id(client_id);
-            let surface_counters = counters_at(client, true);
-            if !surface_counters.is_empty() {
-                grouped
-                    .entry((day_key.clone(), surface, ALL_MODELS.to_string()))
-                    .or_default()
-                    .merge(&surface_counters);
-            }
-            let Some(models) = first_array(
-                client,
-                &["models", "model_breakdown", "by_model", "per_model"],
-            ) else {
-                continue;
-            };
-            for model in models {
-                let Some(raw_model) =
-                    first_string(model, &["model", "model_id", "model_slug", "name"])
-                else {
+        let mut day_emitted_row = false;
+        if let Some(clients) = first_array(day, CLIENT_ARRAY_KEYS) {
+            for client in clients {
+                clients_seen += 1;
+                record_unrecognized_keys(
+                    client,
+                    &[CLIENT_ID_KEYS, MODEL_ARRAY_KEYS, COUNTER_KEYS],
+                    &mut unrecognized_client_keys,
+                );
+                let Some(client_id) = first_string(client, CLIENT_ID_KEYS) else {
+                    clients_missing_id += 1;
                     continue;
                 };
-                let Some(slug) = normalized_model_slug(raw_model) else {
-                    dropped_model_rows += 1;
-                    continue;
-                };
-                // The provider reports 0.0 for per-model credits, which is not
-                // a real attribution. Per-model rows carry tokens, threads and
-                // turns only; the surface row carries the metered credits.
-                let model_counters = counters_at(model, false);
-                if model_counters.is_empty() {
-                    continue;
+                let surface = surface_for_client_id(client_id);
+                let surface_counters = counters_at(client, true);
+                if surface_counters.is_empty() {
+                    entries_empty_counters += 1;
+                } else {
+                    grouped
+                        .entry((day_key.clone(), surface, ALL_MODELS.to_string()))
+                        .or_default()
+                        .merge(&surface_counters);
+                    day_emitted_row = true;
                 }
+                if let Some(models) = first_array(client, MODEL_ARRAY_KEYS) {
+                    for model in models {
+                        models_seen += 1;
+                        record_unrecognized_keys(
+                            model,
+                            &[MODEL_NAME_KEYS, COUNTER_KEYS],
+                            &mut unrecognized_model_keys,
+                        );
+                        let Some(raw_model) = first_string(model, MODEL_NAME_KEYS) else {
+                            models_missing_id += 1;
+                            continue;
+                        };
+                        let Some(slug) = normalized_model_slug(raw_model) else {
+                            dropped_model_rows += 1;
+                            continue;
+                        };
+                        // The provider reports 0.0 for per-model credits, which is not
+                        // a real attribution. Per-model rows carry tokens, threads and
+                        // turns only; the surface row carries the metered credits.
+                        let model_counters = counters_at(model, false);
+                        if model_counters.is_empty() {
+                            entries_empty_counters += 1;
+                            continue;
+                        }
+                        grouped
+                            .entry((day_key.clone(), surface, slug))
+                            .or_default()
+                            .merge(&model_counters);
+                        day_emitted_row = true;
+                    }
+                } else {
+                    clients_no_model_breakdown += 1;
+                }
+            }
+        } else {
+            days_no_client_breakdown += 1;
+        }
+
+        if !day_emitted_row {
+            let day_counters = counters_at(day, true);
+            if day_counters.is_empty() {
+                entries_empty_counters += 1;
+            } else {
                 grouped
-                    .entry((day_key.clone(), surface, slug))
+                    .entry((day_key, Surface::Other, ALL_MODELS.to_string()))
                     .or_default()
-                    .merge(&model_counters);
+                    .merge(&day_counters);
+                days_used_fallback += 1;
             }
         }
     }
 
-    if recognized_days == 0 {
+    if days_recognized == 0 {
         return Err(ProviderReadError::ResponseShape(
             "no recognizable provider day in payload".to_string(),
         ));
@@ -1574,6 +1782,21 @@ pub fn normalize_provider_window(
         rows,
         provider_data_refreshed_at: refreshed_at,
         dropped_model_rows,
+        days_seen,
+        days_recognized,
+        days_out_of_window,
+        days_no_client_breakdown,
+        days_used_fallback,
+        days_missing_date,
+        clients_seen,
+        clients_missing_id,
+        clients_no_model_breakdown,
+        models_seen,
+        models_missing_id,
+        entries_empty_counters,
+        unrecognized_day_keys,
+        unrecognized_client_keys,
+        unrecognized_model_keys,
     })
 }
 
@@ -1856,7 +2079,7 @@ fn map_upload_error(error: &anyhow::Error) -> UploadError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleOutcome {
-    /// Sentinel, absent consent, unapproved policy, or an unadmitted build.
+    /// Sentinel, absent consent, mismatched disclosure, or unapproved policy.
     Disabled,
     /// The breaker is open; no provider request was made.
     CircuitOpen,
@@ -1916,6 +2139,94 @@ fn warning(code: &str, message: &str) -> AgentStatusDiagnostic {
     AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Warning, message)
 }
 
+fn normalization_counter_summary(normalized: &NormalizedWindow) -> String {
+    let mut counters = Vec::new();
+    macro_rules! add_nonzero {
+        ($name:ident) => {
+            if normalized.$name > 0 {
+                counters.push(format!("{}={}", stringify!($name), normalized.$name));
+            }
+        };
+    }
+    add_nonzero!(days_seen);
+    add_nonzero!(days_recognized);
+    add_nonzero!(days_missing_date);
+    add_nonzero!(days_out_of_window);
+    add_nonzero!(days_no_client_breakdown);
+    add_nonzero!(days_used_fallback);
+    add_nonzero!(clients_seen);
+    add_nonzero!(clients_missing_id);
+    add_nonzero!(clients_no_model_breakdown);
+    add_nonzero!(models_seen);
+    add_nonzero!(models_missing_id);
+    add_nonzero!(entries_empty_counters);
+    add_nonzero!(dropped_model_rows);
+    counters.join(", ")
+}
+
+fn has_normalization_accounting_events(normalized: &NormalizedWindow) -> bool {
+    normalized.days_missing_date > 0
+        || normalized.days_out_of_window > 0
+        || normalized.days_no_client_breakdown > 0
+        || normalized.days_used_fallback > 0
+        || normalized.clients_missing_id > 0
+        || normalized.clients_no_model_breakdown > 0
+        || normalized.models_missing_id > 0
+        || normalized.entries_empty_counters > 0
+}
+
+fn format_unrecognized_keys(keys: &BTreeSet<String>) -> String {
+    format!(
+        "[{}]",
+        keys.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn append_normalization_diagnostics(
+    normalized: &NormalizedWindow,
+    diagnostics: &mut Vec<AgentStatusDiagnostic>,
+) {
+    if has_normalization_accounting_events(normalized) {
+        diagnostics.push(info(
+            "codex_daily_aggregates_normalization_accounting",
+            &format!(
+                "Provider normalization accounting: {}.",
+                normalization_counter_summary(normalized)
+            ),
+        ));
+    }
+    for (code, level, keys) in [
+        (
+            "codex_daily_aggregates_unrecognized_day_keys",
+            "day",
+            &normalized.unrecognized_day_keys,
+        ),
+        (
+            "codex_daily_aggregates_unrecognized_client_keys",
+            "client",
+            &normalized.unrecognized_client_keys,
+        ),
+        (
+            "codex_daily_aggregates_unrecognized_model_keys",
+            "model",
+            &normalized.unrecognized_model_keys,
+        ),
+    ] {
+        if !keys.is_empty() {
+            diagnostics.push(info(
+                code,
+                &format!(
+                    "Unrecognized {level}-level keys: {}.",
+                    format_unrecognized_keys(keys)
+                ),
+            ));
+        }
+    }
+}
+
 /// Consent, cadence state, and the off-switch for one installation.
 #[derive(Debug, Clone)]
 pub struct Collector {
@@ -1959,10 +2270,11 @@ impl Collector {
 
     /// Run one collection cycle.
     ///
-    /// Every gate below runs before a socket is opened, in this order: the
-    /// sentinel, live consent at the current epoch on this exact build, the
+    /// Every local gate below runs before a socket is opened, in this order:
+    /// the sentinel, live consent at the current epoch and disclosure, the
     /// live credential proving it is the installation and account consent was
-    /// taken over, the circuit breaker, and finally the cadence gate.
+    /// taken over, the circuit breaker, and finally the cadence gate. The
+    /// backend applies build admission when the resulting batch is uploaded.
     pub fn collect_once(
         &self,
         runtime: &Runtime,
@@ -2004,11 +2316,30 @@ fn collect_once(
     }
 
     // No consent is the silent case: nothing to report, nothing to warn about.
-    let Ok(Some(grant)) = grants.load() else {
-        return Cycle::new(CycleOutcome::Disabled);
+    // A grant that exists but cannot collect is not that case, and says so.
+    let grant = match grants.load() {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
+        Err(_) => {
+            return Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_consent_unreadable",
+                    "Stored consent could not be read on this Mac, so nothing was collected.",
+                ),
+            )
+        }
     };
-    if !grant_runtime_ready(&grant) {
-        return Cycle::new(CycleOutcome::Disabled);
+    if let Some(reason) = grant_runtime_block_reason(&grant) {
+        return Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_consent_not_runtime_ready",
+                &format!(
+                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
+                ),
+            ),
+        );
     }
 
     // Consent is bound to one installation and one provider account. Prove both
@@ -2112,6 +2443,16 @@ fn collect_once(
             ),
         ));
     }
+    if normalized_row_count == 0 {
+        diagnostics.push(info(
+            "codex_daily_aggregates_zero_rows_explained",
+            &format!(
+                "The provider request succeeded but normalized zero rows; stage accounting: {}.",
+                normalization_counter_summary(&normalized)
+            ),
+        ));
+    }
+    append_normalization_diagnostics(&normalized, &mut diagnostics);
 
     let batches = match pack_batches(normalized.rows, &window_start, &window_end) {
         Ok(batches) => batches,
@@ -2525,11 +2866,32 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     // The default/off path is one local grant read. Nothing below - account,
     // device, connection, destination, credential, or keychain - is touched
     // until consent is capable of becoming runtime-ready.
-    let Ok(Some(grant)) = collector.grants.load() else {
-        return Cycle::new(CycleOutcome::Disabled);
+    // No consent at all stays silent: nothing was promised, so nothing is owed.
+    // A grant that exists but cannot collect is the opposite case and must say
+    // so, or "consent is on" and "nothing is being read" look identical.
+    let grant = match collector.grants.load() {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
+        Err(_) => {
+            return Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_consent_unreadable",
+                    "Stored consent could not be read on this Mac, so nothing was collected.",
+                ),
+            )
+        }
     };
-    if !grant_runtime_ready(&grant) {
-        return Cycle::new(CycleOutcome::Disabled);
+    if let Some(reason) = grant_runtime_block_reason(&grant) {
+        return Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_consent_not_runtime_ready",
+                &format!(
+                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
+                ),
+            ),
+        );
     }
 
     let Ok(Some((runtime, credential, api_base_url))) = load_runtime_binding() else {
@@ -2613,6 +2975,12 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
             if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
                 eprintln!("{}", cycle_summary_log(&cycle));
             }
+            // Diagnostics are printed whatever the outcome. A Disabled cycle is
+            // the one most worth explaining: it is where a live consent quietly
+            // stops collecting. Silent outcomes carry no diagnostics anyway.
+            for line in cycle_diagnostic_log_lines(&cycle.diagnostics) {
+                eprintln!("{line}");
+            }
             thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
     if let Err(error) = spawned {
@@ -2632,6 +3000,28 @@ fn cycle_summary_log(cycle: &Cycle) -> String {
         cycle.outcome,
         cycle.diagnostics.len()
     )
+}
+
+fn cycle_diagnostic_log_lines(diagnostics: &[AgentStatusDiagnostic]) -> Vec<String> {
+    let mut lines = diagnostics
+        .iter()
+        .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
+        .map(|diagnostic| {
+            format!(
+                "codex_daily_aggregates_collector_diagnostic severity={:?} code={} message={:?}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            )
+        })
+        .collect::<Vec<_>>();
+    let suppressed = diagnostics
+        .len()
+        .saturating_sub(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE);
+    if suppressed > 0 {
+        lines.push(format!(
+            "codex_daily_aggregates_collector_diagnostics_suppressed count={suppressed}"
+        ));
+    }
+    lines
 }
 
 fn cycle_jitter() -> Duration {
@@ -3343,6 +3733,154 @@ mod tests {
             normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
         assert_eq!(normalized.rows.len(), 1);
         assert_eq!(normalized.rows[0].provider_day, "2026-07-26");
+        assert_eq!(normalized.days_seen, 5);
+        assert_eq!(normalized.days_recognized, 2);
+        assert_eq!(normalized.days_out_of_window, 1);
+        assert_eq!(normalized.days_missing_date, 3);
+    }
+
+    #[test]
+    fn day_totals_without_a_client_breakdown_use_the_other_surface_fallback() {
+        let payload = json!({
+            "results": [{
+                "timestamp": "2026-07-26T00:00:00Z",
+                "credits_used": 2.5,
+                "total_token_count": 42,
+                "threads_count": 3,
+                "turns_count": 7
+            }]
+        });
+
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+
+        assert_eq!(normalized.rows.len(), 1);
+        let row = &normalized.rows[0];
+        assert_eq!(row.provider_day, "2026-07-26");
+        assert_eq!(row.surface, "other");
+        assert_eq!(row.model, ALL_MODELS);
+        assert_eq!(row.credits_used.as_deref(), Some("2.500000"));
+        assert_eq!(row.total_tokens, Some(42));
+        assert_eq!(row.thread_count, Some(3));
+        assert_eq!(row.turn_count, Some(7));
+        assert_eq!(normalized.days_no_client_breakdown, 1);
+        assert_eq!(normalized.days_used_fallback, 1);
+    }
+
+    #[test]
+    fn entirely_out_of_window_days_have_an_explaining_diagnostic() {
+        let payload = json!({
+            "results": [
+                {"date": "2020-01-01", "total_tokens": 5},
+                {"date": "2020-01-02", "total_tokens": 7}
+            ]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+
+        assert!(normalized.rows.is_empty());
+        assert_eq!(normalized.days_out_of_window, 2);
+        let accounting = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_normalization_accounting")
+            .expect("normalization accounting diagnostic");
+        assert!(accounting.message.contains("days_out_of_window=2"));
+    }
+
+    #[test]
+    fn a_client_without_an_id_is_counted_and_reported() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "clients": [{"total_tokens": 9}]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+
+        assert_eq!(normalized.clients_seen, 1);
+        assert_eq!(normalized.clients_missing_id, 1);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("clients_missing_id=1")));
+    }
+
+    #[test]
+    fn widened_shape_aliases_are_normalized() {
+        let payload = json!({
+            "results": [{
+                "period_start": "2026-07-26",
+                "surfaces": [{
+                    "surface": "CODEX_WEB",
+                    "model_list": [{
+                        "model_name": "GPT-5-Codex",
+                        "total_token_count": 17
+                    }]
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+
+        let row = row_at(&normalized.rows, "2026-07-26", "codex_web", "gpt-5-codex")
+            .expect("aliased model row");
+        assert_eq!(row.total_tokens, Some(17));
+    }
+
+    #[test]
+    fn shape_diagnostics_report_only_bounded_key_names() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "future_day_field": "secret-day-value",
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "total_tokens": 3,
+                    "future_client_field": "secret-client-value",
+                    "models": [{
+                        "model": "gpt-5-codex",
+                        "total_tokens": 3,
+                        "future_model_field": "secret-model-value"
+                    }]
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(messages.contains("future_day_field"));
+        assert!(messages.contains("future_client_field"));
+        assert!(messages.contains("future_model_field"));
+        for secret in [
+            "secret-day-value",
+            "secret-client-value",
+            "secret-model-value",
+            "CODEX_WEB",
+            "gpt-5-codex",
+        ] {
+            assert!(!messages.contains(secret), "diagnostic leaked {secret}");
+        }
+        for keys in [
+            &normalized.unrecognized_day_keys,
+            &normalized.unrecognized_client_keys,
+            &normalized.unrecognized_model_keys,
+        ] {
+            assert!(keys.len() <= MAX_UNRECOGNIZED_KEYS);
+            assert!(keys
+                .iter()
+                .all(|key| key.chars().count() <= MAX_REPORTED_KEY_CHARS));
+        }
     }
 
     #[test]
@@ -3599,16 +4137,29 @@ mod tests {
     }
 
     #[test]
-    fn runtime_readiness_fails_closed_on_every_axis() {
+    fn runtime_readiness_ignores_collector_version_when_disclosure_matches() {
         let collector = collector("runtime-readiness");
+        let mut grant = enabled(&collector);
+        grant.collector_version = "99.99.99".to_string();
+
+        assert_eq!(grant.disclosure_version, DISCLOSURE_VERSION);
+        assert!(grant_runtime_ready(&grant));
+    }
+
+    #[test]
+    fn runtime_readiness_refuses_a_different_disclosure_version() {
+        let collector = collector("runtime-readiness-disclosure");
+        let mut grant = enabled(&collector);
+        grant.disclosure_version = "provider_daily_reference_disclosure.v2".to_string();
+
+        assert!(!grant_runtime_ready(&grant));
+    }
+
+    #[test]
+    fn runtime_readiness_fails_closed_on_every_other_axis() {
+        let collector = collector("runtime-readiness-other-axes");
         let grant = enabled(&collector);
         assert!(grant_runtime_ready(&grant));
-
-        // A daemon upgrade makes the recorded consent ineligible: the server
-        // states the admitted build and consent is per build.
-        let mut upgraded = grant.clone();
-        upgraded.collector_version = "99.99.99".to_string();
-        assert!(!grant_runtime_ready(&upgraded));
 
         // Server policy defaults closed.
         let mut disabled_policy = grant.clone();
@@ -3632,10 +4183,6 @@ mod tests {
         let mut unbound = grant.clone();
         unbound.backend_binding = None;
         assert!(!grant_runtime_ready(&unbound));
-
-        let mut wrong_disclosure = grant.clone();
-        wrong_disclosure.disclosure_version = "something_else.v1".to_string();
-        assert!(!grant_runtime_ready(&wrong_disclosure));
 
         let mut revoked = grant;
         revoked.status = GrantStatus::Revoked;
@@ -3756,7 +4303,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_status_separates_policy_from_build_admission() {
+    fn collector_status_enforces_policy_without_pinning_consent_to_a_build() {
         let collector = collector("collector-status-policy");
         let grant = enabled(&collector);
 
@@ -3775,7 +4322,7 @@ mod tests {
         assert_eq!(policy.reason_code, "policy_disabled");
         assert!(!policy.provider_read_permitted);
 
-        // An upgraded daemon needs re-consent, and says so distinctly.
+        // Build admission is a backend upload decision, not a consent gate.
         persisted["grant"]["backend_binding"]["server_policy_state"] =
             serde_json::Value::String("approved".to_string());
         persisted["grant"]["collector_version"] = serde_json::Value::String("0.0.1".to_string());
@@ -3784,10 +4331,10 @@ mod tests {
             serde_json::to_vec_pretty(&persisted).expect("encode"),
         )
         .expect("write");
-        let rebind = collector_status(collector.grants(), false);
-        assert_eq!(rebind.runtime_state, RuntimeState::ConsentRequired);
-        assert_eq!(rebind.reason_code, "collector_version_rebind_required");
-        assert!(!rebind.provider_read_permitted);
+        let build_changed = collector_status(collector.grants(), false);
+        assert_eq!(build_changed.runtime_state, RuntimeState::Enabled);
+        assert_eq!(build_changed.reason_code, "enabled");
+        assert!(build_changed.provider_read_permitted);
         assert_eq!(grant.status, GrantStatus::Enabled);
     }
 
@@ -3866,18 +4413,125 @@ mod tests {
     }
 
     #[test]
-    fn an_unadmitted_build_stops_before_the_provider_is_contacted() {
-        let collector = collector("unadmitted-build");
+    fn an_upload_from_a_different_admitted_build_is_accepted_when_disclosure_matches() {
+        let collector = collector("different-admitted-build");
         let grant = enabled(&collector);
-        let mut upgraded = grant_response(&grant, "enabled", 2);
-        upgraded.collector_version = "99.99.99".to_string();
+        let mut previously_admitted = grant_response(&grant, "enabled", 2);
+        previously_admitted.collector_version = if compiled_release_version() == "99.99.99" {
+            "98.98.98".to_string()
+        } else {
+            "99.99.99".to_string()
+        };
+        let rebound = collector
+            .grants()
+            .bind_backend_grant(&previously_admitted, INSTALLATION_ID)
+            .expect("bind the previously admitted build");
+        assert_ne!(rebound.collector_version, compiled_release_version());
+        assert_eq!(rebound.disclosure_version, DISCLOSURE_VERSION);
+
+        // The recording transport represents backend acceptance of the
+        // running build under its current admission list.
+        let reader = StaticReader::new(poisoned_payload());
+        let transport = RecordingTransport::default();
+        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
+        assert_eq!(reader.calls.get(), 1);
+        assert_eq!(transport.batches.borrow().len(), 1);
+        assert_eq!(
+            transport.batches.borrow()[0]["collector_version"],
+            compiled_release_version()
+        );
+    }
+
+    #[test]
+    fn an_admitted_build_with_a_different_disclosure_is_refused() {
+        let collector = collector("admitted-build-disclosure-mismatch");
+        let grant = enabled(&collector);
+        let mut previously_admitted = grant_response(&grant, "enabled", 2);
+        previously_admitted.collector_version = if compiled_release_version() == "99.99.99" {
+            "98.98.98".to_string()
+        } else {
+            "99.99.99".to_string()
+        };
         collector
             .grants()
-            .bind_backend_grant(&upgraded, INSTALLATION_ID)
-            .expect("bind a build this binary is not");
+            .bind_backend_grant(&previously_admitted, INSTALLATION_ID)
+            .expect("bind the previously admitted build");
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
+                .expect("decode");
+        persisted["grant"]["disclosure_version"] =
+            serde_json::Value::String("provider_daily_reference_disclosure.v2".to_string());
+        fs::write(
+            collector.grants().path(),
+            serde_json::to_vec_pretty(&persisted).expect("encode"),
+        )
+        .expect("write");
+
         let cycle =
             collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
         assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+        let status = collector_status(collector.grants(), false);
+        assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
+        assert_eq!(status.reason_code, "consent_required");
+        assert!(!status.provider_read_permitted);
+    }
+
+    #[test]
+    fn a_disabled_cycle_still_gets_its_diagnostics_logged() {
+        // Regression: a live consent that stops collecting used to build this
+        // warning and drop it, because the supervisor logged only non-Disabled
+        // cycles. On a real Mac that read as "everything is fine, no data".
+        let collector = collector("disabled-cycle-logging");
+        enabled(&collector);
+        let other_account = Runtime {
+            installation_id: INSTALLATION_ID.to_string(),
+            provider_account_scope: "acct-a-completely-different-account".to_string(),
+        };
+
+        let cycle =
+            collector.collect_once(&other_account, &ForbiddenReader, &ForbiddenTransport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+        let lines = cycle_diagnostic_log_lines(&cycle.diagnostics);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("codex_daily_aggregates_account_mismatch")),
+            "a Disabled cycle must still explain itself: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_grant_that_cannot_collect_names_the_condition_that_stops_it() {
+        let collector = collector("block-reason");
+        let ready = enabled(&collector);
+        assert_eq!(grant_runtime_block_reason(&ready), None);
+        assert!(grant_runtime_ready(&ready));
+
+        let mut stale_disclosure = ready.clone();
+        stale_disclosure.disclosure_version = "provider_daily_reference_disclosure.v99".to_string();
+        assert_eq!(
+            grant_runtime_block_reason(&stale_disclosure),
+            Some("disclosure_version_mismatch")
+        );
+        assert!(!grant_runtime_ready(&stale_disclosure));
+
+        let mut pending = ready.clone();
+        pending.backend_create_pending = true;
+        assert_eq!(
+            grant_runtime_block_reason(&pending),
+            Some("backend_create_pending")
+        );
+
+        let mut unbound = ready.clone();
+        unbound.backend_binding = None;
+        assert_eq!(
+            grant_runtime_block_reason(&unbound),
+            Some("no_backend_binding")
+        );
     }
 
     #[test]
@@ -4201,6 +4855,39 @@ mod tests {
     // -- upload ------------------------------------------------------------
 
     #[test]
+    fn diagnostic_log_lines_include_codes_and_cap_output() {
+        let diagnostics = vec![
+            info("first_code", "count=1"),
+            warning("second_code", "date=\"2026-07-26\""),
+        ];
+
+        assert_eq!(
+            cycle_diagnostic_log_lines(&diagnostics),
+            vec![
+                "codex_daily_aggregates_collector_diagnostic severity=Info code=first_code message=\"count=1\"",
+                "codex_daily_aggregates_collector_diagnostic severity=Warning code=second_code message=\"date=\\\"2026-07-26\\\"\"",
+            ]
+        );
+
+        let capped = (0..MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 3)
+            .map(|index| info(&format!("code_{index}"), "count=1"))
+            .collect::<Vec<_>>();
+        let lines = cycle_diagnostic_log_lines(&capped);
+        assert_eq!(lines.len(), MAX_LOGGED_DIAGNOSTICS_PER_CYCLE + 1);
+        for (index, line) in lines
+            .iter()
+            .take(MAX_LOGGED_DIAGNOSTICS_PER_CYCLE)
+            .enumerate()
+        {
+            assert!(line.contains(&format!("code=code_{index} ")));
+        }
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("codex_daily_aggregates_collector_diagnostics_suppressed count=3")
+        );
+    }
+
+    #[test]
     fn successful_empty_window_is_diagnostic_and_recorded_in_state() {
         let collector = collector("successful-empty-window");
         let grant = enabled(&collector);
@@ -4213,14 +4900,18 @@ mod tests {
 
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(0));
-        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(cycle.diagnostics.len(), 3);
+        let zero_rows = diagnostic(&cycle, "codex_daily_aggregates_zero_rows_explained");
+        assert!(zero_rows.message.contains("days_seen=1"));
+        assert!(zero_rows.message.contains("days_recognized=1"));
+        assert!(zero_rows.message.contains("entries_empty_counters=1"));
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
             AgentDiagnosticSeverity::Info
         );
         assert_eq!(
             cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=1"
+            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=3"
         );
 
         let state = collector.state.load(&state_identity(&grant, false));
@@ -4250,14 +4941,19 @@ mod tests {
 
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(1));
-        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(cycle.diagnostics.len(), 2);
+        assert!(
+            diagnostic(&cycle, "codex_daily_aggregates_normalization_accounting")
+                .message
+                .contains("clients_no_model_breakdown=1")
+        );
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_collected").severity,
             AgentDiagnosticSeverity::Info
         );
         assert_eq!(
             cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=1"
+            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=2"
         );
 
         let state = collector.state.load(&state_identity(&grant, false));
