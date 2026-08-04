@@ -361,7 +361,7 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
     // existing delivery/retry contract, while a disabled upstream returns its
     // normal OTLP-compatible 200 response.
     if request_source == SnapshotSource::ClaudeCode && request.path == "/v1/logs" {
-        match crate::claude_effort::capture_claude_api_request_logs(
+        match crate::claude_local_otel::capture_claude_api_request_logs(
             &ottto_core::default_support_dir(),
             &request.body,
             request
@@ -1580,13 +1580,13 @@ mod tests {
                 .as_nanos()
         ));
 
-        let captured = crate::claude_effort::capture_claude_api_request_logs(
+        let captured = crate::claude_local_otel::capture_claude_api_request_logs(
             &support_dir,
             &request.body,
             request.headers["content-type"].as_str(),
         )
         .expect("effort reduction succeeds");
-        let evidence = crate::claude_effort::load_claude_effort_evidence(
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
             &support_dir,
             ["chunked-session".to_string()],
         )

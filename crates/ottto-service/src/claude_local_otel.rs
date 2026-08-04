@@ -1,18 +1,16 @@
-//! Content-free local Claude Code reasoning-effort evidence.
+//! Privacy-safe local Claude Code OTLP account-identity evidence.
 //!
-//! Claude transcripts intentionally omit the effort tier. Claude Code's official
-//! `claude_code.api_request` OTLP log carries the actual applied tier and exact
-//! request token counts, so the loopback relay reduces only those allowlisted
-//! fields into an owner-only sidecar. Raw OTLP payloads, prompts, responses,
-//! commands, paths, raw account identifiers, and email addresses are never
-//! stored. A provider UUID may be reduced to the same privacy-safe billing
-//! identity hash used by snapshots and then discarded.
+//! Claude transcripts do not include the provider account UUID. Claude Code's
+//! official `claude_code.api_request` OTLP log does, so the loopback relay
+//! reduces `user.account_uuid` to the same privacy-safe billing identity hash
+//! used by snapshots and immediately discards the raw identifier. Exact request
+//! counters let snapshot enrichment require complete coverage before applying
+//! that identity. Raw OTLP payloads, prompts, responses, commands, paths, raw
+//! account identifiers, and email addresses are never stored.
 //!
-//! The sidecar also keeps the API request id, which is the join key back to the
-//! turn that used the tier. It is an opaque provider-side call identifier, not
-//! user content, and Claude Code already writes the same value into the user's
-//! own transcripts as `requestId`. It stays local: only the resolved tier ever
-//! reaches a snapshot.
+//! The sidecar retains its existing serialized fields and historical on-disk
+//! location for upgrade compatibility. Reasoning effort is authoritative only
+//! when Claude Code records it on the transcript's assistant record.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,7 +28,7 @@ const MAX_EVIDENCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeEffortEvidence {
+pub struct ClaudeLocalOtelEvidence {
     pub fingerprint: String,
     pub session_id: String,
     /// Anthropic's per-request id (`req_...`), which the transcript repeats as
@@ -126,7 +124,7 @@ pub fn capture_claude_api_request_logs(
 pub fn load_claude_effort_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
-) -> Result<BTreeMap<String, Vec<ClaudeEffortEvidence>>> {
+) -> Result<BTreeMap<String, Vec<ClaudeLocalOtelEvidence>>> {
     let mut result = BTreeMap::new();
     for session_id in session_ids {
         let path = evidence_path(support_dir, &session_id);
@@ -141,7 +139,7 @@ pub fn load_claude_effort_evidence(
         let mut rows = Vec::new();
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else { continue };
-            let Ok(item) = serde_json::from_str::<ClaudeEffortEvidence>(&line) else {
+            let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
             if item.session_id != session_id || !seen.insert(item.fingerprint.clone()) {
@@ -156,7 +154,7 @@ pub fn load_claude_effort_evidence(
     Ok(result)
 }
 
-/// Index one scan's effort evidence by Anthropic request id.
+/// Build the legacy effort index by Anthropic request id.
 ///
 /// `session_ids` are the sessions whose sidecars own the evidence, which for a
 /// subagent transcript is its PARENT session (Claude Code stamps the top-level
@@ -164,8 +162,9 @@ pub fn load_claude_effort_evidence(
 /// one flat map serves every transcript in the scan: each request lands on
 /// whichever transcript actually recorded it, parent or sidechain alike.
 ///
-/// Rows without a request id (captured before the field existed) are skipped;
-/// `apply_claude_effort_evidence` still reconciles those in aggregate.
+/// Rows without a request id (captured before the field existed) are skipped.
+/// Production snapshot enrichment no longer consults this index: a transcript
+/// record without `effort` stays effort-unknown.
 pub fn load_claude_effort_by_request(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
@@ -184,7 +183,7 @@ pub fn load_claude_effort_by_request(
         };
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else { continue };
-            let Ok(item) = serde_json::from_str::<ClaudeEffortEvidence>(&line) else {
+            let Ok(item) = serde_json::from_str::<ClaudeLocalOtelEvidence>(&line) else {
                 continue;
             };
             if item.session_id != session_id
@@ -230,7 +229,7 @@ pub fn claude_effort_sidecar_fingerprint(support_dir: &Path, session_id: &str) -
 fn evidence_from_record(
     record: &Value,
     attrs: &BTreeMap<String, String>,
-) -> Option<ClaudeEffortEvidence> {
+) -> Option<ClaudeLocalOtelEvidence> {
     let session_id = first_attr(attrs, &["session.id", "session_id"])?;
     let model = first_attr(attrs, &["model", "gen_ai.request.model"])?;
     let effort = first_attr(attrs, &["effort", "effort_level"])
@@ -245,7 +244,7 @@ fn evidence_from_record(
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
-    let mut item = ClaudeEffortEvidence {
+    let mut item = ClaudeLocalOtelEvidence {
         fingerprint: String::new(),
         session_id: session_id.to_string(),
         request_id,
@@ -387,7 +386,7 @@ fn timestamp_at(record: &Value) -> Option<String> {
         .ok()
 }
 
-fn append_evidence(support_dir: &Path, item: &ClaudeEffortEvidence) -> Result<()> {
+fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result<()> {
     let path = evidence_path(support_dir, &item.session_id);
     let dir = path.parent().expect("evidence path has parent");
     fs::create_dir_all(dir).context("create Claude effort evidence directory")?;
@@ -465,7 +464,7 @@ mod tests {
         // path can place it, so it must not enter the per-request index.
         append_evidence(
             &dir,
-            &ClaudeEffortEvidence {
+            &ClaudeLocalOtelEvidence {
                 fingerprint: "legacy".to_string(),
                 session_id: "sess-legacy".to_string(),
                 observed_at: "2026-07-12T15:07:58Z".to_string(),
@@ -524,7 +523,7 @@ mod tests {
 
     #[test]
     fn legacy_evidence_without_aggregate_cache_field_still_loads() {
-        let row: ClaudeEffortEvidence = serde_json::from_str(
+        let row: ClaudeLocalOtelEvidence = serde_json::from_str(
             r#"{"fingerprint":"legacy","session_id":"sess-1","observed_at":"2026-07-12T15:07:58Z","model":"claude-opus-4-8","effort":"low","input_tokens":2,"output_tokens":9,"cache_read_tokens":0,"cache_creation_5m_tokens":2014,"cache_creation_1h_tokens":0,"reasoning_output_tokens":0,"request_count":1}"#,
         )
         .expect("deserialize v0.1.77 evidence");

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 314,
-  "content_sha256": "10caef6e0e2301087bc9190ce6f9a6a8068aaafa63d6dec7e4fcc6c0f1db9b5e",
+  "content_sha256": "38ea0ae26bb6caa8c99c2f3d4065c8abb3e4ebfe46293e257490fb90b4c91cb8",
   "files": [
     {
       "executable": false,
@@ -663,9 +663,9 @@
     {
       "executable": false,
       "mode": "0644",
-      "path": "crates/ottto-service/src/claude_effort.rs",
-      "sha256": "6e4cb2ff3330e86a6f516ca0d2136faf148a50fe2d27d849e802d2a046706bda",
-      "size_bytes": 21817
+      "path": "crates/ottto-service/src/claude_local_otel.rs",
+      "sha256": "76ba1cf13b3b998f2d2b90d5aa9dc663ee42ceaf85f4dc58f02d279aac4512a0",
+      "size_bytes": 21793
     },
     {
       "executable": false,
@@ -769,8 +769,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "6c1b630401b9de8c27fc1c4073b066a57cc6e3c86b3e2d83da67348490be73c9",
-      "size_bytes": 307307
+      "sha256": "49c406d64b717b579219246d64a219f5082ab3d239583ed09fa405ffab5446cd",
+      "size_bytes": 307311
     },
     {
       "executable": false,
@@ -811,8 +811,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/otlp_relay.rs",
-      "sha256": "4698f6c258dcc7028970d1a692405245a7ba75300dbee224656fb51e0723f59a",
-      "size_bytes": 71403
+      "sha256": "fa0e1c1a69b853c3636ce83055ac2248b46f27361c4f245202a3a28f10f58c54",
+      "size_bytes": 71415
     },
     {
       "executable": false,
@@ -846,8 +846,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "687ee4457a462246fed77898537131024978b7cf3ff99b501d220e662a0c000c",
-      "size_bytes": 271045
+      "sha256": "9930598d5d401e60cbc06c9d5e244ae8976b3d8f4cc850ac305b51eebfe0a601",
+      "size_bytes": 271049
     },
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "be378f54df7dfb7ddd20db07bdafa7535a22bfcb160cfbe5ee9b8e83dc8e33b5",
-      "size_bytes": 1060285
+      "sha256": "040dff99da4524b25631d62f7c5624cb7b992864bd6f439e7cb4152d1a540eb6",
+      "size_bytes": 1050160
     },
     {
       "executable": false,
@@ -1693,7 +1693,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "07533191571c6f16dfbe2432dd0321c1bd43c7401c85d71533dcf54c160f0d75",
+      "sha256": "3f476fd252a3bf48d305559e7324741edef9f3e91794ffad3809e417a7bde501",
       "size_bytes": 218514
     },
     {
@@ -2201,7 +2201,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-04T23:15:11+00:00",
+  "generated_at": "2026-08-05T18:40:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 315,
   "public_roots": [
@@ -2237,5 +2237,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "13133c6c2571be216e447e2e9025120e9d5f64b3"
+  "source_commit": "9582b7f553f5782ffea79ffd81b498143b7b0a70"
 }
