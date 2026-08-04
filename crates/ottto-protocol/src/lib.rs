@@ -2391,7 +2391,10 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         LocalControlCommand::ClaudeAccountsStatus
         | LocalControlCommand::ClaudeAccountSetUpkeepConsent { .. }
         | LocalControlCommand::ClaudeAccountRemove { .. }
-        | LocalControlCommand::ClaudeAccountRegisterPath { .. } => {
+        | LocalControlCommand::ClaudeAccountRegisterPath { .. }
+        | LocalControlCommand::ClaudeAccountPrepare { .. }
+        | LocalControlCommand::ClaudeAccountCheck { .. }
+        | LocalControlCommand::ClaudeAccountStopWaiting { .. } => {
             CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION
         }
         _ => LOCAL_CONTROL_PROTOCOL_VERSION,
@@ -2429,19 +2432,39 @@ pub enum ClaudeAccountUpkeepConsentState {
     Granted,
 }
 
-/// Automated config-directory setup and registration belong to a later slice.
-/// Authentication remains user-owned: Ottto never runs or cancels `/login`;
-/// the user runs the official Claude `/login`. Slice A reports the explicit
-/// idle state so clients do not infer work from registered paths or consent.
+/// Daemon-owned observation state for one customer-owned Claude Code login.
+/// Ottto prepares and registers the exact directory, but never starts,
+/// completes, or cancels `/login` and never owns the Claude process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeAccountSetupOperationState {
     Idle,
+    Preparing,
+    WaitingForUserLogin,
+    Validating,
+    Reading,
+    Complete,
+    SetupStopped,
+    SetupFailed,
+    IdentityMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeAccountSetupOperationV1 {
     pub state: ClaudeAccountSetupOperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    /// Exact copyable command returned only by authenticated local control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Who owns lifecycle changes for a Claude config slot. Registering an
@@ -2485,6 +2508,22 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     pub organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Rfc3339Timestamp>,
+    /// Safe local label derived only from a strong account hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    /// Credential deadlines read by the existing read-only exact-slot helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_expires_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relogin_required_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_full_quota_read_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub has_account_windows: bool,
+    #[serde(default)]
+    pub has_scoped_limits: bool,
+    #[serde(default)]
+    pub has_credit_balances: bool,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
 }
@@ -2500,6 +2539,8 @@ pub enum ClaudeConfigSlotCollectionStateV1 {
     IdentityMismatch,
     ConcurrentMutation,
     ProviderUnavailable,
+    CollectionPaused,
+    CollectionInProgress,
     DuplicateAccount,
     CapacityExceeded,
 }
@@ -2518,6 +2559,8 @@ pub enum ClaudeConfigSlotDiagnosticCodeV1 {
     IdentityMismatch,
     ConcurrentMutation,
     ProviderUnavailable,
+    CollectionPaused,
+    CollectionInProgress,
     DuplicateAccount,
     CapacityExceeded,
 }
@@ -2528,6 +2571,7 @@ pub enum ClaudeConfigSlotDiagnosticCodeV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeUnresolvedAccountEvidenceKind {
     CliIdentity,
+    DesktopSession,
     StatusLine,
     UsageCache,
 }
@@ -2537,6 +2581,8 @@ pub struct ClaudeUnresolvedAccountDescriptorV1 {
     pub unresolved_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default)]
     pub evidence: Vec<ClaudeUnresolvedAccountEvidenceKind>,
 }
@@ -2786,6 +2832,25 @@ pub enum LocalControlCommand {
     ClaudeAccountRegisterPath {
         schema_version: u16,
         config_dir: String,
+    },
+    /// Prepare and atomically register one daemon-owned exact config directory.
+    ClaudeAccountPrepare {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_identifier_hash: Option<String>,
+    },
+    /// Advance one persisted setup observation using the existing collector.
+    ClaudeAccountCheck {
+        schema_version: u16,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_identifier_hash: Option<String>,
+    },
+    /// Stop only Ottto's observation; registration and Claude stay untouched.
+    ClaudeAccountStopWaiting {
+        schema_version: u16,
+        operation_id: String,
     },
     Detect {
         source: SourceKind,
@@ -3290,6 +3355,22 @@ mod tests {
                 "schema_version": 1,
                 "slot_id": "claude_slot_0123456789abcdef0123456789abcdef"
             }),
+            serde_json::json!({
+                "command": "claude_account_prepare",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
+                "command": "claude_account_check",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
         ] {
             let mut request = command;
             request["request_id"] = serde_json::json!("req_account_mutation");
@@ -3348,6 +3429,21 @@ mod tests {
                 "schema_version": 1,
                 "config_dir": "/tmp/claude-work"
             }),
+            serde_json::json!({
+                "command": "claude_account_prepare",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_check",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
+            }),
         ] {
             let mut request = command;
             request["request_id"] = serde_json::json!("req_claude_v15");
@@ -3372,10 +3468,57 @@ mod tests {
     }
 
     #[test]
+    fn claude_setup_operation_phases_and_safe_metadata_are_typed() {
+        for (state, expected) in [
+            (ClaudeAccountSetupOperationState::Preparing, "preparing"),
+            (
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+                "waiting_for_user_login",
+            ),
+            (ClaudeAccountSetupOperationState::Validating, "validating"),
+            (ClaudeAccountSetupOperationState::Reading, "reading"),
+            (ClaudeAccountSetupOperationState::Complete, "complete"),
+            (
+                ClaudeAccountSetupOperationState::SetupStopped,
+                "setup_stopped",
+            ),
+            (
+                ClaudeAccountSetupOperationState::SetupFailed,
+                "setup_failed",
+            ),
+            (
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+                "identity_mismatch",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(state).expect("state"), expected);
+        }
+
+        let status = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some("a".repeat(64)),
+            display_label: Some("Claude account aaaaaaaa".to_string()),
+            access_expires_at: Some("2026-08-05T08:00:00Z".to_string()),
+            relogin_required_at: Some("2026-09-01T08:00:00Z".to_string()),
+            last_full_quota_read_at: Some("2026-08-05T00:00:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            has_credit_balances: false,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(status).expect("safe local status");
+        assert_eq!(wire["has_credit_balances"], false);
+        for forbidden in ["access_token", "refresh_token", "config_dir"] {
+            assert!(wire.get(forbidden).is_none());
+        }
+    }
+
+    #[test]
     fn unresolved_claude_account_evidence_has_no_slot_path_or_service_requirement() {
         let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
             unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
             account_identifier_hash: Some("display-safe-hash".to_string()),
+            observed_at: Some("2026-08-04T12:00:00Z".to_string()),
             evidence: vec![
                 ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
                 ClaudeUnresolvedAccountEvidenceKind::StatusLine,

@@ -26,8 +26,9 @@ pub use claude_account::{
 };
 pub use claude_config_slots::{
     ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError, FileClaudeConfigSlotSettingsStore,
-    CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME, CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS,
-    MAX_CLAUDE_CONFIG_DIR_BYTES, MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
+    CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME, CLAUDE_MANAGED_ACCOUNTS_DIR_NAME,
+    CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS, MAX_CLAUDE_CONFIG_DIR_BYTES,
+    MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
 };
 pub use claude_statusline::{
     append_claude_statusline_context_history, claude_statusline_cache_path,

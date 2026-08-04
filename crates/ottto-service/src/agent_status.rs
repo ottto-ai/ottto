@@ -19,13 +19,15 @@ use ottto_protocol::{
     AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, ClaudeAccountsStatusV1,
     ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
     ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
-    ClaudeConfigSlotOwnership, SourceKind,
+    ClaudeConfigSlotOwnership, ClaudeUnresolvedAccountDescriptorV1,
+    ClaudeUnresolvedAccountEvidenceKind, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -69,6 +71,8 @@ const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str = "claude-oauth-usage-netwo
 const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "breaker.json";
 const CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
 const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE: &str = "claude-config-slot-collection-state.json";
+const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE: &str =
+    ".claude-config-slot-collection-state.lock";
 const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION: u16 = 1;
 const CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION: u16 = 1;
 /// How long the breaker stays open once tripped. Long on purpose: an open
@@ -87,9 +91,17 @@ const CLAUDE_OAUTH_USAGE_BREAKER_SHAPE_THRESHOLD: u32 = 3;
 const CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD: u32 = 5;
 static CLAUDE_OAUTH_ACCOUNT_STATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
+static CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS: OnceLock<
+    Mutex<BTreeMap<String, &'static Mutex<()>>>,
+> = OnceLock::new();
 static CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CLAUDE_SLOT_COLLECTION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
+// Reuse the daemon's existing detected-use/session retention contract. This
+// warning is a view of the same local activity evidence, not a new lifetime.
+const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
+    crate::detected_uses::DETECTED_USE_RETENTION_DAYS * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BillingIdentityHints {
@@ -190,7 +202,7 @@ struct ResolvedClaudeSlot {
     account: AgentAccountStatus,
     account_identifier_hash: String,
     organization_identifier_hash: String,
-    access_token: Option<String>,
+    credential: ClaudeOAuthCredential,
 }
 
 /// One captured credential after display-safe identity stayed unchanged across
@@ -198,7 +210,16 @@ struct ResolvedClaudeSlot {
 /// persisted, or read a second time during the attempt.
 struct StableClaudeSlotCredential {
     oauth_account: ClaudeCliOauthAccount,
+    credential: ClaudeOAuthCredential,
+}
+
+/// Exact-slot credential material read once per attempt. This type
+/// deliberately implements neither `Debug` nor `Serialize`; only safe expiry
+/// metadata can be copied into authenticated local status.
+struct ClaudeOAuthCredential {
     access_token: Option<String>,
+    access_expires_at: Option<String>,
+    relogin_required_at: Option<String>,
 }
 
 struct ClaudeSnapshotCandidate {
@@ -266,6 +287,40 @@ impl ClaudeSlotProbeFailure {
 struct PersistedClaudeSlotCollectionStateV1 {
     schema_version: u16,
     slots: BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    #[serde(default)]
+    unresolved_accounts: Vec<ClaudeUnresolvedAccountDescriptorV1>,
+}
+
+struct ClaudeSlotCollectionStateGuard {
+    _process: std::sync::MutexGuard<'static, ()>,
+    file: Option<File>,
+}
+
+struct ClaudeOAuthCollectionAttemptGuard {
+    _process: std::sync::MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for ClaudeOAuthCollectionAttemptGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+impl Drop for ClaudeSlotCollectionStateGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if let Some(file) = &self.file {
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            }
+        }
+    }
 }
 
 /// The failure classes that count toward opening the breaker. Everything else
@@ -808,7 +863,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     );
     let default_slot = ClaudeConfigDirSlot::Default;
     let claude_oauth_account = read_claude_cli_oauth_account(&claude_cli_config_path());
-    let initial_access_token = read_claude_oauth_access_token_for_slot(&default_slot);
+    let initial_credential = read_claude_oauth_credential_for_slot(&default_slot);
     let auth = run_claude_slot_command(
         &default_slot,
         &["auth", "status", "--json"],
@@ -816,7 +871,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     );
     let stable_default_credential = stable_claude_slot_credential(
         claude_oauth_account.clone(),
-        initial_access_token,
+        initial_credential,
         read_claude_cli_oauth_account(&claude_cli_config_path()),
     );
     if auth.command_found && auth.success {
@@ -995,7 +1050,7 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
             collect_claude_oauth_usage_with_access_token(
                 &account_hash,
                 &organization_hash,
-                stable.access_token.clone(),
+                stable.credential.access_token.clone(),
                 true,
             )
         }
@@ -1198,7 +1253,7 @@ fn collect_claude_status_snapshots(
         let slot_id = resolved.descriptor.slot_id.clone();
         let account_hash = resolved.account_identifier_hash.clone();
         let organization_hash = resolved.organization_identifier_hash.clone();
-        let access_token = std::mem::take(&mut resolved.access_token);
+        let access_token = resolved.credential.access_token.take();
         let credential_available = access_token.is_some();
         let outcome = collect_claude_oauth_usage_with_access_token(
             &account_hash,
@@ -1255,7 +1310,13 @@ fn collect_claude_status_snapshots(
             );
         }
     }
-    let _ = persist_claude_slot_collection_states(&slot_states);
+    let unresolved_accounts = derive_unresolved_claude_accounts(
+        &default_snapshot,
+        &snapshots,
+        &slot_states,
+        OffsetDateTime::parse(&captured_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc()),
+    );
+    let _ = persist_claude_slot_collection_states(&slot_states, &unresolved_accounts);
 
     let mut source_health_snapshot = default_snapshot.clone();
     let mut custom_slot_states = slot_states
@@ -1387,6 +1448,58 @@ fn ordered_claude_slot_descriptors(
     descriptors
 }
 
+/// Refresh exactly one registered custom slot for the connection workflow.
+/// This intentionally does not collect the default slot, statusLine, or any
+/// sibling custom slot and never uploads a backend snapshot.
+pub(crate) fn collect_registered_claude_slot_status(
+    slot_id: &str,
+    captured_at: String,
+    expires_at: String,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let descriptor = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .ok()
+        .and_then(|status| {
+            status
+                .managed_slots
+                .into_iter()
+                .chain(status.external_slots)
+                .find(|descriptor| descriptor.slot_id == slot_id)
+        });
+    let Some(descriptor) = descriptor else {
+        return ClaudeSlotProbeFailure::IdentityUnknown.status(&captured_at);
+    };
+    let mut resolved = match resolve_registered_claude_slot(descriptor) {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            let status = failure.status(&captured_at);
+            let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+            return status;
+        }
+    };
+    let account_hash = resolved.account_identifier_hash.clone();
+    let organization_hash = resolved.organization_identifier_hash.clone();
+    let access_token = resolved.credential.access_token.take();
+    let credential_available = access_token.is_some();
+    let outcome = collect_claude_oauth_usage_with_access_token(
+        &account_hash,
+        &organization_hash,
+        access_token,
+        false,
+    );
+    let status = match custom_claude_snapshot_from_usage(
+        resolved,
+        outcome,
+        credential_available,
+        captured_at,
+        expires_at,
+    ) {
+        Ok((_, status)) | Err(status) => status,
+    };
+    let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+    status
+}
+
 fn resolve_registered_claude_slot(
     descriptor: ClaudeConfigSlotDescriptorV1,
 ) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
@@ -1397,7 +1510,7 @@ fn resolve_registered_claude_slot(
     let slot = ClaudeConfigDirSlot::registered(config_dir.clone())
         .map_err(|_| ClaudeSlotProbeFailure::IdentityUnknown)?;
     let initial_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
-    let initial_access_token = read_claude_oauth_access_token_for_slot(&slot);
+    let initial_credential = read_claude_oauth_credential_for_slot(&slot);
     let auth = run_claude_slot_command(&slot, &["auth", "status", "--json"], COMMAND_TIMEOUT);
     let final_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
     if !auth.command_found || !auth.success {
@@ -1405,7 +1518,7 @@ fn resolve_registered_claude_slot(
     }
     let stable = stable_claude_slot_credential(
         initial_oauth_account,
-        initial_access_token,
+        initial_credential,
         final_oauth_account,
     )?;
     let auth_json = serde_json::from_str::<Value>(&auth.stdout)
@@ -1433,10 +1546,11 @@ fn resolve_registered_claude_slot(
         account,
         account_identifier_hash,
         organization_identifier_hash,
-        access_token: stable.access_token,
+        credential: stable.credential,
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn custom_claude_snapshot_from_usage(
     resolved: ResolvedClaudeSlot,
     outcome: ClaudeOAuthUsageOutcome,
@@ -1454,7 +1568,25 @@ fn custom_claude_snapshot_from_usage(
     let usage = match result {
         Ok(usage) if !usage.windows.is_empty() => usage,
         _ => {
-            return Err(if credential_available {
+            let collection_paused = diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "claude_oauth_usage_network_disabled");
+            let collection_in_progress = diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "claude_oauth_usage_collection_in_progress");
+            let mut status = if collection_paused {
+                collection_paused_status(
+                    &captured_at,
+                    &resolved.account_identifier_hash,
+                    &resolved.organization_identifier_hash,
+                )
+            } else if collection_in_progress {
+                collection_in_progress_status(
+                    &captured_at,
+                    &resolved.account_identifier_hash,
+                    &resolved.organization_identifier_hash,
+                )
+            } else if credential_available {
                 provider_unavailable_status(
                     &captured_at,
                     &resolved.account_identifier_hash,
@@ -1462,7 +1594,9 @@ fn custom_claude_snapshot_from_usage(
                 )
             } else {
                 ClaudeSlotProbeFailure::CredentialUnavailable.status(&captured_at)
-            });
+            };
+            apply_credential_metadata(&mut status, &resolved.credential);
+            return Err(status);
         }
     };
     if !claude_usage_has_exact_identity(
@@ -1480,6 +1614,18 @@ fn custom_claude_snapshot_from_usage(
             .credit_balances
             .iter()
             .any(|balance| balance.freshness != AgentQuotaWindowFreshness::Fresh);
+    let has_account_windows =
+        usage.windows.iter().any(|window| {
+            window.scope == AgentQuotaWindowScope::Account && window.name == "session"
+        }) && usage.windows.iter().any(|window| {
+            window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
+        });
+    let has_scoped_limits = usage.windows.iter().any(|window| {
+        window.scope == AgentQuotaWindowScope::Model
+            || window.model.is_some()
+            || window.group.is_some()
+    });
+    let has_credit_balances = !usage.credit_balances.is_empty();
     let mut snapshot = base_snapshot(
         SourceKind::ClaudeCode,
         AgentStatusState::Available,
@@ -1510,7 +1656,7 @@ fn custom_claude_snapshot_from_usage(
     ];
     snapshot.diagnostics = diagnostics;
     append_current_plan_observation(&mut snapshot);
-    let state = if stale {
+    let mut state = if stale {
         provider_unavailable_status(
             &captured_at,
             &resolved.account_identifier_hash,
@@ -1521,8 +1667,12 @@ fn custom_claude_snapshot_from_usage(
             &captured_at,
             &resolved.account_identifier_hash,
             &resolved.organization_identifier_hash,
+            has_account_windows,
+            has_scoped_limits,
+            has_credit_balances,
         )
     };
+    apply_credential_metadata(&mut state, &resolved.credential);
     Ok((snapshot, state))
 }
 
@@ -1587,7 +1737,22 @@ fn claude_default_slot_collection_status(
                         && balance.freshness == AgentQuotaWindowFreshness::Fresh
                 }) =>
         {
-            fresh_slot_status(&snapshot.captured_at, account_hash, organization_hash)
+            fresh_slot_status(
+                &snapshot.captured_at,
+                account_hash,
+                organization_hash,
+                snapshot.quota_windows.iter().any(|window| {
+                    window.scope == AgentQuotaWindowScope::Account && window.name == "session"
+                }) && snapshot.quota_windows.iter().any(|window| {
+                    window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
+                }),
+                snapshot.quota_windows.iter().any(|window| {
+                    window.scope == AgentQuotaWindowScope::Model
+                        || window.model.is_some()
+                        || window.group.is_some()
+                }),
+                !snapshot.credit_balances.is_empty(),
+            )
         }
         Some((account_hash, organization_hash)) => {
             provider_unavailable_status(&snapshot.captured_at, account_hash, organization_hash)
@@ -1601,6 +1766,14 @@ fn claude_default_slot_collection_status(
         }
         None => ClaudeSlotProbeFailure::IdentityUnknown.status(&snapshot.captured_at),
     }
+}
+
+fn apply_credential_metadata(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    credential: &ClaudeOAuthCredential,
+) {
+    status.access_expires_at = credential.access_expires_at.clone();
+    status.relogin_required_at = credential.relogin_required_at.clone();
 }
 
 fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentStatusDiagnostic {
@@ -1620,13 +1793,26 @@ fn fresh_slot_status(
     observed_at: &str,
     account_hash: &str,
     organization_hash: &str,
+    has_account_windows: bool,
+    has_scoped_limits: bool,
+    has_credit_balances: bool,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
     ClaudeConfigSlotCollectionStatusV1 {
         state: ClaudeConfigSlotCollectionStateV1::Fresh,
         account_identifier_hash: Some(account_hash.to_string()),
         organization_identifier_hash: Some(organization_hash.to_string()),
         observed_at: Some(observed_at.to_string()),
+        display_label: Some(format!(
+            "Claude account {}",
+            &account_hash[..account_hash.len().min(8)]
+        )),
+        last_full_quota_read_at: (has_account_windows && has_scoped_limits)
+            .then(|| observed_at.to_string()),
+        has_account_windows,
+        has_scoped_limits,
+        has_credit_balances,
         diagnostics: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -1640,11 +1826,62 @@ fn provider_unavailable_status(
         account_identifier_hash: Some(account_hash.to_string()),
         organization_identifier_hash: Some(organization_hash.to_string()),
         observed_at: Some(observed_at.to_string()),
+        display_label: Some(format!(
+            "Claude account {}",
+            &account_hash[..account_hash.len().min(8)]
+        )),
         diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
             code: ClaudeConfigSlotDiagnosticCodeV1::ProviderUnavailable,
             message: "Full Claude usage is temporarily unavailable for this exact account slot."
                 .to_string(),
         }],
+        ..Default::default()
+    }
+}
+
+fn collection_paused_status(
+    observed_at: &str,
+    account_hash: &str,
+    organization_hash: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::CollectionPaused,
+        account_identifier_hash: Some(account_hash.to_string()),
+        organization_identifier_hash: Some(organization_hash.to_string()),
+        observed_at: Some(observed_at.to_string()),
+        display_label: Some(format!(
+            "Claude account {}",
+            &account_hash[..account_hash.len().min(8)]
+        )),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::CollectionPaused,
+            message: "Claude subscription usage collection is paused by the machine off-switch."
+                .to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+fn collection_in_progress_status(
+    observed_at: &str,
+    account_hash: &str,
+    organization_hash: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::CollectionInProgress,
+        account_identifier_hash: Some(account_hash.to_string()),
+        organization_identifier_hash: Some(organization_hash.to_string()),
+        observed_at: Some(observed_at.to_string()),
+        display_label: Some(format!(
+            "Claude account {}",
+            &account_hash[..account_hash.len().min(8)]
+        )),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::CollectionInProgress,
+            message: "Another task is already reading this exact Claude account; no duplicate request was started."
+                .to_string(),
+        }],
+        ..Default::default()
     }
 }
 
@@ -1658,11 +1895,16 @@ fn duplicate_account_status(
         account_identifier_hash: Some(account_hash.to_string()),
         organization_identifier_hash: organization_hash.map(ToString::to_string),
         observed_at: Some(observed_at.to_string()),
+        display_label: Some(format!(
+            "Claude account {}",
+            &account_hash[..account_hash.len().min(8)]
+        )),
         diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
             code: ClaudeConfigSlotDiagnosticCodeV1::DuplicateAccount,
             message: "This registered slot resolves to an account already collected by an earlier valid slot."
                 .to_string(),
         }],
+        ..Default::default()
     }
 }
 
@@ -1685,33 +1927,262 @@ fn claude_slot_collection_state_path() -> PathBuf {
 
 fn persist_claude_slot_collection_states(
     slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    unresolved_accounts: &[ClaudeUnresolvedAccountDescriptorV1],
 ) -> std::io::Result<()> {
-    let body = serde_json::to_vec_pretty(&PersistedClaudeSlotCollectionStateV1 {
-        schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
-        slots: slots.clone(),
-    })
-    .map_err(std::io::Error::other)?;
+    let _guard = claude_slot_collection_state_guard()?;
+    let mut persisted = read_persisted_claude_slot_collection_state();
+    for (slot_id, candidate) in slots {
+        merge_claude_slot_collection_state(&mut persisted.slots, slot_id, candidate);
+    }
+    persisted.unresolved_accounts = unresolved_accounts.to_vec();
+    // The unresolved candidates were derived before this transaction lock was
+    // acquired. An exact check may have persisted newer full proof in the
+    // meantime, so subtract against the merged lock-time state rather than
+    // trusting the scheduled collector's stale view. Restrict the proof to
+    // slots that are still registered so an orphaned best-effort state file
+    // entry cannot suppress a real unresolved account after slot removal.
+    let current_slot_ids = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map(|status| {
+            std::iter::once(status.default_slot.slot_id)
+                .chain(status.managed_slots.into_iter().map(|slot| slot.slot_id))
+                .chain(status.external_slots.into_iter().map(|slot| slot.slot_id))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_else(|_| slots.keys().cloned().collect());
+    let resolved_full_accounts = persisted
+        .slots
+        .iter()
+        .filter(|(slot_id, state)| {
+            current_slot_ids.contains(*slot_id)
+                && state.last_full_quota_read_at.is_some()
+                && state.has_account_windows
+                && state.has_scoped_limits
+        })
+        .filter_map(|(_, state)| state.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    persisted.unresolved_accounts.retain(|unresolved| {
+        unresolved
+            .account_identifier_hash
+            .as_deref()
+            .map_or(true, |hash| !resolved_full_accounts.contains(hash))
+    });
+    write_persisted_claude_slot_collection_state(&persisted)
+}
+
+fn write_persisted_claude_slot_collection_state(
+    state: &PersistedClaudeSlotCollectionStateV1,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
     write_owner_only_file_atomic(&claude_slot_collection_state_path(), &body)
+}
+
+pub(crate) fn persist_one_claude_slot_collection_state(
+    slot_id: &str,
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> std::io::Result<()> {
+    let _guard = claude_slot_collection_state_guard()?;
+    let mut persisted = read_persisted_claude_slot_collection_state();
+    merge_claude_slot_collection_state(&mut persisted.slots, slot_id, status);
+    if status.last_full_quota_read_at.is_some()
+        && status.has_account_windows
+        && status.has_scoped_limits
+    {
+        if let Some(account_hash) = status.account_identifier_hash.as_deref() {
+            persisted.unresolved_accounts.retain(|unresolved| {
+                unresolved.account_identifier_hash.as_deref() != Some(account_hash)
+            });
+        }
+    }
+    write_persisted_claude_slot_collection_state(&persisted)
+}
+
+fn read_persisted_claude_slot_collection_state() -> PersistedClaudeSlotCollectionStateV1 {
+    fs::read(claude_slot_collection_state_path())
+        .ok()
+        .and_then(|body| serde_json::from_slice::<PersistedClaudeSlotCollectionStateV1>(&body).ok())
+        .filter(|state| state.schema_version == CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION)
+        .unwrap_or_else(|| PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::new(),
+            unresolved_accounts: Vec::new(),
+        })
+}
+
+fn merge_claude_slot_collection_state(
+    slots: &mut BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    slot_id: &str,
+    candidate: &ClaudeConfigSlotCollectionStatusV1,
+) {
+    let replace = slots.get(slot_id).map_or(true, |existing| {
+        candidate.observed_at.as_deref().unwrap_or("")
+            >= existing.observed_at.as_deref().unwrap_or("")
+    });
+    if replace {
+        let mut candidate = candidate.clone();
+        if candidate.last_full_quota_read_at.is_none() {
+            if let Some(existing) = slots.get(slot_id).filter(|existing| {
+                existing.account_identifier_hash == candidate.account_identifier_hash
+                    && existing.last_full_quota_read_at.is_some()
+            }) {
+                candidate.last_full_quota_read_at = existing.last_full_quota_read_at.clone();
+                candidate.has_account_windows = existing.has_account_windows;
+                candidate.has_scoped_limits = existing.has_scoped_limits;
+                candidate.has_credit_balances = existing.has_credit_balances;
+            }
+        }
+        slots.insert(slot_id.to_string(), candidate);
+    }
+}
+
+fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionStateGuard> {
+    let process = CLAUDE_SLOT_COLLECTION_STATE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fs::create_dir_all(default_support_dir())?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE))?;
+    Ok(ClaudeSlotCollectionStateGuard {
+        _process: process,
+        file: Some(file),
+    })
 }
 
 pub(crate) fn annotate_claude_accounts_status(
     mut status: ClaudeAccountsStatusV1,
 ) -> ClaudeAccountsStatusV1 {
-    let states = fs::read(claude_slot_collection_state_path())
-        .ok()
-        .and_then(|body| serde_json::from_slice::<PersistedClaudeSlotCollectionStateV1>(&body).ok())
-        .filter(|state| state.schema_version == CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION)
-        .map(|state| state.slots)
-        .unwrap_or_default();
+    let persisted = read_persisted_claude_slot_collection_state();
     for descriptor in std::iter::once(&mut status.default_slot)
         .chain(status.managed_slots.iter_mut())
         .chain(status.external_slots.iter_mut())
     {
-        if let Some(collection) = states.get(&descriptor.slot_id) {
+        if let Some(collection) = persisted.slots.get(&descriptor.slot_id) {
             descriptor.collection = collection.clone();
         }
     }
+    status.unresolved_accounts = persisted.unresolved_accounts;
     status
+}
+
+pub(crate) fn prune_claude_slot_collection_state(slot_id: &str) -> std::io::Result<()> {
+    let _guard = claude_slot_collection_state_guard()?;
+    let mut persisted = read_persisted_claude_slot_collection_state();
+    persisted.slots.remove(slot_id);
+    write_persisted_claude_slot_collection_state(&persisted)
+}
+
+fn derive_unresolved_claude_accounts(
+    desktop_snapshot: &AgentStatusSnapshot,
+    full_snapshots: &[AgentStatusSnapshot],
+    current_slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    now: OffsetDateTime,
+) -> Vec<ClaudeUnresolvedAccountDescriptorV1> {
+    let mut resolved = full_snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot.quota_windows.iter().any(|window| {
+                window.name == "session"
+                    && window.scope == AgentQuotaWindowScope::Account
+                    && window.freshness == AgentQuotaWindowFreshness::Fresh
+            }) && snapshot.quota_windows.iter().any(|window| {
+                window.name == "weekly"
+                    && window.scope == AgentQuotaWindowScope::Account
+                    && window.freshness == AgentQuotaWindowFreshness::Fresh
+            }) && snapshot.quota_windows.iter().any(|window| {
+                (window.scope == AgentQuotaWindowScope::Model
+                    || window.model.is_some()
+                    || window.group.is_some())
+                    && window.freshness == AgentQuotaWindowFreshness::Fresh
+            })
+        })
+        .filter_map(|snapshot| snapshot.account.as_ref())
+        .filter_map(|account| account.account_identifier_hash.clone())
+        .collect::<BTreeSet<_>>();
+    resolved.extend(
+        read_persisted_claude_slot_collection_state()
+            .slots
+            .into_iter()
+            .filter(|(slot_id, _)| current_slots.contains_key(slot_id))
+            .map(|(_, state)| state)
+            .filter(|state| {
+                state.last_full_quota_read_at.is_some()
+                    && state.has_account_windows
+                    && state.has_scoped_limits
+            })
+            .filter_map(|state| state.account_identifier_hash),
+    );
+    let mut by_hash = BTreeMap::<String, String>::new();
+    for observation in &desktop_snapshot.plan_observations {
+        if observation.evidence_method.as_deref() != Some("claude_desktop_session_bucket")
+            || observation.billing_identity_confidence != AgentStatusConfidence::High
+        {
+            continue;
+        }
+        let Some(account_hash) = observation.account_identifier_hash.as_ref() else {
+            continue;
+        };
+        if account_hash.is_empty() || resolved.contains(account_hash) {
+            continue;
+        }
+        let Some(observed_at) = observation.observed_at.clone() else {
+            continue;
+        };
+        let Ok(observed_time) = OffsetDateTime::parse(&observed_at, &Rfc3339) else {
+            continue;
+        };
+        if now.unix_timestamp() - observed_time.unix_timestamp()
+            > CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS
+        {
+            continue;
+        }
+        by_hash
+            .entry(account_hash.clone())
+            .and_modify(|current| {
+                if observed_at > *current {
+                    *current = observed_at.clone();
+                }
+            })
+            .or_insert(observed_at);
+    }
+    by_hash
+        .into_iter()
+        .map(|(account_hash, observed_at)| {
+            let unresolved_id = format!(
+                "claude-unresolved-{}",
+                &format!(
+                    "{:x}",
+                    Sha256::digest(format!("unresolved:{account_hash}").as_bytes())
+                )[..16]
+            );
+            ClaudeUnresolvedAccountDescriptorV1 {
+                unresolved_id,
+                account_identifier_hash: Some(account_hash),
+                observed_at: Some(observed_at),
+                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+            }
+        })
+        .collect()
 }
 
 /// Takes the observations rather than recomputing them: the statusLine
@@ -1971,7 +2442,7 @@ fn collect_claude_desktop_agent_mode_sessions(
 
 fn claude_desktop_builder_plan_observation(
     builder: ClaudeDesktopProfileBuilder,
-    observed_at: &str,
+    _observed_at: &str,
     last_known_account_uuid: Option<&str>,
 ) -> Option<AgentStatusPlanObservation> {
     let account_identifier_hash =
@@ -2010,8 +2481,12 @@ fn claude_desktop_builder_plan_observation(
         }
     });
     let is_current = last_known_account_uuid == Some(builder.account_uuid.as_str());
+    let activity_observed_at = builder
+        .latest_activity_epoch_seconds
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .and_then(rfc3339_from_unix_seconds);
     Some(AgentStatusPlanObservation {
-        observed_at: Some(observed_at.to_string()),
+        observed_at: activity_observed_at,
         evidence_method: Some("claude_desktop_session_bucket".to_string()),
         source_session_id: builder.latest_session_id,
         provider: Some("anthropic".to_string()),
@@ -2386,7 +2861,7 @@ fn collect_claude_oauth_usage_for_slot(
     collect_claude_oauth_usage_with_access_token(
         account_identifier_hash,
         organization_identifier_hash,
-        read_claude_oauth_access_token_for_slot(slot),
+        read_claude_oauth_credential_for_slot(slot).and_then(|credential| credential.access_token),
         matches!(slot, ClaudeConfigDirSlot::Default),
     )
 }
@@ -2441,13 +2916,10 @@ fn collect_claude_oauth_usage_unstamped(
 ) -> ClaudeOAuthUsageOutcome {
     let now = current_unix_seconds();
 
-    // Off-switch first, ahead of the cache: the sentinel turns this whole data
-    // path off, not just the socket. Serving a previously fetched payload while
-    // the user has switched the endpoint off would still be serving endpoint
-    // data, so the cached copy is dropped from disk too and quota falls back to
-    // Claude Code's own local statusLine surface.
+    // Off-switch first, ahead of the cache. Existing account-scoped cache files
+    // are retained and continue aging honestly; no endpoint data is served and
+    // the network resumes without destroying the last known local evidence.
     if claude_oauth_usage_network_disabled() {
-        clear_all_claude_oauth_usage_caches();
         return ClaudeOAuthUsageOutcome {
             result: Err(
                 "Claude OAuth usage endpoint is switched off on this machine.".to_string(),
@@ -2459,6 +2931,30 @@ fn collect_claude_oauth_usage_unstamped(
             )],
         };
     }
+
+    let Some(_collection_attempt) = try_claude_oauth_collection_attempt(account_identifier_hash)
+    else {
+        if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
+            account_identifier_hash,
+            organization_identifier_hash,
+            mirror_legacy_default,
+        )
+        .filter(|cache| {
+            !cache.windows.is_empty()
+                && now.saturating_sub(cache.observed_at_epoch_seconds)
+                    <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
+        }) {
+            return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)));
+        }
+        return ClaudeOAuthUsageOutcome {
+            result: Err("Claude usage collection is already in progress for this account.".to_string()),
+            diagnostics: vec![AgentStatusDiagnostic::source(
+                "claude_oauth_usage_collection_in_progress",
+                AgentDiagnosticSeverity::Info,
+                "Another daemon task is already reading this exact Claude account; no duplicate provider request was started.",
+            )],
+        };
+    };
 
     let config_fingerprint = claude_oauth_usage_config_fingerprint();
     let open_breaker = read_claude_oauth_usage_breaker_with_legacy_migration(
@@ -2760,6 +3256,58 @@ fn claude_oauth_account_state_lock(account_identifier_hash: &str) -> Arc<Mutex<(
         .clone()
 }
 
+fn try_claude_oauth_collection_attempt(
+    account_identifier_hash: &str,
+) -> Option<ClaudeOAuthCollectionAttemptGuard> {
+    let process_lock = {
+        let mut locks = CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *locks
+            .entry(account_identifier_hash.to_string())
+            .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+    };
+    let process = match process_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    };
+    let account_root = claude_oauth_usage_account_state_dir(account_identifier_hash);
+    if fs::create_dir_all(&account_root).is_err() {
+        return None;
+    }
+    let lock_path = account_root.join(".collection-attempt.lock");
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(lock_path)
+            .ok()?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return None;
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(lock_path)
+        .ok()?;
+    Some(ClaudeOAuthCollectionAttemptGuard {
+        _process: process,
+        file,
+    })
+}
+
 /// Fingerprint of everything about the call that could make a past failure
 /// irrelevant: the endpoint, the beta header, the User-Agent we identify with,
 /// and whether the off-switch is engaged. When any of them changes - a daemon
@@ -3027,12 +3575,16 @@ fn claude_oauth_usage_failure_class(error: &ureq::Error) -> Option<ClaudeOAuthUs
     }
 }
 
-fn read_claude_oauth_access_token_for_slot(slot: &ClaudeConfigDirSlot) -> Option<String> {
-    read_claude_oauth_access_token_from_keychain(slot)
-        .or_else(|| read_claude_oauth_access_token_from_credentials_file(slot))
+fn read_claude_oauth_credential_for_slot(
+    slot: &ClaudeConfigDirSlot,
+) -> Option<ClaudeOAuthCredential> {
+    read_claude_oauth_credential_from_keychain(slot)
+        .or_else(|| read_claude_oauth_credential_from_credentials_file(slot))
 }
 
-fn read_claude_oauth_access_token_from_keychain(slot: &ClaudeConfigDirSlot) -> Option<String> {
+fn read_claude_oauth_credential_from_keychain(
+    slot: &ClaudeConfigDirSlot,
+) -> Option<ClaudeOAuthCredential> {
     let account = effective_user_account_name()?;
     let arguments = claude_oauth_keychain_lookup_arguments(slot, &account)?;
     let argument_refs: Vec<_> = arguments.iter().map(String::as_str).collect();
@@ -3040,7 +3592,7 @@ fn read_claude_oauth_access_token_from_keychain(slot: &ClaudeConfigDirSlot) -> O
     if !output.command_found || !output.success {
         return None;
     }
-    parse_claude_oauth_access_token(&output.stdout)
+    parse_claude_oauth_credential(&output.stdout)
 }
 
 #[cfg(unix)]
@@ -3115,23 +3667,50 @@ fn claude_oauth_keychain_lookup_arguments(
     ])
 }
 
-fn read_claude_oauth_access_token_from_credentials_file(
+fn read_claude_oauth_credential_from_credentials_file(
     slot: &ClaudeConfigDirSlot,
-) -> Option<String> {
+) -> Option<ClaudeOAuthCredential> {
     let path = slot.credentials_path(&home_dir());
     let body = fs::read_to_string(path).ok()?;
-    parse_claude_oauth_access_token(&body)
+    parse_claude_oauth_credential(&body)
 }
 
+#[cfg(test)]
 fn parse_claude_oauth_access_token(payload: &str) -> Option<String> {
+    parse_claude_oauth_credential(payload)?.access_token
+}
+
+fn parse_claude_oauth_credential(payload: &str) -> Option<ClaudeOAuthCredential> {
     let value: Value = serde_json::from_str(payload).ok()?;
-    value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("accessToken"))
+    let oauth = value.get("claudeAiOauth")?;
+    let access_token = oauth
+        .get("accessToken")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .map(ToString::to_string)
+        .map(ToString::to_string);
+    let timestamp = |field: &str| {
+        oauth
+            .get(field)
+            .and_then(Value::as_i64)
+            .and_then(rfc3339_from_epoch_millis)
+    };
+    Some(ClaudeOAuthCredential {
+        access_token,
+        access_expires_at: timestamp("expiresAt"),
+        relogin_required_at: timestamp("refreshTokenExpiresAt"),
+    })
+}
+
+fn rfc3339_from_epoch_millis(epoch_millis: i64) -> Option<String> {
+    let seconds = epoch_millis.div_euclid(1_000);
+    let nanos = u32::try_from(epoch_millis.rem_euclid(1_000)).ok()? * 1_000_000;
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()?
+        .replace_nanosecond(nanos)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 fn claude_oauth_usage_error(error: ureq::Error) -> String {
@@ -3154,20 +3733,6 @@ fn claude_oauth_usage_cache_path(account_identifier_hash: &str) -> PathBuf {
 
 fn claude_oauth_usage_legacy_cache_path() -> PathBuf {
     default_support_dir().join(CLAUDE_OAUTH_USAGE_LEGACY_CACHE_FILE)
-}
-
-fn clear_all_claude_oauth_usage_caches() {
-    let _ = fs::remove_file(claude_oauth_usage_legacy_cache_path());
-    let accounts_root = default_support_dir().join(CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR);
-    let Ok(entries) = fs::read_dir(accounts_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let _ = fs::remove_file(path.join(CLAUDE_OAUTH_USAGE_CACHE_FILE));
-        }
-    }
 }
 
 /// Identify the Claude account that currently owns the local Claude Code
@@ -3214,7 +3779,7 @@ fn claude_strong_oauth_identity_hashes(
 
 fn stable_claude_slot_credential(
     initial_oauth_account: Option<ClaudeCliOauthAccount>,
-    initial_access_token: Option<String>,
+    initial_credential: Option<ClaudeOAuthCredential>,
     final_oauth_account: Option<ClaudeCliOauthAccount>,
 ) -> Result<StableClaudeSlotCredential, ClaudeSlotProbeFailure> {
     let (Some(initial_oauth_account), Some(final_oauth_account)) =
@@ -3227,7 +3792,11 @@ fn stable_claude_slot_credential(
     }
     Ok(StableClaudeSlotCredential {
         oauth_account: initial_oauth_account,
-        access_token: initial_access_token,
+        credential: initial_credential.unwrap_or(ClaudeOAuthCredential {
+            access_token: None,
+            access_expires_at: None,
+            relogin_required_at: None,
+        }),
     })
 }
 
@@ -10542,7 +11111,8 @@ for line in sys.stdin:
         // Default (no sentinel) is enabled -- unchanged behaviour.
         assert!(!claude_oauth_usage_network_disabled());
 
-        // A previously fetched payload that the sentinel must retire.
+        // A previously fetched payload remains local and keeps its original
+        // observation time while the sentinel pauses all network reads.
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: String::new(),
@@ -10580,9 +11150,14 @@ for line in sys.stdin:
             outcome.diagnostics[0].severity,
             AgentDiagnosticSeverity::Info
         );
+        assert!(claude_oauth_usage_cache_path("").exists());
+
+        std::fs::remove_file(support_dir.join("claude-oauth-usage-network-disabled"))
+            .expect("re-enable collection");
+        let resumed = collect_claude_oauth_usage(&claude_oauth_account_identifier_hash(), None);
         assert!(
-            !claude_oauth_usage_cache_path("").exists(),
-            "the off-switch retires the endpoint's cached payload too"
+            resumed.result.is_ok(),
+            "the retained fresh cache resumes without another prompt"
         );
 
         let _ = std::fs::remove_dir_all(&support_dir);
@@ -11901,5 +12476,346 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             !user_agent.to_ascii_lowercase().contains("claude"),
             "never present a claude-* client identity: {user_agent}"
         );
+    }
+
+    #[test]
+    fn full_slot_marker_requires_both_canonical_windows_and_a_scoped_limit() {
+        let partial = fresh_slot_status("2026-08-04T10:00:00Z", "aaaa", "bbbb", true, false, true);
+        assert!(partial.last_full_quota_read_at.is_none());
+        let no_credits =
+            fresh_slot_status("2026-08-04T10:00:00Z", "aaaa", "bbbb", true, true, false);
+        assert_eq!(
+            no_credits.last_full_quota_read_at.as_deref(),
+            Some("2026-08-04T10:00:00Z")
+        );
+        assert!(
+            !no_credits.has_credit_balances,
+            "credits are optional for completeness"
+        );
+    }
+
+    #[test]
+    fn unresolved_accounts_use_only_strong_desktop_evidence_and_subtract_full_accounts() {
+        let mut desktop = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-04T10:00:00Z".to_string(),
+            "2026-08-04T10:05:00Z".to_string(),
+        );
+        let observation =
+            |hash: Option<&str>, confidence: AgentStatusConfidence| AgentStatusPlanObservation {
+                observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+                evidence_method: Some("claude_desktop_session_bucket".to_string()),
+                source_session_id: None,
+                provider: Some("anthropic".to_string()),
+                billing_provider: Some("anthropic".to_string()),
+                model_provider: Some("anthropic".to_string()),
+                billing_channel: Some("subscription".to_string()),
+                auth_mode: Some("claude_desktop".to_string()),
+                gateway_provider: None,
+                subscription_product: None,
+                plan_type: None,
+                account_label: None,
+                account_id: None,
+                organization_label: None,
+                organization_id: None,
+                account_identifier_hash: hash.map(ToString::to_string),
+                organization_identifier_hash: None,
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: None,
+                billing_identity_confidence: confidence.clone(),
+                confidence,
+                is_current: None,
+            };
+        let mut expired = observation(Some("expired"), AgentStatusConfidence::High);
+        expired.observed_at = Some("2026-05-05T09:59:59Z".to_string());
+        desktop.plan_observations = vec![
+            observation(Some("strong-unresolved"), AgentStatusConfidence::High),
+            observation(Some("weak"), AgentStatusConfidence::Low),
+            observation(None, AgentStatusConfidence::High),
+            observation(Some("resolved"), AgentStatusConfidence::High),
+            expired,
+        ];
+        let mut full = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-04T10:00:00Z".to_string(),
+            "2026-08-04T10:05:00Z".to_string(),
+        );
+        full.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            provider: Some("anthropic".to_string()),
+            auth_method: None,
+            email: None,
+            account_id: None,
+            organization_id: None,
+            organization_label: None,
+            plan_type: None,
+            subscription_product: None,
+            billing_channel: None,
+            subscription_period_start: None,
+            subscription_period_end: None,
+            subscription_period_last_checked_at: None,
+            account_identifier_hash: Some("resolved".to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: None,
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::High,
+        });
+        full.quota_windows = vec![
+            AgentQuotaWindow {
+                name: "session".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                ..Default::default()
+            },
+            AgentQuotaWindow {
+                name: "weekly".to_string(),
+                scope: AgentQuotaWindowScope::Account,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                ..Default::default()
+            },
+            AgentQuotaWindow {
+                name: "weekly_sonnet".to_string(),
+                scope: AgentQuotaWindowScope::Model,
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                model: Some("claude-sonnet".to_string()),
+                ..Default::default()
+            },
+        ];
+        let unresolved = derive_unresolved_claude_accounts(
+            &desktop,
+            &[full],
+            &BTreeMap::new(),
+            OffsetDateTime::parse("2026-08-04T10:00:00Z", &Rfc3339).expect("fixed now"),
+        );
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0].account_identifier_hash.as_deref(),
+            Some("strong-unresolved")
+        );
+        assert_eq!(
+            unresolved[0].evidence,
+            vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exact_full_slot_persistence_atomically_clears_matching_unresolved_account() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-unresolved-clear-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        fs::create_dir_all(&root).expect("support root");
+        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::new(),
+            unresolved_accounts: vec![ClaudeUnresolvedAccountDescriptorV1 {
+                unresolved_id: "claude-unresolved-test".to_string(),
+                account_identifier_hash: Some("account-full".to_string()),
+                observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+                evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+            }],
+        })
+        .expect("seed unresolved state");
+        persist_one_claude_slot_collection_state(
+            "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some("account-full".to_string()),
+                observed_at: Some("2026-08-04T10:01:00Z".to_string()),
+                last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("persist exact full proof");
+        assert!(
+            read_persisted_claude_slot_collection_state()
+                .unresolved_accounts
+                .is_empty(),
+            "the same Complete response must not retain a stale unresolved warning"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn stale_bulk_persistence_cannot_resurrect_exactly_resolved_account() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-unresolved-stale-bulk-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        fs::create_dir_all(&root).expect("support root");
+        let config_dir = root.join("registered-account");
+        fs::create_dir_all(&config_dir).expect("registered config dir");
+        let status = FileClaudeConfigSlotSettingsStore::default()
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                config_dir.to_string_lossy().into_owned(),
+            )
+            .expect("register current slot");
+        let slot_id = status
+            .external_slots
+            .first()
+            .expect("registered external slot")
+            .slot_id
+            .clone();
+        let stale_unresolved = ClaudeUnresolvedAccountDescriptorV1 {
+            unresolved_id: "claude-unresolved-stale".to_string(),
+            account_identifier_hash: Some("account-full".to_string()),
+            observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+            evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
+        };
+        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::new(),
+            unresolved_accounts: vec![stale_unresolved.clone()],
+        })
+        .expect("seed unresolved state");
+        persist_one_claude_slot_collection_state(
+            &slot_id,
+            &ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some("account-full".to_string()),
+                observed_at: Some("2026-08-04T10:01:00Z".to_string()),
+                last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("persist exact full proof");
+
+        persist_claude_slot_collection_states(&BTreeMap::new(), &[stale_unresolved])
+            .expect("persist delayed stale scheduled state");
+
+        assert!(
+            read_persisted_claude_slot_collection_state()
+                .unresolved_accounts
+                .is_empty(),
+            "a delayed bulk writer must subtract newer full proof under its lock"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_collection_attempt_lock_child() {
+        let Ok(account) = std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_ACCOUNT") else {
+            return;
+        };
+        let mode = std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_MODE").expect("child mode");
+        if mode == "contender" {
+            assert!(try_claude_oauth_collection_attempt(&account).is_none());
+            return;
+        }
+        let ready =
+            PathBuf::from(std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_READY").expect("ready path"));
+        let release = PathBuf::from(
+            std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_RELEASE").expect("release path"),
+        );
+        let guard = try_claude_oauth_collection_attempt(&account).expect("holder lock");
+        fs::write(&ready, b"ready").expect("signal ready");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !release.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(release.exists(), "parent released holder");
+        drop(guard);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_collection_attempt_lock_is_cross_process_and_account_scoped() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-attempt-process-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let ready = root.join("ready");
+        let release = root.join("release");
+        let executable = std::env::current_exe().expect("test executable");
+        let child_args = [
+            "--exact",
+            "agent_status::tests::claude_collection_attempt_lock_child",
+            "--nocapture",
+        ];
+        let mut holder = std::process::Command::new(&executable)
+            .args(child_args)
+            .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root)
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_ACCOUNT", "account-a")
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_MODE", "holder")
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_READY", &ready)
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_RELEASE", &release)
+            .spawn()
+            .expect("spawn holder");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "holder acquired lock");
+        let contender = std::process::Command::new(&executable)
+            .args(child_args)
+            .env("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root)
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_ACCOUNT", "account-a")
+            .env("OTTTO_TEST_CLAUDE_ATTEMPT_MODE", "contender")
+            .status()
+            .expect("run contender");
+        assert!(contender.success());
+        fs::write(&release, b"release").expect("release holder");
+        assert!(holder.wait().expect("wait holder").success());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn scheduled_collection_and_exact_check_share_one_account_provider_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-attempt-shared-paths-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let scheduled_calls = Arc::clone(&provider_calls);
+        let scheduled = thread::spawn(move || {
+            let _guard = try_claude_oauth_collection_attempt("same-strong-account")
+                .expect("scheduled collector admission");
+            scheduled_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).expect("entered");
+            release_rx.recv().expect("release");
+        });
+        entered_rx.recv().expect("scheduled admitted");
+        let exact_check_admission = try_claude_oauth_collection_attempt("same-strong-account");
+        if exact_check_admission.is_some() {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(exact_check_admission.is_none());
+        release_tx.send(()).expect("release scheduled");
+        scheduled.join().expect("join scheduled");
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(root);
     }
 }
