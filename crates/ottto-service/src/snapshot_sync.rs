@@ -78,6 +78,13 @@ const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 2;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
+static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
+
+#[derive(Default)]
+struct ClaudeRefreshActivity {
+    running: bool,
+    pending: bool,
+}
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Durable, privacy-minimal progress for one policy-scoped scan index.
@@ -1035,6 +1042,102 @@ pub fn spawn_startup_source_reverify(daemon: LocalDaemon) {
     if let Err(error) = spawn_result {
         eprintln!("startup source re-verify unavailable: {error}");
     }
+}
+
+/// Startup/wake Claude freshness uses the normal collection and upload path.
+/// This avoids a refresh-only worker winning the durable claim and leaving a
+/// concurrent collector with no post-refresh reading to upload.
+pub fn spawn_claude_agent_status_refresh(opportunity: &'static str) {
+    let Some(refresh_claim) = claim_claude_refresh_slot() else {
+        return;
+    };
+    let spawn = std::thread::Builder::new()
+        .name(format!("ottto-claude-refresh-{opportunity}"))
+        .spawn(move || {
+            let mut refresh_claim = refresh_claim;
+            loop {
+                // Serialize with the cadence/full-sync path as well as other
+                // startup/wake hooks. This bounds worker count and prevents a
+                // hook collection from racing the same local indexes/uploads.
+                {
+                    let _sync_guard = SNAPSHOT_SYNC_LOCK
+                        .get_or_init(|| Mutex::new(()))
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let captured_at = current_rfc3339();
+                    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+                        .unwrap_or_else(|| captured_at.clone());
+                    let collection = collect_agent_status_collection(
+                        &SourceKind::ClaudeCode,
+                        captured_at,
+                        expires_at,
+                    );
+                    if let Err(error) = upload_agent_status_snapshots(&collection.snapshots) {
+                        eprintln!(
+                            "Claude agent-status {opportunity} refresh skipped: {}",
+                            safe_error(&error)
+                        );
+                    }
+                }
+                if !refresh_claim.take_pending_or_finish() {
+                    break;
+                }
+            }
+        });
+    if let Err(error) = spawn {
+        eprintln!("Claude agent-status {opportunity} refresh unavailable: {error}");
+    }
+}
+
+struct ClaudeRefreshClaim {
+    active: bool,
+}
+
+impl ClaudeRefreshClaim {
+    fn take_pending_or_finish(&mut self) -> bool {
+        let lock =
+            CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
+        let mut activity = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if activity.pending {
+            activity.pending = false;
+            true
+        } else {
+            activity.running = false;
+            self.active = false;
+            false
+        }
+    }
+}
+
+impl Drop for ClaudeRefreshClaim {
+    fn drop(&mut self) {
+        if self.active {
+            reset_claude_refresh_activity();
+        }
+    }
+}
+
+fn claim_claude_refresh_slot() -> Option<ClaudeRefreshClaim> {
+    let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
+    let mut activity = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if activity.running {
+        activity.pending = true;
+        None
+    } else {
+        activity.running = true;
+        Some(ClaudeRefreshClaim { active: true })
+    }
+}
+
+fn reset_claude_refresh_activity() {
+    let lock = CLAUDE_REFRESH_ACTIVITY.get_or_init(|| Mutex::new(ClaudeRefreshActivity::default()));
+    *lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = ClaudeRefreshActivity::default();
 }
 
 /// Cadence for the blocking-verification retry loop below: how often it checks
@@ -3311,6 +3414,27 @@ mod tests {
     }
 
     static TEST_POISON_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    #[serial]
+    fn claude_refresh_hook_coalesces_and_raii_releases() {
+        reset_claude_refresh_activity();
+        let mut first = claim_claude_refresh_slot().expect("first hook claim");
+        assert!(claim_claude_refresh_slot().is_none());
+        assert!(claim_claude_refresh_slot().is_none());
+        assert!(
+            first.take_pending_or_finish(),
+            "triggers during startup queue one trailing wake run"
+        );
+        assert!(
+            !first.take_pending_or_finish(),
+            "trailing run drains pending"
+        );
+        let after_drop = claim_claude_refresh_slot().expect("RAII releases hook claim");
+        drop(after_drop);
+        assert!(claim_claude_refresh_slot().is_some());
+        reset_claude_refresh_activity();
+    }
 
     /// A unique poison-ledger scope per call, so tests that run in parallel
     /// cannot prune each other's ledgers.

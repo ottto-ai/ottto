@@ -15,7 +15,7 @@ app sometimes shows a plan without numbers or a "Partial view" badge.
   slot. Ottto can also collect from explicitly registered
   `CLAUDE_CONFIG_DIR` paths, up to ten slots total. Running `/login` without a
   custom config directory still replaces the default terminal account. Ottto
-  never runs `/login`, refreshes a token, or writes a credential.
+  never runs `/login`, calls a token/refresh endpoint, or writes a credential.
 - **The desktop app login.** Separate from the terminal login. Chat sessions
   in the app run under whichever account the app is signed into - which can
   be a different account than the terminal, at the same time.
@@ -95,11 +95,52 @@ When the machine off-switch is enabled, exact-slot usage collection reports
 consent, and account-scoped caches with their original age. Re-enabling resumes
 normal collection without another login prompt.
 
+## Consented background upkeep
+
+Registered custom slots can stay readable after their short-lived access
+credential expires without keeping the Companion app open. One explicit
+machine-level consent applies to every registered custom slot and persists until
+revoked. It does not apply to Claude Code's default slot.
+
+At daemon startup, after wake/network restoration, and when normal quota
+collection is already due, Ottto reads only the slot's credential deadlines. It
+does nothing before the exact access expiry. After expiry, and only while the
+absolute refresh deadline remains valid, the daemon may run the resolved
+installed Claude binary once with argument `doctor` and the exact registered
+`CLAUDE_CONFIG_DIR`. The command receives a cleared minimal environment, closed
+stdin, discarded output, and a bounded timeout. It receives no prompt, login,
+model, or inference flag. Ottto treats the attempt as successful only when a
+second read-only deadline observation proves `expiresAt` advanced into the
+future; exit status zero alone is not success.
+
+Each due expiry is atomically claimed before the command starts. Startup, wake,
+collection, daemon restart, and multiple daemon processes therefore cannot
+start duplicate commands. A failed same-expiry attempt can retry only after a
+durable five-minute exponential backoff, capped at six hours. The local witness
+contains only the opaque slot id, safe deadlines/attempt times, a typed result,
+and a failure count—never a token, token fingerprint, account UUID, or config
+path.
+
+The existing **Read subscription usage** off-switch always wins: while it is
+off, Ottto performs neither provider usage reads nor background upkeep, but it
+keeps registrations, consent, caches, and their honest age. Turning collection
+back on resumes the prior consent automatically. Operators can also create the
+absent-by-default `claude-background-upkeep-disabled` sentinel in Ottto's
+support directory to stop only new `doctor` commands while investigating a
+vendor-command problem; it does not change consent or provider collection.
+
+`refreshTokenExpiresAt` is an absolute login horizon. Within 72 hours the slot
+reports `relogin_approaching`; once elapsed it reports `needs_login` and waits
+for the customer to complete official Claude Code `/login` again. Background
+upkeep cannot promise an indefinitely fresh login.
+
 ## Tips
 
 - To get full quota visibility for an account, its default or explicitly
   registered Claude Code credential must remain valid. Claude Code credentials
   are the only full-picture source.
+- Background upkeep is post-expiry catch-up, not proactive renewal. The
+  absolute refresh deadline still requires customer-owned official login.
 - Remember `/login` replaces the terminal account rather than adding one.
   After switching, the previous account's terminal readings stop refreshing
   and will show their age honestly.

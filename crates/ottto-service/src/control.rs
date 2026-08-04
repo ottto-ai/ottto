@@ -955,6 +955,7 @@ fn remove_claude_account(
     // so a cleanup I/O failure must not turn a committed removal into a false
     // failure that cannot be retried honestly.
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
+    let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
     Ok(crate::agent_status::annotate_claude_accounts_status(status))
 }
 

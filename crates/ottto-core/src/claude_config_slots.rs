@@ -213,6 +213,19 @@ impl FileClaudeConfigSlotSettingsStore {
         Ok(status_contract(&persisted))
     }
 
+    /// Inspect the current registry while holding the same process and
+    /// cross-process transaction lock used by consent/registration mutations.
+    /// This lets a caller serialize a final consent check with a bounded
+    /// operation start without exposing persisted internals.
+    pub fn with_locked_status<T>(
+        &self,
+        inspect: impl FnOnce(&ClaudeAccountsStatusV1) -> T,
+    ) -> Result<T, ClaudeConfigSlotSettingsError> {
+        let _transaction = self.settings_transaction_lock()?;
+        let persisted = self.load_persisted()?;
+        Ok(inspect(&status_contract(&persisted)))
+    }
+
     pub fn set_upkeep_consent(
         &self,
         schema_version: u16,

@@ -348,6 +348,19 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   checks are single-flight, stop is durable until explicit prepare replay, and
   these protocol-v18 operations perform no login automation, token refresh,
   inference, credential write, or Keychain write.
+- consented background freshness upkeep for registered custom Claude slots.
+  On daemon startup, macOS wake/network restoration, and normal quota
+  collection opportunities, an expired access credential with a still-valid
+  absolute refresh deadline may run only the resolved installed `claude`
+  binary with argv `doctor`, exact `CLAUDE_CONFIG_DIR`, a shared cleared
+  minimal environment, closed stdin, discarded output, and a bounded timeout.
+  Success requires read-only proof that `expiresAt` advanced; durable
+  per-expiry claims and exponential backoff suppress restart/wake/process
+  storms. The default slot is never probed. The existing subscription-usage
+  off-switch pauses both reads and upkeep without clearing registrations,
+  consent, or caches, while an absent-by-default operational sentinel stops
+  only new upkeep commands. Ottto still performs no raw OAuth refresh, login,
+  inference, credential write, second scheduling service, or Keychain mutation.
 - persistent Unix-socket serving with `--once` smoke mode
 - CLI-to-daemon Unix-socket requests for status, setup, login, account, logout,
   setup claim codes, doctor, repair, verify, diagnostics, and uninstall

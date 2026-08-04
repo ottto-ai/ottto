@@ -432,6 +432,9 @@ fn cleanup_legacy_services_at_startup() {
 fn cleanup_legacy_services_at_startup() {}
 
 fn start_builtin_relays(daemon: &LocalDaemon) {
+    // Existing per-user LaunchAgent startup is a post-expiry freshness
+    // opportunity even when the Companion app is closed.
+    ottto_service::snapshot_sync::spawn_claude_agent_status_refresh("startup");
     // Proactively rebuild upstream HTTP pools on macOS network transitions so
     // pooled sockets bound to a dead local IP never stall uploads (2026-07-17).
     match ottto_service::net_transition::spawn_network_transition_observer() {

@@ -5,6 +5,7 @@ pub mod agent_status;
 pub mod backfill;
 pub mod canonical_json;
 pub mod claude_effort;
+pub mod claude_upkeep;
 pub mod client_report;
 pub mod cloud_sessions;
 pub(crate) mod command_env;

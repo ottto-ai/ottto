@@ -19,7 +19,7 @@ use ottto_protocol::{
     AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, ClaudeAccountsStatusV1,
     ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
     ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
-    ClaudeConfigSlotOwnership, ClaudeUnresolvedAccountDescriptorV1,
+    ClaudeConfigSlotOwnership, ClaudeConfigSlotUpkeepResultV1, ClaudeUnresolvedAccountDescriptorV1,
     ClaudeUnresolvedAccountEvidenceKind, SourceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,8 @@ const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 /// Claude OAuth usage endpoint is never contacted and quota comes from the
 /// sanctioned local statusLine surface only. The name is a fixed contract with
 /// the macOS Companion toggle - do not rename it.
-const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str = "claude-oauth-usage-network-disabled";
+pub(crate) const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str =
+    "claude-oauth-usage-network-disabled";
 const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "breaker.json";
 const CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
 const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE: &str = "claude-config-slot-collection-state.json";
@@ -220,6 +221,14 @@ struct ClaudeOAuthCredential {
     access_token: Option<String>,
     access_expires_at: Option<String>,
     relogin_required_at: Option<String>,
+}
+
+/// Secret-free projection used by the background upkeep scheduler. Reading it
+/// drops the access token immediately and exposes only vendor deadlines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeOAuthCredentialMetadata {
+    pub(crate) access_expires_at: Option<String>,
+    pub(crate) refresh_token_expires_at: Option<String>,
 }
 
 struct ClaudeSnapshotCandidate {
@@ -1191,6 +1200,9 @@ fn collect_claude_status_snapshots(
     let default_snapshot = collect_claude_status(captured_at.clone(), expires_at.clone());
     let mut candidates = Vec::new();
     let settings = FileClaudeConfigSlotSettingsStore::default().load();
+    let upkeep_consent = settings.as_ref().is_ok_and(|status| {
+        status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
+    });
     let mut descriptors = settings
         .as_ref()
         .map(ordered_claude_slot_descriptors)
@@ -1243,10 +1255,23 @@ fn collect_claude_status_snapshots(
         slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
     }
     for descriptor in custom_descriptors {
+        let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
+            &descriptor,
+            upkeep_consent,
+            !claude_oauth_usage_network_disabled(),
+        );
+        if !upkeep.proceed_with_collection {
+            let status =
+                blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status);
+            slot_states.insert(descriptor.slot_id, status);
+            continue;
+        }
         let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
             Ok(resolved) => resolved,
             Err(failure) => {
-                slot_states.insert(descriptor.slot_id, failure.status(&captured_at));
+                let mut status = failure.status(&captured_at);
+                apply_claude_upkeep_observation(&mut status, upkeep.status);
+                slot_states.insert(descriptor.slot_id, status);
                 continue;
             }
         };
@@ -1268,7 +1293,8 @@ fn collect_claude_status_snapshots(
             captured_at.clone(),
             expires_at.clone(),
         ) {
-            Ok((snapshot, state)) => {
+            Ok((snapshot, mut state)) => {
+                apply_claude_upkeep_observation(&mut state, upkeep.status);
                 let rank = claude_snapshot_candidate_rank(&snapshot)
                     .expect("validated custom full-meter snapshot is rankable");
                 candidates.push(ClaudeSnapshotCandidate {
@@ -1280,7 +1306,8 @@ fn collect_claude_status_snapshots(
                 });
                 slot_states.insert(slot_id, state);
             }
-            Err(state) => {
+            Err(mut state) => {
+                apply_claude_upkeep_observation(&mut state, upkeep.status);
                 slot_states.insert(slot_id, state);
             }
         }
@@ -1456,23 +1483,35 @@ pub(crate) fn collect_registered_claude_slot_status(
     captured_at: String,
     expires_at: String,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
-    let descriptor = FileClaudeConfigSlotSettingsStore::default()
-        .load()
-        .ok()
-        .and_then(|status| {
-            status
-                .managed_slots
-                .into_iter()
-                .chain(status.external_slots)
-                .find(|descriptor| descriptor.slot_id == slot_id)
-        });
+    let settings = FileClaudeConfigSlotSettingsStore::default().load().ok();
+    let upkeep_consent = settings.as_ref().is_some_and(|status| {
+        status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
+    });
+    let descriptor = settings.and_then(|status| {
+        status
+            .managed_slots
+            .into_iter()
+            .chain(status.external_slots)
+            .find(|descriptor| descriptor.slot_id == slot_id)
+    });
     let Some(descriptor) = descriptor else {
         return ClaudeSlotProbeFailure::IdentityUnknown.status(&captured_at);
     };
+    let upkeep = crate::claude_upkeep::observe_registered_slot_upkeep(
+        &descriptor,
+        upkeep_consent,
+        !claude_oauth_usage_network_disabled(),
+    );
+    if !upkeep.proceed_with_collection {
+        let status = blocked_claude_upkeep_status(slot_id, &captured_at, upkeep.status);
+        let _ = persist_one_claude_slot_collection_state(slot_id, &status);
+        return status;
+    }
     let mut resolved = match resolve_registered_claude_slot(descriptor) {
         Ok(resolved) => resolved,
         Err(failure) => {
-            let status = failure.status(&captured_at);
+            let mut status = failure.status(&captured_at);
+            apply_claude_upkeep_observation(&mut status, upkeep.status);
             let _ = persist_one_claude_slot_collection_state(slot_id, &status);
             return status;
         }
@@ -1487,7 +1526,7 @@ pub(crate) fn collect_registered_claude_slot_status(
         access_token,
         false,
     );
-    let status = match custom_claude_snapshot_from_usage(
+    let mut status = match custom_claude_snapshot_from_usage(
         resolved,
         outcome,
         credential_available,
@@ -1496,6 +1535,7 @@ pub(crate) fn collect_registered_claude_slot_status(
     ) {
         Ok((_, status)) | Err(status) => status,
     };
+    apply_claude_upkeep_observation(&mut status, upkeep.status);
     let _ = persist_one_claude_slot_collection_state(slot_id, &status);
     status
 }
@@ -1774,6 +1814,126 @@ fn apply_credential_metadata(
 ) {
     status.access_expires_at = credential.access_expires_at.clone();
     status.relogin_required_at = credential.relogin_required_at.clone();
+}
+
+fn blocked_claude_upkeep_status(
+    slot_id: &str,
+    observed_at: &str,
+    upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    let mut status = read_persisted_claude_slot_collection_state()
+        .slots
+        .get(slot_id)
+        .cloned()
+        .unwrap_or_default();
+    status.observed_at = Some(observed_at.to_string());
+    if upkeep.due_access_expires_at.is_some() {
+        status.access_expires_at = upkeep.due_access_expires_at.clone();
+    }
+    if upkeep.refresh_token_expires_at.is_some() {
+        status.relogin_required_at = upkeep.refresh_token_expires_at.clone();
+    }
+    let (state, code, message) = upkeep_state_diagnostic(upkeep.result);
+    status.state = state;
+    status.diagnostics = vec![ClaudeConfigSlotDiagnosticV1 {
+        code,
+        message: message.to_string(),
+    }];
+    status.upkeep = Some(upkeep);
+    status
+}
+
+fn apply_claude_upkeep_observation(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    upkeep: ottto_protocol::ClaudeConfigSlotUpkeepStatusV1,
+) {
+    let deadline_approaching = upkeep
+        .refresh_token_expires_at
+        .as_deref()
+        .and_then(|deadline| OffsetDateTime::parse(deadline, &Rfc3339).ok())
+        .is_some_and(|deadline| {
+            let now = OffsetDateTime::now_utc();
+            deadline > now && deadline - now <= TimeDuration::hours(72)
+        });
+    match upkeep.result {
+        ClaudeConfigSlotUpkeepResultV1::ReloginApproaching => {
+            status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
+                code: ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
+                message: "This Claude login reaches its absolute refresh deadline within 72 hours; official login will be required again.".to_string(),
+            });
+        }
+        ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented => {
+            status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
+                code: ClaudeConfigSlotDiagnosticCodeV1::UpkeepNotConsented,
+                message: "Background Claude login upkeep is not consented; valid credentials remain readable until they expire.".to_string(),
+            });
+        }
+        _ => {}
+    }
+    if deadline_approaching && upkeep.result != ClaudeConfigSlotUpkeepResultV1::ReloginApproaching {
+        status.diagnostics.push(ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
+            message: "This Claude login reaches its absolute refresh deadline within 72 hours; official login will be required again.".to_string(),
+        });
+    }
+    status.upkeep = Some(upkeep);
+}
+
+fn upkeep_state_diagnostic(
+    result: ClaudeConfigSlotUpkeepResultV1,
+) -> (
+    ClaudeConfigSlotCollectionStateV1,
+    ClaudeConfigSlotDiagnosticCodeV1,
+    &'static str,
+) {
+    match result {
+        ClaudeConfigSlotUpkeepResultV1::CollectionPaused => (
+            ClaudeConfigSlotCollectionStateV1::CollectionPaused,
+            ClaudeConfigSlotDiagnosticCodeV1::CollectionPaused,
+            "Claude subscription usage collection and background upkeep are paused by the machine off-switch.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented => (
+            ClaudeConfigSlotCollectionStateV1::UpkeepNotConsented,
+            ClaudeConfigSlotDiagnosticCodeV1::UpkeepNotConsented,
+            "This expired Claude slot cannot run background upkeep until machine-level consent is granted.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::NeedsLogin => (
+            ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+            ClaudeConfigSlotDiagnosticCodeV1::NeedsLogin,
+            "This Claude slot reached its absolute refresh deadline and needs official Claude Code login again.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled => (
+            ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+            ClaudeConfigSlotDiagnosticCodeV1::UpkeepDisabled,
+            "Background Claude upkeep is stopped by the operational kill-switch; consent and account data are unchanged.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable => (
+            ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+            ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
+            "This registered Claude slot has no readable credential metadata.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::Backoff => (
+            ClaudeConfigSlotCollectionStateV1::StaleAccessToken,
+            ClaudeConfigSlotDiagnosticCodeV1::StaleAccessToken,
+            "This expired Claude slot is waiting for its durable upkeep retry deadline; no duplicate command was started.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::RefreshDue
+        | ClaudeConfigSlotUpkeepResultV1::InProgress => (
+            ClaudeConfigSlotCollectionStateV1::RefreshDue,
+            ClaudeConfigSlotDiagnosticCodeV1::RefreshDue,
+            "This expired Claude slot has one background upkeep attempt in progress.",
+        ),
+        ClaudeConfigSlotUpkeepResultV1::ReloginApproaching => (
+            ClaudeConfigSlotCollectionStateV1::ReloginApproaching,
+            ClaudeConfigSlotDiagnosticCodeV1::ReloginApproaching,
+            "This Claude login reaches its absolute refresh deadline within 72 hours.",
+        ),
+        _ => (
+            ClaudeConfigSlotCollectionStateV1::ProbeFailed,
+            ClaudeConfigSlotDiagnosticCodeV1::ProbeFailed,
+            "Claude Code background upkeep did not prove that this expired credential advanced; cached readings remain honestly stale.",
+        ),
+    }
 }
 
 fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentStatusDiagnostic {
@@ -3216,7 +3376,7 @@ fn claude_oauth_usage_fresh_age_seconds(seed: &str) -> u64 {
 /// Whether the off-switch sentinel is present in the daemon support dir.
 ///
 /// Absent means enabled, which keeps the default behaviour unchanged.
-fn claude_oauth_usage_network_disabled() -> bool {
+pub(crate) fn claude_oauth_usage_network_disabled() -> bool {
     default_support_dir()
         .join(CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE)
         .is_file()
@@ -3582,6 +3742,16 @@ fn read_claude_oauth_credential_for_slot(
         .or_else(|| read_claude_oauth_credential_from_credentials_file(slot))
 }
 
+pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
+    slot: &ClaudeConfigDirSlot,
+) -> Option<ClaudeOAuthCredentialMetadata> {
+    let credential = read_claude_oauth_credential_for_slot(slot)?;
+    Some(ClaudeOAuthCredentialMetadata {
+        access_expires_at: credential.access_expires_at,
+        refresh_token_expires_at: credential.relogin_required_at,
+    })
+}
+
 fn read_claude_oauth_credential_from_keychain(
     slot: &ClaudeConfigDirSlot,
 ) -> Option<ClaudeOAuthCredential> {
@@ -3595,8 +3765,17 @@ fn read_claude_oauth_credential_from_keychain(
     parse_claude_oauth_credential(&output.stdout)
 }
 
-#[cfg(unix)]
+struct EffectiveUserIdentity {
+    account_name: String,
+    home_dir: PathBuf,
+}
+
 fn effective_user_account_name() -> Option<String> {
+    effective_user_identity().map(|identity| identity.account_name)
+}
+
+#[cfg(unix)]
+fn effective_user_identity() -> Option<EffectiveUserIdentity> {
     use std::ffi::CStr;
     use std::mem::MaybeUninit;
 
@@ -3631,23 +3810,39 @@ fn effective_user_account_name() -> Option<String> {
             return None;
         }
         let passwd = unsafe { passwd.assume_init() };
-        if passwd.pw_name.is_null() {
+        if passwd.pw_name.is_null() || passwd.pw_dir.is_null() {
             return None;
         }
         let account = unsafe { CStr::from_ptr(passwd.pw_name) }
             .to_str()
             .ok()?
             .to_string();
-        return (!account.is_empty()).then_some(account);
+        let home_dir = PathBuf::from(unsafe { CStr::from_ptr(passwd.pw_dir) }.to_str().ok()?);
+        #[cfg(test)]
+        let home_dir = std::env::var_os("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS")
+            .map(PathBuf::from)
+            .unwrap_or(home_dir);
+        if account.is_empty() || !home_dir.is_absolute() {
+            return None;
+        }
+        return Some(EffectiveUserIdentity {
+            account_name: account,
+            home_dir,
+        });
     }
     None
 }
 
 #[cfg(not(unix))]
-fn effective_user_account_name() -> Option<String> {
-    std::env::var("USER")
+fn effective_user_identity() -> Option<EffectiveUserIdentity> {
+    let account_name = std::env::var("USER")
         .ok()
-        .filter(|account| !account.is_empty() && !account.contains('\0'))
+        .filter(|account| !account.is_empty() && !account.contains('\0'))?;
+    let home_dir = PathBuf::from(std::env::var_os("HOME")?);
+    home_dir.is_absolute().then_some(EffectiveUserIdentity {
+        account_name,
+        home_dir,
+    })
 }
 
 fn claude_oauth_keychain_lookup_arguments(
@@ -7526,7 +7721,54 @@ fn run_claude_slot_command(
     args: &[&str],
     timeout: Duration,
 ) -> CommandOutput {
-    run_command_capture_with_exact_env("claude", args, timeout, Some(slot))
+    let Some(mut command) = resolved_claude_slot_command(slot, args) else {
+        return CommandOutput {
+            command_found: false,
+            success: false,
+            status_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_prepared_command_capture(command, timeout)
+}
+
+/// Resolve Claude once and apply the single shared sanitized exact-slot
+/// environment used by auth observation and background upkeep. No provider or
+/// token-shaped ambient variables survive `env_clear`.
+pub(crate) fn resolved_claude_slot_command(
+    slot: &ClaudeConfigDirSlot,
+    args: &[&str],
+) -> Option<Command> {
+    let identity = effective_user_identity()?;
+    let program_path = crate::command_env::claude_executable_path(&identity.home_dir)?;
+    let mut command = Command::new(program_path);
+    command
+        .args(args)
+        .env_clear()
+        .env("HOME", &identity.home_dir)
+        .env("USER", identity.account_name);
+    for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(locale_key) {
+            command.env(locale_key, value);
+        }
+    }
+    if let Some(path_env) = crate::command_env::claude_path_env(&identity.home_dir) {
+        command.env("PATH", path_env);
+    }
+    match slot.config_dir() {
+        Some(config_dir) => {
+            command.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        None => {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
+    }
+    Some(command)
 }
 
 fn run_command_capture_with_exact_env(
@@ -7535,7 +7777,6 @@ fn run_command_capture_with_exact_env(
     timeout: Duration,
     claude_slot: Option<&ClaudeConfigDirSlot>,
 ) -> CommandOutput {
-    let start = Instant::now();
     let Some(program_path) = crate::command_env::executable_path(program) else {
         return CommandOutput {
             command_found: false,
@@ -7545,37 +7786,34 @@ fn run_command_capture_with_exact_env(
             stderr: String::new(),
         };
     };
-    let mut command = Command::new(program_path);
+    let mut command = if let Some(slot) = claude_slot {
+        let Some(command) = resolved_claude_slot_command(slot, args) else {
+            return CommandOutput {
+                command_found: false,
+                success: false,
+                status_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            };
+        };
+        command
+    } else {
+        let mut command = Command::new(program_path);
+        command.args(args);
+        if let Some(path_env) = crate::command_env::path_env() {
+            command.env("PATH", path_env);
+        }
+        command
+    };
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if claude_slot.is_some() {
-        command.env_clear();
-        command.env("HOME", home_dir());
-        if let Some(user) = std::env::var_os("USER") {
-            command.env("USER", user);
-        }
-        for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
-            if let Some(value) = std::env::var_os(locale_key) {
-                command.env(locale_key, value);
-            }
-        }
-    }
-    if let Some(path_env) = crate::command_env::path_env() {
-        command.env("PATH", path_env);
-    }
-    if let Some(slot) = claude_slot {
-        match slot.config_dir() {
-            Some(config_dir) => {
-                command.env("CLAUDE_CONFIG_DIR", config_dir);
-            }
-            None => {
-                command.env_remove("CLAUDE_CONFIG_DIR");
-            }
-        }
-    }
+    run_prepared_command_capture(command, timeout)
+}
+
+fn run_prepared_command_capture(mut command: Command, timeout: Duration) -> CommandOutput {
+    let start = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -7670,7 +7908,7 @@ fn home_path(relative: &str) -> PathBuf {
     home_dir().join(relative)
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -7699,13 +7937,23 @@ mod tests {
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
+        effective_home_previous: Option<Option<OsString>>,
     }
 
     impl EnvVarGuard {
         fn set_os(key: &'static str, value: OsString) -> Self {
             let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
+            let effective_home_previous =
+                (key == "HOME").then(|| std::env::var_os("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"));
+            std::env::set_var(key, &value);
+            if key == "HOME" {
+                std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &value);
+            }
+            Self {
+                key,
+                previous,
+                effective_home_previous,
+            }
         }
     }
 
@@ -7714,6 +7962,12 @@ mod tests {
             match self.previous.as_ref() {
                 Some(value) => std::env::set_var(self.key, value),
                 None => std::env::remove_var(self.key),
+            }
+            if let Some(previous) = self.effective_home_previous.as_ref() {
+                match previous {
+                    Some(value) => std::env::set_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", value),
+                    None => std::env::remove_var("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS"),
+                }
             }
         }
     }
@@ -12622,6 +12876,98 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             unresolved[0].evidence,
             vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession]
         );
+    }
+
+    #[test]
+    #[serial]
+    fn advisory_upkeep_never_overwrites_a_successful_fresh_collection() {
+        for result in [
+            ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented,
+            ClaudeConfigSlotUpkeepResultV1::ReloginApproaching,
+        ] {
+            let mut status = ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some("account-hash".to_string()),
+                last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            };
+            apply_claude_upkeep_observation(
+                &mut status,
+                ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                    result,
+                    due_access_expires_at: Some("2026-08-04T11:00:00Z".to_string()),
+                    refresh_token_expires_at: Some("2026-08-07T09:00:00Z".to_string()),
+                    attempted_at: None,
+                    next_allowed_attempt_at: None,
+                    consecutive_failures: 0,
+                },
+            );
+            assert_eq!(status.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+            assert!(status.upkeep.is_some());
+            assert!(!status.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn paused_upkeep_retains_previous_safe_deadlines_without_a_credential_read() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-paused-deadlines-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        fs::create_dir_all(&root).expect("support root");
+        let slot_id = "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::from([(
+                slot_id.to_string(),
+                ClaudeConfigSlotCollectionStatusV1 {
+                    access_expires_at: Some("2026-08-04T10:00:00Z".to_string()),
+                    relogin_required_at: Some("2026-08-20T00:00:00Z".to_string()),
+                    account_identifier_hash: Some("safe-account-hash".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            unresolved_accounts: Vec::new(),
+        })
+        .expect("seed slot state");
+
+        let status = blocked_claude_upkeep_status(
+            slot_id,
+            "2026-08-04T11:00:00Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                attempted_at: None,
+                next_allowed_attempt_at: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert_eq!(
+            status.access_expires_at.as_deref(),
+            Some("2026-08-04T10:00:00Z")
+        );
+        assert_eq!(
+            status.relogin_required_at.as_deref(),
+            Some("2026-08-20T00:00:00Z")
+        );
+        assert_eq!(
+            status.account_identifier_hash.as_deref(),
+            Some("safe-account-hash")
+        );
+        assert_eq!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::CollectionPaused
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
