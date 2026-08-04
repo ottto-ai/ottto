@@ -2393,6 +2393,7 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::ClaudeAccountRemove { .. }
         | LocalControlCommand::ClaudeAccountRegisterPath { .. }
         | LocalControlCommand::ClaudeAccountPrepare { .. }
+        | LocalControlCommand::ClaudeAccountReconnect { .. }
         | LocalControlCommand::ClaudeAccountCheck { .. }
         | LocalControlCommand::ClaudeAccountStopWaiting { .. } => {
             CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION
@@ -2449,8 +2450,22 @@ pub enum ClaudeAccountSetupOperationState {
     IdentityMismatch,
 }
 
+/// Why the persisted Claude account operation exists. Both variants leave
+/// Anthropic authentication to the customer in an official Claude Code
+/// session; the distinction prevents a reconnect from ever allocating a new
+/// managed directory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountSetupOperationKind {
+    #[default]
+    ConnectManagedAccount,
+    ReconnectRegisteredSlot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeAccountSetupOperationV1 {
+    #[serde(default)]
+    pub kind: ClaudeAccountSetupOperationKind,
     pub state: ClaudeAccountSetupOperationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -2524,12 +2539,41 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     pub has_scoped_limits: bool,
     #[serde(default)]
     pub has_credit_balances: bool,
+    /// Safe full-meter values for this exact slot, available only through
+    /// authenticated machine-local control. The backend snapshot wire remains
+    /// unchanged and raw credential material is never represented here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_snapshot: Option<ClaudeConfigSlotQuotaSnapshotV1>,
     /// Safe, machine-local witness for the most recent consented upkeep
     /// decision. This never contains credential material or a config path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upkeep: Option<ClaudeConfigSlotUpkeepStatusV1>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotQuotaSnapshotV1 {
+    pub state: ClaudeConfigSlotQuotaSnapshotStateV1,
+    /// When the daemon assembled this local snapshot.
+    pub captured_at: Rfc3339Timestamp,
+    /// Oldest provider/cache observation represented by the returned values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    pub credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotQuotaSnapshotStateV1 {
+    Fresh,
+    Stale,
+    Partial,
+    #[default]
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2894,6 +2938,14 @@ pub enum LocalControlCommand {
         operation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_account_identifier_hash: Option<String>,
+    },
+    /// Begin observing customer-owned official `/login` for one already
+    /// registered custom slot. No directory or credential is created.
+    ClaudeAccountReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        expected_account_identifier_hash: String,
     },
     /// Advance one persisted setup observation using the existing collector.
     ClaudeAccountCheck {
@@ -3417,6 +3469,13 @@ mod tests {
                 "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             }),
             serde_json::json!({
+                "command": "claude_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
                 "command": "claude_account_check",
                 "schema_version": 1,
                 "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
@@ -3490,6 +3549,13 @@ mod tests {
                 "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
             }),
             serde_json::json!({
+                "command": "claude_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+            serde_json::json!({
                 "command": "claude_account_check",
                 "schema_version": 1,
                 "operation_id": "claude_setup_0123456789abcdef0123456789abcdef"
@@ -3559,10 +3625,42 @@ mod tests {
             has_account_windows: true,
             has_scoped_limits: true,
             has_credit_balances: false,
+            quota_snapshot: Some(ClaudeConfigSlotQuotaSnapshotV1 {
+                state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+                captured_at: "2026-08-05T00:01:00Z".to_string(),
+                observed_at: Some("2026-08-05T00:00:00Z".to_string()),
+                quota_windows: vec![AgentQuotaWindow {
+                    name: "weekly_sonnet".to_string(),
+                    scope: AgentQuotaWindowScope::Model,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    model: Some("claude-sonnet".to_string()),
+                    account_identifier_hash: Some("a".repeat(64)),
+                    organization_identifier_hash: Some("b".repeat(64)),
+                    used_percent: Some(42),
+                    ..Default::default()
+                }],
+                credit_balances: vec![AgentCreditBalance {
+                    name: "Usage credits".to_string(),
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    account_identifier_hash: Some("a".repeat(64)),
+                    organization_identifier_hash: Some("b".repeat(64)),
+                    remaining: Some(1234),
+                    ..Default::default()
+                }],
+            }),
             ..Default::default()
         };
         let wire = serde_json::to_value(status).expect("safe local status");
         assert_eq!(wire["has_credit_balances"], false);
+        assert_eq!(wire["quota_snapshot"]["state"], "fresh");
+        assert_eq!(
+            wire["quota_snapshot"]["quota_windows"][0]["used_percent"],
+            42
+        );
+        assert_eq!(
+            wire["quota_snapshot"]["credit_balances"][0]["remaining"],
+            1234
+        );
         for forbidden in ["access_token", "refresh_token", "config_dir"] {
             assert!(wire.get(forbidden).is_none());
         }

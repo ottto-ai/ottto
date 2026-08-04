@@ -680,6 +680,20 @@ fn handle_command(
                 expected_account_identifier_hash,
             )?)
         }
+        LocalControlCommand::ClaudeAccountReconnect {
+            schema_version,
+            operation_id,
+            slot_id,
+            expected_account_identifier_hash,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(reconnect_claude_account(
+                schema_version,
+                operation_id,
+                &slot_id,
+                expected_account_identifier_hash,
+            )?)
+        }
         LocalControlCommand::ClaudeAccountCheck {
             schema_version,
             operation_id,
@@ -984,6 +998,44 @@ fn prepare_claude_account(
         .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
+fn reconnect_claude_account(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    expected_account_identifier_hash: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let current = crate::agent_status::annotate_claude_accounts_status(
+        store.load().map_err(claude_config_slot_settings_error)?,
+    );
+    let descriptor = current
+        .managed_slots
+        .iter()
+        .chain(current.external_slots.iter())
+        .find(|descriptor| descriptor.slot_id == slot_id)
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(format!(
+                "unknown registered Claude account slot_id {slot_id}"
+            ))
+        })?;
+    if descriptor.collection.account_identifier_hash.as_deref()
+        != Some(expected_account_identifier_hash.as_str())
+    {
+        return Err(LocalApiError::InvalidRequest(
+            "reconnect account binding does not match the slot's last strong identity".to_string(),
+        ));
+    }
+    store
+        .begin_registered_slot_reconnect(
+            schema_version,
+            operation_id,
+            slot_id,
+            expected_account_identifier_hash,
+        )
+        .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
+}
+
 fn check_claude_account(
     schema_version: u16,
     operation_id: &str,
@@ -1040,6 +1092,27 @@ where
         if bound != requested {
             return Err(LocalApiError::InvalidRequest(
                 "setup operation expected account does not match its original binding".to_string(),
+            ));
+        }
+    }
+    if current.setup_operation.kind
+        == ottto_protocol::ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+    {
+        let reconnect_slot_registered =
+            current
+                .setup_operation
+                .slot_id
+                .as_deref()
+                .is_some_and(|slot_id| {
+                    current
+                        .managed_slots
+                        .iter()
+                        .chain(current.external_slots.iter())
+                        .any(|slot| slot.slot_id == slot_id)
+                });
+        if !reconnect_slot_registered {
+            return Err(LocalApiError::InvalidRequest(
+                "reconnect operation slot is no longer registered".to_string(),
             ));
         }
     }
@@ -15421,6 +15494,12 @@ mod tests {
                 operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
                 expected_account_identifier_hash: None,
             },
+            LocalControlCommand::ClaudeAccountReconnect {
+                schema_version: 1,
+                operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
+                slot_id: "claude_slot_0123456789abcdef0123456789abcdef".to_string(),
+                expected_account_identifier_hash: "a".repeat(64),
+            },
             LocalControlCommand::ClaudeAccountCheck {
                 schema_version: 1,
                 operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
@@ -15627,6 +15706,98 @@ mod tests {
             "waiting_for_user_login"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_reconnect_binds_existing_slot_identity_and_final_check_fails_closed() {
+        let root = control_test_root("claude-account-reconnect");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let exact_dir = format!("{}/existing account/", root.display());
+        let registered = store
+            .register_path(1, exact_dir.clone())
+            .expect("register existing slot");
+        let slot_id = registered.external_slots[0].slot_id.clone();
+        let account_hash = "a".repeat(64);
+        let organization_hash = "b".repeat(64);
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &slot_id,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+                account_identifier_hash: Some(account_hash.clone()),
+                organization_identifier_hash: Some(organization_hash),
+                observed_at: Some("2026-08-05T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("persist last strong identity");
+        let operation_id = "claude_setup_99999999999999999999999999999999";
+        let begun =
+            reconnect_claude_account(1, operation_id.to_string(), &slot_id, account_hash.clone())
+                .expect("begin reconnect");
+        assert_eq!(
+            begun.setup_operation.kind,
+            ottto_protocol::ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
+        );
+        assert_eq!(begun.external_slots.len(), 1);
+        assert_eq!(
+            begun.external_slots[0].config_dir.as_deref(),
+            Some(exact_dir.as_str())
+        );
+        assert_eq!(
+            begun.setup_operation.slot_id.as_deref(),
+            Some(slot_id.as_str())
+        );
+        assert!(begun
+            .setup_operation
+            .launch_command
+            .as_deref()
+            .is_some_and(
+                |command| command.contains("existing account/") && !command.contains("/login")
+            ));
+        assert!(matches!(
+            reconnect_claude_account(
+                1,
+                "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                &slot_id,
+                "c".repeat(64),
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+
+        let mismatched = check_claude_account_with_collector(
+            1,
+            operation_id,
+            Some(&account_hash),
+            |observed_slot_id, _, _| {
+                assert_eq!(observed_slot_id, slot_id);
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some("d".repeat(64)),
+                    organization_identifier_hash: Some("e".repeat(64)),
+                    observed_at: Some("2026-08-05T00:01:00Z".to_string()),
+                    last_full_quota_read_at: Some("2026-08-05T00:01:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    ..Default::default()
+                }
+            },
+        )
+        .expect("identity mismatch is typed");
+        assert_eq!(
+            mismatched.setup_operation.state,
+            ClaudeAccountSetupOperationState::IdentityMismatch
+        );
+
+        store.remove(1, &slot_id).expect("remove registered slot");
+        assert!(matches!(
+            check_claude_account_with_collector(1, operation_id, Some(&account_hash), |_, _, _| {
+                unreachable!("removed slot cannot be collected")
+            }),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

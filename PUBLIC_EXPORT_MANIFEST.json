@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 313,
-  "content_sha256": "18fe6697271cd42340dc75317b32d366e7a55d808ff75fdbdcd5a9b39ee3c3b2",
+  "candidate_file_count": 314,
+  "content_sha256": "918c2b2e567df660b7d6917f70cf847b60c32b8b8201b0cf09fb2cf9a05d373f",
   "files": [
     {
       "executable": false,
@@ -76,8 +76,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "78ddd387b1d8f7ccfab31d596910679884da2f7f4259bf68b9d47ceee4c120d3",
-      "size_bytes": 49555
+      "sha256": "838ceb45046744959b0fa33af29f66c71ccc27c5f0dbfe6e0ed4788ba5fc6172",
+      "size_bytes": 50109
     },
     {
       "executable": false,
@@ -440,8 +440,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "138914e2f610f29a0b6a816b632f9150cf53fa3b5f466d74a8bec3072a7e1e63",
-      "size_bytes": 157845
+      "sha256": "ac43c64db7736ade0b086838c53de5b835dcc400a323db1b626f3dcc07aa4262",
+      "size_bytes": 157935
     },
     {
       "executable": false,
@@ -503,8 +503,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/claude_config_slots.rs",
-      "sha256": "5ffe09330bb9bc4125592c4c27d8113328c5037be771c7485f49d505e1d90c46",
-      "size_bytes": 73934
+      "sha256": "b296f0afaae9f8a74235dfd5eecba7b5e8c416b370fb4023fdbe9a2f8ac17b71",
+      "size_bytes": 115723
     },
     {
       "executable": false,
@@ -573,8 +573,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "505004844f7e15149c5b85a980ebff5922b597514e73274dd7b12150a8ac7557",
-      "size_bytes": 201412
+      "sha256": "e9c42c2ccbf31c6dbeab4fd3a07501a70fe117450497cfa1c28503a44b900c75",
+      "size_bytes": 205883
     },
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "65aaf2e698dd2354fa61f274ab1e534f110870bc931da0e357021c5dc58c0eb7",
-      "size_bytes": 521922
+      "sha256": "f85098b0fcaf4f55272f93cabce716477896eb79efbe22875831f02156525e3b",
+      "size_bytes": 547249
     },
     {
       "executable": false,
@@ -727,8 +727,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "c0c39207283f3f490e65407ab43b0240ffb038fb58b7b3f686ce7034a7a94ebf",
-      "size_bytes": 1010940
+      "sha256": "003251e285be48471e2377dcd624dc2574fbb075a31eb32091d7bf4ae2a247e0",
+      "size_bytes": 1017785
     },
     {
       "executable": false,
@@ -902,8 +902,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "2bf443dccd95bdd90afe3c5cba31cb7d183b825a00ca9c7a905210bdc4b9e0cb",
-      "size_bytes": 8636
+      "sha256": "911773043bd05c262e48d7602c9d670a92c7f8404abcc7d8a63b2d5a04583d67",
+      "size_bytes": 10156
     },
     {
       "executable": false,
@@ -1331,6 +1331,13 @@
       "path": "docs/session-2026-08-04-public-daemon-multi-account-collection.md",
       "sha256": "6a517dfbe59c3e012d09f36faec7a7a940ab2d4d20503a425968e4dbcc59a88a",
       "size_bytes": 4688
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-05-claude-slot-reconnect-local-meters.md",
+      "sha256": "e36fb13fa0542664ed1c4ea8f3a0b658d5f83290dd791a9e8a71c07063f7b90a",
+      "size_bytes": 4036
     },
     {
       "executable": false,
@@ -2194,9 +2201,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-04T21:50:05+00:00",
+  "generated_at": "2026-08-04T23:15:11+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 314,
+  "output_file_count": 315,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2230,5 +2237,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "390f1ed37dbf3679a2836752f82fd749c9628a95"
+  "source_commit": "13133c6c2571be216e447e2e9025120e9d5f64b3"
 }

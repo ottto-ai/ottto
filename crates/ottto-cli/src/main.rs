@@ -2138,6 +2138,7 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::ClaudeAccountRemove { .. } => "claude_account_remove",
         LocalControlCommand::ClaudeAccountRegisterPath { .. } => "claude_account_register_path",
         LocalControlCommand::ClaudeAccountPrepare { .. } => "claude_account_prepare",
+        LocalControlCommand::ClaudeAccountReconnect { .. } => "claude_account_reconnect",
         LocalControlCommand::ClaudeAccountCheck { .. } => "claude_account_check",
         LocalControlCommand::ClaudeAccountStopWaiting { .. } => "claude_account_stop_waiting",
         LocalControlCommand::Detect { .. } => "detect",
