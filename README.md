@@ -334,16 +334,20 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   repair payloads without authority/approval metadata fail deserialization
 - typed diagnostics bundles with explicit redaction reports
 - typed local control request/response envelopes
-- authenticated `claude_accounts_status`,
+- authenticated `claude_accounts_status`, `claude_account_prepare`,
+  `claude_account_check`, `claude_account_stop_waiting`,
   `claude_account_set_upkeep_consent`, `claude_account_register_path`, and
   `claude_account_remove` operations for one bounded, versioned machine-local
   registry. The true default `CLAUDE_CONFIG_DIR`-unset slot is always present;
   up to nine absolute config-dir strings are stored exactly as registered with
   stable opaque ids and explicit `managed` / `external` ownership, and one
   explicit consent bit governs future background upkeep for the whole registry.
-  Advanced path registration is external ownership. These protocol-v18
-  operations perform no login, token refresh, setup, inference, or Keychain
-  writes.
+  Advanced path registration is external ownership. Managed prepare creates a
+  private `0700` directory and returns an exact Claude Code launch command;
+  customer-owned `/login` remains entirely inside official Claude Code. Exact
+  checks are single-flight, stop is durable until explicit prepare replay, and
+  these protocol-v18 operations perform no login automation, token refresh,
+  inference, credential write, or Keychain write.
 - persistent Unix-socket serving with `--once` smoke mode
 - CLI-to-daemon Unix-socket requests for status, setup, login, account, logout,
   setup claim codes, doctor, repair, verify, diagnostics, and uninstall

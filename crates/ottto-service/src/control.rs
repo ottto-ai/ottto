@@ -30,8 +30,9 @@ use ottto_protocol::{
     validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
     AgentInstallationDetection, AgentProviderImpactQuery, AgentRecommendationsQuery,
     AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
-    AuthStartResponse, CliError, CliErrorCode, CloudSessionBackendGrantResponseV1,
-    CloudSessionsControlAction, ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
+    AuthStartResponse, ClaudeAccountSetupOperationState, ClaudeConfigSlotCollectionStateV1,
+    CliError, CliErrorCode, CloudSessionBackendGrantResponseV1, CloudSessionsControlAction,
+    ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
     DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
     DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
     LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
@@ -667,6 +668,40 @@ fn handle_command(
             require_authorized_local_client(daemon, &authorization)?;
             to_value(register_claude_account_path(schema_version, config_dir)?)
         }
+        LocalControlCommand::ClaudeAccountPrepare {
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(prepare_claude_account(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+            )?)
+        }
+        LocalControlCommand::ClaudeAccountCheck {
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(check_claude_account(
+                schema_version,
+                &operation_id,
+                expected_account_identifier_hash.as_deref(),
+            )?)
+        }
+        LocalControlCommand::ClaudeAccountStopWaiting {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(stop_waiting_for_claude_account(
+                schema_version,
+                &operation_id,
+            )?)
+        }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
             to_value(detect_agent_installation(&source))
@@ -912,10 +947,15 @@ fn remove_claude_account(
     schema_version: u16,
     slot_id: &str,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
-    FileClaudeConfigSlotSettingsStore::default()
+    let status = FileClaudeConfigSlotSettingsStore::default()
         .remove(schema_version, slot_id)
-        .map_err(claude_config_slot_settings_error)
-        .map(crate::agent_status::annotate_claude_accounts_status)
+        .map_err(claude_config_slot_settings_error)?;
+    // Settings removal is authoritative. Collection-state cleanup is
+    // best-effort; current-slot filtering makes an orphan non-authoritative,
+    // so a cleanup I/O failure must not turn a committed removal into a false
+    // failure that cannot be retried honestly.
+    let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
+    Ok(crate::agent_status::annotate_claude_accounts_status(status))
 }
 
 fn register_claude_account_path(
@@ -924,6 +964,255 @@ fn register_claude_account_path(
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     FileClaudeConfigSlotSettingsStore::default()
         .register_path(schema_version, config_dir)
+        .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
+}
+
+fn prepare_claude_account(
+    schema_version: u16,
+    operation_id: String,
+    expected_account_identifier_hash: Option<String>,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .prepare_managed_account(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+        )
+        .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
+}
+
+fn check_claude_account(
+    schema_version: u16,
+    operation_id: &str,
+    expected_account_identifier_hash: Option<&str>,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    check_claude_account_with_collector(
+        schema_version,
+        operation_id,
+        expected_account_identifier_hash,
+        crate::agent_status::collect_registered_claude_slot_status,
+    )
+}
+
+fn check_claude_account_with_collector<F>(
+    schema_version: u16,
+    operation_id: &str,
+    expected_account_identifier_hash: Option<&str>,
+    collector: F,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError>
+where
+    F: FnOnce(&str, String, String) -> ottto_protocol::ClaudeConfigSlotCollectionStatusV1,
+{
+    check_claude_account_with_hooks(
+        schema_version,
+        operation_id,
+        expected_account_identifier_hash,
+        || {},
+        collector,
+    )
+}
+
+fn check_claude_account_with_hooks<B, F>(
+    schema_version: u16,
+    operation_id: &str,
+    expected_account_identifier_hash: Option<&str>,
+    before_validating: B,
+    collector: F,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError>
+where
+    B: FnOnce(),
+    F: FnOnce(&str, String, String) -> ottto_protocol::ClaudeConfigSlotCollectionStatusV1,
+{
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let current = store
+        .setup_operation(operation_id)
+        .map_err(claude_config_slot_settings_error)?;
+    if let (Some(bound), Some(requested)) = (
+        current
+            .setup_operation
+            .expected_account_identifier_hash
+            .as_deref(),
+        expected_account_identifier_hash,
+    ) {
+        if bound != requested {
+            return Err(LocalApiError::InvalidRequest(
+                "setup operation expected account does not match its original binding".to_string(),
+            ));
+        }
+    }
+
+    // A crash-persisted Preparing intent has no registered credential slot to
+    // inspect yet. Its authenticated status remains actionable and replaying
+    // prepare resumes the same deterministic path transaction.
+    if matches!(
+        current.setup_operation.state,
+        ClaudeAccountSetupOperationState::Preparing
+            | ClaudeAccountSetupOperationState::SetupStopped
+    ) {
+        return Ok(crate::agent_status::annotate_claude_accounts_status(
+            current,
+        ));
+    }
+    let Some(_observation_guard) = store
+        .try_setup_operation_observation(operation_id)
+        .map_err(claude_config_slot_settings_error)?
+    else {
+        return Ok(crate::agent_status::annotate_claude_accounts_status(
+            current,
+        ));
+    };
+    let historical_state = current.setup_operation.state.clone();
+    let historical_account_hash = current.setup_operation.account_identifier_hash.clone();
+    before_validating();
+    let validating = store
+        .transition_setup_operation(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            ClaudeAccountSetupOperationState::Validating,
+            historical_account_hash.as_deref(),
+            Some("Checking the exact registered Claude Code login."),
+        )
+        .map_err(claude_config_slot_settings_error)?;
+    if validating.setup_operation.state != ClaudeAccountSetupOperationState::Validating {
+        return Ok(crate::agent_status::annotate_claude_accounts_status(
+            validating,
+        ));
+    }
+
+    let captured_at = current_rfc3339();
+    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+        .unwrap_or_else(|| captured_at.clone());
+    let slot_id = current
+        .setup_operation
+        .slot_id
+        .as_deref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let direct_slot_status = collector(slot_id, captured_at, expires_at);
+    crate::agent_status::persist_one_claude_slot_collection_state(slot_id, &direct_slot_status)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    let refreshed = store
+        .setup_operation(operation_id)
+        .map_err(claude_config_slot_settings_error)?;
+    let observed_account_hash = direct_slot_status.account_identifier_hash.as_deref();
+    let bound_account_hash = refreshed
+        .setup_operation
+        .expected_account_identifier_hash
+        .as_deref()
+        .or(expected_account_identifier_hash);
+    if matches!(
+        direct_slot_status.state,
+        ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+            | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+    ) || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
+    {
+        return store
+            .transition_setup_operation(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+                None,
+                Some("The exact slot did not match the expected Claude account. Complete /login with the intended account, then retry."),
+            )
+            .map_err(claude_config_slot_settings_error)
+            .map(crate::agent_status::annotate_claude_accounts_status);
+    }
+
+    let full_read = direct_slot_status.state == ClaudeConfigSlotCollectionStateV1::Fresh
+        && direct_slot_status.last_full_quota_read_at.is_some()
+        && direct_slot_status.has_account_windows
+        && direct_slot_status.has_scoped_limits;
+    let result = if full_read {
+        let Some(account_hash) = observed_account_hash else {
+            return Err(LocalApiError::StatePoisoned);
+        };
+        store
+            .transition_setup_operation(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+                ClaudeAccountSetupOperationState::Reading,
+                Some(account_hash),
+                Some("Identity matched. Reading full Claude quota for this exact account."),
+            )
+            .map_err(claude_config_slot_settings_error)?;
+        store.transition_setup_operation(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            ClaudeAccountSetupOperationState::Complete,
+            Some(account_hash),
+            Some("Claude account identity and full quota read are complete."),
+        )
+    } else if let Some(account_hash) = observed_account_hash {
+        if historical_state == ClaudeAccountSetupOperationState::Complete {
+            store.transition_setup_operation(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+                ClaudeAccountSetupOperationState::Complete,
+                Some(account_hash),
+                Some(
+                    "Claude account remains identity-validated; the last full reading is retained.",
+                ),
+            )
+        } else {
+            store.transition_setup_operation(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+                ClaudeAccountSetupOperationState::Reading,
+                Some(account_hash),
+                Some("Identity is validated; the full quota read has not completed yet."),
+            )
+        }
+    } else if historical_state == ClaudeAccountSetupOperationState::Complete {
+        store.transition_setup_operation(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            ClaudeAccountSetupOperationState::Complete,
+            historical_account_hash.as_deref(),
+            Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
+        )
+    } else if matches!(
+        direct_slot_status.state,
+        ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+            | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+            | ClaudeConfigSlotCollectionStateV1::Unverified
+    ) {
+        store.transition_setup_operation(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            None,
+            Some("Waiting for the customer to complete official Claude Code /login."),
+        )
+    } else {
+        store.transition_setup_operation(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            ClaudeAccountSetupOperationState::SetupFailed,
+            None,
+            Some("Claude account validation could not complete from safe local evidence."),
+        )
+    };
+    result
+        .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
+}
+
+fn stop_waiting_for_claude_account(
+    schema_version: u16,
+    operation_id: &str,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .stop_waiting(schema_version, operation_id)
         .map_err(claude_config_slot_settings_error)
         .map(crate::agent_status::annotate_claude_accounts_status)
 }
@@ -15110,7 +15399,7 @@ mod tests {
     fn claude_accounts_require_auth_and_apply_operation_specific_mutations() {
         let root = control_test_root("claude-config-slots");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let daemon = daemon();
+        let test_daemon = daemon();
 
         for command in [
             LocalControlCommand::ClaudeAccountsStatus,
@@ -15126,9 +15415,23 @@ mod tests {
                 schema_version: 1,
                 config_dir: "/tmp/claude-work/".to_string(),
             },
+            LocalControlCommand::ClaudeAccountPrepare {
+                schema_version: 1,
+                operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
+                expected_account_identifier_hash: None,
+            },
+            LocalControlCommand::ClaudeAccountCheck {
+                schema_version: 1,
+                operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
+                expected_account_identifier_hash: None,
+            },
+            LocalControlCommand::ClaudeAccountStopWaiting {
+                schema_version: 1,
+                operation_id: "claude_setup_0123456789abcdef0123456789abcdef".to_string(),
+            },
         ] {
             let response = handle_request(
-                &daemon,
+                &test_daemon,
                 LocalControlRequest {
                     request_id: "req_slots_unauthorized".to_string(),
                     protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
@@ -15146,7 +15449,7 @@ mod tests {
         }
 
         let registered = handle_request(
-            &daemon,
+            &test_daemon,
             LocalControlRequest {
                 request_id: "req_account_register".to_string(),
                 protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
@@ -15183,7 +15486,7 @@ mod tests {
         assert_eq!(register_payload["capacity"]["used_slots"], 2);
 
         let consented = handle_request(
-            &daemon,
+            &test_daemon,
             LocalControlRequest {
                 request_id: "req_account_consent".to_string(),
                 protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
@@ -15201,7 +15504,7 @@ mod tests {
         assert_eq!(consent_payload["consent"], "granted");
 
         let loaded = handle_request(
-            &daemon,
+            &test_daemon,
             LocalControlRequest {
                 request_id: "req_accounts_status".to_string(),
                 protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
@@ -15219,7 +15522,7 @@ mod tests {
             .expect("slot id")
             .to_string();
         let removed = handle_request(
-            &daemon,
+            &test_daemon,
             LocalControlRequest {
                 request_id: "req_account_remove".to_string(),
                 protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
@@ -15239,6 +15542,375 @@ mod tests {
         );
         assert!(root.join("claude-config-slots.json").is_file());
 
+        let operation_id = "claude_setup_abcdefabcdefabcdefabcdefabcdefab";
+        let lifecycle_request = |request_id: &str, command| LocalControlRequest {
+            request_id: request_id.to_string(),
+            protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::CompanionApp),
+            client_install_owner: None,
+            command,
+        };
+        let prepared = handle_request(
+            &test_daemon,
+            lifecycle_request(
+                "req_account_prepare",
+                LocalControlCommand::ClaudeAccountPrepare {
+                    schema_version: 1,
+                    operation_id: operation_id.to_string(),
+                    expected_account_identifier_hash: None,
+                },
+            ),
+        );
+        assert!(prepared.ok, "{prepared:?}");
+        let prepared_payload = prepared.payload.expect("prepare payload");
+        assert_eq!(
+            prepared_payload["setup_operation"]["state"],
+            "waiting_for_user_login"
+        );
+        assert!(prepared_payload["setup_operation"]["launch_command"]
+            .as_str()
+            .is_some_and(|command| command.starts_with("CLAUDE_CONFIG_DIR='")
+                && command.ends_with("' claude")));
+
+        let stopped = handle_request(
+            &test_daemon,
+            lifecycle_request(
+                "req_account_stop",
+                LocalControlCommand::ClaudeAccountStopWaiting {
+                    schema_version: 1,
+                    operation_id: operation_id.to_string(),
+                },
+            ),
+        );
+        assert!(stopped.ok, "{stopped:?}");
+        assert_eq!(
+            stopped.payload.as_ref().expect("stop payload")["setup_operation"]["state"],
+            "setup_stopped"
+        );
+
+        let queued_check = handle_request(
+            &test_daemon,
+            lifecycle_request(
+                "req_account_stopped_check",
+                LocalControlCommand::ClaudeAccountCheck {
+                    schema_version: 1,
+                    operation_id: operation_id.to_string(),
+                    expected_account_identifier_hash: None,
+                },
+            ),
+        );
+        assert!(queued_check.ok, "{queued_check:?}");
+        assert_eq!(
+            queued_check.payload.expect("stopped check payload")["setup_operation"]["state"],
+            "setup_stopped"
+        );
+
+        // A new daemon instance reads the same persisted stopped operation;
+        // only explicit prepare replay resumes the same slot/path.
+        let restarted_daemon = daemon();
+        let resumed = handle_request(
+            &restarted_daemon,
+            lifecycle_request(
+                "req_account_resume",
+                LocalControlCommand::ClaudeAccountPrepare {
+                    schema_version: 1,
+                    operation_id: operation_id.to_string(),
+                    expected_account_identifier_hash: None,
+                },
+            ),
+        );
+        assert!(resumed.ok, "{resumed:?}");
+        assert_eq!(
+            resumed.payload.expect("resume payload")["setup_operation"]["state"],
+            "waiting_for_user_login"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fanout() {
+        let root = control_test_root("claude-account-check-orchestration");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let account_a = "a".repeat(64);
+        let account_b = "b".repeat(64);
+        let operation_a = "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .prepare_managed_account(1, operation_a.to_string(), Some(account_a.clone()))
+            .expect("prepare exact account");
+
+        let full =
+            check_claude_account_with_collector(1, operation_a, Some(&account_a), |_, _, _| {
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account_a.clone()),
+                    observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+                    last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    has_credit_balances: false,
+                    ..Default::default()
+                }
+            })
+            .expect("one synchronous full check");
+        assert_eq!(
+            full.setup_operation.state,
+            ClaudeAccountSetupOperationState::Complete
+        );
+
+        for temporary in [
+            ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+        ] {
+            let retained =
+                check_claude_account_with_collector(1, operation_a, Some(&account_a), |_, _, _| {
+                    ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                        state: temporary,
+                        observed_at: Some("2026-08-04T10:00:30Z".to_string()),
+                        ..Default::default()
+                    }
+                })
+                .expect("temporary evidence loss preserves complete");
+            assert_eq!(
+                retained.setup_operation.state,
+                ClaudeAccountSetupOperationState::Complete
+            );
+        }
+
+        let rotated =
+            check_claude_account_with_collector(1, operation_a, Some(&account_a), |_, _, _| {
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account_b),
+                    observed_at: Some("2026-08-04T10:01:00Z".to_string()),
+                    last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    ..Default::default()
+                }
+            })
+            .expect("rotation is typed, not an API failure");
+        assert_eq!(
+            rotated.setup_operation.state,
+            ClaudeAccountSetupOperationState::IdentityMismatch
+        );
+
+        let operation_partial = "claude_setup_cccccccccccccccccccccccccccccccc";
+        let account_c = "c".repeat(64);
+        store
+            .prepare_managed_account(1, operation_partial.to_string(), Some(account_c.clone()))
+            .expect("prepare partial account");
+        let partial = check_claude_account_with_collector(
+            1,
+            operation_partial,
+            Some(&account_c),
+            |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some(account_c.clone()),
+                observed_at: Some("2026-08-04T10:02:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: false,
+                ..Default::default()
+            },
+        )
+        .expect("partial check");
+        assert_eq!(
+            partial.setup_operation.state,
+            ClaudeAccountSetupOperationState::Reading
+        );
+
+        let paused = check_claude_account_with_collector(
+            1,
+            operation_partial,
+            Some(&account_c),
+            |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::CollectionPaused,
+                account_identifier_hash: Some(account_c.clone()),
+                observed_at: Some("2026-08-04T10:03:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("paused check remains active");
+        assert_eq!(
+            paused.setup_operation.state,
+            ClaudeAccountSetupOperationState::Reading
+        );
+
+        let cases = [
+            (
+                "claude_setup_11111111111111111111111111111111",
+                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+                None,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            ),
+            (
+                "claude_setup_22222222222222222222222222222222",
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                None,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            ),
+            (
+                "claude_setup_33333333333333333333333333333333",
+                ClaudeConfigSlotCollectionStateV1::Unverified,
+                None,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            ),
+            (
+                "claude_setup_44444444444444444444444444444444",
+                ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+                Some("d".repeat(64)),
+                ClaudeAccountSetupOperationState::Reading,
+            ),
+            (
+                "claude_setup_55555555555555555555555555555555",
+                ClaudeConfigSlotCollectionStateV1::CollectionInProgress,
+                Some("e".repeat(64)),
+                ClaudeAccountSetupOperationState::Reading,
+            ),
+            (
+                "claude_setup_66666666666666666666666666666666",
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                None,
+                ClaudeAccountSetupOperationState::IdentityMismatch,
+            ),
+        ];
+        for (operation_id, collection_state, account_hash, expected_state) in cases {
+            store
+                .prepare_managed_account(1, operation_id.to_string(), account_hash.clone())
+                .expect("prepare matrix case");
+            let result = check_claude_account_with_collector(
+                1,
+                operation_id,
+                account_hash.as_deref(),
+                |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: collection_state.clone(),
+                    account_identifier_hash: account_hash.clone(),
+                    observed_at: Some("2026-08-04T10:04:00Z".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("matrix check");
+            assert_eq!(result.setup_operation.state, expected_state);
+            let slot_id = result.setup_operation.slot_id.as_deref().expect("slot id");
+            let slot = result
+                .managed_slots
+                .iter()
+                .find(|slot| slot.slot_id == slot_id)
+                .expect("managed slot");
+            assert_eq!(slot.collection.state, collection_state);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_account_check_is_singleflight_and_stop_wins_inflight_finalization() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = control_test_root("claude-account-check-singleflight");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let operation_id = "claude_setup_77777777777777777777777777777777";
+        let account_hash = "7".repeat(64);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .prepare_managed_account(1, operation_id.to_string(), Some(account_hash.clone()))
+            .expect("prepare");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_hash = account_hash.clone();
+        let first_probes = Arc::clone(&probes);
+        let first = thread::spawn(move || {
+            check_claude_account_with_collector(1, operation_id, Some(&first_hash), |_, _, _| {
+                first_probes.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).expect("entered");
+                release_rx.recv().expect("release");
+                ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(first_hash.clone()),
+                    observed_at: Some("2026-08-04T11:00:00Z".to_string()),
+                    last_full_quota_read_at: Some("2026-08-04T11:00:00Z".to_string()),
+                    has_account_windows: true,
+                    has_scoped_limits: true,
+                    ..Default::default()
+                }
+            })
+        });
+        entered_rx.recv().expect("first probe entered");
+        let loser_probes = Arc::clone(&probes);
+        let loser =
+            check_claude_account_with_collector(1, operation_id, Some(&account_hash), |_, _, _| {
+                loser_probes.fetch_add(1, Ordering::SeqCst);
+                unreachable!("single-flight loser must not collect")
+            })
+            .expect("loser returns persisted progress");
+        assert_eq!(
+            loser.setup_operation.state,
+            ClaudeAccountSetupOperationState::Validating
+        );
+        let stopped = store.stop_waiting(1, operation_id).expect("stop in flight");
+        assert_eq!(
+            stopped.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupStopped
+        );
+        release_tx.send(()).expect("release first");
+        let first_result = first.join().expect("join first").expect("first result");
+        assert_eq!(
+            first_result.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupStopped
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_account_stop_before_validating_prevents_the_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = control_test_root("claude-account-stop-before-validating");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let operation_id = "claude_setup_88888888888888888888888888888888";
+        let account_hash = "8".repeat(64);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .prepare_managed_account(1, operation_id.to_string(), Some(account_hash.clone()))
+            .expect("prepare");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread_probes = Arc::clone(&probes);
+        let check = thread::spawn(move || {
+            check_claude_account_with_hooks(
+                1,
+                operation_id,
+                Some(&account_hash),
+                || {
+                    claimed_tx.send(()).expect("claimed");
+                    release_rx.recv().expect("release");
+                },
+                |_, _, _| {
+                    thread_probes.fetch_add(1, Ordering::SeqCst);
+                    unreachable!("stop won before Validating; collector must not run")
+                },
+            )
+        });
+        claimed_rx.recv().expect("check claimed operation guard");
+        let stopped = store
+            .stop_waiting(1, operation_id)
+            .expect("stop before CAS");
+        assert_eq!(
+            stopped.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupStopped
+        );
+        release_tx.send(()).expect("release check");
+        let result = check.join().expect("join check").expect("check result");
+        assert_eq!(
+            result.setup_operation.state,
+            ClaudeAccountSetupOperationState::SetupStopped
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
         let _ = fs::remove_dir_all(root);
     }
 

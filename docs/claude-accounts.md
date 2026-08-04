@@ -73,10 +73,27 @@ diagnostics. One failed slot does not stop healthy siblings. A same-account
 and same-organization cached reading may remain visible for up to 24 hours with
 stale freshness; it is never borrowed or relabeled under another organization.
 
-This is collector support, not the future connection workflow. The daemon does
-not yet prepare a managed directory, perform setup/check phases, wait for a
-user-run login, or provide background credential upkeep. Advanced path
-registration remains explicit local configuration.
+## Connecting another account
+
+Authenticated local control can prepare a private managed directory and return
+one exact command of the form `CLAUDE_CONFIG_DIR='<path>' claude`. Ottto never
+runs or types `/login`: the customer opens official Claude Code with that
+command and completes `/login` there. A check then validates only that exact
+registered slot and completes only after fresh session, weekly, and at least one
+model-scoped limit are attributed to the same strong account identity. Credits
+are reported when available but are not required for completion.
+
+Prepare is idempotent by opaque operation id, including across daemon restarts.
+Stop Waiting stops only Ottto's observation; it does not terminate Claude Code,
+delete a registration, or erase credentials. A queued check cannot silently
+resume a stopped operation. Replaying prepare for the same operation explicitly
+resumes it on the same path. Removing a managed registration also preserves its
+directory; customers remain in control of credential deletion.
+
+When the machine off-switch is enabled, exact-slot usage collection reports
+`collection_paused`, makes no provider request, and retains registrations,
+consent, and account-scoped caches with their original age. Re-enabling resumes
+normal collection without another login prompt.
 
 ## Tips
 
@@ -86,5 +103,8 @@ registration remains explicit local configuration.
 - Remember `/login` replaces the terminal account rather than adding one.
   After switching, the previous account's terminal readings stop refreshing
   and will show their age honestly.
+- For another account, use the exact managed-slot command returned by Ottto;
+  do not run `/login` in the default terminal slot unless replacing it is your
+  intent.
 - The badge and the "not verified" label are not errors. They are Ottto
   telling you exactly how much it can prove.
