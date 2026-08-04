@@ -3685,9 +3685,7 @@ mod tests {
         assert_eq!(normalized.days_out_of_window, 2);
         let accounting = diagnostics
             .iter()
-            .find(|diagnostic| {
-                diagnostic.code == "codex_daily_aggregates_normalization_accounting"
-            })
+            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_normalization_accounting")
             .expect("normalization accounting diagnostic");
         assert!(accounting.message.contains("days_out_of_window=2"));
     }
@@ -3729,13 +3727,8 @@ mod tests {
         let normalized =
             normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
 
-        let row = row_at(
-            &normalized.rows,
-            "2026-07-26",
-            "codex_web",
-            "gpt-5-codex",
-        )
-        .expect("aliased model row");
+        let row = row_at(&normalized.rows, "2026-07-26", "codex_web", "gpt-5-codex")
+            .expect("aliased model row");
         assert_eq!(row.total_tokens, Some(17));
     }
 
@@ -3785,10 +3778,9 @@ mod tests {
             &normalized.unrecognized_model_keys,
         ] {
             assert!(keys.len() <= MAX_UNRECOGNIZED_KEYS);
-            assert!(
-                keys.iter()
-                    .all(|key| key.chars().count() <= MAX_REPORTED_KEY_CHARS)
-            );
+            assert!(keys
+                .iter()
+                .all(|key| key.chars().count() <= MAX_REPORTED_KEY_CHARS));
         }
     }
 
@@ -4722,6 +4714,10 @@ mod tests {
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(0));
         assert_eq!(cycle.diagnostics.len(), 3);
+        let zero_rows = diagnostic(&cycle, "codex_daily_aggregates_zero_rows_explained");
+        assert!(zero_rows.message.contains("days_seen=1"));
+        assert!(zero_rows.message.contains("days_recognized=1"));
+        assert!(zero_rows.message.contains("entries_empty_counters=1"));
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
             AgentDiagnosticSeverity::Info
@@ -4759,6 +4755,11 @@ mod tests {
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(1));
         assert_eq!(cycle.diagnostics.len(), 2);
+        assert!(
+            diagnostic(&cycle, "codex_daily_aggregates_normalization_accounting")
+                .message
+                .contains("clients_no_model_breakdown=1")
+        );
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_collected").severity,
             AgentDiagnosticSeverity::Info
