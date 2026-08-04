@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/provider_daily_reference.rs",
-      "sha256": "fe3bf05976a59feede1729c457cdec804b2dd7bcff18db22a39a6824dc471044",
-      "size_bytes": 173931
+      "sha256": "94b21c8183e88734d1250f08be76e7636644aa57fede1846cfb5873e11efa1d8",
+      "size_bytes": 183301
     },
     {
       "executable": false,
