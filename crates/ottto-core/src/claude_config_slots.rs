@@ -34,16 +34,13 @@ static CLAUDE_CONFIG_SLOT_SETTINGS_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::
 ///
 /// `Default` means `CLAUDE_CONFIG_DIR` is unset. A registered slot retains the
 /// exact raw string; no path normalization is performed anywhere in this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ClaudeConfigDirSlot {
+    #[default]
     Default,
-    Registered { config_dir: String },
-}
-
-impl Default for ClaudeConfigDirSlot {
-    fn default() -> Self {
-        Self::Default
-    }
+    Registered {
+        config_dir: String,
+    },
 }
 
 impl ClaudeConfigDirSlot {
