@@ -719,17 +719,47 @@ fn validate_grant_response(
 /// Collector build governance lives in the backend admission list, so a daemon
 /// upgrade does not make stored consent ineligible or require re-consent.
 pub fn grant_runtime_ready(grant: &DailyReferenceGrant) -> bool {
-    grant.status == GrantStatus::Enabled
-        && grant.schema_version == SCHEMA_VERSION
-        && grant.source == SOURCE
-        && grant.collector_id == COLLECTOR_ID
-        && grant.disclosure_version == DISCLOSURE_VERSION
-        && !grant.backend_create_pending
-        && grant.backend_binding.as_ref().is_some_and(|binding| {
-            !binding.backend_revoked
-                && binding.server_policy_state == ServerPolicyState::Approved
-                && binding.grant_version >= 1
-        })
+    grant_runtime_block_reason(grant).is_none()
+}
+
+/// Which single condition stops a stored grant from collecting, if any.
+///
+/// `grant_runtime_ready` is the boolean this answers. Kept separate so a
+/// refusal can name its own cause: a grant that exists but cannot collect used
+/// to end the cycle in silence, which reads exactly like "nothing to report".
+/// Returns a fixed vocabulary, never grant contents.
+pub fn grant_runtime_block_reason(grant: &DailyReferenceGrant) -> Option<&'static str> {
+    if grant.status != GrantStatus::Enabled {
+        return Some("grant_not_enabled");
+    }
+    if grant.schema_version != SCHEMA_VERSION {
+        return Some("schema_version_mismatch");
+    }
+    if grant.source != SOURCE {
+        return Some("source_mismatch");
+    }
+    if grant.collector_id != COLLECTOR_ID {
+        return Some("collector_id_mismatch");
+    }
+    if grant.disclosure_version != DISCLOSURE_VERSION {
+        return Some("disclosure_version_mismatch");
+    }
+    if grant.backend_create_pending {
+        return Some("backend_create_pending");
+    }
+    let Some(binding) = grant.backend_binding.as_ref() else {
+        return Some("no_backend_binding");
+    };
+    if binding.backend_revoked {
+        return Some("backend_revoked");
+    }
+    if binding.server_policy_state != ServerPolicyState::Approved {
+        return Some("server_policy_not_approved");
+    }
+    if binding.grant_version < 1 {
+        return Some("grant_version_below_one");
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2286,11 +2316,30 @@ fn collect_once(
     }
 
     // No consent is the silent case: nothing to report, nothing to warn about.
-    let Ok(Some(grant)) = grants.load() else {
-        return Cycle::new(CycleOutcome::Disabled);
+    // A grant that exists but cannot collect is not that case, and says so.
+    let grant = match grants.load() {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
+        Err(_) => {
+            return Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_consent_unreadable",
+                    "Stored consent could not be read on this Mac, so nothing was collected.",
+                ),
+            )
+        }
     };
-    if !grant_runtime_ready(&grant) {
-        return Cycle::new(CycleOutcome::Disabled);
+    if let Some(reason) = grant_runtime_block_reason(&grant) {
+        return Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_consent_not_runtime_ready",
+                &format!(
+                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
+                ),
+            ),
+        );
     }
 
     // Consent is bound to one installation and one provider account. Prove both
@@ -2817,11 +2866,32 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     // The default/off path is one local grant read. Nothing below - account,
     // device, connection, destination, credential, or keychain - is touched
     // until consent is capable of becoming runtime-ready.
-    let Ok(Some(grant)) = collector.grants.load() else {
-        return Cycle::new(CycleOutcome::Disabled);
+    // No consent at all stays silent: nothing was promised, so nothing is owed.
+    // A grant that exists but cannot collect is the opposite case and must say
+    // so, or "consent is on" and "nothing is being read" look identical.
+    let grant = match collector.grants.load() {
+        Ok(Some(grant)) => grant,
+        Ok(None) => return Cycle::new(CycleOutcome::Disabled),
+        Err(_) => {
+            return Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_consent_unreadable",
+                    "Stored consent could not be read on this Mac, so nothing was collected.",
+                ),
+            )
+        }
     };
-    if !grant_runtime_ready(&grant) {
-        return Cycle::new(CycleOutcome::Disabled);
+    if let Some(reason) = grant_runtime_block_reason(&grant) {
+        return Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_consent_not_runtime_ready",
+                &format!(
+                    "Stored consent exists but cannot collect on this Mac: {reason}. Nothing was read."
+                ),
+            ),
+        );
     }
 
     let Ok(Some((runtime, credential, api_base_url))) = load_runtime_binding() else {
@@ -2904,9 +2974,12 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
             let cycle = collect_composed_once(OffsetDateTime::now_utc());
             if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
                 eprintln!("{}", cycle_summary_log(&cycle));
-                for line in cycle_diagnostic_log_lines(&cycle.diagnostics) {
-                    eprintln!("{line}");
-                }
+            }
+            // Diagnostics are printed whatever the outcome. A Disabled cycle is
+            // the one most worth explaining: it is where a live consent quietly
+            // stops collecting. Silent outcomes carry no diagnostics anyway.
+            for line in cycle_diagnostic_log_lines(&cycle.diagnostics) {
+                eprintln!("{line}");
             }
             thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
@@ -4404,6 +4477,61 @@ mod tests {
         assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
         assert_eq!(status.reason_code, "consent_required");
         assert!(!status.provider_read_permitted);
+    }
+
+    #[test]
+    fn a_disabled_cycle_still_gets_its_diagnostics_logged() {
+        // Regression: a live consent that stops collecting used to build this
+        // warning and drop it, because the supervisor logged only non-Disabled
+        // cycles. On a real Mac that read as "everything is fine, no data".
+        let collector = collector("disabled-cycle-logging");
+        enabled(&collector);
+        let other_account = Runtime {
+            installation_id: INSTALLATION_ID.to_string(),
+            provider_account_scope: "acct-a-completely-different-account".to_string(),
+        };
+
+        let cycle =
+            collector.collect_once(&other_account, &ForbiddenReader, &ForbiddenTransport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+        let lines = cycle_diagnostic_log_lines(&cycle.diagnostics);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("codex_daily_aggregates_account_mismatch")),
+            "a Disabled cycle must still explain itself: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_grant_that_cannot_collect_names_the_condition_that_stops_it() {
+        let collector = collector("block-reason");
+        let ready = enabled(&collector);
+        assert_eq!(grant_runtime_block_reason(&ready), None);
+        assert!(grant_runtime_ready(&ready));
+
+        let mut stale_disclosure = ready.clone();
+        stale_disclosure.disclosure_version = "provider_daily_reference_disclosure.v99".to_string();
+        assert_eq!(
+            grant_runtime_block_reason(&stale_disclosure),
+            Some("disclosure_version_mismatch")
+        );
+        assert!(!grant_runtime_ready(&stale_disclosure));
+
+        let mut pending = ready.clone();
+        pending.backend_create_pending = true;
+        assert_eq!(
+            grant_runtime_block_reason(&pending),
+            Some("backend_create_pending")
+        );
+
+        let mut unbound = ready.clone();
+        unbound.backend_binding = None;
+        assert_eq!(
+            grant_runtime_block_reason(&unbound),
+            Some("no_backend_binding")
+        );
     }
 
     #[test]
