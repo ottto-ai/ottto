@@ -36,7 +36,7 @@ use ottto_protocol::{AgentDiagnosticSeverity, AgentStatusDiagnostic, LocalAccoun
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1360,30 +1360,164 @@ fn credits_at(value: &Value, keys: &[&str]) -> Option<f64> {
 fn counters_at(value: &Value, include_credits: bool) -> Counters {
     Counters {
         credits_used: include_credits
-            .then(|| credits_at(value, &["credits"]))
+            .then(|| {
+                credits_at(
+                    value,
+                    &["credits", "credits_used", "credit_usage", "total_credits"],
+                )
+            })
             .flatten(),
         uncached_input_tokens: counter_at(
             value,
-            &["uncached_text_input_tokens", "uncached_input_tokens"],
+            &[
+                "uncached_text_input_tokens",
+                "uncached_input_tokens",
+                "input_tokens_uncached",
+                "text_input_tokens_uncached",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         cached_input_tokens: counter_at(
             value,
-            &["cached_text_input_tokens", "cached_input_tokens"],
+            &[
+                "cached_text_input_tokens",
+                "cached_input_tokens",
+                "input_tokens_cached",
+                "text_input_tokens_cached",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         output_tokens: counter_at(
             value,
-            &["text_output_tokens", "output_tokens"],
+            &[
+                "text_output_tokens",
+                "output_tokens",
+                "completion_tokens",
+                "generated_tokens",
+            ],
             MAX_TOKEN_COUNTER,
         ),
         total_tokens: counter_at(
             value,
-            &["text_total_tokens", "total_tokens"],
+            &[
+                "text_total_tokens",
+                "total_tokens",
+                "token_count",
+                "total_token_count",
+                "tokens",
+            ],
             MAX_TOKEN_COUNTER,
         ),
-        thread_count: counter_at(value, &["threads", "thread_count"], MAX_EVENT_COUNTER),
-        turn_count: counter_at(value, &["turns", "turn_count"], MAX_EVENT_COUNTER),
+        thread_count: counter_at(
+            value,
+            &["threads", "thread_count", "threads_count", "total_threads"],
+            MAX_EVENT_COUNTER,
+        ),
+        turn_count: counter_at(
+            value,
+            &["turns", "turn_count", "turns_count", "total_turns"],
+            MAX_EVENT_COUNTER,
+        ),
+    }
+}
+
+const DAY_DATE_KEYS: &[&str] = &[
+    "date",
+    "day",
+    "usage_date",
+    "bucket_start",
+    "start_date",
+    "timestamp",
+    "created_at",
+    "start",
+    "period_start",
+];
+const CLIENT_ARRAY_KEYS: &[&str] = &[
+    "clients",
+    "client_breakdown",
+    "by_client",
+    "per_client",
+    "client_counts",
+    "breakdown",
+    "surfaces",
+    "clients_data",
+    "client_data",
+];
+const CLIENT_ID_KEYS: &[&str] = &["client_id", "client", "id", "name", "surface", "surface_id"];
+const MODEL_ARRAY_KEYS: &[&str] = &[
+    "models",
+    "model_breakdown",
+    "by_model",
+    "per_model",
+    "model_list",
+    "models_data",
+    "model_data",
+];
+const MODEL_NAME_KEYS: &[&str] = &[
+    "model",
+    "model_id",
+    "model_slug",
+    "name",
+    "model_name",
+    "identifier",
+    "slug",
+];
+const COUNTER_KEYS: &[&str] = &[
+    "credits",
+    "credits_used",
+    "credit_usage",
+    "total_credits",
+    "uncached_text_input_tokens",
+    "uncached_input_tokens",
+    "input_tokens_uncached",
+    "text_input_tokens_uncached",
+    "cached_text_input_tokens",
+    "cached_input_tokens",
+    "input_tokens_cached",
+    "text_input_tokens_cached",
+    "text_output_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "generated_tokens",
+    "text_total_tokens",
+    "total_tokens",
+    "token_count",
+    "total_token_count",
+    "tokens",
+    "threads",
+    "thread_count",
+    "threads_count",
+    "total_threads",
+    "turns",
+    "turn_count",
+    "turns_count",
+    "total_turns",
+];
+const MAX_UNRECOGNIZED_KEYS: usize = 12;
+const MAX_REPORTED_KEY_CHARS: usize = 40;
+
+fn record_unrecognized_keys(
+    value: &Value,
+    recognized_groups: &[&[&str]],
+    unrecognized: &mut BTreeSet<String>,
+) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in object.keys() {
+        if recognized_groups
+            .iter()
+            .any(|group| group.contains(&key.as_str()))
+        {
+            continue;
+        }
+        let bounded: String = key.chars().take(MAX_REPORTED_KEY_CHARS).collect();
+        unrecognized.insert(bounded);
+        if unrecognized.len() > MAX_UNRECOGNIZED_KEYS {
+            if let Some(last) = unrecognized.iter().next_back().cloned() {
+                unrecognized.remove(&last);
+            }
+        }
     }
 }
 
@@ -1430,6 +1564,23 @@ pub struct NormalizedWindow {
     /// Model identifiers the contract's slug cannot represent. Counted, never
     /// coerced, and never uploaded.
     pub dropped_model_rows: usize,
+    pub days_seen: usize,
+    pub days_recognized: usize,
+    pub days_out_of_window: usize,
+    pub days_no_client_breakdown: usize,
+    pub days_used_fallback: usize,
+    pub days_missing_date: usize,
+    pub clients_seen: usize,
+    pub clients_missing_id: usize,
+    pub clients_no_model_breakdown: usize,
+    pub models_seen: usize,
+    pub models_missing_id: usize,
+    pub entries_empty_counters: usize,
+    /// Structure-only provider shape hints. These sets contain bounded key
+    /// names, never the corresponding values or account identifiers.
+    pub unrecognized_day_keys: BTreeSet<String>,
+    pub unrecognized_client_keys: BTreeSet<String>,
+    pub unrecognized_model_keys: BTreeSet<String>,
 }
 
 /// Normalize a provider payload into contract rows.
@@ -1465,80 +1616,116 @@ pub fn normalize_provider_window(
 
     let mut grouped: BTreeMap<(String, Surface, String), Counters> = BTreeMap::new();
     let mut dropped_model_rows = 0_usize;
-    let mut recognized_days = 0_usize;
+    let mut days_recognized = 0_usize;
+    let days_seen = days.len();
+    let mut days_out_of_window = 0_usize;
+    let mut days_no_client_breakdown = 0_usize;
+    let mut days_used_fallback = 0_usize;
+    let mut days_missing_date = 0_usize;
+    let mut clients_seen = 0_usize;
+    let mut clients_missing_id = 0_usize;
+    let mut clients_no_model_breakdown = 0_usize;
+    let mut models_seen = 0_usize;
+    let mut models_missing_id = 0_usize;
+    let mut entries_empty_counters = 0_usize;
+    let mut unrecognized_day_keys = BTreeSet::new();
+    let mut unrecognized_client_keys = BTreeSet::new();
+    let mut unrecognized_model_keys = BTreeSet::new();
 
     for day in days {
-        let Some(day_key) = first_string(
+        record_unrecognized_keys(
             day,
-            &["date", "day", "usage_date", "bucket_start", "start_date"],
-        )
-        .and_then(provider_day) else {
+            &[DAY_DATE_KEYS, CLIENT_ARRAY_KEYS, COUNTER_KEYS],
+            &mut unrecognized_day_keys,
+        );
+        let Some(day_key) = first_string(day, DAY_DATE_KEYS).and_then(provider_day) else {
+            days_missing_date += 1;
             continue;
         };
-        recognized_days += 1;
+        days_recognized += 1;
         // A provider day outside the window we asked for is not evidence for
         // this batch; the contract rejects it and so do we.
         if day_key.as_str() < coverage_start || day_key.as_str() > coverage_end {
+            days_out_of_window += 1;
             continue;
         }
-        let Some(clients) = first_array(
-            day,
-            &[
-                "clients",
-                "client_breakdown",
-                "by_client",
-                "per_client",
-                "client_counts",
-                "breakdown",
-            ],
-        ) else {
-            continue;
-        };
-        for client in clients {
-            let Some(client_id) = first_string(client, &["client_id", "client", "id", "name"])
-            else {
-                continue;
-            };
-            let surface = surface_for_client_id(client_id);
-            let surface_counters = counters_at(client, true);
-            if !surface_counters.is_empty() {
-                grouped
-                    .entry((day_key.clone(), surface, ALL_MODELS.to_string()))
-                    .or_default()
-                    .merge(&surface_counters);
-            }
-            let Some(models) = first_array(
-                client,
-                &["models", "model_breakdown", "by_model", "per_model"],
-            ) else {
-                continue;
-            };
-            for model in models {
-                let Some(raw_model) =
-                    first_string(model, &["model", "model_id", "model_slug", "name"])
-                else {
+        let mut day_emitted_row = false;
+        if let Some(clients) = first_array(day, CLIENT_ARRAY_KEYS) {
+            for client in clients {
+                clients_seen += 1;
+                record_unrecognized_keys(
+                    client,
+                    &[CLIENT_ID_KEYS, MODEL_ARRAY_KEYS, COUNTER_KEYS],
+                    &mut unrecognized_client_keys,
+                );
+                let Some(client_id) = first_string(client, CLIENT_ID_KEYS) else {
+                    clients_missing_id += 1;
                     continue;
                 };
-                let Some(slug) = normalized_model_slug(raw_model) else {
-                    dropped_model_rows += 1;
-                    continue;
-                };
-                // The provider reports 0.0 for per-model credits, which is not
-                // a real attribution. Per-model rows carry tokens, threads and
-                // turns only; the surface row carries the metered credits.
-                let model_counters = counters_at(model, false);
-                if model_counters.is_empty() {
-                    continue;
+                let surface = surface_for_client_id(client_id);
+                let surface_counters = counters_at(client, true);
+                if surface_counters.is_empty() {
+                    entries_empty_counters += 1;
+                } else {
+                    grouped
+                        .entry((day_key.clone(), surface, ALL_MODELS.to_string()))
+                        .or_default()
+                        .merge(&surface_counters);
+                    day_emitted_row = true;
                 }
+                if let Some(models) = first_array(client, MODEL_ARRAY_KEYS) {
+                    for model in models {
+                        models_seen += 1;
+                        record_unrecognized_keys(
+                            model,
+                            &[MODEL_NAME_KEYS, COUNTER_KEYS],
+                            &mut unrecognized_model_keys,
+                        );
+                        let Some(raw_model) = first_string(model, MODEL_NAME_KEYS) else {
+                            models_missing_id += 1;
+                            continue;
+                        };
+                        let Some(slug) = normalized_model_slug(raw_model) else {
+                            dropped_model_rows += 1;
+                            continue;
+                        };
+                        // The provider reports 0.0 for per-model credits, which is not
+                        // a real attribution. Per-model rows carry tokens, threads and
+                        // turns only; the surface row carries the metered credits.
+                        let model_counters = counters_at(model, false);
+                        if model_counters.is_empty() {
+                            entries_empty_counters += 1;
+                            continue;
+                        }
+                        grouped
+                            .entry((day_key.clone(), surface, slug))
+                            .or_default()
+                            .merge(&model_counters);
+                        day_emitted_row = true;
+                    }
+                } else {
+                    clients_no_model_breakdown += 1;
+                }
+            }
+        } else {
+            days_no_client_breakdown += 1;
+        }
+
+        if !day_emitted_row {
+            let day_counters = counters_at(day, true);
+            if day_counters.is_empty() {
+                entries_empty_counters += 1;
+            } else {
                 grouped
-                    .entry((day_key.clone(), surface, slug))
+                    .entry((day_key, Surface::Other, ALL_MODELS.to_string()))
                     .or_default()
-                    .merge(&model_counters);
+                    .merge(&day_counters);
+                days_used_fallback += 1;
             }
         }
     }
 
-    if recognized_days == 0 {
+    if days_recognized == 0 {
         return Err(ProviderReadError::ResponseShape(
             "no recognizable provider day in payload".to_string(),
         ));
@@ -1564,6 +1751,21 @@ pub fn normalize_provider_window(
         rows,
         provider_data_refreshed_at: refreshed_at,
         dropped_model_rows,
+        days_seen,
+        days_recognized,
+        days_out_of_window,
+        days_no_client_breakdown,
+        days_used_fallback,
+        days_missing_date,
+        clients_seen,
+        clients_missing_id,
+        clients_no_model_breakdown,
+        models_seen,
+        models_missing_id,
+        entries_empty_counters,
+        unrecognized_day_keys,
+        unrecognized_client_keys,
+        unrecognized_model_keys,
     })
 }
 
@@ -1906,6 +2108,94 @@ fn warning(code: &str, message: &str) -> AgentStatusDiagnostic {
     AgentStatusDiagnostic::source(code, AgentDiagnosticSeverity::Warning, message)
 }
 
+fn normalization_counter_summary(normalized: &NormalizedWindow) -> String {
+    let mut counters = Vec::new();
+    macro_rules! add_nonzero {
+        ($name:ident) => {
+            if normalized.$name > 0 {
+                counters.push(format!("{}={}", stringify!($name), normalized.$name));
+            }
+        };
+    }
+    add_nonzero!(days_seen);
+    add_nonzero!(days_recognized);
+    add_nonzero!(days_missing_date);
+    add_nonzero!(days_out_of_window);
+    add_nonzero!(days_no_client_breakdown);
+    add_nonzero!(days_used_fallback);
+    add_nonzero!(clients_seen);
+    add_nonzero!(clients_missing_id);
+    add_nonzero!(clients_no_model_breakdown);
+    add_nonzero!(models_seen);
+    add_nonzero!(models_missing_id);
+    add_nonzero!(entries_empty_counters);
+    add_nonzero!(dropped_model_rows);
+    counters.join(", ")
+}
+
+fn has_normalization_accounting_events(normalized: &NormalizedWindow) -> bool {
+    normalized.days_missing_date > 0
+        || normalized.days_out_of_window > 0
+        || normalized.days_no_client_breakdown > 0
+        || normalized.days_used_fallback > 0
+        || normalized.clients_missing_id > 0
+        || normalized.clients_no_model_breakdown > 0
+        || normalized.models_missing_id > 0
+        || normalized.entries_empty_counters > 0
+}
+
+fn format_unrecognized_keys(keys: &BTreeSet<String>) -> String {
+    format!(
+        "[{}]",
+        keys.iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn append_normalization_diagnostics(
+    normalized: &NormalizedWindow,
+    diagnostics: &mut Vec<AgentStatusDiagnostic>,
+) {
+    if has_normalization_accounting_events(normalized) {
+        diagnostics.push(info(
+            "codex_daily_aggregates_normalization_accounting",
+            &format!(
+                "Provider normalization accounting: {}.",
+                normalization_counter_summary(normalized)
+            ),
+        ));
+    }
+    for (code, level, keys) in [
+        (
+            "codex_daily_aggregates_unrecognized_day_keys",
+            "day",
+            &normalized.unrecognized_day_keys,
+        ),
+        (
+            "codex_daily_aggregates_unrecognized_client_keys",
+            "client",
+            &normalized.unrecognized_client_keys,
+        ),
+        (
+            "codex_daily_aggregates_unrecognized_model_keys",
+            "model",
+            &normalized.unrecognized_model_keys,
+        ),
+    ] {
+        if !keys.is_empty() {
+            diagnostics.push(info(
+                code,
+                &format!(
+                    "Unrecognized {level}-level keys: {}.",
+                    format_unrecognized_keys(keys)
+                ),
+            ));
+        }
+    }
+}
+
 /// Consent, cadence state, and the off-switch for one installation.
 #[derive(Debug, Clone)]
 pub struct Collector {
@@ -2103,6 +2393,16 @@ fn collect_once(
             ),
         ));
     }
+    if normalized_row_count == 0 {
+        diagnostics.push(info(
+            "codex_daily_aggregates_zero_rows_explained",
+            &format!(
+                "The provider request succeeded but normalized zero rows; stage accounting: {}.",
+                normalization_counter_summary(&normalized)
+            ),
+        ));
+    }
+    append_normalization_diagnostics(&normalized, &mut diagnostics);
 
     let batches = match pack_batches(normalized.rows, &window_start, &window_end) {
         Ok(batches) => batches,
@@ -3334,6 +3634,154 @@ mod tests {
             normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
         assert_eq!(normalized.rows.len(), 1);
         assert_eq!(normalized.rows[0].provider_day, "2026-07-26");
+        assert_eq!(normalized.days_seen, 5);
+        assert_eq!(normalized.days_recognized, 2);
+        assert_eq!(normalized.days_out_of_window, 1);
+        assert_eq!(normalized.days_missing_date, 3);
+    }
+
+    #[test]
+    fn day_totals_without_a_client_breakdown_use_the_other_surface_fallback() {
+        let payload = json!({
+            "results": [{
+                "timestamp": "2026-07-26T00:00:00Z",
+                "credits_used": 2.5,
+                "total_token_count": 42,
+                "threads_count": 3,
+                "turns_count": 7
+            }]
+        });
+
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+
+        assert_eq!(normalized.rows.len(), 1);
+        let row = &normalized.rows[0];
+        assert_eq!(row.provider_day, "2026-07-26");
+        assert_eq!(row.surface, "other");
+        assert_eq!(row.model, ALL_MODELS);
+        assert_eq!(row.credits_used.as_deref(), Some("2.500000"));
+        assert_eq!(row.total_tokens, Some(42));
+        assert_eq!(row.thread_count, Some(3));
+        assert_eq!(row.turn_count, Some(7));
+        assert_eq!(normalized.days_no_client_breakdown, 1);
+        assert_eq!(normalized.days_used_fallback, 1);
+    }
+
+    #[test]
+    fn entirely_out_of_window_days_have_an_explaining_diagnostic() {
+        let payload = json!({
+            "results": [
+                {"date": "2020-01-01", "total_tokens": 5},
+                {"date": "2020-01-02", "total_tokens": 7}
+            ]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+
+        assert!(normalized.rows.is_empty());
+        assert_eq!(normalized.days_out_of_window, 2);
+        let accounting = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_normalization_accounting")
+            .expect("normalization accounting diagnostic");
+        assert!(accounting.message.contains("days_out_of_window=2"));
+    }
+
+    #[test]
+    fn a_client_without_an_id_is_counted_and_reported() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "clients": [{"total_tokens": 9}]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+
+        assert_eq!(normalized.clients_seen, 1);
+        assert_eq!(normalized.clients_missing_id, 1);
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("clients_missing_id=1")));
+    }
+
+    #[test]
+    fn widened_shape_aliases_are_normalized() {
+        let payload = json!({
+            "results": [{
+                "period_start": "2026-07-26",
+                "surfaces": [{
+                    "surface": "CODEX_WEB",
+                    "model_list": [{
+                        "model_name": "GPT-5-Codex",
+                        "total_token_count": 17
+                    }]
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+
+        let row = row_at(&normalized.rows, "2026-07-26", "codex_web", "gpt-5-codex")
+            .expect("aliased model row");
+        assert_eq!(row.total_tokens, Some(17));
+    }
+
+    #[test]
+    fn shape_diagnostics_report_only_bounded_key_names() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "future_day_field": "secret-day-value",
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "total_tokens": 3,
+                    "future_client_field": "secret-client-value",
+                    "models": [{
+                        "model": "gpt-5-codex",
+                        "total_tokens": 3,
+                        "future_model_field": "secret-model-value"
+                    }]
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(messages.contains("future_day_field"));
+        assert!(messages.contains("future_client_field"));
+        assert!(messages.contains("future_model_field"));
+        for secret in [
+            "secret-day-value",
+            "secret-client-value",
+            "secret-model-value",
+            "CODEX_WEB",
+            "gpt-5-codex",
+        ] {
+            assert!(!messages.contains(secret), "diagnostic leaked {secret}");
+        }
+        for keys in [
+            &normalized.unrecognized_day_keys,
+            &normalized.unrecognized_client_keys,
+            &normalized.unrecognized_model_keys,
+        ] {
+            assert!(keys.len() <= MAX_UNRECOGNIZED_KEYS);
+            assert!(keys
+                .iter()
+                .all(|key| key.chars().count() <= MAX_REPORTED_KEY_CHARS));
+        }
     }
 
     #[test]
@@ -4265,14 +4713,18 @@ mod tests {
 
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(0));
-        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(cycle.diagnostics.len(), 3);
+        let zero_rows = diagnostic(&cycle, "codex_daily_aggregates_zero_rows_explained");
+        assert!(zero_rows.message.contains("days_seen=1"));
+        assert!(zero_rows.message.contains("days_recognized=1"));
+        assert!(zero_rows.message.contains("entries_empty_counters=1"));
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_empty").severity,
             AgentDiagnosticSeverity::Info
         );
         assert_eq!(
             cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=1"
+            "codex_daily_aggregates_collector outcome=Uploaded rows=0 diagnostics=3"
         );
 
         let state = collector.state.load(&state_identity(&grant, false));
@@ -4302,14 +4754,19 @@ mod tests {
 
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
         assert_eq!(cycle.normalized_row_count, Some(1));
-        assert_eq!(cycle.diagnostics.len(), 1);
+        assert_eq!(cycle.diagnostics.len(), 2);
+        assert!(
+            diagnostic(&cycle, "codex_daily_aggregates_normalization_accounting")
+                .message
+                .contains("clients_no_model_breakdown=1")
+        );
         assert_eq!(
             diagnostic(&cycle, "codex_daily_aggregates_window_collected").severity,
             AgentDiagnosticSeverity::Info
         );
         assert_eq!(
             cycle_summary_log(&cycle),
-            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=1"
+            "codex_daily_aggregates_collector outcome=Uploaded rows=1 diagnostics=2"
         );
 
         let state = collector.state.load(&state_identity(&grant, false));
