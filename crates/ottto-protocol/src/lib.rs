@@ -2464,6 +2464,62 @@ pub struct ClaudeConfigSlotDescriptorV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<String>,
     pub service_name: String,
+    /// Collector-owned verification state for this exact slot. This is only
+    /// returned over authenticated local control; it is never copied into an
+    /// agent-status backend payload.
+    #[serde(default)]
+    pub collection: ClaudeConfigSlotCollectionStatusV1,
+}
+
+/// Safe local result of the most recent normal quota-collection attempt for a
+/// registered Claude credential slot. Setup/login lifecycle phases are owned
+/// by a later contract; this state only says whether Slice B could prove and
+/// read the already-registered slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotCollectionStatusV1 {
+    #[serde(default)]
+    pub state: ClaudeConfigSlotCollectionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default)]
+    pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotCollectionStateV1 {
+    #[default]
+    Unverified,
+    Fresh,
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+    ProviderUnavailable,
+    DuplicateAccount,
+    CapacityExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotDiagnosticV1 {
+    pub code: ClaudeConfigSlotDiagnosticCodeV1,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotDiagnosticCodeV1 {
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+    ProviderUnavailable,
+    DuplicateAccount,
+    CapacityExceeded,
 }
 
 /// Safe evidence for an account that cannot yet be associated with a config
@@ -3242,6 +3298,35 @@ mod tests {
             request["client_kind"] = serde_json::json!("companion_app");
             serde_json::from_value::<LocalControlRequest>(request).expect("account mutation");
         }
+    }
+
+    #[test]
+    fn claude_slot_collection_status_is_typed_and_backward_compatible() {
+        let legacy: ClaudeConfigSlotDescriptorV1 = serde_json::from_value(serde_json::json!({
+            "slot_id": "default",
+            "ownership": "external",
+            "service_name": "Claude Code-credentials"
+        }))
+        .expect("legacy descriptor without collection state");
+        assert_eq!(
+            legacy.collection.state,
+            ClaudeConfigSlotCollectionStateV1::Unverified
+        );
+
+        let value = serde_json::to_value(ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+            observed_at: Some("2026-08-04T12:00:00Z".to_string()),
+            diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+                code: ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
+                message: "Exact-slot identity did not agree.".to_string(),
+            }],
+            ..Default::default()
+        })
+        .expect("serialize typed collection state");
+        assert_eq!(value["state"], "identity_mismatch");
+        assert_eq!(value["diagnostics"][0]["code"], "identity_mismatch");
+        assert!(value.get("account_identifier_hash").is_none());
+        assert!(value.get("organization_identifier_hash").is_none());
     }
 
     #[test]

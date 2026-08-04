@@ -895,6 +895,7 @@ fn load_claude_config_slot_settings(
     FileClaudeConfigSlotSettingsStore::default()
         .load()
         .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
 fn set_claude_account_upkeep_consent(
@@ -904,6 +905,7 @@ fn set_claude_account_upkeep_consent(
     FileClaudeConfigSlotSettingsStore::default()
         .set_upkeep_consent(schema_version, consent)
         .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
 fn remove_claude_account(
@@ -913,6 +915,7 @@ fn remove_claude_account(
     FileClaudeConfigSlotSettingsStore::default()
         .remove(schema_version, slot_id)
         .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
 fn register_claude_account_path(
@@ -922,6 +925,7 @@ fn register_claude_account_path(
     FileClaudeConfigSlotSettingsStore::default()
         .register_path(schema_version, config_dir)
         .map_err(claude_config_slot_settings_error)
+        .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
 fn claude_config_slot_settings_error(error: ClaudeConfigSlotSettingsError) -> LocalApiError {
