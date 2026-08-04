@@ -10,8 +10,9 @@
 use anyhow::Result;
 use ottto_protocol::{
     ClaudeAccountCapacityV1, ClaudeAccountSetupOperationState, ClaudeAccountSetupOperationV1,
-    ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1, ClaudeConfigSlotDescriptorV1,
-    ClaudeConfigSlotOwnership, CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+    ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1, ClaudeConfigSlotCollectionStatusV1,
+    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotOwnership,
+    CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,6 +104,7 @@ impl ClaudeConfigDirSlot {
             ownership,
             config_dir: self.config_dir().map(ToString::to_string),
             service_name: self.service_name(),
+            collection: ClaudeConfigSlotCollectionStatusV1::default(),
         }
     }
 }

@@ -1103,15 +1103,23 @@ impl LocalDaemon {
             Some(source) => vec![source],
             None => vec![SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi],
         };
-        let snapshots = sources
+        let collections = sources
             .iter()
             .map(|source| {
-                agent_status::collect_agent_status(source, captured_at.clone(), expires_at.clone())
+                agent_status::collect_agent_status_collection(
+                    source,
+                    captured_at.clone(),
+                    expires_at.clone(),
+                )
             })
             .collect::<Vec<_>>();
+        let snapshots = collections
+            .iter()
+            .flat_map(|collection| collection.snapshots.iter().cloned())
+            .collect::<Vec<_>>();
         let mut state = self.state()?;
-        for snapshot in snapshots.iter().cloned() {
-            upsert_agent_status_snapshot(&mut state, snapshot);
+        for collection in collections {
+            upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot);
         }
         Ok(snapshots)
     }
@@ -1147,12 +1155,20 @@ impl LocalDaemon {
         if verifying.is_empty() {
             return Ok(0);
         }
-        let snapshots = verifying
+        let collections = verifying
             .iter()
             .map(|source| {
-                agent_status::collect_agent_status(source, captured_at.clone(), expires_at.clone())
+                agent_status::collect_agent_status_collection(
+                    source,
+                    captured_at.clone(),
+                    expires_at.clone(),
+                )
             })
             .collect::<Vec<_>>();
+        let snapshots = collections
+            .into_iter()
+            .map(|collection| collection.source_health_snapshot)
+            .collect();
         let mut state = self.state()?;
         Ok(apply_verifying_reconfirm(&mut state, snapshots))
     }

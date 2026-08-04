@@ -1,5 +1,5 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
-use crate::agent_status::collect_agent_status;
+use crate::agent_status::{collect_agent_status_collection, AgentStatusCollection};
 use crate::backfill::{
     apply_backfill_cutoff, current_historical_replay, load_backfill_state,
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
@@ -1550,12 +1550,18 @@ fn sync_source(
     let agent_status_captured_at = current_rfc3339();
     let agent_status_expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
         .unwrap_or_else(|| agent_status_captured_at.clone());
-    let scan_agent_status = collect_agent_status(
+    let scan_agent_status_collection = collect_agent_status_collection(
         &source_kind(source),
         agent_status_captured_at,
         agent_status_expires_at,
     );
-    if let Err(error) = upload_agent_status(client, &relay_token, machine_id, &scan_agent_status) {
+    let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
+    if let Err(error) = upload_agent_status(
+        client,
+        &relay_token,
+        machine_id,
+        &scan_agent_status_collection.snapshots,
+    ) {
         // Best-effort for the sync itself, but not for outage tracking: a
         // persistent transport-only failure here must still feed the streak
         // instead of being swallowed with the log line.
@@ -1582,7 +1588,7 @@ fn sync_source(
             support_dir,
             source,
             &[],
-            Some(&scan_agent_status),
+            Some(scan_agent_status),
             &scan_started_at,
         );
         report_status(
@@ -1825,7 +1831,7 @@ fn sync_source(
         support_dir,
         source,
         &scan_result.snapshots,
-        Some(&scan_agent_status),
+        Some(scan_agent_status),
         &scan_started_at,
     )
     .is_err()
@@ -2206,6 +2212,10 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+fn reconciliation_agent_status(collection: &AgentStatusCollection) -> &AgentStatusSnapshot {
+    &collection.source_health_snapshot
 }
 
 fn claude_evidence_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
@@ -2672,11 +2682,18 @@ fn upload_agent_status(
     client: &SnapshotApiClient,
     relay_token: &str,
     machine_id: &str,
-    snapshot: &AgentStatusSnapshot,
+    snapshots: &[AgentStatusSnapshot],
 ) -> Result<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
     let request = AgentStatusSnapshotUploadRequest {
         machine_id: machine_id.to_string(),
-        snapshots: vec![snapshot.clone().redacted_for_backend()],
+        snapshots: snapshots
+            .iter()
+            .cloned()
+            .map(AgentStatusSnapshot::redacted_for_backend)
+            .collect(),
     };
     let response = client.upload_agent_status(relay_token, &request)?;
     persist_machine_icon(&response);
@@ -3281,7 +3298,8 @@ mod tests {
         OTTTO_SECRET_FALLBACK_DIR_ENV, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
     };
     use ottto_protocol::{
-        AgentStatusCollectionMethod, AgentStatusState, MachineIdentity, OperatingSystem,
+        AgentAccountStatus, AgentLoginState, AgentStatusCollectionMethod, AgentStatusConfidence,
+        AgentStatusState, MachineIdentity, OperatingSystem,
     };
     use serial_test::serial;
     use std::io::{Read, Write};
@@ -5482,6 +5500,85 @@ mod tests {
     }
 
     #[test]
+    fn per_source_agent_status_upload_batches_two_claude_accounts() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_server = captured.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind agent status batch backend");
+        let address = listener.local_addr().expect("local address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept agent status batch");
+            let request = read_complete_http_request(&mut stream);
+            captured_server
+                .lock()
+                .expect("capture agent status batch")
+                .push(request);
+            let body = r#"{"accepted":2,"machine_id":"otm_test","sources":["claude_code"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write agent status batch response");
+        });
+        let client = SnapshotApiClient::new(format!("http://{address}"));
+        let mut first = test_agent_status(SourceKind::ClaudeCode);
+        first.account = Some(test_agent_account("account-hash-a", "organization-hash-a"));
+        let mut second = test_agent_status(SourceKind::ClaudeCode);
+        second.account = Some(test_agent_account("account-hash-b", "organization-hash-b"));
+
+        upload_agent_status(&client, "relay-token-claude", "otm_test", &[first, second])
+            .expect("upload two-account batch");
+
+        let requests = captured.lock().expect("captured batch requests");
+        assert_eq!(requests.len(), 1);
+        let body = requests[0].split("\r\n\r\n").nth(1).expect("request body");
+        let request: serde_json::Value = serde_json::from_str(body).expect("parse request body");
+        let snapshots = request["snapshots"].as_array().expect("snapshot batch");
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot["source"] == "claude_code"));
+        assert_eq!(snapshots[0]["captured_at"], snapshots[1]["captured_at"]);
+        assert_ne!(
+            snapshots[0]["account"]["account_identifier_hash"],
+            snapshots[1]["account"]["account_identifier_hash"]
+        );
+    }
+
+    #[test]
+    fn empty_agent_status_upload_is_a_noop_and_reconciliation_keeps_default_owner() {
+        let client = SnapshotApiClient::new("http://127.0.0.1:1".to_string());
+        upload_agent_status(&client, "unused", "otm_test", &[])
+            .expect("empty upload must not touch the network or abort scanning");
+
+        let mut default_health = test_agent_status(SourceKind::ClaudeCode);
+        default_health.account = Some(test_agent_account(
+            "default-account-hash",
+            "default-organization-hash",
+        ));
+        let mut custom_upload = test_agent_status(SourceKind::ClaudeCode);
+        custom_upload.account = Some(test_agent_account(
+            "custom-account-hash",
+            "custom-organization-hash",
+        ));
+        let collection = AgentStatusCollection {
+            snapshots: vec![custom_upload],
+            source_health_snapshot: default_health,
+        };
+
+        let reconciliation = reconciliation_agent_status(&collection);
+        assert_eq!(
+            reconciliation
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.as_deref()),
+            Some("default-account-hash"),
+            "a custom upload row must never become default-session ownership evidence"
+        );
+    }
+
+    #[test]
     #[serial]
     fn manual_agent_status_upload_attempts_remaining_sources_after_failure() {
         let root = test_dir("manual-agent-status-partial-failure");
@@ -6121,6 +6218,30 @@ mod tests {
             plan_observations: Vec::new(),
             diagnostics: Vec::new(),
             runtime_defaults: None,
+        }
+    }
+
+    fn test_agent_account(account_hash: &str, organization_hash: &str) -> AgentAccountStatus {
+        AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            provider: Some("anthropic".to_string()),
+            auth_method: Some("oauth".to_string()),
+            email: None,
+            account_id: None,
+            organization_id: None,
+            organization_label: None,
+            plan_type: Some("max".to_string()),
+            subscription_product: Some("claude_max".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            subscription_period_start: None,
+            subscription_period_end: None,
+            subscription_period_last_checked_at: None,
+            account_identifier_hash: Some(account_hash.to_string()),
+            organization_identifier_hash: Some(organization_hash.to_string()),
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("provider_account_id".to_string()),
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::High,
         }
     }
 

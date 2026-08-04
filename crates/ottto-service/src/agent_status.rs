@@ -1,10 +1,13 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(test)]
+use ottto_core::claude_account_identifier_hash;
 use ottto_core::{
-    billing_identity_hash, claude_account_identifier_hash, compiled_release_version,
-    default_support_dir, read_claude_statusline_cache, read_claude_statusline_context_cache,
+    billing_identity_hash, compiled_release_version, default_support_dir,
+    read_claude_statusline_cache, read_claude_statusline_context_cache,
     read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
     ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
     ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache,
+    FileClaudeConfigSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -13,7 +16,10 @@ use ottto_protocol::{
     AgentLoginState, AgentModelStatus, AgentQuotaWindow, AgentQuotaWindowFreshness,
     AgentQuotaWindowScope, AgentQuotaWindowStatus, AgentRuntimeDefaults,
     AgentStatusCollectionMethod, AgentStatusConfidence, AgentStatusDiagnostic,
-    AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, SourceKind,
+    AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, ClaudeAccountsStatusV1,
+    ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
+    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
+    ClaudeConfigSlotOwnership, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +68,8 @@ const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str = "claude-oauth-usage-network-disabled";
 const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "breaker.json";
 const CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
+const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE: &str = "claude-config-slot-collection-state.json";
+const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION: u16 = 1;
 const CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION: u16 = 1;
 /// How long the breaker stays open once tripped. Long on purpose: an open
 /// breaker means we believe further calls could be unwelcome or useless, and a
@@ -118,33 +126,34 @@ struct CodexUsageProbe {
 struct ClaudeOAuthUsageCache {
     schema_version: u16,
     /// Which Claude account the cached numbers belong to, as the same
-    /// `billing_identity_hash` this collector uses everywhere else. Empty when
-    /// the local account metadata could not name an account at write time.
+    /// `billing_identity_hash` this collector uses everywhere else.
     ///
-    /// This file lives at one machine-global path, but the Claude Code CLI
-    /// credential store holds exactly ONE account: `/login` as a second account
-    /// overwrites the first, and `~/.claude.json` `oauthAccount` switches with
-    /// it. Without this field the cache served whichever account was active at
-    /// write time under whichever account is logged in now -- observed live on
-    /// 2026-07-26, where a personal Max account's weekly window rendered under
-    /// a work Team subscription.
+    /// The physical path is account-keyed, but every read still requires this
+    /// field, the organization hash, and every embedded meter to agree exactly.
     #[serde(default)]
     account_identifier_hash: String,
+    /// Exact organization paired with the account when these meters were
+    /// fetched. Both hashes and every embedded meter must agree on read.
+    #[serde(default)]
+    organization_identifier_hash: String,
     observed_at_epoch_seconds: u64,
     next_refresh_after_epoch_seconds: u64,
     windows: Vec<AgentQuotaWindow>,
     /// Usage-credit balances parsed from the same OAuth usage response.
-    /// `serde(default)` keeps schema-version-2 caches readable if the field is
-    /// absent; version-1 caches are discarded wholesale on read.
+    /// `serde(default)` permits safe parsing of older caches before their
+    /// schema and identity are rejected.
     #[serde(default)]
     credit_balances: Vec<AgentCreditBalance>,
 }
 
-/// v3 adds `account_identifier_hash`. Version-2 caches carry no account
-/// identity at all, so they are discarded wholesale on upgrade rather than
-/// treated as belonging to the account that happens to be logged in now --
-/// the same precedent v1 set.
-const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 3;
+/// v4 adds organization identity and requires exact identity on every embedded
+/// meter. Released v3 account-only caches cannot prove organization ownership
+/// and are discarded rather than relabeled.
+const CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION: u16 = 4;
+const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION: u16 = 3;
+#[cfg(test)]
+static CLAUDE_OAUTH_PROVIDER_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Everything the Claude OAuth usage endpoint yields in one fetch.
 #[derive(Debug, Clone, Default)]
@@ -164,6 +173,99 @@ struct ClaudeOAuthUsage {
 struct ClaudeOAuthUsageOutcome {
     result: Result<ClaudeOAuthUsage, String>,
     diagnostics: Vec<AgentStatusDiagnostic>,
+}
+
+/// One source scan can now produce several Claude account snapshots while
+/// local source health remains one row per source.
+pub(crate) struct AgentStatusCollection {
+    pub snapshots: Vec<AgentStatusSnapshot>,
+    pub source_health_snapshot: AgentStatusSnapshot,
+}
+
+/// A validated exact-slot credential. Deliberately implements neither
+/// `Debug` nor `Serialize`: the access token must stay in memory and never
+/// become diagnostic or persistence material.
+struct ResolvedClaudeSlot {
+    descriptor: ClaudeConfigSlotDescriptorV1,
+    account: AgentAccountStatus,
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+    access_token: Option<String>,
+}
+
+/// One captured credential after display-safe identity stayed unchanged across
+/// an exact-slot auth probe. The token is never debugged, serialized, logged,
+/// persisted, or read a second time during the attempt.
+struct StableClaudeSlotCredential {
+    oauth_account: ClaudeCliOauthAccount,
+    access_token: Option<String>,
+}
+
+struct ClaudeSnapshotCandidate {
+    slot_id: String,
+    account_identifier_hash: String,
+    organization_identifier_hash: Option<String>,
+    rank: u8,
+    snapshot: AgentStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeSlotProbeFailure {
+    IdentityUnknown,
+    CredentialUnavailable,
+    IdentityMismatch,
+    ConcurrentMutation,
+}
+
+impl ClaudeSlotProbeFailure {
+    fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::IdentityUnknown => "claude_slot_identity_unknown",
+            Self::CredentialUnavailable => "claude_slot_credential_unavailable",
+            Self::IdentityMismatch => "claude_slot_identity_mismatch",
+            Self::ConcurrentMutation => "claude_slot_concurrent_mutation",
+        }
+    }
+
+    fn status(&self, observed_at: &str) -> ClaudeConfigSlotCollectionStatusV1 {
+        let (state, code, message) = match self {
+            Self::IdentityUnknown => (
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+                ClaudeConfigSlotDiagnosticCodeV1::IdentityUnknown,
+                "This registered Claude slot has no complete strong local account and organization identity.",
+            ),
+            Self::CredentialUnavailable => (
+                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+                ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
+                "This registered Claude slot has no readable valid Claude Code credential.",
+            ),
+            Self::IdentityMismatch => (
+                ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+                ClaudeConfigSlotDiagnosticCodeV1::IdentityMismatch,
+                "This registered Claude slot's credential status does not match its local account identity.",
+            ),
+            Self::ConcurrentMutation => (
+                ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+                ClaudeConfigSlotDiagnosticCodeV1::ConcurrentMutation,
+                "This registered Claude slot changed during verification; collection will retry from a stable state.",
+            ),
+        };
+        ClaudeConfigSlotCollectionStatusV1 {
+            state,
+            observed_at: Some(observed_at.to_string()),
+            diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+                code,
+                message: message.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedClaudeSlotCollectionStateV1 {
+    schema_version: u16,
+    slots: BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
 }
 
 /// The failure classes that count toward opening the breaker. Everything else
@@ -335,10 +437,37 @@ pub fn collect_agent_status(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusSnapshot {
+    collect_agent_status_collection(source, captured_at, expires_at).source_health_snapshot
+}
+
+pub fn collect_agent_status_snapshots(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+) -> Vec<AgentStatusSnapshot> {
+    collect_agent_status_collection(source, captured_at, expires_at).snapshots
+}
+
+pub(crate) fn collect_agent_status_collection(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+) -> AgentStatusCollection {
     match source {
-        SourceKind::Codex => collect_codex_status(captured_at, expires_at),
-        SourceKind::ClaudeCode => collect_claude_status(captured_at, expires_at),
-        SourceKind::Pi => collect_pi_status(captured_at, expires_at),
+        SourceKind::Codex => {
+            single_agent_status_collection(collect_codex_status(captured_at, expires_at))
+        }
+        SourceKind::ClaudeCode => collect_claude_status_snapshots(captured_at, expires_at),
+        SourceKind::Pi => {
+            single_agent_status_collection(collect_pi_status(captured_at, expires_at))
+        }
+    }
+}
+
+fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusCollection {
+    AgentStatusCollection {
+        snapshots: vec![snapshot.clone()],
+        source_health_snapshot: snapshot,
     }
 }
 
@@ -677,22 +806,48 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         captured_at,
         expires_at,
     );
-    let auth = run_command_capture("claude", &["auth", "status", "--json"], COMMAND_TIMEOUT);
+    let default_slot = ClaudeConfigDirSlot::Default;
+    let claude_oauth_account = read_claude_cli_oauth_account(&claude_cli_config_path());
+    let initial_access_token = read_claude_oauth_access_token_for_slot(&default_slot);
+    let auth = run_claude_slot_command(
+        &default_slot,
+        &["auth", "status", "--json"],
+        COMMAND_TIMEOUT,
+    );
+    let stable_default_credential = stable_claude_slot_credential(
+        claude_oauth_account.clone(),
+        initial_access_token,
+        read_claude_cli_oauth_account(&claude_cli_config_path()),
+    );
     if auth.command_found && auth.success {
         snapshot.collection_method = AgentStatusCollectionMethod::CliJson;
         if let Ok(json) = serde_json::from_str::<Value>(&auth.stdout) {
             let mut account = parse_claude_auth_json(&json);
             let mut refined_seat_plan = None;
             let mut refined_max_plan = None;
-            if let Some(oauth) = read_claude_cli_oauth_account(&claude_cli_config_path()) {
-                // Mutually exclusive by plan_type gate (`team` vs `max`).
-                refined_seat_plan = refine_claude_team_seat_plan(&mut account, &oauth);
-                refined_max_plan = refine_claude_max_rate_limit_plan(&mut account, &oauth);
-                // Regardless of plan refinement: carry the account uuid onto
-                // the account so the snapshot account section and the plan
-                // observation built from it resolve under the same account
-                // hash the quota windows are stamped with.
-                stamp_claude_cli_account_identity(&mut account, &oauth);
+            match stable_default_credential.as_ref() {
+                Ok(stable) => {
+                    match require_claude_auth_identity_agreement(&account, &stable.oauth_account) {
+                        Ok(()) => {
+                            // Mutually exclusive by plan_type gate (`team` vs `max`).
+                            refined_seat_plan =
+                                refine_claude_team_seat_plan(&mut account, &stable.oauth_account);
+                            refined_max_plan = refine_claude_max_rate_limit_plan(
+                                &mut account,
+                                &stable.oauth_account,
+                            );
+                            // Positive account + organization agreement is required
+                            // before local metadata can stamp full-meter identity.
+                            stamp_claude_cli_account_identity(&mut account, &stable.oauth_account);
+                        }
+                        Err(failure) => snapshot
+                            .diagnostics
+                            .push(default_claude_identity_diagnostic(failure)),
+                    }
+                }
+                Err(failure) => snapshot
+                    .diagnostics
+                    .push(default_claude_identity_diagnostic(*failure)),
             }
             snapshot.account = Some(account);
             snapshot.status = AgentStatusState::Available;
@@ -714,6 +869,13 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                     ),
                 ));
             }
+        } else {
+            snapshot.account = Some(unsupported_account("anthropic"));
+            snapshot
+                .diagnostics
+                .push(default_claude_identity_diagnostic(
+                    ClaudeSlotProbeFailure::CredentialUnavailable,
+                ));
         }
     } else {
         snapshot.account = Some(unsupported_account("anthropic"));
@@ -747,15 +909,21 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
     // The same resolution also scopes the OAuth usage read and stamps its
     // served windows, so cache scope, statusLine gate, and wire identity can
     // never disagree.
-    let claude_oauth_account = read_claude_cli_oauth_account(&claude_cli_config_path());
-    let claude_account_identifier_hash = claude_oauth_account
+    let strong_oauth_identity = match (
+        stable_default_credential.as_ref().ok(),
+        snapshot.account.as_ref(),
+    ) {
+        (Some(stable), Some(account))
+            if require_claude_auth_identity_agreement(account, &stable.oauth_account).is_ok() =>
+        {
+            claude_strong_oauth_identity_hashes(&stable.oauth_account)
+        }
+        _ => None,
+    };
+    let claude_account_identifier_hash = strong_oauth_identity
         .as_ref()
-        .map(claude_oauth_account_identifier_hash_for)
+        .map(|(account_hash, _)| account_hash.clone())
         .unwrap_or_default();
-    let claude_organization_identifier_hash = claude_oauth_account
-        .as_ref()
-        .and_then(|account| account.organization_uuid.as_deref())
-        .and_then(|uuid| billing_identity_hash("anthropic", "organization", uuid));
     let desktop_plan_observations =
         claude_desktop_plan_observations_from_root(&claude_desktop_root, &snapshot.captured_at);
     let observable_account_identifier_hashes =
@@ -800,10 +968,42 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 }
             }
         };
-    let oauth_outcome = collect_claude_oauth_usage(
-        &claude_account_identifier_hash,
-        claude_organization_identifier_hash.as_deref(),
-    );
+    if let (Some(stable), Some((account_hash, organization_hash)), Some(account)) = (
+        stable_default_credential.as_ref().ok(),
+        strong_oauth_identity.as_ref(),
+        snapshot.account.as_mut(),
+    ) {
+        account.account_identifier_hash = Some(account_hash.clone());
+        account.organization_identifier_hash = Some(organization_hash.clone());
+        if account.account_id.is_none() {
+            account.account_id = stable.oauth_account.account_uuid.clone();
+        }
+        if account.organization_id.is_none() {
+            account.organization_id = stable.oauth_account.organization_uuid.clone();
+        }
+        account.billing_identity_evidence = billing_identity_evidence_for(
+            &account.account_identifier_hash,
+            &account.organization_identifier_hash,
+            &account.credential_fingerprint_hash,
+        );
+    }
+    let oauth_outcome = match (
+        strong_oauth_identity,
+        stable_default_credential.as_ref().ok(),
+    ) {
+        (Some((account_hash, organization_hash)), Some(stable)) => {
+            collect_claude_oauth_usage_with_access_token(
+                &account_hash,
+                &organization_hash,
+                stable.access_token.clone(),
+                true,
+            )
+        }
+        _ => ClaudeOAuthUsageOutcome::from(Err(
+            "Claude OAuth usage requires strong matching local account and organization identity."
+                .to_string(),
+        )),
+    };
     // Pushed before the quota branch below so the reason the endpoint was or
     // was not called rides the snapshot regardless of which source ends up
     // serving quota. These diagnostics are the alert channel for the circuit
@@ -927,6 +1127,591 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
         ));
     }
     snapshot
+}
+
+fn collect_claude_status_snapshots(
+    captured_at: String,
+    expires_at: String,
+) -> AgentStatusCollection {
+    let default_snapshot = collect_claude_status(captured_at.clone(), expires_at.clone());
+    let mut candidates = Vec::new();
+    let settings = FileClaudeConfigSlotSettingsStore::default().load();
+    let mut descriptors = settings
+        .as_ref()
+        .map(ordered_claude_slot_descriptors)
+        .unwrap_or_else(|_| {
+            vec![ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External)]
+        });
+    if descriptors.is_empty() {
+        descriptors.push(
+            ClaudeConfigDirSlot::Default.descriptor("default", ClaudeConfigSlotOwnership::External),
+        );
+    }
+
+    let mut slot_states = BTreeMap::new();
+    let default_state = claude_default_slot_collection_status(&default_snapshot);
+    slot_states.insert("default".to_string(), default_state.clone());
+    if let Some(rank) = claude_snapshot_candidate_rank(&default_snapshot) {
+        if let Some(account_identifier_hash) = default_snapshot
+            .account
+            .as_ref()
+            .and_then(|account| account.account_identifier_hash.clone())
+            .or_else(|| {
+                default_snapshot
+                    .quota_windows
+                    .first()
+                    .and_then(|window| window.account_identifier_hash.clone())
+            })
+        {
+            candidates.push(ClaudeSnapshotCandidate {
+                slot_id: "default".to_string(),
+                account_identifier_hash,
+                organization_identifier_hash: default_snapshot
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.organization_identifier_hash.clone()),
+                rank,
+                snapshot: default_snapshot.clone(),
+            });
+        }
+    }
+
+    let mut custom_descriptors = descriptors
+        .into_iter()
+        .filter(|descriptor| descriptor.slot_id != "default")
+        .collect::<Vec<_>>();
+    custom_descriptors.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
+    let (custom_descriptors, overflow_descriptors) =
+        bounded_claude_custom_descriptors(custom_descriptors);
+    for descriptor in overflow_descriptors {
+        slot_states.insert(descriptor.slot_id, capacity_exceeded_status(&captured_at));
+    }
+    for descriptor in custom_descriptors {
+        let mut resolved = match resolve_registered_claude_slot(descriptor.clone()) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                slot_states.insert(descriptor.slot_id, failure.status(&captured_at));
+                continue;
+            }
+        };
+        let slot_id = resolved.descriptor.slot_id.clone();
+        let account_hash = resolved.account_identifier_hash.clone();
+        let organization_hash = resolved.organization_identifier_hash.clone();
+        let access_token = std::mem::take(&mut resolved.access_token);
+        let credential_available = access_token.is_some();
+        let outcome = collect_claude_oauth_usage_with_access_token(
+            &account_hash,
+            &organization_hash,
+            access_token,
+            false,
+        );
+        match custom_claude_snapshot_from_usage(
+            resolved,
+            outcome,
+            credential_available,
+            captured_at.clone(),
+            expires_at.clone(),
+        ) {
+            Ok((snapshot, state)) => {
+                let rank = claude_snapshot_candidate_rank(&snapshot)
+                    .expect("validated custom full-meter snapshot is rankable");
+                candidates.push(ClaudeSnapshotCandidate {
+                    slot_id: slot_id.clone(),
+                    account_identifier_hash: account_hash,
+                    organization_identifier_hash: Some(organization_hash),
+                    rank,
+                    snapshot,
+                });
+                slot_states.insert(slot_id, state);
+            }
+            Err(state) => {
+                slot_states.insert(slot_id, state);
+            }
+        }
+    }
+    let mut best_by_account = BTreeMap::<String, usize>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        match best_by_account.get(&candidate.account_identifier_hash) {
+            Some(previous) if candidates[*previous].rank >= candidate.rank => {}
+            _ => {
+                best_by_account.insert(candidate.account_identifier_hash.clone(), index);
+            }
+        }
+    }
+    let winners = best_by_account.values().copied().collect::<BTreeSet<_>>();
+    let mut snapshots = Vec::with_capacity(winners.len());
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if winners.contains(&index) {
+            snapshots.push(candidate.snapshot);
+        } else {
+            slot_states.insert(
+                candidate.slot_id,
+                duplicate_account_status(
+                    &captured_at,
+                    &candidate.account_identifier_hash,
+                    candidate.organization_identifier_hash.as_deref(),
+                ),
+            );
+        }
+    }
+    let _ = persist_claude_slot_collection_states(&slot_states);
+
+    let mut source_health_snapshot = default_snapshot.clone();
+    let mut custom_slot_states = slot_states
+        .iter()
+        .filter(|(slot_id, _)| slot_id.as_str() != "default")
+        .map(|(_, status)| status);
+    let has_healthy_custom_account = custom_slot_states
+        .clone()
+        .any(|status| status.state == ClaudeConfigSlotCollectionStateV1::Fresh);
+    let has_actionable_custom_slot = custom_slot_states.any(|status| {
+        !matches!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::Fresh
+                | ClaudeConfigSlotCollectionStateV1::Unverified
+        )
+    });
+    let default_has_full_meter_evidence = default_snapshot
+        .quota_windows
+        .iter()
+        .any(|window| window.organization_identifier_hash.is_some())
+        || !default_snapshot.credit_balances.is_empty();
+    let default_full_meter_needs_attention = default_has_full_meter_evidence
+        && default_state.state != ClaudeConfigSlotCollectionStateV1::Fresh;
+    if has_actionable_custom_slot || default_full_meter_needs_attention {
+        source_health_snapshot.status = AgentStatusState::Degraded;
+        source_health_snapshot
+            .diagnostics
+            .push(AgentStatusDiagnostic::source(
+                "claude_registered_slot_needs_attention",
+                AgentDiagnosticSeverity::Warning,
+                "One or more registered Claude account slots need local attention; healthy accounts continue collecting independently.",
+            ));
+    } else if has_healthy_custom_account {
+        source_health_snapshot.status = AgentStatusState::Available;
+    }
+
+    AgentStatusCollection {
+        snapshots,
+        source_health_snapshot,
+    }
+}
+
+#[cfg(test)]
+fn claude_default_snapshot_is_uploadable(snapshot: &AgentStatusSnapshot) -> bool {
+    claude_snapshot_candidate_rank(snapshot).is_some()
+}
+
+fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> {
+    if snapshot.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == ClaudeSlotProbeFailure::ConcurrentMutation.diagnostic_code()
+    }) {
+        return None;
+    }
+    if let Some((account_hash, organization_hash)) = snapshot.account.as_ref().and_then(|account| {
+        Some((
+            account.account_identifier_hash.as_deref()?,
+            account.organization_identifier_hash.as_deref()?,
+        ))
+    }) {
+        let full_oauth_meters = !snapshot.quota_windows.is_empty()
+            && snapshot.quota_windows.iter().all(|window| {
+                window.account_identifier_hash.as_deref() == Some(account_hash)
+                    && window.organization_identifier_hash.as_deref() == Some(organization_hash)
+            })
+            && snapshot.credit_balances.iter().all(|balance| {
+                balance.account_identifier_hash.as_deref() == Some(account_hash)
+                    && balance.organization_identifier_hash.as_deref() == Some(organization_hash)
+            });
+        if full_oauth_meters {
+            let fresh = snapshot
+                .quota_windows
+                .iter()
+                .all(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)
+                && snapshot
+                    .credit_balances
+                    .iter()
+                    .all(|balance| balance.freshness == AgentQuotaWindowFreshness::Fresh);
+            return Some(if fresh { 3 } else { 2 });
+        }
+    }
+    if snapshot.collection_method != AgentStatusCollectionMethod::StatusLine
+        || !snapshot.credit_balances.is_empty()
+        || snapshot.quota_windows.is_empty()
+    {
+        return None;
+    }
+    let attributed_account = snapshot.quota_windows[0]
+        .account_identifier_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty());
+    let attributed_account = attributed_account?;
+    snapshot
+        .quota_windows
+        .iter()
+        .all(|window| {
+            window.account_identifier_hash.as_deref() == Some(attributed_account)
+                && window.organization_identifier_hash.is_none()
+        })
+        .then_some(1)
+}
+
+fn bounded_claude_custom_descriptors(
+    mut descriptors: Vec<ClaudeConfigSlotDescriptorV1>,
+) -> (
+    Vec<ClaudeConfigSlotDescriptorV1>,
+    Vec<ClaudeConfigSlotDescriptorV1>,
+) {
+    let overflow = descriptors.split_off(
+        descriptors
+            .len()
+            .min(MAX_CLAUDE_ACCOUNT_SLOTS.saturating_sub(1)),
+    );
+    (descriptors, overflow)
+}
+
+fn ordered_claude_slot_descriptors(
+    status: &ClaudeAccountsStatusV1,
+) -> Vec<ClaudeConfigSlotDescriptorV1> {
+    let mut custom = status
+        .managed_slots
+        .iter()
+        .chain(status.external_slots.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    custom.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
+    let mut descriptors = Vec::with_capacity(1 + custom.len());
+    descriptors.push(status.default_slot.clone());
+    descriptors.extend(custom);
+    descriptors
+}
+
+fn resolve_registered_claude_slot(
+    descriptor: ClaudeConfigSlotDescriptorV1,
+) -> Result<ResolvedClaudeSlot, ClaudeSlotProbeFailure> {
+    let config_dir = descriptor
+        .config_dir
+        .as_ref()
+        .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
+    let slot = ClaudeConfigDirSlot::registered(config_dir.clone())
+        .map_err(|_| ClaudeSlotProbeFailure::IdentityUnknown)?;
+    let initial_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
+    let initial_access_token = read_claude_oauth_access_token_for_slot(&slot);
+    let auth = run_claude_slot_command(&slot, &["auth", "status", "--json"], COMMAND_TIMEOUT);
+    let final_oauth_account = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()));
+    if !auth.command_found || !auth.success {
+        return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
+    }
+    let stable = stable_claude_slot_credential(
+        initial_oauth_account,
+        initial_access_token,
+        final_oauth_account,
+    )?;
+    let auth_json = serde_json::from_str::<Value>(&auth.stdout)
+        .map_err(|_| ClaudeSlotProbeFailure::IdentityMismatch)?;
+    let mut account = parse_claude_auth_json(&auth_json);
+    if account.login_state != AgentLoginState::SignedIn {
+        return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
+    }
+    require_claude_auth_identity_agreement(&account, &stable.oauth_account)?;
+    let (account_identifier_hash, organization_identifier_hash) =
+        claude_strong_oauth_identity_hashes(&stable.oauth_account)
+            .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
+    if !stamp_claude_cli_account_identity(&mut account, &stable.oauth_account) {
+        return Err(ClaudeSlotProbeFailure::IdentityMismatch);
+    }
+    account.account_identifier_hash = Some(account_identifier_hash.clone());
+    account.organization_identifier_hash = Some(organization_identifier_hash.clone());
+    account.billing_identity_evidence = billing_identity_evidence_for(
+        &account.account_identifier_hash,
+        &account.organization_identifier_hash,
+        &account.credential_fingerprint_hash,
+    );
+    Ok(ResolvedClaudeSlot {
+        descriptor,
+        account,
+        account_identifier_hash,
+        organization_identifier_hash,
+        access_token: stable.access_token,
+    })
+}
+
+fn custom_claude_snapshot_from_usage(
+    resolved: ResolvedClaudeSlot,
+    outcome: ClaudeOAuthUsageOutcome,
+    credential_available: bool,
+    captured_at: String,
+    expires_at: String,
+) -> Result<
+    (AgentStatusSnapshot, ClaudeConfigSlotCollectionStatusV1),
+    ClaudeConfigSlotCollectionStatusV1,
+> {
+    let ClaudeOAuthUsageOutcome {
+        result,
+        diagnostics,
+    } = outcome;
+    let usage = match result {
+        Ok(usage) if !usage.windows.is_empty() => usage,
+        _ => {
+            return Err(if credential_available {
+                provider_unavailable_status(
+                    &captured_at,
+                    &resolved.account_identifier_hash,
+                    &resolved.organization_identifier_hash,
+                )
+            } else {
+                ClaudeSlotProbeFailure::CredentialUnavailable.status(&captured_at)
+            });
+        }
+    };
+    if !claude_usage_has_exact_identity(
+        &usage,
+        &resolved.account_identifier_hash,
+        &resolved.organization_identifier_hash,
+    ) {
+        return Err(ClaudeSlotProbeFailure::IdentityMismatch.status(&captured_at));
+    }
+    let stale = usage
+        .windows
+        .iter()
+        .any(|window| window.freshness != AgentQuotaWindowFreshness::Fresh)
+        || usage
+            .credit_balances
+            .iter()
+            .any(|balance| balance.freshness != AgentQuotaWindowFreshness::Fresh);
+    let mut snapshot = base_snapshot(
+        SourceKind::ClaudeCode,
+        AgentStatusState::Available,
+        AgentStatusCollectionMethod::CliJson,
+        captured_at.clone(),
+        expires_at,
+    );
+    snapshot.account = Some(resolved.account);
+    snapshot.model = Some(AgentModelStatus {
+        active_model: None,
+        default_model: None,
+        provider: Some("anthropic".to_string()),
+        available_models: Vec::new(),
+        available_model_details: Vec::new(),
+        context_window_tokens: None,
+    });
+    snapshot.quota_windows = usage.windows;
+    snapshot.credit_balances = usage.credit_balances;
+    snapshot.capabilities = vec![
+        supported_capability(
+            "account_status",
+            "Validated from the exact registered Claude Code slot.",
+        ),
+        supported_capability(
+            "quota_windows",
+            "Collected from Claude Code's local OAuth usage endpoint.",
+        ),
+    ];
+    snapshot.diagnostics = diagnostics;
+    append_current_plan_observation(&mut snapshot);
+    let state = if stale {
+        provider_unavailable_status(
+            &captured_at,
+            &resolved.account_identifier_hash,
+            &resolved.organization_identifier_hash,
+        )
+    } else {
+        fresh_slot_status(
+            &captured_at,
+            &resolved.account_identifier_hash,
+            &resolved.organization_identifier_hash,
+        )
+    };
+    Ok((snapshot, state))
+}
+
+fn claude_usage_has_exact_identity(
+    usage: &ClaudeOAuthUsage,
+    account_hash: &str,
+    organization_hash: &str,
+) -> bool {
+    !usage.windows.is_empty()
+        && usage.windows.iter().all(|window| {
+            window.account_identifier_hash.as_deref() == Some(account_hash)
+                && window.organization_identifier_hash.as_deref() == Some(organization_hash)
+        })
+        && usage.credit_balances.iter().all(|balance| {
+            balance.account_identifier_hash.as_deref() == Some(account_hash)
+                && balance.organization_identifier_hash.as_deref() == Some(organization_hash)
+        })
+}
+
+fn claude_default_slot_collection_status(
+    snapshot: &AgentStatusSnapshot,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    for failure in [
+        ClaudeSlotProbeFailure::CredentialUnavailable,
+        ClaudeSlotProbeFailure::ConcurrentMutation,
+        ClaudeSlotProbeFailure::IdentityMismatch,
+        ClaudeSlotProbeFailure::IdentityUnknown,
+    ] {
+        if snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == failure.diagnostic_code())
+        {
+            return failure.status(&snapshot.captured_at);
+        }
+    }
+    if snapshot
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "claude_auth_status_failed")
+    {
+        return ClaudeSlotProbeFailure::CredentialUnavailable.status(&snapshot.captured_at);
+    }
+    let hashes = snapshot.account.as_ref().and_then(|account| {
+        Some((
+            account.account_identifier_hash.as_deref()?,
+            account.organization_identifier_hash.as_deref()?,
+        ))
+    });
+    match hashes {
+        Some((account_hash, organization_hash))
+            if !snapshot.quota_windows.is_empty()
+                && snapshot.quota_windows.iter().all(|window| {
+                    window.account_identifier_hash.as_deref() == Some(account_hash)
+                        && window.organization_identifier_hash.as_deref() == Some(organization_hash)
+                        && window.freshness == AgentQuotaWindowFreshness::Fresh
+                })
+                && snapshot.credit_balances.iter().all(|balance| {
+                    balance.account_identifier_hash.as_deref() == Some(account_hash)
+                        && balance.organization_identifier_hash.as_deref()
+                            == Some(organization_hash)
+                        && balance.freshness == AgentQuotaWindowFreshness::Fresh
+                }) =>
+        {
+            fresh_slot_status(&snapshot.captured_at, account_hash, organization_hash)
+        }
+        Some((account_hash, organization_hash)) => {
+            provider_unavailable_status(&snapshot.captured_at, account_hash, organization_hash)
+        }
+        None if snapshot
+            .account
+            .as_ref()
+            .is_some_and(|account| account.login_state != AgentLoginState::SignedIn) =>
+        {
+            ClaudeSlotProbeFailure::CredentialUnavailable.status(&snapshot.captured_at)
+        }
+        None => ClaudeSlotProbeFailure::IdentityUnknown.status(&snapshot.captured_at),
+    }
+}
+
+fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentStatusDiagnostic {
+    let status = failure.status("");
+    AgentStatusDiagnostic::source(
+        failure.diagnostic_code(),
+        AgentDiagnosticSeverity::Warning,
+        status
+            .diagnostics
+            .first()
+            .map(|diagnostic| diagnostic.message.clone())
+            .unwrap_or_else(|| "Claude slot identity could not be verified.".to_string()),
+    )
+}
+
+fn fresh_slot_status(
+    observed_at: &str,
+    account_hash: &str,
+    organization_hash: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::Fresh,
+        account_identifier_hash: Some(account_hash.to_string()),
+        organization_identifier_hash: Some(organization_hash.to_string()),
+        observed_at: Some(observed_at.to_string()),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn provider_unavailable_status(
+    observed_at: &str,
+    account_hash: &str,
+    organization_hash: &str,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+        account_identifier_hash: Some(account_hash.to_string()),
+        organization_identifier_hash: Some(organization_hash.to_string()),
+        observed_at: Some(observed_at.to_string()),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::ProviderUnavailable,
+            message: "Full Claude usage is temporarily unavailable for this exact account slot."
+                .to_string(),
+        }],
+    }
+}
+
+fn duplicate_account_status(
+    observed_at: &str,
+    account_hash: &str,
+    organization_hash: Option<&str>,
+) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::DuplicateAccount,
+        account_identifier_hash: Some(account_hash.to_string()),
+        organization_identifier_hash: organization_hash.map(ToString::to_string),
+        observed_at: Some(observed_at.to_string()),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::DuplicateAccount,
+            message: "This registered slot resolves to an account already collected by an earlier valid slot."
+                .to_string(),
+        }],
+    }
+}
+
+fn capacity_exceeded_status(observed_at: &str) -> ClaudeConfigSlotCollectionStatusV1 {
+    ClaudeConfigSlotCollectionStatusV1 {
+        state: ClaudeConfigSlotCollectionStateV1::CapacityExceeded,
+        observed_at: Some(observed_at.to_string()),
+        diagnostics: vec![ClaudeConfigSlotDiagnosticV1 {
+            code: ClaudeConfigSlotDiagnosticCodeV1::CapacityExceeded,
+            message: "This slot is beyond the ten-account collection capacity and remains local."
+                .to_string(),
+        }],
+        ..Default::default()
+    }
+}
+
+fn claude_slot_collection_state_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE)
+}
+
+fn persist_claude_slot_collection_states(
+    slots: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(&PersistedClaudeSlotCollectionStateV1 {
+        schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+        slots: slots.clone(),
+    })
+    .map_err(std::io::Error::other)?;
+    write_owner_only_file_atomic(&claude_slot_collection_state_path(), &body)
+}
+
+pub(crate) fn annotate_claude_accounts_status(
+    mut status: ClaudeAccountsStatusV1,
+) -> ClaudeAccountsStatusV1 {
+    let states = fs::read(claude_slot_collection_state_path())
+        .ok()
+        .and_then(|body| serde_json::from_slice::<PersistedClaudeSlotCollectionStateV1>(&body).ok())
+        .filter(|state| state.schema_version == CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION)
+        .map(|state| state.slots)
+        .unwrap_or_default();
+    for descriptor in std::iter::once(&mut status.default_slot)
+        .chain(status.managed_slots.iter_mut())
+        .chain(status.external_slots.iter_mut())
+    {
+        if let Some(collection) = states.get(&descriptor.slot_id) {
+            descriptor.collection = collection.clone();
+        }
+    }
+    status
 }
 
 /// Takes the observations rather than recomputing them: the statusLine
@@ -1575,21 +2360,54 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
 /// with the account the numbers belong to.
 ///
 /// The caller resolves the identity once (`collect_claude_status`) and this
-/// path scopes every cache read to it, so one stamp at the boundary covers
-/// fresh fetches and every cache fallback alike -- the cache is discarded
-/// rather than served whenever it belongs to a different account
-/// (`claude_oauth_usage_cache_belongs_to_account`). An unresolved account
-/// stays unstamped: unknown must read as unknown downstream, never as a guess.
+/// path scopes every cache read to it. Fresh responses are stamped before
+/// persistence; every cache fallback must already carry the exact same account
+/// and organization hashes on the cache and every embedded meter. An
+/// unresolved identity stays unstamped: unknown must read as unknown
+/// downstream, never as a guess.
+#[cfg(test)]
 fn collect_claude_oauth_usage(
     account_identifier_hash: &str,
     organization_identifier_hash: Option<&str>,
 ) -> ClaudeOAuthUsageOutcome {
-    let mut outcome = collect_claude_oauth_usage_unstamped(account_identifier_hash);
+    collect_claude_oauth_usage_for_slot(
+        account_identifier_hash,
+        organization_identifier_hash.unwrap_or_default(),
+        &ClaudeConfigDirSlot::Default,
+    )
+}
+
+#[cfg(test)]
+fn collect_claude_oauth_usage_for_slot(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    slot: &ClaudeConfigDirSlot,
+) -> ClaudeOAuthUsageOutcome {
+    collect_claude_oauth_usage_with_access_token(
+        account_identifier_hash,
+        organization_identifier_hash,
+        read_claude_oauth_access_token_for_slot(slot),
+        matches!(slot, ClaudeConfigDirSlot::Default),
+    )
+}
+
+fn collect_claude_oauth_usage_with_access_token(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    access_token: Option<String>,
+    mirror_legacy_default: bool,
+) -> ClaudeOAuthUsageOutcome {
+    let mut outcome = collect_claude_oauth_usage_unstamped(
+        account_identifier_hash,
+        organization_identifier_hash,
+        access_token,
+        mirror_legacy_default,
+    );
     if let Ok(usage) = &mut outcome.result {
         claude_oauth_stamp_account_identity(
             usage,
             account_identifier_hash,
-            organization_identifier_hash,
+            Some(organization_identifier_hash),
         );
     }
     outcome
@@ -1615,7 +2433,12 @@ fn claude_oauth_stamp_account_identity(
     }
 }
 
-fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> ClaudeOAuthUsageOutcome {
+fn collect_claude_oauth_usage_unstamped(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    access_token: Option<String>,
+    mirror_legacy_default: bool,
+) -> ClaudeOAuthUsageOutcome {
     let now = current_unix_seconds();
 
     // Off-switch first, ahead of the cache: the sentinel turns this whole data
@@ -1638,18 +2461,27 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
     }
 
     let config_fingerprint = claude_oauth_usage_config_fingerprint();
-    if let Some(breaker) =
-        read_claude_oauth_usage_breaker(account_identifier_hash, &config_fingerprint)
-    {
-        if claude_oauth_usage_breaker_is_open(&breaker, now) {
-            return ClaudeOAuthUsageOutcome {
-                result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
-                diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
-            };
+    let open_breaker = read_claude_oauth_usage_breaker_with_legacy_migration(
+        account_identifier_hash,
+        &config_fingerprint,
+        mirror_legacy_default,
+    )
+    .and_then(|breaker| {
+        if mirror_legacy_default {
+            let _ = write_legacy_claude_oauth_usage_breaker(&breaker);
         }
-    }
+        claude_oauth_usage_breaker_is_open(&breaker, now).then_some(breaker)
+    });
 
-    if let Some(cache) = read_claude_oauth_usage_cache(account_identifier_hash) {
+    let mut exact_stale_fallback = None;
+    if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
+        account_identifier_hash,
+        organization_identifier_hash,
+        mirror_legacy_default,
+    ) {
+        if mirror_legacy_default {
+            let _ = write_legacy_claude_oauth_usage_cache(&cache);
+        }
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -1663,15 +2495,48 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
                 "Claude OAuth usage endpoint is rate limited.".to_string(),
             ));
         }
+        if !cache.windows.is_empty() && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS {
+            exact_stale_fallback = Some(cache);
+        }
     }
 
-    let Some(token) = read_claude_oauth_access_token() else {
+    let Some(token) = access_token else {
+        if let Some(cache) = exact_stale_fallback {
+            return ClaudeOAuthUsageOutcome {
+                result: Ok(claude_oauth_usage_from_cache(cache, now)),
+                diagnostics: open_breaker
+                    .as_ref()
+                    .map(|breaker| claude_oauth_usage_circuit_open_diagnostic(breaker, now))
+                    .into_iter()
+                    .collect(),
+            };
+        }
+        if let Some(breaker) = open_breaker {
+            return ClaudeOAuthUsageOutcome {
+                result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
+                diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
+            };
+        }
         return ClaudeOAuthUsageOutcome::from(Err(
             "Claude OAuth credentials were not available locally.".to_string(),
         ));
     };
+    if let Some(breaker) = open_breaker {
+        if let Some(cache) = exact_stale_fallback {
+            return ClaudeOAuthUsageOutcome {
+                result: Ok(claude_oauth_usage_from_cache(cache, now)),
+                diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
+            };
+        }
+        return ClaudeOAuthUsageOutcome {
+            result: Err("Claude OAuth usage endpoint is not being called.".to_string()),
+            diagnostics: vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)],
+        };
+    }
     let authorization = format!("Bearer {token}");
     let user_agent = ottto_user_agent();
+    #[cfg(test)]
+    CLAUDE_OAUTH_PROVIDER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let response = ureq::get(CLAUDE_OAUTH_USAGE_ENDPOINT)
         .set("Accept", "application/json")
         .set("Content-Type", "application/json")
@@ -1688,25 +2553,33 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
             // `unwrap_or` replaces it with an empty cache for the current
             // account, so the write below also clears the stale payload off
             // disk instead of leaving it to be reconsidered next tick.
-            let mut cache = read_claude_oauth_usage_cache(account_identifier_hash).unwrap_or(
-                ClaudeOAuthUsageCache {
-                    schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-                    account_identifier_hash: account_identifier_hash.to_string(),
-                    observed_at_epoch_seconds: now,
-                    next_refresh_after_epoch_seconds: retry_after,
-                    windows: Vec::new(),
-                    credit_balances: Vec::new(),
-                },
-            );
+            let mut cache = read_claude_oauth_usage_cache_with_legacy_migration(
+                account_identifier_hash,
+                organization_identifier_hash,
+                mirror_legacy_default,
+            )
+            .unwrap_or(ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account_identifier_hash.to_string(),
+                organization_identifier_hash: organization_identifier_hash.to_string(),
+                observed_at_epoch_seconds: now,
+                next_refresh_after_epoch_seconds: retry_after,
+                windows: Vec::new(),
+                credit_balances: Vec::new(),
+            });
             cache.next_refresh_after_epoch_seconds = retry_after;
             let _ = write_claude_oauth_usage_cache(&cache);
+            if mirror_legacy_default {
+                let _ = write_legacy_claude_oauth_usage_cache(&cache);
+            }
             // The retry-after backoff above still handles the transient case
             // unchanged; the breaker only fires once 429s outlive it.
-            let diagnostics = record_claude_oauth_usage_failure(
+            let diagnostics = record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::RateLimited,
                 account_identifier_hash,
                 &config_fingerprint,
                 now,
+                mirror_legacy_default,
             );
             if !cache.windows.is_empty()
                 && now.saturating_sub(cache.observed_at_epoch_seconds)
@@ -1724,15 +2597,20 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
         }
         Err(error) => {
             let diagnostics = match claude_oauth_usage_failure_class(&error) {
-                Some(failure) => record_claude_oauth_usage_failure(
+                Some(failure) => record_claude_oauth_usage_failure_with_legacy(
                     failure,
                     account_identifier_hash,
                     &config_fingerprint,
                     now,
+                    mirror_legacy_default,
                 ),
                 None => Vec::new(),
             };
-            if let Some(cache) = read_claude_oauth_usage_cache(account_identifier_hash) {
+            if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
+                account_identifier_hash,
+                organization_identifier_hash,
+                mirror_legacy_default,
+            ) {
                 if !cache.windows.is_empty()
                     && now.saturating_sub(cache.observed_at_epoch_seconds)
                         <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
@@ -1752,15 +2630,16 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
     let Ok(value) = response.into_json::<Value>() else {
         return ClaudeOAuthUsageOutcome {
             result: Err("Claude OAuth usage endpoint returned an unreadable response.".to_string()),
-            diagnostics: record_claude_oauth_usage_failure(
+            diagnostics: record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::ResponseShape,
                 account_identifier_hash,
                 &config_fingerprint,
                 now,
+                mirror_legacy_default,
             ),
         };
     };
-    let usage = ClaudeOAuthUsage {
+    let mut usage = ClaudeOAuthUsage {
         windows: claude_oauth_quota_windows(&value),
         credit_balances: claude_oauth_credit_balances(&value),
     };
@@ -1770,25 +2649,36 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
         // reports at least one window.
         return ClaudeOAuthUsageOutcome {
             result: Ok(usage),
-            diagnostics: record_claude_oauth_usage_failure(
+            diagnostics: record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::ResponseShape,
                 account_identifier_hash,
                 &config_fingerprint,
                 now,
+                mirror_legacy_default,
             ),
         };
     }
-    let _ = write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+    claude_oauth_stamp_account_identity(
+        &mut usage,
+        account_identifier_hash,
+        Some(organization_identifier_hash),
+    );
+    let cache = ClaudeOAuthUsageCache {
         schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
         account_identifier_hash: account_identifier_hash.to_string(),
+        organization_identifier_hash: organization_identifier_hash.to_string(),
         observed_at_epoch_seconds: now,
         next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
         windows: usage.windows.clone(),
         credit_balances: usage.credit_balances.clone(),
-    });
+    };
+    let _ = write_claude_oauth_usage_cache(&cache);
+    if mirror_legacy_default {
+        let _ = write_legacy_claude_oauth_usage_cache(&cache);
+    }
     // One clean answer clears the accumulated failure counters: the thresholds
     // below are about *consecutive* failures.
-    clear_claude_oauth_usage_breaker(account_identifier_hash);
+    clear_claude_oauth_usage_breaker_with_legacy(account_identifier_hash, mirror_legacy_default);
     ClaudeOAuthUsageOutcome::from(Ok(usage))
 }
 
@@ -1902,22 +2792,45 @@ fn claude_oauth_usage_config_fingerprint_for(
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
+#[cfg(test)]
 fn read_claude_oauth_usage_breaker(
     account_identifier_hash: &str,
     config_fingerprint: &str,
+) -> Option<ClaudeOAuthUsageBreaker> {
+    read_claude_oauth_usage_breaker_with_legacy_migration(
+        account_identifier_hash,
+        config_fingerprint,
+        true,
+    )
+}
+
+fn read_claude_oauth_usage_breaker_with_legacy_migration(
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+    allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
     let lock = claude_oauth_account_state_lock(account_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint)
+    read_claude_oauth_usage_breaker_locked(
+        account_identifier_hash,
+        config_fingerprint,
+        allow_legacy_migration,
+    )
 }
 
 fn read_claude_oauth_usage_breaker_locked(
     account_identifier_hash: &str,
     config_fingerprint: &str,
+    allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
-    migrate_legacy_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint);
+    if allow_legacy_migration {
+        migrate_legacy_claude_oauth_usage_breaker_locked(
+            account_identifier_hash,
+            config_fingerprint,
+        );
+    }
     let body = fs::read_to_string(claude_oauth_usage_breaker_path(account_identifier_hash)).ok()?;
     let breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
     if breaker.schema_version != CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
@@ -1937,12 +2850,30 @@ fn write_claude_oauth_usage_breaker_locked(
     write_owner_only_file_atomic(&path, &body)
 }
 
+fn write_legacy_claude_oauth_usage_breaker(
+    breaker: &ClaudeOAuthUsageBreaker,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
+    write_owner_only_file_atomic(&claude_oauth_usage_legacy_breaker_path(), &body)
+}
+
+#[cfg(test)]
 fn clear_claude_oauth_usage_breaker(account_identifier_hash: &str) {
+    clear_claude_oauth_usage_breaker_with_legacy(account_identifier_hash, false);
+}
+
+fn clear_claude_oauth_usage_breaker_with_legacy(
+    account_identifier_hash: &str,
+    mirror_legacy_default: bool,
+) {
     let lock = claude_oauth_account_state_lock(account_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = fs::remove_file(claude_oauth_usage_breaker_path(account_identifier_hash));
+    if mirror_legacy_default {
+        let _ = fs::remove_file(claude_oauth_usage_legacy_breaker_path());
+    }
 }
 
 fn migrate_legacy_claude_oauth_usage_breaker_locked(
@@ -2010,18 +2941,38 @@ fn claude_oauth_usage_breaker_after_failure(
     breaker
 }
 
+#[cfg(test)]
 fn record_claude_oauth_usage_failure(
     failure: ClaudeOAuthUsageFailure,
     account_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
 ) -> Vec<AgentStatusDiagnostic> {
+    record_claude_oauth_usage_failure_with_legacy(
+        failure,
+        account_identifier_hash,
+        config_fingerprint,
+        now,
+        false,
+    )
+}
+
+fn record_claude_oauth_usage_failure_with_legacy(
+    failure: ClaudeOAuthUsageFailure,
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+    now: u64,
+    mirror_legacy_default: bool,
+) -> Vec<AgentStatusDiagnostic> {
     let lock = claude_oauth_account_state_lock(account_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let previous =
-        read_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint);
+    let previous = read_claude_oauth_usage_breaker_locked(
+        account_identifier_hash,
+        config_fingerprint,
+        mirror_legacy_default,
+    );
     let was_open = previous
         .as_ref()
         .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
@@ -2033,6 +2984,9 @@ fn record_claude_oauth_usage_failure(
         now,
     );
     let _ = write_claude_oauth_usage_breaker_locked(&breaker);
+    if mirror_legacy_default {
+        let _ = write_legacy_claude_oauth_usage_breaker(&breaker);
+    }
     if !was_open && claude_oauth_usage_breaker_is_open(&breaker, now) {
         return vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)];
     }
@@ -2071,10 +3025,6 @@ fn claude_oauth_usage_failure_class(error: &ureq::Error) -> Option<ClaudeOAuthUs
         ureq::Error::Status(404 | 410, _) => Some(ClaudeOAuthUsageFailure::ResponseShape),
         _ => None,
     }
-}
-
-fn read_claude_oauth_access_token() -> Option<String> {
-    read_claude_oauth_access_token_for_slot(&ClaudeConfigDirSlot::Default)
 }
 
 fn read_claude_oauth_access_token_for_slot(slot: &ClaudeConfigDirSlot) -> Option<String> {
@@ -2231,6 +3181,7 @@ fn clear_all_claude_oauth_usage_caches() {
 /// that rate-limits, and no cache left to fall back on when it answers 429.
 /// `oauthAccount` is rewritten by Claude Code itself on every profile refresh,
 /// so it tracks the credential without inheriting its rotation.
+#[cfg(test)]
 fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> String {
     // Same preference order the subscription grouping uses: provider account
     // id, then organization, then email. It lives in `ottto-core` because the
@@ -2244,18 +3195,81 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
     )
 }
 
-fn read_claude_oauth_usage_cache(account_identifier_hash: &str) -> Option<ClaudeOAuthUsageCache> {
+/// Multi-account collection never assigns full meters through organization or
+/// email fallback. Both provider UUIDs must be present and independently
+/// hashed before a window or credit can leave the machine.
+fn claude_strong_oauth_identity_hashes(
+    account: &ClaudeCliOauthAccount,
+) -> Option<(String, String)> {
+    let account_hash = account
+        .account_uuid
+        .as_deref()
+        .and_then(|value| billing_identity_hash("anthropic", "account", value))?;
+    let organization_hash = account
+        .organization_uuid
+        .as_deref()
+        .and_then(|value| billing_identity_hash("anthropic", "organization", value))?;
+    Some((account_hash, organization_hash))
+}
+
+fn stable_claude_slot_credential(
+    initial_oauth_account: Option<ClaudeCliOauthAccount>,
+    initial_access_token: Option<String>,
+    final_oauth_account: Option<ClaudeCliOauthAccount>,
+) -> Result<StableClaudeSlotCredential, ClaudeSlotProbeFailure> {
+    let (Some(initial_oauth_account), Some(final_oauth_account)) =
+        (initial_oauth_account, final_oauth_account)
+    else {
+        return Err(ClaudeSlotProbeFailure::IdentityUnknown);
+    };
+    if initial_oauth_account != final_oauth_account {
+        return Err(ClaudeSlotProbeFailure::ConcurrentMutation);
+    }
+    Ok(StableClaudeSlotCredential {
+        oauth_account: initial_oauth_account,
+        access_token: initial_access_token,
+    })
+}
+
+#[cfg(test)]
+fn read_claude_oauth_usage_cache(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Option<ClaudeOAuthUsageCache> {
+    read_claude_oauth_usage_cache_with_legacy_migration(
+        account_identifier_hash,
+        organization_identifier_hash,
+        true,
+    )
+}
+
+fn read_claude_oauth_usage_cache_with_legacy_migration(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    allow_legacy_migration: bool,
+) -> Option<ClaudeOAuthUsageCache> {
     let lock = claude_oauth_account_state_lock(account_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read_claude_oauth_usage_cache_locked(account_identifier_hash)
+    read_claude_oauth_usage_cache_locked(
+        account_identifier_hash,
+        organization_identifier_hash,
+        allow_legacy_migration,
+    )
 }
 
 fn read_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
-    migrate_legacy_claude_oauth_usage_cache_locked(account_identifier_hash);
+    if allow_legacy_migration {
+        migrate_legacy_claude_oauth_usage_cache_locked(
+            account_identifier_hash,
+            organization_identifier_hash,
+        );
+    }
     let path = claude_oauth_usage_cache_path(account_identifier_hash);
     let body = fs::read_to_string(path).ok()?;
     let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
@@ -2264,30 +3278,41 @@ fn read_claude_oauth_usage_cache_locked(
         // discarded so the next tick refetches under a known account.
         return None;
     }
-    if !claude_oauth_usage_cache_belongs_to_account(&cache, account_identifier_hash) {
+    if !claude_oauth_usage_cache_belongs_to_identity(
+        &cache,
+        account_identifier_hash,
+        organization_identifier_hash,
+    ) {
         return None;
     }
     Some(cache)
 }
 
-/// Whether a cached OAuth usage payload may be served for the account that
-/// currently owns the credential.
+/// Whether a cached OAuth usage payload may be served for the exact account
+/// and organization that currently own the credential.
 ///
-/// Exact match, both directions. A cache written under account A is never
-/// served once account B holds the credential -- including on the 429 and
-/// transport fallback paths, where another account's quota is worse than no
-/// quota at all, because the fallback window is 24h and 429s on this endpoint
-/// are routine.
-///
-/// Two empty hashes DO match: if the local account metadata named no account
-/// when the cache was written and still names none now, nothing changed that we
-/// can observe. Refusing there would drop every cache hit on such machines and
-/// turn each status tick into another request to a rate-limited endpoint.
-fn claude_oauth_usage_cache_belongs_to_account(
+/// Exact match, both directions. Account-only matches and caches whose embedded
+/// meters are unattributed or differently attributed are rejected. Empty
+/// v4 caches may retain per-identity retry timing, but cannot produce a row.
+fn claude_oauth_usage_cache_belongs_to_identity(
     cache: &ClaudeOAuthUsageCache,
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
 ) -> bool {
     cache.account_identifier_hash == account_identifier_hash
+        && cache.organization_identifier_hash == organization_identifier_hash
+        && !account_identifier_hash.is_empty()
+        && !organization_identifier_hash.is_empty()
+        && cache.windows.iter().all(|window| {
+            window.account_identifier_hash.as_deref() == Some(account_identifier_hash)
+                && window.organization_identifier_hash.as_deref()
+                    == Some(organization_identifier_hash)
+        })
+        && cache.credit_balances.iter().all(|balance| {
+            balance.account_identifier_hash.as_deref() == Some(account_identifier_hash)
+                && balance.organization_identifier_hash.as_deref()
+                    == Some(organization_identifier_hash)
+        })
 }
 
 fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
@@ -2304,7 +3329,17 @@ fn write_claude_oauth_usage_cache_locked(cache: &ClaudeOAuthUsageCache) -> std::
     write_owner_only_file_atomic(&path, &body)
 }
 
-fn migrate_legacy_claude_oauth_usage_cache_locked(account_identifier_hash: &str) {
+fn write_legacy_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
+    let mut legacy_cache = cache.clone();
+    legacy_cache.schema_version = CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION;
+    let body = serde_json::to_vec_pretty(&legacy_cache).map_err(std::io::Error::other)?;
+    write_owner_only_file_atomic(&claude_oauth_usage_legacy_cache_path(), &body)
+}
+
+fn migrate_legacy_claude_oauth_usage_cache_locked(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) {
     let target = claude_oauth_usage_cache_path(account_identifier_hash);
     if target.exists() {
         return;
@@ -2317,16 +3352,25 @@ fn migrate_legacy_claude_oauth_usage_cache_locked(account_identifier_hash: &str)
         return;
     }
     let legacy = claude_oauth_usage_legacy_cache_path();
-    let Some(cache) = fs::read_to_string(&legacy)
+    let Some(mut cache) = fs::read_to_string(&legacy)
         .ok()
         .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageCache>(&body).ok())
         .filter(|cache| {
-            cache.schema_version == CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
-                && claude_oauth_usage_cache_belongs_to_account(cache, account_identifier_hash)
+            matches!(
+                cache.schema_version,
+                CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION
+                    | CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
+            ) && !cache.windows.is_empty()
+                && claude_oauth_usage_cache_belongs_to_identity(
+                    cache,
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                )
         })
     else {
         return;
     };
+    cache.schema_version = CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION;
     if write_claude_oauth_usage_cache_locked(&cache).is_ok() {
         let _ = fs::remove_file(legacy);
     }
@@ -4231,6 +5275,40 @@ struct ClaudeCliOauthAccount {
     user_rate_limit_tier: Option<String>,
 }
 
+/// Full-meter collection requires positive agreement from the exact slot's
+/// live auth status and its local account metadata. The real Claude auth JSON
+/// reports email and organization UUID (not account UUID), so both fields must
+/// be present and equal before the account UUID from that exact slot's identity
+/// file may become strong meter identity. Absence of contradiction is not
+/// identity evidence.
+fn require_claude_auth_identity_agreement(
+    account: &AgentAccountStatus,
+    oauth: &ClaudeCliOauthAccount,
+) -> Result<(), ClaudeSlotProbeFailure> {
+    if account.login_state != AgentLoginState::SignedIn {
+        return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
+    }
+    let (Some(auth_email), Some(auth_organization)) =
+        (account.email.as_deref(), account.organization_id.as_deref())
+    else {
+        return Err(ClaudeSlotProbeFailure::IdentityUnknown);
+    };
+    let (Some(local_email), Some(local_organization)) = (
+        oauth.email_address.as_deref(),
+        oauth.organization_uuid.as_deref(),
+    ) else {
+        return Err(ClaudeSlotProbeFailure::IdentityUnknown);
+    };
+    if !auth_email.trim().eq_ignore_ascii_case(local_email.trim())
+        || !auth_organization
+            .trim()
+            .eq_ignore_ascii_case(local_organization.trim())
+    {
+        return Err(ClaudeSlotProbeFailure::IdentityMismatch);
+    }
+    Ok(())
+}
+
 fn read_claude_cli_oauth_account(path: &Path) -> Option<ClaudeCliOauthAccount> {
     let raw = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
@@ -5871,6 +6949,23 @@ fn extract_percent_before(text: &str, markers: &[&str]) -> Option<u8> {
 }
 
 fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> CommandOutput {
+    run_command_capture_with_exact_env(program, args, timeout, None)
+}
+
+fn run_claude_slot_command(
+    slot: &ClaudeConfigDirSlot,
+    args: &[&str],
+    timeout: Duration,
+) -> CommandOutput {
+    run_command_capture_with_exact_env("claude", args, timeout, Some(slot))
+}
+
+fn run_command_capture_with_exact_env(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    claude_slot: Option<&ClaudeConfigDirSlot>,
+) -> CommandOutput {
     let start = Instant::now();
     let Some(program_path) = crate::command_env::executable_path(program) else {
         return CommandOutput {
@@ -5884,10 +6979,33 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
     let mut command = Command::new(program_path);
     command
         .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if claude_slot.is_some() {
+        command.env_clear();
+        command.env("HOME", home_dir());
+        if let Some(user) = std::env::var_os("USER") {
+            command.env("USER", user);
+        }
+        for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            if let Some(value) = std::env::var_os(locale_key) {
+                command.env(locale_key, value);
+            }
+        }
+    }
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
+    }
+    if let Some(slot) = claude_slot {
+        match slot.config_dir() {
+            Some(config_dir) => {
+                command.env("CLAUDE_CONFIG_DIR", config_dir);
+            }
+            None => {
+                command.env_remove("CLAUDE_CONFIG_DIR");
+            }
+        }
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -6029,6 +7147,593 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    fn test_slot_descriptor(index: usize) -> ClaudeConfigSlotDescriptorV1 {
+        ClaudeConfigDirSlot::registered(format!("/tmp/claude-slot-{index}"))
+            .expect("test slot")
+            .descriptor(
+                format!("claude_slot_{index:032x}"),
+                ClaudeConfigSlotOwnership::External,
+            )
+    }
+
+    #[test]
+    fn claude_snapshot_capacity_is_one_default_plus_nine_custom() {
+        let descriptors = (0..12).map(test_slot_descriptor).collect::<Vec<_>>();
+        let (collected, overflow) = bounded_claude_custom_descriptors(descriptors);
+
+        assert_eq!(collected.len(), 9);
+        assert_eq!(overflow.len(), 3);
+        assert_eq!(
+            collected[0].slot_id,
+            "claude_slot_00000000000000000000000000000000"
+        );
+        assert_eq!(
+            overflow[0].slot_id,
+            "claude_slot_00000000000000000000000000000009"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_registered_slots_fan_out_full_usage_without_cross_account_mixing() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-multi-account-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let support = root.join("support");
+        let bin = root.join("bin");
+        fs::create_dir_all(home.join(".claude")).expect("create default config dir");
+        fs::create_dir_all(&support).expect("create support dir");
+        fs::create_dir_all(&bin).expect("create command dir");
+
+        let claude = bin.join("claude");
+        fs::write(
+            &claude,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "fixture-version"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$CLAUDE_CODE_USE_BEDROCK" ] || [ -n "$CLAUDE_CODE_USE_VERTEX" ]; then
+    exit 42
+  fi
+  if [ -n "$CLAUDE_CONFIG_DIR" ]; then
+    config="$CLAUDE_CONFIG_DIR/.claude.json"
+  else
+    config="$HOME/.claude.json"
+  fi
+  exec /usr/bin/python3 - "$config" <<'PY'
+import json, os, sys
+account = json.load(open(sys.argv[1]))["oauthAccount"]
+mode_path = os.path.join(os.path.dirname(sys.argv[1]), ".auth-mode")
+mode = open(mode_path).read().strip() if os.path.exists(mode_path) else ""
+if mode == "command_failure":
+    raise SystemExit(7)
+result = {
+  "status": "authenticated",
+  "email": account["emailAddress"],
+  "organizationId": account["organizationUuid"],
+  "subscriptionType": "max"
+}
+if mode == "missing_email":
+    result.pop("email")
+if mode == "missing_organization":
+    result.pop("organizationId")
+if mode == "identity_mismatch":
+    result["email"] = "rotated@example.invalid"
+    result["organizationId"] = "organization-rotated"
+print(json.dumps(result))
+PY
+fi
+exit 1
+"#,
+        )
+        .expect("write fake claude");
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+        for executable in [&claude, &security] {
+            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).expect("chmod executable");
+        }
+
+        let write_identity = |dir: &Path, account: &str, organization: &str| {
+            fs::create_dir_all(dir).expect("create slot dir");
+            fs::write(
+                dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "organizationUuid": organization,
+                        "emailAddress": "same@example.invalid",
+                        "organizationType": "max",
+                        "userRateLimitTier": "default_claude_max_20x"
+                    }
+                }))
+                .expect("serialize identity"),
+            )
+            .expect("write identity");
+        };
+        let write_credential = |dir: &Path| {
+            fs::write(
+                dir.join(".credentials.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "claudeAiOauth": {"accessToken": "fixture"}
+                }))
+                .expect("serialize credential fixture"),
+            )
+            .expect("write credential fixture");
+        };
+
+        write_identity(&home, "account-primary", "organization-primary");
+        write_credential(&home.join(".claude"));
+        let managed = root.join("managed-slot");
+        write_identity(&managed, "account-secondary", "organization-secondary");
+        // No token: stable exact identity must still serve this slot's
+        // same-account, same-organization cache without a network fetch.
+        let healthy_external = root.join("healthy-external-slot");
+        write_identity(
+            &healthy_external,
+            "account-tertiary",
+            "organization-tertiary",
+        );
+        write_credential(&healthy_external);
+        let duplicate = root.join("duplicate-slot");
+        write_identity(&duplicate, "account-secondary", "organization-secondary");
+        write_credential(&duplicate);
+        let failed = root.join("failed-slot");
+        write_identity(&failed, "account-failed", "organization-failed");
+        let auth_failed = root.join("auth-failed-slot");
+        write_identity(&auth_failed, "account-secondary", "organization-secondary");
+        write_credential(&auth_failed);
+        fs::write(auth_failed.join(".auth-mode"), "command_failure")
+            .expect("write auth failure mode");
+        let missing_identity = root.join("missing-identity-slot");
+        write_identity(
+            &missing_identity,
+            "account-missing-identity",
+            "organization-missing-identity",
+        );
+        write_credential(&missing_identity);
+        fs::write(missing_identity.join(".auth-mode"), "missing_email")
+            .expect("write missing identity mode");
+        let mismatched_identity = root.join("mismatched-identity-slot");
+        write_identity(
+            &mismatched_identity,
+            "account-stale-identity",
+            "organization-stale-identity",
+        );
+        write_credential(&mismatched_identity);
+        fs::write(mismatched_identity.join(".auth-mode"), "identity_mismatch")
+            .expect("write mismatch mode");
+
+        let _home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let _command_guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
+        let _oauth_poison = EnvVarGuard::set_os(
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            OsString::from("ambient-wrong-account"),
+        );
+        let _api_poison =
+            EnvVarGuard::set_os("ANTHROPIC_API_KEY", OsString::from("ambient-api-key"));
+        let _bedrock_poison = EnvVarGuard::set_os("CLAUDE_CODE_USE_BEDROCK", OsString::from("1"));
+        let _vertex_poison = EnvVarGuard::set_os("CLAUDE_CODE_USE_VERTEX", OsString::from("1"));
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .register_managed_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                managed.to_string_lossy().to_string(),
+            )
+            .expect("register managed slot");
+        store
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                healthy_external.to_string_lossy().to_string(),
+            )
+            .expect("register healthy external slot");
+        store
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                duplicate.to_string_lossy().to_string(),
+            )
+            .expect("register duplicate slot");
+        store
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                failed.to_string_lossy().to_string(),
+            )
+            .expect("register failed slot");
+        for path in [&auth_failed, &missing_identity, &mismatched_identity] {
+            store
+                .register_path(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    path.to_string_lossy().to_string(),
+                )
+                .expect("register invalid identity slot");
+        }
+
+        let now = current_unix_seconds();
+        let primary_hash =
+            billing_identity_hash("anthropic", "account", "account-primary").expect("primary hash");
+        let primary_org =
+            billing_identity_hash("anthropic", "organization", "organization-primary")
+                .expect("primary org hash");
+        let secondary_hash = billing_identity_hash("anthropic", "account", "account-secondary")
+            .expect("secondary hash");
+        let secondary_org =
+            billing_identity_hash("anthropic", "organization", "organization-secondary")
+                .expect("secondary org hash");
+        let tertiary_hash = billing_identity_hash("anthropic", "account", "account-tertiary")
+            .expect("tertiary hash");
+        let tertiary_org =
+            billing_identity_hash("anthropic", "organization", "organization-tertiary")
+                .expect("tertiary org hash");
+        let usage_cache = |account_hash: &str,
+                           organization_hash: &str,
+                           used_percent: u8,
+                           credits: u64| {
+            let mut usage = ClaudeOAuthUsage {
+                windows: vec![
+                    AgentQuotaWindow {
+                        name: "session".to_string(),
+                        scope: AgentQuotaWindowScope::Account,
+                        status: AgentQuotaWindowStatus::Ok,
+                        freshness: AgentQuotaWindowFreshness::Fresh,
+                        used_percent: Some(used_percent),
+                        ..Default::default()
+                    },
+                    AgentQuotaWindow {
+                        name: "weekly".to_string(),
+                        scope: AgentQuotaWindowScope::Account,
+                        status: AgentQuotaWindowStatus::Ok,
+                        freshness: AgentQuotaWindowFreshness::Fresh,
+                        used_percent: Some(used_percent),
+                        ..Default::default()
+                    },
+                    AgentQuotaWindow {
+                        name: "weekly_sonnet".to_string(),
+                        scope: AgentQuotaWindowScope::Model,
+                        status: AgentQuotaWindowStatus::Ok,
+                        freshness: AgentQuotaWindowFreshness::Fresh,
+                        model: Some("claude-sonnet".to_string()),
+                        used_percent: Some(used_percent),
+                        ..Default::default()
+                    },
+                ],
+                credit_balances: vec![AgentCreditBalance {
+                    name: "Usage credits".to_string(),
+                    status: AgentCreditBalanceStatus::Ok,
+                    freshness: AgentQuotaWindowFreshness::Fresh,
+                    remaining: Some(credits),
+                    ..Default::default()
+                }],
+            };
+            claude_oauth_stamp_account_identity(&mut usage, account_hash, Some(organization_hash));
+            ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account_hash.to_string(),
+                organization_identifier_hash: organization_hash.to_string(),
+                observed_at_epoch_seconds: now,
+                next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+                windows: usage.windows,
+                credit_balances: usage.credit_balances,
+            }
+        };
+        write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: primary_hash.clone(),
+            organization_identifier_hash: primary_org.clone(),
+            observed_at_epoch_seconds: now,
+            next_refresh_after_epoch_seconds: u64::MAX,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        })
+        .expect("write unavailable primary cache");
+        write_claude_oauth_usage_cache(&usage_cache(&secondary_hash, &secondary_org, 77, 777))
+            .expect("write secondary cache");
+        write_claude_oauth_usage_cache(&usage_cache(&tertiary_hash, &tertiary_org, 33, 333))
+            .expect("write tertiary cache");
+
+        let captured_at = "2026-08-04T12:34:56Z".to_string();
+        let collection = collect_agent_status_collection(
+            &SourceKind::ClaudeCode,
+            captured_at.clone(),
+            "2026-08-04T12:49:56Z".to_string(),
+        );
+        let snapshots = collection.snapshots;
+
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "unavailable default, failed slot, and duplicate stay local"
+        );
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.captured_at == captured_at));
+        let by_account = snapshots
+            .iter()
+            .map(|snapshot| {
+                (
+                    snapshot
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.account_identifier_hash.clone())
+                        .expect("strong snapshot account"),
+                    snapshot,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_account.len(), 2);
+        for (account_hash, organization_hash, expected_percent, expected_credits) in [
+            (&secondary_hash, &secondary_org, 77, 777),
+            (&tertiary_hash, &tertiary_org, 33, 333),
+        ] {
+            let snapshot = by_account.get(account_hash).expect("account snapshot");
+            assert_eq!(snapshot.quota_windows.len(), 3);
+            assert!(snapshot.quota_windows.iter().all(|window| {
+                window.account_identifier_hash.as_ref() == Some(account_hash)
+                    && window.organization_identifier_hash.as_ref() == Some(organization_hash)
+                    && window.used_percent == Some(expected_percent)
+            }));
+            assert_eq!(snapshot.credit_balances.len(), 1);
+            assert_eq!(
+                snapshot.credit_balances[0].account_identifier_hash.as_ref(),
+                Some(account_hash)
+            );
+            assert_eq!(
+                snapshot.credit_balances[0]
+                    .organization_identifier_hash
+                    .as_ref(),
+                Some(organization_hash)
+            );
+            assert_eq!(
+                snapshot.credit_balances[0].remaining,
+                Some(expected_credits)
+            );
+        }
+
+        let status = annotate_claude_accounts_status(store.load().expect("load slot status"));
+        assert_eq!(
+            status.default_slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+        assert_eq!(
+            status
+                .default_slot
+                .collection
+                .account_identifier_hash
+                .as_ref(),
+            Some(&primary_hash)
+        );
+        assert_eq!(
+            status
+                .default_slot
+                .collection
+                .organization_identifier_hash
+                .as_ref(),
+            Some(&primary_org)
+        );
+        let managed_status = status
+            .managed_slots
+            .iter()
+            .find(|slot| slot.config_dir.as_deref() == managed.to_str())
+            .expect("managed slot status");
+        let duplicate_status = status
+            .external_slots
+            .iter()
+            .find(|slot| slot.config_dir.as_deref() == duplicate.to_str())
+            .expect("duplicate account slot status");
+        let pair_states = [
+            managed_status.collection.state.clone(),
+            duplicate_status.collection.state.clone(),
+        ];
+        assert!(pair_states.contains(&ClaudeConfigSlotCollectionStateV1::Fresh));
+        assert!(pair_states.contains(&ClaudeConfigSlotCollectionStateV1::DuplicateAccount));
+        assert!(
+            matches!(
+                managed_status.collection.state,
+                ClaudeConfigSlotCollectionStateV1::Fresh
+                    | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+            ),
+            "the no-token slot must reach candidate ranking via its exact cache"
+        );
+        assert!(status.external_slots.iter().any(|slot| {
+            slot.collection.state == ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+        }));
+        assert!(status.external_slots.iter().any(|slot| {
+            slot.collection.state == ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+        }));
+        assert!(status.external_slots.iter().any(|slot| {
+            slot.collection.state == ClaudeConfigSlotCollectionStateV1::IdentityMismatch
+        }));
+        for (path, expected) in [
+            (
+                &auth_failed,
+                ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
+            ),
+            (
+                &missing_identity,
+                ClaudeConfigSlotCollectionStateV1::IdentityUnknown,
+            ),
+            (
+                &mismatched_identity,
+                ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
+            ),
+        ] {
+            let slot = status
+                .external_slots
+                .iter()
+                .find(|slot| slot.config_dir.as_deref() == path.to_str())
+                .expect("typed invalid slot status");
+            assert_eq!(slot.collection.state, expected);
+        }
+
+        let backend_json = serde_json::to_string(
+            &snapshots
+                .into_iter()
+                .map(AgentStatusSnapshot::redacted_for_backend)
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize backend snapshots");
+        for forbidden in [
+            root.to_string_lossy().as_ref(),
+            "account-primary",
+            "account-secondary",
+            "account-tertiary",
+            "organization-primary",
+            "organization-secondary",
+            "organization-tertiary",
+            "fixture",
+            "claude_slot_",
+        ] {
+            assert!(
+                !backend_json.contains(forbidden),
+                "backend snapshots leaked forbidden local material"
+            );
+        }
+        let local_state =
+            fs::read_to_string(claude_slot_collection_state_path()).expect("read local slot state");
+        assert!(!local_state.contains(root.to_string_lossy().as_ref()));
+        assert!(!local_state.contains("fixture"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn claude_default_and_custom_rotation_during_auth_fail_closed() {
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-slot-rotation-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let support = root.join("support");
+        let custom = root.join("custom");
+        let bin = root.join("bin");
+        for directory in [&home.join(".claude"), &support, &custom, &bin] {
+            fs::create_dir_all(directory).expect("create rotation test directory");
+        }
+        let write_slot = |identity_dir: &Path, credential_dir: &Path, suffix: &str| {
+            fs::write(
+                identity_dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": format!("account-{suffix}"),
+                        "organizationUuid": format!("organization-{suffix}"),
+                        "emailAddress": format!("{suffix}@example.invalid")
+                    }
+                }))
+                .expect("serialize rotation identity"),
+            )
+            .expect("write rotation identity");
+            fs::write(
+                credential_dir.join(".credentials.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "claudeAiOauth": {"accessToken": "test-captured-value"}
+                }))
+                .expect("serialize rotation credential"),
+            )
+            .expect("write rotation credential");
+        };
+        write_slot(&home, &home.join(".claude"), "default");
+        write_slot(&custom, &custom, "custom");
+
+        let claude = bin.join("claude");
+        fs::write(
+            &claude,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "test-version"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  if [ -n "$CLAUDE_CONFIG_DIR" ]; then
+    config="$CLAUDE_CONFIG_DIR/.claude.json"
+  else
+    config="$HOME/.claude.json"
+  fi
+  exec /usr/bin/python3 - "$config" <<'PY'
+import json, sys
+path = sys.argv[1]
+value = json.load(open(path))
+account = value["oauthAccount"]
+result = {
+  "status": "authenticated",
+  "email": account["emailAddress"],
+  "organizationId": account["organizationUuid"],
+  "subscriptionType": "max"
+}
+account["accountUuid"] += "-rotated"
+account["organizationUuid"] += "-rotated"
+account["emailAddress"] = "rotated@example.invalid"
+with open(path, "w") as output:
+    json.dump(value, output)
+print(json.dumps(result))
+PY
+fi
+exit 1
+"#,
+        )
+        .expect("write rotating claude");
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write security fallback");
+        for executable in [&claude, &security] {
+            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).expect("chmod executable");
+        }
+
+        let _home = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
+        let _support = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support.as_os_str().to_os_string(),
+        );
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .register_path(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                custom.to_string_lossy().to_string(),
+            )
+            .expect("register rotating custom slot");
+
+        let collection = collect_agent_status_collection(
+            &SourceKind::ClaudeCode,
+            "2026-08-04T13:00:00Z".to_string(),
+            "2026-08-04T13:15:00Z".to_string(),
+        );
+        assert!(
+            collection.snapshots.is_empty(),
+            "rotating slots must emit no backend snapshot"
+        );
+        assert!(collection
+            .source_health_snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.account_identifier_hash.is_none()));
+        let status = annotate_claude_accounts_status(store.load().expect("load rotating slots"));
+        assert_eq!(
+            status.default_slot.collection.state,
+            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        );
+        assert_eq!(status.external_slots.len(), 1);
+        assert_eq!(
+            status.external_slots[0].collection.state,
+            ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        );
+        let persisted = fs::read_to_string(claude_slot_collection_state_path())
+            .expect("read rotation local state");
+        assert!(!persisted.contains("test-captured-value"));
+        assert!(!persisted.contains(root.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7654,6 +9359,7 @@ for line in sys.stdin:
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -7703,6 +9409,7 @@ for line in sys.stdin:
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 400,
             windows: vec![AgentQuotaWindow {
@@ -7854,12 +9561,15 @@ for line in sys.stdin:
             account_uuid: Some("acct-b".to_string()),
             ..ClaudeCliOauthAccount::default()
         });
+        let organization_a = "organization-a";
+        let organization_b = "organization-b";
         assert_ne!(account_a, account_b);
 
         let now = 10_000;
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: account_a.clone(),
+            organization_identifier_hash: organization_a.to_string(),
             observed_at_epoch_seconds: now,
             next_refresh_after_epoch_seconds: now + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
             windows: vec![AgentQuotaWindow {
@@ -7873,6 +9583,8 @@ for line in sys.stdin:
                 resets_at: Some("2026-08-01T05:00:00Z".to_string()),
                 used_percent: Some(44),
                 left_percent: Some(56),
+                account_identifier_hash: Some(account_a.clone()),
+                organization_identifier_hash: Some(organization_a.to_string()),
                 ..Default::default()
             }],
             credit_balances: Vec::new(),
@@ -7880,31 +9592,39 @@ for line in sys.stdin:
         .expect("write cache");
 
         // The account that wrote it still reads it.
-        let served = read_claude_oauth_usage_cache(&account_a).expect("own account is served");
+        let served = read_claude_oauth_usage_cache(&account_a, organization_a)
+            .expect("own account is served");
         assert_eq!(served.windows[0].used_percent, Some(44));
         assert!(claude_oauth_usage_cache_path(&account_a).is_file());
+        assert!(
+            read_claude_oauth_usage_cache(&account_a, organization_b).is_none(),
+            "an account-only match must not relabel cached meters under another organization"
+        );
 
         // The replacing account must not.
         assert!(
-            read_claude_oauth_usage_cache(&account_b).is_none(),
+            read_claude_oauth_usage_cache(&account_b, organization_b).is_none(),
             "cache written under account A was served to account B"
         );
         // Nor may an unidentifiable credential inherit a named account's cache.
-        assert!(read_claude_oauth_usage_cache("").is_none());
+        assert!(read_claude_oauth_usage_cache("", "").is_none());
 
         // Same guard on the 429 / transport fallback path, where the 24h max
         // age applies and serving another account's numbers is worse than
         // serving none. This mirrors the `unwrap_or` in
         // `collect_claude_oauth_usage`'s 429 arm.
         let retry_after = now + CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS;
-        let fallback = read_claude_oauth_usage_cache(&account_b).unwrap_or(ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: account_b.clone(),
-            observed_at_epoch_seconds: now,
-            next_refresh_after_epoch_seconds: retry_after,
-            windows: Vec::new(),
-            credit_balances: Vec::new(),
-        });
+        let fallback = read_claude_oauth_usage_cache(&account_b, organization_b).unwrap_or(
+            ClaudeOAuthUsageCache {
+                schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                account_identifier_hash: account_b.clone(),
+                organization_identifier_hash: organization_b.to_string(),
+                observed_at_epoch_seconds: now,
+                next_refresh_after_epoch_seconds: retry_after,
+                windows: Vec::new(),
+                credit_balances: Vec::new(),
+            },
+        );
         assert!(
             fallback.windows.is_empty(),
             "429 fallback served account A's windows to account B"
@@ -7914,7 +9634,7 @@ for line in sys.stdin:
         // replacing A's. Future multi-slot collection can therefore maintain
         // both accounts independently.
         write_claude_oauth_usage_cache(&fallback).expect("write fallback cache");
-        assert!(read_claude_oauth_usage_cache(&account_a).is_some());
+        assert!(read_claude_oauth_usage_cache(&account_a, organization_a).is_some());
         assert!(claude_oauth_usage_cache_path(&account_b).is_file());
         assert_ne!(
             claude_oauth_usage_cache_path(&account_a),
@@ -7925,37 +9645,137 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_oauth_usage_cache_account_match_is_exact_both_ways() {
-        let cache = |hash: &str| ClaudeOAuthUsageCache {
+    fn claude_oauth_usage_cache_rejects_mismatched_embedded_meter_identity() {
+        let mut cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
-            account_identifier_hash: hash.to_string(),
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 200,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("organization-a".to_string()),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        };
+        assert!(claude_oauth_usage_cache_belongs_to_identity(
+            &cache,
+            "account-a",
+            "organization-a",
+        ));
+        cache.windows[0].organization_identifier_hash = Some("organization-b".to_string());
+        assert!(!claude_oauth_usage_cache_belongs_to_identity(
+            &cache,
+            "account-a",
+            "organization-a",
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn missing_token_serves_exact_two_hour_cache_stale_past_open_breaker() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-no-token-stale-cache-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let _network_guard =
+            EnvVarGuard::set_os("OTTTO_DISABLE_CLAUDE_OAUTH_USAGE", OsString::from("0"));
+        let account = "account-stale";
+        let organization = "organization-stale";
+        let now = current_unix_seconds();
+        let observed_at = now.saturating_sub(2 * 60 * 60);
+        write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account.to_string(),
+            organization_identifier_hash: organization.to_string(),
+            observed_at_epoch_seconds: observed_at,
+            next_refresh_after_epoch_seconds: observed_at + CLAUDE_OAUTH_USAGE_REFRESH_SECONDS,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                freshness: AgentQuotaWindowFreshness::Fresh,
+                account_identifier_hash: Some(account.to_string()),
+                organization_identifier_hash: Some(organization.to_string()),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        })
+        .expect("write exact stale cache");
+        let fingerprint = claude_oauth_usage_config_fingerprint();
+        for _ in 0..ClaudeOAuthUsageFailure::AuthRejected.threshold() {
+            record_claude_oauth_usage_failure(
+                ClaudeOAuthUsageFailure::AuthRejected,
+                account,
+                &fingerprint,
+                now,
+            );
+        }
+        assert!(read_claude_oauth_usage_breaker(account, &fingerprint)
+            .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(&breaker, now)));
+        let calls_before = CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome =
+            collect_claude_oauth_usage_with_access_token(account, organization, None, false);
+
+        let usage = outcome.result.expect("serve exact stale cache");
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].freshness, AgentQuotaWindowFreshness::Stale);
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "claude_oauth_usage_circuit_open"));
+        assert_eq!(
+            CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before,
+            "a missing token must never admit a provider call"
+        );
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    fn claude_oauth_usage_cache_identity_match_is_exact_both_ways() {
+        let cache = |account_hash: &str, organization_hash: &str| ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account_hash.to_string(),
+            organization_identifier_hash: organization_hash.to_string(),
             observed_at_epoch_seconds: 0,
             next_refresh_after_epoch_seconds: 0,
             windows: Vec::new(),
             credit_balances: Vec::new(),
         };
 
-        assert!(claude_oauth_usage_cache_belongs_to_account(
-            &cache("account-a"),
-            "account-a"
+        assert!(claude_oauth_usage_cache_belongs_to_identity(
+            &cache("account-a", "organization-a"),
+            "account-a",
+            "organization-a",
         ));
-        assert!(!claude_oauth_usage_cache_belongs_to_account(
-            &cache("account-a"),
-            "account-b"
+        assert!(!claude_oauth_usage_cache_belongs_to_identity(
+            &cache("account-a", "organization-a"),
+            "account-b",
+            "organization-a",
         ));
-        // A named cache is not served to an unidentifiable credential, and an
-        // unattributed cache is not adopted by a named account.
-        assert!(!claude_oauth_usage_cache_belongs_to_account(
-            &cache("account-a"),
-            ""
+        assert!(!claude_oauth_usage_cache_belongs_to_identity(
+            &cache("account-a", "organization-a"),
+            "account-a",
+            "organization-b",
         ));
-        assert!(!claude_oauth_usage_cache_belongs_to_account(
-            &cache(""),
-            "account-a"
+        assert!(!claude_oauth_usage_cache_belongs_to_identity(
+            &cache("account-a", "organization-a"),
+            "",
+            "",
         ));
-        // Nothing observable changed: keep serving rather than hammering a
-        // rate-limited endpoint every tick.
-        assert!(claude_oauth_usage_cache_belongs_to_account(&cache(""), ""));
+        assert!(!claude_oauth_usage_cache_belongs_to_identity(
+            &cache("", ""),
+            "",
+            "",
+        ));
     }
 
     #[test]
@@ -7972,11 +9792,17 @@ for line in sys.stdin:
             support_dir.as_os_str().to_os_string(),
         );
         let cache = ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            schema_version: CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 200,
-            windows: Vec::new(),
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                account_identifier_hash: Some("account-a".to_string()),
+                organization_identifier_hash: Some("organization-a".to_string()),
+                ..Default::default()
+            }],
             credit_balances: Vec::new(),
         };
         fs::write(
@@ -7985,16 +9811,136 @@ for line in sys.stdin:
         )
         .expect("write legacy cache");
 
-        assert!(read_claude_oauth_usage_cache("account-b").is_none());
+        assert!(read_claude_oauth_usage_cache("account-b", "organization-b").is_none());
         assert!(claude_oauth_usage_legacy_cache_path().is_file());
         assert_eq!(
-            read_claude_oauth_usage_cache("account-a")
+            read_claude_oauth_usage_cache("account-a", "organization-a")
                 .expect("migrated cache")
                 .account_identifier_hash,
             "account-a"
         );
         assert!(claude_oauth_usage_cache_path("account-a").is_file());
         assert!(!claude_oauth_usage_legacy_cache_path().exists());
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn default_account_state_is_mirrored_for_downgrade_without_custom_account_leakage() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-downgrade-mirror-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let default_cache = ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-default".to_string(),
+            organization_identifier_hash: "organization-default".to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: u64::MAX,
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                used_percent: Some(20),
+                account_identifier_hash: Some("account-default".to_string()),
+                organization_identifier_hash: Some("organization-default".to_string()),
+                ..Default::default()
+            }],
+            credit_balances: Vec::new(),
+        };
+        let custom_cache = ClaudeOAuthUsageCache {
+            account_identifier_hash: "account-custom".to_string(),
+            organization_identifier_hash: "organization-custom".to_string(),
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                used_percent: Some(80),
+                account_identifier_hash: Some("account-custom".to_string()),
+                organization_identifier_hash: Some("organization-custom".to_string()),
+                ..Default::default()
+            }],
+            ..default_cache.clone()
+        };
+        write_claude_oauth_usage_cache(&default_cache).expect("write default account cache");
+        write_legacy_claude_oauth_usage_cache(&default_cache).expect("mirror legacy cache");
+        assert!(read_claude_oauth_usage_cache_with_legacy_migration(
+            "account-custom",
+            "organization-custom",
+            false,
+        )
+        .is_none());
+        assert!(
+            claude_oauth_usage_legacy_cache_path().is_file(),
+            "a custom-first read must not consume the default downgrade cache"
+        );
+        write_claude_oauth_usage_cache(&custom_cache).expect("write custom account cache");
+
+        let legacy_cache: ClaudeOAuthUsageCache = serde_json::from_str(
+            &fs::read_to_string(claude_oauth_usage_legacy_cache_path()).expect("read legacy cache"),
+        )
+        .expect("parse legacy cache");
+        assert_eq!(legacy_cache.account_identifier_hash, "account-default");
+        assert_eq!(
+            legacy_cache.schema_version,
+            CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION
+        );
+        assert_eq!(legacy_cache.windows[0].used_percent, Some(20));
+        assert_eq!(
+            read_claude_oauth_usage_cache("account-custom", "organization-custom")
+                .expect("read custom cache")
+                .windows[0]
+                .used_percent,
+            Some(80)
+        );
+
+        let fingerprint = "fingerprint-default";
+        record_claude_oauth_usage_failure_with_legacy(
+            ClaudeOAuthUsageFailure::AuthRejected,
+            "account-default",
+            fingerprint,
+            1_000,
+            true,
+        );
+        assert!(read_claude_oauth_usage_breaker_with_legacy_migration(
+            "account-custom",
+            "fingerprint-custom",
+            false,
+        )
+        .is_none());
+        assert!(
+            claude_oauth_usage_legacy_breaker_path().is_file(),
+            "a custom-first read must not consume the default downgrade breaker"
+        );
+        record_claude_oauth_usage_failure_with_legacy(
+            ClaudeOAuthUsageFailure::ResponseShape,
+            "account-custom",
+            "fingerprint-custom",
+            1_000,
+            false,
+        );
+        let legacy_breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(
+            &fs::read_to_string(claude_oauth_usage_legacy_breaker_path())
+                .expect("read legacy breaker"),
+        )
+        .expect("parse legacy breaker");
+        assert_eq!(legacy_breaker.account_identifier_hash, "account-default");
+        assert_eq!(legacy_breaker.config_fingerprint, fingerprint);
+        assert_eq!(legacy_breaker.auth_failures, 1);
+        assert_eq!(legacy_breaker.shape_failures, 0);
+        assert_eq!(
+            read_claude_oauth_usage_breaker("account-custom", "fingerprint-custom")
+                .expect("read custom breaker")
+                .shape_failures,
+            1
+        );
+
+        clear_claude_oauth_usage_breaker_with_legacy("account-default", true);
+        assert!(!claude_oauth_usage_legacy_breaker_path().exists());
+        assert!(read_claude_oauth_usage_breaker("account-default", fingerprint).is_none());
+        assert!(read_claude_oauth_usage_breaker("account-custom", "fingerprint-custom").is_some());
         let _ = fs::remove_dir_all(support_dir);
     }
 
@@ -8012,11 +9958,17 @@ for line in sys.stdin:
             support_dir.as_os_str().to_os_string(),
         );
         let cache = ClaudeOAuthUsageCache {
-            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            schema_version: CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION,
             account_identifier_hash: "account-concurrent".to_string(),
+            organization_identifier_hash: "organization-concurrent".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 200,
-            windows: Vec::new(),
+            windows: vec![AgentQuotaWindow {
+                name: "session".to_string(),
+                account_identifier_hash: Some("account-concurrent".to_string()),
+                organization_identifier_hash: Some("organization-concurrent".to_string()),
+                ..Default::default()
+            }],
             credit_balances: Vec::new(),
         };
         fs::write(
@@ -8028,7 +9980,7 @@ for line in sys.stdin:
         let workers: Vec<_> = (0..12)
             .map(|_| {
                 std::thread::spawn(|| {
-                    read_claude_oauth_usage_cache("account-concurrent")
+                    read_claude_oauth_usage_cache("account-concurrent", "organization-concurrent")
                         .expect("migrated cache")
                         .account_identifier_hash
                 })
@@ -8072,6 +10024,7 @@ for line in sys.stdin:
         let cache = ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: account.to_string(),
+            organization_identifier_hash: "organization-atomic".to_string(),
             observed_at_epoch_seconds: 100,
             next_refresh_after_epoch_seconds: 200,
             windows: Vec::new(),
@@ -8165,6 +10118,7 @@ for line in sys.stdin:
                     write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
                         schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
                         account_identifier_hash: "account-concurrent-cache".to_string(),
+                        organization_identifier_hash: "organization-concurrent-cache".to_string(),
                         observed_at_epoch_seconds,
                         next_refresh_after_epoch_seconds: observed_at_epoch_seconds + 100,
                         windows: Vec::new(),
@@ -8176,8 +10130,11 @@ for line in sys.stdin:
         for worker in workers {
             worker.join().expect("worker").expect("cache write");
         }
-        let cache = read_claude_oauth_usage_cache("account-concurrent-cache")
-            .expect("complete cache after concurrent writes");
+        let cache = read_claude_oauth_usage_cache(
+            "account-concurrent-cache",
+            "organization-concurrent-cache",
+        )
+        .expect("complete cache after concurrent writes");
         assert!(cache.observed_at_epoch_seconds < WORKERS);
         assert_eq!(
             cache.next_refresh_after_epoch_seconds,
@@ -8589,6 +10546,7 @@ for line in sys.stdin:
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: String::new(),
+            organization_identifier_hash: String::new(),
             observed_at_epoch_seconds: current_unix_seconds(),
             next_refresh_after_epoch_seconds: current_unix_seconds() + 60,
             windows: vec![AgentQuotaWindow {
@@ -9177,6 +11135,143 @@ for line in sys.stdin:
         claude_oauth_stamp_account_identity(&mut unresolved, "", Some(""));
         assert_eq!(unresolved.windows[0].account_identifier_hash, None);
         assert_eq!(unresolved.windows[0].organization_identifier_hash, None);
+    }
+
+    #[test]
+    fn claude_exact_slot_auth_requires_positive_real_cli_field_agreement() {
+        let oauth = ClaudeCliOauthAccount {
+            account_uuid: Some("account-a".to_string()),
+            email_address: Some("person@example.invalid".to_string()),
+            organization_uuid: Some("organization-a".to_string()),
+            ..Default::default()
+        };
+        let auth = AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            email: Some("person@example.invalid".to_string()),
+            organization_id: Some("organization-a".to_string()),
+            account_id: None,
+            ..unsupported_account("anthropic")
+        };
+        assert_eq!(
+            require_claude_auth_identity_agreement(&auth, &oauth),
+            Ok(())
+        );
+
+        let missing_email = AgentAccountStatus {
+            email: None,
+            ..auth.clone()
+        };
+        assert_eq!(
+            require_claude_auth_identity_agreement(&missing_email, &oauth),
+            Err(ClaudeSlotProbeFailure::IdentityUnknown)
+        );
+        let missing_organization = AgentAccountStatus {
+            organization_id: None,
+            ..auth.clone()
+        };
+        assert_eq!(
+            require_claude_auth_identity_agreement(&missing_organization, &oauth),
+            Err(ClaudeSlotProbeFailure::IdentityUnknown)
+        );
+        let rotated_credential = AgentAccountStatus {
+            email: Some("rotated@example.invalid".to_string()),
+            organization_id: Some("organization-rotated".to_string()),
+            ..auth
+        };
+        assert_eq!(
+            require_claude_auth_identity_agreement(&rotated_credential, &oauth),
+            Err(ClaudeSlotProbeFailure::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn claude_stale_same_account_fallback_is_uploadable_but_not_fresh() {
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-04T12:00:00Z".to_string(),
+            "2026-08-04T12:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..unsupported_account("anthropic")
+        });
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "session".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..Default::default()
+        }];
+        snapshot.credit_balances = vec![AgentCreditBalance {
+            name: "Usage credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Stale,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..Default::default()
+        }];
+
+        assert!(claude_default_snapshot_is_uploadable(&snapshot));
+        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(2));
+        assert_eq!(
+            claude_default_slot_collection_status(&snapshot).state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+
+        snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "weekly".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: None,
+            ..Default::default()
+        });
+        assert!(
+            !claude_default_snapshot_is_uploadable(&snapshot),
+            "partial identity must not create a backend row"
+        );
+        assert_eq!(
+            claude_default_slot_collection_status(&snapshot).state,
+            ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        );
+
+        snapshot.collection_method = AgentStatusCollectionMethod::StatusLine;
+        snapshot.quota_windows.truncate(1);
+        snapshot.quota_windows[0].organization_identifier_hash = None;
+        snapshot.credit_balances.clear();
+        assert!(
+            claude_default_snapshot_is_uploadable(&snapshot),
+            "an attributed default statusLine partial remains uploadable"
+        );
+        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(1));
+    }
+
+    #[test]
+    fn claude_candidate_rank_prefers_fresh_full_over_stale_full() {
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-04T12:00:00Z".to_string(),
+            "2026-08-04T12:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            account_identifier_hash: Some("account-a".to_string()),
+            organization_identifier_hash: Some("organization-a".to_string()),
+            ..unsupported_account("anthropic")
+        });
+        snapshot.quota_windows = vec![AgentQuotaWindow {
+            name: "session".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            account_identifier_hash: Some("account-a".to_string()),
+            organization_identifier_hash: Some("organization-a".to_string()),
+            ..Default::default()
+        }];
+        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(3));
+        snapshot.quota_windows[0].freshness = AgentQuotaWindowFreshness::Stale;
+        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(2));
     }
 
     #[test]

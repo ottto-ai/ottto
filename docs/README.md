@@ -23,6 +23,9 @@ CLI and `ottto-service` daemon, not private development scripts.
   boundaries, Pi CLI usage, and the public-v1 MCP deferral.
 - [Active Session Surfaces](session-surfaces.md): canonical Desktop, CLI,
   exec, and SDK provenance in local active-session status.
+- [Claude Accounts](claude-accounts.md): default and registered credential
+  slots, full-meter identity gates, partial statusLine data, and local failure
+  isolation.
 - [Release Verification](release-verification.md): checksums, signing,
   notarization, SBOM, and provenance checks.
 - [Troubleshooting](troubleshooting.md): common exit codes and recovery steps.
