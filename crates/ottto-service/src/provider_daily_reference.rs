@@ -20,9 +20,10 @@
 //!   `wham/analytics/daily-workspace-usage-counts` is read. `wham/tasks/*`,
 //!   `teleport-events`, and `/v1/sessions` are permanently out of scope.
 //! * **The credential and the raw response body never leave the machine.**
-//! * **Dark by default.** No grant, no sentinel-free support directory, no
-//!   approved server policy, or an unadmitted collector version each stop the
-//!   cycle before a socket is opened.
+//! * **Dark by default.** No grant, no sentinel-free support directory, or no
+//!   approved server policy each stop the cycle before a socket is opened.
+//!   The backend separately applies its collector-build admission list to each
+//!   upload and stores nothing from an unadmitted build.
 
 use anyhow::{anyhow, Context, Result};
 use getrandom::fill as random_fill;
@@ -320,8 +321,9 @@ pub struct DailyReferenceGrant {
     pub schema_version: String,
     pub source: String,
     pub collector_id: String,
-    /// Server-owned. Only [`GrantStore::bind_backend_grant`] writes it, and a
-    /// binary whose release version differs is refused at runtime.
+    /// Informational build recorded from the backend grant response. Only
+    /// [`GrantStore::bind_backend_grant`] writes it; uploads independently
+    /// report the running build for backend admission.
     pub collector_version: String,
     pub release_lane: String,
     pub disclosure_version: String,
@@ -456,8 +458,7 @@ impl GrantStore {
     }
 
     /// Record local consent. The grant is not live until the backend binds it:
-    /// `collector_version` stays empty and `backend_create_pending` is set, so
-    /// [`grant_runtime_ready`] refuses it.
+    /// `backend_create_pending` is set, so [`grant_runtime_ready`] refuses it.
     pub fn enable(&self, setup: &GrantSetup, now: OffsetDateTime) -> Result<DailyReferenceGrant> {
         if !is_uuid(&setup.installation_id) {
             return Err(anyhow!("installation id is not a device uuid"));
@@ -529,8 +530,8 @@ impl GrantStore {
     }
 
     /// Bind the server's answer. This is the only writer of `collector_version`
-    /// and of the backend binding: the server owns admission, the client only
-    /// compares the answer to its own release.
+    /// and of the backend binding. Build governance remains server-owned: each
+    /// upload reports the running release for backend admission.
     pub fn bind_backend_grant(
         &self,
         response: &GrantResponse,
@@ -713,16 +714,15 @@ fn validate_grant_response(
 
 /// The single answer to "may this build collect right now".
 ///
-/// Note the `collector_version` check: the server states which build it
-/// admitted, and a daemon upgrade therefore makes the stored grant ineligible
-/// until the customer re-consents on the new build. Consent is per build.
+/// `disclosure_version` remains the local "what is read" gate and must match.
+/// Collector build governance lives in the backend admission list, so a daemon
+/// upgrade does not make stored consent ineligible or require re-consent.
 pub fn grant_runtime_ready(grant: &DailyReferenceGrant) -> bool {
     grant.status == GrantStatus::Enabled
         && grant.schema_version == SCHEMA_VERSION
         && grant.source == SOURCE
         && grant.collector_id == COLLECTOR_ID
         && grant.disclosure_version == DISCLOSURE_VERSION
-        && grant.collector_version == compiled_release_version()
         && !grant.backend_create_pending
         && grant.backend_binding.as_ref().is_some_and(|binding| {
             !binding.backend_revoked
@@ -740,8 +740,8 @@ pub const COLLECTOR_STATUS_SCHEMA_VERSION: &str = "provider_daily_reference_coll
 
 /// What the capability is actually doing right now, as opposed to what the
 /// stored grant says. `grant_status` is the persisted consent record;
-/// `runtime_state` folds in the local off-switch, server policy, and the
-/// per-build admission rule.
+/// `runtime_state` folds in the local off-switch and server policy. Build
+/// admission remains a backend upload decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeState {
@@ -799,11 +799,6 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
                     || binding.server_policy_state != ServerPolicyState::Approved
             })
     });
-    let version_rebind_required = stored.as_ref().is_some_and(|grant| {
-        grant.status == GrantStatus::Enabled
-            && !grant.backend_create_pending
-            && grant.collector_version != compiled_release_version()
-    });
     let runtime_ready = stored.as_ref().is_some_and(grant_runtime_ready);
     let provider_read_permitted = runtime_ready && !network_disabled;
 
@@ -819,11 +814,6 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
         (
             RuntimeState::ConsentRequired,
             "backend_grant_reconciliation_required",
-        )
-    } else if version_rebind_required {
-        (
-            RuntimeState::ConsentRequired,
-            "collector_version_rebind_required",
         )
     } else if runtime_ready {
         (RuntimeState::Enabled, "enabled")
@@ -1856,7 +1846,7 @@ fn map_upload_error(error: &anyhow::Error) -> UploadError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleOutcome {
-    /// Sentinel, absent consent, unapproved policy, or an unadmitted build.
+    /// Sentinel, absent consent, mismatched disclosure, or unapproved policy.
     Disabled,
     /// The breaker is open; no provider request was made.
     CircuitOpen,
@@ -1959,10 +1949,11 @@ impl Collector {
 
     /// Run one collection cycle.
     ///
-    /// Every gate below runs before a socket is opened, in this order: the
-    /// sentinel, live consent at the current epoch on this exact build, the
+    /// Every local gate below runs before a socket is opened, in this order:
+    /// the sentinel, live consent at the current epoch and disclosure, the
     /// live credential proving it is the installation and account consent was
-    /// taken over, the circuit breaker, and finally the cadence gate.
+    /// taken over, the circuit breaker, and finally the cadence gate. The
+    /// backend applies build admission when the resulting batch is uploaded.
     pub fn collect_once(
         &self,
         runtime: &Runtime,
@@ -3599,16 +3590,29 @@ mod tests {
     }
 
     #[test]
-    fn runtime_readiness_fails_closed_on_every_axis() {
+    fn runtime_readiness_ignores_collector_version_when_disclosure_matches() {
         let collector = collector("runtime-readiness");
+        let mut grant = enabled(&collector);
+        grant.collector_version = "99.99.99".to_string();
+
+        assert_eq!(grant.disclosure_version, DISCLOSURE_VERSION);
+        assert!(grant_runtime_ready(&grant));
+    }
+
+    #[test]
+    fn runtime_readiness_refuses_a_different_disclosure_version() {
+        let collector = collector("runtime-readiness-disclosure");
+        let mut grant = enabled(&collector);
+        grant.disclosure_version = "provider_daily_reference_disclosure.v2".to_string();
+
+        assert!(!grant_runtime_ready(&grant));
+    }
+
+    #[test]
+    fn runtime_readiness_fails_closed_on_every_other_axis() {
+        let collector = collector("runtime-readiness-other-axes");
         let grant = enabled(&collector);
         assert!(grant_runtime_ready(&grant));
-
-        // A daemon upgrade makes the recorded consent ineligible: the server
-        // states the admitted build and consent is per build.
-        let mut upgraded = grant.clone();
-        upgraded.collector_version = "99.99.99".to_string();
-        assert!(!grant_runtime_ready(&upgraded));
 
         // Server policy defaults closed.
         let mut disabled_policy = grant.clone();
@@ -3632,10 +3636,6 @@ mod tests {
         let mut unbound = grant.clone();
         unbound.backend_binding = None;
         assert!(!grant_runtime_ready(&unbound));
-
-        let mut wrong_disclosure = grant.clone();
-        wrong_disclosure.disclosure_version = "something_else.v1".to_string();
-        assert!(!grant_runtime_ready(&wrong_disclosure));
 
         let mut revoked = grant;
         revoked.status = GrantStatus::Revoked;
@@ -3756,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_status_separates_policy_from_build_admission() {
+    fn collector_status_enforces_policy_without_pinning_consent_to_a_build() {
         let collector = collector("collector-status-policy");
         let grant = enabled(&collector);
 
@@ -3775,7 +3775,7 @@ mod tests {
         assert_eq!(policy.reason_code, "policy_disabled");
         assert!(!policy.provider_read_permitted);
 
-        // An upgraded daemon needs re-consent, and says so distinctly.
+        // Build admission is a backend upload decision, not a consent gate.
         persisted["grant"]["backend_binding"]["server_policy_state"] =
             serde_json::Value::String("approved".to_string());
         persisted["grant"]["collector_version"] = serde_json::Value::String("0.0.1".to_string());
@@ -3784,10 +3784,10 @@ mod tests {
             serde_json::to_vec_pretty(&persisted).expect("encode"),
         )
         .expect("write");
-        let rebind = collector_status(collector.grants(), false);
-        assert_eq!(rebind.runtime_state, RuntimeState::ConsentRequired);
-        assert_eq!(rebind.reason_code, "collector_version_rebind_required");
-        assert!(!rebind.provider_read_permitted);
+        let build_changed = collector_status(collector.grants(), false);
+        assert_eq!(build_changed.runtime_state, RuntimeState::Enabled);
+        assert_eq!(build_changed.reason_code, "enabled");
+        assert!(build_changed.provider_read_permitted);
         assert_eq!(grant.status, GrantStatus::Enabled);
     }
 
@@ -3866,18 +3866,70 @@ mod tests {
     }
 
     #[test]
-    fn an_unadmitted_build_stops_before_the_provider_is_contacted() {
-        let collector = collector("unadmitted-build");
+    fn an_upload_from_a_different_admitted_build_is_accepted_when_disclosure_matches() {
+        let collector = collector("different-admitted-build");
         let grant = enabled(&collector);
-        let mut upgraded = grant_response(&grant, "enabled", 2);
-        upgraded.collector_version = "99.99.99".to_string();
+        let mut previously_admitted = grant_response(&grant, "enabled", 2);
+        previously_admitted.collector_version = if compiled_release_version() == "99.99.99" {
+            "98.98.98".to_string()
+        } else {
+            "99.99.99".to_string()
+        };
+        let rebound = collector
+            .grants()
+            .bind_backend_grant(&previously_admitted, INSTALLATION_ID)
+            .expect("bind the previously admitted build");
+        assert_ne!(rebound.collector_version, compiled_release_version());
+        assert_eq!(rebound.disclosure_version, DISCLOSURE_VERSION);
+
+        // The recording transport represents backend acceptance of the
+        // running build under its current admission list.
+        let reader = StaticReader::new(poisoned_payload());
+        let transport = RecordingTransport::default();
+        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+
+        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
+        assert_eq!(reader.calls.get(), 1);
+        assert_eq!(transport.batches.borrow().len(), 1);
+        assert_eq!(
+            transport.batches.borrow()[0]["collector_version"],
+            compiled_release_version()
+        );
+    }
+
+    #[test]
+    fn an_admitted_build_with_a_different_disclosure_is_refused() {
+        let collector = collector("admitted-build-disclosure-mismatch");
+        let grant = enabled(&collector);
+        let mut previously_admitted = grant_response(&grant, "enabled", 2);
+        previously_admitted.collector_version = if compiled_release_version() == "99.99.99" {
+            "98.98.98".to_string()
+        } else {
+            "99.99.99".to_string()
+        };
         collector
             .grants()
-            .bind_backend_grant(&upgraded, INSTALLATION_ID)
-            .expect("bind a build this binary is not");
+            .bind_backend_grant(&previously_admitted, INSTALLATION_ID)
+            .expect("bind the previously admitted build");
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
+                .expect("decode");
+        persisted["grant"]["disclosure_version"] =
+            serde_json::Value::String("provider_daily_reference_disclosure.v2".to_string());
+        fs::write(
+            collector.grants().path(),
+            serde_json::to_vec_pretty(&persisted).expect("encode"),
+        )
+        .expect("write");
+
         let cycle =
             collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
         assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+        let status = collector_status(collector.grants(), false);
+        assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
+        assert_eq!(status.reason_code, "consent_required");
+        assert!(!status.provider_read_permitted);
     }
 
     #[test]
