@@ -1,5 +1,6 @@
 pub mod account_store;
 pub mod claude_account;
+pub mod claude_config_slots;
 pub mod claude_statusline;
 pub mod lifecycle;
 pub mod local_client;
@@ -22,6 +23,11 @@ pub use claude_account::{
     billing_identity_hash, claude_account_identifier_hash, claude_cli_account_identifier_hash,
     claude_cli_account_identifier_hash_at, claude_cli_account_identifier_hash_from_config,
     default_claude_cli_config_path, CLAUDE_CLI_CONFIG_FILE_NAME,
+};
+pub use claude_config_slots::{
+    ClaudeConfigDirSlot, ClaudeConfigSlotSettingsError, FileClaudeConfigSlotSettingsStore,
+    CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME, CLAUDE_OAUTH_KEYCHAIN_SERVICE, MAX_CLAUDE_ACCOUNT_SLOTS,
+    MAX_CLAUDE_CONFIG_DIR_BYTES, MAX_REGISTERED_CLAUDE_CONFIG_SLOTS,
 };
 pub use claude_statusline::{
     append_claude_statusline_context_history, claude_statusline_cache_path,
@@ -61,8 +67,9 @@ pub use status::{
 };
 pub use token_store::{
     client_control_token, disable_keychain_user_interaction, generate_control_token,
-    load_or_create_control_token, ControlTokenStore, KeychainSecretStore, TokenStoreError,
-    OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE, OTTTO_LEGACY_KEYCHAIN_SERVICE,
-    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    load_or_create_control_token, write_owner_only_file_atomic, ControlTokenStore,
+    KeychainSecretStore, TokenStoreError, OTTTO_KEYCHAIN_ACCOUNT, OTTTO_KEYCHAIN_SERVICE,
+    OTTTO_LEGACY_KEYCHAIN_SERVICE, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
