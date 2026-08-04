@@ -2903,6 +2903,12 @@ pub fn spawn_codex_daily_aggregate_collector() -> Result<CollectorStartup> {
             let cycle = collect_composed_once(OffsetDateTime::now_utc());
             if !matches!(cycle.outcome, CycleOutcome::Disabled | CycleOutcome::Noop) {
                 eprintln!("{}", cycle_summary_log(&cycle));
+                // The cycle explains an empty window in its diagnostics. Print
+                // them, or the guarantee that a zero-row cycle always names the
+                // stage that lost the rows is built and then thrown away.
+                for line in cycle_diagnostic_logs(&cycle) {
+                    eprintln!("{line}");
+                }
             }
             thread::sleep(POLL_INTERVAL + cycle_jitter());
         });
@@ -2923,6 +2929,38 @@ fn cycle_summary_log(cycle: &Cycle) -> String {
         cycle.outcome,
         cycle.diagnostics.len()
     )
+}
+
+/// At most this many diagnostic lines per cycle. A pathological payload must
+/// not be able to flood the log; the surplus is reported as a count instead.
+const MAX_LOGGED_DIAGNOSTICS: usize = 20;
+
+/// One log line per diagnostic the cycle produced, bounded.
+///
+/// The messages are already built to be safe to print: counts, UTC dates, and
+/// bounded key *names* only. Nothing here reaches into the provider payload.
+fn cycle_diagnostic_logs(cycle: &Cycle) -> Vec<String> {
+    let mut lines: Vec<String> = cycle
+        .diagnostics
+        .iter()
+        .take(MAX_LOGGED_DIAGNOSTICS)
+        .map(|diagnostic| {
+            format!(
+                "codex_daily_aggregates_collector_diagnostic severity={:?} code={} message={:?}",
+                diagnostic.severity, diagnostic.code, diagnostic.message
+            )
+        })
+        .collect();
+    let suppressed = cycle
+        .diagnostics
+        .len()
+        .saturating_sub(MAX_LOGGED_DIAGNOSTICS);
+    if suppressed > 0 {
+        lines.push(format!(
+            "codex_daily_aggregates_collector_diagnostic suppressed={suppressed}"
+        ));
+    }
+    lines
 }
 
 fn cycle_jitter() -> Duration {
@@ -4696,6 +4734,55 @@ mod tests {
             clock += TimeDuration::hours(7);
         }
         assert_eq!(reader.calls.get(), 4, "transients must keep being retried");
+    }
+
+    #[test]
+    fn every_cycle_diagnostic_reaches_the_log() {
+        let collector = collector("diagnostics-are-logged");
+        let grant = enabled(&collector);
+        let reader = StaticReader::new(json!({
+            "results": [{"date": "2026-07-26", "clients": []}]
+        }));
+        let transport = RecordingTransport::default();
+
+        let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+
+        // The zero-row guarantee is only worth anything if an operator can read
+        // the explanation it produced.
+        let lines = cycle_diagnostic_logs(&cycle);
+        assert_eq!(lines.len(), cycle.diagnostics.len());
+        for diagnostic in &cycle.diagnostics {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&format!("code={}", diagnostic.code))),
+                "diagnostic {} never reached the log",
+                diagnostic.code
+            );
+        }
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("codex_daily_aggregates_zero_rows_explained")));
+        let _ = grant;
+    }
+
+    #[test]
+    fn diagnostic_logging_is_bounded() {
+        let mut cycle = Cycle::new(CycleOutcome::Uploaded);
+        for index in 0..(MAX_LOGGED_DIAGNOSTICS + 5) {
+            cycle.diagnostics.push(info(
+                &format!("codex_daily_aggregates_test_{index}"),
+                "bounded",
+            ));
+        }
+
+        let lines = cycle_diagnostic_logs(&cycle);
+
+        assert_eq!(lines.len(), MAX_LOGGED_DIAGNOSTICS + 1);
+        assert!(lines
+            .last()
+            .expect("suppressed line")
+            .contains("suppressed=5"));
     }
 
     // -- upload ------------------------------------------------------------
