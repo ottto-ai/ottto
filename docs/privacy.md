@@ -216,8 +216,12 @@ Live telemetry is source-level opt-in. Setup can mint scoped setup keys and
 write local source config through `ottto-service`. Opt-out must remove fenced
 local config or Keychain state before backend setup-key revocation completes.
 
-Claude Code can continue sending its documented OTLP logs to Ottto's loopback
-daemon when cloud live telemetry is off. The daemon reduces only content-free
+Reasoning effort is read from the Claude transcript itself, which records the
+applied tier on each assistant record. No OTLP is required for it.
+
+Claude Code can also continue sending its documented OTLP logs to Ottto's
+loopback daemon when cloud live telemetry is off. That path now only supplies
+effort for older transcripts that predate the transcript-native field. The daemon reduces only content-free
 per-request effort evidence (session id, API request id, timestamp, model,
 effort, and token counters) into owner-only hashed local sidecars and uploads
 it later through the aggregate local snapshot path. It never persists the raw

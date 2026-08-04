@@ -186,7 +186,16 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // maps to is unchanged, and the effort sidecar fingerprint already re-selects a
 // transcript whose evidence grew after its final write.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v27";
+// claude_code v28: read the applied reasoning-effort tier straight off the
+// assistant transcript record. Current Claude Code writes `"effort":"high"` on
+// the record whose usage this is, which makes the OTLP sidecar unnecessary for
+// effort: no loopback relay dependency, and no way for a subagent turn to be
+// attributed to its parent, because nothing is pooled per session to begin with.
+// Measured over two days of local transcripts: 99% of top-level and 72% of
+// subagent usage records carry it (the remainder is Haiku, which has no tier),
+// and it matched the OTLP sidecar on 7020 of 7020 records both described. The
+// sidecar stays as the fallback for older transcripts that omit the field.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v28";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -1492,6 +1501,23 @@ fn snapshot_semantic_activity_at(item: &SnapshotItem) -> Option<String> {
         })
         .max_by_key(|(parsed, _)| *parsed)
         .map(|(_, value)| value.to_string())
+}
+
+/// Reasoning-effort tiers Claude Code reports today. Kept in one place so the
+/// transcript reader and the OTLP sidecar admit exactly the same vocabulary.
+const CLAUDE_EFFORT_TIERS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The applied reasoning-effort tier recorded on this transcript record.
+///
+/// Claude Code writes it as a top-level `effort` field on assistant records.
+/// Unknown or malformed values degrade to `None` (effort-unknown) rather than
+/// inventing a tier, and the vocabulary check keeps a future Claude tier from
+/// silently widening the column the backend stores this in.
+fn claude_transcript_effort(value: &Value) -> Option<String> {
+    let effort = string_at(value, &["effort"])?.trim().to_ascii_lowercase();
+    CLAUDE_EFFORT_TIERS
+        .contains(&effort.as_str())
+        .then_some(effort)
 }
 
 /// Anthropic request id -> applied reasoning-effort tier, for one scan.
@@ -7696,12 +7722,16 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 "derived_from_effective_input_volume",
             );
         }
-        // Claude Code surfaces per-turn effort via OTLP, never in the transcript.
-        // The sidecar carries the API request id, and the transcript repeats it
-        // as `requestId`, so the tier attaches to the exact turn that used it --
-        // no hourly reconciliation, and subagent turns land on their own
-        // transcript instead of the parent's.
-        let reasoning_effort = accumulator.claude_effort_for_line(value);
+        // Current Claude Code stamps the applied tier on the assistant record
+        // itself (`"effort":"high"`), so the transcript is authoritative and no
+        // OTLP is required: the tier is already on the record whose usage this
+        // is, in the parent and sidechain transcripts alike.
+        //
+        // Older transcripts carry no such field. For those, fall back to the
+        // local OTLP sidecar keyed by API request id. Both sources were compared
+        // over 7020 records that each described, and they agreed on every one.
+        let reasoning_effort =
+            claude_transcript_effort(value).or_else(|| accumulator.claude_effort_for_line(value));
         accumulator.add_usage_with_selector(
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
@@ -18808,6 +18838,137 @@ mod tests {
             .any(|fact| fact.field == "provider_surface" && fact.value == "claude_cli"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_transcript_effort_is_read_without_any_otlp_sidecar() {
+        // The whole point: no effort index is threaded in, and the tiers still
+        // land, because current Claude Code stamps them on the record itself.
+        let path = temp_file("claude-transcript-effort");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-04T10:00:00Z\",\"sessionId\":\"transcript-effort-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-04T10:01:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"xhigh\",\"requestId\":\"req_A\",\"message\":{\"id\":\"msg_A\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-04T10:02:00Z\",\"sessionId\":\"transcript-effort-1\",\"type\":\"assistant\",\"effort\":\"low\",\"requestId\":\"req_B\",\"message\":{\"id\":\"msg_B\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-04T10:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        let mut split: Vec<(Option<String>, u64)> = item
+            .model_usage
+            .iter()
+            .map(|row| (row.reasoning_effort.clone(), row.input_tokens))
+            .collect();
+        split.sort();
+        assert_eq!(
+            split,
+            vec![
+                (Some("low".to_string()), 20),
+                (Some("xhigh".to_string()), 10)
+            ]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_transcript_effort_wins_over_the_otlp_sidecar() {
+        // Both sources present. The transcript describes the record in hand, so
+        // it is authoritative; the sidecar is only a fallback.
+        let path = temp_file("claude-effort-precedence");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-04T11:00:00Z\",\"sessionId\":\"precedence-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-04T11:01:00Z\",\"sessionId\":\"precedence-1\",\"type\":\"assistant\",\"effort\":\"max\",\"requestId\":\"req_X\",\"message\":{\"id\":\"msg_X\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let index = Arc::new(ClaudeEffortByRequest::from([(
+            "req_X".to_string(),
+            "low".to_string(),
+        )]));
+
+        let item = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-04T11:04:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.model_usage.len(), 1);
+        assert_eq!(item.model_usage[0].reasoning_effort.as_deref(), Some("max"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_transcript_effort_falls_back_to_the_sidecar_when_absent() {
+        // Older transcripts carry no `effort`. Those still resolve through the
+        // request-id sidecar rather than regressing to unknown.
+        let path = temp_file("claude-effort-fallback");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-04T12:00:00Z\",\"sessionId\":\"fallback-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-04T12:01:00Z\",\"sessionId\":\"fallback-1\",\"type\":\"assistant\",\"requestId\":\"req_OLD\",\"message\":{\"id\":\"msg_OLD\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let index = Arc::new(ClaudeEffortByRequest::from([(
+            "req_OLD".to_string(),
+            "high".to_string(),
+        )]));
+
+        let item = parse_claude_code_jsonl_file_with_effort_index(
+            &path,
+            "2026-08-04T12:04:00Z",
+            "fp".to_string(),
+            Some(index),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(
+            item.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn claude_transcript_effort_rejects_an_unknown_tier() {
+        // A tier this build does not know must degrade to unknown, never widen
+        // the vocabulary the backend stores.
+        let path = temp_file("claude-effort-unknown-tier");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-04T13:00:00Z\",\"sessionId\":\"tier-1\",\"summary\":\"t\"}\n",
+                "{\"timestamp\":\"2026-08-04T13:01:00Z\",\"sessionId\":\"tier-1\",\"type\":\"assistant\",\"effort\":\"hyper\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-04T13:04:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+
+        assert_eq!(item.model_usage[0].reasoning_effort, None);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
