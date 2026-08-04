@@ -10,6 +10,11 @@ pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 /// rather than silently doing nothing. Every unrelated command stays on the
 /// base version for mixed-owner upgrade compatibility.
 pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 17;
+/// Command-scoped version for the four machine-local Claude account registry
+/// operations. Version 15 predates ownership and opaque slot identifiers, so
+/// accepting it would let clients silently misclassify external paths.
+pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
+pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
 
@@ -2383,6 +2388,12 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::ClaudeAccountsStatus
+        | LocalControlCommand::ClaudeAccountSetUpkeepConsent { .. }
+        | LocalControlCommand::ClaudeAccountRemove { .. }
+        | LocalControlCommand::ClaudeAccountRegisterPath { .. } => {
+            CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION
+        }
         _ => LOCAL_CONTROL_PROTOCOL_VERSION,
     }
 }
@@ -2406,6 +2417,100 @@ pub enum LocalClientKind {
     Cli,
     CompanionApp,
     WebUi,
+}
+
+/// Whether the machine-local Claude config-slot registry may be maintained by
+/// the daemon in the background. Consent applies to the whole registry; a slot
+/// never acquires a separate hidden or inferred grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountUpkeepConsentState {
+    ConsentRequired,
+    Granted,
+}
+
+/// Automated config-directory setup and registration belong to a later slice.
+/// Authentication remains user-owned: Ottto never runs or cancels `/login`;
+/// the user runs the official Claude `/login`. Slice A reports the explicit
+/// idle state so clients do not infer work from registered paths or consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountSetupOperationState {
+    Idle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountSetupOperationV1 {
+    pub state: ClaudeAccountSetupOperationState,
+}
+
+/// Who owns lifecycle changes for a Claude config slot. Registering an
+/// existing Advanced path records `external`; only a later setup workflow may
+/// create `managed` slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotOwnership {
+    Managed,
+    External,
+}
+
+/// One resolved Claude credential slot exposed over authenticated local
+/// control. `config_dir` is the exact registered string for custom slots and
+/// is absent for Claude Code's true default (unset `CLAUDE_CONFIG_DIR`) slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeConfigSlotDescriptorV1 {
+    pub slot_id: String,
+    pub ownership: ClaudeConfigSlotOwnership,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
+    pub service_name: String,
+}
+
+/// Safe evidence for an account that cannot yet be associated with a config
+/// slot. It intentionally has no path, slot identifier, or Keychain service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeUnresolvedAccountEvidenceKind {
+    CliIdentity,
+    StatusLine,
+    UsageCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeUnresolvedAccountDescriptorV1 {
+    pub unresolved_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<ClaudeUnresolvedAccountEvidenceKind>,
+}
+
+/// Capacity of the bounded Claude snapshot registry. The default slot always
+/// consumes one slot even when it has no resolved account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountCapacityV1 {
+    pub max_slots: u8,
+    pub used_slots: u8,
+    pub remaining_slots: u8,
+}
+
+/// Complete machine-local account registry returned by the daemon. Raw custom
+/// paths are local-control-only and must never be copied into backend payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountsStatusV1 {
+    pub schema_version: u16,
+    pub consent: ClaudeAccountUpkeepConsentState,
+    pub setup_operation: ClaudeAccountSetupOperationV1,
+    pub default_slot: ClaudeConfigSlotDescriptorV1,
+    #[serde(default)]
+    pub managed_slots: Vec<ClaudeConfigSlotDescriptorV1>,
+    #[serde(default)]
+    pub external_slots: Vec<ClaudeConfigSlotDescriptorV1>,
+    /// Reserved for account discovery performed by a later slice. Slice A
+    /// never probes additional Claude paths or infers registrations.
+    #[serde(default)]
+    pub unresolved_accounts: Vec<ClaudeUnresolvedAccountDescriptorV1>,
+    pub capacity: ClaudeAccountCapacityV1,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2609,6 +2714,23 @@ pub enum LocalControlCommand {
         local_only: bool,
     },
     Account,
+    /// Read machine-local Claude account registration state.
+    ClaudeAccountsStatus,
+    /// Explicitly grant or revoke daemon background-upkeep consent.
+    ClaudeAccountSetUpkeepConsent {
+        schema_version: u16,
+        consent: bool,
+    },
+    /// Remove one custom registration by its opaque local slot identifier.
+    ClaudeAccountRemove {
+        schema_version: u16,
+        slot_id: String,
+    },
+    /// Advanced: register the exact raw string used for `CLAUDE_CONFIG_DIR`.
+    ClaudeAccountRegisterPath {
+        schema_version: u16,
+        config_dir: String,
+    },
     Detect {
         source: SourceKind,
     },
@@ -3071,6 +3193,117 @@ mod tests {
                 api_base_url: None,
             }
         );
+    }
+
+    #[test]
+    fn claude_account_commands_round_trip_exact_registered_strings() {
+        let status: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_accounts_status",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "claude_accounts_status"
+        }))
+        .expect("account status request");
+        assert_eq!(status.command, LocalControlCommand::ClaudeAccountsStatus);
+
+        let register: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_account_register",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "claude_account_register_path",
+            "schema_version": 1,
+            "config_dir": "/tmp/claude-work/"
+        }))
+        .expect("account register request");
+        assert_eq!(
+            register.command,
+            LocalControlCommand::ClaudeAccountRegisterPath {
+                schema_version: 1,
+                config_dir: "/tmp/claude-work/".to_string(),
+            }
+        );
+
+        for command in [
+            serde_json::json!({
+                "command": "claude_account_set_upkeep_consent",
+                "schema_version": 1,
+                "consent": true
+            }),
+            serde_json::json!({
+                "command": "claude_account_remove",
+                "schema_version": 1,
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_account_mutation");
+            request["protocol_version"] =
+                serde_json::json!(CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION);
+            request["client_kind"] = serde_json::json!("companion_app");
+            serde_json::from_value::<LocalControlRequest>(request).expect("account mutation");
+        }
+    }
+
+    #[test]
+    fn claude_account_commands_fail_closed_on_base_protocol_version() {
+        for command in [
+            serde_json::json!({"command": "claude_accounts_status"}),
+            serde_json::json!({
+                "command": "claude_account_set_upkeep_consent",
+                "schema_version": 1,
+                "consent": true
+            }),
+            serde_json::json!({
+                "command": "claude_account_remove",
+                "schema_version": 1,
+                "slot_id": "claude_slot_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "claude_account_register_path",
+                "schema_version": 1,
+                "config_dir": "/tmp/claude-work"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_claude_v15");
+            request["protocol_version"] = serde_json::json!(LOCAL_CONTROL_PROTOCOL_VERSION);
+            let error = serde_json::from_value::<LocalControlRequest>(request)
+                .expect_err("Claude account command must reject protocol version 15");
+            assert!(error.to_string().contains(&format!(
+                "expected {CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION}"
+            )));
+        }
+
+        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
+            "request_id": "req_status_v18",
+            "protocol_version": CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+            "command": "status"
+        }))
+        .expect_err("ordinary status must reject the Claude account protocol version");
+        assert!(error
+            .to_string()
+            .contains(&format!("expected {LOCAL_CONTROL_PROTOCOL_VERSION}")));
+        assert_eq!(CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 18);
+    }
+
+    #[test]
+    fn unresolved_claude_account_evidence_has_no_slot_path_or_service_requirement() {
+        let descriptor = ClaudeUnresolvedAccountDescriptorV1 {
+            unresolved_id: "claude_unresolved_0123456789abcdef".to_string(),
+            account_identifier_hash: Some("display-safe-hash".to_string()),
+            evidence: vec![
+                ClaudeUnresolvedAccountEvidenceKind::CliIdentity,
+                ClaudeUnresolvedAccountEvidenceKind::StatusLine,
+            ],
+        };
+        let wire = serde_json::to_value(descriptor).expect("unresolved descriptor");
+        assert_eq!(
+            wire["evidence"],
+            serde_json::json!(["cli_identity", "status_line"])
+        );
+        for forbidden in ["slot_id", "config_dir", "service_name"] {
+            assert!(wire.get(forbidden).is_none(), "unexpected {forbidden}");
+        }
     }
 
     #[test]

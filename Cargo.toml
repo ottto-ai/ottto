@@ -35,5 +35,6 @@ sha2 = "0.10"
 thiserror = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml_edit = "0.22"
+unicode-normalization = "0.1"
 ureq = { version = "2", features = ["json"] }
 zeroize = { version = "1", features = ["alloc"] }

@@ -17,7 +17,8 @@ use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
     execute_local_uninstall, generate_control_token, install_owner_for_path,
     local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
-    ControlTokenStore, FileAccountStore, FileConnectionStore, FileDeviceStore,
+    ClaudeConfigSlotSettingsError, ControlTokenStore, FileAccountStore,
+    FileClaudeConfigSlotSettingsStore, FileConnectionStore, FileDeviceStore,
     FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
     LocalDeviceBinding, LocalDeviceCredentialBinding, PendingClaimCredentialCommit,
     PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority, TokenStoreError,
@@ -641,6 +642,31 @@ fn handle_command(
             to_value(auth_reset(daemon, &authorization, local_only)?)
         }
         LocalControlCommand::Account => to_value(account_for(daemon, &authorization)?),
+        LocalControlCommand::ClaudeAccountsStatus => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(load_claude_config_slot_settings()?)
+        }
+        LocalControlCommand::ClaudeAccountSetUpkeepConsent {
+            schema_version,
+            consent,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(set_claude_account_upkeep_consent(schema_version, consent)?)
+        }
+        LocalControlCommand::ClaudeAccountRemove {
+            schema_version,
+            slot_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(remove_claude_account(schema_version, &slot_id)?)
+        }
+        LocalControlCommand::ClaudeAccountRegisterPath {
+            schema_version,
+            config_dir,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(register_claude_account_path(schema_version, config_dir)?)
+        }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
             to_value(detect_agent_installation(&source))
@@ -861,6 +887,47 @@ fn account_for(
         RequestAuthorization::Token(token) => Ok(daemon.status(token)?.account),
         RequestAuthorization::TrustedCompanionApp => daemon.account_for_trusted_client(),
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+    }
+}
+
+fn load_claude_config_slot_settings(
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map_err(claude_config_slot_settings_error)
+}
+
+fn set_claude_account_upkeep_consent(
+    schema_version: u16,
+    consent: bool,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .set_upkeep_consent(schema_version, consent)
+        .map_err(claude_config_slot_settings_error)
+}
+
+fn remove_claude_account(
+    schema_version: u16,
+    slot_id: &str,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .remove(schema_version, slot_id)
+        .map_err(claude_config_slot_settings_error)
+}
+
+fn register_claude_account_path(
+    schema_version: u16,
+    config_dir: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    FileClaudeConfigSlotSettingsStore::default()
+        .register_path(schema_version, config_dir)
+        .map_err(claude_config_slot_settings_error)
+}
+
+fn claude_config_slot_settings_error(error: ClaudeConfigSlotSettingsError) -> LocalApiError {
+    match error {
+        ClaudeConfigSlotSettingsError::Invalid(message) => LocalApiError::InvalidRequest(message),
+        ClaudeConfigSlotSettingsError::State(_) => LocalApiError::StatePoisoned,
     }
 }
 
@@ -15032,6 +15099,143 @@ mod tests {
             response.error.expect("error").code,
             CliErrorCode::LocalAuthFailed
         );
+    }
+
+    #[test]
+    #[serial]
+    fn claude_accounts_require_auth_and_apply_operation_specific_mutations() {
+        let root = control_test_root("claude-config-slots");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let daemon = daemon();
+
+        for command in [
+            LocalControlCommand::ClaudeAccountsStatus,
+            LocalControlCommand::ClaudeAccountSetUpkeepConsent {
+                schema_version: 1,
+                consent: true,
+            },
+            LocalControlCommand::ClaudeAccountRemove {
+                schema_version: 1,
+                slot_id: "claude_slot_0123456789abcdef0123456789abcdef".to_string(),
+            },
+            LocalControlCommand::ClaudeAccountRegisterPath {
+                schema_version: 1,
+                config_dir: "/tmp/claude-work/".to_string(),
+            },
+        ] {
+            let response = handle_request(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "req_slots_unauthorized".to_string(),
+                    protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+                    token: Some("bad-token".to_string()),
+                    client_kind: Some(LocalClientKind::CompanionApp),
+                    client_install_owner: None,
+                    command,
+                },
+            );
+            assert!(!response.ok);
+            assert_eq!(
+                response.error.expect("auth error").code,
+                CliErrorCode::LocalAuthFailed
+            );
+        }
+
+        let registered = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_account_register".to_string(),
+                protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: LocalControlCommand::ClaudeAccountRegisterPath {
+                    schema_version: 1,
+                    config_dir: "/tmp/claude-work/".to_string(),
+                },
+            },
+        );
+        assert!(registered.ok, "{registered:?}");
+        let register_payload = registered.payload.expect("register payload");
+        assert_eq!(register_payload["consent"], "consent_required");
+        assert_eq!(
+            register_payload["default_slot"]["service_name"],
+            "Claude Code-credentials"
+        );
+        assert_eq!(
+            register_payload["external_slots"][0]["config_dir"],
+            "/tmp/claude-work/"
+        );
+        assert_eq!(
+            register_payload["external_slots"][0]["ownership"],
+            "external"
+        );
+        assert!(register_payload["managed_slots"]
+            .as_array()
+            .expect("managed slots")
+            .is_empty());
+        assert_eq!(register_payload["setup_operation"]["state"], "idle");
+        assert_eq!(register_payload["capacity"]["max_slots"], 10);
+        assert_eq!(register_payload["capacity"]["used_slots"], 2);
+
+        let consented = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_account_consent".to_string(),
+                protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: LocalControlCommand::ClaudeAccountSetUpkeepConsent {
+                    schema_version: 1,
+                    consent: true,
+                },
+            },
+        );
+        assert!(consented.ok, "{consented:?}");
+        let consent_payload = consented.payload.expect("consent payload");
+        assert_eq!(consent_payload["consent"], "granted");
+
+        let loaded = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_accounts_status".to_string(),
+                protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: LocalControlCommand::ClaudeAccountsStatus,
+            },
+        );
+        assert!(loaded.ok, "{loaded:?}");
+        assert_eq!(loaded.payload.expect("status payload"), consent_payload);
+
+        let slot_id = register_payload["external_slots"][0]["slot_id"]
+            .as_str()
+            .expect("slot id")
+            .to_string();
+        let removed = handle_request(
+            &daemon,
+            LocalControlRequest {
+                request_id: "req_account_remove".to_string(),
+                protocol_version: ottto_protocol::CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
+                token: Some("token".to_string()),
+                client_kind: Some(LocalClientKind::CompanionApp),
+                client_install_owner: None,
+                command: LocalControlCommand::ClaudeAccountRemove {
+                    schema_version: 1,
+                    slot_id,
+                },
+            },
+        );
+        assert!(removed.ok, "{removed:?}");
+        assert_eq!(
+            removed.payload.expect("remove payload")["capacity"]["used_slots"],
+            1
+        );
+        assert!(root.join("claude-config-slots.json").is_file());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

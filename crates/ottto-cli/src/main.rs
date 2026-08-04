@@ -2131,6 +2131,12 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::AuthSwitchAccount { .. } => "auth_switch_account",
         LocalControlCommand::AuthReset { .. } => "auth_reset",
         LocalControlCommand::Account => "account",
+        LocalControlCommand::ClaudeAccountsStatus => "claude_accounts_status",
+        LocalControlCommand::ClaudeAccountSetUpkeepConsent { .. } => {
+            "claude_account_set_upkeep_consent"
+        }
+        LocalControlCommand::ClaudeAccountRemove { .. } => "claude_account_remove",
+        LocalControlCommand::ClaudeAccountRegisterPath { .. } => "claude_account_register_path",
         LocalControlCommand::Detect { .. } => "detect",
         LocalControlCommand::Setup { .. } => "setup",
         LocalControlCommand::SetupAnswer { .. } => "setup_answer",

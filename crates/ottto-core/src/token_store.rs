@@ -486,6 +486,17 @@ pub fn generate_control_token() -> Result<String, String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// Atomically writes machine-local private state with an owner-only parent
+/// directory and file mode. Suitable for credentials and credential-adjacent
+/// caches that must never expose a partial JSON document after a crash.
+pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    write_secret_file_0600(path, bytes)
+}
+
 /// Writes `bytes` to `path` so the secret is never exposed through a
 /// world-readable or symlink-followable window.
 ///

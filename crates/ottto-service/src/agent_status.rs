@@ -2,9 +2,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::{
     billing_identity_hash, claude_account_identifier_hash, compiled_release_version,
     default_support_dir, read_claude_statusline_cache, read_claude_statusline_context_cache,
-    read_claude_statusline_context_history, ClaudeStatusLineContextWindowCache,
-    ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
-    ClaudeStatusLineRateLimitCache,
+    read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
+    ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
+    ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -23,7 +23,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::{
@@ -37,10 +37,11 @@ const MAX_AVAILABLE_MODELS: usize = 250;
 const CLAUDE_STATUSLINE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 const CLAUDE_STATUSLINE_CACHE_FRESH_AGE_SECONDS: u64 = 15 * 60;
 const CLAUDE_STATUSLINE_CONTEXT_HISTORY_RESPONSE_MAX_SAMPLES: usize = 48;
-const CLAUDE_OAUTH_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const CLAUDE_OAUTH_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
-const CLAUDE_OAUTH_USAGE_CACHE_FILE: &str = "claude-code-oauth-usage-cache.json";
+const CLAUDE_OAUTH_USAGE_CACHE_FILE: &str = "usage-cache.json";
+const CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR: &str = "claude-oauth-usage/accounts";
+const CLAUDE_OAUTH_USAGE_LEGACY_CACHE_FILE: &str = "claude-code-oauth-usage-cache.json";
 /// Display fallback only: how long a cached payload may still be rendered (as
 /// `Stale`) when the endpoint cannot be reached. Not a refresh cadence.
 const CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
@@ -59,7 +60,8 @@ const CLAUDE_OAUTH_USAGE_RETRY_AFTER_FALLBACK_SECONDS: u64 = 5 * 60;
 /// sanctioned local statusLine surface only. The name is a fixed contract with
 /// the macOS Companion toggle - do not rename it.
 const CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE: &str = "claude-oauth-usage-network-disabled";
-const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
+const CLAUDE_OAUTH_USAGE_BREAKER_FILE: &str = "breaker.json";
+const CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE: &str = "claude-oauth-usage-breaker.json";
 const CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION: u16 = 1;
 /// How long the breaker stays open once tripped. Long on purpose: an open
 /// breaker means we believe further calls could be unwelcome or useless, and a
@@ -75,6 +77,9 @@ const CLAUDE_OAUTH_USAGE_BREAKER_SHAPE_THRESHOLD: u32 = 3;
 /// a single 429 is routine here and is already handled by the retry-after
 /// backoff; this catches the sustained case that backoff never clears.
 const CLAUDE_OAUTH_USAGE_BREAKER_RATE_LIMIT_THRESHOLD: u32 = 5;
+static CLAUDE_OAUTH_ACCOUNT_STATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+static CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
 
@@ -941,7 +946,7 @@ fn claude_desktop_support_dir() -> PathBuf {
 }
 
 fn claude_cli_config_path() -> PathBuf {
-    home_path(".claude.json")
+    ClaudeConfigDirSlot::Default.identity_path(&home_dir())
 }
 
 fn claude_desktop_metadata_present(root: &Path) -> bool {
@@ -1619,7 +1624,7 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
     // data, so the cached copy is dropped from disk too and quota falls back to
     // Claude Code's own local statusLine surface.
     if claude_oauth_usage_network_disabled() {
-        let _ = fs::remove_file(claude_oauth_usage_cache_path());
+        clear_all_claude_oauth_usage_caches();
         return ClaudeOAuthUsageOutcome {
             result: Err(
                 "Claude OAuth usage endpoint is switched off on this machine.".to_string(),
@@ -1783,7 +1788,7 @@ fn collect_claude_oauth_usage_unstamped(account_identifier_hash: &str) -> Claude
     });
     // One clean answer clears the accumulated failure counters: the thresholds
     // below are about *consecutive* failures.
-    clear_claude_oauth_usage_breaker();
+    clear_claude_oauth_usage_breaker(account_identifier_hash);
     ClaudeOAuthUsageOutcome::from(Ok(usage))
 }
 
@@ -1831,8 +1836,38 @@ fn claude_oauth_usage_network_disabled() -> bool {
         .is_file()
 }
 
-fn claude_oauth_usage_breaker_path() -> PathBuf {
-    default_support_dir().join(CLAUDE_OAUTH_USAGE_BREAKER_FILE)
+fn claude_oauth_usage_account_state_dir(account_identifier_hash: &str) -> PathBuf {
+    let component = if account_identifier_hash.is_empty() {
+        "unresolved".to_string()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(b"ottto:claude-oauth-account-state:");
+        hasher.update(account_identifier_hash.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    default_support_dir()
+        .join(CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR)
+        .join(component)
+}
+
+fn claude_oauth_usage_breaker_path(account_identifier_hash: &str) -> PathBuf {
+    claude_oauth_usage_account_state_dir(account_identifier_hash)
+        .join(CLAUDE_OAUTH_USAGE_BREAKER_FILE)
+}
+
+fn claude_oauth_usage_legacy_breaker_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE)
+}
+
+fn claude_oauth_account_state_lock(account_identifier_hash: &str) -> Arc<Mutex<()>> {
+    let mut locks = CLAUDE_OAUTH_ACCOUNT_STATE_LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks
+        .entry(account_identifier_hash.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Fingerprint of everything about the call that could make a past failure
@@ -1871,7 +1906,19 @@ fn read_claude_oauth_usage_breaker(
     account_identifier_hash: &str,
     config_fingerprint: &str,
 ) -> Option<ClaudeOAuthUsageBreaker> {
-    let body = fs::read_to_string(claude_oauth_usage_breaker_path()).ok()?;
+    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint)
+}
+
+fn read_claude_oauth_usage_breaker_locked(
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+) -> Option<ClaudeOAuthUsageBreaker> {
+    migrate_legacy_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint);
+    let body = fs::read_to_string(claude_oauth_usage_breaker_path(account_identifier_hash)).ok()?;
     let breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
     if breaker.schema_version != CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
         || breaker.account_identifier_hash != account_identifier_hash
@@ -1882,17 +1929,52 @@ fn read_claude_oauth_usage_breaker(
     Some(breaker)
 }
 
-fn write_claude_oauth_usage_breaker(breaker: &ClaudeOAuthUsageBreaker) -> std::io::Result<()> {
-    let path = claude_oauth_usage_breaker_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn write_claude_oauth_usage_breaker_locked(
+    breaker: &ClaudeOAuthUsageBreaker,
+) -> std::io::Result<()> {
+    let path = claude_oauth_usage_breaker_path(&breaker.account_identifier_hash);
     let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
-    fs::write(path, body)
+    write_owner_only_file_atomic(&path, &body)
 }
 
-fn clear_claude_oauth_usage_breaker() {
-    let _ = fs::remove_file(claude_oauth_usage_breaker_path());
+fn clear_claude_oauth_usage_breaker(account_identifier_hash: &str) {
+    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = fs::remove_file(claude_oauth_usage_breaker_path(account_identifier_hash));
+}
+
+fn migrate_legacy_claude_oauth_usage_breaker_locked(
+    account_identifier_hash: &str,
+    config_fingerprint: &str,
+) {
+    let target = claude_oauth_usage_breaker_path(account_identifier_hash);
+    if target.exists() {
+        return;
+    }
+    let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if target.exists() {
+        return;
+    }
+    let legacy = claude_oauth_usage_legacy_breaker_path();
+    let Some(breaker) = fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageBreaker>(&body).ok())
+        .filter(|breaker| {
+            breaker.schema_version == CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
+                && breaker.account_identifier_hash == account_identifier_hash
+                && breaker.config_fingerprint == config_fingerprint
+        })
+    else {
+        return;
+    };
+    if write_claude_oauth_usage_breaker_locked(&breaker).is_ok() {
+        let _ = fs::remove_file(legacy);
+    }
 }
 
 fn claude_oauth_usage_breaker_is_open(breaker: &ClaudeOAuthUsageBreaker, now: u64) -> bool {
@@ -1934,7 +2016,12 @@ fn record_claude_oauth_usage_failure(
     config_fingerprint: &str,
     now: u64,
 ) -> Vec<AgentStatusDiagnostic> {
-    let previous = read_claude_oauth_usage_breaker(account_identifier_hash, config_fingerprint);
+    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous =
+        read_claude_oauth_usage_breaker_locked(account_identifier_hash, config_fingerprint);
     let was_open = previous
         .as_ref()
         .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(breaker, now));
@@ -1945,7 +2032,7 @@ fn record_claude_oauth_usage_failure(
         config_fingerprint,
         now,
     );
-    let _ = write_claude_oauth_usage_breaker(&breaker);
+    let _ = write_claude_oauth_usage_breaker_locked(&breaker);
     if !was_open && claude_oauth_usage_breaker_is_open(&breaker, now) {
         return vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)];
     }
@@ -1987,29 +2074,101 @@ fn claude_oauth_usage_failure_class(error: &ureq::Error) -> Option<ClaudeOAuthUs
 }
 
 fn read_claude_oauth_access_token() -> Option<String> {
-    read_claude_oauth_access_token_from_keychain()
-        .or_else(read_claude_oauth_access_token_from_credentials_file)
+    read_claude_oauth_access_token_for_slot(&ClaudeConfigDirSlot::Default)
 }
 
-fn read_claude_oauth_access_token_from_keychain() -> Option<String> {
-    let output = run_command_capture(
-        "security",
-        &[
-            "find-generic-password",
-            "-s",
-            CLAUDE_OAUTH_KEYCHAIN_SERVICE,
-            "-w",
-        ],
-        COMMAND_TIMEOUT,
-    );
+fn read_claude_oauth_access_token_for_slot(slot: &ClaudeConfigDirSlot) -> Option<String> {
+    read_claude_oauth_access_token_from_keychain(slot)
+        .or_else(|| read_claude_oauth_access_token_from_credentials_file(slot))
+}
+
+fn read_claude_oauth_access_token_from_keychain(slot: &ClaudeConfigDirSlot) -> Option<String> {
+    let account = effective_user_account_name()?;
+    let arguments = claude_oauth_keychain_lookup_arguments(slot, &account)?;
+    let argument_refs: Vec<_> = arguments.iter().map(String::as_str).collect();
+    let output = run_command_capture("security", &argument_refs, COMMAND_TIMEOUT);
     if !output.command_found || !output.success {
         return None;
     }
     parse_claude_oauth_access_token(&output.stdout)
 }
 
-fn read_claude_oauth_access_token_from_credentials_file() -> Option<String> {
-    let path = home_path(".claude").join(".credentials.json");
+#[cfg(unix)]
+fn effective_user_account_name() -> Option<String> {
+    use std::ffi::CStr;
+    use std::mem::MaybeUninit;
+
+    // LaunchAgents are not guaranteed to inherit USER. Resolve the account
+    // that owns this daemon from its effective uid instead of trusting ambient
+    // environment state when selecting a same-service Keychain item.
+    let uid = unsafe { libc::geteuid() };
+    let size_hint = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let mut buffer_size = usize::try_from(size_hint)
+        .ok()
+        .filter(|size| (1_024..=1_048_576).contains(size))
+        .unwrap_or(16_384);
+
+    for _ in 0..3 {
+        let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; buffer_size];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE {
+            buffer_size = buffer_size.checked_mul(2)?.min(1_048_576);
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_name.is_null() {
+            return None;
+        }
+        let account = unsafe { CStr::from_ptr(passwd.pw_name) }
+            .to_str()
+            .ok()?
+            .to_string();
+        return (!account.is_empty()).then_some(account);
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn effective_user_account_name() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .filter(|account| !account.is_empty() && !account.contains('\0'))
+}
+
+fn claude_oauth_keychain_lookup_arguments(
+    slot: &ClaudeConfigDirSlot,
+    account: &str,
+) -> Option<Vec<String>> {
+    if account.is_empty() || account.contains('\0') {
+        return None;
+    }
+    Some(vec![
+        "find-generic-password".to_string(),
+        "-a".to_string(),
+        account.to_string(),
+        "-s".to_string(),
+        slot.service_name(),
+        "-w".to_string(),
+    ])
+}
+
+fn read_claude_oauth_access_token_from_credentials_file(
+    slot: &ClaudeConfigDirSlot,
+) -> Option<String> {
+    let path = slot.credentials_path(&home_dir());
     let body = fs::read_to_string(path).ok()?;
     parse_claude_oauth_access_token(&body)
 }
@@ -2038,8 +2197,27 @@ fn claude_oauth_usage_error(error: ureq::Error) -> String {
     }
 }
 
-fn claude_oauth_usage_cache_path() -> PathBuf {
-    default_support_dir().join(CLAUDE_OAUTH_USAGE_CACHE_FILE)
+fn claude_oauth_usage_cache_path(account_identifier_hash: &str) -> PathBuf {
+    claude_oauth_usage_account_state_dir(account_identifier_hash)
+        .join(CLAUDE_OAUTH_USAGE_CACHE_FILE)
+}
+
+fn claude_oauth_usage_legacy_cache_path() -> PathBuf {
+    default_support_dir().join(CLAUDE_OAUTH_USAGE_LEGACY_CACHE_FILE)
+}
+
+fn clear_all_claude_oauth_usage_caches() {
+    let _ = fs::remove_file(claude_oauth_usage_legacy_cache_path());
+    let accounts_root = default_support_dir().join(CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR);
+    let Ok(entries) = fs::read_dir(accounts_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = fs::remove_file(path.join(CLAUDE_OAUTH_USAGE_CACHE_FILE));
+        }
+    }
 }
 
 /// Identify the Claude account that currently owns the local Claude Code
@@ -2067,7 +2245,18 @@ fn claude_oauth_account_identifier_hash_for(account: &ClaudeCliOauthAccount) -> 
 }
 
 fn read_claude_oauth_usage_cache(account_identifier_hash: &str) -> Option<ClaudeOAuthUsageCache> {
-    let path = claude_oauth_usage_cache_path();
+    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read_claude_oauth_usage_cache_locked(account_identifier_hash)
+}
+
+fn read_claude_oauth_usage_cache_locked(
+    account_identifier_hash: &str,
+) -> Option<ClaudeOAuthUsageCache> {
+    migrate_legacy_claude_oauth_usage_cache_locked(account_identifier_hash);
+    let path = claude_oauth_usage_cache_path(account_identifier_hash);
     let body = fs::read_to_string(path).ok()?;
     let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
     if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
@@ -2102,12 +2291,45 @@ fn claude_oauth_usage_cache_belongs_to_account(
 }
 
 fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
-    let path = claude_oauth_usage_cache_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let lock = claude_oauth_account_state_lock(&cache.account_identifier_hash);
+    let _transaction = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    write_claude_oauth_usage_cache_locked(cache)
+}
+
+fn write_claude_oauth_usage_cache_locked(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
+    let path = claude_oauth_usage_cache_path(&cache.account_identifier_hash);
     let body = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
-    fs::write(path, body)
+    write_owner_only_file_atomic(&path, &body)
+}
+
+fn migrate_legacy_claude_oauth_usage_cache_locked(account_identifier_hash: &str) {
+    let target = claude_oauth_usage_cache_path(account_identifier_hash);
+    if target.exists() {
+        return;
+    }
+    let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if target.exists() {
+        return;
+    }
+    let legacy = claude_oauth_usage_legacy_cache_path();
+    let Some(cache) = fs::read_to_string(&legacy)
+        .ok()
+        .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageCache>(&body).ok())
+        .filter(|cache| {
+            cache.schema_version == CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION
+                && claude_oauth_usage_cache_belongs_to_account(cache, account_identifier_hash)
+        })
+    else {
+        return;
+    };
+    if write_claude_oauth_usage_cache_locked(&cache).is_ok() {
+        let _ = fs::remove_file(legacy);
+    }
 }
 
 fn claude_oauth_retry_after_epoch_seconds(response: &ureq::Response, now: u64) -> u64 {
@@ -5758,10 +5980,13 @@ fn codex_auth_path() -> PathBuf {
 }
 
 fn home_path(relative: &str) -> PathBuf {
+    home_dir().join(relative)
+}
+
+fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join(relative)
 }
 
 #[cfg(test)]
@@ -7237,6 +7462,53 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn claude_oauth_keychain_lookup_pins_current_account_and_exact_slot_service() {
+        assert_eq!(
+            claude_oauth_keychain_lookup_arguments(&ClaudeConfigDirSlot::Default, "local-user")
+                .expect("default lookup"),
+            vec![
+                "find-generic-password",
+                "-a",
+                "local-user",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ]
+        );
+        assert_eq!(
+            claude_oauth_keychain_lookup_arguments(
+                &ClaudeConfigDirSlot::registered("/tmp/claude-account").expect("slot"),
+                "local-user",
+            )
+            .expect("custom lookup"),
+            vec![
+                "find-generic-password",
+                "-a",
+                "local-user",
+                "-s",
+                "Claude Code-credentials-ae4ef741",
+                "-w",
+            ]
+        );
+        assert!(
+            claude_oauth_keychain_lookup_arguments(&ClaudeConfigDirSlot::Default, "").is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn claude_oauth_keychain_account_comes_from_effective_uid_not_user_environment() {
+        let _guard = EnvVarGuard::set_os(
+            "USER",
+            OsString::from("ottto-environment-account-must-not-win"),
+        );
+        let account = effective_user_account_name().expect("effective uid account");
+        assert_ne!(account, "ottto-environment-account-must-not-win");
+        assert!(!account.is_empty());
+    }
+
+    #[test]
     fn current_claude_desktop_profile_gets_safe_label_fallback() {
         let observation = claude_desktop_builder_plan_observation(
             ClaudeDesktopProfileBuilder {
@@ -7559,9 +7831,9 @@ for line in sys.stdin:
     #[serial]
     fn claude_oauth_usage_cache_is_not_served_across_accounts() {
         // Regression, observed live 2026-07-26 on Ottto 0.1.96: the Claude Code
-        // CLI credential store is single-slot, so `/login` as a second account
-        // replaces the first while this machine-global cache keeps the first
-        // account's numbers. Account A's weekly window rendered under account
+        // CLI credential store was historically single-slot, so `/login` as a
+        // second account replaced the first while the machine-global cache kept
+        // the first account's numbers. Account A's weekly window rendered under account
         // B's Team subscription, complete with A's reset boundary.
         let support_dir = std::env::temp_dir().join(format!(
             "ottto-claude-oauth-usage-cache-account-{}",
@@ -7610,6 +7882,7 @@ for line in sys.stdin:
         // The account that wrote it still reads it.
         let served = read_claude_oauth_usage_cache(&account_a).expect("own account is served");
         assert_eq!(served.windows[0].used_percent, Some(44));
+        assert!(claude_oauth_usage_cache_path(&account_a).is_file());
 
         // The replacing account must not.
         assert!(
@@ -7637,9 +7910,16 @@ for line in sys.stdin:
             "429 fallback served account A's windows to account B"
         );
         assert_eq!(fallback.account_identifier_hash, account_b);
-        // Writing that empty cache back is what clears A's payload off disk.
+        // Writing B's fallback now creates B's physical account store without
+        // replacing A's. Future multi-slot collection can therefore maintain
+        // both accounts independently.
         write_claude_oauth_usage_cache(&fallback).expect("write fallback cache");
-        assert!(read_claude_oauth_usage_cache(&account_a).is_none());
+        assert!(read_claude_oauth_usage_cache(&account_a).is_some());
+        assert!(claude_oauth_usage_cache_path(&account_b).is_file());
+        assert_ne!(
+            claude_oauth_usage_cache_path(&account_a),
+            claude_oauth_usage_cache_path(&account_b)
+        );
 
         let _ = std::fs::remove_dir_all(&support_dir);
     }
@@ -7676,6 +7956,234 @@ for line in sys.stdin:
         // Nothing observable changed: keep serving rather than hammering a
         // rate-limited endpoint every tick.
         assert!(claude_oauth_usage_cache_belongs_to_account(&cache(""), ""));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_usage_cache_migrates_into_its_physical_account_store() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-cache-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let cache = ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-a".to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 200,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        };
+        fs::write(
+            claude_oauth_usage_legacy_cache_path(),
+            serde_json::to_vec_pretty(&cache).expect("serialize legacy cache"),
+        )
+        .expect("write legacy cache");
+
+        assert!(read_claude_oauth_usage_cache("account-b").is_none());
+        assert!(claude_oauth_usage_legacy_cache_path().is_file());
+        assert_eq!(
+            read_claude_oauth_usage_cache("account-a")
+                .expect("migrated cache")
+                .account_identifier_hash,
+            "account-a"
+        );
+        assert!(claude_oauth_usage_cache_path("account-a").is_file());
+        assert!(!claude_oauth_usage_legacy_cache_path().exists());
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_legacy_cache_migration_is_single_copy_and_owner_only() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-cache-concurrent-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let cache = ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: "account-concurrent".to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 200,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        };
+        fs::write(
+            claude_oauth_usage_legacy_cache_path(),
+            serde_json::to_vec_pretty(&cache).expect("serialize legacy cache"),
+        )
+        .expect("write legacy cache");
+
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    read_claude_oauth_usage_cache("account-concurrent")
+                        .expect("migrated cache")
+                        .account_identifier_hash
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().expect("worker"), "account-concurrent");
+        }
+        let target = claude_oauth_usage_cache_path("account-concurrent");
+        assert!(target.is_file());
+        assert!(!claude_oauth_usage_legacy_cache_path().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&target)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn cache_and_breaker_writes_are_atomic_owner_only_and_symlink_safe() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-state-atomic-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let account = "account-atomic";
+        let cache = ClaudeOAuthUsageCache {
+            schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+            account_identifier_hash: account.to_string(),
+            observed_at_epoch_seconds: 100,
+            next_refresh_after_epoch_seconds: 200,
+            windows: Vec::new(),
+            credit_balances: Vec::new(),
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let cache_path = claude_oauth_usage_cache_path(account);
+            fs::create_dir_all(cache_path.parent().expect("cache parent"))
+                .expect("create cache parent");
+            let sentinel = support_dir.join("sentinel.json");
+            fs::write(&sentinel, b"untouched").expect("write sentinel");
+            symlink(&sentinel, &cache_path).expect("plant cache symlink");
+
+            write_claude_oauth_usage_cache(&cache).expect("atomic cache write");
+            assert_eq!(fs::read(&sentinel).expect("read sentinel"), b"untouched");
+            assert!(!fs::symlink_metadata(&cache_path)
+                .expect("cache metadata")
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::metadata(&cache_path)
+                    .expect("cache metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        #[cfg(not(unix))]
+        write_claude_oauth_usage_cache(&cache).expect("atomic cache write");
+
+        record_claude_oauth_usage_failure(
+            ClaudeOAuthUsageFailure::AuthRejected,
+            account,
+            "fingerprint-atomic",
+            100,
+        );
+        let breaker_path = claude_oauth_usage_breaker_path(account);
+        let _: ClaudeOAuthUsageBreaker =
+            serde_json::from_slice(&fs::read(&breaker_path).expect("read complete breaker JSON"))
+                .expect("parse complete breaker JSON");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&breaker_path)
+                    .expect("breaker metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        for entry in fs::read_dir(
+            claude_oauth_usage_cache_path(account)
+                .parent()
+                .expect("account state dir"),
+        )
+        .expect("read account state dir")
+        {
+            let name = entry
+                .expect("state entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            assert!(!name.contains(".tmp."), "orphaned atomic temp file: {name}");
+        }
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_cache_writes_leave_one_complete_account_document() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-cache-concurrent-write-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        const WORKERS: u64 = 20;
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|observed_at_epoch_seconds| {
+                std::thread::spawn(move || {
+                    write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
+                        schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
+                        account_identifier_hash: "account-concurrent-cache".to_string(),
+                        observed_at_epoch_seconds,
+                        next_refresh_after_epoch_seconds: observed_at_epoch_seconds + 100,
+                        windows: Vec::new(),
+                        credit_balances: Vec::new(),
+                    })
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker").expect("cache write");
+        }
+        let cache = read_claude_oauth_usage_cache("account-concurrent-cache")
+            .expect("complete cache after concurrent writes");
+        assert!(cache.observed_at_epoch_seconds < WORKERS);
+        assert_eq!(
+            cache.next_refresh_after_epoch_seconds,
+            cache.observed_at_epoch_seconds + 100
+        );
+        let _ = fs::remove_dir_all(support_dir);
     }
 
     #[test]
@@ -7883,10 +8391,89 @@ for line in sys.stdin:
         assert!(read_claude_oauth_usage_breaker("account-b", "fingerprint-a").is_none());
         assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-b").is_none());
 
-        clear_claude_oauth_usage_breaker();
+        clear_claude_oauth_usage_breaker("account-a");
         assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-a").is_none());
 
         let _ = std::fs::remove_dir_all(&support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_breaker_failures_are_one_account_transaction_without_lost_updates() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-breaker-concurrent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        const WORKERS: usize = 24;
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    record_claude_oauth_usage_failure(
+                        ClaudeOAuthUsageFailure::AuthRejected,
+                        "account-concurrent-breaker",
+                        "fingerprint-concurrent-breaker",
+                        1_000,
+                    )
+                })
+            })
+            .collect();
+        let emitted = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("worker"))
+            .collect::<Vec<_>>();
+        let breaker = read_claude_oauth_usage_breaker(
+            "account-concurrent-breaker",
+            "fingerprint-concurrent-breaker",
+        )
+        .expect("concurrent breaker");
+        assert_eq!(breaker.auth_failures, WORKERS as u32);
+        assert_eq!(emitted.len(), 1, "open transition should emit exactly once");
+        let _ = fs::remove_dir_all(support_dir);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_breaker_migrates_into_its_physical_account_store() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-oauth-breaker-migration-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let breaker = ClaudeOAuthUsageBreaker {
+            schema_version: CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION,
+            account_identifier_hash: "account-a".to_string(),
+            config_fingerprint: "fingerprint-a".to_string(),
+            auth_failures: 2,
+            ..Default::default()
+        };
+        fs::write(
+            claude_oauth_usage_legacy_breaker_path(),
+            serde_json::to_vec_pretty(&breaker).expect("serialize legacy breaker"),
+        )
+        .expect("write legacy breaker");
+
+        assert!(read_claude_oauth_usage_breaker("account-b", "fingerprint-a").is_none());
+        assert!(claude_oauth_usage_legacy_breaker_path().is_file());
+        assert_eq!(
+            read_claude_oauth_usage_breaker("account-a", "fingerprint-a")
+                .expect("migrated breaker")
+                .auth_failures,
+            2
+        );
+        assert!(claude_oauth_usage_breaker_path("account-a").is_file());
+        assert!(!claude_oauth_usage_legacy_breaker_path().exists());
+        let _ = fs::remove_dir_all(support_dir);
     }
 
     #[test]
@@ -8036,7 +8623,7 @@ for line in sys.stdin:
             AgentDiagnosticSeverity::Info
         );
         assert!(
-            !claude_oauth_usage_cache_path().exists(),
+            !claude_oauth_usage_cache_path("").exists(),
             "the off-switch retires the endpoint's cached payload too"
         );
 
