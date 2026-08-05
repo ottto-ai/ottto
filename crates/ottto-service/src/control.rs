@@ -2989,9 +2989,28 @@ fn provider_daily_reference_control_with_stores(
     }
     drop(identity_lifecycle_lock);
 
+    let live_binding = provider_account_scope.as_deref().and_then(|scope| {
+        devices
+            .load()
+            .ok()
+            .flatten()
+            .map(|device| crate::provider_daily_reference::Runtime {
+                installation_id: device.device_id,
+                provider_account_scope: scope.to_string(),
+            })
+    });
+
     Ok(ProviderDailyReferenceControlResult {
         action,
-        status: crate::provider_daily_reference::collector_status(grants, network_disabled),
+        // Built from the stores this call was handed, not from process-wide
+        // state, so the reported status belongs to this installation and the
+        // account actually signed in. A status that can read `enabled` while
+        // every collection cycle refuses is the bug this closes.
+        status: crate::provider_daily_reference::status_with_live_binding(
+            grants,
+            crate::provider_daily_reference::collector_status(grants, network_disabled),
+            live_binding.as_ref(),
+        ),
         backend_create_request,
         backend_revoke_target,
     })
