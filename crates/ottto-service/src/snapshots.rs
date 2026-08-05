@@ -186,16 +186,17 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // maps to is unchanged, and the effort sidecar fingerprint already re-selects a
 // transcript whose evidence grew after its final write.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
-// claude_code v28: read the applied reasoning-effort tier straight off the
+// claude_code v29: read the applied reasoning-effort tier straight off the
 // assistant transcript record. Current Claude Code writes `"effort":"high"` on
 // the record whose usage this is, which makes the OTLP sidecar unnecessary for
 // effort: no loopback relay dependency, and no way for a subagent turn to be
 // attributed to its parent, because nothing is pooled per session to begin with.
 // Measured over two days of local transcripts: 99% of top-level and 72% of
 // subagent usage records carry it (the remainder is Haiku, which has no tier),
-// and it matched the OTLP sidecar on 7020 of 7020 records both described. The
-// sidecar stays as the fallback for older transcripts that omit the field.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v28";
+// and it matched the OTLP sidecar on 7020 of 7020 records both described. A
+// transcript record without the field stays effort-unknown; local OTLP is used
+// only for privacy-safe account identity evidence.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v29";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -1520,15 +1521,14 @@ fn claude_transcript_effort(value: &Value) -> Option<String> {
         .then_some(effort)
 }
 
-/// Split Claude transcript bucket rows by exact locally-reduced OTLP effort.
+/// Apply privacy-safe account identity reduced from Claude Code's local OTLP.
 ///
-/// The transcript remains authoritative for total tokens. Evidence is applied
-/// only when one transcript row unambiguously owns the model/hour and every
-/// observed component fits inside it. Any uncovered remainder stays as an
-/// effort-unknown row, preserving byte-exact totals under partial collection.
+/// Reasoning effort comes only from each assistant transcript record. Local
+/// OTLP evidence may stamp an exactly covered session or proven account family,
+/// but it must never supply or split reasoning-effort tiers.
 pub fn apply_claude_effort_evidence(
     snapshots: &mut [SnapshotItem],
-    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
 ) {
     let mut witnesses = BTreeMap::new();
     apply_claude_effort_evidence_with_families(
@@ -1541,7 +1541,7 @@ pub fn apply_claude_effort_evidence(
 
 pub fn apply_claude_effort_evidence_with_index(
     snapshots: &mut [SnapshotItem],
-    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     index: &mut ScanIndex,
     census_complete: bool,
     census_window_end: &str,
@@ -1641,7 +1641,7 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
 
 fn accumulate_claude_family_pending(
     snapshots: &[SnapshotItem],
-    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     pending_by_root: &mut BTreeMap<String, ClaudeAccountFamilyPending>,
     census_window_end: &str,
 ) {
@@ -1698,7 +1698,7 @@ fn accumulate_claude_family_pending(
 
 fn apply_claude_effort_evidence_with_families(
     snapshots: &mut [SnapshotItem],
-    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     family_witnesses: &mut BTreeMap<String, ClaudeAccountFamilyWitness>,
     proven_family_counts: &BTreeMap<String, BTreeMap<String, u64>>,
 ) {
@@ -1706,118 +1706,7 @@ fn apply_claude_effort_evidence_with_families(
         let Some(evidence) = evidence_by_session.get(&item.source_session_id) else {
             continue;
         };
-        let mut changed = apply_claude_account_evidence(item, evidence);
-        let mut grouped: BTreeMap<(String, String, String), UsageTotals> = BTreeMap::new();
-        for observed in evidence {
-            if observed.effort.is_empty() {
-                continue;
-            }
-            let Some((bucket_start, _)) = activity_bucket_from_timestamp(&observed.observed_at)
-            else {
-                continue;
-            };
-            let totals = UsageTotals {
-                input_tokens: observed.input_tokens,
-                output_tokens: observed.output_tokens,
-                cache_read_tokens: observed.cache_read_tokens,
-                cache_creation_5m_tokens: observed.cache_creation_5m_tokens,
-                cache_creation_1h_tokens: observed.cache_creation_1h_tokens,
-                reasoning_output_tokens: observed.reasoning_output_tokens,
-                unattributed_total_tokens: 0,
-                request_count: observed.request_count,
-                costs: UsageCosts::default(),
-            };
-            let grouped_totals = grouped
-                .entry((
-                    bucket_start,
-                    normalized_evidence_model(&observed.model),
-                    observed.effort.clone(),
-                ))
-                .or_default();
-            if !grouped_totals.add(&totals) {
-                // Supplemental effort evidence must never make the transcript's
-                // authoritative wire totals inexact. Ignore the whole evidence
-                // projection when its own counters are not representable.
-                grouped.clear();
-                break;
-            }
-        }
-
-        for bucket in &mut item.usage_buckets {
-            let mut model_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-            for (index, row) in bucket.model_usage.iter().enumerate() {
-                model_indices
-                    .entry(normalized_evidence_model(&row.model))
-                    .or_default()
-                    .push(index);
-            }
-            let mut replacements: BTreeMap<usize, Vec<SnapshotModelUsage>> = BTreeMap::new();
-            for (model, indices) in model_indices {
-                if indices.len() != 1 {
-                    continue;
-                }
-                let index = indices[0];
-                let base = &bucket.model_usage[index];
-                if model_usage_has_cost(base) {
-                    continue;
-                }
-                // Already attributed per request during the parse. Re-splitting
-                // it from hourly aggregates could only lose precision, and the
-                // evidence pool may include subagent requests this transcript
-                // never recorded.
-                if base.reasoning_effort.is_some() {
-                    continue;
-                }
-                let mut effort_rows: Vec<(String, UsageTotals)> = grouped
-                    .iter()
-                    .filter(|((observed_bucket, observed_model, _effort), _totals)| {
-                        observed_bucket == &bucket.bucket_start && observed_model == &model
-                    })
-                    .map(|((_observed_bucket, _observed_model, effort), totals)| {
-                        (effort.clone(), totals.clone())
-                    })
-                    .collect();
-                if effort_rows.is_empty() {
-                    continue;
-                }
-                let base_totals = usage_totals_from_model_usage(base);
-                let Some(observed_totals) =
-                    reconcile_effort_cache_creation(&mut effort_rows, &base_totals)
-                else {
-                    continue;
-                };
-
-                let mut split = Vec::new();
-                for (effort, totals) in effort_rows {
-                    if !usage_totals_has_usage(&totals) {
-                        continue;
-                    }
-                    split.push(model_usage_with_totals(base, &totals, Some(effort)));
-                }
-                let residual = base_totals.delta_from(&observed_totals);
-                if usage_totals_has_usage(&residual) {
-                    split.push(model_usage_with_totals(base, &residual, None));
-                }
-                if !split.is_empty() {
-                    replacements.insert(index, split);
-                }
-            }
-            if replacements.is_empty() {
-                continue;
-            }
-            let mut rows = Vec::new();
-            for (index, row) in bucket.model_usage.drain(..).enumerate() {
-                if let Some(split) = replacements.remove(&index) {
-                    rows.extend(split);
-                } else {
-                    rows.push(row);
-                }
-            }
-            rows.sort_by_key(row_key_from_model_usage);
-            bucket.model_usage = rows;
-            changed = true;
-        }
-        if changed {
+        if apply_claude_account_evidence(item, evidence) {
             rebuild_snapshot_model_usage(item);
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
@@ -1843,7 +1732,7 @@ fn apply_claude_effort_evidence_with_families(
 /// the one-record-per-request count remains exact.
 fn apply_claude_family_account_evidence(
     snapshots: &mut [SnapshotItem],
-    evidence_by_session: &BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>>,
+    evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     family_witnesses: &mut BTreeMap<String, ClaudeAccountFamilyWitness>,
     proven_family_counts: &BTreeMap<String, BTreeMap<String, u64>>,
 ) {
@@ -1961,7 +1850,7 @@ fn claude_snapshot_has_conflicting_account_hash(item: &SnapshotItem, account_has
 }
 
 fn strict_claude_account_hash(
-    evidence: &[crate::claude_effort::ClaudeEffortEvidence],
+    evidence: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
 ) -> Option<&str> {
     if evidence.is_empty()
         || evidence
@@ -2036,7 +1925,7 @@ fn claude_index_path_family_member(path: &Path) -> Option<(String, String)> {
 
 fn apply_claude_account_evidence(
     item: &mut SnapshotItem,
-    evidence: &[crate::claude_effort::ClaudeEffortEvidence],
+    evidence: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
 ) -> bool {
     let checked_evidence = evidence
         .iter()
@@ -2094,9 +1983,9 @@ fn set_claude_account_hash(item: &mut SnapshotItem, target: Option<String>) -> b
 
 fn claude_account_evidence_covers_snapshot(
     item: &SnapshotItem,
-    evidence: &[&crate::claude_effort::ClaudeEffortEvidence],
+    evidence: &[&crate::claude_local_otel::ClaudeLocalOtelEvidence],
 ) -> bool {
-    let sum = |value: fn(&crate::claude_effort::ClaudeEffortEvidence) -> u64| {
+    let sum = |value: fn(&crate::claude_local_otel::ClaudeLocalOtelEvidence) -> u64| {
         evidence
             .iter()
             .map(|row| u128::from(value(row)))
@@ -2118,91 +2007,6 @@ fn claude_account_evidence_covers_snapshot(
             == u128::from(item.cache_creation_5m_tokens) + u128::from(item.cache_creation_1h_tokens)
         && sum(|row| row.reasoning_output_tokens) == u128::from(item.reasoning_output_tokens)
         && sum(|row| row.request_count) == u128::from(item.request_count)
-}
-
-fn normalized_evidence_model(model: &str) -> String {
-    model.trim().to_ascii_lowercase()
-}
-
-fn model_usage_has_cost(row: &SnapshotModelUsage) -> bool {
-    row.cost_usd.is_some()
-        || row.input_cost_usd.is_some()
-        || row.output_cost_usd.is_some()
-        || row.cache_read_cost_usd.is_some()
-        || row.cache_creation_cost_usd.is_some()
-}
-
-fn usage_totals_fit(observed: &UsageTotals, base: &UsageTotals) -> bool {
-    base.is_monotonic_after(observed)
-}
-
-fn sum_effort_totals(rows: &[(String, UsageTotals)]) -> Option<UsageTotals> {
-    let mut total = UsageTotals::default();
-    for (_, row) in rows {
-        if !total.add(row) {
-            return None;
-        }
-    }
-    Some(total)
-}
-
-/// Reconcile legacy cache evidence against the transcript's authoritative TTLs.
-///
-/// Stable v0.1.77 placed Claude's unscoped aggregate cache-creation count in
-/// the 5m field. New evidence stores that aggregate separately and never enters
-/// these totals. For old rows, retain each TTL component when its aggregate
-/// independently fits the transcript and discard only a conflicting component;
-/// this preserves genuinely scoped evidence without inventing a billing TTL.
-fn reconcile_effort_cache_creation(
-    rows: &mut [(String, UsageTotals)],
-    base: &UsageTotals,
-) -> Option<UsageTotals> {
-    let observed = sum_effort_totals(rows)?;
-    if usage_totals_fit(&observed, base) {
-        return Some(observed);
-    }
-
-    let mut non_cache = observed.clone();
-    non_cache.cache_creation_5m_tokens = 0;
-    non_cache.cache_creation_1h_tokens = 0;
-    if !usage_totals_fit(&non_cache, base) {
-        return None;
-    }
-    if observed.cache_creation_5m_tokens > base.cache_creation_5m_tokens {
-        for (_, totals) in rows.iter_mut() {
-            totals.cache_creation_5m_tokens = 0;
-        }
-    }
-    if observed.cache_creation_1h_tokens > base.cache_creation_1h_tokens {
-        for (_, totals) in rows.iter_mut() {
-            totals.cache_creation_1h_tokens = 0;
-        }
-    }
-    let reconciled = sum_effort_totals(rows)?;
-    usage_totals_fit(&reconciled, base).then_some(reconciled)
-}
-
-fn model_usage_with_totals(
-    base: &SnapshotModelUsage,
-    totals: &UsageTotals,
-    effort: Option<String>,
-) -> SnapshotModelUsage {
-    let mut row = base.clone();
-    row.input_tokens = totals.input_tokens;
-    row.output_tokens = totals.output_tokens;
-    row.cache_read_tokens = totals.cache_read_tokens;
-    row.cache_creation_5m_tokens = totals.cache_creation_5m_tokens;
-    row.cache_creation_1h_tokens = totals.cache_creation_1h_tokens;
-    row.reasoning_output_tokens = totals.reasoning_output_tokens;
-    row.unattributed_total_tokens = totals.unattributed_total_tokens;
-    row.request_count = totals.request_count;
-    row.reasoning_effort = effort;
-    row.cost_usd = None;
-    row.input_cost_usd = None;
-    row.output_cost_usd = None;
-    row.cache_read_cost_usd = None;
-    row.cache_creation_cost_usd = None;
-    row
 }
 
 fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
@@ -5256,7 +5060,7 @@ fn scan_source_roots_with_limit_and_attribution(
                                 claude_title_metadata.session_sidecar_fingerprint(session_id);
                             let effort_fingerprint = claude_effort_support_dir
                                 .map(|support_dir| {
-                                    crate::claude_effort::claude_effort_sidecar_fingerprint(
+                                    crate::claude_local_otel::claude_effort_sidecar_fingerprint(
                                         support_dir,
                                         session_id,
                                     )
@@ -11860,7 +11664,7 @@ fn claude_subagent_sidecar_fingerprint(
     // indexed before the final provider event arrived.
     let effort_fingerprint = claude_effort_support_dir
         .map(|support_dir| {
-            crate::claude_effort::claude_effort_sidecar_fingerprint(
+            crate::claude_local_otel::claude_effort_sidecar_fingerprint(
                 support_dir,
                 &identity.root_session_id,
             )
@@ -18815,79 +18619,59 @@ mod tests {
     }
 
     #[test]
-    fn claude_local_otel_effort_splits_bucket_without_changing_totals() {
-        let path = temp_file("claude-effort");
+    fn claude_local_otel_does_not_supply_missing_transcript_effort() {
+        let path = temp_file("claude-local-otel-effort-unknown");
         fs::write(
             &path,
             concat!(
                 "{\"timestamp\":\"2026-07-11T10:00:00Z\",\"sessionId\":\"claude-effort-1\",\"summary\":\"t\"}\n",
-                "{\"timestamp\":\"2026-07-11T10:01:00Z\",\"sessionId\":\"claude-effort-1\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
-                "{\"timestamp\":\"2026-07-11T10:02:00Z\",\"sessionId\":\"claude-effort-1\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+                "{\"timestamp\":\"2026-07-11T10:01:00Z\",\"sessionId\":\"claude-effort-1\",\"message\":{\"model\":\"claude-opus-4-7\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12}}}\n"
             ),
         )
         .expect("write fixture");
         let mut items =
             parse_claude_code_jsonl_file(&path, "2026-07-11T10:04:00Z", "fp".to_string())
                 .expect("parse");
-        for row in &mut items[0].model_usage {
-            row.account_identifier_hash = Some("hash-account-exact".to_string());
-        }
-        for row in &mut items[0].usage_buckets[0].model_usage {
-            row.account_identifier_hash = Some("hash-account-exact".to_string());
-        }
         let evidence = BTreeMap::from([(
             "claude-effort-1".to_string(),
-            vec![
-                crate::claude_effort::ClaudeEffortEvidence {
-                    fingerprint: "one".to_string(),
-                    session_id: "claude-effort-1".to_string(),
-                    observed_at: "2026-07-11T10:01:00Z".to_string(),
-                    model: "claude-opus-4-7".to_string(),
-                    effort: "high".to_string(),
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    request_count: 1,
-                    ..Default::default()
-                },
-                crate::claude_effort::ClaudeEffortEvidence {
-                    fingerprint: "two".to_string(),
-                    session_id: "claude-effort-1".to_string(),
-                    observed_at: "2026-07-11T10:02:00Z".to_string(),
-                    model: "claude-opus-4-7".to_string(),
-                    effort: "low".to_string(),
-                    input_tokens: 20,
-                    output_tokens: 7,
-                    request_count: 1,
-                    ..Default::default()
-                },
-            ],
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                fingerprint: "one".to_string(),
+                session_id: "claude-effort-1".to_string(),
+                observed_at: "2026-07-11T10:01:00Z".to_string(),
+                model: "claude-opus-4-7".to_string(),
+                effort: "high".to_string(),
+                input_tokens: 30,
+                output_tokens: 12,
+                request_count: 1,
+                account_identity_checked: true,
+                account_identifier_hash: Some("hash-account-exact".to_string()),
+                ..Default::default()
+            }],
         )]);
 
         apply_claude_effort_evidence(&mut items, &evidence);
 
         assert_eq!(items[0].input_tokens, 30);
         assert_eq!(items[0].output_tokens, 12);
-        assert_eq!(items[0].request_count, 2);
-        assert_eq!(items[0].model_usage.len(), 2);
-        assert_eq!(items[0].usage_buckets[0].model_usage.len(), 2);
+        assert_eq!(items[0].request_count, 1);
+        assert_eq!(items[0].model_usage.len(), 1);
+        assert_eq!(items[0].usage_buckets[0].model_usage.len(), 1);
         assert!(items[0]
             .model_usage
             .iter()
-            .any(|row| row.reasoning_effort.as_deref() == Some("high") && row.input_tokens == 10));
+            .chain(items[0].usage_buckets[0].model_usage.iter())
+            .all(|row| row.reasoning_effort.is_none()));
         assert!(items[0]
             .model_usage
             .iter()
-            .any(|row| row.reasoning_effort.as_deref() == Some("low") && row.input_tokens == 20));
-        assert!(items[0]
-            .model_usage
-            .iter()
+            .chain(items[0].usage_buckets[0].model_usage.iter())
             .all(|row| row.account_identifier_hash.as_deref() == Some("hash-account-exact")));
-        validate_snapshot_item(0, &items[0]).expect("split snapshot remains byte-exact");
+        validate_snapshot_item(0, &items[0]).expect("account-only enrichment remains byte-exact");
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn claude_local_otel_effort_keeps_unscoped_cache_creation_on_unknown_residual() {
+    fn claude_local_otel_does_not_split_unknown_cache_creation() {
         let path = temp_file("claude-effort-cache-ttl");
         fs::write(
             &path,
@@ -18902,7 +18686,7 @@ mod tests {
                 .expect("parse");
         let evidence = BTreeMap::from([(
             "claude-effort-cache-1".to_string(),
-            vec![crate::claude_effort::ClaudeEffortEvidence {
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: "legacy-v0.1.77".to_string(),
                 session_id: "claude-effort-cache-1".to_string(),
                 observed_at: "2026-07-12T15:07:58.852Z".to_string(),
@@ -18921,31 +18705,21 @@ mod tests {
         apply_claude_effort_evidence(&mut items, &evidence);
 
         let rows = &items[0].usage_buckets[0].model_usage;
-        assert_eq!(rows.len(), 2);
-        let low = rows
-            .iter()
-            .find(|row| row.reasoning_effort.as_deref() == Some("low"))
-            .expect("low effort row");
-        assert_eq!(low.input_tokens, 2);
-        assert_eq!(low.output_tokens, 9);
-        assert_eq!(low.request_count, 1);
-        assert_eq!(low.cache_creation_5m_tokens, 0);
-        assert_eq!(low.cache_creation_1h_tokens, 0);
-        let residual = rows
-            .iter()
-            .find(|row| row.reasoning_effort.is_none())
-            .expect("unknown cache residual");
-        assert_eq!(residual.request_count, 0);
-        assert_eq!(residual.cache_creation_5m_tokens, 0);
-        assert_eq!(residual.cache_creation_1h_tokens, 2014);
-        validate_snapshot_item(0, &items[0]).expect("enriched snapshot remains byte-exact");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reasoning_effort, None);
+        assert_eq!(rows[0].input_tokens, 2);
+        assert_eq!(rows[0].output_tokens, 9);
+        assert_eq!(rows[0].request_count, 1);
+        assert_eq!(rows[0].cache_creation_5m_tokens, 0);
+        assert_eq!(rows[0].cache_creation_1h_tokens, 2014);
+        validate_snapshot_item(0, &items[0]).expect("unchanged snapshot remains byte-exact");
 
         let mut scoped_items =
             parse_claude_code_jsonl_file(&path, "2026-07-12T15:08:00Z", "fp".to_string())
                 .expect("parse scoped fixture");
         let scoped_evidence = BTreeMap::from([(
             "claude-effort-cache-1".to_string(),
-            vec![crate::claude_effort::ClaudeEffortEvidence {
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 fingerprint: "explicit-1h".to_string(),
                 session_id: "claude-effort-cache-1".to_string(),
                 observed_at: "2026-07-12T15:07:58.852Z".to_string(),
@@ -18961,10 +18735,10 @@ mod tests {
         apply_claude_effort_evidence(&mut scoped_items, &scoped_evidence);
         let scoped_rows = &scoped_items[0].usage_buckets[0].model_usage;
         assert_eq!(scoped_rows.len(), 1);
-        assert_eq!(scoped_rows[0].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(scoped_rows[0].reasoning_effort, None);
         assert_eq!(scoped_rows[0].cache_creation_1h_tokens, 2014);
         validate_snapshot_item(0, &scoped_items[0])
-            .expect("explicit TTL evidence remains byte-exact");
+            .expect("explicit sidecar TTL remains ignored and byte-exact");
         let _ = fs::remove_file(path);
     }
 
@@ -18986,7 +18760,7 @@ mod tests {
         let account_b = "b".repeat(64);
         let unique = BTreeMap::from([(
             "claude-account-1".to_string(),
-            vec![crate::claude_effort::ClaudeEffortEvidence {
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 session_id: "claude-account-1".to_string(),
                 model: "unmatched-model".to_string(),
                 effort: "high".to_string(),
@@ -19016,12 +18790,12 @@ mod tests {
         let conflicting = BTreeMap::from([(
             "claude-account-1".to_string(),
             vec![
-                crate::claude_effort::ClaudeEffortEvidence {
+                crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
                     account_identifier_hash: Some(account_a),
                     ..Default::default()
                 },
-                crate::claude_effort::ClaudeEffortEvidence {
+                crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
                     account_identifier_hash: Some(account_b),
                     ..Default::default()
@@ -19045,12 +18819,12 @@ mod tests {
         let partially_identified = BTreeMap::from([(
             "claude-account-1".to_string(),
             vec![
-                crate::claude_effort::ClaudeEffortEvidence {
+                crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
                     account_identifier_hash: Some("a".repeat(64)),
                     ..Default::default()
                 },
-                crate::claude_effort::ClaudeEffortEvidence {
+                crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
                     ..Default::default()
                 },
@@ -19072,7 +18846,7 @@ mod tests {
         apply_claude_effort_evidence(&mut items, &unique);
         let unidentified = BTreeMap::from([(
             "claude-account-1".to_string(),
-            vec![crate::claude_effort::ClaudeEffortEvidence {
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 account_identity_checked: true,
                 ..Default::default()
             }],
@@ -19092,8 +18866,8 @@ mod tests {
         let mixed_legacy_and_current = BTreeMap::from([(
             "claude-account-1".to_string(),
             vec![
-                crate::claude_effort::ClaudeEffortEvidence::default(),
-                crate::claude_effort::ClaudeEffortEvidence {
+                crate::claude_local_otel::ClaudeLocalOtelEvidence::default(),
+                crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     account_identity_checked: true,
                     account_identifier_hash: Some("a".repeat(64)),
                     ..Default::default()
@@ -19114,7 +18888,7 @@ mod tests {
 
         let incomplete_current = BTreeMap::from([(
             "claude-account-1".to_string(),
-            vec![crate::claude_effort::ClaudeEffortEvidence {
+            vec![crate::claude_local_otel::ClaudeLocalOtelEvidence {
                 account_identity_checked: true,
                 account_identifier_hash: Some("a".repeat(64)),
                 request_count: 1,
@@ -19182,23 +18956,25 @@ mod tests {
     fn claude_account_family_evidence(
         parent: &str,
         hashes: &[String],
-    ) -> BTreeMap<String, Vec<crate::claude_effort::ClaudeEffortEvidence>> {
+    ) -> BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>> {
         let rows = hashes
             .iter()
             .enumerate()
-            .map(|(index, hash)| crate::claude_effort::ClaudeEffortEvidence {
-                fingerprint: format!("family-{index}"),
-                session_id: parent.to_string(),
-                observed_at: format!("2026-08-02T07:00:0{index}Z"),
-                model: "claude-haiku-4-5".to_string(),
-                // Deliberately differ from transcript token accounting. The
-                // family fallback is proven by one checked row per request.
-                output_tokens: 11,
-                request_count: 1,
-                account_identity_checked: true,
-                account_identifier_hash: Some(hash.clone()),
-                ..Default::default()
-            })
+            .map(
+                |(index, hash)| crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                    fingerprint: format!("family-{index}"),
+                    session_id: parent.to_string(),
+                    observed_at: format!("2026-08-02T07:00:0{index}Z"),
+                    model: "claude-haiku-4-5".to_string(),
+                    // Deliberately differ from transcript token accounting. The
+                    // family fallback is proven by one checked row per request.
+                    output_tokens: 11,
+                    request_count: 1,
+                    account_identity_checked: true,
+                    account_identifier_hash: Some(hash.clone()),
+                    ..Default::default()
+                },
+            )
             .collect();
         BTreeMap::from([(parent.to_string(), rows)])
     }
@@ -19446,37 +19222,6 @@ mod tests {
         );
         assert_unknown(&page_items);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn claude_effort_cache_reconciliation_drops_only_conflicting_ttl_component() {
-        let mut rows = vec![(
-            "low".to_string(),
-            UsageTotals {
-                input_tokens: 2,
-                output_tokens: 9,
-                cache_creation_5m_tokens: 500,
-                cache_creation_1h_tokens: 700,
-                request_count: 1,
-                ..Default::default()
-            },
-        )];
-        let base = UsageTotals {
-            input_tokens: 2,
-            output_tokens: 9,
-            cache_creation_5m_tokens: 0,
-            cache_creation_1h_tokens: 700,
-            request_count: 1,
-            ..Default::default()
-        };
-
-        let reconciled = reconcile_effort_cache_creation(&mut rows, &base)
-            .expect("non-cache totals and explicit 1h cache fit");
-
-        assert_eq!(reconciled.cache_creation_5m_tokens, 0);
-        assert_eq!(reconciled.cache_creation_1h_tokens, 700);
-        assert_eq!(rows[0].1.cache_creation_5m_tokens, 0);
-        assert_eq!(rows[0].1.cache_creation_1h_tokens, 700);
     }
 
     #[test]
@@ -20696,7 +20441,7 @@ mod tests {
             "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785654000000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{parent_session}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"1\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"1\"}}}}]}}]}}]}}]}}"
         );
         assert_eq!(
-            crate::claude_effort::capture_claude_api_request_logs(
+            crate::claude_local_otel::capture_claude_api_request_logs(
                 &support_dir,
                 body.as_bytes(),
                 "application/json",
@@ -21569,7 +21314,7 @@ mod tests {
             "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{{\"timeUnixNano\":\"1785492120000000000\",\"body\":{{\"stringValue\":\"claude_code.api_request\"}},\"attributes\":[{{\"key\":\"session.id\",\"value\":{{\"stringValue\":\"{session_id}\"}}}},{{\"key\":\"user.account_uuid\",\"value\":{{\"stringValue\":\"123E4567-E89B-12D3-A456-426614174000\"}}}},{{\"key\":\"model\",\"value\":{{\"stringValue\":\"claude-opus-4-8\"}}}},{{\"key\":\"input_tokens\",\"value\":{{\"intValue\":\"35\"}}}},{{\"key\":\"output_tokens\",\"value\":{{\"intValue\":\"8\"}}}}]}}]}}]}}]}}"
         );
         assert_eq!(
-            crate::claude_effort::capture_claude_api_request_logs(
+            crate::claude_local_otel::capture_claude_api_request_logs(
                 &support_dir,
                 body.as_bytes(),
                 "application/json",
@@ -21593,7 +21338,7 @@ mod tests {
         assert_eq!(second.semantic_noop_count, 0);
         assert_eq!(second.snapshots.len(), 1);
 
-        let evidence = crate::claude_effort::load_claude_effort_evidence(
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
             &support_dir,
             [session_id.to_string()],
         )

@@ -1893,7 +1893,7 @@ fn sync_source(
             session_ids.extend(crate::snapshots::claude_pending_family_session_ids(&index));
         }
         if let Ok(evidence) =
-            crate::claude_effort::load_claude_effort_evidence(support_dir, session_ids)
+            crate::claude_local_otel::load_claude_effort_evidence(support_dir, session_ids)
         {
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
