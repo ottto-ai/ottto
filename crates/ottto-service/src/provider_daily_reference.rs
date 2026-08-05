@@ -867,9 +867,80 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
     }
 }
 
+/// Downgrade an otherwise-ready status when the live binding is not the one
+/// consent covers.
+///
+/// [`collector_status`] reads the grant alone, so it cannot see that the signed-in
+/// Codex account has changed. The collector checks that on every cycle and stops,
+/// which left the operator surface reporting `enabled` while nothing was being
+/// collected - a live install sat that way for over a day. Anything a cycle
+/// refuses for, the status has to be able to say.
+///
+/// The privacy ordering is preserved: the live account and installation are only
+/// resolved when consent is ALREADY runtime-ready, which is exactly when reading
+/// is permitted anyway. A grant that is absent or blocked earlier touches nothing.
+pub fn status_with_live_binding(
+    grants: &GrantStore,
+    status: CollectorStatusV1,
+    runtime: Option<&Runtime>,
+) -> CollectorStatusV1 {
+    if status.runtime_state != RuntimeState::Enabled {
+        return status;
+    }
+    let Some(runtime) = runtime else {
+        return status;
+    };
+    let Some(reason) = live_binding_mismatch(grants, runtime) else {
+        return status;
+    };
+    CollectorStatusV1 {
+        runtime_state: RuntimeState::ConsentRequired,
+        provider_read_permitted: false,
+        reason_code: reason.to_string(),
+        ..status
+    }
+}
+
+/// Which half of the binding disagrees with stored consent, if either.
+///
+/// An unreadable fingerprint is NOT reported as a mismatch: failing to derive it
+/// is not evidence that the account differs, and claiming otherwise would send a
+/// customer to re-approve for no reason.
+fn live_binding_mismatch(grants: &GrantStore, runtime: &Runtime) -> Option<&'static str> {
+    let stored = grants.load().ok().flatten()?;
+    if let Ok(Some(installation)) = grants.installation_fingerprint_for(&runtime.installation_id) {
+        if installation != stored.installation_fingerprint {
+            return Some("installation_mismatch");
+        }
+    }
+    if let Ok(Some(account)) = grants.account_fingerprint_for(&runtime.provider_account_scope) {
+        if account != stored.account_fingerprint {
+            return Some("account_mismatch");
+        }
+    }
+    None
+}
+
+/// [`collector_status`] plus the live-binding check. This is what operator and UI
+/// surfaces should call: a status that can still read `enabled` while the
+/// collector refuses every cycle is the bug this exists to prevent.
+pub fn collector_status_live(grants: &GrantStore, network_disabled: bool) -> CollectorStatusV1 {
+    let status = collector_status(grants, network_disabled);
+    if status.runtime_state != RuntimeState::Enabled {
+        // Nothing is resolved and no account state is touched unless consent is
+        // already permitted to read.
+        return status;
+    }
+    let runtime = load_runtime_binding()
+        .ok()
+        .flatten()
+        .map(|(runtime, _credential, _api_base_url)| runtime);
+    status_with_live_binding(grants, status, runtime.as_ref())
+}
+
 /// The status view for the real support directory.
 pub fn default_collector_status() -> CollectorStatusV1 {
-    collector_status(&GrantStore::default(), network_disabled())
+    collector_status_live(&GrantStore::default(), network_disabled())
 }
 
 /// Replay ledger for this capability's one-time control tokens.
@@ -4531,6 +4602,40 @@ mod tests {
         assert_eq!(
             grant_runtime_block_reason(&unbound),
             Some("no_backend_binding")
+        );
+    }
+
+    #[test]
+    fn the_status_reports_a_live_account_the_consent_does_not_cover() {
+        // Regression: the cycle refused on account mismatch while the operator
+        // surface still read `enabled`, so a live install collected nothing for
+        // over a day with nothing to show for it. Whatever a cycle refuses for,
+        // the status has to be able to say.
+        let collector = collector("status-account-mismatch");
+        enabled(&collector);
+        let grants = collector.grants();
+        let ready = collector_status(grants, false);
+        assert_eq!(ready.runtime_state, RuntimeState::Enabled);
+        assert!(ready.provider_read_permitted);
+
+        let other_account = Runtime {
+            installation_id: INSTALLATION_ID.to_string(),
+            provider_account_scope: "acct-a-completely-different-account".to_string(),
+        };
+        let mismatched = status_with_live_binding(grants, ready.clone(), Some(&other_account));
+        assert_eq!(mismatched.runtime_state, RuntimeState::ConsentRequired);
+        assert_eq!(mismatched.reason_code, "account_mismatch");
+        assert!(!mismatched.provider_read_permitted);
+
+        // The matching binding is left exactly as it was, and an unresolvable
+        // binding must not invent a mismatch.
+        assert_eq!(
+            status_with_live_binding(grants, ready.clone(), Some(&runtime())).reason_code,
+            "enabled"
+        );
+        assert_eq!(
+            status_with_live_binding(grants, ready, None).reason_code,
+            "enabled"
         );
     }
 
