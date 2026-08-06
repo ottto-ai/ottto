@@ -23,8 +23,7 @@ use crate::snapshots::{
     validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
     SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
     SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_BATCH_WIRE_BYTES, SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION,
-    SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -59,20 +58,19 @@ const COLLECTOR_CHECKIN_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CHECKIN_BACKFILL_WINDOW_DAYS: u64 = 183;
 const LOCAL_HEALTH_PROJECTION_INTERVAL: Duration = Duration::from_secs(60);
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: i64 = 15;
-// The backend accepts up to 100 snapshots, but a reconciliation-heavy parser
-// backfill can make that ceiling exceed the load balancer request window. Keep
-// daemon uploads deliberately smaller: normal incremental scans are usually a
-// single chunk, while historical replay trades more requests for bounded DB
-// work and reliable checkpoint advancement.
-const SNAPSHOT_BATCH_LIMIT: usize = 20;
-// Pack serialized item bodies to half the backend's uncompressed request cap.
-// The remaining half safely covers the derived semantic envelopes and bounded
-// request metadata; the exact request serializer is still checked immediately
-// before network I/O by `validate_snapshot_batch_request`.
-const SNAPSHOT_BATCH_PACKED_ITEM_BYTES: usize = MAX_SNAPSHOT_BATCH_WIRE_BYTES / 2;
-// A 20-item page needs at most five binary splits to isolate one poison item.
-// Keep only one extra split of headroom so broad schema drift cannot turn one
-// five-minute cycle into dozens of doomed backend calls.
+// Match the backend's accepted entity count while retaining a separate byte
+// bound for pathological backfill batches. Normal incremental scans are
+// usually a single small chunk; historical replay avoids count-only 50-item
+// requests that could consume the backend's full wire budget.
+const SNAPSHOT_BATCH_LIMIT: usize = 50;
+// Leave half of the backend's 4 MiB uncompressed request cap for derived
+// semantic envelopes and bounded request metadata. The exact request serializer
+// is still checked immediately before network I/O by
+// `validate_snapshot_batch_request`.
+const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+// A 50-item page needs at most six binary splits to isolate one poison item.
+// Cap there so broad schema drift cannot turn one five-minute cycle into dozens
+// of doomed backend calls.
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
@@ -2538,7 +2536,7 @@ where
         let item_bytes = body.len().saturating_add(1);
         if !batch.is_empty()
             && (batch.len() == SNAPSHOT_BATCH_LIMIT
-                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_PACKED_ITEM_BYTES)
+                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_MAX_BYTES)
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
@@ -3472,9 +3470,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_upload_batches_bound_reconciliation_work() {
+    fn snapshot_upload_batches_enforce_the_entity_count_bound() {
         let poison_scope = &unique_poison_scope();
-        let items = test_fingerprints(45);
+        let items = test_fingerprints(101);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let mut chunk_lengths = Vec::new();
@@ -3493,10 +3491,12 @@ mod tests {
         )
         .expect("upload succeeds");
 
-        assert_eq!(SNAPSHOT_BATCH_LIMIT, 20);
-        assert_eq!(chunk_lengths, vec![20, 20, 5]);
-        assert!(chunk_lengths.iter().all(|length| *length <= 20));
-        assert_eq!(accepted, 45);
+        assert_eq!(SNAPSHOT_BATCH_LIMIT, 50);
+        assert_eq!(chunk_lengths, vec![50, 50, 1]);
+        assert!(chunk_lengths
+            .iter()
+            .all(|length| *length <= SNAPSHOT_BATCH_LIMIT));
+        assert_eq!(accepted, 101);
         assert_eq!(result, ResumableUploadResult::Completed);
     }
 
@@ -3760,16 +3760,19 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_upload_packs_uncompressed_bytes_below_the_request_cap() {
-        let items = (0..5)
-            .map(|index| SizedUploadItem {
+    fn snapshot_upload_byte_bound_closes_mixed_size_batches_early() {
+        let body_sizes = [400 * 1024, 800 * 1024, 1_000 * 1024, 100 * 1024];
+        let items = body_sizes
+            .into_iter()
+            .enumerate()
+            .map(|(index, body_size)| SizedUploadItem {
                 fingerprint: format!("{index:064x}"),
-                body: "x".repeat(700 * 1024),
+                body: "x".repeat(body_size),
             })
             .collect::<Vec<_>>();
         let mut progress = test_upload_progress();
         let mut accepted = 0;
-        let mut observed_sizes = Vec::new();
+        let mut observed_batches = Vec::new();
         upload_resumable_batches(
             &items,
             &unique_poison_scope(),
@@ -3777,18 +3780,61 @@ mod tests {
             &mut accepted,
             |item| item.fingerprint.as_str(),
             |batch| {
-                observed_sizes.push(serde_json::to_vec(&batch).unwrap().len());
+                observed_batches.push((batch.len(), serde_json::to_vec(&batch).unwrap().len()));
                 Ok(accepted_batch(batch.len()))
             },
             |_| Ok(()),
         )
         .expect("byte-packed upload succeeds");
 
-        assert_eq!(accepted, 5);
-        assert_eq!(observed_sizes.len(), 3);
-        assert!(observed_sizes
+        assert_eq!(accepted, 4);
+        assert_eq!(
+            observed_batches
+                .iter()
+                .map(|(count, _)| *count)
+                .collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+        assert!(observed_batches
             .iter()
-            .all(|size| *size <= SNAPSHOT_BATCH_PACKED_ITEM_BYTES));
+            .all(|(_, size)| *size <= SNAPSHOT_BATCH_MAX_BYTES));
+    }
+
+    #[test]
+    fn snapshot_upload_single_oversize_entity_ships_alone() {
+        let items = vec![
+            SizedUploadItem {
+                fingerprint: format!("{:064x}", 0),
+                body: "x".repeat(SNAPSHOT_BATCH_MAX_BYTES + 1),
+            },
+            SizedUploadItem {
+                fingerprint: format!("{:064x}", 1),
+                body: "small".to_string(),
+            },
+        ];
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut observed_batches = Vec::new();
+        upload_resumable_batches(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.fingerprint.as_str(),
+            |batch| {
+                observed_batches.push((batch.len(), serde_json::to_vec(&batch).unwrap().len()));
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect("a single oversize entity is left for the server entity cap");
+
+        assert_eq!(accepted, 2);
+        assert_eq!(observed_batches.len(), 2);
+        assert_eq!(observed_batches[0].0, 1);
+        assert!(observed_batches[0].1 > SNAPSHOT_BATCH_MAX_BYTES);
+        assert_eq!(observed_batches[1].0, 1);
+        assert!(observed_batches[1].1 <= SNAPSHOT_BATCH_MAX_BYTES);
     }
 
     #[test]
@@ -4166,7 +4212,7 @@ mod tests {
         let poison_scope = &unique_poison_scope();
         use crate::client_report::{observe, reset_for_test, ClientReportReason};
         reset_for_test();
-        let items = test_fingerprints(45);
+        let items = test_fingerprints(75);
         let first_page = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
         let mut progress = test_upload_progress();
         let mut accepted = 0;
@@ -4583,7 +4629,7 @@ mod tests {
         let poison_scope = &unique_poison_scope();
         let root = test_dir("snapshot-upload-resume-timeout");
         let path = root.join("codex-scan-index-attribution-test-upload-progress.json");
-        let items = test_fingerprints(45);
+        let items = test_fingerprints(75);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let first_page = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
@@ -4800,7 +4846,7 @@ mod tests {
     #[serial(client_report)]
     fn broad_item_validation_failure_caps_adaptive_requests() {
         let poison_scope = &unique_poison_scope();
-        let items = test_fingerprints(45);
+        let items = test_fingerprints(75);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let mut attempts = 0usize;
