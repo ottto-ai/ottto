@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 314,
-  "content_sha256": "38ea0ae26bb6caa8c99c2f3d4065c8abb3e4ebfe46293e257490fb90b4c91cb8",
+  "content_sha256": "090774d646f859ec2eaab2dc9c8c3bd2c9c801c542bab850238a9d6a823621fd",
   "files": [
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "e6f8338a8b30e8670aad064063a21241738009e9a2f4d65c828f11c5b8ca32ce",
-      "size_bytes": 33373
+      "sha256": "545b2c13122ac9a04a641f2c74e0b1c6ac1d199520631b907a43fa784bf2caf5",
+      "size_bytes": 35106
     },
     {
       "executable": false,
