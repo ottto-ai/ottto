@@ -186,17 +186,12 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // maps to is unchanged, and the effort sidecar fingerprint already re-selects a
 // transcript whose evidence grew after its final write.
 pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
-// claude_code v29: read the applied reasoning-effort tier straight off the
-// assistant transcript record. Current Claude Code writes `"effort":"high"` on
-// the record whose usage this is, which makes the OTLP sidecar unnecessary for
-// effort: no loopback relay dependency, and no way for a subagent turn to be
-// attributed to its parent, because nothing is pooled per session to begin with.
-// Measured over two days of local transcripts: 99% of top-level and 72% of
-// subagent usage records carry it (the remainder is Haiku, which has no tier),
-// and it matched the OTLP sidecar on 7020 of 7020 records both described. A
-// transcript record without the field stays effort-unknown; local OTLP is used
-// only for privacy-safe account identity evidence.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v29";
+// claude_code v30: retain the exact response ids for counted transcript usage
+// in local memory. Account attribution can then prove that every billed request
+// appears in one-account local OTLP evidence while safely tolerating auxiliary
+// requests (such as prompt suggestions) that Claude records only in OTLP under
+// the same root session. Raw request ids are never serialized or uploaded.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v30";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -677,6 +672,14 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
+    /// Local-only identities of the Claude API responses whose transcript
+    /// usage contributed to this snapshot. Claude Code also emits auxiliary
+    /// OTLP requests (for example prompt suggestions) under the same session
+    /// id; these exact request ids let account attribution prove coverage of
+    /// billed transcript usage without treating those auxiliary requests as
+    /// missing transcript rows. Never serialized or uploaded.
+    #[serde(skip)]
+    pub(crate) claude_usage_request_ids: BTreeSet<String>,
     // Session-level Codex latency (avg across the session's `task_complete`
     // turns). Codex emits duration/ttft only in the rollout `task_complete`
     // event (never over OTLP), so the daemon aggregates them here. Absent for
@@ -1177,6 +1180,8 @@ struct ClaudeAccountFamilyWitness {
     account_identifier_hash: String,
     evidence_request_count: u128,
     members: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    member_request_id_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1185,7 +1190,15 @@ struct ClaudeAccountFamilyPending {
     account_identifier_hash: String,
     evidence_request_count: u128,
     members: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
     invalid: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProvenClaudeAccountFamily {
+    members: BTreeMap<String, u64>,
+    member_request_id_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1552,6 +1565,42 @@ pub fn apply_claude_effort_evidence_with_index(
         BTreeMap::new()
     };
     if census_complete {
+        // v29 witnesses predate per-member request-set fingerprints. Removing
+        // one without revisiting its unchanged transcript files would strand
+        // later child-only reparses: scan identity stays at v24, so no ordinary
+        // parser upgrade selects those files. Schedule only the affected
+        // complete families for a bounded local reparse before the legacy
+        // witness is discarded. The old count-only witness is never used to
+        // stamp a v30 parse; the reparse must rebuild exact request coverage.
+        let legacy_witness_roots = index
+            .claude_account_family_witnesses
+            .iter()
+            .filter_map(|(root_session_id, witness)| {
+                let fingerprint_members = witness
+                    .member_request_id_fingerprints
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let witness_members = witness.members.keys().cloned().collect::<BTreeSet<_>>();
+                (fingerprint_members != witness_members
+                    && complete_family_members.contains_key(root_session_id))
+                .then_some(root_session_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        for (index_key, entry) in &mut index.files {
+            let Some((root_session_id, source_session_id)) =
+                claude_index_path_family_member(Path::new(index_key))
+            else {
+                continue;
+            };
+            if legacy_witness_roots.contains(&root_session_id)
+                && complete_family_members
+                    .get(&root_session_id)
+                    .is_some_and(|members| members.contains(&source_session_id))
+            {
+                entry.source_file_fingerprint.clear();
+            }
+        }
         index
             .claude_account_family_witnesses
             .retain(|root_session_id, witness| {
@@ -1559,6 +1608,12 @@ pub fn apply_claude_effort_evidence_with_index(
                     .get(root_session_id)
                     .is_some_and(|members| {
                         members == &witness.members.keys().cloned().collect::<BTreeSet<_>>()
+                            && members
+                                == &witness
+                                    .member_request_id_fingerprints
+                                    .keys()
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>()
                     })
             });
     }
@@ -1568,7 +1623,7 @@ pub fn apply_claude_effort_evidence_with_index(
         &mut index.claude_account_family_pending,
         census_window_end,
     );
-    let proven_family_counts = if census_complete {
+    let proven_families = if census_complete {
         complete_family_members
             .iter()
             .filter_map(|(root_session_id, complete_members)| {
@@ -1580,8 +1635,32 @@ pub fn apply_claude_effort_evidence_with_index(
                             && pending.census_window_end == census_window_end
                             && &pending.members.keys().cloned().collect::<BTreeSet<_>>()
                                 == complete_members
+                            && &pending
+                                .member_request_id_hashes
+                                .keys()
+                                .cloned()
+                                .collect::<BTreeSet<_>>()
+                                == complete_members
+                            && claude_family_request_ids_are_disjoint(pending)
                     })
-                    .map(|pending| (root_session_id.clone(), pending.members.clone()))
+                    .map(|pending| {
+                        (
+                            root_session_id.clone(),
+                            ProvenClaudeAccountFamily {
+                                members: pending.members.clone(),
+                                member_request_id_fingerprints: pending
+                                    .member_request_id_hashes
+                                    .iter()
+                                    .map(|(source_session_id, request_id_hashes)| {
+                                        (
+                                            source_session_id.clone(),
+                                            claude_request_id_set_fingerprint(request_id_hashes),
+                                        )
+                                    })
+                                    .collect(),
+                            },
+                        )
+                    })
             })
             .collect::<BTreeMap<_, _>>()
     } else {
@@ -1596,7 +1675,7 @@ pub fn apply_claude_effort_evidence_with_index(
         snapshots,
         evidence_by_session,
         &mut index.claude_account_family_witnesses,
-        &proven_family_counts,
+        &proven_families,
     );
     if census_complete {
         index.claude_account_family_pending.clear();
@@ -1604,7 +1683,7 @@ pub fn apply_claude_effort_evidence_with_index(
             .iter()
             .map(|snapshot| snapshot.source_session_id.as_str())
             .collect::<BTreeSet<_>>();
-        let newly_proven_roots = proven_family_counts
+        let newly_proven_roots = proven_families
             .keys()
             .filter(|root_session_id| {
                 !witness_roots_before.contains(*root_session_id)
@@ -1661,6 +1740,7 @@ fn accumulate_claude_family_pending(
                 account_identifier_hash: account_hash.to_string(),
                 evidence_request_count,
                 members: BTreeMap::new(),
+                member_request_id_hashes: BTreeMap::new(),
                 invalid: false,
             });
         if pending.census_window_end != census_window_end
@@ -1672,6 +1752,7 @@ fn accumulate_claude_family_pending(
                 account_identifier_hash: account_hash.to_string(),
                 evidence_request_count,
                 members: BTreeMap::new(),
+                member_request_id_hashes: BTreeMap::new(),
                 invalid: false,
             };
         }
@@ -1681,6 +1762,7 @@ fn accumulate_claude_family_pending(
         {
             if item.unattributed_total_tokens != 0
                 || claude_snapshot_has_conflicting_account_hash(item, account_hash)
+                || !claude_account_evidence_covers_request_ids(item, evidence)
             {
                 pending.invalid = true;
                 continue;
@@ -1692,15 +1774,63 @@ fn accumulate_claude_family_pending(
             {
                 pending.invalid = true;
             }
+            let Some(request_id_hashes) = claude_snapshot_request_id_hashes(item) else {
+                pending.invalid = true;
+                continue;
+            };
+            if let Some(previous) = pending
+                .member_request_id_hashes
+                .insert(item.source_session_id.clone(), request_id_hashes.clone())
+            {
+                if previous != request_id_hashes {
+                    pending.invalid = true;
+                }
+            }
         }
     }
+}
+
+fn claude_snapshot_request_id_hashes(item: &SnapshotItem) -> Option<BTreeSet<String>> {
+    let expected = usize::try_from(item.request_count).ok()?;
+    if expected == 0 || item.claude_usage_request_ids.len() != expected {
+        return None;
+    }
+    Some(
+        item.claude_usage_request_ids
+            .iter()
+            .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+            .collect(),
+    )
+}
+
+fn claude_request_id_set_fingerprint(request_id_hashes: &BTreeSet<String>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"claude_request_id_set:v1\0");
+    for request_id_hash in request_id_hashes {
+        digest.update(request_id_hash.as_bytes());
+        digest.update(b"\0");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPending) -> bool {
+    let expected_request_count = pending
+        .members
+        .values()
+        .map(|request_count| u128::from(*request_count))
+        .sum::<u128>();
+    let mut union = BTreeSet::new();
+    for request_id_hashes in pending.member_request_id_hashes.values() {
+        union.extend(request_id_hashes.iter());
+    }
+    expected_request_count > 0 && union.len() as u128 == expected_request_count
 }
 
 fn apply_claude_effort_evidence_with_families(
     snapshots: &mut [SnapshotItem],
     evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     family_witnesses: &mut BTreeMap<String, ClaudeAccountFamilyWitness>,
-    proven_family_counts: &BTreeMap<String, BTreeMap<String, u64>>,
+    proven_families: &BTreeMap<String, ProvenClaudeAccountFamily>,
 ) {
     for item in snapshots.iter_mut() {
         let Some(evidence) = evidence_by_session.get(&item.source_session_id) else {
@@ -1715,7 +1845,7 @@ fn apply_claude_effort_evidence_with_families(
         snapshots,
         evidence_by_session,
         family_witnesses,
-        proven_family_counts,
+        proven_families,
     );
 }
 
@@ -1723,18 +1853,20 @@ fn apply_claude_effort_evidence_with_families(
 /// when the transcript scanner correctly emits those requests as distinct
 /// subagent sessions. In that case the root-only token totals cannot cover the
 /// sidecar and the per-session guard above must refuse it. Recover the identity
-/// only when the checked sidecar request count exactly covers every explicit
-/// member proven by a complete filesystem census and every request names the
-/// same account. The durable local witness then supports child-only incremental
+/// only when every billed transcript request id is covered by checked sidecar
+/// evidence, every explicit member is proven by a complete filesystem census,
+/// and every sidecar request names the same account. Extra sidecar requests are
+/// allowed because Claude Code records auxiliary calls such as prompt
+/// suggestions under the root session id without writing them to the billed
+/// transcript. The durable local witness then supports child-only incremental
 /// reparses without treating their current page as a complete family. Token
 /// counters intentionally do not participate in this fallback: provider
-/// API-request output accounting can differ from the child transcript while
-/// the one-record-per-request count remains exact.
+/// API-request output accounting can differ from the child transcript.
 fn apply_claude_family_account_evidence(
     snapshots: &mut [SnapshotItem],
     evidence_by_session: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     family_witnesses: &mut BTreeMap<String, ClaudeAccountFamilyWitness>,
-    proven_family_counts: &BTreeMap<String, BTreeMap<String, u64>>,
+    proven_families: &BTreeMap<String, ProvenClaudeAccountFamily>,
 ) {
     for (root_session_id, evidence) in evidence_by_session {
         let Some(account_hash) = strict_claude_account_hash(evidence) else {
@@ -1768,27 +1900,40 @@ fn apply_claude_family_account_evidence(
                 (item.source_session_id.clone(), item.request_count)
             })
             .collect::<BTreeMap<_, _>>();
+        let current_member_request_id_fingerprints = family_indices
+            .iter()
+            .filter_map(|index| {
+                let item = &snapshots[*index];
+                claude_snapshot_request_id_hashes(item).map(|request_id_hashes| {
+                    (
+                        item.source_session_id.clone(),
+                        claude_request_id_set_fingerprint(&request_id_hashes),
+                    )
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         let current_items_valid = family_indices.len() == current_member_counts.len()
+            && family_indices.len() == current_member_request_id_fingerprints.len()
             && family_indices.iter().all(|index| {
                 let item = &snapshots[*index];
                 item.unattributed_total_tokens == 0
                     && !claude_snapshot_has_conflicting_account_hash(item, account_hash)
+                    && claude_account_evidence_covers_request_ids(item, evidence)
             });
         if !current_items_valid {
             family_witnesses.remove(root_session_id);
             continue;
         }
 
-        if let Some(proven_counts) = proven_family_counts.get(root_session_id) {
-            let proven_members = proven_counts.keys().cloned().collect::<BTreeSet<_>>();
-            let snapshot_request_count = proven_counts
-                .values()
-                .map(|request_count| u128::from(*request_count))
-                .sum::<u128>();
-            if proven_counts.len() < 2
+        if let Some(proven_family) = proven_families.get(root_session_id) {
+            let proven_members = proven_family
+                .members
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if proven_family.members.len() < 2
                 || !proven_members.contains(root_session_id)
-                || snapshot_request_count == 0
-                || snapshot_request_count != evidence_request_count
+                || proven_family.member_request_id_fingerprints.len() != proven_family.members.len()
             {
                 family_witnesses.remove(root_session_id);
                 continue;
@@ -1798,7 +1943,10 @@ fn apply_claude_family_account_evidence(
                 ClaudeAccountFamilyWitness {
                     account_identifier_hash: account_hash.to_string(),
                     evidence_request_count,
-                    members: proven_counts.clone(),
+                    members: proven_family.members.clone(),
+                    member_request_id_fingerprints: proven_family
+                        .member_request_id_fingerprints
+                        .clone(),
                 },
             );
         } else if family_witnesses
@@ -1808,6 +1956,10 @@ fn apply_claude_family_account_evidence(
                     .iter()
                     .any(|(source_session_id, request_count)| {
                         witness.members.get(source_session_id) != Some(request_count)
+                            || witness
+                                .member_request_id_fingerprints
+                                .get(source_session_id)
+                                != current_member_request_id_fingerprints.get(source_session_id)
                     })
             })
         {
@@ -1823,6 +1975,10 @@ fn apply_claude_family_account_evidence(
                     .iter()
                     .all(|(source_session_id, request_count)| {
                         witness.members.get(source_session_id) == Some(request_count)
+                            && witness
+                                .member_request_id_fingerprints
+                                .get(source_session_id)
+                                == current_member_request_id_fingerprints.get(source_session_id)
                     })
         }) else {
             continue;
@@ -1955,12 +2111,14 @@ fn apply_claude_account_evidence(
     let existing_identity_matches =
         !existing_hashes.is_empty() && existing_hashes == evidence_hashes;
     let evidence_covers_snapshot = claude_account_evidence_covers_snapshot(item, &checked_evidence);
+    let request_ids_cover_snapshot = strict_claude_account_hash(evidence).is_some()
+        && claude_account_evidence_covers_request_ids(item, evidence);
     let target = (!has_unidentified_request
         && evidence_hashes.len() == 1
         && (existing_identity_matches
             || (existing_hashes.is_empty()
                 && !has_legacy_unchecked_request
-                && evidence_covers_snapshot)))
+                && (evidence_covers_snapshot || request_ids_cover_snapshot))))
         .then(|| evidence_hashes.first().map(|value| (*value).to_string()))
         .flatten();
     set_claude_account_hash(item, target)
@@ -2007,6 +2165,24 @@ fn claude_account_evidence_covers_snapshot(
             == u128::from(item.cache_creation_5m_tokens) + u128::from(item.cache_creation_1h_tokens)
         && sum(|row| row.reasoning_output_tokens) == u128::from(item.reasoning_output_tokens)
         && sum(|row| row.request_count) == u128::from(item.request_count)
+}
+
+fn claude_account_evidence_covers_request_ids(
+    item: &SnapshotItem,
+    evidence: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+) -> bool {
+    if item.unattributed_total_tokens != 0 || claude_snapshot_request_id_hashes(item).is_none() {
+        return false;
+    }
+    let mut covered = BTreeSet::new();
+    for row in evidence {
+        if item.claude_usage_request_ids.contains(&row.request_id)
+            && (row.request_count != 1 || !covered.insert(row.request_id.as_str()))
+        {
+            return false;
+        }
+    }
+    covered.len() == item.claude_usage_request_ids.len()
 }
 
 fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
@@ -3624,6 +3800,10 @@ struct SnapshotAccumulator {
     // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
     // the set's lifetime matches one scan of one session file exactly.
     seen_claude_usage_keys: BTreeSet<String>,
+    // Exact provider response ids for the once-per-response Claude usage rows
+    // above. Local-only; copied into SnapshotItem solely for account-evidence
+    // coverage and never serialized.
+    claude_usage_request_ids: BTreeSet<String>,
     // Current Pi transcripts carry usage on `type=message` assistant records;
     // older exporters used `type=message_end`. When both representations are
     // present, their response id is the exact occurrence key that prevents a
@@ -3710,6 +3890,7 @@ impl SnapshotAccumulator {
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
             seen_claude_usage_keys: BTreeSet::new(),
+            claude_usage_request_ids: BTreeSet::new(),
             seen_pi_usage_keys: BTreeMap::new(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
@@ -4431,6 +4612,7 @@ impl SnapshotAccumulator {
             reasoning_output_tokens: totals.reasoning_output_tokens,
             unattributed_total_tokens: totals.unattributed_total_tokens,
             request_count: totals.request_count,
+            claude_usage_request_ids: self.claude_usage_request_ids,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
             avg_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
@@ -5553,6 +5735,7 @@ fn codex_state_only_snapshot(
         reasoning_output_tokens: 0,
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
+        claude_usage_request_ids: BTreeSet::new(),
         avg_duration_ms: None,
         avg_time_to_first_token_ms: None,
         max_duration_ms: None,
@@ -7387,6 +7570,13 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         _ => true,
     };
     if let Some(usage) = usage.filter(|_| usage_first_seen) {
+        if let Some(request_id) =
+            string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]))
+        {
+            accumulator
+                .claude_usage_request_ids
+                .insert(request_id.to_string());
+        }
         // First content-block record of this API response: derive the turn's
         // wall-clock duration (this record's timestamp minus the preceding user
         // record) once, aligned with the once-per-response usage count above.
@@ -16912,6 +17102,7 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            claude_usage_request_ids: BTreeSet::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -18909,6 +19100,89 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn claude_account_hash_uses_exact_request_ids_when_auxiliary_requests_share_session() {
+        let path = temp_file("claude-account-request-id-coverage");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-06T00:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"claude-request-id-1\",\"requestId\":\"req_usage_1\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-06T00:01:00Z\",\"type\":\"assistant\",\"sessionId\":\"claude-request-id-1\",\"requestId\":\"req_usage_2\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let parsed = parse_claude_code_jsonl_file(&path, "2026-08-06T00:02:00Z", "fp".to_string())
+            .expect("parse");
+        assert_eq!(
+            parsed[0].claude_usage_request_ids,
+            BTreeSet::from(["req_usage_1".to_string(), "req_usage_2".to_string()])
+        );
+        assert!(serde_json::to_value(&parsed[0])
+            .expect("serialize snapshot")
+            .get("claude_usage_request_ids")
+            .is_none());
+        let account_hash = "a".repeat(64);
+        let row = |request_id: &str, input_tokens, output_tokens| {
+            crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                fingerprint: request_id.to_string(),
+                session_id: "claude-request-id-1".to_string(),
+                request_id: request_id.to_string(),
+                model: "claude-opus-4-8".to_string(),
+                input_tokens,
+                output_tokens,
+                request_count: 1,
+                account_identity_checked: true,
+                account_identifier_hash: Some(account_hash.clone()),
+                ..Default::default()
+            }
+        };
+        let with_prompt_suggestion = BTreeMap::from([(
+            "claude-request-id-1".to_string(),
+            vec![
+                row("req_usage_1", 10, 2),
+                row("req_usage_2", 20, 3),
+                // Claude Code prompt suggestions use the same root session id
+                // but are absent from the billed usage transcript. Their
+                // totals intentionally make aggregate coverage impossible.
+                row("req_prompt_suggestion", 50_000, 1_000),
+            ],
+        )]);
+        let mut items = parsed.clone();
+        apply_claude_effort_evidence(&mut items, &with_prompt_suggestion);
+        assert!(items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+
+        // Negative control: one missing billed request must remain unknown even
+        // though the sidecar's other rows all name one account. If the new
+        // request-id coverage were decorative/always-true, this would fail.
+        let incomplete = BTreeMap::from([(
+            "claude-request-id-1".to_string(),
+            vec![
+                row("req_usage_1", 10, 2),
+                row("req_prompt_suggestion", 50_000, 1_000),
+            ],
+        )]);
+        let mut incomplete_items = parsed.clone();
+        apply_claude_effort_evidence(&mut incomplete_items, &incomplete);
+        assert!(incomplete_items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+
+        let mut conflicting_rows = with_prompt_suggestion["claude-request-id-1"].clone();
+        conflicting_rows[2].account_identifier_hash = Some("b".repeat(64));
+        let conflicting = BTreeMap::from([("claude-request-id-1".to_string(), conflicting_rows)]);
+        let mut conflicting_items = parsed;
+        apply_claude_effort_evidence(&mut conflicting_items, &conflicting);
+        assert!(conflicting_items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        let _ = fs::remove_file(path);
+    }
+
     fn claude_account_family_fixture() -> (PathBuf, String, Vec<SnapshotItem>) {
         let root = temp_dir("claude-account-family");
         let parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5".to_string();
@@ -18964,6 +19238,7 @@ mod tests {
                 |(index, hash)| crate::claude_local_otel::ClaudeLocalOtelEvidence {
                     fingerprint: format!("family-{index}"),
                     session_id: parent.to_string(),
+                    request_id: format!("req_{}", index + 1),
                     observed_at: format!("2026-08-02T07:00:0{index}Z"),
                     model: "claude-haiku-4-5".to_string(),
                     // Deliberately differ from transcript token accounting. The
@@ -18979,16 +19254,29 @@ mod tests {
         BTreeMap::from([(parent.to_string(), rows)])
     }
 
-    fn complete_family_counts(
+    fn complete_family_proof(
         parent: &str,
         items: &[SnapshotItem],
-    ) -> BTreeMap<String, BTreeMap<String, u64>> {
+    ) -> BTreeMap<String, ProvenClaudeAccountFamily> {
         BTreeMap::from([(
             parent.to_string(),
-            items
-                .iter()
-                .map(|item| (item.source_session_id.clone(), item.request_count))
-                .collect(),
+            ProvenClaudeAccountFamily {
+                members: items
+                    .iter()
+                    .map(|item| (item.source_session_id.clone(), item.request_count))
+                    .collect(),
+                member_request_id_fingerprints: items
+                    .iter()
+                    .map(|item| {
+                        let request_id_hashes = claude_snapshot_request_id_hashes(item)
+                            .expect("fixture has one request id per request");
+                        (
+                            item.source_session_id.clone(),
+                            claude_request_id_set_fingerprint(&request_id_hashes),
+                        )
+                    })
+                    .collect(),
+            },
         )])
     }
 
@@ -18996,7 +19284,21 @@ mod tests {
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
         let (root, parent, mut items) = claude_account_family_fixture();
         let account_hash = "a".repeat(64);
-        let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        let mut evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        evidence.get_mut(&parent).expect("family evidence").push(
+            crate::claude_local_otel::ClaudeLocalOtelEvidence {
+                fingerprint: "family-prompt-suggestion".to_string(),
+                session_id: parent.clone(),
+                request_id: "req_prompt_suggestion".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                input_tokens: 50_000,
+                output_tokens: 1_000,
+                request_count: 1,
+                account_identity_checked: true,
+                account_identifier_hash: Some(account_hash.clone()),
+                ..Default::default()
+            },
+        );
         let mut index = ScanIndex::default();
         index.files.insert(
             local_index_key(&root.join(format!("{parent}.jsonl"))),
@@ -19059,9 +19361,11 @@ mod tests {
             .model_usage
             .iter()
             .all(|row| { row.account_identifier_hash.as_deref() == Some(account_hash.as_str()) }));
+        let mut changed_ids_index = index.clone();
 
         // An observed request-count change invalidates the witness before any
-        // unchanged sibling can be stamped from stale family proof.
+        // unchanged sibling can be stamped from stale family proof. The root
+        // remains independently provable from its exact request ids.
         let (changed_root, _, mut changed_family) = claude_account_family_fixture();
         changed_family[1].request_count += 1;
         apply_claude_effort_evidence_with_index(
@@ -19071,13 +19375,136 @@ mod tests {
             false,
             "2026-08-02T07:03:00Z",
         );
-        assert!(changed_family.iter().all(|item| item
+        assert!(changed_family[0]
             .model_usage
             .iter()
-            .all(|row| row.account_identifier_hash.is_none())));
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+        assert!(changed_family[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
         assert!(!index.claude_account_family_witnesses.contains_key(&parent));
+
+        // A request-id change with the same count must also invalidate the
+        // witness. Counts alone cannot authorize a changed child request.
+        let (changed_ids_root, _, mut changed_ids_family) = claude_account_family_fixture();
+        changed_ids_family[1].claude_usage_request_ids =
+            BTreeSet::from(["req_changed".to_string()]);
+        apply_claude_effort_evidence_with_index(
+            &mut changed_ids_family,
+            &evidence,
+            &mut changed_ids_index,
+            false,
+            "2026-08-02T07:04:00Z",
+        );
+        assert!(changed_ids_family[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
+        assert!(changed_ids_family[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
+        assert!(!changed_ids_index
+            .claude_account_family_witnesses
+            .contains_key(&parent));
+        let _ = fs::remove_dir_all(changed_ids_root);
         let _ = fs::remove_dir_all(changed_root);
         let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_account_family_legacy_witness_schedules_reparse_and_rebuilds() {
+        let (root, parent, items) = claude_account_family_fixture();
+        let account_hash = "a".repeat(64);
+        let evidence = claude_account_family_evidence(&parent, &vec![account_hash.clone(); 5]);
+        let parent_index_key = local_index_key(&root.join(format!("{parent}.jsonl")));
+        let child_index_key = local_index_key(
+            &root
+                .join(&parent)
+                .join("subagents")
+                .join("agent-a4d1585d310070d0f.jsonl"),
+        );
+        let members = items
+            .iter()
+            .map(|item| (item.source_session_id.clone(), item.request_count))
+            .collect::<BTreeMap<_, _>>();
+        let mut legacy = ScanIndex::default();
+        legacy.files.insert(
+            parent_index_key.clone(),
+            manifest_index_entry(Some("parent")),
+        );
+        legacy
+            .files
+            .insert(child_index_key.clone(), manifest_index_entry(Some("child")));
+        legacy.claude_account_family_witnesses.insert(
+            parent.clone(),
+            ClaudeAccountFamilyWitness {
+                account_identifier_hash: account_hash.clone(),
+                evidence_request_count: 5,
+                members,
+                // v29 serialized no field here.
+                member_request_id_fingerprints: BTreeMap::new(),
+            },
+        );
+        let serialized = serde_json::to_value(&legacy).expect("serialize legacy index");
+        assert!(serialized["claude_account_family_witnesses"][&parent]
+            .get("member_request_id_fingerprints")
+            .is_none());
+        let mut index: ScanIndex =
+            serde_json::from_value(serialized).expect("load v29-compatible index");
+
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(!index.claude_account_family_witnesses.contains_key(&parent));
+        assert!(index.files[&parent_index_key]
+            .source_file_fingerprint
+            .is_empty());
+        assert!(index.files[&child_index_key]
+            .source_file_fingerprint
+            .is_empty());
+
+        // The scheduled bounded replay reconstructs request-set proof across
+        // pages and mints a v30 witness at the terminal census.
+        let mut parent_page = vec![items[0].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut parent_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        let mut child_page = vec![items[1].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut child_page,
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        let rebuilt = &index.claude_account_family_witnesses[&parent];
+        assert_eq!(rebuilt.member_request_id_fingerprints.len(), 2);
+        assert_eq!(
+            rebuilt
+                .member_request_id_fingerprints
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            rebuilt.members.keys().cloned().collect::<BTreeSet<_>>()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19112,7 +19539,7 @@ mod tests {
         assert!(parent_page[0]
             .model_usage
             .iter()
-            .all(|row| row.account_identifier_hash.is_none()));
+            .all(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str())));
 
         let mut child_page = items;
         apply_claude_effort_evidence_with_index(
@@ -19176,7 +19603,7 @@ mod tests {
                 )
                 .all(|row| row.account_identifier_hash.is_none())));
         };
-        let complete = complete_family_counts(&parent, &items);
+        let complete = complete_family_proof(&parent, &items);
 
         let mut incomplete_items = items.clone();
         let incomplete = claude_account_family_evidence(&parent, &vec!["a".repeat(64); 4]);
@@ -19186,7 +19613,14 @@ mod tests {
             &mut BTreeMap::new(),
             &complete,
         );
-        assert_unknown(&incomplete_items);
+        assert!(incomplete_items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some("a".repeat(64).as_str())));
+        assert!(incomplete_items[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
 
         let mut conflicting_items = items.clone();
         let conflicting = claude_account_family_evidence(
@@ -19210,9 +19644,11 @@ mod tests {
         // A bounded page is never accepted as the complete family, even when
         // its request total happens to equal the currently available sidecar.
         let mut page_items = items;
-        let mut indexed_members = complete[&parent].clone();
+        let mut indexed_family = complete[&parent].clone();
+        let mut indexed_members = indexed_family.members.clone();
         indexed_members.insert(format!("{parent}_agent-missing"), 1);
-        let indexed_complete = BTreeMap::from([(parent.clone(), indexed_members)]);
+        indexed_family.members = indexed_members;
+        let indexed_complete = BTreeMap::from([(parent.clone(), indexed_family)]);
         let page_evidence = claude_account_family_evidence(&parent, &vec!["a".repeat(64); 5]);
         apply_claude_effort_evidence_with_families(
             &mut page_items,
@@ -19220,7 +19656,14 @@ mod tests {
             &mut BTreeMap::new(),
             &indexed_complete,
         );
-        assert_unknown(&page_items);
+        assert!(page_items[0]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.as_deref() == Some("a".repeat(64).as_str())));
+        assert!(page_items[1]
+            .model_usage
+            .iter()
+            .all(|row| row.account_identifier_hash.is_none()));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -23787,6 +24230,7 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            claude_usage_request_ids: BTreeSet::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -24070,6 +24514,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 unattributed_total_tokens: 0,
                 request_count: 1,
+                claude_usage_request_ids: BTreeSet::new(),
                 avg_duration_ms: None,
                 avg_time_to_first_token_ms: None,
                 max_duration_ms: None,
