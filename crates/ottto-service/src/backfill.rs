@@ -225,12 +225,16 @@ pub struct HistoricalReplayDirective {
 pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDirective {
     match source {
         SnapshotSource::ClaudeCode => HistoricalReplayDirective {
-            revision: "claude_compact_boundary_dedup:v2",
+            revision: "claude_founder_backfill_leg_a:v1",
             policy: HistoricalReplayPolicy::Full,
         },
-        SnapshotSource::Codex | SnapshotSource::Pi => HistoricalReplayDirective {
-            revision: "historical_replay:none:v1",
-            policy: HistoricalReplayPolicy::None,
+        SnapshotSource::Codex => HistoricalReplayDirective {
+            revision: "codex_founder_backfill_leg_a:v1",
+            policy: HistoricalReplayPolicy::Full,
+        },
+        SnapshotSource::Pi => HistoricalReplayDirective {
+            revision: "pi_founder_backfill_leg_a:v1",
+            policy: HistoricalReplayPolicy::Full,
         },
     }
 }
@@ -711,6 +715,7 @@ mod tests {
     #[test]
     fn parser_version_change_does_not_trigger_historical_replay() {
         let mut state = BackfillState::default();
+        mark_backfill_complete(&mut state, SnapshotSource::Codex);
         state.completed_parser_versions.insert(
             SnapshotSource::Codex.api_slug().to_string(),
             "codex_jsonl:vOLD".to_string(),
@@ -740,20 +745,61 @@ mod tests {
     }
 
     #[test]
-    fn current_claude_compaction_replay_is_one_shot() {
-        let source = SnapshotSource::ClaudeCode;
-        let directive = current_historical_replay(source);
-        assert_eq!(directive.policy, HistoricalReplayPolicy::Full);
-        assert_eq!(directive.revision, "claude_compact_boundary_dedup:v2");
-
+    fn current_founder_backfill_replays_are_one_shot_and_source_scoped() {
+        let expected = [
+            (
+                SnapshotSource::ClaudeCode,
+                "claude_founder_backfill_leg_a:v1",
+            ),
+            (SnapshotSource::Codex, "codex_founder_backfill_leg_a:v1"),
+            (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
+        ];
         let mut state = BackfillState::default();
-        state.completed_parser_versions.insert(
-            source.api_slug().to_string(),
-            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION.to_string(),
+        for (source, _) in expected {
+            state.completed_parser_versions.insert(
+                source.api_slug().to_string(),
+                current_parser_version(source).to_string(),
+            );
+        }
+        state.completed_replay_revisions.insert(
+            SnapshotSource::ClaudeCode.api_slug().to_string(),
+            "claude_compact_boundary_dedup:v2".to_string(),
         );
-        assert!(source_needs_backfill(&state, source, directive));
-        mark_backfill_complete(&mut state, source);
-        assert!(!source_needs_backfill(&state, source, directive));
+
+        assert_eq!(
+            pending_backfill_sources(&state),
+            vec![
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Codex,
+                SnapshotSource::Pi,
+            ]
+        );
+        for (completed_index, (source, revision)) in expected.into_iter().enumerate() {
+            let directive = current_historical_replay(source);
+            assert_eq!(directive.policy, HistoricalReplayPolicy::Full);
+            assert_eq!(directive.revision, revision);
+
+            mark_backfill_complete(&mut state, source);
+            assert!(!pending_backfill_sources(&state).contains(&source));
+            for (pending_source, _) in &expected[completed_index + 1..] {
+                assert!(pending_backfill_sources(&state).contains(pending_source));
+            }
+        }
+
+        let dir = temp_dir("founder-replay-state");
+        save_backfill_state(&dir, &state).expect("save completed replay revisions");
+        let loaded = load_backfill_state(&dir);
+        assert!(pending_backfill_sources(&loaded).is_empty());
+        for (source, revision) in expected {
+            assert_eq!(
+                loaded
+                    .completed_replay_revisions
+                    .get(source.api_slug())
+                    .map(String::as_str),
+                Some(revision)
+            );
+        }
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
