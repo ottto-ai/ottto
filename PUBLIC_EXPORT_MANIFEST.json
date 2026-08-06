@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 314,
-  "content_sha256": "15812cb17b12ce1e1d3d8a5df78806552206ed1d5e3af520729af7cbfd5d0614",
+  "candidate_file_count": 315,
+  "content_sha256": "d8cbf3ac057c236b97ee54427f32eaee751c7c6f772b36c76a64128989709ee8",
   "files": [
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "3f64d66599ad279de8937f9f13bcf7ae1ce95fc075b2c18193d43fea1f140808",
-      "size_bytes": 23313
+      "sha256": "88fae493ad46be8fff00f3c03e5c5076ff29a78362a8268f2f21258d54e2e65a",
+      "size_bytes": 23386
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "545b2c13122ac9a04a641f2c74e0b1c6ac1d199520631b907a43fa784bf2caf5",
-      "size_bytes": 35106
+      "sha256": "75bd3905a6a9d1d59ff37996f2d7035ce77ea9f9ed44f7b20e8fe5958c25b0d8",
+      "size_bytes": 35179
     },
     {
       "executable": false,
@@ -720,8 +720,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_posture.rs",
-      "sha256": "be4d2b349586429f9a73811312aeb35ba9a55ffc75690b0b36dd8a643644f980",
-      "size_bytes": 28363
+      "sha256": "7319b468d881fd6ecbb77e9d2d7b46b9c98f1cff5f91d7debd5757bb63495ed5",
+      "size_bytes": 28436
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "9963b9aef99543bda1b07092b3c7374b301565d652e3baf06ed2b627a739855b",
-      "size_bytes": 29051
+      "sha256": "4e3f252b2960e449ff509a693afcb8e2eba507853717b0e6dd0036249bd30c1d",
+      "size_bytes": 29124
     },
     {
       "executable": false,
@@ -860,8 +860,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "040dff99da4524b25631d62f7c5624cb7b992864bd6f439e7cb4152d1a540eb6",
-      "size_bytes": 1050160
+      "sha256": "f5407f1d5cc4a5e67cd7d2874ded2ba3a043641c1b2ce8a3094ceae9cbe182ea",
+      "size_bytes": 1070044
     },
     {
       "executable": false,
@@ -1342,6 +1342,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-08-06-claude-account-request-coverage.md",
+      "sha256": "d13a84b46610404261ebea93c373d97a5ffd21999d6ca27b40aae9bce550d593",
+      "size_bytes": 3753
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "68314119355043346c6febf8f3ce739efb4f4c23c77db4e8120766473ff7b3fb",
       "size_bytes": 1124
@@ -1693,7 +1700,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "3f476fd252a3bf48d305559e7324741edef9f3e91794ffad3809e417a7bde501",
+      "sha256": "5e333f5578845e149b99f065b883d616d442ef110d81ca9ab85f8d0c410a8f86",
       "size_bytes": 218514
     },
     {
@@ -2201,9 +2208,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-06T09:28:00+00:00",
+  "generated_at": "2026-08-06T10:27:59+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 315,
+  "output_file_count": 316,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2237,5 +2244,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9018f179d5e286d910a0cb7caecae9c801f4d7df"
+  "source_commit": "8d1005a25e3f481663dc02710562bb47894b3636"
 }
