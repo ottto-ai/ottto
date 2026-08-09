@@ -142,7 +142,9 @@ pub enum Surface {
 }
 
 /// Reserved wire surface for provider-owned day totals and their day-level
-/// model breakdown. Provider client ids can never map to this value.
+/// model breakdown. Provider client ids can never map to this value. The
+/// backend's additive v1 surface validator must be deployed before any runtime
+/// containing this constant is released.
 pub const PROVIDER_DAY_TOTAL_SURFACE: &str = "provider_day_total";
 
 impl Surface {

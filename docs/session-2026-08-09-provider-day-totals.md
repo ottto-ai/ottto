@@ -10,6 +10,11 @@ The Codex daily-aggregate normalizer now reads the provider's day-level
 total, while a bounded model slug is the provider's day-level model grain.
 Client-derived surface rows remain unchanged.
 
+`provider_day_total` is an additive value in the closed v1 surface vocabulary,
+so the receiving backend validator must admit and deploy it before a daemon
+containing this change is released. Releasing in the opposite order would make
+the backend reject the whole batch.
+
 Per-model rows continue to omit credits because the provider's model entries
 do not attribute that meter. Day totals and recognized client sums are compared
 locally for every mutually reported counter. A mismatch emits a bounded warning
