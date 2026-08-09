@@ -258,11 +258,20 @@ impl std::fmt::Display for ProviderDailyReferenceUploadRejected {
 
 impl std::error::Error for ProviderDailyReferenceUploadRejected {}
 
-/// The provider-daily-reference ingest route rejected the batch as shaped. A
-/// `409` specifically means the declared consent epoch is stale.
+/// Closed reason vocabulary for provider-daily-reference contract refusals.
+/// Only the bounded `detail.code` is retained; the response body is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDailyReferenceContractRejection {
+    AccountExcluded,
+    GrantEpochConflict,
+    Other,
+}
+
+/// The provider-daily-reference ingest route rejected the batch as shaped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderDailyReferenceContractRejected {
     pub status: u16,
+    pub reason: ProviderDailyReferenceContractRejection,
 }
 
 impl std::fmt::Display for ProviderDailyReferenceContractRejected {
@@ -1502,9 +1511,28 @@ impl SnapshotApiClient {
                     status: code,
                 }))
             }
-            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), _response)) => {
+            Err(ureq::Error::Status(code @ (400 | 404 | 409 | 422), response)) => {
+                let reason = if code == 409 {
+                    let body = response.into_json::<serde_json::Value>().ok();
+                    match body
+                        .as_ref()
+                        .and_then(|value| value.pointer("/detail/code"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("provider_daily_reference_account_excluded") => {
+                            ProviderDailyReferenceContractRejection::AccountExcluded
+                        }
+                        Some("provider_daily_reference_grant_epoch_mismatch") => {
+                            ProviderDailyReferenceContractRejection::GrantEpochConflict
+                        }
+                        _ => ProviderDailyReferenceContractRejection::Other,
+                    }
+                } else {
+                    ProviderDailyReferenceContractRejection::Other
+                };
                 Err(anyhow::Error::new(ProviderDailyReferenceContractRejected {
                     status: code,
+                    reason,
                 }))
             }
             Err(ureq::Error::Status(code, response)) => {

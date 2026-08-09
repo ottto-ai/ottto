@@ -874,11 +874,13 @@ fn handle_command(
             control_token,
             api_base_url,
             backend_grant,
+            expected_account_fingerprint,
         } => to_value(provider_daily_reference_control(
             action,
             control_token,
             api_base_url,
             backend_grant,
+            expected_account_fingerprint,
         )?),
         LocalControlCommand::UpdateCheck => to_value(check_update_state()),
         LocalControlCommand::UninstallPlan | LocalControlCommand::Uninstall => {
@@ -2765,6 +2767,12 @@ fn provider_daily_reference_action_slug(
             "confirm_provider_daily_reference_revoked"
         }
         ProviderDailyReferenceControlAction::Status => "provider_daily_reference_status",
+        ProviderDailyReferenceControlAction::ExcludeCurrentAccount => {
+            "exclude_provider_daily_reference_current_account"
+        }
+        ProviderDailyReferenceControlAction::IncludeCurrentAccount => {
+            "include_provider_daily_reference_current_account"
+        }
     }
 }
 
@@ -2774,19 +2782,21 @@ fn provider_daily_reference_action_slug(
 /// This command packages consent; it never creates it. Prepare records the
 /// operator's explicit local consent and hands back the credential-free DTO the
 /// browser POSTs; nothing collects until the backend's answer is bound, the
-/// server policy approves, and the admitted build matches. All five collection
+/// server policy approves, and the admitted build matches. All collection
 /// gates from the collector are untouched by this path.
 fn provider_daily_reference_control(
     action: ProviderDailyReferenceControlAction,
     control_token: SecretString,
     api_base_url: Option<String>,
     backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+    expected_account_fingerprint: Option<String>,
 ) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
     provider_daily_reference_control_with_stores(
         action,
         control_token,
         api_base_url,
         backend_grant,
+        expected_account_fingerprint,
         &FileAccountStore::default(),
         &FileDeviceStore::default(),
         &crate::provider_daily_reference::GrantStore::default(),
@@ -2805,6 +2815,7 @@ fn provider_daily_reference_control_with_stores(
     control_token: SecretString,
     api_base_url: Option<String>,
     backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+    expected_account_fingerprint: Option<String>,
     accounts: &FileAccountStore,
     devices: &FileDeviceStore,
     grants: &crate::provider_daily_reference::GrantStore,
@@ -2886,6 +2897,17 @@ fn provider_daily_reference_control_with_stores(
             "backend_grant presence does not match provider daily reference action".to_string(),
         ));
     }
+    let targets_current_account = matches!(
+        action,
+        ProviderDailyReferenceControlAction::ExcludeCurrentAccount
+            | ProviderDailyReferenceControlAction::IncludeCurrentAccount
+    );
+    if targets_current_account != expected_account_fingerprint.is_some() {
+        return Err(LocalApiError::InvalidRequest(
+            "expected_account_fingerprint presence does not match provider daily reference action"
+                .to_string(),
+        ));
+    }
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2952,6 +2974,40 @@ fn provider_daily_reference_control_with_stores(
             )
             .map(|_| ()),
         ProviderDailyReferenceControlAction::Status => Ok(()),
+        ProviderDailyReferenceControlAction::ExcludeCurrentAccount
+        | ProviderDailyReferenceControlAction::IncludeCurrentAccount => {
+            let Some(provider_account_scope) = provider_account_scope
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Err(LocalApiError::LocalOperationFailed(
+                    "a signed-in Codex account is required for this privacy control".to_string(),
+                ));
+            };
+            let fingerprint = grants
+                .account_fingerprint_for(provider_account_scope)
+                .map_err(|_| {
+                    LocalApiError::LocalOperationFailed(
+                        "codex daily aggregates account attribution is unavailable".to_string(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    LocalApiError::LocalOperationFailed(
+                        "codex daily aggregates consent is absent".to_string(),
+                    )
+                })?;
+            if expected_account_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                return Err(LocalApiError::InvalidRequest(
+                    "the signed-in Codex account changed; refresh status before changing privacy controls"
+                        .to_string(),
+                ));
+            }
+            grants.set_account_excluded(
+                &fingerprint,
+                action == ProviderDailyReferenceControlAction::ExcludeCurrentAccount,
+            )
+        }
     };
     result.map_err(|_| {
         LocalApiError::LocalOperationFailed(
@@ -19943,12 +19999,24 @@ mod tests {
             let action_slug = provider_daily_reference_action_slug(&action);
             let api_base = cloud_control_validation_server(action_slug, token_id, device_id);
             let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base);
+            let expected_account_fingerprint = matches!(
+                action,
+                ProviderDailyReferenceControlAction::ExcludeCurrentAccount
+                    | ProviderDailyReferenceControlAction::IncludeCurrentAccount
+            )
+            .then(|| {
+                grants
+                    .account_fingerprint_for("provider-account-scope")
+                    .unwrap()
+                    .unwrap()
+            });
             provider_daily_reference_control_with_stores(
                 action,
                 SecretString::new(test_control_token(action_slug, "codex", 240)),
                 // An attacker-supplied base url never wins over the trusted one.
                 Some(ATTACKER_LOOPBACK_API_BASE_URL.to_string()),
                 backend_grant,
+                expected_account_fingerprint,
                 &accounts,
                 &devices,
                 &grants,
@@ -20021,6 +20089,69 @@ mod tests {
         assert!(bound.status.provider_read_permitted);
         assert!(bound.backend_create_request.is_none());
 
+        // Browser status and the privacy mutation must name the same opaque
+        // account. If the provider login changes between them, refuse before
+        // mutating the newly-current account.
+        let live_fingerprint = grants
+            .account_fingerprint_for("provider-account-scope")
+            .unwrap()
+            .unwrap();
+        let mismatch_action = ProviderDailyReferenceControlAction::ExcludeCurrentAccount;
+        let mismatch_slug = provider_daily_reference_action_slug(&mismatch_action);
+        let mismatch_api = cloud_control_validation_server(
+            mismatch_slug,
+            "pdr-control-exclude-account-mismatch",
+            device_id,
+        );
+        let _mismatch_api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &mismatch_api);
+        assert!(matches!(
+            provider_daily_reference_control_with_stores(
+                mismatch_action,
+                SecretString::new(test_control_token(mismatch_slug, "codex", 240)),
+                None,
+                None,
+                Some(format!("hmac-sha256:{}", "f".repeat(64))),
+                &accounts,
+                &devices,
+                &grants,
+                &token_uses,
+                Some("provider-account-scope".to_string()),
+                false,
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+        assert!(!grants.account_is_excluded(&live_fingerprint).unwrap());
+
+        let excluded = run(
+            ProviderDailyReferenceControlAction::ExcludeCurrentAccount,
+            "pdr-control-exclude-current",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            excluded.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::AccountExcluded
+        );
+        assert_eq!(excluded.status.reason_code, "account_excluded");
+        assert!(excluded.status.current_account_excluded);
+        assert!(!excluded.status.provider_read_permitted);
+
+        let included = run(
+            ProviderDailyReferenceControlAction::IncludeCurrentAccount,
+            "pdr-control-include-current",
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            included.status.runtime_state,
+            crate::provider_daily_reference::RuntimeState::Enabled
+        );
+        assert_eq!(included.status.reason_code, "enabled");
+        assert!(!included.status.current_account_excluded);
+        assert!(included.status.provider_read_permitted);
+
         // The local off-switch outranks a live grant in the served status.
         let switched_off = run(
             ProviderDailyReferenceControlAction::Status,
@@ -20084,6 +20215,8 @@ mod tests {
             "pdr-control-prepare",
             "pdr-control-status-pending",
             "pdr-control-bind",
+            "pdr-control-exclude-current",
+            "pdr-control-include-current",
             "pdr-control-status-off",
             "pdr-control-revoke",
             "pdr-control-confirm",
@@ -20126,6 +20259,7 @@ mod tests {
                 SecretString::new(test_control_token(action_slug, "codex", 240)),
                 None,
                 backend_grant,
+                None,
                 &accounts,
                 &devices,
                 &grants,
@@ -20199,6 +20333,7 @@ mod tests {
             provider_daily_reference_control_with_stores(
                 ProviderDailyReferenceControlAction::Prepare,
                 SecretString::new(test_control_token("prepare_cloud_sessions", "codex", 240)),
+                None,
                 None,
                 None,
                 &accounts,

@@ -1884,6 +1884,7 @@ mod tests {
             control_token: ottto_protocol::SecretString::new("test-token"),
             api_base_url: None,
             backend_grant: None,
+            expected_account_fingerprint: None,
         };
 
         // This should match the allowlist in handle_control_request.
