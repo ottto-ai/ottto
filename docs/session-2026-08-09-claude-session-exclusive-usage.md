@@ -25,6 +25,8 @@ with one response identity are resolved in transcript order:
 A conflict makes the file retryable through the existing recognized-usage loss
 gate. Usage rows with neither response identifier retain the conservative
 one-line/one-request fallback but cannot claim exclusive accounting proof.
+Pending family evidence is capped at 250,000 request occurrences. Crossing the
+cap invalidates that family proof instead of publishing a partial union.
 
 Current Claude branch writers stamp copied records with
 `forkedFrom.sessionId` and `forkedFrom.messageUuid`. Valid copied records return
@@ -33,6 +35,11 @@ or artifact extraction. A malformed marker quarantines the file. This changes
 usage ownership only; Task/Workflow parent, root, agent, depth, and workflow
 facts are unchanged.
 
+Malformed or future-unknown `forkedFrom` shapes intentionally remain retryable
+and do not become confirmed-empty snapshots. Settling them as local or inherited
+would guess ownership; a later parser/scan identity upgrade is the safe recovery
+path for a new provider format.
+
 Historical Claude snapshots deliberately omit `usage_accounting_contract`.
 Future evidence captured at `claude_api_request:v2` can claim
 `session_exclusive_reported_usage:v1` only when a healthy enhanced-trace join
@@ -40,6 +47,17 @@ assigns every reported API occurrence to an existing filesystem family member
 by exact request id. Transcript-owned responses preserve their exact cache TTL
 split; auxiliary aggregate cache creation remains `unattributed_total_tokens`.
 The trace owner never rewrites provider graph facts.
+Auxiliary request timestamps extend the session's reported activity range so
+usage buckets cannot fall outside the snapshot lifecycle interval.
+
+Legacy top-level branch files without `forkedFrom` get one additional
+fail-closed check. Ordered response-id hashes must show a duplicated, divergent
+leading prefix in another top-level transcript from the same complete census;
+every excluded prefix request must have one exact healthy API/trace owner in a
+different root; and the candidate child must have a non-empty, fully owned
+suffix. The decision is a usage exclusion only, not an inferred parent edge.
+Equal histories, zero-owned-work branches, missing historical sidecars,
+conflicting owners, and non-prefix overlap remain unproven.
 
 ## Replay
 
@@ -57,6 +75,7 @@ Rust fixtures cover:
 - Task and Workflow child ownership without graph changes;
 - progressive output and late selector resolution;
 - conflicting/non-monotonic response quarantine;
+- malformed fork provenance failing closed without an authoritative empty row;
 - missing identifiers and conservative proof omission;
 - explicit fork, zero-owned-work fork, and fork-of-fork exclusion;
 - same-session resume and compaction continuity;
@@ -66,11 +85,15 @@ Rust fixtures cover:
   transcript cache-TTL buckets remain intact;
 - unknown trace owners, malformed evidence, request-set gaps, and conflicting
   earlier bounded-page occurrences refusing accounting proof;
+- bounded pending-family occurrence retention and activity coverage for
+  auxiliary usage outside the transcript's original interval;
 - privacy-safe persisted family witnesses, child-only corrective reparses, and
   unchanged parent/root/agent/depth/workflow graph facts;
+- legacy top-level copied-prefix exclusion, external-owner revalidation,
+  unchanged-census witness retention, and fail-closed owner-evidence loss;
 - conditional wire/hash compatibility for the shared accounting field, plus
   proof omission across Task, Workflow, progressive, and explicit-fork cases.
 
-The measured legacy-fork cross-file prefix ledger is intentionally deferred.
-Until that bounded ownership index exists, historical top-level transcripts
-without `forkedFrom` remain unproven rather than being assigned by heuristic.
+Historical top-level forks whose requests predate v2 API/trace capture remain
+unproven. The collector does not backfill ownership from timestamps, file
+creation order, costs, token similarity, or a guessed parent.

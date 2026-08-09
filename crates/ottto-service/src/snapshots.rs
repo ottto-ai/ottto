@@ -204,7 +204,10 @@ pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v29";
 // branch history and are excluded from every child-session metric.
 // v32 retains the exact resolved occurrence in local memory and joins it to
 // current api_request + enhanced llm_request evidence. Only a healthy complete
-// family census can replace usage with the reported occurrence union.
+// family census can replace usage with the reported occurrence union. The
+// same census may exclude a legacy top-level fork's duplicated leading
+// response prefix, but only when exact current API/trace evidence assigns each
+// excluded request to another root; provider graph facts remain untouched.
 pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v32";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
@@ -1293,6 +1296,12 @@ struct ClaudeUsageFamilyWitness {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     member_occurrence_fingerprints: BTreeMap<String, String>,
     assigned_request_id_fingerprints: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    legacy_excluded_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_exclusion_evidence_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    legacy_owner_roots: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1304,8 +1313,15 @@ struct ClaudeUsageFamilyPending {
     invalid: bool,
 }
 
+// Historical paging may retain occurrence witnesses until a complete family
+// census closes. Keep that retry state finite; crossing the bound makes only
+// the affected pending proof fail closed and never authorizes partial usage.
+const MAX_CLAUDE_PENDING_USAGE_OCCURRENCES: usize = 250_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClaudeTranscriptUsageOccurrenceWitness {
+    #[serde(default)]
+    sequence: u64,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -1320,6 +1336,7 @@ struct ClaudeTranscriptUsageOccurrenceWitness {
 impl From<&ClaudeTranscriptUsageOccurrence> for ClaudeTranscriptUsageOccurrenceWitness {
     fn from(occurrence: &ClaudeTranscriptUsageOccurrence) -> Self {
         Self {
+            sequence: occurrence.sequence,
             input_tokens: occurrence.usage.input_tokens,
             output_tokens: occurrence.usage.output_tokens,
             cache_read_tokens: occurrence.usage.cache_read_tokens,
@@ -1344,6 +1361,13 @@ struct ReducedClaudeUsageLedger {
     evidence_fingerprint: String,
     assigned_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
     rows_by_member: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeLegacyUsageExclusion {
+    excluded_request_id_hashes: BTreeSet<String>,
+    evidence_fingerprint: String,
+    owner_roots: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1861,6 +1885,12 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
         .keys()
         .chain(index.claude_usage_family_pending.keys())
         .chain(index.claude_usage_family_witnesses.keys())
+        .chain(
+            index
+                .claude_usage_family_witnesses
+                .values()
+                .flat_map(|witness| witness.legacy_owner_roots.iter()),
+        )
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1893,7 +1923,23 @@ pub fn apply_claude_reported_usage_with_index(
         BTreeMap::new()
     };
     let mut proven = BTreeMap::new();
-    if census_complete && api_report.health.is_complete() && trace_report.is_complete() {
+    let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
+    let legacy_request_owners = reports_healthy
+        .then(|| claude_legacy_request_owners(api_report, trace_report))
+        .flatten();
+    let mut reconstructed = BTreeMap::new();
+    let witness_roots_before = index
+        .claude_usage_family_witnesses
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if census_complete && reports_healthy {
+        let legacy_exclusions = derive_claude_legacy_usage_exclusions(
+            &complete_families,
+            &index.claude_usage_family_pending,
+            api_report,
+            trace_report,
+        );
         for (root_session_id, members) in &complete_families {
             let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
                 continue;
@@ -1929,44 +1975,77 @@ pub fn apply_claude_reported_usage_with_index(
                 &pending,
                 api_report.evidence.get(root_session_id),
                 trace_report.evidence.get(root_session_id),
+                legacy_exclusions.get(root_session_id),
             ) else {
                 continue;
             };
             proven.insert(root_session_id.clone(), family);
         }
+        reconstructed = index
+            .claude_usage_family_witnesses
+            .iter()
+            .filter(|(root_session_id, _)| !proven.contains_key(*root_session_id))
+            .filter_map(|(root_session_id, witness)| {
+                reconstruct_claude_usage_family(
+                    root_session_id,
+                    witness,
+                    api_report,
+                    trace_report,
+                    legacy_request_owners.as_ref(),
+                )
+                .map(|family| (root_session_id.clone(), family))
+            })
+            .collect();
         index
             .claude_usage_family_witnesses
-            .retain(|root_session_id, _| proven.contains_key(root_session_id));
+            .retain(|root_session_id, _| {
+                proven.contains_key(root_session_id) || reconstructed.contains_key(root_session_id)
+            });
         for (root_session_id, family) in &proven {
             index
                 .claude_usage_family_witnesses
                 .insert(root_session_id.clone(), family.witness.clone());
         }
+    } else if census_complete {
+        index.claude_usage_family_witnesses.clear();
+    } else if reports_healthy {
+        reconstructed = index
+            .claude_usage_family_witnesses
+            .iter()
+            .filter_map(|(root_session_id, witness)| {
+                reconstruct_claude_usage_family(
+                    root_session_id,
+                    witness,
+                    api_report,
+                    trace_report,
+                    legacy_request_owners.as_ref(),
+                )
+                .map(|family| (root_session_id.clone(), family))
+            })
+            .collect();
     }
 
     for item in snapshots.iter_mut() {
         item.usage_accounting_contract = None;
         let root_session_id = claude_snapshot_family_root(item);
-        let reconstructed = (api_report.health.is_complete() && trace_report.is_complete())
-            .then(|| index.claude_usage_family_witnesses.get(&root_session_id))
-            .flatten()
-            .and_then(|witness| {
-                reconstruct_claude_usage_family(
-                    &root_session_id,
-                    witness,
-                    api_report.evidence.get(&root_session_id),
-                    trace_report.evidence.get(&root_session_id),
-                )
-            });
-        let family = proven.get(&root_session_id).or(reconstructed.as_ref());
+        let family = proven
+            .get(&root_session_id)
+            .or_else(|| reconstructed.get(&root_session_id));
         let Some(family) = family else { continue };
         let Some(rows) = family.rows_by_member.get(&item.source_session_id) else {
             continue;
         };
+        let excluded_request_hashes = family
+            .witness
+            .legacy_excluded_request_id_hashes
+            .get(&item.source_session_id)
+            .cloned()
+            .unwrap_or_default();
         let request_hashes = item
             .claude_usage_request_ids
             .iter()
             .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+            .filter(|request_hash| !excluded_request_hashes.contains(request_hash))
             .collect::<BTreeSet<_>>();
         if family
             .witness
@@ -1985,6 +2064,7 @@ pub fn apply_claude_reported_usage_with_index(
                     ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
                 )
             })
+            .filter(|(request_hash, _)| !excluded_request_hashes.contains(request_hash))
             .collect::<BTreeMap<_, _>>();
         if family
             .witness
@@ -1994,7 +2074,7 @@ pub fn apply_claude_reported_usage_with_index(
         {
             continue;
         }
-        if rebuild_claude_reported_usage(item, rows) {
+        if rebuild_claude_reported_usage(item, rows, &excluded_request_hashes) {
             item.usage_accounting_contract =
                 Some("session_exclusive_reported_usage:v1".to_string());
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
@@ -2002,6 +2082,16 @@ pub fn apply_claude_reported_usage_with_index(
     }
 
     if census_complete {
+        let invalidated_witness_roots = witness_roots_before
+            .difference(
+                &index
+                    .claude_usage_family_witnesses
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+            )
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let current_ids = snapshots
             .iter()
             .map(|item| item.source_session_id.as_str())
@@ -2012,8 +2102,9 @@ pub fn apply_claude_reported_usage_with_index(
             else {
                 continue;
             };
-            if proven.contains_key(&root_session_id)
-                && !current_ids.contains(source_session_id.as_str())
+            if (proven.contains_key(&root_session_id)
+                && !current_ids.contains(source_session_id.as_str()))
+                || invalidated_witness_roots.contains(&root_session_id)
             {
                 entry.source_file_fingerprint.clear();
             }
@@ -2027,8 +2118,23 @@ fn accumulate_claude_usage_family_pending(
     pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
     census_window_end: &str,
 ) {
+    let mut retained_occurrence_count = pending_by_root
+        .values()
+        .flat_map(|pending| pending.member_occurrences.values())
+        .map(BTreeMap::len)
+        .fold(0_usize, usize::saturating_add);
     for item in snapshots {
         let root_session_id = claude_snapshot_family_root(item);
+        let prior_family_occurrence_count = pending_by_root
+            .get(&root_session_id)
+            .map(|pending| {
+                pending
+                    .member_occurrences
+                    .values()
+                    .map(BTreeMap::len)
+                    .fold(0_usize, usize::saturating_add)
+            })
+            .unwrap_or_default();
         let pending =
             pending_by_root
                 .entry(root_session_id)
@@ -2039,6 +2145,8 @@ fn accumulate_claude_usage_family_pending(
                     invalid: false,
                 });
         if pending.census_window_end != census_window_end {
+            retained_occurrence_count =
+                retained_occurrence_count.saturating_sub(prior_family_occurrence_count);
             *pending = ClaudeUsageFamilyPending {
                 census_window_end: census_window_end.to_string(),
                 member_request_id_hashes: BTreeMap::new(),
@@ -2046,19 +2154,15 @@ fn accumulate_claude_usage_family_pending(
                 invalid: false,
             };
         }
+        if pending.invalid {
+            continue;
+        }
         let Some(hashes) = claude_snapshot_request_id_hashes(item)
             .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())
         else {
-            pending.invalid = true;
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         };
-        if pending
-            .member_request_id_hashes
-            .insert(item.source_session_id.clone(), hashes.clone())
-            .is_some_and(|previous| previous != hashes)
-        {
-            pending.invalid = true;
-        }
         let occurrences = item
             .claude_usage_occurrences
             .iter()
@@ -2070,7 +2174,28 @@ fn accumulate_claude_usage_family_pending(
             })
             .collect::<BTreeMap<_, _>>();
         if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
-            pending.invalid = true;
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+            continue;
+        }
+        let replaced_occurrence_count = pending
+            .member_occurrences
+            .get(&item.source_session_id)
+            .map(BTreeMap::len)
+            .unwrap_or_default();
+        let Some(next_retained_occurrence_count) = claude_pending_occurrence_count_after_replace(
+            retained_occurrence_count,
+            replaced_occurrence_count,
+            occurrences.len(),
+        ) else {
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+            continue;
+        };
+        if pending
+            .member_request_id_hashes
+            .insert(item.source_session_id.clone(), hashes.clone())
+            .is_some_and(|previous| previous != hashes)
+        {
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
             continue;
         }
         if pending
@@ -2078,9 +2203,36 @@ fn accumulate_claude_usage_family_pending(
             .insert(item.source_session_id.clone(), occurrences.clone())
             .is_some_and(|previous| previous != occurrences)
         {
-            pending.invalid = true;
+            invalidate_claude_usage_family_pending(pending, &mut retained_occurrence_count);
+            continue;
         }
+        retained_occurrence_count = next_retained_occurrence_count;
     }
+}
+
+fn invalidate_claude_usage_family_pending(
+    pending: &mut ClaudeUsageFamilyPending,
+    retained_occurrence_count: &mut usize,
+) {
+    *retained_occurrence_count = retained_occurrence_count.saturating_sub(
+        pending
+            .member_occurrences
+            .values()
+            .map(BTreeMap::len)
+            .fold(0_usize, usize::saturating_add),
+    );
+    pending.member_request_id_hashes.clear();
+    pending.member_occurrences.clear();
+    pending.invalid = true;
+}
+
+fn claude_pending_occurrence_count_after_replace(
+    retained: usize,
+    replaced: usize,
+    incoming: usize,
+) -> Option<usize> {
+    let next = retained.saturating_sub(replaced).saturating_add(incoming);
+    (next <= MAX_CLAUDE_PENDING_USAGE_OCCURRENCES).then_some(next)
 }
 
 fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
@@ -2133,22 +2285,249 @@ fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
         .unwrap_or_else(|| item.source_session_id.clone())
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeLegacyRequestOwner {
+    root_session_id: String,
+    evidence_fingerprint: String,
+}
+
+/// Infer only the usage exclusion, never a provider graph edge, for legacy
+/// top-level forks written before `forkedFrom` existed. A child is eligible
+/// only when its non-owned responses are one contiguous leading prefix, that
+/// exact prefix is duplicated by another top-level transcript in the same
+/// complete census, and current healthy API + trace evidence gives every
+/// excluded request one different root owner. Sessions with no owned suffix,
+/// missing historical telemetry, or an ambiguous owner remain untouched.
+fn derive_claude_legacy_usage_exclusions(
+    complete_families: &BTreeMap<String, BTreeSet<String>>,
+    pending_by_root: &BTreeMap<String, ClaudeUsageFamilyPending>,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) -> BTreeMap<String, ClaudeLegacyUsageExclusion> {
+    let Some(request_owners) = claude_legacy_request_owners(api_report, trace_report) else {
+        return BTreeMap::new();
+    };
+    let sequences = complete_families
+        .keys()
+        .filter_map(|root_session_id| {
+            let pending = pending_by_root.get(root_session_id)?;
+            let occurrences = pending.member_occurrences.get(root_session_id)?;
+            let mut ordered = occurrences
+                .iter()
+                .map(|(request_hash, occurrence)| (occurrence.sequence, request_hash.clone()))
+                .collect::<Vec<_>>();
+            ordered.sort();
+            if ordered.is_empty() || ordered.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return None;
+            }
+            Some((
+                root_session_id.clone(),
+                ordered
+                    .into_iter()
+                    .map(|(_, hash)| hash)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut exclusions = BTreeMap::new();
+    for (child_root, sequence) in &sequences {
+        let missing_prefix_len = sequence
+            .iter()
+            .take_while(|request_hash| {
+                request_owners
+                    .get(*request_hash)
+                    .is_some_and(|owner| owner.root_session_id != *child_root)
+            })
+            .count();
+        if missing_prefix_len == 0 || missing_prefix_len == sequence.len() {
+            continue;
+        }
+        if sequence[missing_prefix_len..].iter().any(|request_hash| {
+            request_owners
+                .get(request_hash)
+                .map_or(true, |owner| owner.root_session_id != *child_root)
+        }) {
+            continue;
+        }
+        let prefix = &sequence[..missing_prefix_len];
+        let duplicated_divergent_prefix = sequences.iter().any(|(other_root, other)| {
+            other_root != child_root
+                && other.len() > missing_prefix_len
+                && other[..missing_prefix_len] == *prefix
+                && other[missing_prefix_len] != sequence[missing_prefix_len]
+        });
+        if !duplicated_divergent_prefix {
+            continue;
+        }
+        let excluded_request_id_hashes = prefix.iter().cloned().collect::<BTreeSet<_>>();
+        let owner_roots = prefix
+            .iter()
+            .filter_map(|request_hash| {
+                request_owners
+                    .get(request_hash)
+                    .map(|owner| owner.root_session_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let Some(evidence_fingerprint) = claude_legacy_exclusion_evidence_fingerprint(
+            child_root,
+            &excluded_request_id_hashes,
+            &request_owners,
+        ) else {
+            continue;
+        };
+        exclusions.insert(
+            child_root.clone(),
+            ClaudeLegacyUsageExclusion {
+                excluded_request_id_hashes,
+                evidence_fingerprint,
+                owner_roots,
+            },
+        );
+    }
+    exclusions
+}
+
+fn claude_legacy_request_owners(
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+) -> Option<BTreeMap<String, ClaudeLegacyRequestOwner>> {
+    if !api_report.health.is_complete() || !trace_report.is_complete() {
+        return None;
+    }
+    let mut owners = BTreeMap::new();
+    for (root_session_id, api_rows) in &api_report.evidence {
+        let trace_rows = trace_report.evidence.get(root_session_id)?;
+        let members = std::iter::once(root_session_id.clone())
+            .chain(
+                trace_rows
+                    .iter()
+                    .filter(|row| !row.agent_id.trim().is_empty())
+                    .map(|row| claude_trace_owner_session_id(root_session_id, &row.agent_id)),
+            )
+            .collect::<BTreeSet<_>>();
+        let reduced = reduce_claude_usage_ledger(root_session_id, &members, api_rows, trace_rows)?;
+        let trace_by_request = trace_rows
+            .iter()
+            .map(|row| (row.request_id.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        for row in reduced.rows_by_member.get(root_session_id)? {
+            let trace = trace_by_request.get(row.request_id.as_str())?;
+            if !trace.agent_id.trim().is_empty() {
+                return None;
+            }
+            let request_hash = format!("{:x}", Sha256::digest(row.request_id.as_bytes()));
+            let evidence_fingerprint = sha256_hex(&[
+                "claude_legacy_request_owner:v1",
+                root_session_id,
+                request_hash.as_str(),
+                row.fingerprint.as_str(),
+                trace.fingerprint.as_str(),
+            ]);
+            if owners
+                .insert(
+                    request_hash,
+                    ClaudeLegacyRequestOwner {
+                        root_session_id: root_session_id.clone(),
+                        evidence_fingerprint,
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+        }
+    }
+    Some(owners)
+}
+
+fn claude_legacy_exclusion_evidence_fingerprint(
+    child_root: &str,
+    excluded_request_id_hashes: &BTreeSet<String>,
+    request_owners: &BTreeMap<String, ClaudeLegacyRequestOwner>,
+) -> Option<String> {
+    if excluded_request_id_hashes.is_empty() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"claude_legacy_usage_exclusion:v1\0");
+    digest.update(child_root.as_bytes());
+    digest.update(b"\0");
+    for request_hash in excluded_request_id_hashes {
+        let owner = request_owners.get(request_hash)?;
+        if owner.root_session_id == child_root {
+            return None;
+        }
+        digest.update(request_hash.as_bytes());
+        digest.update(b"\0");
+        digest.update(owner.root_session_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(owner.evidence_fingerprint.as_bytes());
+        digest.update(b"\0");
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn validate_claude_legacy_exclusion_witness(
+    witness: &ClaudeUsageFamilyWitness,
+    request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
+) -> bool {
+    if witness.legacy_excluded_request_id_hashes.is_empty() {
+        return witness.legacy_exclusion_evidence_fingerprint.is_none()
+            && witness.legacy_owner_roots.is_empty();
+    }
+    if witness.legacy_excluded_request_id_hashes.len() != 1 {
+        return false;
+    }
+    let Some((child_root, excluded)) = witness.legacy_excluded_request_id_hashes.first_key_value()
+    else {
+        return false;
+    };
+    let Some(owners) = request_owners else {
+        return false;
+    };
+    let actual_owner_roots = excluded
+        .iter()
+        .filter_map(|request_hash| {
+            owners
+                .get(request_hash)
+                .map(|owner| owner.root_session_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    actual_owner_roots == witness.legacy_owner_roots
+        && claude_legacy_exclusion_evidence_fingerprint(child_root, excluded, owners)
+            == witness.legacy_exclusion_evidence_fingerprint
+}
+
 fn prove_claude_usage_family(
     root_session_id: &str,
     members: &BTreeSet<String>,
     pending: &ClaudeUsageFamilyPending,
     api_rows: Option<&Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+    legacy_exclusion: Option<&ClaudeLegacyUsageExclusion>,
 ) -> Option<ProvenClaudeUsageFamily> {
     let reduced = reduce_claude_usage_ledger(root_session_id, members, api_rows?, trace_rows?)?;
     let mut member_request_id_fingerprints = BTreeMap::new();
     let mut member_occurrence_fingerprints = BTreeMap::new();
+    let mut legacy_excluded_request_id_hashes = BTreeMap::new();
     for member in members {
-        let transcript_hashes = pending
+        let mut transcript_hashes = pending
             .member_request_id_hashes
             .get(member)
             .cloned()
             .unwrap_or_default();
+        let excluded = (member == root_session_id)
+            .then_some(legacy_exclusion)
+            .flatten()
+            .map(|proof| &proof.excluded_request_id_hashes);
+        if let Some(excluded) = excluded {
+            if excluded.is_empty() || !excluded.is_subset(&transcript_hashes) {
+                return None;
+            }
+            transcript_hashes.retain(|request_hash| !excluded.contains(request_hash));
+            legacy_excluded_request_id_hashes.insert(member.clone(), excluded.clone());
+        }
         let assigned_hashes = reduced.assigned_request_id_hashes.get(member)?;
         if !transcript_hashes.is_subset(assigned_hashes)
             || (transcript_hashes.is_empty() && !assigned_hashes.is_empty())
@@ -2157,15 +2536,24 @@ fn prove_claude_usage_family(
             // upstream; fail closed instead of silently dropping its aux calls.
             return None;
         }
-        let transcript_occurrences = pending.member_occurrences.get(member)?;
-        if transcript_occurrences
+        let all_transcript_occurrences = pending.member_occurrences.get(member)?;
+        if all_transcript_occurrences
             .keys()
             .cloned()
             .collect::<BTreeSet<_>>()
-            != transcript_hashes
+            != pending
+                .member_request_id_hashes
+                .get(member)
+                .cloned()
+                .unwrap_or_default()
         {
             return None;
         }
+        let transcript_occurrences = all_transcript_occurrences
+            .iter()
+            .filter(|(request_hash, _)| !excluded.is_some_and(|set| set.contains(*request_hash)))
+            .map(|(request_hash, occurrence)| (request_hash.clone(), occurrence.clone()))
+            .collect::<BTreeMap<_, _>>();
         let rows_by_hash = reduced
             .rows_by_member
             .get(member)?
@@ -2193,7 +2581,7 @@ fn prove_claude_usage_family(
         );
         member_occurrence_fingerprints.insert(
             member.clone(),
-            claude_occurrence_map_fingerprint(transcript_occurrences),
+            claude_occurrence_map_fingerprint(&transcript_occurrences),
         );
     }
     let assigned_request_id_fingerprints = reduced
@@ -2207,6 +2595,12 @@ fn prove_claude_usage_family(
             member_request_id_fingerprints,
             member_occurrence_fingerprints,
             assigned_request_id_fingerprints,
+            legacy_excluded_request_id_hashes,
+            legacy_exclusion_evidence_fingerprint: legacy_exclusion
+                .map(|proof| proof.evidence_fingerprint.clone()),
+            legacy_owner_roots: legacy_exclusion
+                .map(|proof| proof.owner_roots.clone())
+                .unwrap_or_default(),
         },
         rows_by_member: reduced.rows_by_member,
     })
@@ -2215,15 +2609,21 @@ fn prove_claude_usage_family(
 fn reconstruct_claude_usage_family(
     root_session_id: &str,
     witness: &ClaudeUsageFamilyWitness,
-    api_rows: Option<&Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
-    trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    legacy_request_owners: Option<&BTreeMap<String, ClaudeLegacyRequestOwner>>,
 ) -> Option<ProvenClaudeUsageFamily> {
     let members = witness
         .member_request_id_fingerprints
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let reduced = reduce_claude_usage_ledger(root_session_id, &members, api_rows?, trace_rows?)?;
+    let reduced = reduce_claude_usage_ledger(
+        root_session_id,
+        &members,
+        api_report.evidence.get(root_session_id)?,
+        trace_report.evidence.get(root_session_id)?,
+    )?;
     let assigned_request_id_fingerprints = reduced
         .assigned_request_id_hashes
         .iter()
@@ -2231,6 +2631,7 @@ fn reconstruct_claude_usage_family(
         .collect::<BTreeMap<_, _>>();
     if reduced.evidence_fingerprint != witness.evidence_fingerprint
         || assigned_request_id_fingerprints != witness.assigned_request_id_fingerprints
+        || !validate_claude_legacy_exclusion_witness(witness, legacy_request_owners)
     {
         return None;
     }
@@ -2920,13 +3321,26 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
 fn rebuild_claude_reported_usage(
     item: &mut SnapshotItem,
     rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    excluded_request_hashes: &BTreeSet<String>,
 ) -> bool {
+    let owned_request_ids = item
+        .claude_usage_request_ids
+        .iter()
+        .filter(|request_id| {
+            !excluded_request_hashes
+                .contains(&format!("{:x}", Sha256::digest(request_id.as_bytes())))
+        })
+        .collect::<BTreeSet<_>>();
     if rows.is_empty()
         || item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len()
-        || !item
-            .claude_usage_request_ids
+        || owned_request_ids.is_empty()
+        || !owned_request_ids
             .iter()
-            .all(|request_id| rows.iter().any(|row| &row.request_id == request_id))
+            .all(|request_id| rows.iter().any(|row| row.request_id == request_id.as_str()))
+        || rows.iter().any(|row| {
+            excluded_request_hashes
+                .contains(&format!("{:x}", Sha256::digest(row.request_id.as_bytes())))
+        })
     {
         return false;
     }
@@ -3086,6 +3500,15 @@ fn rebuild_claude_reported_usage(
         }
     }
 
+    let mut reported_activity = UsageBucketState::default();
+    for bucket in buckets.values() {
+        if let Some(first_activity_at) = bucket.first_activity_at.as_deref() {
+            reported_activity.note_activity_at(first_activity_at);
+        }
+        if let Some(last_activity_at) = bucket.last_activity_at.as_deref() {
+            reported_activity.note_activity_at(last_activity_at);
+        }
+    }
     let mut session_rows = BTreeMap::new();
     let mut usage_buckets = Vec::new();
     for (bucket_start, bucket) in buckets {
@@ -3123,6 +3546,31 @@ fn rebuild_claude_reported_usage(
     item.request_count = totals.request_count;
     item.model_usage = model_usage;
     item.usage_buckets = usage_buckets;
+    if let Some(first_activity_at) = reported_activity.first_activity_at {
+        if item.source_started_at.as_ref().map_or(true, |current| {
+            timestamp_is_before(&first_activity_at, current)
+        }) {
+            item.source_started_at = Some(first_activity_at);
+        }
+    }
+    if let Some(last_activity_at) = reported_activity.last_activity_at {
+        if item
+            .source_last_activity_at
+            .as_ref()
+            .map_or(true, |current| {
+                timestamp_is_after(&last_activity_at, current)
+            })
+        {
+            item.source_last_activity_at = Some(last_activity_at.clone());
+        }
+        if item
+            .source_ended_at
+            .as_ref()
+            .is_some_and(|current| timestamp_is_after(&last_activity_at, current))
+        {
+            item.source_ended_at = Some(last_activity_at);
+        }
+    }
     item.cost = Some(SnapshotCost {
         total_cost_usd: Some(usd_picos_string(total_cost_picos)),
         input_cost_usd: None,
@@ -3977,6 +4425,7 @@ struct ClaudeResponseObservation {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ClaudeTranscriptUsageOccurrence {
+    sequence: u64,
     usage: UsageTotals,
     model: Option<String>,
     selector: SelectorCapture,
@@ -5495,6 +5944,7 @@ impl SnapshotAccumulator {
                 self.claude_usage_occurrences.insert(
                     request_id,
                     ClaudeTranscriptUsageOccurrence {
+                        sequence: response.sequence,
                         usage: response.usage.clone(),
                         model: response.model.clone(),
                         selector: response.selector.clone(),
@@ -21481,6 +21931,67 @@ mod tests {
     }
 
     #[test]
+    fn claude_pending_usage_occurrence_limit_is_replacement_aware() {
+        assert_eq!(
+            claude_pending_occurrence_count_after_replace(
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES - 10,
+                0,
+                10,
+            ),
+            Some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
+        );
+        assert_eq!(
+            claude_pending_occurrence_count_after_replace(
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                10,
+                10,
+            ),
+            Some(MAX_CLAUDE_PENDING_USAGE_OCCURRENCES)
+        );
+        assert_eq!(
+            claude_pending_occurrence_count_after_replace(
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+                0,
+                1,
+            ),
+            None
+        );
+
+        let mut pending = ClaudeUsageFamilyPending {
+            census_window_end: "2026-08-09T00:00:00Z".to_string(),
+            member_request_id_hashes: BTreeMap::from([(
+                "child".to_string(),
+                BTreeSet::from(["request".to_string()]),
+            )]),
+            member_occurrences: BTreeMap::from([(
+                "child".to_string(),
+                BTreeMap::from([(
+                    "request".to_string(),
+                    ClaudeTranscriptUsageOccurrenceWitness {
+                        sequence: 0,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_creation_5m_tokens: 0,
+                        cache_creation_1h_tokens: 0,
+                        reasoning_output_tokens: 0,
+                        model: None,
+                        speed_mode: None,
+                        reasoning_effort: None,
+                    },
+                )]),
+            )]),
+            invalid: false,
+        };
+        let mut retained = 1;
+        invalidate_claude_usage_family_pending(&mut pending, &mut retained);
+        assert_eq!(retained, 0);
+        assert!(pending.invalid);
+        assert!(pending.member_request_id_hashes.is_empty());
+        assert!(pending.member_occurrences.is_empty());
+    }
+
+    #[test]
     fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
         let (root, parent, mut items) = claude_account_family_fixture();
         let graph_before = items
@@ -21495,14 +22006,14 @@ mod tests {
         // Prompt-suggestion/model-selection work is reported but has no
         // transcript response. Its aggregate cache write is exact usage while
         // the TTL split remains intentionally unknown.
-        api_rows.push(complete_api_row(
-            &parent,
-            "req_prompt_suggestion",
-            6,
-            3,
-            2,
-            7,
-        ));
+        let mut prompt_suggestion = complete_api_row(&parent, "req_prompt_suggestion", 6, 3, 2, 7);
+        prompt_suggestion.observed_at = "2026-08-02T08:14:00Z".to_string();
+        prompt_suggestion.fingerprint = String::new();
+        let prompt_suggestion_bytes =
+            serde_json::to_vec(&prompt_suggestion).expect("serialize moved API evidence");
+        prompt_suggestion.fingerprint =
+            format!("sha256:{:x}", Sha256::digest(prompt_suggestion_bytes));
+        api_rows.push(prompt_suggestion);
         let mut trace_rows = (1..=4)
             .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
             .collect::<Vec<_>>();
@@ -21544,6 +22055,11 @@ mod tests {
         assert_eq!(items[0].input_tokens, 43);
         assert_eq!(items[0].output_tokens, 42);
         assert_eq!(items[0].unattributed_total_tokens, 7);
+        assert_eq!(items[0].usage_buckets.len(), 2);
+        assert_eq!(
+            items[0].source_last_activity_at.as_deref(),
+            Some("2026-08-02T08:14:00Z")
+        );
         assert_eq!(items[1].request_count, 1);
         assert_eq!(items[1].input_tokens, 10);
         assert_eq!(items[1].output_tokens, 1);
@@ -21589,6 +22105,19 @@ mod tests {
         assert_eq!(
             child_only[0].usage_accounting_contract.as_deref(),
             Some("session_exclusive_reported_usage:v1")
+        );
+        let mut unchanged_page = Vec::new();
+        apply_claude_reported_usage_with_index(
+            &mut unchanged_page,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:11:30Z",
+        );
+        assert!(
+            index.claude_usage_family_witnesses.contains_key(&parent),
+            "an unchanged terminal census retains a revalidated witness"
         );
         let mut unhealthy_trace = trace_report.clone();
         unhealthy_trace.malformed_lines = 1;
@@ -21715,6 +22244,315 @@ mod tests {
         assert_eq!(child_page[0].usage_accounting_contract, None);
         assert!(!index.claude_usage_family_witnesses.contains_key(&parent));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_legacy_fork_prefix_is_excluded_only_with_exact_external_owner() {
+        let root = temp_dir("claude-legacy-fork-prefix");
+        let parent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let child = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let parent_path = root.join(format!("{parent}.jsonl"));
+        let child_path = root.join(format!("{child}.jsonl"));
+        fs::write(
+            &parent_path,
+            format!(
+                concat!(
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n",
+                    "{{\"uuid\":\"parent-assistant\",\"timestamp\":\"2026-08-02T07:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"{parent}\",\"requestId\":\"req_parent\",\"message\":{{\"id\":\"msg_parent\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":11,\"output_tokens\":3}}}}}}\n"
+                ),
+                parent = parent,
+            ),
+        )
+        .expect("write parent branch");
+        fs::write(
+            &child_path,
+            format!(
+                concat!(
+                    "{{\"uuid\":\"shared-assistant\",\"timestamp\":\"2026-08-02T07:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_shared\",\"message\":{{\"id\":\"msg_shared\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":2}}}}}}\n",
+                    "{{\"uuid\":\"child-assistant\",\"timestamp\":\"2026-08-02T07:00:03Z\",\"type\":\"assistant\",\"sessionId\":\"{child}\",\"requestId\":\"req_child\",\"message\":{{\"id\":\"msg_child\",\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4}}}}}}\n"
+                ),
+                child = child,
+            ),
+        )
+        .expect("write legacy child branch");
+        let mut items = parse_claude_code_jsonl_file(
+            &parent_path,
+            "2026-08-02T07:10:00Z",
+            "parent-fp".to_string(),
+        )
+        .expect("parse parent");
+        items.extend(
+            parse_claude_code_jsonl_file(
+                &child_path,
+                "2026-08-02T07:10:00Z",
+                "child-fp".to_string(),
+            )
+            .expect("parse child"),
+        );
+        assert_eq!(
+            items[1].request_count, 2,
+            "raw legacy child double-counts prefix"
+        );
+
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    parent.to_string(),
+                    vec![
+                        complete_api_row(parent, "req_shared", 1, 10, 2, 0),
+                        complete_api_row(parent, "req_parent", 2, 11, 3, 0),
+                    ],
+                ),
+                (
+                    child.to_string(),
+                    vec![complete_api_row(child, "req_child", 3, 12, 4, 0)],
+                ),
+            ]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    parent.to_string(),
+                    vec![
+                        complete_trace_row(parent, "req_shared", ""),
+                        complete_trace_row(parent, "req_parent", ""),
+                    ],
+                ),
+                (
+                    child.to_string(),
+                    vec![complete_trace_row(child, "req_child", "")],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index
+            .files
+            .insert(local_index_key(&parent_path), manifest_index_entry(None));
+        index
+            .files
+            .insert(local_index_key(&child_path), manifest_index_entry(None));
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(items[0].request_count, 2);
+        assert_eq!(items[1].request_count, 1);
+        assert_eq!(items[1].input_tokens, 12);
+        assert_eq!(items[1].output_tokens, 4);
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        let child_witness = index
+            .claude_usage_family_witnesses
+            .get(child)
+            .expect("legacy child witness");
+        assert_eq!(
+            child_witness.legacy_owner_roots,
+            BTreeSet::from([parent.to_string()])
+        );
+        let serialized = serde_json::to_string(&index).expect("serialize index");
+        assert!(!serialized.contains("req_shared"));
+
+        // A later child-only correction must revalidate the exact external
+        // owner evidence, not trust the persisted prefix decision by itself.
+        let mut child_only = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-02T07:11:00Z",
+            "child-fp-2".to_string(),
+        )
+        .expect("reparse child");
+        apply_claude_reported_usage_with_index(
+            &mut child_only,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(child_only[0].request_count, 1);
+        assert_eq!(
+            child_only[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let child_only_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(
+                child.to_string(),
+                vec![complete_api_row(child, "req_child", 3, 12, 4, 0)],
+            )]),
+            health: Default::default(),
+        };
+        let child_only_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(
+                child.to_string(),
+                vec![complete_trace_row(child, "req_child", "")],
+            )]),
+            ..Default::default()
+        };
+        let mut unproven = parse_claude_code_jsonl_file(
+            &child_path,
+            "2026-08-02T07:12:00Z",
+            "child-fp-3".to_string(),
+        )
+        .expect("reparse unproven child");
+        apply_claude_reported_usage_with_index(
+            &mut unproven,
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            false,
+            "2026-08-02T07:12:00Z",
+        );
+        assert_eq!(unproven[0].request_count, 2);
+        assert_eq!(unproven[0].usage_accounting_contract, None);
+        let mut unhealthy_terminal = Vec::new();
+        apply_claude_reported_usage_with_index(
+            &mut unhealthy_terminal,
+            &child_only_report,
+            &child_only_trace,
+            &mut index,
+            true,
+            "2026-08-02T07:12:30Z",
+        );
+        assert!(!index.claude_usage_family_witnesses.contains_key(child));
+        assert!(index
+            .files
+            .get(&local_index_key(&child_path))
+            .is_some_and(|entry| entry.source_file_fingerprint.is_empty()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_legacy_fork_of_fork_excludes_each_exact_inherited_prefix() {
+        let ancestor = "ancestor";
+        let middle = "middle";
+        let leaf = "leaf";
+        let zero_owned = "zero-owned";
+        let hash = |request_id: &str| format!("{:x}", Sha256::digest(request_id.as_bytes()));
+        let pending = |root: &str, request_ids: &[&str]| {
+            let occurrences = request_ids
+                .iter()
+                .enumerate()
+                .map(|(sequence, request_id)| {
+                    (
+                        hash(request_id),
+                        ClaudeTranscriptUsageOccurrenceWitness {
+                            sequence: sequence as u64,
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            cache_read_tokens: 0,
+                            cache_creation_5m_tokens: 0,
+                            cache_creation_1h_tokens: 0,
+                            reasoning_output_tokens: 0,
+                            model: Some("claude-haiku-4-5".to_string()),
+                            speed_mode: None,
+                            reasoning_effort: None,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            ClaudeUsageFamilyPending {
+                census_window_end: "2026-08-02T07:10:00Z".to_string(),
+                member_request_id_hashes: BTreeMap::from([(
+                    root.to_string(),
+                    occurrences.keys().cloned().collect(),
+                )]),
+                member_occurrences: BTreeMap::from([(root.to_string(), occurrences)]),
+                invalid: false,
+            }
+        };
+        let complete_families = [ancestor, middle, leaf, zero_owned]
+            .into_iter()
+            .map(|root| (root.to_string(), BTreeSet::from([root.to_string()])))
+            .collect::<BTreeMap<_, _>>();
+        let pending_by_root = BTreeMap::from([
+            (ancestor.to_string(), pending(ancestor, &["req_a", "req_x"])),
+            (
+                middle.to_string(),
+                pending(middle, &["req_a", "req_b", "req_y"]),
+            ),
+            (
+                leaf.to_string(),
+                pending(leaf, &["req_a", "req_b", "req_c"]),
+            ),
+            (zero_owned.to_string(), pending(zero_owned, &["req_a"])),
+        ]);
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    ancestor.to_string(),
+                    vec![
+                        complete_api_row(ancestor, "req_a", 1, 1, 1, 0),
+                        complete_api_row(ancestor, "req_x", 2, 1, 1, 0),
+                    ],
+                ),
+                (
+                    middle.to_string(),
+                    vec![
+                        complete_api_row(middle, "req_b", 3, 1, 1, 0),
+                        complete_api_row(middle, "req_y", 4, 1, 1, 0),
+                    ],
+                ),
+                (
+                    leaf.to_string(),
+                    vec![complete_api_row(leaf, "req_c", 5, 1, 1, 0)],
+                ),
+            ]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([
+                (
+                    ancestor.to_string(),
+                    vec![
+                        complete_trace_row(ancestor, "req_a", ""),
+                        complete_trace_row(ancestor, "req_x", ""),
+                    ],
+                ),
+                (
+                    middle.to_string(),
+                    vec![
+                        complete_trace_row(middle, "req_b", ""),
+                        complete_trace_row(middle, "req_y", ""),
+                    ],
+                ),
+                (
+                    leaf.to_string(),
+                    vec![complete_trace_row(leaf, "req_c", "")],
+                ),
+            ]),
+            ..Default::default()
+        };
+        let exclusions = derive_claude_legacy_usage_exclusions(
+            &complete_families,
+            &pending_by_root,
+            &api_report,
+            &trace_report,
+        );
+        assert!(!exclusions.contains_key(ancestor));
+        assert!(
+            !exclusions.contains_key(zero_owned),
+            "a fully inherited response sequence has no proven terminal census"
+        );
+        assert_eq!(
+            exclusions
+                .get(middle)
+                .expect("middle exclusion")
+                .excluded_request_id_hashes,
+            BTreeSet::from([hash("req_a")])
+        );
+        assert_eq!(
+            exclusions
+                .get(leaf)
+                .expect("leaf exclusion")
+                .excluded_request_id_hashes,
+            BTreeSet::from([hash("req_a"), hash("req_b")])
+        );
     }
 
     #[test]
@@ -23754,6 +24592,34 @@ mod tests {
         assert_eq!(item.usage_accounting_contract, None);
         assert!(!item.claude_usage_request_ids.contains("req_copied"));
         assert!(item.claude_usage_request_ids.contains("req_owned"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_malformed_fork_marker_fails_closed_without_confirming_empty() {
+        let root = temp_dir("claude-malformed-fork-marker");
+        let path = root.join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-01T08:00:02Z\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"forkedFrom\":{\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"},\"type\":\"assistant\",\"requestId\":\"req_unknown\",\"message\":{\"id\":\"msg_unknown\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n",
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-09T08:01:00Z",
+            365,
+            10,
+            false,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert!(scan.recognized_usage_drop_count > 0);
+        assert!(!index
+            .confirmed_empty_files
+            .contains(&local_index_key(&path)));
         let _ = fs::remove_dir_all(root);
     }
 
