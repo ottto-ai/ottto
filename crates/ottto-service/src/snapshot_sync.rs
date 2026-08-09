@@ -1902,6 +1902,58 @@ fn sync_source(
                 &census_window_end,
             );
         }
+        let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
+            .into_iter()
+            .chain(crate::snapshots::claude_pending_family_session_ids(&index))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|session_id| {
+                !crate::claude_local_otel::claude_effort_sidecar_fingerprint(
+                    support_dir,
+                    session_id,
+                )
+                .is_empty()
+                    && !crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+                        support_dir,
+                        session_id,
+                    )
+                    .is_empty()
+            })
+            .collect::<Vec<_>>();
+        // Health is family-scoped: one malformed historical sidecar must make
+        // that family unproven, not suppress an unrelated healthy family.
+        let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        for root_session_id in usage_roots {
+            let api = crate::claude_local_otel::load_claude_api_request_evidence_report(
+                support_dir,
+                [root_session_id.clone()],
+            );
+            let trace = crate::claude_local_otel::load_claude_trace_ownership_evidence(
+                support_dir,
+                [root_session_id.clone()],
+            );
+            if !api.health.is_complete() || !trace.is_complete() {
+                continue;
+            }
+            if let Some(rows) = api.evidence.get(&root_session_id) {
+                api_report
+                    .evidence
+                    .insert(root_session_id.clone(), rows.clone());
+            }
+            if let Some(rows) = trace.evidence.get(&root_session_id) {
+                trace_report.evidence.insert(root_session_id, rows.clone());
+            }
+        }
+        let census_window_end = scan_result.census_window_end.clone();
+        crate::snapshots::apply_claude_reported_usage_with_index(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            &mut index,
+            census_complete,
+            &census_window_end,
+        );
     }
 
     apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
@@ -2335,6 +2387,28 @@ fn claude_evidence_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
                     })
                     .map(|fact| fact.value.clone()),
             )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            snapshot
+                .attribution_facts
+                .iter()
+                .find(|fact| fact.field == "root_session_ref")
+                .map(|fact| fact.value.clone())
+                .or_else(|| {
+                    snapshot
+                        .source_session_id
+                        .split_once("_agent-")
+                        .map(|(root, _)| root.to_string())
+                })
+                .unwrap_or_else(|| snapshot.source_session_id.clone())
         })
         .collect::<BTreeSet<_>>()
         .into_iter()

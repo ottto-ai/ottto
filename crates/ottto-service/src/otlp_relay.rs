@@ -376,6 +376,24 @@ fn handle_client(mut stream: TcpStream, source: SnapshotSource, daemon: LocalDae
             }
         }
     }
+    if request_source == SnapshotSource::ClaudeCode && request.path == "/v1/traces" {
+        match crate::claude_local_otel::capture_claude_llm_request_traces(
+            &ottto_core::default_support_dir(),
+            &request.body,
+            request
+                .headers
+                .get("content-type")
+                .map(String::as_str)
+                .unwrap_or("application/octet-stream"),
+        ) {
+            Ok(_) => {}
+            Err(_error) => {
+                eprintln!(
+                    "local Claude trace ownership reduction skipped: invalid local OTLP traces payload"
+                );
+            }
+        }
+    }
     match forward_otlp_request(request_source, &request) {
         Ok(response) => write_raw_response(
             &mut stream,

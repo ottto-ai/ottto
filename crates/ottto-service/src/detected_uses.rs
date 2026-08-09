@@ -382,6 +382,7 @@ mod tests {
             request_count: 0,
             usage_accounting_contract: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
+            claude_usage_occurrences: std::collections::BTreeMap::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,

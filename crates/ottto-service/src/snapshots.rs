@@ -197,7 +197,15 @@ pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v29";
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
 // requests (such as prompt suggestions) that Claude records only in OTLP under
 // the same root session. Raw request ids are never serialized or uploaded.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v30";
+// v31 resolves Claude assistant content-block records as one complete provider
+// response before admitting usage. Claude Code sidechains progressively update
+// `output_tokens` across repeated (`message.id`, `requestId`) rows; taking the
+// first row undercounts the response. Explicit `forkedFrom` rows are copied
+// branch history and are excluded from every child-session metric.
+// v32 retains the exact resolved occurrence in local memory and joins it to
+// current api_request + enhanced llm_request evidence. Only a healthy complete
+// family census can replace usage with the reported occurrence union.
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v32";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -232,7 +240,10 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // files still converge through the semantic no-op path after the new summary
 // has been uploaded.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v29";
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v24";
+// v26 deliberately revisits Claude history so every snapshot clears the old
+// safety state and future-captured, trace-owned occurrence unions can mint the
+// reported-usage contract. Historical v31 sidecars remain unproven.
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v26";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -683,10 +694,9 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
-    /// Present only when the collector proved that usage and every related
-    /// session metric contain this session's work exclusively. Omission is an
-    /// explicit fail-closed signal for legacy fork shapes whose inherited
-    /// prefix cannot be bounded safely.
+    /// Collector proof that all provider-reported usage assigned to this snapshot belongs
+    /// exclusively to this source session. Omitted whenever ownership remains unproven,
+    /// including ambiguous Codex or Claude legacy fork shapes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_accounting_contract: Option<String>,
     /// Local-only identities of the Claude API responses whose transcript
@@ -697,6 +707,11 @@ pub struct SnapshotItem {
     /// missing transcript rows. Never serialized or uploaded.
     #[serde(skip)]
     pub(crate) claude_usage_request_ids: BTreeSet<String>,
+    /// Local-only, per-response Claude usage retained until OTLP log and trace
+    /// evidence can prove one owner for every reported occurrence in a family.
+    /// Raw request ids and response observations never cross the snapshot wire.
+    #[serde(skip)]
+    pub(crate) claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
     // Session-level Codex latency (avg across the session's `task_complete`
     // turns). Codex emits duration/ttft only in the rollout `task_complete`
     // event (never over OTLP), so the daemon aggregates them here. Absent for
@@ -1048,6 +1063,13 @@ pub struct ScanIndex {
     claude_account_family_witnesses: BTreeMap<String, ClaudeAccountFamilyWitness>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     claude_account_family_pending: BTreeMap<String, ClaudeAccountFamilyPending>,
+    /// Complete Claude request-ownership witnesses. These are local-only and
+    /// persist only content-free request-set fingerprints; raw provider request
+    /// ids remain in the transcript/API sidecars that produced them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_usage_family_witnesses: BTreeMap<String, ClaudeUsageFamilyWitness>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    claude_usage_family_pending: BTreeMap<String, ClaudeUsageFamilyPending>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_desktop_store_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1138,6 +1160,8 @@ impl Default for ScanIndex {
             claude_desktop_title_files: BTreeMap::new(),
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
+            claude_usage_family_witnesses: BTreeMap::new(),
+            claude_usage_family_pending: BTreeMap::new(),
             claude_desktop_store_cursor: None,
             claude_desktop_store_upper_bound: None,
             claude_desktop_store_sweep_had_errors: false,
@@ -1260,6 +1284,66 @@ struct ClaudeAccountFamilyPending {
 struct ProvenClaudeAccountFamily {
     members: BTreeMap<String, u64>,
     member_request_id_fingerprints: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeUsageFamilyWitness {
+    evidence_fingerprint: String,
+    member_request_id_fingerprints: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    member_occurrence_fingerprints: BTreeMap<String, String>,
+    assigned_request_id_fingerprints: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeUsageFamilyPending {
+    census_window_end: String,
+    member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    member_occurrences: BTreeMap<String, BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>>,
+    invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClaudeTranscriptUsageOccurrenceWitness {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_5m_tokens: u64,
+    cache_creation_1h_tokens: u64,
+    reasoning_output_tokens: u64,
+    model: Option<String>,
+    speed_mode: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl From<&ClaudeTranscriptUsageOccurrence> for ClaudeTranscriptUsageOccurrenceWitness {
+    fn from(occurrence: &ClaudeTranscriptUsageOccurrence) -> Self {
+        Self {
+            input_tokens: occurrence.usage.input_tokens,
+            output_tokens: occurrence.usage.output_tokens,
+            cache_read_tokens: occurrence.usage.cache_read_tokens,
+            cache_creation_5m_tokens: occurrence.usage.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: occurrence.usage.cache_creation_1h_tokens,
+            reasoning_output_tokens: occurrence.usage.reasoning_output_tokens,
+            model: occurrence.model.clone(),
+            speed_mode: occurrence.selector.context.get("speed_mode").cloned(),
+            reasoning_effort: occurrence.reasoning_effort.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProvenClaudeUsageFamily {
+    witness: ClaudeUsageFamilyWitness,
+    rows_by_member: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+}
+
+#[derive(Debug, Clone)]
+struct ReducedClaudeUsageLedger {
+    evidence_fingerprint: String,
+    assigned_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
+    rows_by_member: BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1775,8 +1859,504 @@ pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
     index
         .claude_account_family_pending
         .keys()
+        .chain(index.claude_usage_family_pending.keys())
+        .chain(index.claude_usage_family_witnesses.keys())
         .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
+}
+
+/// Replace transcript-only Claude usage with the exact union of transcript
+/// responses and locally reported API-request occurrences, but only after a
+/// complete filesystem census and an exact enhanced-trace ownership join.
+///
+/// This mutates usage and cost fields only. Provider graph facts remain the
+/// transcript/filesystem truth and are never inferred from telemetry spans.
+pub fn apply_claude_reported_usage_with_index(
+    snapshots: &mut [SnapshotItem],
+    api_report: &crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+    trace_report: &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    index: &mut ScanIndex,
+    census_complete: bool,
+    census_window_end: &str,
+) {
+    accumulate_claude_usage_family_pending(
+        snapshots,
+        &mut index.claude_usage_family_pending,
+        census_window_end,
+    );
+
+    let complete_families = if census_complete {
+        complete_claude_usage_family_members(index)
+    } else {
+        BTreeMap::new()
+    };
+    let mut proven = BTreeMap::new();
+    if census_complete && api_report.health.is_complete() && trace_report.is_complete() {
+        for (root_session_id, members) in &complete_families {
+            let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
+                continue;
+            };
+            let mut pending = base_pending.clone();
+            for member in confirmed_empty_claude_family_members(index, root_session_id) {
+                pending
+                    .member_request_id_hashes
+                    .entry(member.clone())
+                    .or_default();
+                pending.member_occurrences.entry(member).or_default();
+            }
+            if pending.invalid
+                || pending.census_window_end != census_window_end
+                || pending
+                    .member_request_id_hashes
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != *members
+                || pending
+                    .member_occurrences
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    != *members
+            {
+                continue;
+            }
+            let Some(family) = prove_claude_usage_family(
+                root_session_id,
+                members,
+                &pending,
+                api_report.evidence.get(root_session_id),
+                trace_report.evidence.get(root_session_id),
+            ) else {
+                continue;
+            };
+            proven.insert(root_session_id.clone(), family);
+        }
+        index
+            .claude_usage_family_witnesses
+            .retain(|root_session_id, _| proven.contains_key(root_session_id));
+        for (root_session_id, family) in &proven {
+            index
+                .claude_usage_family_witnesses
+                .insert(root_session_id.clone(), family.witness.clone());
+        }
+    }
+
+    for item in snapshots.iter_mut() {
+        item.usage_accounting_contract = None;
+        let root_session_id = claude_snapshot_family_root(item);
+        let reconstructed = (api_report.health.is_complete() && trace_report.is_complete())
+            .then(|| index.claude_usage_family_witnesses.get(&root_session_id))
+            .flatten()
+            .and_then(|witness| {
+                reconstruct_claude_usage_family(
+                    &root_session_id,
+                    witness,
+                    api_report.evidence.get(&root_session_id),
+                    trace_report.evidence.get(&root_session_id),
+                )
+            });
+        let family = proven.get(&root_session_id).or(reconstructed.as_ref());
+        let Some(family) = family else { continue };
+        let Some(rows) = family.rows_by_member.get(&item.source_session_id) else {
+            continue;
+        };
+        let request_hashes = item
+            .claude_usage_request_ids
+            .iter()
+            .map(|request_id| format!("{:x}", Sha256::digest(request_id.as_bytes())))
+            .collect::<BTreeSet<_>>();
+        if family
+            .witness
+            .member_request_id_fingerprints
+            .get(&item.source_session_id)
+            != Some(&claude_request_id_set_fingerprint(&request_hashes))
+        {
+            continue;
+        }
+        let current_occurrences = item
+            .claude_usage_occurrences
+            .iter()
+            .map(|(request_id, occurrence)| {
+                (
+                    format!("{:x}", Sha256::digest(request_id.as_bytes())),
+                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if family
+            .witness
+            .member_occurrence_fingerprints
+            .get(&item.source_session_id)
+            != Some(&claude_occurrence_map_fingerprint(&current_occurrences))
+        {
+            continue;
+        }
+        if rebuild_claude_reported_usage(item, rows) {
+            item.usage_accounting_contract =
+                Some("session_exclusive_reported_usage:v1".to_string());
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        }
+    }
+
+    if census_complete {
+        let current_ids = snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for (index_key, entry) in &mut index.files {
+            let Some((root_session_id, source_session_id)) =
+                claude_index_path_family_member(Path::new(index_key))
+            else {
+                continue;
+            };
+            if proven.contains_key(&root_session_id)
+                && !current_ids.contains(source_session_id.as_str())
+            {
+                entry.source_file_fingerprint.clear();
+            }
+        }
+        index.claude_usage_family_pending.clear();
+    }
+}
+
+fn accumulate_claude_usage_family_pending(
+    snapshots: &[SnapshotItem],
+    pending_by_root: &mut BTreeMap<String, ClaudeUsageFamilyPending>,
+    census_window_end: &str,
+) {
+    for item in snapshots {
+        let root_session_id = claude_snapshot_family_root(item);
+        let pending =
+            pending_by_root
+                .entry(root_session_id)
+                .or_insert_with(|| ClaudeUsageFamilyPending {
+                    census_window_end: census_window_end.to_string(),
+                    member_request_id_hashes: BTreeMap::new(),
+                    member_occurrences: BTreeMap::new(),
+                    invalid: false,
+                });
+        if pending.census_window_end != census_window_end {
+            *pending = ClaudeUsageFamilyPending {
+                census_window_end: census_window_end.to_string(),
+                member_request_id_hashes: BTreeMap::new(),
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            };
+        }
+        let Some(hashes) = claude_snapshot_request_id_hashes(item)
+            .filter(|_| item.claude_usage_occurrences.len() == item.claude_usage_request_ids.len())
+        else {
+            pending.invalid = true;
+            continue;
+        };
+        if pending
+            .member_request_id_hashes
+            .insert(item.source_session_id.clone(), hashes.clone())
+            .is_some_and(|previous| previous != hashes)
+        {
+            pending.invalid = true;
+        }
+        let occurrences = item
+            .claude_usage_occurrences
+            .iter()
+            .map(|(request_id, occurrence)| {
+                (
+                    format!("{:x}", Sha256::digest(request_id.as_bytes())),
+                    ClaudeTranscriptUsageOccurrenceWitness::from(occurrence),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if occurrences.keys().cloned().collect::<BTreeSet<_>>() != hashes {
+            pending.invalid = true;
+            continue;
+        }
+        if pending
+            .member_occurrences
+            .insert(item.source_session_id.clone(), occurrences.clone())
+            .is_some_and(|previous| previous != occurrences)
+        {
+            pending.invalid = true;
+        }
+    }
+}
+
+fn complete_claude_usage_family_members(index: &ScanIndex) -> BTreeMap<String, BTreeSet<String>> {
+    let mut paths_by_family: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for index_key in index.files.keys() {
+        let Some((root_session_id, source_session_id)) =
+            claude_index_path_family_member(Path::new(index_key))
+        else {
+            continue;
+        };
+        *paths_by_family
+            .entry(root_session_id)
+            .or_default()
+            .entry(source_session_id)
+            .or_default() += 1;
+    }
+    paths_by_family
+        .into_iter()
+        .filter_map(|(root_session_id, members)| {
+            (members.values().all(|count| *count == 1) && members.contains_key(&root_session_id))
+                .then(|| (root_session_id, members.into_keys().collect()))
+        })
+        .collect()
+}
+
+fn confirmed_empty_claude_family_members(
+    index: &ScanIndex,
+    root_session_id: &str,
+) -> BTreeSet<String> {
+    index
+        .confirmed_empty_files
+        .iter()
+        .filter_map(|index_key| {
+            let (root, member) = claude_index_path_family_member(Path::new(index_key))?;
+            (root == root_session_id).then_some(member)
+        })
+        .collect()
+}
+
+fn claude_snapshot_family_root(item: &SnapshotItem) -> String {
+    item.attribution_facts
+        .iter()
+        .find(|fact| fact.field == "root_session_ref")
+        .map(|fact| fact.value.clone())
+        .or_else(|| {
+            item.source_session_id
+                .split_once("_agent-")
+                .map(|(root, _)| root.to_string())
+        })
+        .unwrap_or_else(|| item.source_session_id.clone())
+}
+
+fn prove_claude_usage_family(
+    root_session_id: &str,
+    members: &BTreeSet<String>,
+    pending: &ClaudeUsageFamilyPending,
+    api_rows: Option<&Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+    trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+) -> Option<ProvenClaudeUsageFamily> {
+    let reduced = reduce_claude_usage_ledger(root_session_id, members, api_rows?, trace_rows?)?;
+    let mut member_request_id_fingerprints = BTreeMap::new();
+    let mut member_occurrence_fingerprints = BTreeMap::new();
+    for member in members {
+        let transcript_hashes = pending
+            .member_request_id_hashes
+            .get(member)
+            .cloned()
+            .unwrap_or_default();
+        let assigned_hashes = reduced.assigned_request_id_hashes.get(member)?;
+        if !transcript_hashes.is_subset(assigned_hashes)
+            || (transcript_hashes.is_empty() && !assigned_hashes.is_empty())
+        {
+            // A usage-bearing owner without a snapshot cannot carry its union
+            // upstream; fail closed instead of silently dropping its aux calls.
+            return None;
+        }
+        let transcript_occurrences = pending.member_occurrences.get(member)?;
+        if transcript_occurrences
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != transcript_hashes
+        {
+            return None;
+        }
+        let rows_by_hash = reduced
+            .rows_by_member
+            .get(member)?
+            .iter()
+            .map(|row| {
+                (
+                    format!("{:x}", Sha256::digest(row.request_id.as_bytes())),
+                    row,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if transcript_occurrences
+            .iter()
+            .any(|(request_hash, occurrence)| {
+                rows_by_hash.get(request_hash).map_or(true, |row| {
+                    !claude_api_matches_transcript_occurrence(row, occurrence)
+                })
+            })
+        {
+            return None;
+        }
+        member_request_id_fingerprints.insert(
+            member.clone(),
+            claude_request_id_set_fingerprint(&transcript_hashes),
+        );
+        member_occurrence_fingerprints.insert(
+            member.clone(),
+            claude_occurrence_map_fingerprint(transcript_occurrences),
+        );
+    }
+    let assigned_request_id_fingerprints = reduced
+        .assigned_request_id_hashes
+        .iter()
+        .map(|(member, hashes)| (member.clone(), claude_request_id_set_fingerprint(hashes)))
+        .collect();
+    Some(ProvenClaudeUsageFamily {
+        witness: ClaudeUsageFamilyWitness {
+            evidence_fingerprint: reduced.evidence_fingerprint,
+            member_request_id_fingerprints,
+            member_occurrence_fingerprints,
+            assigned_request_id_fingerprints,
+        },
+        rows_by_member: reduced.rows_by_member,
+    })
+}
+
+fn reconstruct_claude_usage_family(
+    root_session_id: &str,
+    witness: &ClaudeUsageFamilyWitness,
+    api_rows: Option<&Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
+    trace_rows: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+) -> Option<ProvenClaudeUsageFamily> {
+    let members = witness
+        .member_request_id_fingerprints
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let reduced = reduce_claude_usage_ledger(root_session_id, &members, api_rows?, trace_rows?)?;
+    let assigned_request_id_fingerprints = reduced
+        .assigned_request_id_hashes
+        .iter()
+        .map(|(member, hashes)| (member.clone(), claude_request_id_set_fingerprint(hashes)))
+        .collect::<BTreeMap<_, _>>();
+    if reduced.evidence_fingerprint != witness.evidence_fingerprint
+        || assigned_request_id_fingerprints != witness.assigned_request_id_fingerprints
+    {
+        return None;
+    }
+    Some(ProvenClaudeUsageFamily {
+        witness: witness.clone(),
+        rows_by_member: reduced.rows_by_member,
+    })
+}
+
+fn reduce_claude_usage_ledger(
+    root_session_id: &str,
+    members: &BTreeSet<String>,
+    api_rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+    trace_rows: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence],
+) -> Option<ReducedClaudeUsageLedger> {
+    if !members.contains(root_session_id) || api_rows.is_empty() || trace_rows.is_empty() {
+        return None;
+    }
+    let mut api_by_request = BTreeMap::new();
+    for row in api_rows {
+        if row.capture_revision != "claude_api_request:v2"
+            || row.session_id != root_session_id
+            || row.request_id.is_empty()
+            || row.client_request_id.is_empty()
+            || row.model.is_empty()
+            || row.request_count != 1
+            || row.event_sequence.is_none()
+            || row.app_version.is_empty()
+            || row.cost_usd_micros.is_none()
+            || !claude_api_evidence_fingerprint_is_valid(row)
+            || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
+            || api_by_request.insert(row.request_id.clone(), row).is_some()
+        {
+            return None;
+        }
+    }
+    let mut trace_by_request = BTreeMap::new();
+    for row in trace_rows {
+        if row.capture_revision != "claude_llm_request_ownership:v1"
+            || row.session_id != root_session_id
+            || row.request_id.is_empty()
+            || row.client_request_id.is_empty()
+            || !claude_trace_evidence_fingerprint_is_valid(row)
+            || OffsetDateTime::parse(&row.observed_at, &Rfc3339).is_err()
+            || trace_by_request
+                .insert(row.request_id.clone(), row)
+                .is_some()
+        {
+            return None;
+        }
+    }
+    if api_by_request.keys().collect::<Vec<_>>() != trace_by_request.keys().collect::<Vec<_>>() {
+        return None;
+    }
+
+    let mut assigned_hashes = members
+        .iter()
+        .map(|member| (member.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows_by_member = members
+        .iter()
+        .map(|member| (member.clone(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut digest = Sha256::new();
+    digest.update(b"claude_reported_usage_ledger:v1\0");
+    for (request_id, api_row) in api_by_request {
+        let trace_row = trace_by_request.get(&request_id)?;
+        if api_row.client_request_id != trace_row.client_request_id {
+            return None;
+        }
+        let owner = claude_trace_owner_session_id(root_session_id, &trace_row.agent_id);
+        if !members.contains(&owner) {
+            return None;
+        }
+        let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+        assigned_hashes
+            .get_mut(&owner)?
+            .insert(request_hash.clone());
+        rows_by_member.get_mut(&owner)?.push(api_row.clone());
+        digest.update(request_hash.as_bytes());
+        digest.update(b"\0");
+        digest.update(owner.as_bytes());
+        digest.update(b"\0");
+        digest.update(api_row.fingerprint.as_bytes());
+        digest.update(b"\0");
+        digest.update(trace_row.fingerprint.as_bytes());
+        digest.update(b"\0");
+    }
+    Some(ReducedClaudeUsageLedger {
+        evidence_fingerprint: format!("{:x}", digest.finalize()),
+        assigned_request_id_hashes: assigned_hashes,
+        rows_by_member,
+    })
+}
+
+fn claude_trace_owner_session_id(root_session_id: &str, agent_id: &str) -> String {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return root_session_id.to_string();
+    }
+    let agent_id = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    format!("{root_session_id}_agent-{agent_id}")
+}
+
+fn claude_api_evidence_fingerprint_is_valid(
+    row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
+) -> bool {
+    let mut canonical = row.clone();
+    canonical.fingerprint.clear();
+    serde_json::to_vec(&canonical)
+        .ok()
+        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+        .as_deref()
+        == Some(row.fingerprint.as_str())
+}
+
+fn claude_trace_evidence_fingerprint_is_valid(
+    row: &crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
+) -> bool {
+    let mut canonical = row.clone();
+    canonical.fingerprint.clear();
+    serde_json::to_vec(&canonical)
+        .ok()
+        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+        .as_deref()
+        == Some(row.fingerprint.as_str())
 }
 
 fn accumulate_claude_family_pending(
@@ -1872,6 +2452,56 @@ fn claude_request_id_set_fingerprint(request_id_hashes: &BTreeSet<String>) -> St
         digest.update(b"\0");
     }
     format!("{:x}", digest.finalize())
+}
+
+fn claude_occurrence_map_fingerprint(
+    occurrences: &BTreeMap<String, ClaudeTranscriptUsageOccurrenceWitness>,
+) -> String {
+    let payload = serde_json::to_vec(occurrences).unwrap_or_default();
+    let mut digest = Sha256::new();
+    digest.update(b"claude_transcript_occurrence_map:v1\0");
+    digest.update(payload);
+    format!("{:x}", digest.finalize())
+}
+
+fn claude_api_matches_transcript_occurrence(
+    row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
+    occurrence: &ClaudeTranscriptUsageOccurrenceWitness,
+) -> bool {
+    let api_cache_creation = row
+        .cache_creation_tokens
+        .checked_add(row.cache_creation_5m_tokens)
+        .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
+    let transcript_cache_creation = occurrence
+        .cache_creation_5m_tokens
+        .checked_add(occurrence.cache_creation_1h_tokens);
+    let reported_speed = (!row.speed.trim().is_empty())
+        .then(|| normalize_selector_raw("speed_mode", &Value::String(row.speed.clone())))
+        .flatten();
+    let speed_matches = occurrence
+        .speed_mode
+        .as_deref()
+        .zip(reported_speed.as_deref())
+        .map_or(true, |(transcript, reported)| transcript == reported);
+    let reported_effort = CLAUDE_EFFORT_TIERS
+        .contains(&row.effort.as_str())
+        .then_some(row.effort.as_str());
+    let effort_matches = occurrence
+        .reasoning_effort
+        .as_deref()
+        .zip(reported_effort)
+        .map_or(true, |(transcript, reported)| transcript == reported);
+    row.input_tokens == occurrence.input_tokens
+        && row.output_tokens == occurrence.output_tokens
+        && row.cache_read_tokens == occurrence.cache_read_tokens
+        && row.reasoning_output_tokens == occurrence.reasoning_output_tokens
+        && api_cache_creation == transcript_cache_creation
+        && occurrence
+            .model
+            .as_deref()
+            .map_or(true, |model| model == row.model)
+        && speed_matches
+        && effort_matches
 }
 
 fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPending) -> bool {
@@ -2285,6 +2915,223 @@ fn rebuild_snapshot_model_usage(item: &mut SnapshotItem) {
     for row in &mut item.model_usage {
         row.account_identifier_hash = account_identifier_hash.clone();
     }
+}
+
+fn rebuild_claude_reported_usage(
+    item: &mut SnapshotItem,
+    rows: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+) -> bool {
+    if rows.is_empty()
+        || item.claude_usage_occurrences.len() != item.claude_usage_request_ids.len()
+        || !item
+            .claude_usage_request_ids
+            .iter()
+            .all(|request_id| rows.iter().any(|row| &row.request_id == request_id))
+    {
+        return false;
+    }
+    let account_hashes = rows
+        .iter()
+        .filter_map(|row| row.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    let account_identifier_hash = (rows.iter().all(|row| row.account_identity_checked)
+        && account_hashes.len() == 1)
+        .then(|| account_hashes.first().map(|value| (*value).to_string()))
+        .flatten();
+    let mut totals = UsageTotals::default();
+    let mut buckets: BTreeMap<String, UsageBucketState> = BTreeMap::new();
+    let mut total_cost_picos = 0_u128;
+
+    for row in rows {
+        let cost_picos = match row
+            .cost_usd_micros
+            .map(u128::from)
+            .and_then(|value| value.checked_mul(1_000_000))
+        {
+            Some(value) => value,
+            None => return false,
+        };
+        total_cost_picos = match total_cost_picos.checked_add(cost_picos) {
+            Some(value) => value,
+            None => return false,
+        };
+        let occurrence = item.claude_usage_occurrences.get(&row.request_id);
+        let mut selector = occurrence
+            .map(|occurrence| occurrence.selector.clone())
+            .unwrap_or_default();
+        if !row.speed.trim().is_empty() {
+            let normalized_speed =
+                normalize_selector_raw("speed_mode", &Value::String(row.speed.clone()));
+            if normalized_speed.as_ref().is_some_and(|speed| {
+                selector
+                    .context
+                    .get("speed_mode")
+                    .is_some_and(|existing| existing != speed)
+            }) {
+                return false;
+            }
+            insert_selector_raw(
+                &mut selector,
+                "speed_mode",
+                "claude_code.api_request.speed",
+                &Value::String(row.speed.clone()),
+            );
+        }
+        let reported_effort = CLAUDE_EFFORT_TIERS
+            .contains(&row.effort.as_str())
+            .then(|| row.effort.clone());
+        if occurrence
+            .and_then(|occurrence| occurrence.reasoning_effort.as_deref())
+            .zip(reported_effort.as_deref())
+            .is_some_and(|(transcript, reported)| transcript != reported)
+        {
+            return false;
+        }
+        let effort = occurrence
+            .and_then(|occurrence| occurrence.reasoning_effort.clone())
+            .or(reported_effort);
+        let (mut usage, model, timestamp) = if let Some(occurrence) = occurrence {
+            let api_cache_creation = row
+                .cache_creation_tokens
+                .checked_add(row.cache_creation_5m_tokens)
+                .and_then(|value| value.checked_add(row.cache_creation_1h_tokens));
+            let transcript_cache_creation = occurrence
+                .usage
+                .cache_creation_5m_tokens
+                .checked_add(occurrence.usage.cache_creation_1h_tokens);
+            if row.input_tokens != occurrence.usage.input_tokens
+                || row.output_tokens != occurrence.usage.output_tokens
+                || row.cache_read_tokens != occurrence.usage.cache_read_tokens
+                || Some(occurrence.usage.reasoning_output_tokens)
+                    != Some(row.reasoning_output_tokens)
+                || api_cache_creation != transcript_cache_creation
+                || occurrence
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model != row.model)
+            {
+                return false;
+            }
+            (
+                occurrence.usage.clone(),
+                occurrence
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| row.model.clone()),
+                occurrence
+                    .timestamp
+                    .clone()
+                    .unwrap_or_else(|| row.observed_at.clone()),
+            )
+        } else {
+            (
+                UsageTotals {
+                    input_tokens: row.input_tokens,
+                    output_tokens: row.output_tokens,
+                    cache_read_tokens: row.cache_read_tokens,
+                    cache_creation_5m_tokens: row.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: row.cache_creation_1h_tokens,
+                    reasoning_output_tokens: row.reasoning_output_tokens,
+                    // api_request exposes aggregate cache creation only. It is
+                    // exact usage, but not an honest TTL split.
+                    unattributed_total_tokens: row.cache_creation_tokens,
+                    request_count: 1,
+                    costs: UsageCosts::default(),
+                },
+                row.model.clone(),
+                row.observed_at.clone(),
+            )
+        };
+        usage.request_count = 1;
+        usage.costs = UsageCosts {
+            observed: true,
+            reported: true,
+            total: Some(cost_picos),
+            input: None,
+            output: None,
+            cache_read: None,
+            cache_creation: None,
+        };
+        if !totals.add(&usage) {
+            return false;
+        }
+        let Some((bucket_start, normalized_timestamp)) = activity_bucket_from_timestamp(&timestamp)
+        else {
+            return false;
+        };
+        let (row_key, selector_context, selector_sources) =
+            build_row_identity(&model, &selector, effort.as_deref());
+        let bucket = buckets.entry(bucket_start).or_default();
+        bucket.note_activity_at(&normalized_timestamp);
+        match bucket.rows.get_mut(&row_key) {
+            Some(existing) => {
+                for (field, source) in selector_sources {
+                    existing.selector_sources.insert(field, source);
+                }
+                if !existing.usage.add(&usage) {
+                    return false;
+                }
+            }
+            None => {
+                bucket.rows.insert(
+                    row_key,
+                    BucketRowAccumulator {
+                        selector_context,
+                        selector_sources,
+                        usage,
+                        reasoning_effort: effort,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut session_rows = BTreeMap::new();
+    let mut usage_buckets = Vec::new();
+    for (bucket_start, bucket) in buckets {
+        let mut model_usage = Vec::new();
+        for (row_key, row) in bucket.rows {
+            let mut wire_row = model_usage_from_row(&row_key, &row);
+            wire_row.account_identifier_hash = account_identifier_hash.clone();
+            model_usage.push(wire_row);
+            merge_session_row(&mut session_rows, row_key, row);
+        }
+        usage_buckets.push(SnapshotUsageBucket {
+            bucket_start,
+            model_usage,
+            first_activity_at: bucket.first_activity_at,
+            last_activity_at: bucket.last_activity_at,
+        });
+    }
+    if session_rows.is_empty() {
+        return false;
+    }
+    let mut model_usage = session_rows
+        .iter()
+        .map(|(row_key, row)| model_usage_from_row(row_key, row))
+        .collect::<Vec<_>>();
+    for row in &mut model_usage {
+        row.account_identifier_hash = account_identifier_hash.clone();
+    }
+    item.input_tokens = totals.input_tokens;
+    item.output_tokens = totals.output_tokens;
+    item.cache_read_tokens = totals.cache_read_tokens;
+    item.cache_creation_5m_tokens = totals.cache_creation_5m_tokens;
+    item.cache_creation_1h_tokens = totals.cache_creation_1h_tokens;
+    item.reasoning_output_tokens = totals.reasoning_output_tokens;
+    item.unattributed_total_tokens = totals.unattributed_total_tokens;
+    item.request_count = totals.request_count;
+    item.model_usage = model_usage;
+    item.usage_buckets = usage_buckets;
+    item.cost = Some(SnapshotCost {
+        total_cost_usd: Some(usd_picos_string(total_cost_picos)),
+        input_cost_usd: None,
+        output_cost_usd: None,
+        cache_read_cost_usd: None,
+        cache_creation_cost_usd: None,
+        evidence_source: "claude_code_api_request".to_string(),
+    });
+    true
 }
 
 fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
@@ -3111,6 +3958,124 @@ impl SelectorCapture {
     }
 }
 
+/// One Claude provider response assembled from its content-block transcript
+/// records. Usage is withheld from the session projection until this response
+/// is complete and internally consistent.
+#[derive(Debug, Clone)]
+struct ClaudeResponseObservation {
+    sequence: u64,
+    usage: UsageTotals,
+    model: Option<String>,
+    selector: SelectorCapture,
+    reasoning_effort: Option<String>,
+    request_id: Option<String>,
+    first_timestamp: Option<String>,
+    terminal_timestamp: Option<String>,
+    preceding_user_timestamp: Option<String>,
+    conflict: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeTranscriptUsageOccurrence {
+    usage: UsageTotals,
+    model: Option<String>,
+    selector: SelectorCapture,
+    reasoning_effort: Option<String>,
+    timestamp: Option<String>,
+}
+
+impl ClaudeResponseObservation {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        sequence: u64,
+        usage: UsageTotals,
+        model: Option<String>,
+        selector: SelectorCapture,
+        reasoning_effort: Option<String>,
+        request_id: Option<String>,
+        timestamp: Option<String>,
+        preceding_user_timestamp: Option<String>,
+    ) -> Self {
+        Self {
+            sequence,
+            usage,
+            model,
+            selector,
+            reasoning_effort,
+            request_id,
+            first_timestamp: timestamp.clone(),
+            terminal_timestamp: timestamp,
+            preceding_user_timestamp,
+            conflict: false,
+        }
+    }
+
+    fn merge(
+        &mut self,
+        usage: UsageTotals,
+        model: Option<String>,
+        selector: SelectorCapture,
+        reasoning_effort: Option<String>,
+        request_id: Option<String>,
+        timestamp: Option<String>,
+    ) {
+        if !claude_usage_is_progressive_after(&usage, &self.usage)
+            || !merge_optional_claude_field(&mut self.model, model)
+            || !merge_optional_claude_field(&mut self.reasoning_effort, reasoning_effort)
+            || !merge_optional_claude_field(&mut self.request_id, request_id)
+            || !merge_claude_response_selector(&mut self.selector, selector)
+        {
+            self.conflict = true;
+            return;
+        }
+        // The provider's terminal cumulative output is authoritative. Equal
+        // repeats remain harmless; a regression was rejected above.
+        self.usage = usage;
+        if timestamp.is_some() {
+            self.terminal_timestamp = timestamp;
+        }
+    }
+}
+
+fn merge_optional_claude_field(current: &mut Option<String>, next: Option<String>) -> bool {
+    match (current.as_ref(), next) {
+        (Some(current), Some(next)) if current != &next => false,
+        (None, Some(next)) => {
+            *current = Some(next);
+            true
+        }
+        _ => true,
+    }
+}
+
+fn merge_claude_response_selector(current: &mut SelectorCapture, next: SelectorCapture) -> bool {
+    for (field, value) in &next.context {
+        if current
+            .context
+            .get(field)
+            .is_some_and(|existing| existing != value)
+        {
+            return false;
+        }
+    }
+    current.merge(next);
+    true
+}
+
+/// Claude content-block records repeat input/cache metadata while cumulative
+/// output grows. Everything except output is invariant for one response.
+fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTotals) -> bool {
+    current.input_tokens == previous.input_tokens
+        && current.output_tokens >= previous.output_tokens
+        && current.cache_read_tokens == previous.cache_read_tokens
+        && current.cache_creation_5m_tokens == previous.cache_creation_5m_tokens
+        && current.cache_creation_1h_tokens == previous.cache_creation_1h_tokens
+        && current.reasoning_output_tokens == previous.reasoning_output_tokens
+        && current.unattributed_total_tokens == previous.unattributed_total_tokens
+        && current.request_count == previous.request_count
+        && current.costs == previous.costs
+}
+
 #[derive(Debug, Clone, Default)]
 struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
@@ -3906,18 +4871,19 @@ struct SnapshotAccumulator {
     // Max (slowest single turn) alongside the avg — the tail the average hides.
     latency_duration_ms_max: u64,
     latency_ttft_ms_max: u64,
-    // Claude Code writes one JSONL record per assistant CONTENT BLOCK, and
-    // every record of the same API response repeats the same `message.id` +
-    // `requestId` with byte-identical `message.usage`. Counting each record
-    // overstates tokens and request_count ~3-6x. This set remembers which
-    // API responses already contributed usage so each response counts once.
-    // The accumulator is rebuilt per full-file scan (`parse_jsonl_file`), so
-    // the set's lifetime matches one scan of one session file exactly.
-    seen_claude_usage_keys: BTreeSet<String>,
+    // Claude Code persists one assistant record per content block. Sidechain
+    // writers update output_tokens progressively across those records, so a
+    // response must be resolved in full before any tokens, selectors, latency,
+    // posture, or request count enter the session projection. The map is local
+    // to one complete transcript parse; its key format also provides the seam
+    // for a future scan-level legacy-fork ownership ledger.
+    claude_responses: BTreeMap<String, ClaudeResponseObservation>,
+    claude_response_sequence: u64,
     // Exact provider response ids for the once-per-response Claude usage rows
     // above. Local-only; copied into SnapshotItem solely for account-evidence
     // coverage and never serialized.
     claude_usage_request_ids: BTreeSet<String>,
+    claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
     // Current Pi transcripts carry usage on `type=message` assistant records;
     // older exporters used `type=message_end`. When both representations are
     // present, their response id is the exact occurrence key that prevents a
@@ -4023,8 +4989,10 @@ impl SnapshotAccumulator {
             latency_ttft_ms_count: 0,
             latency_duration_ms_max: 0,
             latency_ttft_ms_max: 0,
-            seen_claude_usage_keys: BTreeSet::new(),
+            claude_responses: BTreeMap::new(),
+            claude_response_sequence: 0,
             claude_usage_request_ids: BTreeSet::new(),
+            claude_usage_occurrences: BTreeMap::new(),
             seen_pi_usage_keys: BTreeMap::new(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
@@ -4456,20 +5424,117 @@ impl SnapshotAccumulator {
         }
     }
 
-    /// Fold one Claude Code turn's wall-clock duration into the session latency
-    /// accumulators: the gap from the most recent `type=user` record (real
-    /// prompt or tool_result) to this API response's first content-block record.
-    /// Called once per API response (gated by the same usage dedup as token
-    /// counting), so each turn contributes exactly one duration sample — the
-    /// Claude Code analogue of the Codex `task_complete` latency path. Only whole
-    /// turn duration is derivable from Claude transcripts (no first-token
-    /// marker), so this never touches the TTFT accumulators. Records with no
-    /// preceding user timestamp, unparseable timestamps, or a negative delta
-    /// (out-of-order/clock skew) contribute nothing.
-    fn note_claude_turn_duration(&mut self, assistant_ts: Option<&str>) {
-        let (Some(user_ts), Some(assistant_ts)) =
-            (self.claude_last_user_ts.as_deref(), assistant_ts)
-        else {
+    /// Retain one Claude usage-bearing record for response-level resolution.
+    /// No session-exclusive metric is mutated here; `finalize_claude_responses`
+    /// admits exactly one terminal observation after the full file is read.
+    #[allow(clippy::too_many_arguments)]
+    fn observe_claude_response(
+        &mut self,
+        value: &Value,
+        usage: UsageTotals,
+        model: Option<String>,
+        selector: SelectorCapture,
+        timestamp: Option<String>,
+        reasoning_effort: Option<String>,
+    ) {
+        let request_id =
+            string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
+        let key = match claude_code_usage_dedup_key(value) {
+            Some(key) => key,
+            None => {
+                // Preserve the historical, conservative one-line/one-response
+                // fallback. Claude accounting proof remains absent for every
+                // snapshot until api_request logs and trace ownership are
+                // reconciled, regardless of transcript identity quality.
+                format!("u\u{1f}{}", self.claude_response_sequence)
+            }
+        };
+        if let Some(existing) = self.claude_responses.get_mut(&key) {
+            existing.merge(
+                usage,
+                model,
+                selector,
+                reasoning_effort,
+                request_id,
+                timestamp,
+            );
+            return;
+        }
+        let sequence = self.claude_response_sequence;
+        self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
+        self.claude_responses.insert(
+            key,
+            ClaudeResponseObservation::new(
+                sequence,
+                usage,
+                model,
+                selector,
+                reasoning_effort,
+                request_id,
+                timestamp,
+                self.claude_last_user_ts.clone(),
+            ),
+        );
+    }
+
+    /// Resolve every Claude response in transcript order, then admit its final
+    /// cumulative usage exactly once. Conflicting provider records are dropped
+    /// and make the enclosing file retryable through the existing diagnostics.
+    fn finalize_claude_responses(&mut self) {
+        let mut responses = std::mem::take(&mut self.claude_responses)
+            .into_values()
+            .collect::<Vec<_>>();
+        responses.sort_by_key(|response| response.sequence);
+        for mut response in responses {
+            if response.conflict {
+                self.note_dropped_usage();
+                continue;
+            }
+            if let Some(request_id) = response.request_id.take() {
+                self.claude_usage_request_ids.insert(request_id.clone());
+                self.claude_usage_occurrences.insert(
+                    request_id,
+                    ClaudeTranscriptUsageOccurrence {
+                        usage: response.usage.clone(),
+                        model: response.model.clone(),
+                        selector: response.selector.clone(),
+                        reasoning_effort: response.reasoning_effort.clone(),
+                        timestamp: response.terminal_timestamp.clone(),
+                    },
+                );
+            }
+            self.note_claude_turn_duration_between(
+                response.preceding_user_timestamp.as_deref(),
+                response.first_timestamp.as_deref(),
+            );
+            let effective_input_context = response.usage.effective_input_context();
+            if effective_input_context > 0 {
+                if self.first_turn_context_tokens.is_none() {
+                    self.first_turn_context_tokens = Some(effective_input_context);
+                }
+                self.peak_context_fill_tokens =
+                    self.peak_context_fill_tokens.max(effective_input_context);
+            }
+            self.add_usage_with_selector(
+                response.model,
+                response.usage,
+                response.selector,
+                response.terminal_timestamp.as_deref(),
+                response.reasoning_effort,
+            );
+        }
+    }
+
+    /// Fold one resolved Claude response's wall-clock duration into the session
+    /// latency accumulators. The preceding user timestamp is captured when the
+    /// response's first content block arrives, before later transcript records
+    /// can advance the streaming user cursor.
+    fn note_claude_turn_duration_between(
+        &mut self,
+        user_ts: Option<&str>,
+        assistant_ts: Option<&str>,
+    ) {
+        let (Some(user_ts), Some(assistant_ts)) = (user_ts, assistant_ts) else {
             return;
         };
         let (Ok(user), Ok(assistant)) = (
@@ -5027,6 +6092,7 @@ impl SnapshotAccumulator {
             usage_accounting_contract: codex_usage_accounting_proven
                 .then(|| "session_exclusive_reported_usage:v1".to_string()),
             claude_usage_request_ids: self.claude_usage_request_ids,
+            claude_usage_occurrences: self.claude_usage_occurrences,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
             avg_time_to_first_token_ms: (self.latency_ttft_ms_count > 0)
@@ -5808,10 +6874,7 @@ fn scan_source_roots_with_limit_and_attribution(
                                 claude_title_metadata.session_sidecar_fingerprint(session_id);
                             let effort_fingerprint = claude_effort_support_dir
                                 .map(|support_dir| {
-                                    crate::claude_local_otel::claude_effort_sidecar_fingerprint(
-                                        support_dir,
-                                        session_id,
-                                    )
+                                    claude_usage_sidecars_fingerprint(support_dir, session_id)
                                 })
                                 .unwrap_or_default();
                             if effort_fingerprint.is_empty() {
@@ -6400,6 +7463,7 @@ fn codex_state_only_snapshot(
         request_count: 0,
         usage_accounting_contract: None,
         claude_usage_request_ids: BTreeSet::new(),
+        claude_usage_occurrences: BTreeMap::new(),
         avg_duration_ms: None,
         avg_time_to_first_token_ms: None,
         max_duration_ms: None,
@@ -6749,13 +7813,17 @@ fn parse_opened_jsonl_file(
     let mut positive_recognized_usage_count: usize = 0;
     let mut positive_usage_evidence = false;
     let report = read_bounded_jsonl_lines(&mut reader, MAX_JSONL_LINE_BYTES, |value| {
-        if recognized_usage_shape_was_dropped(source, value) {
+        let inherited_claude_line = source == SnapshotSource::ClaudeCode
+            && claude_fork_line_provenance(value) == ClaudeForkLineProvenance::Inherited;
+        if !inherited_claude_line && recognized_usage_shape_was_dropped(source, value) {
             recognized_usage_drop_count += 1;
         }
-        if recognized_positive_usage_shape(source, value) {
+        if !inherited_claude_line && recognized_positive_usage_shape(source, value) {
             positive_recognized_usage_count += 1;
         }
-        positive_usage_evidence |= json_has_positive_usage_evidence(value);
+        if !inherited_claude_line {
+            positive_usage_evidence |= json_has_positive_usage_evidence(value);
+        }
         apply_line(value, &mut accumulator);
     })
     .with_context(|| format!("read JSONL {}", path.display()))?;
@@ -6773,6 +7841,7 @@ fn parse_opened_jsonl_file(
         accumulator.apply_first_prompt_fallback();
     }
     if source == SnapshotSource::ClaudeCode {
+        accumulator.finalize_claude_responses();
         if let Some(metadata) = claude_title_metadata {
             accumulator.apply_claude_title_metadata(path, metadata);
         }
@@ -8261,11 +9330,62 @@ fn claude_prompt_is_harness_wrapper(text: &str) -> bool {
         || trimmed.starts_with("Caveat: the messages below were generated")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeForkLineProvenance {
+    None,
+    Inherited,
+    Invalid,
+}
+
+/// Classify Claude's provider-authored branch provenance. Current branch,
+/// `--fork-session`, SDK fork, and rewind writers stamp every copied record
+/// with both the direct source session and original message UUID. A malformed
+/// marker is not safe to count or skip, so it quarantines the file instead.
+fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
+    let Some(forked_from) = value.get("forkedFrom") else {
+        return ClaudeForkLineProvenance::None;
+    };
+    let Some(forked_from) = forked_from.as_object() else {
+        return ClaudeForkLineProvenance::Invalid;
+    };
+    let session_id = forked_from
+        .get("sessionId")
+        .or_else(|| forked_from.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let message_uuid = forked_from
+        .get("messageUuid")
+        .or_else(|| forked_from.get("message_uuid"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if session_id.is_some() && message_uuid.is_some() {
+        ClaudeForkLineProvenance::Inherited
+    } else {
+        ClaudeForkLineProvenance::Invalid
+    }
+}
+
 fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["sessionId"])
             .or_else(|| string_at(value, &["session_id"]))
             .or_else(|| string_at(value, &["conversation_id"]));
+    }
+    match claude_fork_line_provenance(value) {
+        ClaudeForkLineProvenance::Inherited => {
+            // The copied record belongs to the source session. Returning here
+            // excludes its usage, lifecycle, activity, title, model, context,
+            // compaction, and artifacts from the child while leaving graph
+            // attribution untouched (that is path/sidecar-derived later).
+            return;
+        }
+        ClaudeForkLineProvenance::Invalid => {
+            accumulator.note_dropped_usage();
+            return;
+        }
+        ClaudeForkLineProvenance::None => {}
     }
     // Raw session-origin from the Claude JSONL header/lines. entrypoint +
     // sessionKind are first-seen; isSidechain is per-line so any true marks the
@@ -8341,49 +9461,11 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .or_else(|| string_at(value, &["projectPath"]))
             .or_else(|| string_at(value, &["workspace"])),
     );
-    // One API response can span several JSONL records (one per assistant
-    // content block), each repeating the same `message.id` + `requestId` with
-    // identical usage. Count usage once per response; duplicate records still
-    // contribute every NON-usage signal above (timestamps, model, title,
-    // sidechain, workspace) and the artifact scrape below.
-    let usage = claude_code_delta_usage(value);
-    let usage_first_seen = match (usage.is_some(), claude_code_usage_dedup_key(value)) {
-        // Only usage-bearing lines consume the key: a keyed line without
-        // usage must not shadow the later record that carries the tokens.
-        (true, Some(key)) => accumulator.seen_claude_usage_keys.insert(key),
-        // No message.id and no requestId: nothing to dedup on, count the line.
-        _ => true,
-    };
-    if let Some(usage) = usage.filter(|_| usage_first_seen) {
-        if let Some(request_id) =
-            string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]))
-        {
-            accumulator
-                .claude_usage_request_ids
-                .insert(request_id.to_string());
-        }
-        // First content-block record of this API response: derive the turn's
-        // wall-clock duration (this record's timestamp minus the preceding user
-        // record) once, aligned with the once-per-response usage count above.
-        // Later duplicate content-block records of the same response are gated
-        // out here too, so each turn contributes exactly one latency sample.
-        accumulator.note_claude_turn_duration(timestamp.as_deref());
-        // Context posture watermarks from this counted response's effective
-        // input context (the prompt volume the model actually saw). The first
-        // counted response with any context becomes the first-turn baseline
-        // (including first user input); the running max is the session's peak.
-        // Gated by the
-        // same once-per-response dedup as the usage count above, so repeated
-        // content-block records of one API response contribute one sample.
+    // Defer the whole response. Sidechain content-block rows progressively
+    // increase cumulative output and may add selectors late; neither the first
+    // nor an arbitrary line is an authoritative complete response.
+    if let Some(usage) = claude_code_delta_usage(value) {
         let effective_input_context = usage.effective_input_context();
-        if effective_input_context > 0 {
-            if accumulator.first_turn_context_tokens.is_none() {
-                accumulator.first_turn_context_tokens = Some(effective_input_context);
-            }
-            accumulator.peak_context_fill_tokens = accumulator
-                .peak_context_fill_tokens
-                .max(effective_input_context);
-        }
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -8424,13 +9506,14 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         // A record without the field stays effort-unknown, which is the honest
         // answer: the local OTLP sidecar no longer carries effort at all.
         let reasoning_effort = claude_transcript_effort(value);
-        accumulator.add_usage_with_selector(
+        accumulator.observe_claude_response(
+            value,
+            usage,
             string_at(value, &["message", "model"])
                 .or_else(|| string_at(value, &["model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
-            usage,
             selector,
-            timestamp.as_deref(),
+            timestamp,
             reasoning_effort,
         );
     }
@@ -11831,6 +12914,8 @@ impl ScanIndex {
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
             claude_account_family_witnesses: self.claude_account_family_witnesses.clone(),
             claude_account_family_pending: self.claude_account_family_pending.clone(),
+            claude_usage_family_witnesses: self.claude_usage_family_witnesses.clone(),
+            claude_usage_family_pending: self.claude_usage_family_pending.clone(),
             claude_desktop_store_cursor: self.claude_desktop_store_cursor.clone(),
             claude_desktop_store_upper_bound: self.claude_desktop_store_upper_bound.clone(),
             claude_desktop_store_sweep_had_errors: self.claude_desktop_store_sweep_had_errors,
@@ -12715,10 +13800,7 @@ fn claude_subagent_sidecar_fingerprint(
     // indexed before the final provider event arrived.
     let effort_fingerprint = claude_effort_support_dir
         .map(|support_dir| {
-            crate::claude_local_otel::claude_effort_sidecar_fingerprint(
-                support_dir,
-                &identity.root_session_id,
-            )
+            claude_usage_sidecars_fingerprint(support_dir, &identity.root_session_id)
         })
         .unwrap_or_default();
     sha256_hex(&[
@@ -12727,6 +13809,19 @@ fn claude_subagent_sidecar_fingerprint(
         &manifest_stat,
         &effort_fingerprint,
     ])
+}
+
+fn claude_usage_sidecars_fingerprint(support_dir: &Path, session_id: &str) -> String {
+    let api = crate::claude_local_otel::claude_effort_sidecar_fingerprint(support_dir, session_id);
+    let trace = crate::claude_local_otel::claude_trace_ownership_sidecar_fingerprint(
+        support_dir,
+        session_id,
+    );
+    if api.is_empty() && trace.is_empty() {
+        String::new()
+    } else {
+        sha256_hex(&["claude_usage_sidecars:v1", api.as_str(), trace.as_str()])
+    }
 }
 
 /// Path-like fragments the backend fact validator rejects outright. One
@@ -18131,6 +19226,7 @@ mod tests {
             request_count: 1,
             usage_accounting_contract: None,
             claude_usage_request_ids: BTreeSet::new(),
+            claude_usage_occurrences: BTreeMap::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -18175,6 +19271,29 @@ mod tests {
         };
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
         item
+    }
+
+    #[test]
+    fn usage_accounting_contract_is_conditionally_serialized_and_hashed() {
+        let mut item = sample_session_artifact_item();
+        let legacy_wire = serde_json::to_value(&item).expect("serialize legacy item");
+        assert!(legacy_wire.get("usage_accounting_contract").is_none());
+        let legacy_hash = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item)
+            ["usage_accounting"]
+            .clone();
+
+        item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".to_string());
+        let exclusive_wire = serde_json::to_value(&item).expect("serialize exclusive item");
+        assert_eq!(
+            exclusive_wire
+                .get("usage_accounting_contract")
+                .and_then(Value::as_str),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let exclusive_hash = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item)
+            ["usage_accounting"]
+            .clone();
+        assert_ne!(exclusive_hash, legacy_hash);
     }
 
     #[test]
@@ -20308,6 +21427,296 @@ mod tests {
         )])
     }
 
+    fn complete_api_row(
+        parent: &str,
+        request_id: &str,
+        sequence: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+            capture_revision: "claude_api_request:v2".to_string(),
+            session_id: parent.to_string(),
+            request_id: request_id.to_string(),
+            client_request_id: format!("client-{request_id}"),
+            observed_at: format!("2026-08-02T07:00:{sequence:02}Z"),
+            model: "claude-haiku-4-5".to_string(),
+            effort: "high".to_string(),
+            query_source: "user".to_string(),
+            speed: "fast".to_string(),
+            cost_usd_micros: Some(100),
+            event_sequence: Some(sequence),
+            app_version: "2.1.226".to_string(),
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            request_count: 1,
+            account_identity_checked: true,
+            account_identifier_hash: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&row).expect("serialize API evidence");
+        row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+        row
+    }
+
+    fn complete_trace_row(
+        parent: &str,
+        request_id: &str,
+        agent_id: &str,
+    ) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+        let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+            capture_revision: "claude_llm_request_ownership:v1".to_string(),
+            session_id: parent.to_string(),
+            request_id: request_id.to_string(),
+            client_request_id: format!("client-{request_id}"),
+            agent_id: agent_id.to_string(),
+            observed_at: "2026-08-02T07:00:30Z".to_string(),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&row).expect("serialize trace evidence");
+        row.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
+        row
+    }
+
+    #[test]
+    fn claude_reported_usage_union_assigns_aux_and_preserves_graph() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let graph_before = items
+            .iter()
+            .map(|item| item.attribution_facts.clone())
+            .collect::<Vec<_>>();
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|index| complete_api_row(&parent, &format!("req_{index}"), index, 10, 10, 0))
+            .collect::<Vec<_>>();
+        api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+        // Prompt-suggestion/model-selection work is reported but has no
+        // transcript response. Its aggregate cache write is exact usage while
+        // the TTL split remains intentionally unknown.
+        api_rows.push(complete_api_row(
+            &parent,
+            "req_prompt_suggestion",
+            6,
+            3,
+            2,
+            7,
+        ));
+        let mut trace_rows = (1..=4)
+            .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        trace_rows.push(complete_trace_row(&parent, "req_prompt_suggestion", ""));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join(format!("agent-{child_agent}.jsonl")),
+            ),
+            manifest_index_entry(None),
+        );
+
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+
+        assert_eq!(items[0].request_count, 5);
+        assert_eq!(items[0].input_tokens, 43);
+        assert_eq!(items[0].output_tokens, 42);
+        assert_eq!(items[0].unattributed_total_tokens, 7);
+        assert_eq!(items[1].request_count, 1);
+        assert_eq!(items[1].input_tokens, 10);
+        assert_eq!(items[1].output_tokens, 1);
+        assert!(items.iter().all(|item| {
+            item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
+        }));
+        assert_eq!(
+            items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0005")
+        );
+        assert_eq!(
+            items[1].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.attribution_facts.clone())
+                .collect::<Vec<_>>(),
+            graph_before
+        );
+        validate_snapshot_item(0, &items[0]).expect("root union satisfies wire invariants");
+        validate_snapshot_item(1, &items[1]).expect("child union satisfies wire invariants");
+        assert!(index.claude_usage_family_witnesses.contains_key(&parent));
+        let serialized_index = serde_json::to_string(&index).expect("serialize local index");
+        assert!(!serialized_index.contains("req_prompt_suggestion"));
+        assert!(!serialized_index.contains("req_5"));
+
+        // The terminal page mints a content-free family witness. A later
+        // child-only correction can reconstruct the same exact ledger without
+        // pretending the bounded page is a new complete census.
+        let (reparsed_root, _, mut reparsed) = claude_account_family_fixture();
+        let mut child_only = vec![reparsed.remove(1)];
+        apply_claude_reported_usage_with_index(
+            &mut child_only,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert_eq!(child_only[0].request_count, 1);
+        assert_eq!(
+            child_only[0].usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let mut unhealthy_trace = trace_report.clone();
+        unhealthy_trace.malformed_lines = 1;
+        let (unhealthy_root, _, mut unhealthy_reparse) = claude_account_family_fixture();
+        let mut unhealthy_child = vec![unhealthy_reparse.remove(1)];
+        apply_claude_reported_usage_with_index(
+            &mut unhealthy_child,
+            &api_report,
+            &unhealthy_trace,
+            &mut index,
+            false,
+            "2026-08-02T07:12:00Z",
+        );
+        assert_eq!(unhealthy_child[0].usage_accounting_contract, None);
+        let _ = fs::remove_dir_all(unhealthy_root);
+        let _ = fs::remove_dir_all(reparsed_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_reported_usage_union_refuses_unknown_trace_owner() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let api_rows = vec![complete_api_row(&parent, "req_1", 1, 10, 10, 0)];
+        let trace_rows = vec![complete_trace_row(&parent, "req_1", "not-a-member")];
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join("agent-a4d1585d310070d0f.jsonl"),
+            ),
+            manifest_index_entry(None),
+        );
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(items
+            .iter()
+            .all(|item| item.usage_accounting_contract.is_none()));
+        assert!(!index.claude_usage_family_witnesses.contains_key(&parent));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_reported_usage_union_checks_earlier_page_occurrences() {
+        let (root, parent, mut items) = claude_account_family_fixture();
+        let child_agent = "a4d1585d310070d0f";
+        let mut api_rows = (1..=4)
+            .map(|index| {
+                complete_api_row(
+                    &parent,
+                    &format!("req_{index}"),
+                    index,
+                    10,
+                    if index == 1 { 9 } else { 10 },
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        api_rows.push(complete_api_row(&parent, "req_5", 5, 10, 1, 0));
+        let mut trace_rows = (1..=4)
+            .map(|index| complete_trace_row(&parent, &format!("req_{index}"), ""))
+            .collect::<Vec<_>>();
+        trace_rows.push(complete_trace_row(&parent, "req_5", child_agent));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), api_rows)]),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+            evidence: BTreeMap::from([(parent.clone(), trace_rows)]),
+            ..Default::default()
+        };
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            local_index_key(&root.join(format!("{parent}.jsonl"))),
+            manifest_index_entry(None),
+        );
+        index.files.insert(
+            local_index_key(
+                &root
+                    .join(&parent)
+                    .join("subagents")
+                    .join(format!("agent-{child_agent}.jsonl")),
+            ),
+            manifest_index_entry(None),
+        );
+        let mut parent_page = vec![items.remove(0)];
+        apply_claude_reported_usage_with_index(
+            &mut parent_page,
+            &api_report,
+            &trace_report,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut child_page = items;
+        apply_claude_reported_usage_with_index(
+            &mut child_page,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(parent_page[0].usage_accounting_contract, None);
+        assert_eq!(child_page[0].usage_accounting_contract, None);
+        assert!(!index.claude_usage_family_witnesses.contains_key(&parent));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn claude_account_hash_stamps_request_complete_parent_subagent_family() {
         let (root, parent, mut items) = claude_account_family_fixture();
@@ -20741,6 +22150,7 @@ mod tests {
         // not appear in the parent transcript, so nothing is double-counted).
         assert_eq!(item.input_tokens, 40);
         assert_eq!(item.output_tokens, 12);
+        assert_eq!(item.usage_accounting_contract, None);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -20894,6 +22304,7 @@ mod tests {
         // The subagent's own tokens, counted once under its own session.
         assert_eq!(item.input_tokens, 120);
         assert_eq!(item.output_tokens, 30);
+        assert_eq!(item.usage_accounting_contract, None);
 
         let fact = |field: &str| {
             item.attribution_facts
@@ -22198,9 +23609,9 @@ mod tests {
 
     #[test]
     fn claude_code_duplicate_content_block_records_count_usage_once() {
-        // Claude Code writes one JSONL record per assistant content block; all
-        // records of one API response share message.id + requestId and repeat
-        // byte-identical usage. Only the first may count.
+        // Claude Code writes one JSONL record per assistant content block. All
+        // records of one API response share message.id + requestId and resolve
+        // to one terminal usage occurrence.
         let path = temp_file("claude-dedup-same-response");
         fs::write(
             &path,
@@ -22234,6 +23645,167 @@ mod tests {
             Some(true)
         );
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_progressive_sidechain_response_uses_terminal_output_and_late_selector() {
+        let root = temp_dir("claude-progressive-response");
+        let parent = "11111111-2222-3333-4444-555555555555";
+        let dir = root.join(parent).join("subagents");
+        fs::create_dir_all(&dir).expect("create subagent dir");
+        let path = dir.join("agent-a665ed7d7731771a8.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T09:00:00Z\",\"type\":\"user\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"message\":{\"role\":\"user\",\"content\":\"work\"}}\n",
+                "{\"timestamp\":\"2026-08-02T09:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"requestId\":\"req_progress\",\"message\":{\"id\":\"msg_progress\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":30}}}\n",
+                "{\"timestamp\":\"2026-08-02T09:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"isSidechain\":true,\"requestId\":\"req_progress\",\"speed\":\"standard\",\"message\":{\"id\":\"msg_progress\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":19,\"cache_read_input_tokens\":30}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T09:01:00Z", "fp".into())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.input_tokens, 10);
+        assert_eq!(item.output_tokens, 19);
+        assert_eq!(item.cache_read_tokens, 30);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(item.avg_duration_ms, Some(1_000));
+        assert_eq!(item.peak_context_fill_tokens, Some(40));
+        assert_eq!(
+            item.model_usage[0]
+                .selector_context
+                .get("speed_mode")
+                .map(String::as_str),
+            Some("standard")
+        );
+        assert_eq!(item.usage_accounting_contract, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_conflicting_progressive_response_quarantines_the_file() {
+        let root = temp_dir("claude-progressive-conflict");
+        let path = root.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T10:00:01Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9}}}\n",
+                "{\"timestamp\":\"2026-08-02T10:00:02Z\",\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"requestId\":\"req_conflict\",\"message\":{\"id\":\"msg_conflict\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":11,\"output_tokens\":8}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-09T10:01:00Z",
+            365,
+            10,
+            false,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert!(scan.recognized_usage_drop_count > 0);
+        assert!(!index
+            .confirmed_empty_files
+            .contains(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_explicit_fork_excludes_copied_history_from_every_session_metric() {
+        let root = temp_dir("claude-explicit-fork");
+        let path = root.join("bbbbbbbb-cccc-dddd-eeee-ffffffffffff.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-01T08:00:00Z\",\"uuid\":\"copied-user\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"forkedFrom\":{\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"messageUuid\":\"original-user\"},\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"copied title\"}}\n",
+                "{\"timestamp\":\"2026-08-01T08:00:02Z\",\"uuid\":\"copied-assistant\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"forkedFrom\":{\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"messageUuid\":\"original-assistant\"},\"type\":\"assistant\",\"requestId\":\"req_copied\",\"message\":{\"id\":\"msg_copied\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":500,\"cache_read_input_tokens\":10000}}}\n",
+                "{\"timestamp\":\"2026-08-01T08:00:03Z\",\"uuid\":\"copied-compact\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"forkedFrom\":{\"sessionId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"messageUuid\":\"original-compact\"},\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
+                "{\"timestamp\":\"2026-08-02T08:00:00Z\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"owned branch work\"}}\n",
+                "{\"timestamp\":\"2026-08-02T08:00:04Z\",\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"type\":\"assistant\",\"requestId\":\"req_owned\",\"message\":{\"id\":\"msg_owned\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7,\"cache_read_input_tokens\":20}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T08:01:00Z", "fp".into())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.input_tokens, 12);
+        assert_eq!(item.output_tokens, 7);
+        assert_eq!(item.cache_read_tokens, 20);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(
+            item.source_started_at.as_deref(),
+            Some("2026-08-02T08:00:00Z")
+        );
+        assert_eq!(item.compaction_count, Some(0));
+        assert_eq!(
+            item.session_display_name.as_deref(),
+            Some("owned branch work")
+        );
+        assert_eq!(item.usage_accounting_contract, None);
+        assert!(!item.claude_usage_request_ids.contains("req_copied"));
+        assert!(item.claude_usage_request_ids.contains("req_owned"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_explicit_fork_with_zero_owned_usage_is_confirmed_empty() {
+        let root = temp_dir("claude-explicit-fork-empty");
+        let path = root.join("cccccccc-dddd-eeee-ffff-000000000000.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-01T08:00:02Z\",\"uuid\":\"copy\",\"sessionId\":\"cccccccc-dddd-eeee-ffff-000000000000\",\"forkedFrom\":{\"sessionId\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"messageUuid\":\"original\"},\"type\":\"assistant\",\"requestId\":\"req_copy\",\"message\":{\"id\":\"msg_copy\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n",
+        )
+        .expect("write fixture");
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-08-09T08:01:00Z",
+            365,
+            10,
+            false,
+        )
+        .expect("scan");
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(scan.recognized_usage_drop_count, 0);
+        assert!(index
+            .confirmed_empty_files
+            .contains(&local_index_key(&path)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_fork_of_fork_counts_only_the_leaf_owned_response() {
+        let path = temp_file("claude-fork-of-fork");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T11:00:00Z\",\"sessionId\":\"leaf\",\"forkedFrom\":{\"sessionId\":\"middle\",\"messageUuid\":\"middle-copy\"},\"requestId\":\"req_inherited\",\"message\":{\"id\":\"msg_inherited\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":90,\"output_tokens\":45}}}\n",
+                "{\"timestamp\":\"2026-08-02T11:00:01Z\",\"sessionId\":\"leaf\",\"requestId\":\"req_leaf\",\"message\":{\"id\":\"msg_leaf\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T11:01:00Z", "fp".into())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (9, 4, 1)
+        );
+        assert_eq!(item.usage_accounting_contract, None);
         let _ = fs::remove_file(path);
     }
 
@@ -22293,7 +23865,87 @@ mod tests {
         assert_eq!(item.input_tokens, 20);
         assert_eq!(item.output_tokens, 10);
         assert_eq!(item.request_count, 2);
+        assert_eq!(item.usage_accounting_contract, None);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_single_id_fallbacks_resolve_progressive_responses() {
+        let path = temp_file("claude-dedup-single-ids");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-06-30T12:01:00Z\",\"sessionId\":\"claude-dedup-single\",\"message\":{\"id\":\"msg_only\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-06-30T12:01:01Z\",\"sessionId\":\"claude-dedup-single\",\"message\":{\"id\":\"msg_only\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-06-30T12:02:00Z\",\"sessionId\":\"claude-dedup-single\",\"requestId\":\"req_only\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n",
+                "{\"timestamp\":\"2026-06-30T12:02:01Z\",\"sessionId\":\"claude-dedup-single\",\"requestId\":\"req_only\",\"message\":{\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":7,\"output_tokens\":4}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let item = parse_claude_code_jsonl_file(&path, "2026-06-30T12:04:00Z", "fp".into())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (17, 9, 2)
+        );
+        assert_eq!(item.usage_accounting_contract, None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_resume_appends_owned_responses_to_the_same_session_once() {
+        let path = temp_file("claude-resume-same-session");
+        let first = concat!(
+            "{\"timestamp\":\"2026-08-02T12:00:00Z\",\"type\":\"user\",\"sessionId\":\"resume-1\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n",
+            "{\"timestamp\":\"2026-08-02T12:00:01Z\",\"type\":\"assistant\",\"sessionId\":\"resume-1\",\"requestId\":\"req_first\",\"message\":{\"id\":\"msg_first\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n"
+        );
+        fs::write(&path, first).expect("write first run");
+        let first_item = parse_claude_code_jsonl_file(&path, "2026-08-02T12:01:00Z", "fp1".into())
+            .expect("parse first")
+            .into_iter()
+            .next()
+            .expect("first snapshot");
+        assert_eq!(
+            (
+                first_item.input_tokens,
+                first_item.output_tokens,
+                first_item.request_count
+            ),
+            (10, 3, 1)
+        );
+
+        fs::write(
+            &path,
+            format!(
+                "{first}{}",
+                concat!(
+                    "{\"timestamp\":\"2026-08-02T13:00:00Z\",\"type\":\"user\",\"sessionId\":\"resume-1\",\"message\":{\"role\":\"user\",\"content\":\"resume\"}}\n",
+                    "{\"timestamp\":\"2026-08-02T13:00:02Z\",\"type\":\"assistant\",\"sessionId\":\"resume-1\",\"requestId\":\"req_second\",\"message\":{\"id\":\"msg_second\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+                )
+            ),
+        )
+        .expect("append resumed run");
+        let resumed = parse_claude_code_jsonl_file(&path, "2026-08-02T13:01:00Z", "fp2".into())
+            .expect("parse resumed")
+            .into_iter()
+            .next()
+            .expect("resumed snapshot");
+        assert_eq!(resumed.source_session_id, "resume-1");
+        assert_eq!(
+            (
+                resumed.input_tokens,
+                resumed.output_tokens,
+                resumed.request_count
+            ),
+            (30, 10, 2)
+        );
+        // No explicit modern fork proof exists for this historical-style top
+        // fixture, so exact response accounting does not overclaim ownership.
+        assert_eq!(resumed.usage_accounting_contract, None);
         let _ = fs::remove_file(path);
     }
 
@@ -22406,6 +24058,11 @@ mod tests {
         .expect("snapshot");
 
         assert_eq!(item.compaction_count, Some(4));
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (50, 5, 1)
+        );
+        assert_eq!(item.usage_accounting_contract, None);
         assert_eq!(
             item.compaction_timestamps,
             vec![
@@ -26514,6 +28171,7 @@ mod tests {
             request_count: 1,
             usage_accounting_contract: None,
             claude_usage_request_ids: BTreeSet::new(),
+            claude_usage_occurrences: BTreeMap::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -26799,6 +28457,7 @@ mod tests {
                 request_count: 1,
                 usage_accounting_contract: None,
                 claude_usage_request_ids: BTreeSet::new(),
+                claude_usage_occurrences: BTreeMap::new(),
                 avg_duration_ms: None,
                 avg_time_to_first_token_ms: None,
                 max_duration_ms: None,

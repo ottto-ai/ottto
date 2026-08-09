@@ -225,7 +225,7 @@ pub struct HistoricalReplayDirective {
 pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDirective {
     match source {
         SnapshotSource::ClaudeCode => HistoricalReplayDirective {
-            revision: "claude_founder_backfill_leg_a:v1",
+            revision: "claude_reported_usage_union:v3",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Codex => HistoricalReplayDirective {
@@ -485,6 +485,7 @@ mod tests {
             request_count: 1,
             usage_accounting_contract: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
+            claude_usage_occurrences: std::collections::BTreeMap::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
             max_duration_ms: None,
@@ -749,10 +750,7 @@ mod tests {
     #[test]
     fn current_founder_backfill_replays_are_one_shot_and_source_scoped() {
         let expected = [
-            (
-                SnapshotSource::ClaudeCode,
-                "claude_founder_backfill_leg_a:v1",
-            ),
+            (SnapshotSource::ClaudeCode, "claude_reported_usage_union:v3"),
             (SnapshotSource::Codex, "codex_session_exclusive_usage:v2"),
             (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
         ];
