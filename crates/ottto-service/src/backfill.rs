@@ -229,7 +229,7 @@ pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDire
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Codex => HistoricalReplayDirective {
-            revision: "codex_founder_backfill_leg_a:v1",
+            revision: "codex_session_exclusive_usage:v2",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Pi => HistoricalReplayDirective {
@@ -483,6 +483,7 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            usage_accounting_contract: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
@@ -752,7 +753,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 "claude_founder_backfill_leg_a:v1",
             ),
-            (SnapshotSource::Codex, "codex_founder_backfill_leg_a:v1"),
+            (SnapshotSource::Codex, "codex_session_exclusive_usage:v2"),
             (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
         ];
         let mut state = BackfillState::default();
