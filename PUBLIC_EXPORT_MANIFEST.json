@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 316,
-  "content_sha256": "e98682b4ba6199977ef15ea902e523ee9d80ead6155e291b8cacffa9b31bad47",
+  "candidate_file_count": 317,
+  "content_sha256": "e7a726b1336ed86c3619ab1fb94e9bccadb060e4fec0d82272e948dd631e03ba",
   "files": [
     {
       "executable": false,
@@ -818,8 +818,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/provider_daily_reference.rs",
-      "sha256": "79f27e778b20890bfc6ee9a5e3f0b3db84652c9f9ca86a81de1dff013d7ce767",
-      "size_bytes": 201007
+      "sha256": "5a868ecb17c2025966439d584164fbdcd28273217ab5e77b9f120e238c2c1bb0",
+      "size_bytes": 213518
     },
     {
       "executable": false,
@@ -1352,6 +1352,13 @@
       "path": "docs/session-2026-08-09-chatgpt-workspace-monthly-credits.md",
       "sha256": "e21a35da45529efe543d3d5b67611cd5308bd589b64cc193118edcec3af7f9b8",
       "size_bytes": 1636
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-09-provider-day-totals.md",
+      "sha256": "76639d0ffdc06449da724049cdceb252e9fc0d8062279f3e4201e3373902729f",
+      "size_bytes": 2020
     },
     {
       "executable": false,
@@ -2215,9 +2222,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-09T06:24:35+00:00",
+  "generated_at": "2026-08-09T07:06:11+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 317,
+  "output_file_count": 318,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2251,5 +2258,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "da27d6fc78769e1c817a376ea7e0086f9e58c1b7"
+  "source_commit": "a36be2782f77531064f3f49b755201c8918f16b8"
 }

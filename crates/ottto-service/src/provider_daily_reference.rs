@@ -141,6 +141,12 @@ pub enum Surface {
     Other,
 }
 
+/// Reserved wire surface for provider-owned day totals and their day-level
+/// model breakdown. Provider client ids can never map to this value. The
+/// backend's additive v1 surface validator must be deployed before any runtime
+/// containing this constant is released.
+pub const PROVIDER_DAY_TOTAL_SURFACE: &str = "provider_day_total";
+
 impl Surface {
     pub fn wire(self) -> &'static str {
         match self {
@@ -1404,6 +1410,70 @@ struct Counters {
     turn_count: Option<u64>,
 }
 
+const MAX_TOTAL_MISMATCH_DETAILS: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayTotalMismatch {
+    pub provider_day: String,
+    pub metric: &'static str,
+    pub provider_value: String,
+    pub recognized_client_value: String,
+}
+
+fn compare_day_total(
+    provider_day: &str,
+    provider: &Counters,
+    recognized_clients: &Counters,
+    details: &mut Vec<DayTotalMismatch>,
+) -> (bool, bool) {
+    let mut compared = false;
+    let mut mismatched = false;
+
+    let mut record = |metric: &'static str, provider_value: String, client_value: String| {
+        compared = true;
+        if provider_value != client_value {
+            mismatched = true;
+            if details.len() < MAX_TOTAL_MISMATCH_DETAILS {
+                details.push(DayTotalMismatch {
+                    provider_day: provider_day.to_string(),
+                    metric,
+                    provider_value,
+                    recognized_client_value: client_value,
+                });
+            }
+        }
+    };
+
+    if let (Some(provider), Some(clients)) =
+        (provider.credits_used, recognized_clients.credits_used)
+    {
+        record(
+            "credits_used",
+            format_credits(provider),
+            format_credits(clients),
+        );
+    }
+    macro_rules! compare_counter {
+        ($field:ident) => {
+            if let (Some(provider), Some(clients)) = (provider.$field, recognized_clients.$field) {
+                record(
+                    stringify!($field),
+                    provider.to_string(),
+                    clients.to_string(),
+                );
+            }
+        };
+    }
+    compare_counter!(uncached_input_tokens);
+    compare_counter!(cached_input_tokens);
+    compare_counter!(output_tokens);
+    compare_counter!(total_tokens);
+    compare_counter!(thread_count);
+    compare_counter!(turn_count);
+
+    (compared, mismatched)
+}
+
 impl Counters {
     fn merge(&mut self, other: &Counters) {
         self.credits_used = merge_credits(self.credits_used, other.credits_used);
@@ -1545,6 +1615,8 @@ const CLIENT_ARRAY_KEYS: &[&str] = &[
     "clients_data",
     "client_data",
 ];
+const DAY_TOTAL_KEYS: &[&str] = &["totals"];
+const USER_COUNT_KEYS: &[&str] = &["users"];
 const CLIENT_ID_KEYS: &[&str] = &["client_id", "client", "id", "name", "surface", "surface_id"];
 const MODEL_ARRAY_KEYS: &[&str] = &[
     "models",
@@ -1631,6 +1703,11 @@ fn first_array<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value>> {
         .find_map(|key| value.get(*key).and_then(Value::as_array))
 }
 
+fn first_object<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a serde_json::Map<String, Value>> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_object))
+}
+
 fn first_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -1678,6 +1755,12 @@ pub struct NormalizedWindow {
     pub models_seen: usize,
     pub models_missing_id: usize,
     pub entries_empty_counters: usize,
+    pub day_totals_seen: usize,
+    pub day_totals_compared: usize,
+    pub day_total_mismatch_days: usize,
+    pub day_total_mismatches: Vec<DayTotalMismatch>,
+    pub user_count_fields_seen: usize,
+    pub user_count_fields_unreadable: usize,
     /// Structure-only provider shape hints. These sets contain bounded key
     /// names, never the corresponding values or account identifiers.
     pub unrecognized_day_keys: BTreeSet<String>,
@@ -1716,7 +1799,7 @@ pub fn normalize_provider_window(
     .and_then(|raw| OffsetDateTime::parse(raw, &Rfc3339).ok())
     .map(timestamp);
 
-    let mut grouped: BTreeMap<(String, Surface, String), Counters> = BTreeMap::new();
+    let mut grouped: BTreeMap<(String, &'static str, String), Counters> = BTreeMap::new();
     let mut dropped_model_rows = 0_usize;
     let mut days_recognized = 0_usize;
     let days_seen = days.len();
@@ -1730,6 +1813,12 @@ pub fn normalize_provider_window(
     let mut models_seen = 0_usize;
     let mut models_missing_id = 0_usize;
     let mut entries_empty_counters = 0_usize;
+    let mut day_totals_seen = 0_usize;
+    let mut day_totals_compared = 0_usize;
+    let mut day_total_mismatch_days = 0_usize;
+    let mut day_total_mismatches = Vec::new();
+    let mut user_count_fields_seen = 0_usize;
+    let mut user_count_fields_unreadable = 0_usize;
     let mut unrecognized_day_keys = BTreeSet::new();
     let mut unrecognized_client_keys = BTreeSet::new();
     let mut unrecognized_model_keys = BTreeSet::new();
@@ -1737,7 +1826,13 @@ pub fn normalize_provider_window(
     for day in days {
         record_unrecognized_keys(
             day,
-            &[DAY_DATE_KEYS, CLIENT_ARRAY_KEYS, COUNTER_KEYS],
+            &[
+                DAY_DATE_KEYS,
+                CLIENT_ARRAY_KEYS,
+                DAY_TOTAL_KEYS,
+                MODEL_ARRAY_KEYS,
+                COUNTER_KEYS,
+            ],
             &mut unrecognized_day_keys,
         );
         let Some(day_key) = first_string(day, DAY_DATE_KEYS).and_then(provider_day) else {
@@ -1751,15 +1846,30 @@ pub fn normalize_provider_window(
             days_out_of_window += 1;
             continue;
         }
-        let mut day_emitted_row = false;
+        let mut day_emitted_client_row = false;
+        let mut day_emitted_any_row = false;
+        let mut recognized_client_totals = Counters::default();
+        let day_models = first_array(day, MODEL_ARRAY_KEYS);
         if let Some(clients) = first_array(day, CLIENT_ARRAY_KEYS) {
             for client in clients {
                 clients_seen += 1;
                 record_unrecognized_keys(
                     client,
-                    &[CLIENT_ID_KEYS, MODEL_ARRAY_KEYS, COUNTER_KEYS],
+                    &[
+                        CLIENT_ID_KEYS,
+                        MODEL_ARRAY_KEYS,
+                        USER_COUNT_KEYS,
+                        COUNTER_KEYS,
+                    ],
                     &mut unrecognized_client_keys,
                 );
+                if client.get("users").is_some() {
+                    if counter_at(client, USER_COUNT_KEYS, MAX_EVENT_COUNTER).is_some() {
+                        user_count_fields_seen += 1;
+                    } else {
+                        user_count_fields_unreadable += 1;
+                    }
+                }
                 let Some(client_id) = first_string(client, CLIENT_ID_KEYS) else {
                     clients_missing_id += 1;
                     continue;
@@ -1769,20 +1879,29 @@ pub fn normalize_provider_window(
                 if surface_counters.is_empty() {
                     entries_empty_counters += 1;
                 } else {
+                    recognized_client_totals.merge(&surface_counters);
                     grouped
-                        .entry((day_key.clone(), surface, ALL_MODELS.to_string()))
+                        .entry((day_key.clone(), surface.wire(), ALL_MODELS.to_string()))
                         .or_default()
                         .merge(&surface_counters);
-                    day_emitted_row = true;
+                    day_emitted_client_row = true;
+                    day_emitted_any_row = true;
                 }
                 if let Some(models) = first_array(client, MODEL_ARRAY_KEYS) {
                     for model in models {
                         models_seen += 1;
                         record_unrecognized_keys(
                             model,
-                            &[MODEL_NAME_KEYS, COUNTER_KEYS],
+                            &[MODEL_NAME_KEYS, USER_COUNT_KEYS, COUNTER_KEYS],
                             &mut unrecognized_model_keys,
                         );
+                        if model.get("users").is_some() {
+                            if counter_at(model, USER_COUNT_KEYS, MAX_EVENT_COUNTER).is_some() {
+                                user_count_fields_seen += 1;
+                            } else {
+                                user_count_fields_unreadable += 1;
+                            }
+                        }
                         let Some(raw_model) = first_string(model, MODEL_NAME_KEYS) else {
                             models_missing_id += 1;
                             continue;
@@ -1800,12 +1919,12 @@ pub fn normalize_provider_window(
                             continue;
                         }
                         grouped
-                            .entry((day_key.clone(), surface, slug))
+                            .entry((day_key.clone(), surface.wire(), slug))
                             .or_default()
                             .merge(&model_counters);
-                        day_emitted_row = true;
+                        day_emitted_any_row = true;
                     }
-                } else {
+                } else if day_models.is_none() {
                     clients_no_model_breakdown += 1;
                 }
             }
@@ -1813,13 +1932,83 @@ pub fn normalize_provider_window(
             days_no_client_breakdown += 1;
         }
 
-        if !day_emitted_row {
+        if let Some(totals) = first_object(day, DAY_TOTAL_KEYS) {
+            let totals_value = Value::Object(totals.clone());
+            if totals.get("users").is_some() {
+                if counter_at(&totals_value, USER_COUNT_KEYS, MAX_EVENT_COUNTER).is_some() {
+                    user_count_fields_seen += 1;
+                } else {
+                    user_count_fields_unreadable += 1;
+                }
+            }
+            let total_counters = counters_at(&totals_value, true);
+            if !total_counters.is_empty() {
+                day_totals_seen += 1;
+                let (compared, mismatched) = compare_day_total(
+                    &day_key,
+                    &total_counters,
+                    &recognized_client_totals,
+                    &mut day_total_mismatches,
+                );
+                day_totals_compared += usize::from(compared);
+                day_total_mismatch_days += usize::from(mismatched);
+                grouped
+                    .entry((
+                        day_key.clone(),
+                        PROVIDER_DAY_TOTAL_SURFACE,
+                        ALL_MODELS.to_string(),
+                    ))
+                    .or_default()
+                    .merge(&total_counters);
+                day_emitted_any_row = true;
+            }
+        }
+
+        if let Some(models) = day_models {
+            for model in models {
+                models_seen += 1;
+                record_unrecognized_keys(
+                    model,
+                    &[MODEL_NAME_KEYS, USER_COUNT_KEYS, COUNTER_KEYS],
+                    &mut unrecognized_model_keys,
+                );
+                if model.get("users").is_some() {
+                    if counter_at(model, USER_COUNT_KEYS, MAX_EVENT_COUNTER).is_some() {
+                        user_count_fields_seen += 1;
+                    } else {
+                        user_count_fields_unreadable += 1;
+                    }
+                }
+                let Some(raw_model) = first_string(model, MODEL_NAME_KEYS) else {
+                    models_missing_id += 1;
+                    continue;
+                };
+                let Some(slug) = normalized_model_slug(raw_model) else {
+                    dropped_model_rows += 1;
+                    continue;
+                };
+                let model_counters = counters_at(model, false);
+                if model_counters.is_empty() {
+                    entries_empty_counters += 1;
+                    continue;
+                }
+                grouped
+                    .entry((day_key.clone(), PROVIDER_DAY_TOTAL_SURFACE, slug))
+                    .or_default()
+                    .merge(&model_counters);
+                day_emitted_any_row = true;
+            }
+        }
+
+        if !day_emitted_client_row {
             let day_counters = counters_at(day, true);
             if day_counters.is_empty() {
-                entries_empty_counters += 1;
+                if !day_emitted_any_row {
+                    entries_empty_counters += 1;
+                }
             } else {
                 grouped
-                    .entry((day_key, Surface::Other, ALL_MODELS.to_string()))
+                    .entry((day_key, Surface::Other.wire(), ALL_MODELS.to_string()))
                     .or_default()
                     .merge(&day_counters);
                 days_used_fallback += 1;
@@ -1837,7 +2026,7 @@ pub fn normalize_provider_window(
         .into_iter()
         .map(|((day, surface, model), counters)| DailyReferenceRow {
             provider_day: day,
-            surface: surface.wire(),
+            surface,
             model,
             credits_used: counters.credits_used.map(format_credits),
             uncached_input_tokens: counters.uncached_input_tokens,
@@ -1865,6 +2054,12 @@ pub fn normalize_provider_window(
         models_seen,
         models_missing_id,
         entries_empty_counters,
+        day_totals_seen,
+        day_totals_compared,
+        day_total_mismatch_days,
+        day_total_mismatches,
+        user_count_fields_seen,
+        user_count_fields_unreadable,
         unrecognized_day_keys,
         unrecognized_client_keys,
         unrecognized_model_keys,
@@ -2232,6 +2427,11 @@ fn normalization_counter_summary(normalized: &NormalizedWindow) -> String {
     add_nonzero!(models_missing_id);
     add_nonzero!(entries_empty_counters);
     add_nonzero!(dropped_model_rows);
+    add_nonzero!(day_totals_seen);
+    add_nonzero!(day_totals_compared);
+    add_nonzero!(day_total_mismatch_days);
+    add_nonzero!(user_count_fields_seen);
+    add_nonzero!(user_count_fields_unreadable);
     counters.join(", ")
 }
 
@@ -2244,6 +2444,8 @@ fn has_normalization_accounting_events(normalized: &NormalizedWindow) -> bool {
         || normalized.clients_no_model_breakdown > 0
         || normalized.models_missing_id > 0
         || normalized.entries_empty_counters > 0
+        || normalized.user_count_fields_unreadable > 0
+        || normalized.day_total_mismatch_days > 0
 }
 
 fn format_unrecognized_keys(keys: &BTreeSet<String>) -> String {
@@ -2266,6 +2468,18 @@ fn append_normalization_diagnostics(
             &format!(
                 "Provider normalization accounting: {}.",
                 normalization_counter_summary(normalized)
+            ),
+        ));
+    }
+    for mismatch in &normalized.day_total_mismatches {
+        diagnostics.push(warning(
+            "codex_daily_aggregates_provider_total_mismatch",
+            &format!(
+                "Provider day total differs from recognized client sum: day={} metric={} provider={} recognized_clients={}.",
+                mismatch.provider_day,
+                mismatch.metric,
+                mismatch.provider_value,
+                mismatch.recognized_client_value
             ),
         ));
     }
@@ -2872,6 +3086,7 @@ pub fn wire_payload_is_content_free(payload: &Value) -> bool {
                 ]
                 .iter()
                 .any(|surface| surface.wire() == value)
+                    || value == PROVIDER_DAY_TOTAL_SURFACE
             })
         {
             return false;
@@ -3754,6 +3969,116 @@ mod tests {
         let surface_row = row_at(&normalized.rows, "2026-07-26", "codex_web", "__all__")
             .expect("surface total row");
         assert_eq!(surface_row.credits_used.as_deref(), Some("12.500000"));
+    }
+
+    #[test]
+    fn day_level_totals_and_models_use_the_reserved_provider_grain() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "totals": {
+                    "credits": 7.5,
+                    "text_total_tokens": 1200,
+                    "threads": 8,
+                    "turns": 20
+                },
+                "models": [{
+                    "model": "GPT-5-Codex",
+                    "credits": 0.0,
+                    "text_total_tokens": 1200,
+                    "threads": 8,
+                    "turns": 20
+                }],
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "credits": 7.5,
+                    "text_total_tokens": 1200,
+                    "threads": 8,
+                    "turns": 20
+                }]
+            }]
+        });
+
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let total = row_at(
+            &normalized.rows,
+            "2026-07-26",
+            PROVIDER_DAY_TOTAL_SURFACE,
+            ALL_MODELS,
+        )
+        .expect("provider day total");
+        assert_eq!(total.credits_used.as_deref(), Some("7.500000"));
+        assert_eq!(total.total_tokens, Some(1200));
+
+        let model = row_at(
+            &normalized.rows,
+            "2026-07-26",
+            PROVIDER_DAY_TOTAL_SURFACE,
+            "gpt-5-codex",
+        )
+        .expect("provider day model");
+        assert_eq!(model.credits_used, None);
+        assert_eq!(model.total_tokens, Some(1200));
+        assert_eq!(normalized.day_totals_seen, 1);
+        assert_eq!(normalized.day_totals_compared, 1);
+        assert_eq!(normalized.day_total_mismatch_days, 0);
+        assert!(normalized.day_total_mismatches.is_empty());
+        assert_eq!(normalized.clients_no_model_breakdown, 0);
+        assert!(!normalized.unrecognized_day_keys.contains("totals"));
+        assert!(!normalized.unrecognized_day_keys.contains("models"));
+    }
+
+    #[test]
+    fn provider_total_mismatch_diagnostic_names_both_numbers() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "totals": {"text_total_tokens": 1300},
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "text_total_tokens": 1200
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        let mut diagnostics = Vec::new();
+        append_normalization_diagnostics(&normalized, &mut diagnostics);
+
+        assert_eq!(normalized.day_total_mismatch_days, 1);
+        let mismatch = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_daily_aggregates_provider_total_mismatch")
+            .expect("mismatch diagnostic");
+        assert_eq!(mismatch.severity, AgentDiagnosticSeverity::Warning);
+        assert!(mismatch.message.contains("provider=1300"));
+        assert!(mismatch.message.contains("recognized_clients=1200"));
+        assert!(mismatch.message.contains("metric=total_tokens"));
+    }
+
+    #[test]
+    fn user_aggregates_are_counted_but_not_uploaded() {
+        let payload = json!({
+            "results": [{
+                "date": "2026-07-26",
+                "totals": {"text_total_tokens": 10, "users": 1},
+                "models": [{"model": "gpt-5-codex", "text_total_tokens": 10, "users": 1}],
+                "clients": [{
+                    "client_id": "CODEX_WEB",
+                    "text_total_tokens": 10,
+                    "users": 1
+                }]
+            }]
+        });
+        let normalized =
+            normalize_provider_window(&payload, "2026-07-01", "2026-07-26").expect("normalize");
+        assert_eq!(normalized.user_count_fields_seen, 3);
+        assert_eq!(normalized.user_count_fields_unreadable, 0);
+        assert!(!normalized.unrecognized_client_keys.contains("users"));
+        assert!(!normalized.unrecognized_model_keys.contains("users"));
+        let batch_rows = serde_json::to_string(&normalized.rows).expect("rows encode");
+        assert!(!batch_rows.contains("users"));
     }
 
     #[test]
