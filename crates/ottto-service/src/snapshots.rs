@@ -185,7 +185,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // takes its own observed tier. Scan identity does NOT move: which session a file
 // maps to is unchanged, and the effort sidecar fingerprint already re-selects a
 // transcript whose evidence grew after its final write.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v27";
+// codex v28: forked subagent rollouts may contain a physical copy of their
+// parent's history. Bound all session-derived telemetry to the child's own
+// rollout suffix, using Codex's native ordinal when present and the legacy
+// inter-agent trigger marker otherwise. Usage is accounted from the exact
+// per-response `last_token_usage`; cumulative totals remain a reset-safe
+// fallback/checkpoint. Existing indexed rollouts must be revisited once.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v29";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -225,7 +231,7 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // scan identity so already-indexed local history is revisited once; unchanged
 // files still converge through the semantic no-op path after the new summary
 // has been uploaded.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v27";
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v29";
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v24";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
@@ -398,6 +404,11 @@ fn claude_compaction_summary(observations: &[ClaudeCompactionObservation]) -> (u
 pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CODEX_JSONL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+// Legacy ordinary forks have no provider-native boundary. Persist only the
+// content-free ordered turn/usage proof required by a referenced parent, and
+// fail closed when either bound is exceeded.
+const MAX_CODEX_PARENT_LEDGER_SIGNATURES: usize = 4_096;
+const MAX_CODEX_PARENT_LEDGER_REFS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -672,6 +683,12 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub unattributed_total_tokens: u64,
     pub request_count: u64,
+    /// Present only when the collector proved that usage and every related
+    /// session metric contain this session's work exclusively. Omission is an
+    /// explicit fail-closed signal for legacy fork shapes whose inherited
+    /// prefix cannot be bounded safely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_accounting_contract: Option<String>,
     /// Local-only identities of the Claude API responses whose transcript
     /// usage contributed to this snapshot. Claude Code also emits auxiliary
     /// OTLP requests (for example prompt suggestions) under the same session
@@ -929,16 +946,41 @@ struct ScanTraversalCheckpoint {
     pending_directories: VecDeque<ScanTraversalPath>,
     pending_candidates: VecDeque<ScanTraversalPath>,
     observed_index_keys: BTreeSet<String>,
+    /// Complete current Codex rollout population, including files outside the
+    /// usage lookback. Parent-prefix uniqueness cannot ignore an older
+    /// duplicate source-session id merely because it is not a usage candidate.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    codex_rollout_paths: BTreeSet<String>,
     reconciliation_upper_bound: Option<String>,
     reconciliation_after: Option<String>,
     reconciliation_started: bool,
     #[serde(default)]
     watcher_hint_seen: bool,
+    /// At least one ordinary fork needs another clean generation after its
+    /// parent ledger was discovered/refreshed later in this bounded pass.
+    #[serde(default)]
+    codex_parent_resolution_retry_required: bool,
     #[serde(default)]
     unhealthy_retry_attempt: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unhealthy_retry_not_before_unix_seconds: Option<u64>,
     counts: ScanTraversalCounts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexParentOwnershipLedger {
+    /// Exact ordered, content-free turn/usage signatures from the complete
+    /// physical parent rollout. A child must match a non-empty prefix before
+    /// its first divergent signature can prove the local boundary.
+    signatures: Vec<String>,
+    #[serde(default)]
+    complete: bool,
+    /// Opened-object witness for the exact parent rollout that produced the
+    /// signatures. Persisted evidence is usable only after the current parent
+    /// path revalidates to this identity; a changed parent therefore makes its
+    /// children retry instead of treating the newly inherited suffix as local.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    opened_object_identity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -977,6 +1019,22 @@ pub struct ScanIndex {
     /// every later state-database observation into another upload.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub codex_state_only_snapshot_fingerprints: BTreeMap<String, String>,
+    /// Codex rollout sessions whose physical file is known to contain an
+    /// inherited prefix but whose exclusive ownership boundary is unresolved.
+    /// Persisting the session id prevents a later incremental page (where the
+    /// unchanged rollout is not reparsed) from publishing inclusive
+    /// `state_5.sqlite.tokens_used` as session-local usage.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    codex_state_only_blocked_session_ids: BTreeSet<String>,
+    /// Parent ids requested by unresolved legacy ordinary forks. This bounded
+    /// set forces an unchanged parent through one structural prepass instead
+    /// of retaining every Codex transcript signature in the index.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    codex_parent_ownership_refs: BTreeSet<String>,
+    /// Content-free ordered evidence for only the referenced parent sessions.
+    /// Missing, overflowed, or incomplete ledgers are never authoritative.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    codex_parent_ownership_ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     /// Durable, local-only index of Claude Desktop naming sidecars. Paging the
     /// store without retaining these safe extracted fields would make titles
     /// disappear whenever their file was outside the current bounded page.
@@ -1074,6 +1132,9 @@ impl Default for ScanIndex {
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),
             codex_state_only_snapshot_fingerprints: BTreeMap::new(),
+            codex_state_only_blocked_session_ids: BTreeSet::new(),
+            codex_parent_ownership_refs: BTreeSet::new(),
+            codex_parent_ownership_ledgers: BTreeMap::new(),
             claude_desktop_title_files: BTreeMap::new(),
             claude_account_family_witnesses: BTreeMap::new(),
             claude_account_family_pending: BTreeMap::new(),
@@ -2327,28 +2388,32 @@ pub(crate) fn snapshot_semantic_component_hashes(
         components.insert(name, sha256_hex(&[&payload.to_string()]));
     };
 
-    insert(
-        "usage_accounting",
-        json!({
-            "input_tokens": item.input_tokens,
-            "output_tokens": item.output_tokens,
-            "cache_read_tokens": item.cache_read_tokens,
-            "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
-            "cache_creation_1h_tokens": item.cache_creation_1h_tokens,
-            "reasoning_output_tokens": item.reasoning_output_tokens,
-            "unattributed_total_tokens": item.unattributed_total_tokens,
-            "request_count": item.request_count,
-            "model_usage": item.model_usage.iter().map(semantic_model_usage).collect::<Vec<_>>(),
-            "usage_buckets": semantic_usage_buckets(item),
-            "cost": item.cost.as_ref().map(|cost| json!({
-                "total_cost_usd": &cost.total_cost_usd,
-                "input_cost_usd": &cost.input_cost_usd,
-                "output_cost_usd": &cost.output_cost_usd,
-                "cache_read_cost_usd": &cost.cache_read_cost_usd,
-                "cache_creation_cost_usd": &cost.cache_creation_cost_usd,
-            })),
-        }),
-    );
+    let mut usage_accounting = json!({
+        "input_tokens": item.input_tokens,
+        "output_tokens": item.output_tokens,
+        "cache_read_tokens": item.cache_read_tokens,
+        "cache_creation_5m_tokens": item.cache_creation_5m_tokens,
+        "cache_creation_1h_tokens": item.cache_creation_1h_tokens,
+        "reasoning_output_tokens": item.reasoning_output_tokens,
+        "unattributed_total_tokens": item.unattributed_total_tokens,
+        "request_count": item.request_count,
+        "model_usage": item.model_usage.iter().map(semantic_model_usage).collect::<Vec<_>>(),
+        "usage_buckets": semantic_usage_buckets(item),
+        "cost": item.cost.as_ref().map(|cost| json!({
+            "total_cost_usd": &cost.total_cost_usd,
+            "input_cost_usd": &cost.input_cost_usd,
+            "output_cost_usd": &cost.output_cost_usd,
+            "cache_read_cost_usd": &cost.cache_read_cost_usd,
+            "cache_creation_cost_usd": &cost.cache_creation_cost_usd,
+        })),
+    });
+    if let Some(contract) = item.usage_accounting_contract.as_deref() {
+        usage_accounting
+            .as_object_mut()
+            .expect("usage accounting semantic body is an object")
+            .insert("usage_accounting_contract".to_string(), json!(contract));
+    }
+    insert("usage_accounting", usage_accounting);
     insert(
         "lifecycle_activity",
         json!({
@@ -2604,7 +2669,7 @@ pub(crate) fn snapshot_semantic_envelope(
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UsageTotals {
     input_tokens: u64,
     output_tokens: u64,
@@ -3716,7 +3781,28 @@ impl UsageBucketState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CodexOwnershipBoundary {
+    /// No authoritative session header has been observed yet. Records cannot
+    /// be admitted until the header proves whether a physical prefix exists.
+    #[default]
+    Undetermined,
+    /// The rollout has no inherited physical prefix, or uses a paginated
+    /// history_base whose referenced records are not local child records.
+    AllLocal,
+    /// Legacy subagent fork: records are inherited until the first provider
+    /// trigger-turn marker.
+    AwaitingLegacyTrigger,
+    /// Legacy ordinary fork/resume: records are inherited while their ordered
+    /// turn/usage signatures match the complete referenced-parent ledger.
+    AwaitingParentPrefix,
+    /// Native Codex boundary: ordinals below `start` are inherited context.
+    Ordinal { start: u64 },
+    /// A fork was observed but its inherited prefix cannot be proven locally.
+    /// Usage must fail closed rather than publish an inclusive total.
+    AmbiguousFork,
+}
+
 struct SnapshotAccumulator {
     source: SnapshotSource,
     source_session_id: Option<String>,
@@ -3753,6 +3839,34 @@ struct SnapshotAccumulator {
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
     current_selector: SelectorCapture,
     session_cumulative_usage: Option<UsageTotals>,
+    codex_session_meta_seen: bool,
+    codex_ownership_boundary: CodexOwnershipBoundary,
+    codex_legacy_trigger_seen: bool,
+    codex_legacy_bootstrap_valid: bool,
+    codex_parent_ownership_ledgers:
+        Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    codex_parent_session_ref: Option<String>,
+    codex_parent_signatures: Option<Vec<String>>,
+    codex_parent_ledger_identity_used: Option<String>,
+    codex_parent_signature_index: usize,
+    codex_physical_signatures: Vec<String>,
+    codex_physical_signatures_complete: bool,
+    codex_ordinal_expected: Option<u64>,
+    codex_ordinal_sequence_valid: bool,
+    codex_owned_record_seen: bool,
+    codex_is_fork: bool,
+    codex_inherited_usage_records_skipped: u64,
+    codex_duplicate_usage_records_skipped: u64,
+    codex_cumulative_reset_count: u64,
+    // Identity of the last provider usage event, used only to collapse an
+    // exact repeated physical checkpoint. Cumulative totals alone are not an
+    // occurrence key: a restarted epoch can legitimately reach the same total.
+    codex_last_usage_event_identity: Option<String>,
+    // Legacy child initialization records are written immediately before the
+    // trigger marker. Keep only the bounded, usage-free suffix beginning at
+    // the last task_started so its turn model/tier/title state can be replayed
+    // as child-owned once the marker proves the boundary.
+    codex_legacy_bootstrap_buffer: Vec<Value>,
     // Exact sum of every usage record admitted to the wire projection. A
     // provider record that would overflow any u64 wire field is refused before
     // bucket mutation and counted as dropped, keeping the file retryable.
@@ -3861,6 +3975,26 @@ impl SnapshotAccumulator {
             codex_turn_traces: None,
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
+            codex_session_meta_seen: false,
+            codex_ownership_boundary: CodexOwnershipBoundary::Undetermined,
+            codex_legacy_trigger_seen: false,
+            codex_legacy_bootstrap_valid: true,
+            codex_parent_ownership_ledgers: None,
+            codex_parent_session_ref: None,
+            codex_parent_signatures: None,
+            codex_parent_ledger_identity_used: None,
+            codex_parent_signature_index: 0,
+            codex_physical_signatures: Vec::new(),
+            codex_physical_signatures_complete: true,
+            codex_ordinal_expected: None,
+            codex_ordinal_sequence_valid: true,
+            codex_owned_record_seen: false,
+            codex_is_fork: false,
+            codex_inherited_usage_records_skipped: 0,
+            codex_duplicate_usage_records_skipped: 0,
+            codex_cumulative_reset_count: 0,
+            codex_last_usage_event_identity: None,
+            codex_legacy_bootstrap_buffer: Vec::new(),
             accepted_usage_totals: UsageTotals::default(),
             usage_buckets: BTreeMap::new(),
             origin: SnapshotOrigin::default(),
@@ -3900,6 +4034,242 @@ impl SnapshotAccumulator {
             compaction_timestamps: Vec::new(),
             claude_compaction_observations: Vec::new(),
         }
+    }
+
+    fn configure_codex_ownership(&mut self, value: &Value) {
+        let Some(meta) = codex_session_meta_payload(value) else {
+            return;
+        };
+        if self.codex_ownership_boundary != CodexOwnershipBoundary::Undetermined {
+            return;
+        }
+
+        let thread_source = string_at(meta, &["thread_source"]);
+        let source_subagent = meta
+            .get("source")
+            .and_then(Value::as_object)
+            .is_some_and(|source| source.contains_key("subagent"));
+        let is_subagent = thread_source.as_deref() == Some("subagent") || source_subagent;
+        let forked_from_id = string_at(meta, &["forked_from_id"]);
+        self.codex_parent_session_ref = forked_from_id.clone();
+        let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
+        let exact_start = u64_at(meta, &["subagent_history_start_ordinal"]);
+        self.codex_is_fork = forked_from_id.is_some() || has_history_base || exact_start.is_some();
+
+        self.codex_ownership_boundary = if let Some(start) = exact_start {
+            self.codex_ordinal_expected = Some(0);
+            CodexOwnershipBoundary::Ordinal { start }
+        } else if has_history_base {
+            // Paginated forks keep inherited history behind an external
+            // history_base reference. Physical records in this file are local.
+            CodexOwnershipBoundary::AllLocal
+        } else if is_subagent && forked_from_id.is_some() {
+            CodexOwnershipBoundary::AwaitingLegacyTrigger
+        } else if !is_subagent && forked_from_id.is_some() {
+            let parent_ledger = forked_from_id.as_deref().and_then(|parent_id| {
+                self.codex_parent_ownership_ledgers
+                    .as_ref()
+                    .and_then(|ledgers| ledgers.lock().ok())
+                    .and_then(|ledgers| ledgers.get(parent_id).cloned())
+                    .filter(|ledger| ledger.complete && !ledger.signatures.is_empty())
+            });
+            if let Some(parent_ledger) = parent_ledger {
+                self.codex_parent_ledger_identity_used = Some(parent_ledger.opened_object_identity);
+                self.codex_parent_signatures = Some(parent_ledger.signatures);
+                CodexOwnershipBoundary::AwaitingParentPrefix
+            } else {
+                // Missing, partial, or overflowed parent evidence is not a
+                // boundary. The scan records the parent ref and retries after
+                // a bounded structural prepass has populated its ledger.
+                CodexOwnershipBoundary::AmbiguousFork
+            }
+        } else {
+            CodexOwnershipBoundary::AllLocal
+        };
+    }
+
+    fn codex_record_is_owned(&mut self, value: &Value) -> bool {
+        match self.codex_ownership_boundary {
+            CodexOwnershipBoundary::Undetermined => {
+                // A reordered or partially-written file may expose usage
+                // before its authoritative session header. Treating that
+                // prefix as local would defeat fork isolation.
+                false
+            }
+            CodexOwnershipBoundary::AllLocal => {
+                self.codex_owned_record_seen = true;
+                true
+            }
+            CodexOwnershipBoundary::AwaitingLegacyTrigger => {
+                if codex_legacy_trigger_turn(value) {
+                    self.codex_legacy_trigger_seen = true;
+                    self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+                    self.codex_owned_record_seen = true;
+                    true
+                } else {
+                    self.note_legacy_bootstrap_candidate(value);
+                    self.note_inherited_codex_record(value);
+                    false
+                }
+            }
+            CodexOwnershipBoundary::AwaitingParentPrefix => {
+                let signature = codex_ownership_signature(value);
+                let expected = self.codex_parent_signatures.as_ref();
+                match signature {
+                    Some(signature)
+                        if expected
+                            .and_then(|values| values.get(self.codex_parent_signature_index))
+                            == Some(&signature) =>
+                    {
+                        self.codex_parent_signature_index += 1;
+                        self.codex_legacy_bootstrap_buffer.clear();
+                        self.note_inherited_codex_record(value);
+                        false
+                    }
+                    Some(_) if self.codex_parent_signature_index > 0 => {
+                        // A non-empty ordered common prefix proves copied
+                        // history; the first divergent turn/usage signature is
+                        // the child's first provider-owned occurrence.
+                        self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+                        self.codex_owned_record_seen = true;
+                        true
+                    }
+                    Some(_) => {
+                        self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                        self.note_inherited_codex_record(value);
+                        false
+                    }
+                    None => {
+                        if self.codex_parent_signature_index > 0 {
+                            const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
+                            if self.codex_legacy_bootstrap_buffer.len()
+                                == MAX_BOUNDARY_BUFFER_RECORDS
+                            {
+                                self.codex_legacy_bootstrap_buffer.clear();
+                                self.codex_legacy_bootstrap_valid = false;
+                                self.codex_ownership_boundary =
+                                    CodexOwnershipBoundary::AmbiguousFork;
+                            } else {
+                                self.codex_legacy_bootstrap_buffer.push(value.clone());
+                            }
+                        }
+                        self.note_inherited_codex_record(value);
+                        false
+                    }
+                }
+            }
+            CodexOwnershipBoundary::Ordinal { start } => {
+                let Some(ordinal) = u64_at(value, &["ordinal"]) else {
+                    self.codex_ordinal_sequence_valid = false;
+                    return false;
+                };
+                if self.codex_ordinal_expected != Some(ordinal) {
+                    self.codex_ordinal_sequence_valid = false;
+                }
+                self.codex_ordinal_expected = ordinal.checked_add(1);
+                if ordinal < start {
+                    self.note_inherited_codex_record(value);
+                    false
+                } else {
+                    self.codex_owned_record_seen = true;
+                    true
+                }
+            }
+            CodexOwnershipBoundary::AmbiguousFork => {
+                self.note_inherited_codex_record(value);
+                false
+            }
+        }
+    }
+
+    fn note_inherited_codex_record(&mut self, value: &Value) {
+        if let Some(usage) = codex_total_usage(value) {
+            if !usage.is_zero() {
+                self.codex_inherited_usage_records_skipped =
+                    self.codex_inherited_usage_records_skipped.saturating_add(1);
+            }
+            // The last inherited cumulative is the baseline for legacy records
+            // that predate `last_token_usage`. It never enters a usage bucket.
+            self.session_cumulative_usage = Some(usage);
+        }
+    }
+
+    fn note_legacy_bootstrap_candidate(&mut self, value: &Value) {
+        const MAX_BOOTSTRAP_RECORDS: usize = 64;
+        if codex_total_usage(value).is_some() {
+            // A completed response proves this was still a copied parent task.
+            self.codex_legacy_bootstrap_buffer.clear();
+            self.codex_legacy_bootstrap_valid = true;
+            return;
+        }
+        let task_started = string_eq_at(value, &["payload", "type"], "task_started");
+        if task_started {
+            self.codex_legacy_bootstrap_buffer.clear();
+            self.codex_legacy_bootstrap_valid = true;
+        }
+        if task_started || !self.codex_legacy_bootstrap_buffer.is_empty() {
+            if self.codex_legacy_bootstrap_buffer.len() == MAX_BOOTSTRAP_RECORDS {
+                self.codex_legacy_bootstrap_buffer.clear();
+                self.codex_legacy_bootstrap_valid = false;
+                return;
+            }
+            self.codex_legacy_bootstrap_buffer.push(value.clone());
+        }
+    }
+
+    fn codex_usage_accounting_complete(&self) -> bool {
+        match self.codex_ownership_boundary {
+            CodexOwnershipBoundary::Undetermined => false,
+            CodexOwnershipBoundary::AllLocal => {
+                !self.codex_legacy_trigger_seen || self.codex_legacy_bootstrap_valid
+            }
+            CodexOwnershipBoundary::Ordinal { start } => {
+                self.codex_ordinal_sequence_valid
+                    && self.codex_owned_record_seen
+                    && self.codex_ordinal_expected.is_some_and(|next| next > start)
+            }
+            CodexOwnershipBoundary::AwaitingLegacyTrigger
+            | CodexOwnershipBoundary::AwaitingParentPrefix
+            | CodexOwnershipBoundary::AmbiguousFork => false,
+        }
+    }
+
+    fn codex_parent_resolution_pending(&self) -> bool {
+        self.codex_parent_session_ref.is_some()
+            && self.codex_parent_signatures.is_none()
+            && matches!(
+                self.codex_ownership_boundary,
+                CodexOwnershipBoundary::AmbiguousFork
+                    | CodexOwnershipBoundary::AwaitingParentPrefix
+            )
+    }
+
+    fn note_codex_physical_signature(&mut self, value: &Value) {
+        let Some(signature) = codex_ownership_signature(value) else {
+            return;
+        };
+        if self.codex_physical_signatures.len() == MAX_CODEX_PARENT_LEDGER_SIGNATURES {
+            self.codex_physical_signatures.clear();
+            self.codex_physical_signatures_complete = false;
+            return;
+        }
+        if self.codex_physical_signatures_complete {
+            self.codex_physical_signatures.push(signature);
+        }
+    }
+
+    fn codex_parent_ownership_ledger(&self) -> Option<(String, CodexParentOwnershipLedger)> {
+        let session_id = self.source_session_id.clone()?;
+        Some((
+            session_id,
+            CodexParentOwnershipLedger {
+                signatures: self.codex_physical_signatures.clone(),
+                complete: self.codex_session_meta_seen
+                    && self.codex_physical_signatures_complete
+                    && !self.codex_physical_signatures.is_empty(),
+                opened_object_identity: String::new(),
+            },
+        ))
     }
 
     /// Merge newly scraped artifacts, deduping and capping at
@@ -4348,10 +4718,16 @@ impl SnapshotAccumulator {
         }
     }
 
+    // Usage ownership needs the event identity, selector, activity time, and
+    // effort beside both cumulative and last-response counters. Keeping these
+    // inputs together makes the one-occurrence accounting invariant explicit.
+    #[allow(clippy::too_many_arguments)]
     fn set_cumulative_usage_with_selector(
         &mut self,
         model: Option<String>,
         usage: UsageTotals,
+        last_usage: Option<UsageTotals>,
+        usage_event_identity: Option<String>,
         selector: SelectorCapture,
         timestamp: Option<&str>,
         // Override the delta's request_count when the upstream cumulative did
@@ -4364,33 +4740,46 @@ impl SnapshotAccumulator {
         // Per-turn reasoning effort tier (Codex), attached to the same usage row.
         effort: Option<String>,
     ) -> Option<UsageTotals> {
-        if usage.is_zero() {
-            return None;
-        }
         let resolved_model = model
             .or_else(|| self.latest_model.clone())
             .unwrap_or_else(|| "unknown".to_string());
         self.latest_model = Some(resolved_model.clone());
-        // Codex (the only caller today) emits SESSION-wide cumulative totals.
-        // Detect rollover at the session level — a mid-session selector change
-        // (e.g. plan_window_bucket rollover) must not be treated as a restart.
-        let mut delta = match self.session_cumulative_usage.as_ref() {
-            Some(previous) if usage.is_monotonic_after(previous) => usage.delta_from(previous),
-            Some(_) => {
-                // Non-monotonic: treat as a session restart. Clear all
-                // buckets and their exact session-wide sum because the
-                // cumulative was invalidated. Keeping the pre-restart sum
-                // would detach the top-level totals from the replacement
-                // buckets and make this otherwise valid file fail preflight.
-                self.usage_buckets.clear();
-                self.accepted_usage_totals = UsageTotals::default();
-                usage.clone()
-            }
-            None => usage.clone(),
+        // Only an exact repeated physical usage event is a duplicate. Equal
+        // cumulative totals are not an occurrence identity: after a restart,
+        // a new response can legitimately bring the new epoch to the same
+        // counters while `last_token_usage` proves positive work.
+        if usage_event_identity.is_some()
+            && usage_event_identity == self.codex_last_usage_event_identity
+        {
+            self.codex_duplicate_usage_records_skipped =
+                self.codex_duplicate_usage_records_skipped.saturating_add(1);
+            return None;
+        }
+        if usage_event_identity.is_some() {
+            self.codex_last_usage_event_identity = usage_event_identity;
+        }
+
+        // `last_token_usage` is Codex's exact current-response usage and stays
+        // correct across compaction/restart resets. Older rollouts lack it; in
+        // that case use a cumulative delta, beginning a new additive epoch on
+        // a reset. Never erase usage already accepted from the same rollout.
+        let previous = self.session_cumulative_usage.as_ref();
+        let reset = previous.is_some_and(|previous| !usage.is_monotonic_after(previous));
+        if reset {
+            self.codex_cumulative_reset_count = self.codex_cumulative_reset_count.saturating_add(1);
+        }
+        let mut delta = match last_usage {
+            Some(last) => last,
+            None => match previous {
+                Some(previous) if !reset => usage.delta_from(previous),
+                Some(_) | None => usage.clone(),
+            },
         };
         self.session_cumulative_usage = Some(usage.clone());
-        if let Some(count) = implicit_request_count {
-            delta.request_count = count;
+        if !delta.is_zero() {
+            if let Some(count) = implicit_request_count {
+                delta.request_count = count;
+            }
         }
         if delta.is_zero() {
             return None;
@@ -4436,6 +4825,11 @@ impl SnapshotAccumulator {
         else {
             return Vec::new();
         };
+        if self.source == SnapshotSource::Codex && !self.codex_usage_accounting_complete() {
+            return Vec::new();
+        }
+        let codex_usage_accounting_proven =
+            self.source == SnapshotSource::Codex && self.codex_session_meta_seen;
         // A Claude Code subagent transcript (Task tool or Workflow tool) shares
         // its parent's `sessionId`; re-key it from its PATH to a distinct id so
         // it ingests as its own `isSidechain=true` (ai_agent) session instead of
@@ -4612,6 +5006,8 @@ impl SnapshotAccumulator {
             reasoning_output_tokens: totals.reasoning_output_tokens,
             unattributed_total_tokens: totals.unattributed_total_tokens,
             request_count: totals.request_count,
+            usage_accounting_contract: codex_usage_accounting_proven
+                .then(|| "session_exclusive_reported_usage:v1".to_string()),
             claude_usage_request_ids: self.claude_usage_request_ids,
             avg_duration_ms: (self.latency_duration_ms_count > 0)
                 .then(|| self.latency_duration_ms_sum / self.latency_duration_ms_count),
@@ -5047,6 +5443,119 @@ fn scan_source_roots_with_limit(
     )
 }
 
+/// Return only persisted parent-prefix ledgers whose exact rollout object is
+/// still current. Parent files are sampled through the same no-follow,
+/// opened-object identity path as normal parsing. A missing, duplicated,
+/// replaced, or appended parent is deliberately omitted: the child remains
+/// retryable until a normal parent parse publishes fresh structural evidence.
+fn validated_codex_parent_ownership_ledgers(
+    index: &ScanIndex,
+    scan_roots: &[PathBuf],
+    frozen_census_paths: &BTreeSet<String>,
+) -> BTreeMap<String, CodexParentOwnershipLedger> {
+    let mut validated = BTreeMap::new();
+    for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
+        if !ledger.complete
+            || ledger.signatures.is_empty()
+            || ledger.opened_object_identity.is_empty()
+        {
+            continue;
+        }
+        if current_codex_parent_opened_identity(scan_roots, frozen_census_paths, session_id)
+            .as_deref()
+            == Some(ledger.opened_object_identity.as_str())
+        {
+            validated.insert(session_id.clone(), ledger.clone());
+        }
+    }
+    validated
+}
+
+fn current_codex_parent_opened_identity(
+    scan_roots: &[PathBuf],
+    frozen_census_paths: &BTreeSet<String>,
+    session_id: &str,
+) -> Option<String> {
+    let mut matching_paths = frozen_census_paths.iter().filter_map(|key| {
+        let path = PathBuf::from(key);
+        (codex_session_id_from_path(&path).as_deref() == Some(session_id)).then_some(path)
+    });
+    let path = matching_paths.next()?;
+    // More than one physical rollout claiming the same source session id is
+    // ambiguous evidence, even if one happens to match the old witness.
+    if matching_paths.next().is_some() {
+        return None;
+    }
+    let scan_root = scan_roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()?;
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex)
+    {
+        return None;
+    }
+    let modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(unix_seconds)
+        .unwrap_or_default();
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(unix_nanos)
+        .unwrap_or_else(|| modified_unix_seconds.saturating_mul(1_000_000_000));
+    let mut candidate = CandidateFile {
+        scan_root,
+        path,
+        size_bytes: metadata.len(),
+        modified_unix_seconds,
+        modified_unix_nanos,
+        source_file_fingerprint: String::new(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let _file = open_candidate_file(SnapshotSource::Codex, &mut candidate).ok()?;
+    Some(candidate.opened_object_identity)
+}
+
+fn invalidate_stale_codex_parent_resolution(
+    parsed: &mut ParsedJsonlFile,
+    scan_roots: &[PathBuf],
+    frozen_census_paths: &BTreeSet<String>,
+) -> bool {
+    let Some(used_identity) = parsed.codex_parent_ledger_identity_used.as_deref() else {
+        return false;
+    };
+    let parent_is_still_current = parsed
+        .codex_parent_session_ref
+        .as_deref()
+        .and_then(|parent_id| {
+            current_codex_parent_opened_identity(scan_roots, frozen_census_paths, parent_id)
+        })
+        .as_deref()
+        == Some(used_identity);
+    if parent_is_still_current {
+        return false;
+    }
+    // The parent changed after the scan-time prevalidation but before/during
+    // this child parse. Refuse both the child usage and its transitive ledger
+    // so no derived state can make the stale boundary durable. A later page
+    // reparses the parent and retries the unchanged child.
+    parsed.snapshots.clear();
+    parsed.codex_parent_resolution_pending = true;
+    parsed.zero_snapshot_usage_evidence = false;
+    if let Some((_, ledger)) = parsed.codex_parent_ownership_ledger.as_mut() {
+        ledger.complete = false;
+        ledger.signatures.clear();
+    }
+    true
+}
+
 #[cfg(test)]
 pub(crate) fn scan_source_roots_with_test_limit(
     source: SnapshotSource,
@@ -5125,9 +5634,48 @@ fn scan_source_roots_with_limit_and_attribution(
             ))
         });
     ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
+    {
+        let traversal = index.traversal.as_mut().expect("traversal initialized");
+        enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
+        advance_bounded_directory_traversal(source, traversal, backfill_window_days);
+    }
+    let codex_parent_validation_roots = if source == SnapshotSource::Codex {
+        index
+            .traversal
+            .as_ref()
+            .map(|traversal| traversal.scan_roots.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // Parent identity is not unique until the frozen directory census has
+    // visited every directory. Keep ordinary fork ownership red on earlier
+    // pages; once discovery completes, observed_index_keys is the authoritative
+    // current population, including candidates not yet parsed in this page.
+    let codex_parent_frozen_census_paths = if source == SnapshotSource::Codex {
+        index
+            .traversal
+            .as_ref()
+            .filter(|traversal| {
+                traversal.pending_directories.is_empty()
+                    && traversal.counts.directory_entry_cap_exceeded_count == 0
+                    && traversal.counts.symlink_rejected_count == 0
+                    && traversal.counts.unreadable_path_count == 0
+                    && traversal.counts.disappeared_file_count == 0
+            })
+            .map(|traversal| traversal.codex_rollout_paths.clone())
+            .unwrap_or_default()
+    } else {
+        BTreeSet::new()
+    };
+    let codex_parent_ownership_ledgers = (source == SnapshotSource::Codex).then(|| {
+        Arc::new(Mutex::new(validated_codex_parent_ownership_ledgers(
+            index,
+            &codex_parent_validation_roots,
+            &codex_parent_frozen_census_paths,
+        )))
+    });
     let traversal = index.traversal.as_mut().expect("traversal initialized");
-    enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
-    advance_bounded_directory_traversal(source, traversal, backfill_window_days);
     let census_window_end = traversal.census_window_end.clone();
     let discovered_file_count = traversal.counts.discovered_file_count;
     let mut pending_paths = Vec::new();
@@ -5277,6 +5825,8 @@ fn scan_source_roots_with_limit_and_attribution(
     let mut scanned_file_count = 0;
     let mut scanned_session_count = 0;
     let mut semantic_noop_count = 0;
+    let mut codex_state_only_blocked_session_ids = BTreeSet::new();
+    let mut codex_parent_resolution_retry_required = false;
     let mut pending_finalization = Vec::new();
     for mut candidate in files {
         let opened_file = match open_candidate_file(source, &mut candidate) {
@@ -5327,7 +5877,22 @@ fn scan_source_roots_with_limit_and_attribution(
             &session_sidecar_fingerprint,
             &candidate.opened_object_identity,
         );
-        let decision = index.candidate_decision(&candidate);
+        let mut decision = index.candidate_decision(&candidate);
+        if source == SnapshotSource::Codex
+            && decision == CandidateDecision::Skip
+            && codex_session_id_from_path(&candidate.path).is_some_and(|session_id| {
+                index.codex_parent_ownership_refs.contains(&session_id)
+                    && !index
+                        .codex_parent_ownership_ledgers
+                        .get(&session_id)
+                        .is_some_and(|ledger| ledger.complete)
+            })
+        {
+            // An unresolved child requested this unchanged parent after its
+            // earlier page had already passed. Reparse only that parent to
+            // populate bounded structural evidence.
+            decision = CandidateDecision::Parse;
+        }
         match decision {
             CandidateDecision::Skip => continue,
             CandidateDecision::Migrate => {
@@ -5351,6 +5916,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 Some(&codex_title_metadata),
                 None,
                 codex_turn_traces.clone(),
+                codex_parent_ownership_ledgers.clone(),
                 true,
                 attribution_context,
             ),
@@ -5364,6 +5930,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 apply_claude_code_line,
                 None,
                 Some(&claude_title_metadata),
+                None,
                 None,
                 artifacts_enabled,
                 attribution_context,
@@ -5379,18 +5946,64 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 None,
                 None,
+                None,
                 true,
                 attribution_context,
             ),
         };
-        let parsed_file = match parsed_file {
+        let mut parsed_file = match parsed_file {
             Ok(parsed) => parsed,
             Err(_) => {
                 census.unreadable_path_count += 1;
                 continue;
             }
         };
+        invalidate_stale_codex_parent_resolution(
+            &mut parsed_file,
+            &codex_parent_validation_roots,
+            &codex_parent_frozen_census_paths,
+        );
+        codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
         let parse_complete = parsed_file.complete();
+        if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
+            if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
+                || index
+                    .codex_parent_ownership_refs
+                    .contains(parent_session_ref)
+            {
+                index
+                    .codex_parent_ownership_refs
+                    .insert(parent_session_ref.clone());
+            }
+        }
+        if let Some((session_id, ledger)) = parsed_file.codex_parent_ownership_ledger.as_ref() {
+            let ledger_is_unique_current_parent = ledger.complete
+                && current_codex_parent_opened_identity(
+                    &codex_parent_validation_roots,
+                    &codex_parent_frozen_census_paths,
+                    session_id,
+                )
+                .as_deref()
+                    == Some(ledger.opened_object_identity.as_str());
+            if index.codex_parent_ownership_refs.contains(session_id)
+                && ledger_is_unique_current_parent
+            {
+                index
+                    .codex_parent_ownership_ledgers
+                    .insert(session_id.clone(), ledger.clone());
+                if let Some(shared) = codex_parent_ownership_ledgers.as_ref() {
+                    if let Ok(mut shared) = shared.lock() {
+                        shared.insert(session_id.clone(), ledger.clone());
+                    }
+                }
+            }
+        }
+        if let Some(session_id) = parsed_file.state_only_blocked_session_id.as_ref() {
+            codex_state_only_blocked_session_ids.insert(session_id.clone());
+            index
+                .codex_state_only_blocked_session_ids
+                .insert(session_id.clone());
+        }
         let report = parsed_file.report;
         let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
         let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
@@ -5399,6 +6012,15 @@ fn scan_source_roots_with_limit_and_attribution(
         if source == SnapshotSource::Codex {
             for snapshot in parsed.iter_mut() {
                 apply_codex_state_evidence(snapshot, &codex_title_metadata);
+            }
+            for snapshot in &parsed {
+                if snapshot.usage_accounting_contract.as_deref()
+                    == Some("session_exclusive_reported_usage:v1")
+                {
+                    index
+                        .codex_state_only_blocked_session_ids
+                        .remove(snapshot.source_session_id.as_str());
+                }
             }
         }
         scanned_session_count += parsed.len();
@@ -5441,6 +6063,7 @@ fn scan_source_roots_with_limit_and_attribution(
         }
     }
     if let Some(traversal) = index.traversal.as_mut() {
+        traversal.codex_parent_resolution_retry_required |= codex_parent_resolution_retry_required;
         // Exact watcher remove/rename hints must amend the same durable
         // observation set used by directory census reconciliation. Apply
         // removals first so a valid observation later in this page wins.
@@ -5496,7 +6119,14 @@ fn scan_source_roots_with_limit_and_attribution(
     } else {
         false
     };
-    if source == SnapshotSource::Codex {
+    if source == SnapshotSource::Codex
+        && traversal_discovery_done
+        && traversal_healthy
+        && clean_frozen_generation
+        && state_census_complete
+        && sidecar_census_complete
+        && reconciliation_complete
+    {
         // Reconcile authoritative transcript deletions before deciding which
         // state-database threads are file-backed. Otherwise a vanished rollout
         // remains "covered" for this whole generation, the state-only fallback
@@ -5507,16 +6137,21 @@ fn scan_source_roots_with_limit_and_attribution(
             &codex_title_metadata,
             collected_at,
             index,
+            &codex_state_only_blocked_session_ids,
         );
         scanned_session_count += state_only_scanned;
         semantic_noop_count += state_only_noops;
     }
+    let parent_resolution_restart = traversal_discovery_done
+        && traversal_snapshot.pending_candidates.is_empty()
+        && traversal_snapshot.codex_parent_resolution_retry_required;
     let raw_census_complete = traversal_discovery_done
         && traversal_healthy
         && clean_frozen_generation
         && state_census_complete
         && sidecar_census_complete
-        && reconciliation_complete;
+        && reconciliation_complete
+        && !parent_resolution_restart;
     let needs_clean_followup = raw_census_complete && index.bounded_sweep_had_unsettled_upload;
     let census_complete = raw_census_complete && !needs_clean_followup;
     let reconciliation_pending = traversal_discovery_done
@@ -5557,8 +6192,9 @@ fn scan_source_roots_with_limit_and_attribution(
     let pending_work_count = pending_work_count
         .saturating_add(usize::from(restart_after_hints))
         .saturating_add(usize::from(terminal_unhealthy))
-        .saturating_add(usize::from(needs_clean_followup));
-    if raw_census_complete || restart_after_hints {
+        .saturating_add(usize::from(needs_clean_followup))
+        .saturating_add(usize::from(parent_resolution_restart));
+    if raw_census_complete || restart_after_hints || parent_resolution_restart {
         index.traversal = None;
         index.resume_after_path = None;
         index.resume_upper_bound_path = None;
@@ -5616,7 +6252,12 @@ fn append_codex_state_only_snapshots(
     metadata: &CodexTitleMetadata,
     collected_at: &str,
     index: &mut ScanIndex,
+    blocked_session_ids: &BTreeSet<String>,
 ) -> (usize, usize) {
+    let blocked_session_ids = blocked_session_ids
+        .union(&index.codex_state_only_blocked_session_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let covered_session_ids: BTreeSet<String> = snapshots
         .iter()
         .map(|snapshot| snapshot.source_session_id.clone())
@@ -5646,6 +6287,10 @@ fn append_codex_state_only_snapshots(
         if thread.tokens_used == 0
             || covered_session_ids.contains(source_session_id)
             || covered_in_prior_runs.contains(source_session_id)
+            || blocked_session_ids.contains(source_session_id)
+            || metadata
+                .family_position(source_session_id.as_str())
+                .is_some()
         {
             continue;
         }
@@ -5735,6 +6380,7 @@ fn codex_state_only_snapshot(
         reasoning_output_tokens: 0,
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
+        usage_accounting_contract: None,
         claude_usage_request_ids: BTreeSet::new(),
         avg_duration_ms: None,
         avg_time_to_first_token_ms: None,
@@ -6016,6 +6662,7 @@ fn parse_jsonl_file(
         codex_title_metadata,
         claude_title_metadata,
         codex_turn_traces,
+        None,
         artifacts_enabled,
         attribution_context,
     )?;
@@ -6031,11 +6678,25 @@ struct ParsedJsonlFile {
     recognized_usage_drop_count: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
+    /// A rollout whose exclusive ownership could not be proven must not fall
+    /// through to the inclusive state_5.sqlite tokens_used snapshot.
+    state_only_blocked_session_id: Option<String>,
+    codex_parent_session_ref: Option<String>,
+    /// Exact parent object whose ledger authorized an ordinary fork boundary.
+    /// The scanner rechecks it immediately after the child parse before any
+    /// derived usage or child ledger can enter scan state.
+    codex_parent_ledger_identity_used: Option<String>,
+    /// Missing parent prepass evidence is expected bounded retry work, not a
+    /// malformed/lossy transcript. It still keeps the file uncommittable.
+    codex_parent_resolution_pending: bool,
+    codex_parent_ownership_ledger: Option<(String, CodexParentOwnershipLedger)>,
 }
 
 impl ParsedJsonlFile {
     fn complete(&self) -> bool {
-        self.report.complete() && self.recognized_usage_drop_count == 0
+        self.report.complete()
+            && self.recognized_usage_drop_count == 0
+            && !self.codex_parent_resolution_pending
     }
 }
 
@@ -6051,6 +6712,9 @@ fn parse_opened_jsonl_file(
     codex_title_metadata: Option<&CodexTitleMetadata>,
     claude_title_metadata: Option<&ClaudeTitleMetadata>,
     codex_turn_traces: Option<Arc<CodexTurnTraceMap>>,
+    codex_parent_ownership_ledgers: Option<
+        Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>,
+    >,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
 ) -> Result<ParsedJsonlFile> {
@@ -6062,6 +6726,7 @@ fn parse_opened_jsonl_file(
     let mut accumulator = SnapshotAccumulator::new(source);
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
+    accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
     let mut recognized_usage_drop_count = 0;
     let mut positive_recognized_usage_count: usize = 0;
     let mut positive_usage_evidence = false;
@@ -6113,6 +6778,37 @@ fn parse_opened_jsonl_file(
     let accumulator_dropped_usage_record_count = accumulator.dropped_usage_record_count as usize;
     recognized_usage_drop_count =
         recognized_usage_drop_count.saturating_add(accumulator_dropped_usage_record_count);
+    let codex_ownership_incomplete =
+        source == SnapshotSource::Codex && !accumulator.codex_usage_accounting_complete();
+    let codex_parent_resolution_pending =
+        codex_ownership_incomplete && accumulator.codex_parent_resolution_pending();
+    if codex_ownership_incomplete && !codex_parent_resolution_pending {
+        // Keep the candidate retryable even when the ambiguous/incomplete
+        // rollout contains no recognized positive usage. Otherwise it could be
+        // indexed as confirmed-empty and fall through to inclusive SQLite state
+        // on the next scan generation.
+        recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(1);
+    }
+    let state_only_blocked_session_id = (codex_ownership_incomplete || accumulator.codex_is_fork)
+        .then(|| {
+            accumulator
+                .source_session_id
+                .clone()
+                .or_else(|| codex_session_id_from_path(path))
+        })
+        .flatten();
+    let codex_parent_session_ref = accumulator.codex_parent_session_ref.clone();
+    let codex_parent_ledger_identity_used = accumulator.codex_parent_ledger_identity_used.clone();
+    let mut codex_parent_ownership_ledger = accumulator.codex_parent_ownership_ledger();
+    if let Some((_, ledger)) = codex_parent_ownership_ledger.as_mut() {
+        ledger.opened_object_identity = expected_opened_object_identity.to_string();
+    }
+    if !report.complete() || recognized_usage_drop_count > 0 || codex_parent_resolution_pending {
+        if let Some((_, ledger)) = codex_parent_ownership_ledger.as_mut() {
+            ledger.complete = false;
+            ledger.signatures.clear();
+        }
+    }
     let snapshots = accumulator.into_items(
         path,
         collected_at,
@@ -6123,8 +6819,9 @@ fn parse_opened_jsonl_file(
     // entity is still loss. Typical causes are an absent/unparseable activity
     // timestamp or an identity shape the accumulator cannot settle. Treat the
     // whole file as retryable instead of persisting it as confirmed-empty.
-    let zero_snapshot_usage_evidence = snapshots.is_empty() && positive_usage_evidence;
-    if snapshots.is_empty() {
+    let zero_snapshot_usage_evidence =
+        snapshots.is_empty() && positive_usage_evidence && !codex_parent_resolution_pending;
+    if snapshots.is_empty() && !codex_parent_resolution_pending {
         recognized_usage_drop_count = recognized_usage_drop_count.saturating_add(
             positive_recognized_usage_count.saturating_sub(accumulator_dropped_usage_record_count),
         );
@@ -6138,6 +6835,11 @@ fn parse_opened_jsonl_file(
         recognized_usage_drop_count,
         zero_snapshot_usage_evidence,
         dropped_usage_record_count: recognized_usage_drop_count as u64,
+        state_only_blocked_session_id,
+        codex_parent_session_ref,
+        codex_parent_ledger_identity_used,
+        codex_parent_resolution_pending,
+        codex_parent_ownership_ledger,
     })
 }
 
@@ -7012,7 +7714,70 @@ fn bounded_activity_counts(
     rows
 }
 
+fn codex_session_meta_payload(value: &Value) -> Option<&Value> {
+    if string_eq_at(value, &["type"], "session_meta") {
+        return value.get("payload");
+    }
+    value.pointer("/session_meta/payload")
+}
+
+fn codex_legacy_trigger_turn(value: &Value) -> bool {
+    string_eq_at(value, &["type"], "inter_agent_communication_metadata")
+        && value
+            .pointer("/payload/trigger_turn")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+/// Capture the first physical header before applying the ownership boundary.
+/// Copied parent `session_meta` records later in legacy full-history forks are
+/// deliberately ignored, so identity and graph evidence cannot be overwritten
+/// by inherited context.
+fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    let Some(meta) = codex_session_meta_payload(value) else {
+        return;
+    };
+    if accumulator.codex_session_meta_seen {
+        return;
+    }
+    accumulator.source_session_id = string_at(meta, &["id"])
+        .or_else(|| string_at(meta, &["session_id"]))
+        .or_else(|| accumulator.source_session_id.clone());
+    accumulator.origin.thread_source = string_at(meta, &["thread_source"]);
+    if let Some(src) = meta.get("source") {
+        if let Some(text) = src.as_str() {
+            accumulator.origin.source = Some(text.to_string());
+        } else if src.is_object() {
+            accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
+            accumulator.origin.parent_session_ref =
+                string_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
+                    .or_else(|| string_at(meta, &["parent_thread_id"]));
+        }
+    }
+    accumulator.origin.originator = string_at(meta, &["originator"]);
+    accumulator.origin.agent_role =
+        string_at(meta, &["agent_role"]).or_else(|| string_at(meta, &["agent_type"]));
+    accumulator.set_workspace_hash(string_at(meta, &["cwd"]));
+    accumulator
+        .note_time(string_at(value, &["timestamp"]).or_else(|| string_at(meta, &["timestamp"])));
+    accumulator.codex_session_meta_seen = true;
+}
+
 fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
+    accumulator.note_codex_physical_signature(value);
+    apply_codex_envelope_line(value, accumulator);
+    accumulator.configure_codex_ownership(value);
+    if !accumulator.codex_record_is_owned(value) {
+        return;
+    }
+    let bootstrap = std::mem::take(&mut accumulator.codex_legacy_bootstrap_buffer);
+    for bootstrap_value in &bootstrap {
+        apply_codex_owned_line(bootstrap_value, accumulator);
+    }
+    apply_codex_owned_line(value, accumulator);
+}
+
+fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["session_meta", "payload", "id"])
             .or_else(|| string_at(value, &["payload", "id"]))
@@ -7151,6 +7916,8 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
                 .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
                 .or_else(|| string_at(value, &["payload", "model"])),
             usage,
+            codex_last_usage(value),
+            codex_usage_event_identity(value),
             usage_selector,
             timestamp.as_deref(),
             implicit_request_count,
@@ -7900,6 +8667,62 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| value.pointer("/payload/info/total_token_usage"))
         .or_else(|| value.pointer("/payload/total_token_usage"))
         .or_else(|| value.pointer("/total_token_usage"))?;
+    codex_usage_from_root(root, true)
+}
+
+fn codex_last_usage(value: &Value) -> Option<UsageTotals> {
+    let root = value
+        .pointer("/token_count/info/last_token_usage")
+        .or_else(|| value.pointer("/payload/info/last_token_usage"))
+        .or_else(|| value.pointer("/payload/last_token_usage"))
+        .or_else(|| value.pointer("/last_token_usage"))?;
+    codex_usage_from_root(root, false)
+}
+
+fn codex_usage_event_identity(value: &Value) -> Option<String> {
+    // The digest never leaves this file accumulator. Hash the complete
+    // content-free token_count record so an exact duplicated physical line is
+    // idempotent without pretending that equal cumulative counters identify a
+    // provider response. Native ordinals naturally participate when present.
+    codex_last_usage(value)?;
+    let event = value.to_string();
+    Some(sha256_hex(&["codex_usage_event:v1", event.as_str()]))
+}
+
+fn codex_ownership_signature(value: &Value) -> Option<String> {
+    if string_eq_at(value, &["type"], "turn_context") {
+        let turn_id = string_at(value, &["payload", "turn_id"])?;
+        let model = string_at(value, &["payload", "model"]).unwrap_or_default();
+        let effort = codex_reasoning_effort(value).unwrap_or_default();
+        return Some(sha256_hex(&[
+            "codex_parent_turn:v1",
+            turn_id.as_str(),
+            model.as_str(),
+            effort.as_str(),
+        ]));
+    }
+    let total = codex_total_usage(value)?;
+    let last = codex_last_usage(value).unwrap_or_default();
+    let model = string_at(value, &["payload", "info", "model"])
+        .or_else(|| string_at(value, &["token_count", "info", "model"]))
+        .unwrap_or_default();
+    Some(sha256_hex(&[
+        "codex_parent_usage:v1",
+        model.as_str(),
+        total.input_tokens.to_string().as_str(),
+        total.cache_read_tokens.to_string().as_str(),
+        total.output_tokens.to_string().as_str(),
+        total.reasoning_output_tokens.to_string().as_str(),
+        total.request_count.to_string().as_str(),
+        last.input_tokens.to_string().as_str(),
+        last.cache_read_tokens.to_string().as_str(),
+        last.output_tokens.to_string().as_str(),
+        last.reasoning_output_tokens.to_string().as_str(),
+        last.request_count.to_string().as_str(),
+    ]))
+}
+
+fn codex_usage_from_root(root: &Value, cumulative: bool) -> Option<UsageTotals> {
     if !usage_object_has_numeric_field(
         root,
         &[
@@ -7911,6 +8734,7 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
             "cached_input_tokens",
             "cachedInputTokens",
             "cache_write_tokens",
+            "cache_write_input_tokens",
             "cacheWriteTokens",
             "cache_creation_tokens",
             "cacheCreationInputTokens",
@@ -7944,20 +8768,26 @@ fn codex_total_usage(value: &Value) -> Option<UsageTotals> {
         // newer cache-write aliases now so a future CLI can become complete
         // without another wire-contract change.
         cache_creation_5m_tokens: u64_at(root, &["cache_write_tokens"])
+            .or_else(|| u64_at(root, &["cache_write_input_tokens"]))
             .or_else(|| u64_at(root, &["cacheWriteTokens"]))
             .or_else(|| u64_at(root, &["cache_creation_tokens"]))
             .or_else(|| u64_at(root, &["cacheCreationInputTokens"]))
-            .or_else(|| input_details.and_then(|details| u64_at(details, &["cache_write_tokens"])))
+            .or_else(|| {
+                input_details.and_then(|details| {
+                    u64_at(details, &["cache_write_tokens"])
+                        .or_else(|| u64_at(details, &["cache_write_input_tokens"]))
+                })
+            })
             .unwrap_or_default(),
         cache_creation_1h_tokens: 0,
         reasoning_output_tokens: u64_at(root, &["reasoning_output_tokens"]).unwrap_or_default(),
         unattributed_total_tokens: 0,
         request_count: u64_at(root, &["request_count"])
             .or_else(|| u64_at(root, &["requests"]))
-            .unwrap_or(1),
+            .unwrap_or_default(),
         costs: UsageCosts::default(),
     };
-    if usage.request_count == 0 {
+    if usage.request_count == 0 && (cumulative || !usage.is_zero()) {
         usage.request_count = 1;
     }
     Some(usage)
@@ -9769,10 +10599,12 @@ fn ensure_bounded_traversal(
         pending_directories,
         pending_candidates: VecDeque::new(),
         observed_index_keys: BTreeSet::new(),
+        codex_rollout_paths: BTreeSet::new(),
         reconciliation_upper_bound: index.files.keys().next_back().cloned(),
         reconciliation_after: None,
         reconciliation_started: false,
         watcher_hint_seen: false,
+        codex_parent_resolution_retry_required: false,
         unhealthy_retry_attempt: retry_attempt,
         unhealthy_retry_not_before_unix_seconds: None,
         counts,
@@ -9935,6 +10767,9 @@ fn advance_bounded_directory_traversal_with_budget(
                 && claude_transcript_excluded_from_snapshots(&path)
             {
                 continue;
+            }
+            if source == SnapshotSource::Codex {
+                traversal.codex_rollout_paths.insert(local_index_key(&path));
             }
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
@@ -10570,6 +11405,8 @@ impl ScanIndex {
         self.upload_context_fingerprint = None;
         self.files.clear();
         self.codex_state_only_snapshot_fingerprints.clear();
+        self.codex_parent_ownership_refs.clear();
+        self.codex_parent_ownership_ledgers.clear();
         self.resume_after_path = None;
         self.resume_upper_bound_path = None;
         self.resume_census_window_end = None;
@@ -10970,6 +11807,9 @@ impl ScanIndex {
                 .legacy_unresolved_root_file_witnesses
                 .clone(),
             codex_state_only_snapshot_fingerprints,
+            codex_state_only_blocked_session_ids: self.codex_state_only_blocked_session_ids.clone(),
+            codex_parent_ownership_refs: self.codex_parent_ownership_refs.clone(),
+            codex_parent_ownership_ledgers: self.codex_parent_ownership_ledgers.clone(),
             claude_desktop_title_files: self.claude_desktop_title_files.clone(),
             claude_account_family_witnesses: self.claude_account_family_witnesses.clone(),
             claude_account_family_pending: self.claude_account_family_pending.clone(),
@@ -11014,6 +11854,9 @@ impl ScanIndex {
     }
 
     fn remove_file_entry(&mut self, key: &str) {
+        if let Some(session_id) = codex_session_id_from_path(Path::new(key)) {
+            self.codex_parent_ownership_ledgers.remove(&session_id);
+        }
         self.files.remove(key);
         self.confirmed_empty_files.remove(key);
         self.file_snapshot_fingerprints.remove(key);
@@ -12030,10 +12873,12 @@ mod tests {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
+            codex_rollout_paths: BTreeSet::new(),
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 1,
             unhealthy_retry_not_before_unix_seconds: Some(0),
             counts: ScanTraversalCounts {
@@ -13343,10 +14188,12 @@ mod tests {
             pending_directories: VecDeque::new(),
             pending_candidates: VecDeque::new(),
             observed_index_keys: BTreeSet::new(),
+            codex_rollout_paths: BTreeSet::new(),
             reconciliation_upper_bound: None,
             reconciliation_after: None,
             reconciliation_started: false,
             watcher_hint_seen: false,
+            codex_parent_resolution_retry_required: false,
             unhealthy_retry_attempt: 0,
             unhealthy_retry_not_before_unix_seconds: None,
             counts: ScanTraversalCounts::default(),
@@ -13615,10 +14462,12 @@ mod tests {
                 pending_directories: VecDeque::new(),
                 pending_candidates: VecDeque::new(),
                 observed_index_keys: ["b".to_string(), "d".to_string()].into_iter().collect(),
+                codex_rollout_paths: BTreeSet::new(),
                 reconciliation_upper_bound: Some("d".to_string()),
                 reconciliation_after: None,
                 reconciliation_started: false,
                 watcher_hint_seen: false,
+                codex_parent_resolution_retry_required: false,
                 unhealthy_retry_attempt: 0,
                 unhealthy_retry_not_before_unix_seconds: None,
                 counts: ScanTraversalCounts::default(),
@@ -15864,6 +16713,166 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_codex_fork_blocks_inclusive_state_only_fallback() {
+        let codex_dir = temp_dir("codex-ambiguous-state-fallback");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let session_id = "019fcafe-aaaa-7000-9000-eeeeeeeeeeee";
+        fs::write(
+            sessions_dir.join(format!(
+                "rollout-2026-08-02T10-00-00-{session_id}.jsonl"
+            )),
+            format!(
+                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"user\",\"source\":\"cli\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}},\"model\":\"gpt-5.6-sol\"}}}}}}\n"
+            ),
+        )
+        .expect("write ambiguous rollout");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    session_id,
+                    "Ambiguous Fork",
+                    1_100_i64,
+                    0_i64,
+                    1_775_300_400_i64,
+                    1_775_300_460_i64,
+                    1_775_300_400_000_i64,
+                    1_775_300_460_000_i64,
+                    "gpt-5.6-sol",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+
+        let mut index = ScanIndex::default();
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-02T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan ambiguous fork");
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.source_session_id != session_id));
+        assert_eq!(scan.recognized_usage_drop_count, 0);
+        assert!(!scan.census_complete);
+        assert!(!index
+            .codex_state_only_snapshot_fingerprints
+            .contains_key(session_id));
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(session_id));
+
+        // The unresolved boundary is durable but is expected retry work, not
+        // transcript loss. The clean follow-up generation runs without an
+        // unhealthy backoff; inclusive state usage must stay blocked.
+        let serialized_index = serde_json::to_vec(&index).expect("serialize unresolved block");
+        let mut index: ScanIndex =
+            serde_json::from_slice(&serialized_index).expect("restore unresolved block");
+        let second = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-02T10:04:01Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("second scan retains unresolved boundary");
+        assert!(second
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.source_session_id != session_id));
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(session_id));
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
+    fn codex_state_only_waits_until_later_candidate_pages_prove_absence() {
+        let codex_dir = temp_dir("codex-state-page-before-ambiguous");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(
+            sessions_dir.join("a-first.jsonl"),
+            "{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"first-empty\"}}\n",
+        )
+        .expect("write first page fixture");
+        let session_id = "019fcafe-bbbb-7000-9000-ffffffffffff";
+        fs::write(
+            sessions_dir.join(format!("z-rollout-{session_id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-08-02T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"forked_from_id\":\"root\",\"thread_source\":\"user\"}}}}\n{{\"timestamp\":\"2026-08-02T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":1000,\"output_tokens\":100}},\"last_token_usage\":{{\"input_tokens\":100,\"output_tokens\":10}}}}}}}}\n"
+            ),
+        )
+        .expect("write later ambiguous fixture");
+        let connection = Connection::open(codex_dir.join("state_5.sqlite")).expect("open sqlite");
+        connection
+            .execute(CODEX_THREADS_DDL, [])
+            .expect("create threads");
+        connection
+            .execute(
+                CODEX_THREADS_INSERT,
+                (
+                    session_id,
+                    "Later Ambiguous Fork",
+                    1_100_i64,
+                    0_i64,
+                    1_775_300_400_i64,
+                    1_775_300_460_i64,
+                    1_775_300_400_000_i64,
+                    1_775_300_460_000_i64,
+                    "gpt-5.6-sol",
+                ),
+            )
+            .expect("insert thread");
+        drop(connection);
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-02T10:04:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+        )
+        .expect("scan first bounded page");
+        assert!(!first.census_complete);
+        assert!(first
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.source_session_id != session_id));
+
+        let second = scan_source_roots_with_limit(
+            SnapshotSource::Codex,
+            &[sessions_dir],
+            &mut index,
+            "2026-08-02T10:05:00Z",
+            BACKFILL_WINDOW_DAYS,
+            1,
+            true,
+        )
+        .expect("scan later ambiguous page");
+        assert!(second
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.source_session_id != session_id));
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(session_id));
+        let _ = fs::remove_dir_all(codex_dir);
+    }
+
+    #[test]
     fn codex_state_only_preserved_when_rollout_parses_to_no_usage() {
         // Regression guard: a rollout that exists but yields zero usage rows
         // (e.g. only session_meta, or a legacy/unknown token payload) is still
@@ -17102,6 +18111,7 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            usage_accounting_contract: None,
             claude_usage_request_ids: BTreeSet::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
@@ -22573,12 +23583,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_usage_accepts_future_cache_write_alias() {
+    fn codex_usage_accepts_official_cache_write_input_tokens_alias() {
         let value = serde_json::json!({
             "total_token_usage": {
                 "input_tokens": 100,
                 "cached_input_tokens": 30,
-                "cache_write_tokens": 20,
+                "cache_write_input_tokens": 20,
                 "output_tokens": 5,
                 "request_count": 1
             }
@@ -23872,6 +24882,1012 @@ mod tests {
         assert_eq!(detect_claude_gateway_provider(&serde_json::json!({})), None);
     }
 
+    fn codex_test_token_line(
+        timestamp: &str,
+        ordinal: Option<u64>,
+        total: (u64, u64, u64, u64),
+        last: Option<(u64, u64, u64, u64)>,
+    ) -> Value {
+        let mut value = json!({
+            "timestamp": timestamp,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": total.0,
+                        "cached_input_tokens": total.1,
+                        "output_tokens": total.2,
+                        "reasoning_output_tokens": total.3,
+                    },
+                    "model": "gpt-5.6-sol"
+                }
+            }
+        });
+        if let Some(ordinal) = ordinal {
+            value["ordinal"] = json!(ordinal);
+        }
+        if let Some(last) = last {
+            value["payload"]["info"]["last_token_usage"] = json!({
+                "input_tokens": last.0,
+                "cached_input_tokens": last.1,
+                "output_tokens": last.2,
+                "reasoning_output_tokens": last.3,
+            });
+        }
+        value
+    }
+
+    fn write_codex_test_values(name: &str, values: &[Value]) -> PathBuf {
+        let path = temp_file(name);
+        let mut body = values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        fs::write(&path, body).expect("write Codex fixture");
+        path
+    }
+
+    fn parse_codex_test_with_parent_ledger(
+        path: &Path,
+        parent_id: &str,
+        parent_values: &[Value],
+    ) -> ParsedJsonlFile {
+        let signatures = parent_values
+            .iter()
+            .filter_map(codex_ownership_signature)
+            .collect::<Vec<_>>();
+        let ledgers = BTreeMap::from([(
+            parent_id.to_string(),
+            CodexParentOwnershipLedger {
+                signatures,
+                complete: true,
+                opened_object_identity: String::new(),
+            },
+        )]);
+        parse_codex_test_with_ledgers(path, ledgers)
+    }
+
+    fn parse_codex_test_with_ledgers(
+        path: &Path,
+        ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+    ) -> ParsedJsonlFile {
+        let mut file = File::open(path).expect("open Codex parent-prefix fixture");
+        let identity = opened_object_identity(SnapshotSource::Codex, &mut file)
+            .expect("identify Codex parent-prefix fixture");
+        parse_opened_jsonl_file(
+            file,
+            &identity,
+            path,
+            "2026-08-02T09:00:00Z",
+            "fp".to_string(),
+            SnapshotSource::Codex,
+            apply_codex_line,
+            Some(&CodexTitleMetadata::default()),
+            None,
+            None,
+            Some(Arc::new(Mutex::new(ledgers))),
+            true,
+            None,
+        )
+        .expect("parse Codex parent-prefix fixture")
+    }
+
+    #[test]
+    fn codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture() {
+        let values = vec![
+            json!({
+                "timestamp":"2026-08-02T06:00:00Z", "type":"session_meta",
+                "payload": {
+                    "id":"child-full", "forked_from_id":"root",
+                    "thread_source":"subagent",
+                    "source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}
+                }
+            }),
+            codex_test_token_line(
+                "2026-08-02T06:00:01Z",
+                None,
+                (1_000, 800, 100, 20),
+                Some((1_000, 800, 100, 20)),
+            ),
+            json!({"timestamp":"2026-08-02T06:00:02Z","type":"compacted","payload":{"replacement_history":[]}}),
+            json!({"timestamp":"2026-08-02T06:00:03Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"inherited"}}),
+            json!({"timestamp":"2026-08-02T06:00:04Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":900,"time_to_first_token_ms":90}}),
+            // A copied parent header must not overwrite the first physical child envelope.
+            json!({"timestamp":"2026-08-02T06:00:05Z","type":"session_meta","payload":{"id":"root","thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T06:00:58Z","type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"timestamp":"2026-08-02T06:00:59Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","turn_id":"owned-turn","effort":"high"}}),
+            json!({"timestamp":"2026-08-02T06:01:00Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+            codex_test_token_line(
+                "2026-08-02T06:01:02Z",
+                None,
+                (1_100, 880, 110, 22),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T06:01:03Z","type":"compacted","payload":{"replacement_history":[]}}),
+            json!({"timestamp":"2026-08-02T06:01:04Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"owned"}}),
+            json!({"timestamp":"2026-08-02T06:01:05Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":100,"time_to_first_token_ms":10}}),
+        ];
+        let path = write_codex_test_values("codex-legacy-full-exclusive", &values);
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T06:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("exclusive snapshot");
+
+        assert_eq!(item.source_session_id, "child-full");
+        assert_eq!(
+            item.origin
+                .as_ref()
+                .and_then(|o| o.parent_session_ref.as_deref()),
+            Some("root")
+        );
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let serialized = serde_json::to_value(&item).expect("serialize exclusive snapshot");
+        assert_eq!(
+            serialized
+                .get("usage_accounting_contract")
+                .and_then(Value::as_str),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let mut legacy_hash_shape = item.clone();
+        legacy_hash_shape.usage_accounting_contract = None;
+        assert!(serde_json::to_value(&legacy_hash_shape)
+            .expect("serialize legacy hash shape")
+            .get("usage_accounting_contract")
+            .is_none());
+        assert_ne!(
+            snapshot_semantic_component_hashes(SnapshotSource::Codex, &item)
+                .get("usage_accounting"),
+            snapshot_semantic_component_hashes(SnapshotSource::Codex, &legacy_hash_shape)
+                .get("usage_accounting")
+        );
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count
+            ),
+            (100, 80, 10, 2, 1)
+        );
+        assert_eq!(item.first_turn_context_tokens, Some(100));
+        assert_eq!(item.peak_context_fill_tokens, Some(100));
+        assert_eq!(item.compaction_count, Some(1));
+        assert_eq!(
+            item.model_usage[0].reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert_eq!(item.avg_duration_ms, Some(100));
+        assert_eq!(item.avg_time_to_first_token_ms, Some(10));
+        assert_eq!(
+            item.activity_summary
+                .as_ref()
+                .map(|summary| summary.shell_commands),
+            Some(1)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_legacy_none_and_recent_forks_have_distinct_boundaries() {
+        let none_path = write_codex_test_values(
+            "codex-legacy-none-exclusive",
+            &[
+                json!({"timestamp":"2026-08-02T07:00:00Z","type":"session_meta","payload":{"id":"child-none","thread_source":"subagent","parent_thread_id":"root","source":{"subagent":{}}}}),
+                codex_test_token_line(
+                    "2026-08-02T07:00:01Z",
+                    None,
+                    (25, 10, 5, 1),
+                    Some((25, 10, 5, 1)),
+                ),
+            ],
+        );
+        let none = parse_codex_jsonl_file(&none_path, "2026-08-02T07:01:00Z", "fp".to_string())
+            .expect("parse none")
+            .remove(0);
+        assert_eq!(
+            (none.input_tokens, none.output_tokens, none.request_count),
+            (25, 5, 1)
+        );
+
+        let recent_path = write_codex_test_values(
+            "codex-legacy-recent-exclusive",
+            &[
+                json!({"timestamp":"2026-08-02T07:10:00Z","type":"session_meta","payload":{"id":"child-recent","forked_from_id":"root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}}}),
+                codex_test_token_line(
+                    "2026-08-02T07:10:01Z",
+                    None,
+                    (50, 20, 10, 2),
+                    Some((50, 20, 10, 2)),
+                ),
+                json!({"timestamp":"2026-08-02T07:10:02Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+                codex_test_token_line(
+                    "2026-08-02T07:10:03Z",
+                    None,
+                    (80, 35, 17, 3),
+                    Some((30, 15, 7, 1)),
+                ),
+            ],
+        );
+        let recent = parse_codex_jsonl_file(&recent_path, "2026-08-02T07:11:00Z", "fp".to_string())
+            .expect("parse recent")
+            .remove(0);
+        assert_eq!(
+            (
+                recent.input_tokens,
+                recent.cache_read_tokens,
+                recent.output_tokens,
+                recent.reasoning_output_tokens,
+                recent.request_count
+            ),
+            (30, 15, 7, 1, 1)
+        );
+
+        let nested_path = write_codex_test_values(
+            "codex-legacy-nested-exclusive",
+            &[
+                json!({"timestamp":"2026-08-02T07:20:00Z","type":"session_meta","payload":{"id":"nested-child","forked_from_id":"direct-parent","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"direct-parent"}}}}}),
+                codex_test_token_line(
+                    "2026-08-02T07:20:01Z",
+                    None,
+                    (70, 50, 8, 2),
+                    Some((70, 50, 8, 2)),
+                ),
+                json!({"timestamp":"2026-08-02T07:20:02Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+                codex_test_token_line(
+                    "2026-08-02T07:20:03Z",
+                    None,
+                    (90, 65, 13, 3),
+                    Some((20, 15, 5, 1)),
+                ),
+            ],
+        );
+        let nested = parse_codex_jsonl_file(&nested_path, "2026-08-02T07:21:00Z", "fp".to_string())
+            .expect("parse nested")
+            .remove(0);
+        assert_eq!(
+            nested
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.parent_session_ref.as_deref()),
+            Some("direct-parent")
+        );
+        assert_eq!((nested.input_tokens, nested.output_tokens), (20, 5));
+        let _ = fs::remove_file(none_path);
+        let _ = fs::remove_file(recent_path);
+        let _ = fs::remove_file(nested_path);
+    }
+
+    #[test]
+    fn codex_native_ordinal_boundary_is_exact_and_incomplete_prefix_fails_closed() {
+        let values = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"child-ordinal","forked_from_id":"root","thread_source":"subagent","history_mode":"paginated","subagent_history_start_ordinal":3}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:01Z",
+                Some(1),
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T08:00:02Z","ordinal":2,"type":"compacted","payload":{"replacement_history":[]}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:03Z",
+                Some(3),
+                (140, 110, 18, 3),
+                Some((40, 30, 8, 1)),
+            ),
+            json!({"timestamp":"2026-08-02T08:00:04Z","ordinal":4,"type":"compacted","payload":{"replacement_history":[]}}),
+        ];
+        let path = write_codex_test_values("codex-ordinal-exclusive", &values);
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T08:01:00Z", "fp".to_string())
+            .expect("parse ordinal")
+            .remove(0);
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens
+            ),
+            (40, 30, 8, 1)
+        );
+        assert_eq!(item.compaction_count, Some(1));
+
+        let incomplete_path = write_codex_test_values(
+            "codex-ordinal-incomplete",
+            &[
+                json!({"timestamp":"2026-08-02T08:10:00Z","ordinal":0,"type":"session_meta","payload":{"id":"child-incomplete","forked_from_id":"root","thread_source":"subagent","history_mode":"paginated","subagent_history_start_ordinal":3}}),
+                codex_test_token_line(
+                    "2026-08-02T08:10:01Z",
+                    Some(1),
+                    (100, 80, 10, 2),
+                    Some((100, 80, 10, 2)),
+                ),
+                codex_test_token_line(
+                    "2026-08-02T08:10:03Z",
+                    Some(3),
+                    (140, 110, 18, 3),
+                    Some((40, 30, 8, 1)),
+                ),
+            ],
+        );
+        assert!(
+            parse_codex_jsonl_file(&incomplete_path, "2026-08-02T08:11:00Z", "fp".to_string())
+                .expect("parse incomplete")
+                .is_empty()
+        );
+
+        // `start == next ordinal` means the child-owned suffix has not been
+        // observed yet. The file may still be live/partially flushed, so it is
+        // retryable rather than authoritative confirmed-empty.
+        let zero_owned_path = write_codex_test_values(
+            "codex-ordinal-zero-owned",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","ordinal":0,"type":"session_meta","payload":{"id":"child-zero-owned","forked_from_id":"root","thread_source":"subagent","subagent_history_start_ordinal":3}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:01Z",
+                    Some(1),
+                    (100, 80, 10, 2),
+                    Some((100, 80, 10, 2)),
+                ),
+                json!({"timestamp":"2026-08-02T08:20:02Z","ordinal":2,"type":"compacted","payload":{"replacement_history":[]}}),
+            ],
+        );
+        assert!(
+            parse_codex_jsonl_file(&zero_owned_path, "2026-08-02T08:21:00Z", "fp".to_string())
+                .expect("parse zero-owned suffix")
+                .is_empty()
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(incomplete_path);
+        let _ = fs::remove_file(zero_owned_path);
+    }
+
+    #[test]
+    fn codex_reordered_header_and_legacy_bootstrap_overflow_fail_closed() {
+        let reordered = write_codex_test_values(
+            "codex-reordered-header-fork",
+            &[
+                codex_test_token_line(
+                    "2026-08-02T08:30:00Z",
+                    None,
+                    (100, 80, 10, 2),
+                    Some((100, 80, 10, 2)),
+                ),
+                json!({"timestamp":"2026-08-02T08:30:01Z","type":"session_meta","payload":{"id":"reordered-fork","forked_from_id":"root","thread_source":"user"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:30:02Z",
+                    None,
+                    (140, 110, 18, 3),
+                    Some((40, 30, 8, 1)),
+                ),
+            ],
+        );
+        assert!(
+            parse_codex_jsonl_file(&reordered, "2026-08-02T08:31:00Z", "fp".to_string())
+                .expect("parse reordered header")
+                .is_empty()
+        );
+
+        let mut overflow = vec![
+            json!({"timestamp":"2026-08-02T08:40:00Z","type":"session_meta","payload":{"id":"overflow-child","forked_from_id":"root","thread_source":"subagent"}}),
+            json!({"timestamp":"2026-08-02T08:40:01Z","type":"event_msg","payload":{"type":"task_started"}}),
+        ];
+        for ordinal in 0..65 {
+            overflow.push(json!({
+                "timestamp":"2026-08-02T08:40:02Z",
+                "type":"turn_context",
+                "payload":{"model":"gpt-5.6-sol","reasoning_effort":"high","sequence":ordinal}
+            }));
+        }
+        overflow.push(json!({"timestamp":"2026-08-02T08:40:03Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}));
+        overflow.push(codex_test_token_line(
+            "2026-08-02T08:40:04Z",
+            None,
+            (140, 110, 18, 3),
+            Some((40, 30, 8, 1)),
+        ));
+        let overflow_path = write_codex_test_values("codex-bootstrap-overflow", &overflow);
+        assert!(
+            parse_codex_jsonl_file(&overflow_path, "2026-08-02T08:41:00Z", "fp".to_string())
+                .expect("parse overflowed bootstrap")
+                .is_empty()
+        );
+        let _ = fs::remove_file(reordered);
+        let _ = fs::remove_file(overflow_path);
+    }
+
+    #[test]
+    fn codex_legacy_ordinary_fork_without_parent_prepass_fails_closed() {
+        let path = write_codex_test_values(
+            "codex-ordinary-fork-ambiguous",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"ordinary-fork","forked_from_id":"root","thread_source":"user","source":"cli"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:01Z",
+                    None,
+                    (1_000, 800, 100, 20),
+                    Some((100, 80, 10, 2)),
+                ),
+            ],
+        );
+        assert!(
+            parse_codex_jsonl_file(&path, "2026-08-02T08:21:00Z", "fp".to_string())
+                .expect("parse ambiguous fork")
+                .is_empty()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_legacy_ordinary_fork_and_new_id_resume_use_only_divergent_suffix() {
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"legacy-parent","thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn-1","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            // Parent activity after the fork must not be required to match.
+            json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"parent-late-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:10:02Z",
+                None,
+                (160, 120, 18, 4),
+                Some((60, 40, 8, 2)),
+            ),
+        ];
+        let child = write_codex_test_values(
+            "codex-ordinary-parent-prefix",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"legacy-child","forked_from_id":"legacy-parent","thread_source":"user","source":"cli"}}),
+                parent[0].clone(),
+                parent[1].clone(),
+                parent[2].clone(),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"child-first-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:03Z",
+                    None,
+                    (130, 100, 15, 3),
+                    Some((30, 20, 5, 1)),
+                ),
+            ],
+        );
+        let parsed = parse_codex_test_with_parent_ledger(&child, "legacy-parent", &parent);
+        assert!(parsed.complete());
+        let item = parsed
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("exclusive child");
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            (30, 20, 5, 1, 1)
+        );
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        let _ = fs::remove_file(child);
+    }
+
+    #[test]
+    fn codex_parent_prefix_requires_nonempty_match_and_owned_suffix() {
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"prefix-parent"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let mismatch = write_codex_test_values(
+            "codex-parent-prefix-zero-match",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"mismatch-child","forked_from_id":"prefix-parent","thread_source":"user"}}),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"different-first-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (10, 8, 1, 0),
+                    Some((10, 8, 1, 0)),
+                ),
+            ],
+        );
+        assert!(
+            parse_codex_test_with_parent_ledger(&mismatch, "prefix-parent", &parent)
+                .snapshots
+                .is_empty()
+        );
+
+        let inherited_only = write_codex_test_values(
+            "codex-parent-prefix-no-owned-suffix",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"inherited-only-child","forked_from_id":"prefix-parent","thread_source":"user"}}),
+                parent[0].clone(),
+                parent[1].clone(),
+                parent[2].clone(),
+            ],
+        );
+        assert!(
+            parse_codex_test_with_parent_ledger(&inherited_only, "prefix-parent", &parent)
+                .snapshots
+                .is_empty()
+        );
+        let _ = fs::remove_file(mismatch);
+        let _ = fs::remove_file(inherited_only);
+    }
+
+    #[test]
+    fn codex_truncated_parent_ledger_fails_closed() {
+        let parent_id = "truncated-parent";
+        let parent_path = temp_file("codex-truncated-parent");
+        let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"truncated-parent-turn","model":"gpt-5.6-sol"}});
+        let parent_usage = codex_test_token_line(
+            "2026-08-02T08:00:02Z",
+            None,
+            (100, 80, 10, 2),
+            Some((100, 80, 10, 2)),
+        );
+        fs::write(
+            &parent_path,
+            format!(
+                "{}\n{}\n{}\n{{",
+                json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+                parent_turn,
+                parent_usage,
+            ),
+        )
+        .expect("write truncated parent");
+        let parsed_parent = parse_codex_test_with_ledgers(&parent_path, BTreeMap::new());
+        let (ledger_id, ledger) = parsed_parent
+            .codex_parent_ownership_ledger
+            .expect("truncated parent ledger evidence");
+        assert_eq!(ledger_id, parent_id);
+        assert!(!ledger.complete);
+
+        let child_path = write_codex_test_values(
+            "codex-truncated-parent-child",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"truncated-child","forked_from_id":parent_id,"thread_source":"user"}}),
+                parent_turn,
+                parent_usage,
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"truncated-child-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (120, 95, 13, 3),
+                    Some((20, 15, 3, 1)),
+                ),
+            ],
+        );
+        assert!(parse_codex_test_with_ledgers(
+            &child_path,
+            BTreeMap::from([(parent_id.to_string(), ledger)]),
+        )
+        .snapshots
+        .is_empty());
+        let _ = fs::remove_file(parent_path);
+        let _ = fs::remove_file(child_path);
+    }
+
+    #[test]
+    fn codex_parent_prefix_supports_fork_of_fork_and_same_id_resume() {
+        let nested_parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":"nested-parent","forked_from_id":"root","thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"root-inherited","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"nested-parent-local","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:10:02Z",
+                None,
+                (140, 110, 16, 3),
+                Some((40, 30, 6, 1)),
+            ),
+        ];
+        let nested_child = write_codex_test_values(
+            "codex-fork-of-fork",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"nested-child","forked_from_id":"nested-parent","thread_source":"user"}}),
+                nested_parent[1].clone(),
+                nested_parent[2].clone(),
+                nested_parent[3].clone(),
+                nested_parent[4].clone(),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"nested-child-local","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (155, 122, 19, 4),
+                    Some((15, 12, 3, 1)),
+                ),
+            ],
+        );
+        let item =
+            parse_codex_test_with_parent_ledger(&nested_child, "nested-parent", &nested_parent)
+                .snapshots
+                .remove(0);
+        assert_eq!(
+            (item.input_tokens, item.output_tokens, item.request_count),
+            (15, 3, 1)
+        );
+
+        let same_id = write_codex_test_values(
+            "codex-same-id-resume",
+            &[
+                json!({"timestamp":"2026-08-02T09:00:00Z","type":"session_meta","payload":{"id":"same-id-resume","thread_source":"user"}}),
+                codex_test_token_line(
+                    "2026-08-02T09:00:01Z",
+                    None,
+                    (40, 30, 5, 1),
+                    Some((40, 30, 5, 1)),
+                ),
+                codex_test_token_line(
+                    "2026-08-02T09:10:01Z",
+                    None,
+                    (20, 15, 3, 1),
+                    Some((20, 15, 3, 1)),
+                ),
+            ],
+        );
+        let same_id_item =
+            parse_codex_jsonl_file(&same_id, "2026-08-02T09:11:00Z", "fp".to_string())
+                .expect("parse same-id resume")
+                .remove(0);
+        assert_eq!(
+            (
+                same_id_item.input_tokens,
+                same_id_item.output_tokens,
+                same_id_item.request_count
+            ),
+            (60, 8, 2)
+        );
+        let _ = fs::remove_file(nested_child);
+        let _ = fs::remove_file(same_id);
+    }
+
+    #[test]
+    fn codex_parent_prefix_ledger_survives_paged_scan_and_index_restart() {
+        let root = temp_dir("codex-parent-ledger-paged");
+        let child_id = "019fc428-0000-7000-8000-000000000001";
+        let parent_id = "019fc428-0000-7000-8000-000000000002";
+        let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"paged-parent-turn","model":"gpt-5.6-sol"}});
+        let parent_usage = codex_test_token_line(
+            "2026-08-02T08:00:02Z",
+            None,
+            (100, 80, 10, 2),
+            Some((100, 80, 10, 2)),
+        );
+        fs::write(
+            root.join(format!(
+                "rollout-2026-08-02T08-00-00-{child_id}.jsonl"
+            )),
+            [
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"forked_from_id":parent_id,"thread_source":"user"}}),
+                parent_turn.clone(),
+                parent_usage.clone(),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"paged-child-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line("2026-08-02T08:20:02Z",None,(125,98,14,3),Some((25,18,4,1))),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .expect("write paged child");
+        fs::write(
+            root.join(format!(
+                "rollout-2026-08-02T08-10-00-{parent_id}.jsonl"
+            )),
+            [
+                json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+                parent_turn,
+                parent_usage,
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .expect("write paged parent");
+
+        let checkpoint = root.join("scan-index.json");
+        let mut index = ScanIndex::default();
+        let mut child_snapshot = None;
+        for cycle in 0..8 {
+            let mut scan = scan_source_roots_with_test_limit(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut index,
+                &format!("2026-08-02T09:{cycle:02}:00Z"),
+                BACKFILL_WINDOW_DAYS,
+                1,
+                true,
+            )
+            .expect("paged parent-ledger scan");
+            child_snapshot = scan
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.source_session_id == child_id)
+                .cloned();
+            finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+            index.save(&checkpoint).expect("persist parent ledger");
+            index = ScanIndex::load(&checkpoint).expect("reload parent ledger");
+            if child_snapshot.is_some() {
+                break;
+            }
+        }
+        let child = child_snapshot.expect("paged child converges after parent prepass");
+        assert_eq!(
+            (child.input_tokens, child.output_tokens, child.request_count),
+            (25, 4, 1)
+        );
+        assert!(index
+            .codex_parent_ownership_ledgers
+            .get(parent_id)
+            .is_some_and(|ledger| ledger.complete));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_changed_parent_invalidates_stale_prefix_before_child_parse() {
+        let root = temp_dir("codex-parent-ledger-stale");
+        let parent_id = "019fc428-0000-7000-8000-000000000011";
+        let parent_path = root.join(format!("rollout-2026-08-02T08-00-00-{parent_id}.jsonl"));
+        let parent_turn = json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"stale-parent-turn","model":"gpt-5.6-sol"}});
+        let parent_usage = codex_test_token_line(
+            "2026-08-02T08:00:02Z",
+            None,
+            (100, 80, 10, 2),
+            Some((100, 80, 10, 2)),
+        );
+        let initial_parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            parent_turn.clone(),
+            parent_usage.clone(),
+        ];
+        fs::write(
+            &parent_path,
+            initial_parent
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write initial parent");
+        let initial_parsed = parse_codex_test_with_ledgers(&parent_path, BTreeMap::new());
+        let (_, stale_ledger) = initial_parsed
+            .codex_parent_ownership_ledger
+            .expect("initial parent ledger");
+        assert!(!stale_ledger.opened_object_identity.is_empty());
+
+        let metadata = fs::metadata(&parent_path).expect("parent metadata");
+        let modified_unix_seconds = metadata
+            .modified()
+            .ok()
+            .and_then(unix_seconds)
+            .unwrap_or_default();
+        let modified_unix_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(unix_nanos)
+            .unwrap_or_default();
+        let mut index = ScanIndex::default();
+        index
+            .codex_parent_ownership_refs
+            .insert(parent_id.to_string());
+        index
+            .codex_parent_ownership_ledgers
+            .insert(parent_id.to_string(), stale_ledger);
+        index.files.insert(
+            local_index_key(&parent_path),
+            ScanIndexEntry {
+                size_bytes: metadata.len(),
+                modified_unix_seconds,
+                modified_unix_nanos: Some(modified_unix_nanos),
+                source_file_fingerprint: "stale-parent-file".to_string(),
+                last_snapshot_fingerprint: None,
+                scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
+            },
+        );
+        let frozen_census_paths = BTreeSet::from([local_index_key(&parent_path)]);
+        let validated_before_parent_change = validated_codex_parent_ownership_ledgers(
+            &index,
+            std::slice::from_ref(&root),
+            &frozen_census_paths,
+        );
+        assert!(validated_before_parent_change.contains_key(parent_id));
+        let duplicate_parent_path =
+            root.join(format!("rollout-2026-08-02T08-05-00-{parent_id}.jsonl"));
+        fs::copy(&parent_path, &duplicate_parent_path).expect("write duplicate parent rollout");
+        let duplicate_census_paths = BTreeSet::from([
+            local_index_key(&parent_path),
+            local_index_key(&duplicate_parent_path),
+        ]);
+        assert!(validated_codex_parent_ownership_ledgers(
+            &index,
+            std::slice::from_ref(&root),
+            &duplicate_census_paths,
+        )
+        .is_empty());
+        assert!(current_codex_parent_opened_identity(
+            std::slice::from_ref(&root),
+            &duplicate_census_paths,
+            parent_id,
+        )
+        .is_none());
+        fs::remove_file(&duplicate_parent_path).expect("remove duplicate parent rollout");
+
+        let appended_turn = json!({"timestamp":"2026-08-02T08:10:01Z","type":"turn_context","payload":{"turn_id":"new-parent-turn","model":"gpt-5.6-sol"}});
+        let appended_usage = codex_test_token_line(
+            "2026-08-02T08:10:02Z",
+            None,
+            (130, 103, 14, 3),
+            Some((30, 23, 4, 1)),
+        );
+        let mut changed_parent = initial_parent.clone();
+        changed_parent.push(appended_turn.clone());
+        changed_parent.push(appended_usage.clone());
+        fs::write(
+            &parent_path,
+            changed_parent
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("append parent rollout");
+        let validated = validated_codex_parent_ownership_ledgers(
+            &index,
+            std::slice::from_ref(&root),
+            &frozen_census_paths,
+        );
+        assert!(
+            validated.is_empty(),
+            "changed parent must invalidate old ledger"
+        );
+
+        let child_path = write_codex_test_values(
+            "codex-stale-parent-child",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"stale-parent-child","forked_from_id":parent_id,"thread_source":"user"}}),
+                parent_turn,
+                parent_usage,
+                appended_turn,
+                appended_usage,
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"stale-child-local","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (150, 118, 17, 4),
+                    Some((20, 15, 3, 1)),
+                ),
+            ],
+        );
+        assert!(
+            parse_codex_test_with_ledgers(&child_path, validated.clone())
+                .snapshots
+                .is_empty(),
+            "child must fail closed until the changed parent is reparsed"
+        );
+        // Simulate the tighter TOCTOU: the scan validated the old parent, then
+        // the parent changed before the child was parsed. Parsing with that
+        // once-valid ledger would misclassify the appended parent response,
+        // but the immediate post-parse identity fence must discard it.
+        let mut stale_child =
+            parse_codex_test_with_ledgers(&child_path, validated_before_parent_change);
+        assert!(!stale_child.snapshots.is_empty());
+        assert!(invalidate_stale_codex_parent_resolution(
+            &mut stale_child,
+            std::slice::from_ref(&root),
+            &frozen_census_paths,
+        ));
+        assert!(stale_child.snapshots.is_empty());
+        assert!(!stale_child.complete());
+        let refreshed_parent = parse_codex_test_with_ledgers(&parent_path, BTreeMap::new());
+        let (_, fresh_ledger) = refreshed_parent
+            .codex_parent_ownership_ledger
+            .expect("refreshed parent ledger");
+        let child = parse_codex_test_with_ledgers(
+            &child_path,
+            BTreeMap::from([(parent_id.to_string(), fresh_ledger)]),
+        )
+        .snapshots
+        .remove(0);
+        assert_eq!(
+            (child.input_tokens, child.output_tokens, child.request_count),
+            (20, 3, 1)
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(child_path);
+    }
+
+    #[test]
+    fn codex_north_star_sized_legacy_prefix_emits_only_child_responses() {
+        const INHERITED_TURNS: u64 = 15_359;
+        const OWN_TURNS: u64 = 156;
+        const OWN_INPUT: u64 = 20_681_755;
+        const OWN_CACHED: u64 = 20_253_696;
+        const OWN_OUTPUT: u64 = 36_892;
+        const OWN_REASONING: u64 = 13_359;
+
+        let mut values = Vec::with_capacity((INHERITED_TURNS + OWN_TURNS + 2) as usize);
+        values.push(json!({"timestamp":"2026-08-02T09:00:00Z","type":"session_meta","payload":{"id":"sanitized-north-star-child","forked_from_id":"sanitized-root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"sanitized-root"}}}}}));
+        let mut total = (0, 0, 0, 0);
+        for _ in 0..INHERITED_TURNS {
+            total.0 += 1_000;
+            total.1 += 900;
+            total.2 += 100;
+            total.3 += 10;
+            values.push(codex_test_token_line(
+                "2026-08-02T09:00:01Z",
+                None,
+                total,
+                Some((1_000, 900, 100, 10)),
+            ));
+        }
+        values.push(json!({"timestamp":"2026-08-02T09:01:00Z","type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}));
+        for turn in 0..OWN_TURNS {
+            let remaining = OWN_TURNS - turn;
+            let delta = (
+                (OWN_INPUT - (total.0 - INHERITED_TURNS * 1_000)) / remaining,
+                (OWN_CACHED - (total.1 - INHERITED_TURNS * 900)) / remaining,
+                (OWN_OUTPUT - (total.2 - INHERITED_TURNS * 100)) / remaining,
+                (OWN_REASONING - (total.3 - INHERITED_TURNS * 10)) / remaining,
+            );
+            total.0 += delta.0;
+            total.1 += delta.1;
+            total.2 += delta.2;
+            total.3 += delta.3;
+            values.push(codex_test_token_line(
+                "2026-08-02T09:01:01Z",
+                None,
+                total,
+                Some(delta),
+            ));
+        }
+        let path = write_codex_test_values("codex-north-star-sized-exclusive", &values);
+        let item = parse_codex_jsonl_file(&path, "2026-08-02T09:02:00Z", "fp".to_string())
+            .expect("parse North Star-sized fixture")
+            .remove(0);
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count
+            ),
+            (OWN_INPUT, OWN_CACHED, OWN_OUTPUT, OWN_REASONING, OWN_TURNS)
+        );
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn codex_cumulative_split_across_plan_window_rollover_buckets_correctly() {
         // Regression: a single Codex session that crosses a `secondary.resets_at`
@@ -23926,7 +25942,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_cumulative_restart_replaces_exact_totals_with_replacement_buckets() {
+    fn codex_cumulative_restart_keeps_prior_epoch_and_adds_restarted_epoch() {
         let path = temp_file("codex-cumulative-restart");
         fs::write(
             &path,
@@ -23946,11 +25962,10 @@ mod tests {
         .expect("parse");
         assert_eq!(items.len(), 1);
         let item = &items[0];
-        assert_eq!(item.input_tokens, 20);
-        assert_eq!(item.output_tokens, 8);
-        assert_eq!(item.request_count, 1);
-        assert_eq!(item.usage_buckets.len(), 1);
-        assert_eq!(item.usage_buckets[0].bucket_start, "2026-06-01T00:00:00Z");
+        assert_eq!(item.input_tokens, 120);
+        assert_eq!(item.output_tokens, 48);
+        assert_eq!(item.request_count, 3);
+        assert_eq!(item.usage_buckets.len(), 2);
         let request = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: SnapshotSource::Codex.api_slug().to_string(),
@@ -23961,8 +25976,85 @@ mod tests {
             client_report: crate::client_report::ClientReport::empty(),
         };
         validate_snapshot_batch_request(&request)
-            .expect("replacement cumulative and buckets remain preflight-consistent");
+            .expect("additive cumulative epochs and buckets remain preflight-consistent");
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_last_usage_remains_exact_across_cumulative_reset() {
+        let path = write_codex_test_values(
+            "codex-last-usage-reset",
+            &[
+                json!({"timestamp":"2026-06-01T01:00:00Z","type":"session_meta","payload":{"id":"codex-last-reset"}}),
+                codex_test_token_line(
+                    "2026-06-01T01:01:00Z",
+                    None,
+                    (100, 80, 40, 10),
+                    Some((100, 80, 40, 10)),
+                ),
+                codex_test_token_line(
+                    "2026-06-01T02:01:00Z",
+                    None,
+                    (20, 8, 8, 2),
+                    Some((20, 8, 8, 2)),
+                ),
+            ],
+        );
+        let item = parse_codex_jsonl_file(&path, "2026-06-01T02:05:00Z", "fp".to_string())
+            .expect("parse reset")
+            .remove(0);
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            (120, 88, 48, 12, 2)
+        );
+        assert_eq!(item.usage_buckets.len(), 2);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_exact_usage_event_dedup_does_not_drop_equal_total_restart() {
+        let first = codex_test_token_line(
+            "2026-06-01T03:01:00Z",
+            None,
+            (100, 80, 40, 10),
+            Some((100, 80, 40, 10)),
+        );
+        let equal_total_after_restart = codex_test_token_line(
+            "2026-06-01T04:01:00Z",
+            None,
+            (100, 80, 40, 10),
+            Some((100, 80, 40, 10)),
+        );
+        let path = write_codex_test_values(
+            "codex-equal-total-restart",
+            &[
+                json!({"timestamp":"2026-06-01T03:00:00Z","type":"session_meta","payload":{"id":"codex-equal-total-restart"}}),
+                first.clone(),
+                first,                     // exact repeated physical checkpoint: one occurrence
+                equal_total_after_restart, // new event identity: new occurrence
+            ],
+        );
+        let item = parse_codex_jsonl_file(&path, "2026-06-01T04:05:00Z", "fp".to_string())
+            .expect("parse equal-total restart")
+            .remove(0);
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            (200, 160, 80, 20, 2)
+        );
+        assert_eq!(item.usage_buckets.len(), 2);
         let _ = fs::remove_file(path);
     }
 
@@ -24083,6 +26175,7 @@ mod tests {
             "reasoning_output_tokens",
             "unattributed_total_tokens",
             "request_count",
+            "usage_accounting_contract",
             "peak_context_fill_tokens",
             "first_turn_context_tokens",
             "compaction_count",
@@ -24230,6 +26323,7 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            usage_accounting_contract: None,
             claude_usage_request_ids: BTreeSet::new(),
             avg_duration_ms: None,
             avg_time_to_first_token_ms: None,
@@ -24514,6 +26608,7 @@ mod tests {
                 reasoning_output_tokens: 0,
                 unattributed_total_tokens: 0,
                 request_count: 1,
+                usage_accounting_contract: None,
                 claude_usage_request_ids: BTreeSet::new(),
                 avg_duration_ms: None,
                 avg_time_to_first_token_ms: None,
