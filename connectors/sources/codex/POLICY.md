@@ -24,7 +24,10 @@ Review tier: `official`
   surfaces. Display-only reset-bank counts such as `2 resets available` may be
   represented as redacted credit-balance metadata only when an explicit count is
   present; current app-server `credits.balance` is ChatGPT credit metadata and
-  must not be relabeled as reset-bank availability.
+  must not be relabeled as reset-bank availability. App-server
+  `individualLimit` may be represented separately as
+  `workspace_monthly_credits`, preserving only used/quota/remaining,
+  utilization, reset, status, and safe limit metadata.
 - The documented `codex doctor --json` CLI may be subprocessed by `identity_probe`. Only `auth.credentials.details` fields that do not expose token bytes (`auth storage mode`, `stored auth mode`, presence flags) may be parsed.
 - The officially documented, upstream-experimental `codex cloud list --json` CLI may be subprocessed by `cloud_sessions` after explicit setup. Only task identity (immediately HMAC-transformed), lifecycle, safe timestamps, attempt count, and a closed normalized environment kind are emitted.
 - Any nonempty provider page containing a row without valid task identity and status strings is rejected locally as `provider_payload_invalid`; it cannot be reported as an empty healthy collection or fabricate mandatory status coverage. The strict backend health wire uses only the allowed coarse `provider_error` category; local detail never crosses that boundary.

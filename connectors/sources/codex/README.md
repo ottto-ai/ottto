@@ -9,7 +9,10 @@ Collectors:
 - `quota_status`: requires setup. Prefer the local Codex app-server
   `account/rateLimits/read` protocol for quota windows and ChatGPT credit
   balance metadata; it returns primary/secondary reset windows, used
-  percentages, plan type, and `credits.balance`. The current official/local
+  percentages, plan type, `credits.balance`, and the recurring workspace
+  monthly pool in `individualLimit`. The latter is emitted as a distinct
+  `workspace_monthly_credits` native-count balance so exhausting the weekly
+  window does not erase a still-available workspace pool. The current official/local
   app-server and JSONL surfaces do not expose a dedicated reset-bank count, so
   the collector must emit `unit: "resets"` only when a future local surface or
   gated quota probe provides an explicit reset count. Older/private quota paths
