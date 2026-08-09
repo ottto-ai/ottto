@@ -4910,6 +4910,24 @@ impl SnapshotAccumulator {
                 self.source.parser_version(),
             ));
         }
+        // The controller edge an instrumented launcher stated at spawn time.
+        // Same position and same reason as the subagent identity above: it is
+        // exact lineage, so it has to outrank the derived grouping ids when the
+        // payload budget trims from the tail.
+        //
+        // Provider-native evidence wins every field it already filled. A worker
+        // the launcher started is a root session in its own provider tree, so in
+        // practice nothing collides; when something does, the provider owns the
+        // session and the launcher is the one that must be wrong.
+        if let Some(context) = attribution_context {
+            let mut launch_facts = context.launch_event_facts(&source_session_id, collected_at);
+            launch_facts.retain(|launch_fact| {
+                !attribution_facts
+                    .iter()
+                    .any(|fact| fact.field == launch_fact.field)
+            });
+            attribution_facts.extend(launch_facts);
+        }
         if let Some(context) = attribution_context {
             attribution_facts.extend(
                 context.grouping_facts(
@@ -21274,6 +21292,177 @@ mod tests {
             excluded, layout4,
             "every workflow journal must be excluded from emission"
         );
+    }
+
+    #[test]
+    fn launcher_event_binds_a_worker_transcript_to_its_controller_session() {
+        // End to end through the real intake: a launcher drops the event file at
+        // spawn, the worker then writes its transcript, and the scan that parses
+        // that transcript states the controller edge.
+        let home = temp_dir("launch-event-wiring");
+        let controller = "a9789dcf-1e4a-4a6e-8abd-f30094efb269";
+        let worker = "019f6822-403f-7652-a308-b0c12142e337";
+        let attempt = "402d846d-c13c-4743-8326-580e4ca70e30";
+        let pending = home.join(".ottto/launch-events/pending");
+        fs::create_dir_all(&pending).expect("pending dir");
+        let event = format!(
+            "{{\"capture_source\":\"launcher_event:landing_repair\",\
+             \"controller_session_ref\":\"{controller}\",\"evidence\":\"direct\",\
+             \"launch_ts\":\"2026-08-09T15:17:21Z\",\"pr_ref\":1653,\
+             \"relationship_kind\":\"launched\",\"schema\":\"agent_launch.v1\",\
+             \"worker_session_ref\":\"{worker}\",\"workflow_ref\":\"{attempt}\"}}"
+        );
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(format!("{controller}\n{worker}\n{attempt}").as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        fs::write(pending.join(format!("{digest}.json")), &event).expect("event file");
+
+        let encoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32]);
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::ClaudeCode,
+            &home,
+            true,
+            Some(&encoded_key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .expect("attribution context");
+
+        let transcript = home.join(format!("{worker}.jsonl"));
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"timestamp\":\"2026-08-09T15:18:00.000Z\",\"type\":\"user\",\"sessionId\":\"{worker}\",\"message\":{{\"role\":\"user\",\"content\":\"repair the pull request\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-09T15:18:04.000Z\",\"type\":\"assistant\",\"sessionId\":\"{worker}\",\"requestId\":\"req_A\",\"message\":{{\"id\":\"msg_A\",\"model\":\"claude-opus-4-7\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":20}}}}}}\n"
+            ),
+        )
+        .expect("worker transcript");
+
+        let item = parse_claude_code_jsonl_file_with_title_metadata_and_attribution(
+            &transcript,
+            "2026-08-09T15:20:00Z",
+            "fp-launch-event".to_string(),
+            &ClaudeTitleMetadata::default(),
+            false,
+            Some(&context),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("worker snapshot");
+
+        let launch_facts: Vec<(&str, &str)> = item
+            .attribution_facts
+            .iter()
+            .filter(|fact| fact.evidence.kind == "launcher_event")
+            .map(|fact| (fact.field.as_str(), fact.value.as_str()))
+            .collect();
+        assert_eq!(
+            launch_facts,
+            vec![
+                ("parent_session_ref", controller),
+                ("origin_kind", "agent_spawn"),
+                ("workflow_ref", attempt),
+                ("agent_kind", "pr-fixer"),
+            ]
+        );
+        crate::session_attribution::validate_fact_limits(&item.attribution_facts)
+            .expect("launch facts stay inside the wire contract");
+        // The event file left `pending/` and stays joinable for the next scan of
+        // the same worker.
+        assert!(!pending.join(format!("{digest}.json")).exists());
+        assert!(home
+            .join(".ottto/launch-events/processed")
+            .join(format!("{digest}.json"))
+            .exists());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn provider_native_parent_edge_outranks_a_launch_event_claim() {
+        // A Codex subagent's parent comes from the provider's own spawn graph,
+        // and its session id is a plain UUID -- so a launch event CAN name the
+        // same session. When it does, the provider owns that family: the launch
+        // event must not add a second, competing `parent_session_ref`, because a
+        // session has at most one lineage parent and two answers is not evidence.
+        let home = temp_dir("launch-event-precedence");
+        let worker = "019f6822-403f-7652-a308-b0c12142e337";
+        let provider_parent = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let controller = "a9789dcf-1e4a-4a6e-8abd-f30094efb269";
+        let attempt = "402d846d-c13c-4743-8326-580e4ca70e30";
+        let pending = home.join(".ottto/launch-events/pending");
+        fs::create_dir_all(&pending).expect("pending dir");
+        let event = format!(
+            "{{\"capture_source\":\"launcher_event:landing_repair\",\
+             \"controller_session_ref\":\"{controller}\",\"evidence\":\"direct\",\
+             \"launch_ts\":\"2026-08-09T15:17:21Z\",\"pr_ref\":1653,\
+             \"relationship_kind\":\"launched\",\"schema\":\"agent_launch.v1\",\
+             \"worker_session_ref\":\"{worker}\",\"workflow_ref\":\"{attempt}\"}}"
+        );
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(format!("{controller}\n{worker}\n{attempt}").as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        fs::write(pending.join(format!("{digest}.json")), &event).expect("event file");
+
+        let encoded_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([17_u8; 32]);
+        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+            SnapshotSource::Codex,
+            &home,
+            true,
+            Some(&encoded_key),
+            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+        )
+        .expect("attribution context");
+
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .spawn_parents
+            .insert(worker.to_string(), provider_parent.to_string());
+
+        let transcript = home.join("codex-worker.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"timestamp\":\"2026-08-09T15:18:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{worker}\",\"originator\":\"codex_exec\",\"thread_source\":\"subagent\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-09T15:18:04Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"output_tokens\":5,\"request_count\":1}},\"model\":\"gpt-5.6-sol\"}}}}}}\n"
+            ),
+        )
+        .expect("worker transcript");
+
+        let item = parse_codex_jsonl_file_with_title_metadata_and_attribution(
+            &transcript,
+            "2026-08-09T15:20:00Z",
+            "fp-launch-precedence".to_string(),
+            &metadata,
+            None,
+            Some(&context),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("worker snapshot");
+
+        let parents: Vec<&str> = item
+            .attribution_facts
+            .iter()
+            .filter(|fact| fact.field == "parent_session_ref")
+            .map(|fact| fact.value.as_str())
+            .collect();
+        assert_eq!(parents, vec![provider_parent]);
+        // The rest of the launch event still lands: only the fields the provider
+        // already answered are withheld.
+        let launch_fields: Vec<&str> = item
+            .attribution_facts
+            .iter()
+            .filter(|fact| fact.evidence.kind == "launcher_event")
+            .map(|fact| fact.field.as_str())
+            .collect();
+        assert!(!launch_fields.contains(&"parent_session_ref"));
+        assert!(launch_fields.contains(&"workflow_ref"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

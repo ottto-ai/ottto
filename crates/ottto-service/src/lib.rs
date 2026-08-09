@@ -16,6 +16,7 @@ pub mod control;
 pub mod detected_uses;
 mod external_scheduler_attribution;
 pub mod keychain;
+mod launch_events;
 pub mod legacy_service;
 pub mod macos_service;
 pub mod mcp_inventory;
