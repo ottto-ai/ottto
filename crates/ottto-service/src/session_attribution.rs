@@ -111,6 +111,7 @@ pub struct SessionAttributionContext {
     key: Zeroizing<Vec<u8>>,
     provider_schedules: ProviderScheduleInventory,
     external_schedulers: crate::external_scheduler_attribution::ExternalSchedulerInventory,
+    launch_events: crate::launch_events::LaunchEventInventory,
 }
 
 pub struct SessionAttributionGroupingInput<'a> {
@@ -180,11 +181,78 @@ impl SessionAttributionContext {
         };
         let external_schedulers =
             crate::external_scheduler_attribution::ExternalSchedulerInventory::cached(home, &key);
+        // Gated with everything else in this constructor: launch-event intake
+        // rides the same `session_attribution_enabled` policy and the same
+        // backend-issued key epoch that already govern every attribution fact.
+        // Attribution off means the drop directory is not even listed.
+        let launch_events = crate::launch_events::LaunchEventInventory::cached(home);
         Some(Self {
             key,
             provider_schedules,
             external_schedulers,
+            launch_events,
         })
+    }
+
+    /// Direct lineage facts for a worker session an instrumented launcher
+    /// started, or nothing at all.
+    ///
+    /// Kept out of `grouping_facts` on purpose. Grouping facts are derived
+    /// signals that trim first under the payload budget; these are the exact
+    /// controller edge and belong immediately behind the provider-native facts,
+    /// which is where `into_items` appends them.
+    ///
+    /// The caller drops any field it has already filled from provider-native
+    /// evidence, so a launcher can add an edge the provider never knew about but
+    /// can never overwrite one the provider owns.
+    pub fn launch_event_facts(
+        &self,
+        worker_session_ref: &str,
+        observed_at: &str,
+    ) -> Vec<SessionAttributionFact> {
+        let mut facts = Vec::new();
+        let Some(event) = self.launch_events.matching(worker_session_ref) else {
+            return facts;
+        };
+        let evidence_context = EvidenceContext {
+            source_session_id: worker_session_ref,
+            observed_at,
+            source_version: crate::launch_events::LAUNCH_EVENT_SOURCE_VERSION,
+        };
+        let kind = crate::launch_events::LAUNCH_EVENT_EVIDENCE_KIND;
+        push_fact(
+            &mut facts,
+            "parent_session_ref",
+            &event.controller_session_ref,
+            kind,
+            "direct",
+            &evidence_context,
+        );
+        push_fact(
+            &mut facts,
+            "origin_kind",
+            "agent_spawn",
+            kind,
+            "direct",
+            &evidence_context,
+        );
+        push_fact(
+            &mut facts,
+            "workflow_ref",
+            &event.workflow_ref,
+            kind,
+            "direct",
+            &evidence_context,
+        );
+        push_fact(
+            &mut facts,
+            "agent_kind",
+            event.agent_kind,
+            kind,
+            "direct",
+            &evidence_context,
+        );
+        facts
     }
 
     pub fn grouping_facts(
@@ -1449,12 +1517,14 @@ mod tests {
             provider_schedules: ProviderScheduleInventory::default(),
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let rotated = SessionAttributionContext {
             key: Zeroizing::new(vec![2_u8; 32]),
             provider_schedules: ProviderScheduleInventory::default(),
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let changed_inventory = SessionAttributionContext {
             key: Zeroizing::new(vec![1_u8; 32]),
@@ -1466,12 +1536,81 @@ mod tests {
             },
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
 
         let namespace = context.checkpoint_namespace();
         assert_eq!(namespace.len(), 16);
         assert_ne!(namespace, rotated.checkpoint_namespace());
         assert_eq!(namespace, changed_inventory.checkpoint_namespace());
+    }
+
+    fn launch_context(events: Vec<crate::launch_events::LaunchEvent>) -> SessionAttributionContext {
+        SessionAttributionContext {
+            key: Zeroizing::new(vec![7_u8; 32]),
+            provider_schedules: ProviderScheduleInventory::default(),
+            external_schedulers:
+                crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::from_events(events),
+        }
+    }
+
+    fn launch_event() -> crate::launch_events::LaunchEvent {
+        crate::launch_events::LaunchEvent {
+            controller_session_ref: "a9789dcf-1e4a-4a6e-8abd-f30094efb269".to_string(),
+            worker_session_ref: "019f6822-403f-7652-a308-b0c12142e337".to_string(),
+            workflow_ref: "402d846d-c13c-4743-8326-580e4ca70e30".to_string(),
+            agent_kind: "pr-fixer",
+        }
+    }
+
+    #[test]
+    fn launch_event_facts_state_the_controller_edge_as_direct_evidence() {
+        let event = launch_event();
+        let context = launch_context(vec![event.clone()]);
+
+        let facts = context.launch_event_facts(&event.worker_session_ref, "2026-08-09T15:20:00Z");
+
+        let by_field: BTreeMap<&str, &SessionAttributionFact> = facts
+            .iter()
+            .map(|fact| (fact.field.as_str(), fact))
+            .collect();
+        assert_eq!(
+            by_field["parent_session_ref"].value,
+            event.controller_session_ref
+        );
+        assert_eq!(by_field["workflow_ref"].value, event.workflow_ref);
+        assert_eq!(by_field["origin_kind"].value, "agent_spawn");
+        assert_eq!(by_field["agent_kind"].value, "pr-fixer");
+        // Ordering is load-bearing: `enforce_fact_limits` trims from the tail,
+        // so the edge itself must never be the first thing dropped.
+        assert_eq!(facts[0].field, "parent_session_ref");
+        for fact in &facts {
+            assert_eq!(fact.evidence.strength, "direct");
+            assert_eq!(fact.evidence.kind, "launcher_event");
+            // The backend hard-rejects a source_version outside this shape, and
+            // a raise there 422s the whole batch rather than one fact.
+            assert_eq!(fact.evidence.source_version, "launcher_event:v1");
+            assert!(fact.evidence.evidence_ref.starts_with("sha256:"));
+            assert!(fact.display_label.is_none());
+            assert!(fact.display_label_source.is_none());
+        }
+        validate_fact_limits(&facts).expect("launch facts fit the wire contract");
+    }
+
+    #[test]
+    fn a_session_with_no_launch_event_gets_no_launch_facts() {
+        let context = launch_context(vec![launch_event()]);
+
+        assert!(context
+            .launch_event_facts(
+                "11111111-2222-3333-4444-555555555555",
+                "2026-08-09T15:20:00Z"
+            )
+            .is_empty());
+        assert!(launch_context(Vec::new())
+            .launch_event_facts(&launch_event().worker_session_ref, "2026-08-09T15:20:00Z")
+            .is_empty());
     }
 
     #[test]
@@ -1481,6 +1620,7 @@ mod tests {
             provider_schedules: ProviderScheduleInventory::default(),
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let changed_inventory = SessionAttributionContext {
             key: Zeroizing::new(vec![1_u8; 32]),
@@ -1492,6 +1632,7 @@ mod tests {
             },
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
 
         let namespace = context.legacy_cache_namespace();
@@ -1573,6 +1714,7 @@ mod tests {
             },
             external_schedulers:
                 crate::external_scheduler_attribution::ExternalSchedulerInventory::default(),
+            launch_events: crate::launch_events::LaunchEventInventory::default(),
         };
         let origin = SnapshotOrigin {
             thread_source: Some("automation".to_string()),

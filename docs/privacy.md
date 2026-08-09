@@ -210,6 +210,26 @@ correlation requires matching schedule time, prompt signature, provider, and
 repository. Interval jobs require a live job-PID relationship. Missing access,
 timeouts, and ambiguity produce no external-scheduler fact.
 
+Session attribution can also read launch events written by an instrumented
+launcher into `~/.ottto/launch-events/pending/`. This is the only way Ottto can
+state that a session in one app started a session in another; nothing is
+inferred from timing, repository, worktree, model, command line, or process
+ancestry. An event file may contain exactly nine values — a schema marker, three
+UUID session references, a pull-request number, a UTC timestamp, and three fixed
+enums — and the daemon rejects any file that carries an extra key, an unknown
+schema version, a reference that is not a UUID, a timestamp that is not UTC
+second precision, a name that does not match the references it claims, a session
+that names itself, or a launcher family Ottto does not recognize. No prompt,
+path, command line, environment value, or free text can pass those checks, and
+nothing is read from any other source to complete a partial event. Accepted
+files move to `~/.ottto/launch-events/processed/` and expire after thirty days;
+rejected files move to `~/.ottto/launch-events/rejected/` and expire after seven
+days, with the local log line naming only a reason code and never the file's
+contents. Two events naming the same session with different controllers produce
+no relationship at all. This intake reads only that directory, only while
+session attribution is enabled, and adds no watcher, process inspection, or
+permission prompt.
+
 ## Live Telemetry
 
 Live telemetry is source-level opt-in. Setup can mint scoped setup keys and
