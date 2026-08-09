@@ -5591,6 +5591,7 @@ fn codex_rate_limit_snapshot_has_usage(value: &Value) -> bool {
     value.get("primary").is_some()
         || value.get("secondary").is_some()
         || value.get("credits").is_some()
+        || codex_monthly_credit_limit_from_snapshot(value).is_some()
 }
 
 fn codex_app_server_quota_window(name: &str, value: &Value) -> Option<AgentQuotaWindow> {
@@ -5637,6 +5638,9 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
                 balances.push(balance);
             }
         }
+        if let Some(balance) = codex_monthly_credit_limit_from_snapshot(rate_limit) {
+            balances.push(balance);
+        }
     }
     if let Some(reset_credits) = value.get("rateLimitResetCredits") {
         if let Some(remaining) = json_u64(reset_credits, &["availableCount", "available_count"]) {
@@ -5660,6 +5664,72 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         }
     }
     balances
+}
+
+/// Parse Codex's effective workspace monthly credit limit.
+///
+/// The supported app-server surface calls this `individualLimit`; the legacy
+/// `wham/usage` fallback uses `individual_limit`. It is a recurring budget, not
+/// the earned reset bank and not the sparse `credits.balance`, so it gets a
+/// stable, separate identity downstream.
+fn codex_monthly_credit_limit_from_snapshot(container: &Value) -> Option<AgentCreditBalance> {
+    let individual_limit = container
+        .get("individualLimit")
+        .or_else(|| container.get("individual_limit"))?;
+    if individual_limit.is_null() {
+        return None;
+    }
+
+    let quota = json_u64(individual_limit, &["limit"]);
+    let used = json_u64(individual_limit, &["used"]);
+    let remaining = match (quota, used) {
+        (Some(quota), Some(used)) => Some(quota.saturating_sub(used)),
+        _ => None,
+    };
+    let remaining_percent = json_u8(individual_limit, &["remainingPercent", "remaining_percent"]);
+    let used_percent = remaining_percent.map(|value| 100_u8.saturating_sub(value));
+    let resets_at = json_timestamp_rfc3339(individual_limit, &["resetsAt", "resets_at"]);
+    if quota.is_none() && used.is_none() && remaining_percent.is_none() && resets_at.is_none() {
+        return None;
+    }
+
+    let spend_control_reached =
+        json_bool(container, &["spend_control_reached", "spendControlReached"]);
+    let rate_limit_reached_type = first_json_string(
+        container,
+        &["rate_limit_reached_type", "rateLimitReachedType"],
+    );
+    let limit_id = first_json_string(container, &["limit_id", "limitId"]);
+    let status = if spend_control_reached == Some(true)
+        || remaining == Some(0)
+        || remaining_percent == Some(0)
+    {
+        AgentCreditBalanceStatus::Exhausted
+    } else if remaining_percent.is_some_and(|value| value <= 20) {
+        AgentCreditBalanceStatus::Low
+    } else {
+        AgentCreditBalanceStatus::Ok
+    };
+
+    Some(AgentCreditBalance {
+        name: "workspace_monthly_credits".to_string(),
+        status,
+        freshness: AgentQuotaWindowFreshness::Fresh,
+        unit: AgentCreditBalanceUnit::Credits,
+        account_label: None,
+        remaining,
+        used,
+        quota,
+        unlimited: Some(false),
+        updated_at: None,
+        resets_at,
+        used_percent,
+        enabled: Some(true),
+        spend_control_reached,
+        rate_limit_reached_type,
+        limit_id,
+        ..Default::default()
+    })
 }
 
 fn codex_credit_balance_from_credits_snapshot(
@@ -5877,8 +5947,11 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         .get("rate_limit")
         .filter(|value| value.is_object())
         .unwrap_or(value);
+    let mut balances = Vec::new();
     let Some(credits) = container.get("credits") else {
-        return Vec::new();
+        return codex_monthly_credit_limit_from_snapshot(container)
+            .into_iter()
+            .collect();
     };
     let remaining = json_u64(credits, &["balance", "remaining", "credits"]);
     let unlimited = json_bool(credits, &["unlimited"]);
@@ -5895,7 +5968,10 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         && !has_credits
         && spend_control_reached != Some(true)
     {
-        return Vec::new();
+        if let Some(monthly) = codex_monthly_credit_limit_from_snapshot(container) {
+            balances.push(monthly);
+        }
+        return balances;
     }
     // A reached spend control means the account is spend-capped even if a nominal
     // credit figure remains, so treat it as exhausted regardless of the balance.
@@ -5904,7 +5980,7 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
     } else {
         codex_credit_balance_status(remaining, unlimited, has_credits)
     };
-    vec![AgentCreditBalance {
+    balances.push(AgentCreditBalance {
         name: "credits".to_string(),
         status,
         freshness: AgentQuotaWindowFreshness::Fresh,
@@ -5919,7 +5995,11 @@ fn codex_usage_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
         rate_limit_reached_type,
         limit_id,
         ..Default::default()
-    }]
+    });
+    if let Some(monthly) = codex_monthly_credit_limit_from_snapshot(container) {
+        balances.push(monthly);
+    }
+    balances
 }
 
 #[derive(Debug, Clone)]
@@ -9820,6 +9900,44 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn codex_usage_parser_carries_workspace_monthly_credit_limit() {
+        let json = serde_json::json!({
+            "limit_id": "codex",
+            "primary": {
+                "used_percent": 100,
+                "window_minutes": 10080,
+                "resets_at": 1786431605_u64
+            },
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": null
+            },
+            "individual_limit": {
+                "limit": "8000",
+                "used": "4841",
+                "remaining_percent": 39,
+                "resets_at": 1788220800_u64
+            },
+            "spend_control_reached": false
+        });
+
+        let credits = codex_usage_credit_balances(&json);
+
+        assert_eq!(credits.len(), 2);
+        let monthly = &credits[1];
+        assert_eq!(monthly.name, "workspace_monthly_credits");
+        assert_eq!(monthly.status, AgentCreditBalanceStatus::Ok);
+        assert_eq!(monthly.used, Some(4841));
+        assert_eq!(monthly.quota, Some(8000));
+        assert_eq!(monthly.remaining, Some(3159));
+        assert_eq!(monthly.used_percent, Some(61));
+        assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-01T00:00:00Z"));
+        assert_eq!(monthly.enabled, Some(true));
+        assert_eq!(monthly.limit_id.as_deref(), Some("codex"));
+    }
+
+    #[test]
     fn codex_usage_parser_treats_spend_control_reached_as_exhausted() {
         // A reached spend control caps the account even with a positive balance.
         let json = serde_json::json!({
@@ -9965,6 +10083,102 @@ for line in sys.stdin:
             Some("primary")
         );
         assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn codex_app_server_parser_carries_workspace_monthly_credit_limit() {
+        let json = serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 100,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1786431605_u64
+                    },
+                    "credits": {
+                        "hasCredits": true,
+                        "unlimited": false,
+                        "balance": null
+                    },
+                    "individualLimit": {
+                        "limit": "8000",
+                        "used": "4841",
+                        "remainingPercent": 39,
+                        "resetsAt": 1788220800_u64
+                    },
+                    "spendControlReached": false
+                }
+            }
+        });
+
+        let windows = codex_app_server_quota_windows(&json);
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].status, AgentQuotaWindowStatus::Exhausted);
+        assert_eq!(credits.len(), 2);
+        assert_eq!(credits[0].name, "credits");
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Ok);
+        let monthly = &credits[1];
+        assert_eq!(monthly.name, "workspace_monthly_credits");
+        assert_eq!(monthly.status, AgentCreditBalanceStatus::Ok);
+        assert_eq!(monthly.used, Some(4841));
+        assert_eq!(monthly.quota, Some(8000));
+        assert_eq!(monthly.remaining, Some(3159));
+        assert_eq!(monthly.used_percent, Some(61));
+        assert_eq!(monthly.resets_at.as_deref(), Some("2026-09-01T00:00:00Z"));
+        assert_eq!(monthly.spend_control_reached, Some(false));
+    }
+
+    #[test]
+    fn codex_app_server_selects_snapshot_with_only_monthly_credit_limit() {
+        let json = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": null,
+                "secondary": null,
+                "credits": null,
+                "individualLimit": {
+                    "limit": "100",
+                    "used": "100",
+                    "remainingPercent": 0,
+                    "resetsAt": 1788220800_u64
+                }
+            }
+        });
+
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].name, "workspace_monthly_credits");
+        assert_eq!(credits[0].status, AgentCreditBalanceStatus::Exhausted);
+        assert_eq!(credits[0].remaining, Some(0));
+    }
+
+    #[test]
+    fn codex_app_server_ignores_null_monthly_placeholder_when_selecting_snapshot() {
+        let json = serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "individualLimit": null
+                }
+            },
+            "rateLimits": {
+                "individualLimit": {
+                    "limit": "8000",
+                    "used": "4525",
+                    "remainingPercent": 43,
+                    "resetsAt": 1788220800_u64
+                }
+            }
+        });
+
+        let credits = codex_app_server_credit_balances(&json);
+
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].name, "workspace_monthly_credits");
+        assert_eq!(credits[0].remaining, Some(3475));
     }
 
     #[test]
