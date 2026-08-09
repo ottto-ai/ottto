@@ -9,7 +9,7 @@ pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 /// reject it outright, so a UI that can drive this consent is told to update
 /// rather than silently doing nothing. Every unrelated command stays on the
 /// base version for mixed-owner upgrade compatibility.
-pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 17;
+pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 18;
 /// Command-scoped version for the four machine-local Claude account registry
 /// operations. Version 15 predates ownership and opaque slot identifiers, so
 /// accepting it would let clients silently misclassify external paths.
@@ -3012,6 +3012,11 @@ pub enum LocalControlCommand {
         api_base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_grant: Option<ProviderDailyReferenceBackendGrantResponseV1>,
+        /// Opaque account attribution observed by the browser's immediately
+        /// preceding status read. Required only for current-account privacy
+        /// controls so an account switch cannot retarget the mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_account_fingerprint: Option<String>,
     },
     Repair {
         source: SourceKind,
@@ -3075,6 +3080,8 @@ pub enum ProviderDailyReferenceControlAction {
     Revoke,
     ConfirmRevoked,
     Status,
+    ExcludeCurrentAccount,
+    IncludeCurrentAccount,
 }
 
 /// Server policy for one `provider_daily_reference` grant.
@@ -4991,7 +4998,7 @@ mod tests {
                 "schema_version": "provider_daily_reference.v1",
                 "collector_version": "0.1.98",
                 "release_lane": "supported",
-                "disclosure_version": "provider_daily_reference_disclosure.v1",
+                "disclosure_version": "provider_daily_reference_disclosure.v2",
                 "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
                 "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
                 "status": "enabled",
@@ -5029,6 +5036,41 @@ mod tests {
                 ..
             }
         ));
+
+        for (wire_action, expected) in [
+            (
+                "exclude_current_account",
+                ProviderDailyReferenceControlAction::ExcludeCurrentAccount,
+            ),
+            (
+                "include_current_account",
+                ProviderDailyReferenceControlAction::IncludeCurrentAccount,
+            ),
+        ] {
+            let privacy_control: LocalControlRequest = serde_json::from_value(serde_json::json!({
+                "request_id": format!("req_pdr_{wire_action}"),
+                "protocol_version": PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION,
+                "client_kind": "web_ui",
+                "command": "provider_daily_reference_control",
+                "action": wire_action,
+                "control_token": "header.payload.signature",
+                "api_base_url": "https://api.ottto.net",
+                "expected_account_fingerprint": format!(
+                    "hmac-sha256:{}",
+                    "c".repeat(64)
+                )
+            }))
+            .expect("provider daily reference privacy control request");
+            assert!(matches!(
+                privacy_control.command,
+                LocalControlCommand::ProviderDailyReferenceControl {
+                    action,
+                    expected_account_fingerprint: Some(ref fingerprint),
+                    ..
+                } if action == expected
+                    && fingerprint == &format!("hmac-sha256:{}", "c".repeat(64))
+            ));
+        }
     }
 
     #[test]
@@ -5092,7 +5134,7 @@ mod tests {
             request.protocol_version,
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
         );
-        assert_eq!(PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION, 17);
+        assert_eq!(PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION, 18);
     }
 
     #[test]

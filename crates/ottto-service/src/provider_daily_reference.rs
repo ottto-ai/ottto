@@ -56,7 +56,8 @@ pub const SOURCE: &str = "codex";
 /// Wire collector id.
 pub const COLLECTOR_ID: &str = "provider_daily_reference";
 /// Versioned disclosure the grant is bound to.
-pub const DISCLOSURE_VERSION: &str = "provider_daily_reference_disclosure.v1";
+pub const DISCLOSURE_VERSION: &str = "provider_daily_reference_disclosure.v2";
+const DISCLOSURE_VERSION_V1: &str = "provider_daily_reference_disclosure.v1";
 /// Release lane the server admits.
 pub const RELEASE_LANE: &str = "supported";
 /// Ack schema the backend answers a batch with.
@@ -359,8 +360,9 @@ pub struct GrantSetup {
     pub installation_id: String,
     pub organization_scope: String,
     pub effective_user_scope: String,
-    /// The provider account the consent covers. Two Codex accounts on one
-    /// machine are two grants, and the backend judges freshness per grant.
+    /// The provider account signed in when consent is approved. It supplies
+    /// the initial attribution fingerprint only; disclosure v2 authorization
+    /// is user + installation scoped and never gates on this value.
     pub provider_account_scope: String,
 }
 
@@ -396,6 +398,8 @@ struct PersistedGrant {
     schema_version: String,
     hmac_key_hex: String,
     grant: DailyReferenceGrant,
+    #[serde(default)]
+    excluded_account_fingerprints: BTreeSet<String>,
 }
 
 /// Consent store. One grant per installation, held under the support dir.
@@ -464,6 +468,37 @@ impl GrantStore {
         Ok(Some(opaque_key(&key, installation_id)))
     }
 
+    /// Whether this opaque account is locally suppressed. The set contains no
+    /// provider identifier and survives daemon restarts and consent epochs.
+    pub fn account_is_excluded(&self, account_fingerprint: &str) -> Result<bool> {
+        Ok(self.read()?.is_some_and(|state| {
+            state
+                .excluded_account_fingerprints
+                .contains(account_fingerprint)
+        }))
+    }
+
+    /// Mirror the backend's durable exclusion locally so future cycles stop
+    /// before contacting the provider rather than repeating a refused upload.
+    pub fn set_account_excluded(&self, account_fingerprint: &str, excluded: bool) -> Result<()> {
+        if !is_fingerprint(account_fingerprint) {
+            return Err(anyhow!("account fingerprint is invalid"));
+        }
+        let mut state = self
+            .read()?
+            .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
+        if excluded {
+            state
+                .excluded_account_fingerprints
+                .insert(account_fingerprint.to_string());
+        } else {
+            state
+                .excluded_account_fingerprints
+                .remove(account_fingerprint);
+        }
+        atomic_json_write(&self.path, &state)
+    }
+
     /// Record local consent. The grant is not live until the backend binds it:
     /// `backend_create_pending` is set, so [`grant_runtime_ready`] refuses it.
     pub fn enable(&self, setup: &GrantSetup, now: OffsetDateTime) -> Result<DailyReferenceGrant> {
@@ -505,6 +540,10 @@ impl GrantStore {
             schema_version: GRANT_FILE_SCHEMA_VERSION.to_string(),
             hmac_key_hex: hex(&key),
             grant: grant.clone(),
+            excluded_account_fingerprints: self
+                .read()?
+                .map(|state| state.excluded_account_fingerprints)
+                .unwrap_or_default(),
         };
         atomic_json_write(&self.path, &state)?;
         Ok(grant)
@@ -794,6 +833,8 @@ pub enum RuntimeState {
     PolicyDisabled,
     /// The local off-switch sentinel is present.
     NetworkDisabled,
+    /// Consent remains enabled, but this signed-in account is suppressed.
+    AccountExcluded,
 }
 
 /// Credential-free status view. Building it reads one local file and never
@@ -814,6 +855,12 @@ pub struct CollectorStatusV1 {
     /// been bound. The UI must retry the idempotent POST and bind its answer.
     pub backend_create_pending: bool,
     pub reason_code: String,
+    /// Opaque current-account label for matching the owner-authorized backend
+    /// covered-account response. Never render this value as an account name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_account_fingerprint: Option<String>,
+    #[serde(default)]
+    pub current_account_excluded: bool,
 }
 
 /// Build the status view for a given store and off-switch state.
@@ -870,6 +917,8 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
         network_disabled,
         backend_create_pending,
         reason_code: reason_code.to_string(),
+        current_account_fingerprint: None,
+        current_account_excluded: false,
     }
 }
 
@@ -896,13 +945,35 @@ pub fn status_with_live_binding(
     let Some(runtime) = runtime else {
         return status;
     };
-    let Some(reason) = live_binding_mismatch(grants, runtime) else {
-        return status;
-    };
+    if let Some(reason) = live_binding_mismatch(grants, runtime) {
+        return CollectorStatusV1 {
+            runtime_state: RuntimeState::ConsentRequired,
+            provider_read_permitted: false,
+            reason_code: reason.to_string(),
+            ..status
+        };
+    }
+    let current_account_fingerprint = grants
+        .account_fingerprint_for(&runtime.provider_account_scope)
+        .ok()
+        .flatten();
+    let current_account_excluded = current_account_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| grants.account_is_excluded(fingerprint).unwrap_or(false));
     CollectorStatusV1 {
-        runtime_state: RuntimeState::ConsentRequired,
-        provider_read_permitted: false,
-        reason_code: reason.to_string(),
+        runtime_state: if current_account_excluded {
+            RuntimeState::AccountExcluded
+        } else {
+            status.runtime_state
+        },
+        provider_read_permitted: status.provider_read_permitted && !current_account_excluded,
+        reason_code: if current_account_excluded {
+            "account_excluded".to_string()
+        } else {
+            status.reason_code.clone()
+        },
+        current_account_fingerprint,
+        current_account_excluded,
         ..status
     }
 }
@@ -919,9 +990,11 @@ fn live_binding_mismatch(grants: &GrantStore, runtime: &Runtime) -> Option<&'sta
             return Some("installation_mismatch");
         }
     }
-    if let Ok(Some(account)) = grants.account_fingerprint_for(&runtime.provider_account_scope) {
-        if account != stored.account_fingerprint {
-            return Some("account_mismatch");
+    if stored.disclosure_version == DISCLOSURE_VERSION_V1 {
+        if let Ok(Some(account)) = grants.account_fingerprint_for(&runtime.provider_account_scope) {
+            if account != stored.account_fingerprint {
+                return Some("account_mismatch");
+            }
         }
     }
     None
@@ -1119,7 +1192,16 @@ impl StateStore {
 
 /// Identity the breaker and cadence are keyed by: the grant epoch plus the
 /// call's own configuration.
+#[cfg(test)]
 fn state_identity(grant: &DailyReferenceGrant, sentinel_disabled: bool) -> String {
+    state_identity_for_account(grant, &grant.account_fingerprint, sentinel_disabled)
+}
+
+fn state_identity_for_account(
+    grant: &DailyReferenceGrant,
+    account_fingerprint: &str,
+    sentinel_disabled: bool,
+) -> String {
     let binding = grant
         .backend_binding
         .as_ref()
@@ -1128,7 +1210,7 @@ fn state_identity(grant: &DailyReferenceGrant, sentinel_disabled: bool) -> Strin
     let mut hasher = Sha256::new();
     hasher.update(b"ottto:codex-daily-aggregates-identity:");
     for part in [
-        grant.account_fingerprint.as_str(),
+        account_fingerprint,
         grant.grant_scope_fingerprint.as_str(),
         binding.0,
         &binding.1.to_string(),
@@ -1235,7 +1317,8 @@ pub trait ProviderDailyUsageReader {
 pub struct CodexCredential {
     pub access_token: String,
     pub account_id: Option<String>,
-    /// Stable scope the grant's account fingerprint is derived from.
+    /// Stable provider account scope used only to derive row attribution.
+    /// Disclosure v2 authorization never gates on this value.
     pub account_scope: String,
 }
 
@@ -2201,6 +2284,9 @@ pub enum UploadError {
     /// The declared consent epoch is behind the server's. Only re-consent can
     /// fix it, so the collector stops rather than retrying.
     GrantEpochConflict,
+    /// The current opaque account is durably excluded by the owner. This is a
+    /// terminal privacy state, not a transient upload failure.
+    AccountExcluded,
     /// Contract rejection: the batch is not acceptable as shaped.
     ContractRejected(u16),
     /// Everything else. Retried on the next cycle.
@@ -2212,6 +2298,7 @@ impl UploadError {
         match self {
             UploadError::NotAdmitted(_) => "collector_not_admitted",
             UploadError::GrantEpochConflict => "grant_epoch_conflict",
+            UploadError::AccountExcluded => "account_excluded",
             UploadError::ContractRejected(_) => "contract_rejected",
             UploadError::Unavailable(_) => "upload_unavailable",
         }
@@ -2330,10 +2417,16 @@ fn map_upload_error(error: &anyhow::Error) -> UploadError {
     if let Some(rejected) =
         error.downcast_ref::<crate::snapshot_client::ProviderDailyReferenceContractRejected>()
     {
-        return if rejected.status == 409 {
-            UploadError::GrantEpochConflict
-        } else {
-            UploadError::ContractRejected(rejected.status)
+        return match rejected.reason {
+            crate::snapshot_client::ProviderDailyReferenceContractRejection::AccountExcluded => {
+                UploadError::AccountExcluded
+            }
+            crate::snapshot_client::ProviderDailyReferenceContractRejection::GrantEpochConflict => {
+                UploadError::GrantEpochConflict
+            }
+            crate::snapshot_client::ProviderDailyReferenceContractRejection::Other => {
+                UploadError::ContractRejected(rejected.status)
+            }
         };
     }
     UploadError::Unavailable(error.to_string())
@@ -2357,6 +2450,8 @@ pub enum CycleOutcome {
     Uploaded,
     /// The backend has not admitted this collector version. Expected.
     NotAdmitted,
+    /// Current account is explicitly excluded; no retry loop is entered.
+    AccountExcluded,
     /// A provider or upload failure this cycle.
     Failed,
 }
@@ -2627,9 +2722,9 @@ fn collect_once(
         );
     }
 
-    // Consent is bound to one installation and one provider account. Prove both
-    // before the credential is used, so account B's numbers can never be
-    // uploaded under account A's fingerprint.
+    // Consent is bound to this installation. The live account is attribution,
+    // not authorization under disclosure v2: derive its opaque fingerprint on
+    // every cycle so account A and account B can never overwrite one another.
     let installation_matches = grants
         .installation_fingerprint_for(&runtime.installation_id)
         .ok()
@@ -2644,17 +2739,39 @@ fn collect_once(
             ),
         );
     }
-    let account_matches = grants
+    let Some(account_fingerprint) = grants
         .account_fingerprint_for(&runtime.provider_account_scope)
         .ok()
         .flatten()
-        .is_some_and(|fingerprint| fingerprint == grant.account_fingerprint);
-    if !account_matches {
+    else {
+        return Cycle::with(
+            CycleOutcome::Disabled,
+            warning(
+                "codex_daily_aggregates_account_attribution_unavailable",
+                "The live Codex account could not be assigned an opaque attribution label; collection is stopped.",
+            ),
+        );
+    };
+    if grant.disclosure_version == DISCLOSURE_VERSION_V1
+        && account_fingerprint != grant.account_fingerprint
+    {
         return Cycle::with(
             CycleOutcome::Disabled,
             warning(
                 "codex_daily_aggregates_account_mismatch",
-                "The live Codex account is not the account this consent covers; collection is stopped.",
+                "The live Codex account is not the account this v1 consent covers; collection is stopped.",
+            ),
+        );
+    }
+    if grants
+        .account_is_excluded(&account_fingerprint)
+        .unwrap_or(false)
+    {
+        return Cycle::with(
+            CycleOutcome::AccountExcluded,
+            info(
+                "codex_daily_aggregates_account_excluded",
+                "The current Codex account is excluded. No provider read or upload was attempted.",
             ),
         );
     }
@@ -2663,7 +2780,7 @@ fn collect_once(
         return Cycle::new(CycleOutcome::Deferred);
     }
 
-    let identity = state_identity(&grant, sentinel_disabled);
+    let identity = state_identity_for_account(&grant, &account_fingerprint, sentinel_disabled);
     let mut state = state_store.load(&identity);
     let now_seconds = unix_seconds(now);
     if breaker_is_open(&state, now_seconds) {
@@ -2772,7 +2889,7 @@ fn collect_once(
             collector_version: compiled_release_version(),
             installation_id: runtime.installation_id.clone(),
             grant_scope_fingerprint: grant.grant_scope_fingerprint.clone(),
-            account_fingerprint: grant.account_fingerprint.clone(),
+            account_fingerprint: account_fingerprint.clone(),
             grant_version,
             provider_day_timezone: PROVIDER_DAY_TIMEZONE,
             coverage_start: coverage_start.clone(),
@@ -2841,6 +2958,24 @@ fn collect_once(
                 ));
                 return Cycle {
                     outcome: CycleOutcome::NotAdmitted,
+                    normalized_row_count: Some(normalized_row_count),
+                    diagnostics,
+                };
+            }
+            Err(UploadError::AccountExcluded) => {
+                // Backend ownership is authoritative. Persist only this opaque
+                // label locally so the next cycle stops before another
+                // provider read instead of retrying a non-retryable refusal.
+                let _ = grants.set_account_excluded(&account_fingerprint, true);
+                state.last_error_category = Some("account_excluded".to_string());
+                let _ = state_store.save(&state);
+                let _ = grants.record_health(None, Some("account_excluded"));
+                diagnostics.push(info(
+                    "codex_daily_aggregates_account_excluded",
+                    "The backend excluded the current Codex account. Future cycles stop before reading until the customer includes it again.",
+                ));
+                return Cycle {
+                    outcome: CycleOutcome::AccountExcluded,
                     normalized_row_count: Some(normalized_row_count),
                     diagnostics,
                 };
@@ -3328,11 +3463,10 @@ fn grant_scope_fingerprint(key: &[u8], setup: &GrantSetup) -> String {
     opaque_key(
         key,
         &format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}",
             setup.installation_id,
             setup.organization_scope,
             setup.effective_user_scope,
-            setup.provider_account_scope,
             COLLECTOR_ID
         ),
     )
@@ -4485,6 +4619,31 @@ mod tests {
             .bind_backend_grant(&grant_response(&local, "enabled", 1), INSTALLATION_ID)
             .expect("bind");
         assert!(grant_runtime_ready(&bound));
+        assert_eq!(
+            bound.disclosure_version,
+            "provider_daily_reference_disclosure.v2"
+        );
+    }
+
+    #[test]
+    fn v2_scope_is_stable_across_accounts_but_attribution_is_not() {
+        let collector = collector("v2-scope-across-accounts");
+        let account_a = collector
+            .grants()
+            .enable(&setup(), now())
+            .expect("account a");
+        let mut account_b_setup = setup();
+        account_b_setup.provider_account_scope = "acct-second".to_string();
+        let account_b = collector
+            .grants()
+            .enable(&account_b_setup, now() + TimeDuration::seconds(1))
+            .expect("account b");
+
+        assert_eq!(
+            account_a.grant_scope_fingerprint,
+            account_b.grant_scope_fingerprint
+        );
+        assert_ne!(account_a.account_fingerprint, account_b.account_fingerprint);
     }
 
     #[test]
@@ -4521,7 +4680,7 @@ mod tests {
             .bind_backend_grant(&wrong_account, INSTALLATION_ID)
             .is_err());
         let mut wrong_disclosure = grant_response(&local, "enabled", 1);
-        wrong_disclosure.disclosure_version = "provider_daily_reference_disclosure.v2".to_string();
+        wrong_disclosure.disclosure_version = DISCLOSURE_VERSION_V1.to_string();
         assert!(collector
             .grants()
             .bind_backend_grant(&wrong_disclosure, INSTALLATION_ID)
@@ -4546,7 +4705,7 @@ mod tests {
     fn runtime_readiness_refuses_a_different_disclosure_version() {
         let collector = collector("runtime-readiness-disclosure");
         let mut grant = enabled(&collector);
-        grant.disclosure_version = "provider_daily_reference_disclosure.v2".to_string();
+        grant.disclosure_version = DISCLOSURE_VERSION_V1.to_string();
 
         assert!(!grant_runtime_ready(&grant));
     }
@@ -4778,6 +4937,25 @@ mod tests {
     }
 
     #[test]
+    fn revoke_stops_collection_before_the_provider_is_contacted() {
+        let collector = collector("revoked-collection");
+        enabled(&collector);
+        collector.grants().revoke(now()).expect("revoke");
+
+        let cycle = collector.collect_once(
+            &runtime(),
+            &ForbiddenReader,
+            &ForbiddenTransport,
+            now() + TimeDuration::hours(1),
+        );
+        assert_eq!(cycle.outcome, CycleOutcome::Disabled);
+        assert_eq!(
+            cycle.diagnostics[0].code,
+            "codex_daily_aggregates_consent_not_runtime_ready"
+        );
+    }
+
+    #[test]
     fn the_sentinel_disables_collection_and_retires_local_state() {
         let collector = collector("sentinel");
         enabled(&collector);
@@ -4859,7 +5037,7 @@ mod tests {
             serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
                 .expect("decode");
         persisted["grant"]["disclosure_version"] =
-            serde_json::Value::String("provider_daily_reference_disclosure.v2".to_string());
+            serde_json::Value::String(DISCLOSURE_VERSION_V1.to_string());
         fs::write(
             collector.grants().path(),
             serde_json::to_vec_pretty(&persisted).expect("encode"),
@@ -4876,12 +5054,22 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_cycle_still_gets_its_diagnostics_logged() {
+    fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
         // Regression: a live consent that stops collecting used to build this
         // warning and drop it, because the supervisor logged only non-Disabled
         // cycles. On a real Mac that read as "everything is fine, no data".
         let collector = collector("disabled-cycle-logging");
         enabled(&collector);
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(collector.grants().path()).expect("read"))
+                .expect("decode");
+        persisted["grant"]["disclosure_version"] =
+            serde_json::Value::String(DISCLOSURE_VERSION_V1.to_string());
+        fs::write(
+            collector.grants().path(),
+            serde_json::to_vec_pretty(&persisted).expect("encode"),
+        )
+        .expect("write");
         let other_account = Runtime {
             installation_id: INSTALLATION_ID.to_string(),
             provider_account_scope: "acct-a-completely-different-account".to_string(),
@@ -4895,8 +5083,8 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("codex_daily_aggregates_account_mismatch")),
-            "a Disabled cycle must still explain itself: {lines:?}"
+                .any(|line| line.contains("codex_daily_aggregates_consent_not_runtime_ready")),
+            "a v1 grant must remain blocked pending fresh v2 approval: {lines:?}"
         );
     }
 
@@ -4931,13 +5119,9 @@ mod tests {
     }
 
     #[test]
-    fn the_status_reports_a_live_account_the_consent_does_not_cover() {
-        // Regression: the cycle refused on account mismatch while the operator
-        // surface still read `enabled`, so a live install collected nothing for
-        // over a day with nothing to show for it. Whatever a cycle refuses for,
-        // the status has to be able to say.
-        let collector = collector("status-account-mismatch");
-        enabled(&collector);
+    fn the_status_stays_enabled_after_a_v2_account_switch() {
+        let collector = collector("status-account-switch");
+        let grant = enabled(&collector);
         let grants = collector.grants();
         let ready = collector_status(grants, false);
         assert_eq!(ready.runtime_state, RuntimeState::Enabled);
@@ -4947,10 +5131,14 @@ mod tests {
             installation_id: INSTALLATION_ID.to_string(),
             provider_account_scope: "acct-a-completely-different-account".to_string(),
         };
-        let mismatched = status_with_live_binding(grants, ready.clone(), Some(&other_account));
-        assert_eq!(mismatched.runtime_state, RuntimeState::ConsentRequired);
-        assert_eq!(mismatched.reason_code, "account_mismatch");
-        assert!(!mismatched.provider_read_permitted);
+        let switched = status_with_live_binding(grants, ready.clone(), Some(&other_account));
+        assert_eq!(switched.runtime_state, RuntimeState::Enabled);
+        assert_eq!(switched.reason_code, "enabled");
+        assert!(switched.provider_read_permitted);
+        assert_ne!(
+            switched.current_account_fingerprint.as_deref(),
+            Some(grant.account_fingerprint.as_str())
+        );
 
         // The matching binding is left exactly as it was, and an unresolvable
         // binding must not invent a mismatch.
@@ -4965,20 +5153,107 @@ mod tests {
     }
 
     #[test]
-    fn a_different_provider_account_can_never_upload_under_this_consent() {
-        let collector = collector("account-mismatch");
-        enabled(&collector);
+    fn v2_uploads_a_different_provider_account_under_its_own_attribution() {
+        let collector = collector("account-switch");
+        let grant = enabled(&collector);
         let other_account = Runtime {
             installation_id: INSTALLATION_ID.to_string(),
             provider_account_scope: "acct-a-completely-different-account".to_string(),
         };
-        let cycle =
-            collector.collect_once(&other_account, &ForbiddenReader, &ForbiddenTransport, now());
-        assert_eq!(cycle.outcome, CycleOutcome::Disabled);
-        assert_eq!(
-            cycle.diagnostics[0].code,
-            "codex_daily_aggregates_account_mismatch"
+        let reader = StaticReader::new(poisoned_payload());
+        let transport = RecordingTransport::default();
+        let cycle = collector.collect_once(&other_account, &reader, &transport, now());
+        assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
+        let batch = &transport.batches.borrow()[0];
+        assert_ne!(batch["account_fingerprint"], grant.account_fingerprint);
+        let switched_fingerprint = collector
+            .grants()
+            .account_fingerprint_for(&other_account.provider_account_scope)
+            .expect("derive")
+            .expect("grant");
+        assert_eq!(batch["account_fingerprint"], switched_fingerprint);
+    }
+
+    #[test]
+    fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
+        let collector = collector("account-exclusion");
+        enabled(&collector);
+        let current_fingerprint = collector
+            .grants()
+            .account_fingerprint_for(ACCOUNT_SCOPE)
+            .expect("derive")
+            .expect("grant");
+        let reader = StaticReader::new(poisoned_payload());
+        let rejected = RejectingTransport::new(UploadError::AccountExcluded);
+
+        let refused = collector.collect_once(&runtime(), &reader, &rejected, now());
+        assert_eq!(refused.outcome, CycleOutcome::AccountExcluded);
+        assert_eq!(rejected.calls.get(), 1);
+        assert!(collector
+            .grants()
+            .account_is_excluded(&current_fingerprint)
+            .expect("excluded"));
+
+        let status = status_with_live_binding(
+            collector.grants(),
+            collector_status(collector.grants(), false),
+            Some(&runtime()),
         );
+        assert_eq!(status.runtime_state, RuntimeState::AccountExcluded);
+        assert_eq!(status.reason_code, "account_excluded");
+        assert!(!status.provider_read_permitted);
+        assert_eq!(
+            status.current_account_fingerprint.as_deref(),
+            Some(current_fingerprint.as_str())
+        );
+
+        let blocked = collector.collect_once(
+            &runtime(),
+            &ForbiddenReader,
+            &ForbiddenTransport,
+            now() + TimeDuration::hours(7),
+        );
+        assert_eq!(blocked.outcome, CycleOutcome::AccountExcluded);
+
+        collector
+            .grants()
+            .set_account_excluded(&current_fingerprint, false)
+            .expect("include");
+        let transport = RecordingTransport::default();
+        let restored = collector.collect_once(
+            &runtime(),
+            &StaticReader::new(poisoned_payload()),
+            &transport,
+            now() + TimeDuration::days(1),
+        );
+        assert_eq!(restored.outcome, CycleOutcome::Uploaded);
+    }
+
+    #[test]
+    fn account_exclusions_survive_fresh_approval() {
+        let collector = collector("account-exclusion-reapproval");
+        collector
+            .grants()
+            .enable(&setup(), now())
+            .expect("initial approval");
+        let account = collector
+            .grants()
+            .account_fingerprint_for(ACCOUNT_SCOPE)
+            .expect("derive")
+            .expect("grant");
+        collector
+            .grants()
+            .set_account_excluded(&account, true)
+            .expect("exclude");
+
+        collector
+            .grants()
+            .enable(&setup(), now() + TimeDuration::days(1))
+            .expect("fresh approval");
+        assert!(collector
+            .grants()
+            .account_is_excluded(&account)
+            .expect("persisted exclusion"));
     }
 
     #[test]
@@ -5443,6 +5718,18 @@ mod tests {
             grant.last_error_category.as_deref(),
             Some("grant_epoch_conflict")
         );
+    }
+
+    #[test]
+    fn typed_backend_account_exclusion_is_not_misclassified_as_an_epoch_conflict() {
+        let error = anyhow::Error::new(
+            crate::snapshot_client::ProviderDailyReferenceContractRejected {
+                status: 409,
+                reason:
+                    crate::snapshot_client::ProviderDailyReferenceContractRejection::AccountExcluded,
+            },
+        );
+        assert_eq!(map_upload_error(&error), UploadError::AccountExcluded);
     }
 
     #[test]
