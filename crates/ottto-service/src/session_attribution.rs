@@ -236,14 +236,16 @@ impl SessionAttributionContext {
             "direct",
             &evidence_context,
         );
-        push_fact(
-            &mut facts,
-            "workflow_ref",
-            &event.workflow_ref,
-            kind,
-            "direct",
-            &evidence_context,
-        );
+        if let Some(workflow_ref) = event.workflow_ref.as_deref() {
+            push_fact(
+                &mut facts,
+                "workflow_ref",
+                workflow_ref,
+                kind,
+                "direct",
+                &evidence_context,
+            );
+        }
         push_fact(
             &mut facts,
             "agent_kind",
@@ -1559,7 +1561,7 @@ mod tests {
         crate::launch_events::LaunchEvent {
             controller_session_ref: "a9789dcf-1e4a-4a6e-8abd-f30094efb269".to_string(),
             worker_session_ref: "019f6822-403f-7652-a308-b0c12142e337".to_string(),
-            workflow_ref: "402d846d-c13c-4743-8326-580e4ca70e30".to_string(),
+            workflow_ref: Some("402d846d-c13c-4743-8326-580e4ca70e30".to_string()),
             agent_kind: "pr-fixer",
         }
     }
@@ -1579,7 +1581,10 @@ mod tests {
             by_field["parent_session_ref"].value,
             event.controller_session_ref
         );
-        assert_eq!(by_field["workflow_ref"].value, event.workflow_ref);
+        assert_eq!(
+            by_field["workflow_ref"].value,
+            event.workflow_ref.expect("repair event workflow")
+        );
         assert_eq!(by_field["origin_kind"].value, "agent_spawn");
         assert_eq!(by_field["agent_kind"].value, "pr-fixer");
         // Ordering is load-bearing: `enforce_fact_limits` trims from the tail,
@@ -1596,6 +1601,31 @@ mod tests {
             assert!(fact.display_label_source.is_none());
         }
         validate_fact_limits(&facts).expect("launch facts fit the wire contract");
+    }
+
+    #[test]
+    fn relay_launch_facts_do_not_invent_a_workflow() {
+        let event = crate::launch_events::LaunchEvent {
+            controller_session_ref: "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2af"
+                .to_string(),
+            worker_session_ref: "019f6822-403f-7652-a308-b0c12142e337".to_string(),
+            workflow_ref: None,
+            agent_kind: "gpt-sol",
+        };
+        let context = launch_context(vec![event.clone()]);
+
+        let facts = context.launch_event_facts(&event.worker_session_ref, "2026-08-10T10:00:00Z");
+
+        assert!(facts.iter().any(|fact| {
+            fact.field == "parent_session_ref"
+                && fact.value == event.controller_session_ref
+                && fact.evidence.kind == "launcher_event"
+                && fact.evidence.strength == "direct"
+        }));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.field == "agent_kind" && fact.value == "gpt-sol"));
+        assert!(!facts.iter().any(|fact| fact.field == "workflow_ref"));
     }
 
     #[test]

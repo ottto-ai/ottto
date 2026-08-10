@@ -18,7 +18,7 @@
 //! # What an event may contain
 //!
 //! Exactly the nine keys of `agent_launch.v1`, all of them identifiers, fixed
-//! enums, or a timestamp:
+//! enums, null source-inapplicable identifiers, or a timestamp:
 //!
 //! ```json
 //! {
@@ -136,9 +136,12 @@ const INVENTORY_TTL: Duration = Duration::from_secs(60);
 /// This is an allowlist in both directions: an unlisted `capture_source` cannot
 /// claim Direct evidence, and the `agent_kind` a launch produces is chosen HERE
 /// rather than read from the file, so the event can never supply its own label.
-/// Adding the gpt-sol relay is a one-line widening on this side and on the
-/// emitter's `CAPTURE_SOURCES`; the emitter refuses it today on purpose.
-const CAPTURE_SOURCES: &[(&str, &str)] = &[("launcher_event:landing_repair", "pr-fixer")];
+const CAPTURE_SOURCE_LANDING_REPAIR: &str = "launcher_event:landing_repair";
+const CAPTURE_SOURCE_GPT_SOL_RELAY: &str = "launcher_event:gpt_sol_relay";
+const CAPTURE_SOURCES: &[(&str, &str)] = &[
+    (CAPTURE_SOURCE_LANDING_REPAIR, "pr-fixer"),
+    (CAPTURE_SOURCE_GPT_SOL_RELAY, "gpt-sol"),
+];
 
 /// One accepted launch event, reduced to what a fact may carry.
 ///
@@ -153,7 +156,7 @@ pub(crate) struct LaunchEvent {
     /// The session the launcher started. This is the fact's owner.
     pub(crate) worker_session_ref: String,
     /// The launcher's own attempt id. Becomes `workflow_ref`.
-    pub(crate) workflow_ref: String,
+    pub(crate) workflow_ref: Option<String>,
     /// Worker role, resolved from the capture source allowlist.
     pub(crate) agent_kind: &'static str,
 }
@@ -439,19 +442,34 @@ pub(crate) fn validate_event(raw: &str) -> Result<LaunchEvent, &'static str> {
         .ok_or("unknown_capture_source")?;
 
     let controller_session_ref =
-        session_ref_field(object, "controller_session_ref").ok_or("bad_controller_ref")?;
+        controller_session_ref_field(object, "controller_session_ref", capture_source)
+            .ok_or("bad_controller_ref")?;
     let worker_session_ref =
         session_ref_field(object, "worker_session_ref").ok_or("bad_worker_ref")?;
-    let workflow_ref = session_ref_field(object, "workflow_ref").ok_or("bad_workflow_ref")?;
+    let workflow_ref = match capture_source {
+        CAPTURE_SOURCE_LANDING_REPAIR => {
+            Some(session_ref_field(object, "workflow_ref").ok_or("bad_workflow_ref")?)
+        }
+        CAPTURE_SOURCE_GPT_SOL_RELAY if object.get("workflow_ref").is_some_and(Value::is_null) => {
+            None
+        }
+        CAPTURE_SOURCE_GPT_SOL_RELAY => return Err("bad_workflow_ref"),
+        _ => return Err("unknown_capture_source"),
+    };
     // A session cannot launch itself. Reaching here means one of the two
     // bindings is wrong, and there is no way to tell which.
     if controller_session_ref == worker_session_ref {
         return Err("self_launch");
     }
 
-    match object.get("pr_ref").and_then(Value::as_i64) {
-        Some(pr_ref) if pr_ref > 0 => {}
-        _ => return Err("bad_pr_ref"),
+    match capture_source {
+        CAPTURE_SOURCE_LANDING_REPAIR => match object.get("pr_ref").and_then(Value::as_i64) {
+            Some(pr_ref) if pr_ref > 0 => {}
+            _ => return Err("bad_pr_ref"),
+        },
+        CAPTURE_SOURCE_GPT_SOL_RELAY if object.get("pr_ref").is_some_and(Value::is_null) => {}
+        CAPTURE_SOURCE_GPT_SOL_RELAY => return Err("bad_pr_ref"),
+        _ => return Err("unknown_capture_source"),
     }
     if !is_utc_second_timestamp(string_field(object, "launch_ts").unwrap_or_default()) {
         return Err("bad_launch_ts");
@@ -471,19 +489,39 @@ fn string_field<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str
 
 /// The privacy chokepoint, mirroring the emitter's own.
 ///
-/// A plausible LOCAL session identity here is a plain UUID: the launcher assigns
-/// the Claude worker's id itself and parses the Codex worker's from a run
-/// header, and both are UUIDs. Provider-derived composite refs
-/// (`<uuid>_agent-<id>`) belong to subagent transcripts the provider already
-/// links, and are refused here so a launch event cannot reach into a family the
-/// provider owns. Anything that is not exactly a UUID -- a path, a branch name,
-/// a prompt fragment -- dies here and can never reach a fact.
+/// Workers and repair-family controllers are plain UUIDs. The gpt-sol relay is
+/// the sole exception for controller refs: Claude subagent transcripts are
+/// collected under the exact re-keyed form `<rootUUID>_agent-<17 hex>`, so that
+/// capture family may name precisely that form. No other composite reaches a
+/// fact, and workers remain UUID-only.
 fn session_ref_field(object: &Map<String, Value>, key: &str) -> Option<String> {
     let value = string_field(object, key)?;
     if !is_uuid(value) {
         return None;
     }
     Some(value.to_ascii_lowercase())
+}
+
+fn controller_session_ref_field(
+    object: &Map<String, Value>,
+    key: &str,
+    capture_source: &str,
+) -> Option<String> {
+    let value = string_field(object, key)?;
+    if is_uuid(value) {
+        return Some(value.to_ascii_lowercase());
+    }
+    if capture_source == CAPTURE_SOURCE_GPT_SOL_RELAY && is_claude_subagent_session_ref(value) {
+        return Some(value.to_ascii_lowercase());
+    }
+    None
+}
+
+fn is_claude_subagent_session_ref(value: &str) -> bool {
+    let Some((root, agent_ref)) = value.split_once("_agent-") else {
+        return false;
+    };
+    is_uuid(root) && agent_ref.len() == 17 && agent_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn is_uuid(value: &str) -> bool {
@@ -529,7 +567,9 @@ pub(crate) fn event_digest(event: &LaunchEvent) -> String {
     digest.update(b"\n");
     digest.update(event.worker_session_ref.as_bytes());
     digest.update(b"\n");
-    digest.update(event.workflow_ref.as_bytes());
+    if let Some(workflow_ref) = event.workflow_ref.as_deref() {
+        digest.update(workflow_ref.as_bytes());
+    }
     format!("{:x}", digest.finalize())
 }
 
@@ -539,6 +579,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     const CONTROLLER: &str = "a9789dcf-1e4a-4a6e-8abd-f30094efb269";
+    const RELAY_CONTROLLER: &str = "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2af";
     const WORKER: &str = "019f6822-403f-7652-a308-b0c12142e337";
     const ATTEMPT: &str = "402d846d-c13c-4743-8326-580e4ca70e30";
 
@@ -612,8 +653,76 @@ mod tests {
         let event = validate_event(&event_json(&[])).expect("valid event");
         assert_eq!(event.controller_session_ref, CONTROLLER);
         assert_eq!(event.worker_session_ref, WORKER);
-        assert_eq!(event.workflow_ref, ATTEMPT);
+        assert_eq!(event.workflow_ref.as_deref(), Some(ATTEMPT));
         assert_eq!(event.agent_kind, "pr-fixer");
+    }
+
+    #[test]
+    fn gpt_sol_relay_accepts_only_the_collectors_exact_controller_forms() {
+        for controller in [CONTROLLER, RELAY_CONTROLLER] {
+            let event = validate_event(&event_json(&[
+                ("capture_source", "\"launcher_event:gpt_sol_relay\""),
+                ("controller_session_ref", &format!("\"{controller}\"")),
+                ("workflow_ref", "null"),
+                ("pr_ref", "null"),
+            ]))
+            .expect("valid relay event");
+            assert_eq!(event.controller_session_ref, controller);
+            assert_eq!(event.worker_session_ref, WORKER);
+            assert_eq!(event.workflow_ref, None);
+            assert_eq!(event.agent_kind, "gpt-sol");
+        }
+
+        for controller in [
+            "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-short",
+            "a9789dcf-1e4a-4a6e-8abd-f30094efb269_agent-ad32608db4eecb2az",
+            "a9789dcf-1e4a-4a6e-8abd-f30094efb269/agent-ad32608db4eecb2af",
+            "not-a-uuid_agent-ad32608db4eecb2af",
+        ] {
+            assert_eq!(
+                validate_event(&event_json(&[
+                    ("capture_source", "\"launcher_event:gpt_sol_relay\""),
+                    ("controller_session_ref", &format!("\"{controller}\"")),
+                    ("workflow_ref", "null"),
+                    ("pr_ref", "null"),
+                ])),
+                Err("bad_controller_ref"),
+                "accepted malformed composite {controller}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_controller_and_null_metadata_are_relay_family_only() {
+        assert_eq!(
+            validate_event(&event_json(&[(
+                "controller_session_ref",
+                &format!("\"{RELAY_CONTROLLER}\""),
+            )])),
+            Err("bad_controller_ref")
+        );
+        for (field, raw, expected) in [
+            ("workflow_ref", format!("\"{ATTEMPT}\""), "bad_workflow_ref"),
+            ("pr_ref", "1653".to_string(), "bad_pr_ref"),
+        ] {
+            assert_eq!(
+                validate_event(&event_json(&[
+                    ("capture_source", "\"launcher_event:gpt_sol_relay\""),
+                    ("workflow_ref", "null"),
+                    ("pr_ref", "null"),
+                    (field, raw.as_str()),
+                ])),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            validate_event(&event_json(&[("workflow_ref", "null")])),
+            Err("bad_workflow_ref")
+        );
+        assert_eq!(
+            validate_event(&event_json(&[("pr_ref", "null")])),
+            Err("bad_pr_ref")
+        );
     }
 
     #[test]
@@ -649,7 +758,7 @@ mod tests {
             ("bad_evidence", event_json(&[("evidence", "\"inferred\"")])),
             (
                 "unknown_capture_source",
-                event_json(&[("capture_source", "\"launcher_event:gpt_sol_relay\"")]),
+                event_json(&[("capture_source", "\"launcher_event:unknown\"")]),
             ),
             (
                 "bad_controller_ref",
