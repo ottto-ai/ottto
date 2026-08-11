@@ -2529,17 +2529,18 @@ fn is_shed_failure(error: &anyhow::Error) -> bool {
         .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
 }
 
-fn is_timeout_failure(error: &anyhow::Error) -> bool {
+fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
-        .is_some_and(|diagnostics| diagnostics.status_family() == "transport_timeout")
+        .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
 }
 
 /// Upload changed snapshots in bounded pages while durably checkpointing every
 /// accepted page. Item-specific validation failures are bisected so one poison
-/// snapshot cannot replay or block its valid siblings; timeout-heavy pages are
-/// also bisected to reduce per-request reconciliation work. Splits are capped
-/// so an outage or broad contract mismatch cannot fan out into unbounded calls.
+/// snapshot cannot replay or block its valid siblings; pages that exceed the
+/// client or gateway deadline are also bisected to reduce per-request
+/// reconciliation work. Splits are capped so an outage or broad contract
+/// mismatch cannot fan out into unbounded calls.
 fn upload_resumable_batches<T, Fingerprint, Upload, Persist>(
     items: &[T],
     poison_scope: &str,
@@ -2757,7 +2758,7 @@ where
             Err(error)
                 if indices.len() > 1
                     && adaptive_splits < SNAPSHOT_ADAPTIVE_SPLIT_LIMIT
-                    && is_timeout_failure(&error) =>
+                    && is_snapshot_batch_deadline_failure(&error) =>
             {
                 adaptive_splits += 1;
                 let midpoint = indices.len() / 2;
@@ -4258,6 +4259,57 @@ mod tests {
     }
 
     #[test]
+    fn only_snapshot_page_deadlines_are_adaptively_split() {
+        let gateway_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            504,
+            true,
+        ));
+        assert!(is_snapshot_batch_deadline_failure(&gateway_timeout));
+        assert_eq!(
+            gateway_timeout.to_string(),
+            "local snapshot upload failed (endpoint=snapshot_batch, status_family=http_5xx, retryable=true, request_id=present)"
+        );
+
+        let generic_server_error = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            500,
+            true,
+        ));
+        assert!(!is_snapshot_batch_deadline_failure(&generic_server_error));
+
+        let relay_gateway_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+            "relay token request",
+            "relay_token",
+            504,
+            true,
+        ));
+        assert!(!is_snapshot_batch_deadline_failure(&relay_gateway_timeout));
+
+        let batch_transport_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "local snapshot upload",
+            "snapshot_batch",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert!(is_snapshot_batch_deadline_failure(&batch_transport_timeout));
+
+        let relay_transport_timeout = anyhow::Error::new(UploadFailureDiagnostics::for_test(
+            "relay token request",
+            "relay_token",
+            "transport_timeout",
+            true,
+            false,
+        ));
+        assert!(!is_snapshot_batch_deadline_failure(
+            &relay_transport_timeout
+        ));
+    }
+
+    #[test]
     #[serial(client_report)]
     fn an_unacknowledged_client_report_survives_to_the_next_batch() {
         use crate::client_report::{lease, observe, record, reset_for_test, ClientReportReason};
@@ -4731,7 +4783,7 @@ mod tests {
         )
         .expect_err("persistent timeout stops after checkpointing the first page");
 
-        assert!(is_timeout_failure(&first_error));
+        assert!(is_snapshot_batch_deadline_failure(&first_error));
         assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
         let mut resumed = SnapshotUploadProgress::load(
             &path,
@@ -4763,6 +4815,91 @@ mod tests {
         assert!(resumed_items
             .iter()
             .all(|fingerprint| !first_page.contains(fingerprint)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit() {
+        let poison_scope = &unique_poison_scope();
+        let root = test_dir("snapshot-upload-gateway-timeout-cursor");
+        let path = root.join("claude-scan-index-v3-upload-progress.json");
+        let items = test_fingerprints(SNAPSHOT_BATCH_LIMIT);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut attempts = Vec::new();
+        let mut remotely_held = BTreeSet::new();
+
+        let result = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                attempts.push(batch.len());
+                if batch.len() == SNAPSHOT_BATCH_LIMIT {
+                    // A gateway timeout does not prove whether the backend
+                    // committed. Model the ambiguous side as committed: the
+                    // smaller retries must remain idempotent at entity grain.
+                    remotely_held.extend(batch);
+                    return Err(anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
+                        "local snapshot upload",
+                        "snapshot_batch",
+                        504,
+                        true,
+                    )));
+                }
+                for fingerprint in &batch {
+                    assert!(
+                        !remotely_held.insert(fingerprint.clone()),
+                        "a smaller retry may revisit a held entity but cannot mint a second one"
+                    );
+                }
+                Ok(accepted_batch(batch.len()))
+            },
+            |state| state.save(&path),
+        )
+        .expect("gateway timeout is bisected into resumable child pages");
+
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!(
+            attempts,
+            vec![
+                SNAPSHOT_BATCH_LIMIT,
+                SNAPSHOT_BATCH_LIMIT / 2,
+                SNAPSHOT_BATCH_LIMIT - (SNAPSHOT_BATCH_LIMIT / 2),
+            ]
+        );
+        assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
+        assert_eq!(remotely_held.len(), SNAPSHOT_BATCH_LIMIT);
+        assert_eq!(progress.accepted_fingerprints.len(), SNAPSHOT_BATCH_LIMIT);
+
+        let mut resumed = SnapshotUploadProgress::load(
+            &path,
+            &progress.destination_namespace_hash,
+            test_quarantine_witness(),
+        )
+        .expect("reload entity-grain upload cursor");
+        let mut resumed_accepted = 0;
+        let mut resumed_upload_calls = 0;
+        let resumed_result = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut resumed,
+            &mut resumed_accepted,
+            String::as_str,
+            |_| {
+                resumed_upload_calls += 1;
+                Ok(accepted_batch(0))
+            },
+            |state| state.save(&path),
+        )
+        .expect("restart settles entirely from the durable entity cursor");
+
+        assert_eq!(resumed_result, ResumableUploadResult::Completed);
+        assert_eq!(resumed_upload_calls, 0);
+        assert_eq!(resumed_accepted, 0);
+        assert_eq!(remotely_held.len(), SNAPSHOT_BATCH_LIMIT);
         let _ = std::fs::remove_dir_all(root);
     }
 

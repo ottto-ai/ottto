@@ -384,6 +384,10 @@ pub struct UploadFailureDiagnostics {
     operation: &'static str,
     endpoint: &'static str,
     status_family: &'static str,
+    // Retain the exact HTTP status only for in-process retry policy. It never
+    // appears in the redacted field diagnostic, so log cardinality and the
+    // privacy-safe public error surface remain unchanged.
+    http_status: Option<u16>,
     retryable: bool,
     request_id_present: bool,
 }
@@ -399,6 +403,7 @@ impl UploadFailureDiagnostics {
             operation,
             endpoint,
             status_family: http_status_family(status),
+            http_status: Some(status),
             retryable: http_status_retryable(status),
             request_id_present: response_has_request_id(response),
         }
@@ -413,6 +418,7 @@ impl UploadFailureDiagnostics {
             operation,
             endpoint,
             status_family: transport_status_family(error),
+            http_status: None,
             retryable: true,
             request_id_present: false,
         }
@@ -422,6 +428,18 @@ impl UploadFailureDiagnostics {
     /// `net_resilience` keys the transport-layer outage streak on this.
     pub(crate) fn status_family(&self) -> &'static str {
         self.status_family
+    }
+
+    /// Whether a snapshot page exceeded the client or gateway read deadline.
+    ///
+    /// Keep this endpoint-scoped: a relay-token timeout happened before the
+    /// snapshot page reached the backend, so splitting that page only fans out
+    /// more token requests. A batch transport timeout or HTTP 504 can be
+    /// workload-shaped, and the resumable uploader can safely retry it in
+    /// smaller idempotent subsets.
+    pub(crate) fn is_snapshot_batch_deadline(&self) -> bool {
+        self.endpoint == "snapshot_batch"
+            && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
     pub fn safe_message(&self) -> String {
@@ -451,7 +469,25 @@ impl UploadFailureDiagnostics {
             operation,
             endpoint,
             status_family,
+            http_status: None,
             retryable,
+            request_id_present,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_http_test(
+        operation: &'static str,
+        endpoint: &'static str,
+        status: u16,
+        request_id_present: bool,
+    ) -> Self {
+        Self {
+            operation,
+            endpoint,
+            status_family: http_status_family(status),
+            http_status: Some(status),
+            retryable: http_status_retryable(status),
             request_id_present,
         }
     }
