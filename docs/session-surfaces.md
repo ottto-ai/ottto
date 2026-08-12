@@ -21,3 +21,21 @@ explicit `cli` or `exec` source only when no stronger originator marker exists.
 This surface says where the session ran. It is separate from account login
 probing: `codex app-server` proves a usable CLI identity, not that the Codex
 macOS app is currently open.
+
+## Account attribution
+
+`active_session_reconciliation.sessions[]` attributes a recent session to an
+account only from privacy-safe, conflict-checked evidence. Precedence is:
+
+1. an exact session plan observation;
+2. the exact account hash already carried by the snapshot's model-usage rows;
+3. a high/medium-confidence plan observation on a directly evidenced parent or
+   root session (`parent_session_ref` / `root_session_ref`);
+4. a compatible current login at reconciliation time.
+
+Exact observation/snapshot disagreement, missing or conflicting account hashes
+across aggregate and bucket model-usage rows, or conflicting parent/root
+accounts fail closed and leave the session unattributed; weaker fallbacks are
+not considered after a conflict. The lineage fallback therefore covers
+Task/Workflow subagents without turning repository, timing, title, or provider
+similarity into an account guess.

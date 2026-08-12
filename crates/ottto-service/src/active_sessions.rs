@@ -5,7 +5,7 @@
 //! This avoids treating a title-sidecar refresh or a historical backfill as
 //! live work. The persisted payload contains only content-free snapshot fields.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -236,17 +236,55 @@ fn account_attribution(
     snapshot: &SnapshotItem,
     status: &AgentStatusSnapshot,
 ) -> Option<AccountAttribution> {
-    if let Some(observation) = status.plan_observations.iter().find(|observation| {
-        observation.source_session_id.as_deref() == Some(snapshot.source_session_id.as_str())
-            && observation
-                .account_identifier_hash
-                .as_deref()
-                .is_some_and(non_empty)
-    }) {
+    let exact_observations = status
+        .plan_observations
+        .iter()
+        .filter(|observation| {
+            observation.source_session_id.as_deref() == Some(snapshot.source_session_id.as_str())
+                && observation
+                    .account_identifier_hash
+                    .as_deref()
+                    .is_some_and(non_empty)
+        })
+        .collect::<Vec<_>>();
+    let exact_observation_hashes = exact_observations
+        .iter()
+        .filter_map(|observation| observation.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    if exact_observation_hashes.len() > 1 {
+        return None;
+    }
+    let exact_observation = exact_observations.into_iter().next();
+    let snapshot_account_hash = match exact_snapshot_account_hash(snapshot) {
+        EvidenceResolution::Missing => None,
+        EvidenceResolution::Resolved(account_hash) => Some(account_hash),
+        EvidenceResolution::Conflict => return None,
+    };
+
+    if exact_observation
+        .and_then(|observation| observation.account_identifier_hash.as_deref())
+        .zip(snapshot_account_hash.as_deref())
+        .is_some_and(|(observation, snapshot)| observation != snapshot)
+    {
+        return None;
+    }
+    if let Some(observation) = exact_observation {
         return Some(attribution_from_observation(
             observation,
             "session_plan_observation",
         ));
+    }
+    if let Some(account_hash) = snapshot_account_hash {
+        return Some(attribution_from_account_hash(
+            account_hash,
+            status,
+            "snapshot_account_identity",
+        ));
+    }
+    match lineage_account_attribution(snapshot, status) {
+        EvidenceResolution::Resolved(lineage) => return Some(lineage),
+        EvidenceResolution::Conflict => return None,
+        EvidenceResolution::Missing => {}
     }
 
     let account = status.account.as_ref()?;
@@ -269,6 +307,125 @@ fn account_attribution(
         subscription_product: account.subscription_product.clone(),
         source: "current_login_at_reconciliation".to_string(),
     })
+}
+
+enum EvidenceResolution<T> {
+    Missing,
+    Resolved(T),
+    Conflict,
+}
+
+fn exact_snapshot_account_hash(snapshot: &SnapshotItem) -> EvidenceResolution<String> {
+    let rows = snapshot
+        .model_usage
+        .iter()
+        .chain(
+            snapshot
+                .usage_buckets
+                .iter()
+                .flat_map(|bucket| bucket.model_usage.iter()),
+        )
+        .collect::<Vec<_>>();
+    let hashes = rows
+        .iter()
+        .filter_map(|row| {
+            row.account_identifier_hash
+                .as_deref()
+                .filter(|value| non_empty(value))
+        })
+        .collect::<BTreeSet<_>>();
+    if hashes.is_empty() {
+        return EvidenceResolution::Missing;
+    }
+    if hashes.len() > 1
+        || rows.iter().any(|row| {
+            !row.account_identifier_hash
+                .as_deref()
+                .is_some_and(non_empty)
+        })
+    {
+        return EvidenceResolution::Conflict;
+    }
+    EvidenceResolution::Resolved(hashes.into_iter().next().expect("one hash").to_string())
+}
+
+fn lineage_account_attribution(
+    snapshot: &SnapshotItem,
+    status: &AgentStatusSnapshot,
+) -> EvidenceResolution<AccountAttribution> {
+    let session_refs = snapshot
+        .attribution_facts
+        .iter()
+        .filter(|fact| {
+            matches!(
+                fact.field.as_str(),
+                "parent_session_ref" | "root_session_ref"
+            ) && fact.evidence.strength == "direct"
+                && non_empty(&fact.value)
+        })
+        .map(|fact| fact.value.as_str())
+        .collect::<BTreeSet<_>>();
+    if session_refs.is_empty() {
+        return EvidenceResolution::Missing;
+    }
+
+    let observations = status
+        .plan_observations
+        .iter()
+        .filter(|observation| {
+            observation
+                .source_session_id
+                .as_deref()
+                .is_some_and(|session_id| session_refs.contains(session_id))
+                && observation
+                    .account_identifier_hash
+                    .as_deref()
+                    .is_some_and(non_empty)
+                && matches!(
+                    observation.confidence,
+                    AgentStatusConfidence::High | AgentStatusConfidence::Medium
+                )
+                && matches!(
+                    observation.billing_identity_confidence,
+                    AgentStatusConfidence::High | AgentStatusConfidence::Medium
+                )
+        })
+        .collect::<Vec<_>>();
+    let hashes = observations
+        .iter()
+        .filter_map(|observation| observation.account_identifier_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    if hashes.len() > 1 {
+        return EvidenceResolution::Conflict;
+    }
+    if hashes.is_empty() {
+        return EvidenceResolution::Missing;
+    }
+    let account_hash = hashes.into_iter().next().expect("one lineage hash");
+    observations
+        .into_iter()
+        .find(|observation| observation.account_identifier_hash.as_deref() == Some(account_hash))
+        .map(|observation| attribution_from_observation(observation, "lineage_plan_observation"))
+        .map(EvidenceResolution::Resolved)
+        .unwrap_or(EvidenceResolution::Missing)
+}
+
+fn attribution_from_account_hash(
+    account_hash: String,
+    status: &AgentStatusSnapshot,
+    source: &str,
+) -> AccountAttribution {
+    let matching_observation = status.plan_observations.iter().find(|observation| {
+        observation.account_identifier_hash.as_deref() == Some(account_hash.as_str())
+    });
+    AccountAttribution {
+        account_identifier_hash: Some(account_hash),
+        organization_identifier_hash: matching_observation
+            .and_then(|observation| observation.organization_identifier_hash.clone()),
+        subscription_product: matching_observation
+            .and_then(|observation| observation.subscription_product.clone()),
+        source: source.to_string(),
+    }
 }
 
 fn attribution_from_observation(
@@ -385,7 +542,10 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ottto_protocol::{AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusState};
+    use ottto_protocol::{
+        AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation,
+        AgentStatusState,
+    };
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -517,6 +677,274 @@ mod tests {
         let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
 
         assert_eq!(active.provider_surface.as_deref(), Some("codex_desktop"));
+    }
+
+    #[test]
+    fn attributes_from_exact_snapshot_account_identity() {
+        let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("desktop_hash".to_string());
+        snapshot.usage_buckets[0].model_usage[0].account_identifier_hash =
+            Some("desktop_hash".to_string());
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "desktop_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(
+            active.account_identifier_hash.as_deref(),
+            Some("desktop_hash")
+        );
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("snapshot_account_identity")
+        );
+    }
+
+    #[test]
+    fn inherits_high_confidence_account_from_direct_root_lineage() {
+        let mut snapshot = test_snapshot("parent_agent-child", "2026-07-19T10:04:00Z");
+        snapshot
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        snapshot
+            .attribution_facts
+            .push(direct_fact("root_session_ref", "parent"));
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "desktop_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(
+            active.account_identifier_hash.as_deref(),
+            Some("desktop_hash")
+        );
+        assert_eq!(
+            active.account_attribution_source.as_deref(),
+            Some("lineage_plan_observation")
+        );
+    }
+
+    #[test]
+    fn refuses_conflicting_direct_lineage_accounts() {
+        let mut snapshot = test_snapshot("root_agent-child", "2026-07-19T10:04:00Z");
+        snapshot
+            .attribution_facts
+            .push(direct_fact("parent_session_ref", "parent"));
+        snapshot
+            .attribution_facts
+            .push(direct_fact("root_session_ref", "root"));
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "first_hash",
+            AgentStatusConfidence::High,
+        ));
+        status.plan_observations.push(test_plan_observation(
+            "root",
+            "second_hash",
+            AgentStatusConfidence::High,
+        ));
+        status.account = Some(test_current_account("second_hash"));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn refuses_conflict_between_exact_observation_and_snapshot_identity() {
+        let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("snapshot_hash".to_string());
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "child",
+            "observation_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn refuses_conflicting_exact_session_observations() {
+        let snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "child",
+            "first_hash",
+            AgentStatusConfidence::High,
+        ));
+        status.plan_observations.push(test_plan_observation(
+            "child",
+            "second_hash",
+            AgentStatusConfidence::High,
+        ));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn refuses_partial_snapshot_account_identity() {
+        let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+        let mut second_row = snapshot.model_usage[0].clone();
+        snapshot.model_usage[0].account_identifier_hash = Some("desktop_hash".to_string());
+        second_row.account_identifier_hash = None;
+        snapshot.model_usage.push(second_row);
+
+        let active = active_session_from_snapshot(
+            SnapshotSource::ClaudeCode,
+            &snapshot,
+            Some(&test_status()),
+        );
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn refuses_conflicting_bucket_snapshot_account_identity() {
+        let mut snapshot = test_snapshot("child", "2026-07-19T10:04:00Z");
+        snapshot.model_usage[0].account_identifier_hash = Some("aggregate_hash".to_string());
+        snapshot.usage_buckets[0].model_usage[0].account_identifier_hash =
+            Some("bucket_hash".to_string());
+        let mut status = test_status();
+        status.account = Some(test_current_account("bucket_hash"));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    #[test]
+    fn refuses_indirect_or_low_confidence_lineage() {
+        let mut snapshot = test_snapshot("parent_agent-child", "2026-07-19T10:04:00Z");
+        let mut fact = direct_fact("root_session_ref", "parent");
+        fact.evidence.strength = "inferred".to_string();
+        snapshot.attribution_facts.push(fact);
+        let mut status = test_status();
+        status.plan_observations.push(test_plan_observation(
+            "parent",
+            "desktop_hash",
+            AgentStatusConfidence::Low,
+        ));
+
+        let active =
+            active_session_from_snapshot(SnapshotSource::ClaudeCode, &snapshot, Some(&status));
+
+        assert_eq!(active.account_identifier_hash, None);
+        assert_eq!(active.account_attribution_source, None);
+    }
+
+    fn test_status() -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            source: ottto_protocol::SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::CliJson,
+            captured_at: "2026-07-19T10:05:00Z".to_string(),
+            expires_at: "2026-07-19T10:15:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        }
+    }
+
+    fn test_plan_observation(
+        session_id: &str,
+        account_hash: &str,
+        confidence: AgentStatusConfidence,
+    ) -> AgentStatusPlanObservation {
+        AgentStatusPlanObservation {
+            observed_at: Some("2026-07-19T10:04:00Z".to_string()),
+            evidence_method: Some("claude_desktop_session_bucket".to_string()),
+            source_session_id: Some(session_id.to_string()),
+            provider: Some("anthropic".to_string()),
+            billing_provider: Some("anthropic".to_string()),
+            model_provider: Some("anthropic".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            auth_mode: Some("claude_desktop".to_string()),
+            gateway_provider: None,
+            subscription_product: Some("claude_subscription".to_string()),
+            plan_type: Some("subscription".to_string()),
+            account_label: None,
+            account_id: None,
+            organization_label: None,
+            organization_id: None,
+            account_identifier_hash: Some(account_hash.to_string()),
+            organization_identifier_hash: Some("organization_hash".to_string()),
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("provider_account_id".to_string()),
+            billing_identity_confidence: confidence.clone(),
+            confidence,
+            is_current: Some(true),
+        }
+    }
+
+    fn test_current_account(account_hash: &str) -> AgentAccountStatus {
+        AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            provider: Some("openai".to_string()),
+            auth_method: Some("oauth".to_string()),
+            email: None,
+            account_id: None,
+            organization_id: None,
+            organization_label: None,
+            plan_type: Some("plus".to_string()),
+            subscription_product: Some("chatgpt_plus".to_string()),
+            billing_channel: Some("subscription".to_string()),
+            subscription_period_start: None,
+            subscription_period_end: None,
+            subscription_period_last_checked_at: None,
+            account_identifier_hash: Some(account_hash.to_string()),
+            organization_identifier_hash: None,
+            credential_fingerprint_hash: None,
+            billing_identity_evidence: Some("account_identifier".to_string()),
+            billing_identity_confidence: AgentStatusConfidence::High,
+            confidence: AgentStatusConfidence::High,
+        }
+    }
+
+    fn direct_fact(field: &str, value: &str) -> crate::session_attribution::SessionAttributionFact {
+        crate::session_attribution::SessionAttributionFact {
+            field: field.to_string(),
+            value: value.to_string(),
+            display_label: None,
+            display_label_source: None,
+            evidence: crate::session_attribution::SessionFieldEvidence {
+                kind: "provider_metadata".to_string(),
+                strength: "direct".to_string(),
+                observed_at: "2026-07-19T10:04:00Z".to_string(),
+                source_version: "test:v1".to_string(),
+                evidence_ref: format!("sha256:{}", "a".repeat(64)),
+            },
+        }
     }
 
     fn test_snapshot(session_id: &str, last_activity: &str) -> SnapshotItem {
