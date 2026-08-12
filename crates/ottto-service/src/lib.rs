@@ -6700,6 +6700,7 @@ mod tests {
                 organization_identifier_hash: None,
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: None,
+                claude_quota_access_state: None,
                 billing_identity_confidence: AgentStatusConfidence::High,
                 confidence: AgentStatusConfidence::High,
             }),
@@ -7507,6 +7508,7 @@ mod tests {
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: Some("local_status".to_string()),
+            claude_quota_access_state: None,
             billing_identity_confidence: ottto_protocol::AgentStatusConfidence::High,
             confidence: ottto_protocol::AgentStatusConfidence::High,
         });

@@ -71,15 +71,28 @@ honestly does not know its limits.
 When several Claude Code slots are registered, one collection pass uses one
 capture time and produces at most one row per distinct strong account hash.
 The default slot is considered first, then custom slots in stable opaque-id
-order. Duplicate accounts, failed credentials, identity mismatches, concurrent
-login changes, and slots beyond the ten-account cap stay machine-local as typed
-diagnostics. One failed slot does not stop healthy siblings. A same-account
+order. One failed slot does not stop healthy siblings. If a registered slot
+temporarily fails after Ottto has already proved both its account and
+organization, the daemon sends a meterless, degraded witness for that same
+strong identity. Its typed quota-access state says whether collection is full,
+partial, temporarily unavailable, paused, needs reconnection, or needs local
+attention. This lets a dashboard distinguish "already configured and retrying"
+from "not configured" without receiving a config path, slot id, credential
+deadline, token, or local diagnostic payload. A healthy reading for the same
+account always wins over a failed duplicate slot.
+
+The `claude_quota_access_state_v1` capability marks daemon versions that know
+this contract. On an older daemon, or for a desktop/status-line observation
+that is not an exact strongly bound slot, an absent state means unknown; it
+does not prove that setup is required. Weak identity failures and slots beyond
+the ten-account cap remain machine-local typed diagnostics. A same-account
 and same-organization cached reading may remain visible for up to 24 hours with
 stale freshness; it is never borrowed or relabeled under another organization.
-When a same-slot read temporarily fails, Ottto may retain that slot's last full
-values only if both its strong account and organization hashes still match;
-the retained values and every meter are marked stale. Identity mismatch,
-another organization, or another slot never inherits them.
+When a same-slot read temporarily fails, authenticated machine-local status may
+retain that slot's last full values only if both its strong account and
+organization hashes still match; the retained values and every meter are marked
+stale. The backend witness remains meterless. Identity mismatch, another
+organization, or another slot never inherits the retained values.
 
 ## Connecting another account
 

@@ -20,7 +20,7 @@ use ottto_protocol::{
     ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
     ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
     ClaudeConfigSlotOwnership, ClaudeConfigSlotQuotaSnapshotStateV1,
-    ClaudeConfigSlotQuotaSnapshotV1, ClaudeConfigSlotUpkeepResultV1,
+    ClaudeConfigSlotQuotaSnapshotV1, ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState,
     ClaudeUnresolvedAccountDescriptorV1, ClaudeUnresolvedAccountEvidenceKind, SourceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,7 @@ const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_FILE: &str = "claude-config-slot-colle
 const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_LOCK_FILE: &str =
     ".claude-config-slot-collection-state.lock";
 const CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION: u16 = 1;
+const CLAUDE_QUOTA_ACCESS_CAPABILITY: &str = "claude_quota_access_state_v1";
 const CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION: u16 = 1;
 /// How long the breaker stays open once tripped. Long on purpose: an open
 /// breaker means we believe further calls could be unwelcome or useless, and a
@@ -588,6 +589,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Unknown,
     });
@@ -1217,7 +1219,7 @@ fn collect_claude_status_snapshots(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusCollection {
-    let default_snapshot = collect_claude_status(captured_at.clone(), expires_at.clone());
+    let mut default_snapshot = collect_claude_status(captured_at.clone(), expires_at.clone());
     let mut candidates = Vec::new();
     let settings = FileClaudeConfigSlotSettingsStore::default().load();
     let upkeep_consent = settings.as_ref().is_ok_and(|status| {
@@ -1237,30 +1239,38 @@ fn collect_claude_status_snapshots(
     }
 
     let mut slot_states = BTreeMap::new();
-    let default_state = claude_default_slot_collection_status(&default_snapshot);
+    let mut default_state = claude_default_slot_collection_status(&default_snapshot);
+    retain_verified_claude_slot_binding(
+        "default",
+        &ClaudeConfigDirSlot::Default,
+        &mut default_state,
+    );
+    apply_claude_quota_access_state(&mut default_snapshot, &default_state);
     slot_states.insert("default".to_string(), default_state.clone());
-    if let Some(rank) = claude_snapshot_candidate_rank(&default_snapshot) {
-        if let Some(account_identifier_hash) = default_snapshot
-            .account
-            .as_ref()
-            .and_then(|account| account.account_identifier_hash.clone())
-            .or_else(|| {
-                default_snapshot
-                    .quota_windows
-                    .first()
-                    .and_then(|window| window.account_identifier_hash.clone())
-            })
-        {
-            candidates.push(ClaudeSnapshotCandidate {
-                slot_id: "default".to_string(),
-                account_identifier_hash,
-                organization_identifier_hash: default_snapshot
-                    .account
-                    .as_ref()
-                    .and_then(|account| account.organization_identifier_hash.clone()),
-                rank,
-                snapshot: default_snapshot.clone(),
-            });
+    if claude_slot_status_carries_meters(&default_state) {
+        if let Some(rank) = claude_snapshot_candidate_rank(&default_snapshot) {
+            if let Some(account_identifier_hash) = default_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.account_identifier_hash.clone())
+                .or_else(|| {
+                    default_snapshot
+                        .quota_windows
+                        .first()
+                        .and_then(|window| window.account_identifier_hash.clone())
+                })
+            {
+                candidates.push(ClaudeSnapshotCandidate {
+                    slot_id: "default".to_string(),
+                    account_identifier_hash,
+                    organization_identifier_hash: default_snapshot
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.organization_identifier_hash.clone()),
+                    rank,
+                    snapshot: default_snapshot.clone(),
+                });
+            }
         }
     }
 
@@ -1281,8 +1291,13 @@ fn collect_claude_status_snapshots(
             !claude_oauth_usage_network_disabled(),
         );
         if !upkeep.proceed_with_collection {
-            let status =
+            let mut status =
                 blocked_claude_upkeep_status(&descriptor.slot_id, &captured_at, upkeep.status);
+            if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
+                retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
+            } else {
+                clear_claude_slot_binding(&mut status);
+            }
             slot_states.insert(descriptor.slot_id, status);
             continue;
         }
@@ -1290,6 +1305,9 @@ fn collect_claude_status_snapshots(
             Ok(resolved) => resolved,
             Err(failure) => {
                 let mut status = failure.status(&captured_at);
+                if let Some(slot) = claude_config_slot_for_descriptor(&descriptor) {
+                    retain_verified_claude_slot_binding(&descriptor.slot_id, &slot, &mut status);
+                }
                 apply_claude_upkeep_observation(&mut status, upkeep.status);
                 slot_states.insert(descriptor.slot_id, status);
                 continue;
@@ -1315,18 +1333,23 @@ fn collect_claude_status_snapshots(
         ) {
             Ok((snapshot, mut state)) => {
                 apply_claude_upkeep_observation(&mut state, upkeep.status);
-                let rank = claude_snapshot_candidate_rank(&snapshot)
-                    .expect("validated custom full-meter snapshot is rankable");
-                candidates.push(ClaudeSnapshotCandidate {
-                    slot_id: slot_id.clone(),
-                    account_identifier_hash: account_hash,
-                    organization_identifier_hash: Some(organization_hash),
-                    rank,
-                    snapshot,
-                });
+                let mut snapshot = snapshot;
+                apply_claude_quota_access_state(&mut snapshot, &state);
+                if claude_slot_status_carries_meters(&state) {
+                    let rank = claude_snapshot_candidate_rank(&snapshot)
+                        .expect("validated custom meter snapshot is rankable");
+                    candidates.push(ClaudeSnapshotCandidate {
+                        slot_id: slot_id.clone(),
+                        account_identifier_hash: account_hash,
+                        organization_identifier_hash: Some(organization_hash),
+                        rank,
+                        snapshot,
+                    });
+                }
                 slot_states.insert(slot_id, state);
             }
             Err(mut state) => {
+                retain_exact_claude_slot_binding(&mut state, &account_hash, &organization_hash);
                 apply_claude_upkeep_observation(&mut state, upkeep.status);
                 slot_states.insert(slot_id, state);
             }
@@ -1342,6 +1365,7 @@ fn collect_claude_status_snapshots(
         }
     }
     let winners = best_by_account.values().copied().collect::<BTreeSet<_>>();
+    let winning_accounts = best_by_account.keys().cloned().collect::<BTreeSet<_>>();
     let mut snapshots = Vec::with_capacity(winners.len());
     for (index, candidate) in candidates.into_iter().enumerate() {
         if winners.contains(&index) {
@@ -1357,6 +1381,12 @@ fn collect_claude_status_snapshots(
             );
         }
     }
+    snapshots.extend(degraded_claude_slot_snapshots(
+        &slot_states,
+        &winning_accounts,
+        &captured_at,
+        &expires_at,
+    ));
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
         &snapshots,
@@ -1827,6 +1857,339 @@ fn claude_usage_has_exact_identity(
         })
 }
 
+fn ensure_claude_quota_access_capability(snapshot: &mut AgentStatusSnapshot) {
+    if snapshot
+        .capabilities
+        .iter()
+        .any(|capability| capability.capability == CLAUDE_QUOTA_ACCESS_CAPABILITY)
+    {
+        return;
+    }
+    snapshot.capabilities.push(supported_capability(
+        CLAUDE_QUOTA_ACCESS_CAPABILITY,
+        "This daemon reports exact-slot Claude quota access state for strongly bound accounts.",
+    ));
+}
+
+fn projected_claude_quota_access_state(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> Option<ClaudeQuotaAccessState> {
+    let strongly_bound = status
+        .account_identifier_hash
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && status
+            .organization_identifier_hash
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if !strongly_bound {
+        return None;
+    }
+    if status
+        .upkeep
+        .as_ref()
+        .is_some_and(|upkeep| upkeep.result == ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled)
+    {
+        return Some(ClaudeQuotaAccessState::Paused);
+    }
+    if status
+        .upkeep
+        .as_ref()
+        .is_some_and(|upkeep| upkeep.result == ClaudeConfigSlotUpkeepResultV1::MissingBinary)
+    {
+        return Some(ClaudeQuotaAccessState::AttentionRequired);
+    }
+    match status.state {
+        ClaudeConfigSlotCollectionStateV1::Fresh => {
+            Some(if status.has_account_windows && status.has_scoped_limits {
+                ClaudeQuotaAccessState::Full
+            } else {
+                ClaudeQuotaAccessState::Partial
+            })
+        }
+        ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
+        | ClaudeConfigSlotCollectionStateV1::CollectionInProgress
+        | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
+        | ClaudeConfigSlotCollectionStateV1::RefreshDue
+        | ClaudeConfigSlotCollectionStateV1::StaleAccessToken
+        | ClaudeConfigSlotCollectionStateV1::ProbeFailed
+        | ClaudeConfigSlotCollectionStateV1::ReloginApproaching => {
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+        }
+        ClaudeConfigSlotCollectionStateV1::NeedsLogin => {
+            Some(ClaudeQuotaAccessState::ReconnectRequired)
+        }
+        ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+            if status.upkeep.as_ref().is_some_and(|upkeep| {
+                upkeep.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+            }) =>
+        {
+            Some(ClaudeQuotaAccessState::ReconnectRequired)
+        }
+        ClaudeConfigSlotCollectionStateV1::CollectionPaused
+        | ClaudeConfigSlotCollectionStateV1::UpkeepNotConsented => {
+            Some(ClaudeQuotaAccessState::Paused)
+        }
+        ClaudeConfigSlotCollectionStateV1::IdentityUnknown
+        | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+        | ClaudeConfigSlotCollectionStateV1::IdentityMismatch => {
+            Some(ClaudeQuotaAccessState::AttentionRequired)
+        }
+        ClaudeConfigSlotCollectionStateV1::Unverified
+        | ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+        | ClaudeConfigSlotCollectionStateV1::CapacityExceeded => None,
+    }
+}
+
+fn claude_slot_status_carries_meters(status: &ClaudeConfigSlotCollectionStatusV1) -> bool {
+    matches!(
+        projected_claude_quota_access_state(status),
+        None | Some(ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial)
+    )
+}
+
+fn apply_claude_quota_access_state(
+    snapshot: &mut AgentStatusSnapshot,
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) {
+    ensure_claude_quota_access_capability(snapshot);
+    let Some(projected) = projected_claude_quota_access_state(status) else {
+        return;
+    };
+    let account_matches = snapshot.account.as_ref().is_some_and(|account| {
+        account.account_identifier_hash.as_deref() == status.account_identifier_hash.as_deref()
+            && account.organization_identifier_hash.as_deref()
+                == status.organization_identifier_hash.as_deref()
+    });
+    if account_matches {
+        snapshot
+            .account
+            .as_mut()
+            .expect("matching Claude account must exist")
+            .claude_quota_access_state = Some(projected);
+    }
+}
+
+fn retain_exact_claude_slot_binding(
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+    account_hash: &str,
+    organization_hash: &str,
+) {
+    if account_hash.is_empty() || organization_hash.is_empty() {
+        return;
+    }
+    status.account_identifier_hash = Some(account_hash.to_string());
+    status.organization_identifier_hash = Some(organization_hash.to_string());
+    status.display_label = Some(format!(
+        "Claude account {}",
+        &account_hash[..account_hash.len().min(8)]
+    ));
+}
+
+fn claude_config_slot_for_descriptor(
+    descriptor: &ClaudeConfigSlotDescriptorV1,
+) -> Option<ClaudeConfigDirSlot> {
+    match descriptor.config_dir.as_ref() {
+        Some(config_dir) => ClaudeConfigDirSlot::registered(config_dir.clone()).ok(),
+        None if descriptor.slot_id == "default" => Some(ClaudeConfigDirSlot::Default),
+        None => None,
+    }
+}
+
+fn clear_claude_slot_binding(status: &mut ClaudeConfigSlotCollectionStatusV1) {
+    status.account_identifier_hash = None;
+    status.organization_identifier_hash = None;
+    status.display_label = None;
+    status.last_full_quota_read_at = None;
+    status.has_account_windows = false;
+    status.has_scoped_limits = false;
+    status.has_credit_balances = false;
+    status.quota_snapshot = None;
+}
+
+fn retain_verified_claude_slot_binding(
+    slot_id: &str,
+    slot: &ClaudeConfigDirSlot,
+    status: &mut ClaudeConfigSlotCollectionStatusV1,
+) {
+    let current_binding = read_claude_cli_oauth_account(&slot.identity_path(&home_dir()))
+        .as_ref()
+        .and_then(claude_strong_oauth_identity_hashes);
+    let Some(previous) = read_persisted_claude_slot_collection_state()
+        .slots
+        .get(slot_id)
+        .cloned()
+    else {
+        if status
+            .account_identifier_hash
+            .as_deref()
+            .zip(status.organization_identifier_hash.as_deref())
+            != current_binding
+                .as_ref()
+                .map(|(account, organization)| (account.as_str(), organization.as_str()))
+        {
+            clear_claude_slot_binding(status);
+        }
+        return;
+    };
+    let (Some(previous_account), Some(previous_organization)) = (
+        previous.account_identifier_hash.as_deref(),
+        previous.organization_identifier_hash.as_deref(),
+    ) else {
+        clear_claude_slot_binding(status);
+        return;
+    };
+    let Some((current_account, current_organization)) = current_binding else {
+        clear_claude_slot_binding(status);
+        return;
+    };
+    if current_account != previous_account || current_organization != previous_organization {
+        clear_claude_slot_binding(status);
+        return;
+    }
+    if status
+        .account_identifier_hash
+        .as_deref()
+        .is_some_and(|account| account != current_account)
+        || status
+            .organization_identifier_hash
+            .as_deref()
+            .is_some_and(|organization| organization != current_organization)
+    {
+        clear_claude_slot_binding(status);
+        return;
+    }
+    retain_exact_claude_slot_binding(status, &current_account, &current_organization);
+    status.last_full_quota_read_at = previous.last_full_quota_read_at;
+    status.has_account_windows = previous.has_account_windows;
+    status.has_scoped_limits = previous.has_scoped_limits;
+    status.has_credit_balances = previous.has_credit_balances;
+    status.quota_snapshot = previous
+        .quota_snapshot
+        .as_ref()
+        .map(stale_local_claude_quota_snapshot);
+}
+
+fn degraded_claude_slot_snapshot(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+    captured_at: &str,
+    expires_at: &str,
+) -> Option<AgentStatusSnapshot> {
+    let access_state = projected_claude_quota_access_state(status)?;
+    if matches!(
+        access_state,
+        ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial
+    ) {
+        return None;
+    }
+    let account_hash = status.account_identifier_hash.as_ref()?.clone();
+    let organization_hash = status.organization_identifier_hash.as_ref()?.clone();
+    let mut snapshot = base_snapshot(
+        SourceKind::ClaudeCode,
+        AgentStatusState::Degraded,
+        AgentStatusCollectionMethod::CliJson,
+        captured_at.to_string(),
+        expires_at.to_string(),
+    );
+    snapshot.account = Some(AgentAccountStatus {
+        login_state: if access_state == ClaudeQuotaAccessState::ReconnectRequired {
+            AgentLoginState::SignedOut
+        } else {
+            AgentLoginState::Unknown
+        },
+        provider: Some("anthropic".to_string()),
+        auth_method: Some("oauth".to_string()),
+        email: None,
+        account_id: None,
+        organization_id: None,
+        organization_label: None,
+        plan_type: None,
+        subscription_product: None,
+        billing_channel: Some("subscription".to_string()),
+        subscription_period_start: None,
+        subscription_period_end: None,
+        subscription_period_last_checked_at: None,
+        account_identifier_hash: Some(account_hash),
+        organization_identifier_hash: Some(organization_hash),
+        credential_fingerprint_hash: None,
+        billing_identity_evidence: Some("provider_account_id".to_string()),
+        claude_quota_access_state: Some(access_state),
+        billing_identity_confidence: AgentStatusConfidence::High,
+        confidence: AgentStatusConfidence::High,
+    });
+    ensure_claude_quota_access_capability(&mut snapshot);
+    let (code, message) = match access_state {
+        ClaudeQuotaAccessState::TemporarilyUnavailable => (
+            "claude_quota_temporarily_unavailable",
+            "Full Claude quota collection is temporarily unavailable for this registered account and will retry automatically.",
+        ),
+        ClaudeQuotaAccessState::ReconnectRequired => (
+            "claude_quota_reconnect_required",
+            "This registered Claude account requires customer-owned official Claude Code login before full quota collection can resume.",
+        ),
+        ClaudeQuotaAccessState::Paused => (
+            "claude_quota_collection_paused",
+            "Full Claude quota collection is paused for this registered account.",
+        ),
+        ClaudeQuotaAccessState::AttentionRequired => (
+            "claude_quota_attention_required",
+            "This registered Claude account needs local attention before full quota collection can resume.",
+        ),
+        ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial => unreachable!(),
+    };
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        code,
+        AgentDiagnosticSeverity::Warning,
+        message,
+    ));
+    Some(snapshot)
+}
+
+fn claude_quota_access_priority(snapshot: &AgentStatusSnapshot) -> u8 {
+    match snapshot
+        .account
+        .as_ref()
+        .and_then(|account| account.claude_quota_access_state)
+    {
+        Some(ClaudeQuotaAccessState::ReconnectRequired) => 4,
+        Some(ClaudeQuotaAccessState::AttentionRequired) => 3,
+        Some(ClaudeQuotaAccessState::Paused) => 2,
+        Some(ClaudeQuotaAccessState::TemporarilyUnavailable) => 1,
+        _ => 0,
+    }
+}
+
+fn degraded_claude_slot_snapshots(
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+    winning_accounts: &BTreeSet<String>,
+    captured_at: &str,
+    expires_at: &str,
+) -> Vec<AgentStatusSnapshot> {
+    let mut degraded_by_account = BTreeMap::<String, AgentStatusSnapshot>::new();
+    for status in slot_states.values() {
+        let Some(snapshot) = degraded_claude_slot_snapshot(status, captured_at, expires_at) else {
+            continue;
+        };
+        let account_hash = snapshot
+            .account
+            .as_ref()
+            .and_then(|account| account.account_identifier_hash.clone())
+            .expect("degraded Claude slot snapshots require a strong account binding");
+        if winning_accounts.contains(&account_hash) {
+            continue;
+        }
+        match degraded_by_account.get(&account_hash) {
+            Some(previous)
+                if claude_quota_access_priority(previous)
+                    >= claude_quota_access_priority(&snapshot) => {}
+            _ => {
+                degraded_by_account.insert(account_hash, snapshot);
+            }
+        }
+    }
+    degraded_by_account.into_values().collect()
+}
+
 fn claude_default_slot_collection_status(
     snapshot: &AgentStatusSnapshot,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
@@ -1858,6 +2221,31 @@ fn claude_default_slot_collection_status(
         ))
     });
     match hashes {
+        Some((account_hash, organization_hash))
+            if snapshot.collection_method == AgentStatusCollectionMethod::StatusLine
+                && !snapshot.quota_windows.is_empty()
+                && snapshot.credit_balances.is_empty()
+                && snapshot.quota_windows.iter().all(|window| {
+                    window.account_identifier_hash.as_deref() == Some(account_hash)
+                        && window.organization_identifier_hash.is_none()
+                }) =>
+        {
+            fresh_slot_status(
+                &snapshot.captured_at,
+                account_hash,
+                organization_hash,
+                snapshot
+                    .quota_windows
+                    .iter()
+                    .any(|window| window.name == "session")
+                    && snapshot
+                        .quota_windows
+                        .iter()
+                        .any(|window| window.name == "weekly"),
+                false,
+                false,
+            )
+        }
         Some((account_hash, organization_hash))
             if !snapshot.quota_windows.is_empty()
                 && snapshot.quota_windows.iter().all(|window| {
@@ -5066,6 +5454,7 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Low,
     });
@@ -5339,6 +5728,7 @@ fn not_installed_snapshot(
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::High,
     });
@@ -5375,6 +5765,7 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
+            claude_quota_access_state: None,
             billing_identity_confidence: AgentStatusConfidence::Unknown,
             confidence: AgentStatusConfidence::Medium,
         });
@@ -5406,6 +5797,7 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Medium,
     })
@@ -5524,6 +5916,7 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         organization_identifier_hash,
         credential_fingerprint_hash: None,
         billing_identity_evidence,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     })
@@ -6310,6 +6703,9 @@ fn merge_codex_accounts(
         billing_identity_evidence: auth_account
             .billing_identity_evidence
             .or(existing.billing_identity_evidence),
+        claude_quota_access_state: auth_account
+            .claude_quota_access_state
+            .or(existing.claude_quota_access_state),
         billing_identity_confidence: if auth_account.billing_identity_confidence
             != AgentStatusConfidence::Unknown
         {
@@ -6436,6 +6832,7 @@ fn parse_claude_auth_json(value: &Value) -> AgentAccountStatus {
         organization_identifier_hash,
         credential_fingerprint_hash: None,
         billing_identity_evidence,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     }
@@ -8037,6 +8434,7 @@ fn unsupported_account(provider: &str) -> AgentAccountStatus {
         organization_identifier_hash: None,
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
+        claude_quota_access_state: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Unknown,
     }
@@ -8920,6 +9318,10 @@ exit 1
         let tertiary_org =
             billing_identity_hash("anthropic", "organization", "organization-tertiary")
                 .expect("tertiary org hash");
+        let failed_hash = billing_identity_hash("anthropic", "account", "account-failed")
+            .expect("failed account hash");
+        let failed_org = billing_identity_hash("anthropic", "organization", "organization-failed")
+            .expect("failed org hash");
         let usage_cache = |account_hash: &str,
                            organization_hash: &str,
                            used_percent: u8,
@@ -8996,8 +9398,8 @@ exit 1
 
         assert_eq!(
             snapshots.len(),
-            2,
-            "unavailable default, failed slot, and duplicate stay local"
+            4,
+            "two healthy accounts plus two strongly bound degraded accounts are emitted"
         );
         assert!(snapshots
             .iter()
@@ -9015,7 +9417,7 @@ exit 1
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(by_account.len(), 2);
+        assert_eq!(by_account.len(), 4);
         for (account_hash, organization_hash, expected_percent, expected_credits) in [
             (&secondary_hash, &secondary_org, 77, 777),
             (&tertiary_hash, &tertiary_org, 33, 333),
@@ -9042,7 +9444,56 @@ exit 1
                 snapshot.credit_balances[0].remaining,
                 Some(expected_credits)
             );
+            assert_eq!(
+                snapshot
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.claude_quota_access_state),
+                Some(ClaudeQuotaAccessState::Full)
+            );
         }
+        let failed_snapshot = by_account
+            .get(&failed_hash)
+            .expect("strongly bound failed slot snapshot");
+        assert_eq!(failed_snapshot.status, AgentStatusState::Degraded);
+        assert!(failed_snapshot.quota_windows.is_empty());
+        assert!(failed_snapshot.credit_balances.is_empty());
+        assert!(failed_snapshot.plan_observations.is_empty());
+        assert_eq!(
+            failed_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.organization_identifier_hash.as_ref()),
+            Some(&failed_org)
+        );
+        assert_eq!(
+            failed_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+        let primary_snapshot = by_account
+            .get(&primary_hash)
+            .expect("strongly bound unavailable default snapshot");
+        assert_eq!(primary_snapshot.status, AgentStatusState::Degraded);
+        assert!(primary_snapshot.quota_windows.is_empty());
+        assert!(primary_snapshot.credit_balances.is_empty());
+        assert!(primary_snapshot.plan_observations.is_empty());
+        assert_eq!(
+            primary_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.organization_identifier_hash.as_ref()),
+            Some(&primary_org)
+        );
+        assert_eq!(
+            primary_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+        );
 
         let status = annotate_claude_accounts_status(store.load().expect("load slot status"));
         let local_full_slots = status
@@ -13117,6 +13568,10 @@ for line in sys.stdin:
             claude_default_slot_collection_status(&snapshot).state,
             ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
         );
+        assert!(
+            !claude_slot_status_carries_meters(&claude_default_slot_collection_status(&snapshot)),
+            "an exact stale bundle is replaced by a meterless degraded current witness"
+        );
 
         snapshot.quota_windows.push(AgentQuotaWindow {
             name: "weekly".to_string(),
@@ -13143,6 +13598,14 @@ for line in sys.stdin:
             "an attributed default statusLine partial remains uploadable"
         );
         assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(1));
+        let partial = claude_default_slot_collection_status(&snapshot);
+        assert_eq!(partial.state, ClaudeConfigSlotCollectionStateV1::Fresh);
+        assert_eq!(
+            projected_claude_quota_access_state(&partial),
+            Some(ClaudeQuotaAccessState::Partial),
+            "strongly bound statusLine meters remain an honest partial view"
+        );
+        assert!(claude_slot_status_carries_meters(&partial));
     }
 
     #[test]
@@ -13837,6 +14300,372 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
     }
 
     #[test]
+    fn claude_quota_access_projection_is_strongly_bound_and_fail_closed() {
+        let mut full = fresh_slot_status(
+            "2026-08-12T10:00:00Z",
+            "account-hash",
+            "organization-hash",
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::Full)
+        );
+        full.has_scoped_limits = false;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::Partial)
+        );
+
+        full.state = ClaudeConfigSlotCollectionStateV1::ConcurrentMutation;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable),
+            "a concurrent login mutation retries from stable state"
+        );
+        full.state = ClaudeConfigSlotCollectionStateV1::CredentialUnavailable;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::AttentionRequired),
+            "an ambiguous credential failure must not claim reconnect is sufficient"
+        );
+        full.upkeep = Some(ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+            result: ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            due_access_expires_at: None,
+            refresh_token_expires_at: None,
+            attempted_at: None,
+            next_allowed_attempt_at: None,
+            consecutive_failures: 0,
+        });
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::AttentionRequired),
+            "unreadable metadata does not prove that login is the remedy"
+        );
+
+        full.state = ClaudeConfigSlotCollectionStateV1::NeedsLogin;
+        full.upkeep.as_mut().expect("upkeep").result = ClaudeConfigSlotUpkeepResultV1::NeedsLogin;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::ReconnectRequired),
+            "only explicit absolute login expiry is reconnect-required"
+        );
+
+        full.state = ClaudeConfigSlotCollectionStateV1::ProbeFailed;
+        full.upkeep.as_mut().expect("upkeep").result =
+            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::Paused)
+        );
+        full.upkeep.as_mut().expect("upkeep").result =
+            ClaudeConfigSlotUpkeepResultV1::MissingBinary;
+        assert_eq!(
+            projected_claude_quota_access_state(&full),
+            Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+
+        full.organization_identifier_hash = None;
+        assert_eq!(projected_claude_quota_access_state(&full), None);
+    }
+
+    #[test]
+    fn claude_quota_access_projection_marks_capability_without_guessing_account_state() {
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-12T10:00:00Z".to_string(),
+            "2026-08-12T10:05:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..unsupported_account("anthropic")
+        });
+        let full = fresh_slot_status(
+            "2026-08-12T10:00:00Z",
+            "account-hash",
+            "organization-hash",
+            true,
+            true,
+            false,
+        );
+        apply_claude_quota_access_state(&mut snapshot, &full);
+        assert_eq!(
+            snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::Full)
+        );
+        assert!(snapshot
+            .capabilities
+            .iter()
+            .any(|capability| capability.capability == CLAUDE_QUOTA_ACCESS_CAPABILITY));
+
+        let mut mismatched = snapshot.clone();
+        mismatched
+            .account
+            .as_mut()
+            .expect("account")
+            .claude_quota_access_state = None;
+        let other = fresh_slot_status(
+            "2026-08-12T10:00:00Z",
+            "other-account",
+            "organization-hash",
+            true,
+            true,
+            false,
+        );
+        apply_claude_quota_access_state(&mut mismatched, &other);
+        assert_eq!(
+            mismatched
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            None,
+            "a state for another identity must never be stamped onto this account"
+        );
+        assert!(mismatched
+            .capabilities
+            .iter()
+            .any(|capability| capability.capability == CLAUDE_QUOTA_ACCESS_CAPABILITY));
+    }
+
+    #[test]
+    fn degraded_claude_slot_witness_is_meterless_planless_and_account_deduplicated() {
+        let temporary = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..Default::default()
+        };
+        let reconnect = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+            account_identifier_hash: Some("account-hash".to_string()),
+            organization_identifier_hash: Some("organization-hash".to_string()),
+            ..Default::default()
+        };
+        let unbound = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+            account_identifier_hash: Some("unbound-account".to_string()),
+            organization_identifier_hash: None,
+            ..Default::default()
+        };
+        let slots = BTreeMap::from([
+            ("claude_slot_a".to_string(), temporary),
+            ("claude_slot_b".to_string(), reconnect),
+            ("claude_slot_c".to_string(), unbound),
+        ]);
+
+        let snapshots = degraded_claude_slot_snapshots(
+            &slots,
+            &BTreeSet::new(),
+            "2026-08-12T10:00:00Z",
+            "2026-08-12T10:05:00Z",
+        );
+        assert_eq!(snapshots.len(), 1, "one current row per strong account");
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.status, AgentStatusState::Degraded);
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+        assert!(snapshot.plan_observations.is_empty());
+        assert_eq!(
+            snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::ReconnectRequired)
+        );
+        let wire = serde_json::to_string(snapshot).expect("serialize degraded witness");
+        assert!(!wire.contains("claude_slot_a"));
+        assert!(!wire.contains("claude_slot_b"));
+        assert!(!wire.contains("config_dir"));
+        assert!(!wire.contains("quota_snapshot"));
+
+        let suppressed = degraded_claude_slot_snapshots(
+            &slots,
+            &BTreeSet::from(["account-hash".to_string()]),
+            "2026-08-12T10:00:00Z",
+            "2026-08-12T10:05:00Z",
+        );
+        assert!(
+            suppressed.is_empty(),
+            "a healthy winner for the account must suppress its failed duplicate slot"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn degraded_claude_slot_witness_retains_only_the_same_slots_strong_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-quota-access-witness-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _support_guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        fs::create_dir_all(&root).expect("support root");
+        let config_dir = root.join("exact-config");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        let write_identity = |account: &str, organization: &str| {
+            fs::write(
+                config_dir.join(".claude.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "organizationUuid": organization,
+                        "emailAddress": "person@example.invalid"
+                    }
+                }))
+                .expect("identity json"),
+            )
+            .expect("write identity");
+        };
+        write_identity("account-current", "organization-current");
+        let account_hash =
+            billing_identity_hash("anthropic", "account", "account-current").expect("account hash");
+        let organization_hash =
+            billing_identity_hash("anthropic", "organization", "organization-current")
+                .expect("organization hash");
+        let slot = ClaudeConfigDirSlot::registered(config_dir.to_string_lossy().into_owned())
+            .expect("registered slot");
+        let slot_id = "claude_slot_strong_binding";
+        write_persisted_claude_slot_collection_state(&PersistedClaudeSlotCollectionStateV1 {
+            schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
+            slots: BTreeMap::from([
+                (
+                    slot_id.to_string(),
+                    ClaudeConfigSlotCollectionStatusV1 {
+                        state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                        account_identifier_hash: Some(account_hash.clone()),
+                        organization_identifier_hash: Some(organization_hash.clone()),
+                        last_full_quota_read_at: Some("2026-08-12T09:00:00Z".to_string()),
+                        has_account_windows: true,
+                        has_scoped_limits: true,
+                        quota_snapshot: Some(ClaudeConfigSlotQuotaSnapshotV1 {
+                            state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+                            captured_at: "2026-08-12T09:00:00Z".to_string(),
+                            observed_at: Some("2026-08-12T09:00:00Z".to_string()),
+                            quota_windows: Vec::new(),
+                            credit_balances: Vec::new(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "default".to_string(),
+                    ClaudeConfigSlotCollectionStatusV1 {
+                        state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                        account_identifier_hash: Some(account_hash.clone()),
+                        organization_identifier_hash: Some(organization_hash.clone()),
+                        last_full_quota_read_at: Some("2026-08-12T09:00:00Z".to_string()),
+                        has_account_windows: true,
+                        has_scoped_limits: true,
+                        quota_snapshot: Some(ClaudeConfigSlotQuotaSnapshotV1 {
+                            state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+                            captured_at: "2026-08-12T09:00:00Z".to_string(),
+                            observed_at: Some("2026-08-12T09:00:00Z".to_string()),
+                            quota_windows: Vec::new(),
+                            credit_balances: Vec::new(),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            unresolved_accounts: Vec::new(),
+        })
+        .expect("seed exact slot binding");
+
+        let mut failed = ClaudeSlotProbeFailure::IdentityMismatch.status("2026-08-12T10:00:00Z");
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut failed);
+        assert_eq!(
+            failed.account_identifier_hash.as_deref(),
+            Some(account_hash.as_str())
+        );
+        assert_eq!(
+            failed.organization_identifier_hash.as_deref(),
+            Some(organization_hash.as_str())
+        );
+        assert_eq!(
+            failed
+                .quota_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.state),
+            Some(ClaudeConfigSlotQuotaSnapshotStateV1::Stale)
+        );
+        assert_eq!(
+            projected_claude_quota_access_state(&failed),
+            Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+
+        write_identity("account-rotated", "organization-rotated");
+        let mut rotated = ClaudeSlotProbeFailure::IdentityMismatch.status("2026-08-12T10:01:00Z");
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut rotated);
+        assert_eq!(rotated.account_identifier_hash, None);
+        assert_eq!(rotated.organization_identifier_hash, None);
+        assert_eq!(projected_claude_quota_access_state(&rotated), None);
+
+        let mut blocked_rotated = blocked_claude_upkeep_status(
+            slot_id,
+            "2026-08-12T10:01:30Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                attempted_at: None,
+                next_allowed_attempt_at: None,
+                consecutive_failures: 0,
+            },
+        );
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut blocked_rotated);
+        assert_eq!(blocked_rotated.account_identifier_hash, None);
+        assert_eq!(blocked_rotated.organization_identifier_hash, None);
+
+        fs::remove_file(config_dir.join(".claude.json")).expect("remove current identity");
+        let mut missing = blocked_claude_upkeep_status(
+            slot_id,
+            "2026-08-12T10:02:00Z",
+            ottto_protocol::ClaudeConfigSlotUpkeepStatusV1 {
+                result: ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
+                due_access_expires_at: None,
+                refresh_token_expires_at: None,
+                attempted_at: None,
+                next_allowed_attempt_at: None,
+                consecutive_failures: 0,
+            },
+        );
+        assert!(
+            missing.account_identifier_hash.is_some(),
+            "blocked upkeep starts from the local persisted status"
+        );
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut missing);
+        assert_eq!(missing.account_identifier_hash, None);
+        assert_eq!(missing.organization_identifier_hash, None);
+        assert_eq!(missing.quota_snapshot, None);
+
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("default home");
+        let _home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
+        let mut default_failed =
+            ClaudeSlotProbeFailure::CredentialUnavailable.status("2026-08-12T10:03:00Z");
+        retain_verified_claude_slot_binding(
+            "default",
+            &ClaudeConfigDirSlot::Default,
+            &mut default_failed,
+        );
+        assert_eq!(default_failed.account_identifier_hash, None);
+        assert_eq!(default_failed.organization_identifier_hash, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unresolved_accounts_use_only_strong_desktop_evidence_and_subtract_full_accounts() {
         let mut desktop = base_snapshot(
             SourceKind::ClaudeCode,
@@ -13904,6 +14733,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
+            claude_quota_access_state: None,
             billing_identity_confidence: AgentStatusConfidence::High,
             confidence: AgentStatusConfidence::High,
         });

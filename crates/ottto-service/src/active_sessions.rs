@@ -623,6 +623,7 @@ mod tests {
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: Some("account_identifier".to_string()),
+            claude_quota_access_state: None,
             billing_identity_confidence: AgentStatusConfidence::High,
             confidence: AgentStatusConfidence::High,
         });
@@ -926,6 +927,7 @@ mod tests {
             organization_identifier_hash: None,
             credential_fingerprint_hash: None,
             billing_identity_evidence: Some("account_identifier".to_string()),
+            claude_quota_access_state: None,
             billing_identity_confidence: AgentStatusConfidence::High,
             confidence: AgentStatusConfidence::High,
         }
