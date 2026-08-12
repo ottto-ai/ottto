@@ -3015,7 +3015,7 @@ impl ClaudeDesktopProfileBuilder {
                 .get(session_id)
                 .copied()
                 .flatten();
-            if activity.is_some_and(|next| current.is_none_or(|current| next > current))
+            if activity.is_some_and(|next| current.map_or(true, |current| next > current))
                 || !self.session_activity_by_id.contains_key(session_id)
             {
                 self.session_activity_by_id
