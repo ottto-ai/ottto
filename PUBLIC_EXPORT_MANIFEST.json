@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 322,
-  "content_sha256": "479fbcc41988608da7fb36a747a94682b42fdb2a96c0986f3f210f4c13fc5b2c",
+  "candidate_file_count": 323,
+  "content_sha256": "c7720711f3a6cbee7a3f98caacf04a50bd74284973c9b04f91f5709a85db7532",
   "files": [
     {
       "executable": false,
@@ -594,8 +594,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "f1a6fabfca6c44faf99dbc547328a2403a4128abf5089b3b57bb6042282961b7",
-      "size_bytes": 23504
+      "sha256": "a80f194cfcfd1254408b846ce7fde45c64ea0f737d3bbb3f510db4170a844b33",
+      "size_bytes": 39434
     },
     {
       "executable": false,
@@ -1398,9 +1398,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-08-12-claude-subagent-active-account-attribution.md",
+      "sha256": "eb407a0e27d53af3122f481024a872ef054d515a8cc91b34321d2688331fde7c",
+      "size_bytes": 1756
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
-      "sha256": "68314119355043346c6febf8f3ce739efb4f4c23c77db4e8120766473ff7b3fb",
-      "size_bytes": 1124
+      "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
+      "size_bytes": 2026
     },
     {
       "executable": false,
@@ -2257,9 +2264,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-12T10:58:09+00:00",
+  "generated_at": "2026-08-12T18:53:53+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 323,
+  "output_file_count": 324,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2293,5 +2300,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "17ab395ad6e7832f39467063a202a06af70ae872"
+  "source_commit": "2acb2fa553b9d94ba7ca1ca1fa32ac90b0cd3a36"
 }
