@@ -1258,6 +1258,24 @@ pub enum AgentStatusCollectionMethod {
     Unsupported,
 }
 
+/// Backend-safe summary of whether one strongly bound Claude account can
+/// currently provide its full quota bundle.
+///
+/// This is intentionally smaller than the machine-local config-slot state
+/// machine. It carries no slot identifier, config path, credential metadata,
+/// or free-form diagnostic text, and it is absent for legacy producers and
+/// account observations that do not come from an exact Claude Code slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeQuotaAccessState {
+    Full,
+    Partial,
+    TemporarilyUnavailable,
+    ReconnectRequired,
+    Paused,
+    AttentionRequired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentAccountStatus {
     pub login_state: AgentLoginState,
@@ -1293,6 +1311,11 @@ pub struct AgentAccountStatus {
     pub credential_fingerprint_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing_identity_evidence: Option<String>,
+    /// Present only for an exact, strongly account-and-organization-bound
+    /// Claude Code slot. Older daemons and weaker observations omit it, so a
+    /// consumer must treat absence as unknown rather than setup-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_quota_access_state: Option<ClaudeQuotaAccessState>,
     #[serde(default)]
     pub billing_identity_confidence: AgentStatusConfidence,
     pub confidence: AgentStatusConfidence,
@@ -3532,6 +3555,64 @@ mod tests {
     }
 
     #[test]
+    fn claude_quota_access_state_is_additive_and_account_only() {
+        let legacy: AgentAccountStatus = serde_json::from_value(serde_json::json!({
+            "login_state": "signed_in",
+            "provider": "anthropic",
+            "confidence": "high"
+        }))
+        .expect("legacy account without quota access state");
+        assert_eq!(legacy.claude_quota_access_state, None);
+
+        let mut account = legacy;
+        account.account_identifier_hash = Some("account-hash".to_string());
+        account.organization_identifier_hash = Some("organization-hash".to_string());
+        account.claude_quota_access_state = Some(ClaudeQuotaAccessState::ReconnectRequired);
+        let value = serde_json::to_value(account).expect("serialize account access witness");
+        assert_eq!(value["claude_quota_access_state"], "reconnect_required");
+        assert!(value.get("slot_id").is_none());
+        assert!(value.get("config_dir").is_none());
+        assert!(value.get("quota_snapshot").is_none());
+    }
+
+    #[test]
+    fn claude_quota_access_witness_fixture_is_meterless_planless_and_backend_safe() {
+        let snapshots: Vec<AgentStatusSnapshot> = serde_json::from_str(include_str!(
+            "../../../fixtures/agent-status/claude-quota-access-witness.json"
+        ))
+        .expect("Claude quota access witness fixture");
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = snapshots[0].clone().redacted_for_backend();
+        assert_eq!(snapshot.source, SourceKind::ClaudeCode);
+        assert_eq!(snapshot.status, AgentStatusState::Degraded);
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+        assert!(snapshot.plan_observations.is_empty());
+        assert_eq!(
+            snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_quota_access_state),
+            Some(ClaudeQuotaAccessState::TemporarilyUnavailable)
+        );
+        assert!(snapshot.capabilities.iter().any(|capability| {
+            capability.capability == "claude_quota_access_state_v1"
+                && capability.status == AgentCapabilityStatus::Supported
+        }));
+        let wire = serde_json::to_string(&snapshot).expect("serialize redacted fixture");
+        for forbidden in [
+            "config_dir",
+            "slot_id",
+            "service_name",
+            "access_expires_at",
+            "refresh_token",
+            "quota_snapshot",
+        ] {
+            assert!(!wire.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn claude_account_commands_fail_closed_on_base_protocol_version() {
         for command in [
             serde_json::json!({"command": "claude_accounts_status"}),
@@ -4118,6 +4199,7 @@ mod tests {
                 organization_identifier_hash: Some("def456hash".to_string()),
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: Some("provider_account_id".to_string()),
+                claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
                 billing_identity_confidence: AgentStatusConfidence::High,
                 confidence: AgentStatusConfidence::High,
             }),
@@ -4230,6 +4312,10 @@ mod tests {
         assert_eq!(
             account.billing_identity_evidence.as_deref(),
             Some("provider_account_id")
+        );
+        assert_eq!(
+            account.claude_quota_access_state,
+            Some(ClaudeQuotaAccessState::Full)
         );
         let model = snapshot.model.expect("model");
         assert_eq!(model.active_model, None);

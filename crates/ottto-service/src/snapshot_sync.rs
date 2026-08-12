@@ -6621,6 +6621,7 @@ mod tests {
             organization_identifier_hash: Some(organization_hash.to_string()),
             credential_fingerprint_hash: None,
             billing_identity_evidence: Some("provider_account_id".to_string()),
+            claude_quota_access_state: None,
             billing_identity_confidence: AgentStatusConfidence::High,
             confidence: AgentStatusConfidence::High,
         }

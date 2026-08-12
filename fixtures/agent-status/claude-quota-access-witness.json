@@ -1,0 +1,44 @@
+[
+  {
+    "source": "claude_code",
+    "status": "degraded",
+    "collection_method": "cli_json",
+    "captured_at": "2026-08-12T10:00:00Z",
+    "expires_at": "2026-08-12T10:05:00Z",
+    "account": {
+      "login_state": "unknown",
+      "provider": "anthropic",
+      "auth_method": "oauth",
+      "email": null,
+      "account_id": null,
+      "organization_id": null,
+      "organization_label": null,
+      "plan_type": null,
+      "subscription_product": null,
+      "billing_channel": "subscription",
+      "account_identifier_hash": "account-hash-fixture",
+      "organization_identifier_hash": "organization-hash-fixture",
+      "billing_identity_evidence": "provider_account_id",
+      "claude_quota_access_state": "temporarily_unavailable",
+      "billing_identity_confidence": "high",
+      "confidence": "high"
+    },
+    "quota_windows": [],
+    "credit_balances": [],
+    "capabilities": [
+      {
+        "capability": "claude_quota_access_state_v1",
+        "status": "supported",
+        "detail": "This daemon reports exact-slot Claude quota access state for strongly bound accounts."
+      }
+    ],
+    "plan_observations": [],
+    "diagnostics": [
+      {
+        "code": "claude_quota_temporarily_unavailable",
+        "severity": "warning",
+        "message": "Full Claude quota collection is temporarily unavailable for this registered account and will retry automatically."
+      }
+    ]
+  }
+]
