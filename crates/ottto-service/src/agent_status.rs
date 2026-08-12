@@ -100,6 +100,7 @@ static CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new()
 static CLAUDE_SLOT_COLLECTION_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CLAUDE_DESKTOP_CODE_SESSION_MAX_FILES_PER_ORG: usize = 500;
 const CLAUDE_DESKTOP_AGENT_MODE_MAX_FILES_PER_ORG: usize = 200;
+const CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX: usize = 64;
 // Reuse the daemon's existing detected-use/session retention contract. This
 // warning is a view of the same local activity evidence, not a new lifetime.
 const CLAUDE_UNRESOLVED_ACCOUNT_EVIDENCE_MAX_AGE_SECONDS: i64 =
@@ -455,6 +456,7 @@ struct ClaudeDesktopProfileBuilder {
     current_organization_uuid: Option<String>,
     latest_activity_epoch_seconds: Option<i64>,
     latest_session_id: Option<String>,
+    session_activity_by_id: BTreeMap<String, Option<i64>>,
     code_session_count: usize,
     agent_mode_session_count: usize,
 }
@@ -2627,18 +2629,111 @@ fn claude_desktop_plan_observations_from_root(
         &mut builders,
     );
 
-    builders
+    let builders = builders
         .into_values()
         .filter(|builder| {
             builder.code_session_count > 0
                 || last_known_account_uuid.as_deref() == Some(builder.account_uuid.as_str())
         })
-        .filter_map(|builder| {
-            claude_desktop_builder_plan_observation(
-                builder,
-                observed_at,
-                last_known_account_uuid.as_deref(),
-            )
+        .collect::<Vec<_>>();
+    let duplicate_session_owners = claude_desktop_unambiguous_duplicate_session_owners(&builders);
+    let mut observations = Vec::new();
+
+    for builder in &builders {
+        let mut profile = builder.clone();
+        if let Some(session_id) = profile.latest_session_id.as_deref() {
+            if let Some(owner) = duplicate_session_owners.get(session_id) {
+                let owner_matches = owner
+                    .as_ref()
+                    .is_some_and(|(account_uuid, _)| account_uuid == &profile.account_uuid);
+                if !owner_matches {
+                    // The same resumed Desktop session may remain in an older
+                    // account bucket. Never emit an exact session binding for
+                    // the losing (or tied/ambiguous) bucket.
+                    profile.latest_session_id = None;
+                }
+            }
+        }
+        if let Some(observation) = claude_desktop_builder_plan_observation(
+            profile,
+            observed_at,
+            last_known_account_uuid.as_deref(),
+        ) {
+            observations.push(observation);
+        }
+    }
+
+    let mut resolved_duplicate_sessions = duplicate_session_owners
+        .into_iter()
+        .filter_map(|(session_id, owner)| {
+            owner.map(|(account_uuid, activity)| (session_id, account_uuid, activity))
+        })
+        .collect::<Vec<_>>();
+    resolved_duplicate_sessions
+        .sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    for (session_id, account_uuid, activity) in resolved_duplicate_sessions
+        .into_iter()
+        .take(CLAUDE_DESKTOP_DUPLICATE_SESSION_OBSERVATION_MAX)
+    {
+        let Some(builder) = builders
+            .iter()
+            .find(|builder| builder.account_uuid == account_uuid)
+        else {
+            continue;
+        };
+        if builder.latest_session_id.as_deref() == Some(session_id.as_str()) {
+            continue;
+        }
+        let mut session_builder = builder.clone();
+        session_builder.latest_session_id = Some(session_id);
+        session_builder.latest_activity_epoch_seconds = activity;
+        if let Some(observation) = claude_desktop_builder_plan_observation(
+            session_builder,
+            observed_at,
+            last_known_account_uuid.as_deref(),
+        ) {
+            observations.push(observation);
+        }
+    }
+
+    observations
+}
+
+/// Returns only duplicated Desktop session IDs. A session is attributed when
+/// exactly one account bucket has the newest timestamp; equal or missing
+/// timestamps fail closed so account cards never guess.
+fn claude_desktop_unambiguous_duplicate_session_owners(
+    builders: &[ClaudeDesktopProfileBuilder],
+) -> BTreeMap<String, Option<(String, Option<i64>)>> {
+    let mut candidates: BTreeMap<String, Vec<(String, Option<i64>)>> = BTreeMap::new();
+    for builder in builders {
+        for (session_id, activity) in &builder.session_activity_by_id {
+            candidates
+                .entry(session_id.clone())
+                .or_default()
+                .push((builder.account_uuid.clone(), *activity));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .filter(|(_, candidates)| candidates.len() > 1)
+        .map(|(session_id, candidates)| {
+            if candidates.iter().any(|(_, activity)| activity.is_none()) {
+                return (session_id, None);
+            }
+            let newest = candidates
+                .iter()
+                .filter_map(|(_, activity)| *activity)
+                .max();
+            let winners = newest.map_or_else(Vec::new, |newest| {
+                candidates
+                    .into_iter()
+                    .filter(|(_, activity)| *activity == Some(newest))
+                    .collect::<Vec<_>>()
+            });
+            let owner = (winners.len() == 1).then(|| winners[0].clone());
+            (session_id, owner)
         })
         .collect()
 }
@@ -2914,6 +3009,19 @@ fn claude_desktop_builder_plan_observation(
 
 impl ClaudeDesktopProfileBuilder {
     fn record_activity(&mut self, activity: Option<i64>, session_id: Option<String>) -> bool {
+        if let Some(session_id) = session_id.as_ref() {
+            let current = self
+                .session_activity_by_id
+                .get(session_id)
+                .copied()
+                .flatten();
+            if activity.is_some_and(|next| current.is_none_or(|current| next > current))
+                || !self.session_activity_by_id.contains_key(session_id)
+            {
+                self.session_activity_by_id
+                    .insert(session_id.clone(), activity);
+            }
+        }
         let should_replace = match (activity, self.latest_activity_epoch_seconds) {
             (Some(next), Some(current)) => next >= current,
             (Some(_), None) => true,
@@ -2981,14 +3089,14 @@ fn safe_display_label(value: Option<&str>) -> Option<String> {
 fn timestamp_value_epoch_seconds(value: Option<&Value>) -> Option<i64> {
     let value = value?;
     if let Some(seconds) = value.as_i64() {
-        return Some(seconds);
+        return Some(normalize_unix_epoch_seconds(seconds));
     }
     if let Some(seconds) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
-        return Some(seconds);
+        return Some(normalize_unix_epoch_seconds(seconds));
     }
     if let Some(seconds) = value.as_f64() {
         if seconds.is_finite() {
-            return Some(seconds.round() as i64);
+            return Some(normalize_unix_epoch_seconds(seconds.round() as i64));
         }
     }
     let text = value.as_str()?.trim();
@@ -2996,16 +3104,26 @@ fn timestamp_value_epoch_seconds(value: Option<&Value>) -> Option<i64> {
         return None;
     }
     if let Ok(seconds) = text.parse::<i64>() {
-        return Some(seconds);
+        return Some(normalize_unix_epoch_seconds(seconds));
     }
     if let Ok(seconds) = text.parse::<f64>() {
         if seconds.is_finite() {
-            return Some(seconds.round() as i64);
+            return Some(normalize_unix_epoch_seconds(seconds.round() as i64));
         }
     }
     OffsetDateTime::parse(text, &Rfc3339)
         .ok()
         .map(|value| value.unix_timestamp())
+}
+
+fn normalize_unix_epoch_seconds(mut value: i64) -> i64 {
+    // Claude Desktop currently stores JavaScript millisecond epochs, while
+    // older fixtures and some builds use seconds. Reduce higher-precision
+    // integer epochs until they are in the Unix-seconds range.
+    while value.unsigned_abs() >= 10_000_000_000 {
+        value /= 1_000;
+    }
+    value
 }
 
 fn file_modified_epoch_seconds(path: &Path) -> Option<i64> {
@@ -10744,6 +10862,162 @@ for line in sys.stdin:
         assert_eq!(old.is_current, Some(false));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_desktop_duplicate_session_owner_uses_newest_account_bucket() {
+        let builders = vec![
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "older-account".to_string(),
+                session_activity_by_id: BTreeMap::from([(
+                    "resumed-session".to_string(),
+                    Some(1_700_000_000),
+                )]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "newer-account".to_string(),
+                session_activity_by_id: BTreeMap::from([(
+                    "resumed-session".to_string(),
+                    Some(1_700_000_100),
+                )]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+        ];
+
+        assert_eq!(
+            claude_desktop_unambiguous_duplicate_session_owners(&builders).get("resumed-session"),
+            Some(&Some(("newer-account".to_string(), Some(1_700_000_100))))
+        );
+    }
+
+    #[test]
+    fn claude_desktop_timestamp_parser_normalizes_javascript_milliseconds() {
+        let milliseconds = serde_json::json!(1_786_522_486_333_i64);
+        let seconds = serde_json::json!(1_786_522_486_i64);
+
+        assert_eq!(
+            timestamp_value_epoch_seconds(Some(&milliseconds)),
+            Some(1_786_522_486)
+        );
+        assert_eq!(
+            timestamp_value_epoch_seconds(Some(&seconds)),
+            Some(1_786_522_486)
+        );
+    }
+
+    #[test]
+    fn claude_desktop_resumed_session_emits_only_newest_exact_account_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "ottto-claude-desktop-resumed-session-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"lastKnownAccountUuid":"gmail-account"}"#,
+        )
+        .expect("write config");
+
+        for (account, org, file, session, activity) in [
+            (
+                "team-account",
+                "team-org",
+                "local_team.json",
+                "resumed",
+                100,
+            ),
+            (
+                "gmail-account",
+                "gmail-org",
+                "local_resumed.json",
+                "resumed",
+                200,
+            ),
+            (
+                "gmail-account",
+                "gmail-org",
+                "local_newer.json",
+                "other",
+                300,
+            ),
+        ] {
+            let directory = root.join("claude-code-sessions").join(account).join(org);
+            std::fs::create_dir_all(&directory).expect("create account bucket");
+            std::fs::write(
+                directory.join(file),
+                format!(r#"{{"cliSessionId":"{session}","lastActivityAt":{activity}}}"#),
+            )
+            .expect("write session metadata");
+        }
+
+        let observations =
+            claude_desktop_plan_observations_from_root(&root, "2026-08-12T08:00:00Z");
+        let exact = observations
+            .iter()
+            .filter(|observation| observation.source_session_id.as_deref() == Some("resumed"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].account_id.as_deref(), Some("gmail-account"));
+        assert!(observations.iter().any(|observation| {
+            observation.account_id.as_deref() == Some("team-account")
+                && observation.source_session_id.is_none()
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_desktop_duplicate_session_owner_fails_closed_on_tie() {
+        let builders = vec![
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "first-account".to_string(),
+                session_activity_by_id: BTreeMap::from([(
+                    "ambiguous-session".to_string(),
+                    Some(1_700_000_000),
+                )]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "second-account".to_string(),
+                session_activity_by_id: BTreeMap::from([(
+                    "ambiguous-session".to_string(),
+                    Some(1_700_000_000),
+                )]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+        ];
+
+        assert_eq!(
+            claude_desktop_unambiguous_duplicate_session_owners(&builders).get("ambiguous-session"),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn claude_desktop_duplicate_session_owner_fails_closed_on_missing_activity() {
+        let builders = vec![
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "timestamped-account".to_string(),
+                session_activity_by_id: BTreeMap::from([(
+                    "ambiguous-session".to_string(),
+                    Some(1_700_000_000),
+                )]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+            ClaudeDesktopProfileBuilder {
+                account_uuid: "untimestamped-account".to_string(),
+                session_activity_by_id: BTreeMap::from([("ambiguous-session".to_string(), None)]),
+                ..ClaudeDesktopProfileBuilder::default()
+            },
+        ];
+
+        assert_eq!(
+            claude_desktop_unambiguous_duplicate_session_owners(&builders).get("ambiguous-session"),
+            Some(&None)
+        );
     }
 
     #[test]

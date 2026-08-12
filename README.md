@@ -717,7 +717,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   `AgentStatusSnapshot` also carry
   `plan_observations` with last-seen, current marker, evidence method, optional
   session id, and normalized billing/model attribution so the backend can keep
-  multiple known plans for one source/computer. Pi `--list-models` output is
+  multiple known plans for one source/computer. When a resumed Claude Desktop
+  session remains in more than one account bucket, the uniquely newest bucket
+  owns the live session observation; equal or missing timestamps fail closed.
+  Pi `--list-models` output is
   parsed as a provider table and exposed through structured
   `available_model_details` so OpenAI Codex, OpenAI API-key, Google Vertex
   Gemini, Google Gemini API-key, AWS Bedrock, Azure OpenAI, gateway, and unknown
