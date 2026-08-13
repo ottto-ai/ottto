@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 325,
-  "content_sha256": "ccd785ab3675c808ca7226b5ffc854257da1eb27fda064279411150edbc3011c",
+  "candidate_file_count": 326,
+  "content_sha256": "8480401a0b14ca5a600ea9cef9f2b7199751068054ebc89b9d9977f0fa6fc8ee",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "61a1516e104d7aa28df1f549026ecb531594340d77fc63327eaf06a20ee13624",
-      "size_bytes": 599819
+      "sha256": "5dad8a9d625b6e18687a97ac1710e220042135a09d5c6307d6104e0bf51876db",
+      "size_bytes": 607660
     },
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "4fd8bca5d93fcb746ebe4810303fb7a81bd26e1d68d2bf5a299a5daaa8d1ae7e",
-      "size_bytes": 11047
+      "sha256": "6a3138082e35e75590a3509233887f9520cfee7fd439e0b7de716fba37cd983d",
+      "size_bytes": 11565
     },
     {
       "executable": false,
@@ -1408,6 +1408,13 @@
       "path": "docs/session-2026-08-12-claude-subagent-active-account-attribution.md",
       "sha256": "eb407a0e27d53af3122f481024a872ef054d515a8cc91b34321d2688331fde7c",
       "size_bytes": 1756
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-13-claude-slot-freshness-authority.md",
+      "sha256": "a976621b67dc222057341f9d5ba2d9fb35d11b389d4a1000420b6a1631ebb2be",
+      "size_bytes": 1560
     },
     {
       "executable": false,
@@ -2278,9 +2285,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-12T20:12:58+00:00",
+  "generated_at": "2026-08-13T18:53:54+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 326,
+  "output_file_count": 327,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2314,5 +2321,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "29d5d296e901b89ea0cc8b3db4f555b27c9eaf0f"
+  "source_commit": "ce6aa8b4fa9d9201953958663a0f50dcf0e2eb79"
 }

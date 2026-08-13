@@ -94,6 +94,14 @@ organization hashes still match; the retained values and every meter are marked
 stale. The backend witness remains meterless. Identity mismatch, another
 organization, or another slot never inherits the retained values.
 
+A fresh default-slot status-line observation is lower fidelity, not a failure:
+it has session and weekly percentages but no model-scoped limits or credits. If
+the same account's exact full snapshot is still inside its normal freshness
+horizon, local account status keeps that full snapshot and its original provider
+observation time instead of downgrading it during a concurrent scan. Once that
+horizon elapses, the retained bundle becomes stale normally. A different account
+or organization can never use this rule.
+
 ## Connecting another account
 
 Authenticated local control can prepare a private managed directory and return
