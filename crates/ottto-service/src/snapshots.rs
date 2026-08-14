@@ -345,6 +345,15 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
 
 const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 100;
 
+#[derive(Debug, Clone, Default)]
+struct CompactionMetrics {
+    total_pre_tokens: u64,
+    total_post_tokens: u64,
+    total_cumulative_dropped_tokens: u64,
+    total_duration_ms: u64,
+    metrics_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeCompactionKind {
     LegacySummary,
@@ -355,11 +364,18 @@ enum ClaudeCompactionKind {
 struct ClaudeCompactionObservation {
     kind: ClaudeCompactionKind,
     timestamp: Option<String>,
+    pre_tokens: Option<u64>,
+    post_tokens: Option<u64>,
+    cumulative_dropped_tokens: Option<u64>,
+    duration_ms: Option<u64>,
 }
 
-fn claude_compaction_summary(observations: &[ClaudeCompactionObservation]) -> (u64, Vec<String>) {
+fn claude_compaction_summary(
+    observations: &[ClaudeCompactionObservation],
+) -> (u64, Vec<String>, CompactionMetrics) {
     let mut matched_legacy = BTreeSet::new();
     let mut pair_count = 0_u64;
+    let mut metrics = CompactionMetrics::default();
 
     for current in observations
         .iter()
@@ -394,6 +410,27 @@ fn claude_compaction_summary(observations: &[ClaudeCompactionObservation]) -> (u
             matched_legacy.insert(legacy_index);
             pair_count += 1;
         }
+        if let Some(pre_tokens) = current.pre_tokens {
+            metrics.total_pre_tokens = metrics.total_pre_tokens.saturating_add(pre_tokens);
+        }
+        if let Some(post_tokens) = current.post_tokens {
+            metrics.total_post_tokens = metrics.total_post_tokens.saturating_add(post_tokens);
+        }
+        if let Some(cumulative_dropped_tokens) = current.cumulative_dropped_tokens {
+            metrics.total_cumulative_dropped_tokens = metrics
+                .total_cumulative_dropped_tokens
+                .saturating_add(cumulative_dropped_tokens);
+        }
+        if let Some(duration_ms) = current.duration_ms {
+            metrics.total_duration_ms = metrics.total_duration_ms.saturating_add(duration_ms);
+        }
+        if current.pre_tokens.is_some()
+            || current.post_tokens.is_some()
+            || current.cumulative_dropped_tokens.is_some()
+            || current.duration_ms.is_some()
+        {
+            metrics.metrics_count = metrics.metrics_count.saturating_add(1);
+        }
     }
 
     let timestamps = observations
@@ -408,6 +445,7 @@ fn claude_compaction_summary(observations: &[ClaudeCompactionObservation]) -> (u
     (
         observations.len() as u64 - pair_count,
         bounded_compaction_timestamps(timestamps),
+        metrics,
     )
 }
 
@@ -767,6 +805,14 @@ pub struct SnapshotItem {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_total_pre_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_total_post_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_total_cumulative_dropped_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_total_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_summary: Option<SnapshotActivitySummary>,
     pub model_usage: Vec<SnapshotModelUsage>,
@@ -3751,6 +3797,10 @@ pub(crate) fn snapshot_semantic_component_hashes(
                 "first_turn_context_tokens": item.first_turn_context_tokens,
                 "compaction_count": item.compaction_count,
                 "compaction_timestamps": &item.compaction_timestamps,
+                "compaction_total_pre_tokens": item.compaction_total_pre_tokens,
+                "compaction_total_post_tokens": item.compaction_total_post_tokens,
+                "compaction_total_cumulative_dropped_tokens": item.compaction_total_cumulative_dropped_tokens,
+                "compaction_total_duration_ms": item.compaction_total_duration_ms,
             }),
         );
     }
@@ -6542,15 +6592,16 @@ impl SnapshotAccumulator {
                 row.account_identifier_hash = self.account_identifier_hash.clone();
             }
         }
-        let (compaction_count, compaction_timestamps) = if self.source == SnapshotSource::ClaudeCode
-        {
-            claude_compaction_summary(&self.claude_compaction_observations)
-        } else {
-            (
-                self.compaction_count,
-                bounded_compaction_timestamps(self.compaction_timestamps),
-            )
-        };
+        let (compaction_count, compaction_timestamps, compaction_metrics) =
+            if self.source == SnapshotSource::ClaudeCode {
+                claude_compaction_summary(&self.claude_compaction_observations)
+            } else {
+                (
+                    self.compaction_count,
+                    bounded_compaction_timestamps(self.compaction_timestamps),
+                    CompactionMetrics::default(),
+                )
+            };
         let mut item = SnapshotItem {
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
@@ -6602,6 +6653,34 @@ impl SnapshotAccumulator {
                 compaction_timestamps
             } else {
                 Vec::new()
+            },
+            compaction_total_pre_tokens: if self.source.derives_context_posture()
+                && compaction_metrics.metrics_count > 0
+            {
+                Some(compaction_metrics.total_pre_tokens)
+            } else {
+                None
+            },
+            compaction_total_post_tokens: if self.source.derives_context_posture()
+                && compaction_metrics.metrics_count > 0
+            {
+                Some(compaction_metrics.total_post_tokens)
+            } else {
+                None
+            },
+            compaction_total_cumulative_dropped_tokens: if self.source.derives_context_posture()
+                && compaction_metrics.metrics_count > 0
+            {
+                Some(compaction_metrics.total_cumulative_dropped_tokens)
+            } else {
+                None
+            },
+            compaction_total_duration_ms: if self.source.derives_context_posture()
+                && compaction_metrics.metrics_count > 0
+            {
+                Some(compaction_metrics.total_duration_ms)
+            } else {
+                None
             },
             activity_summary,
             model_usage,
@@ -7952,6 +8031,10 @@ fn codex_state_only_snapshot(
         last_turn_context_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
+        compaction_total_pre_tokens: None,
+        compaction_total_post_tokens: None,
+        compaction_total_cumulative_dropped_tokens: None,
+        compaction_total_duration_ms: None,
         activity_summary: None,
         model_usage,
         usage_buckets,
@@ -9900,14 +9983,26 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             .push(ClaudeCompactionObservation {
                 kind: ClaudeCompactionKind::LegacySummary,
                 timestamp: timestamp.clone(),
+                pre_tokens: None,
+                post_tokens: None,
+                cumulative_dropped_tokens: None,
+                duration_ms: None,
             });
     }
     if is_current_compaction {
+        let pre_tokens = value.pointer("/compactMetadata/preTokens").and_then(Value::as_u64);
+        let post_tokens = value.pointer("/compactMetadata/postTokens").and_then(Value::as_u64);
+        let cumulative_dropped_tokens = value.pointer("/compactMetadata/cumulativeDroppedTokens").and_then(Value::as_u64);
+        let duration_ms = value.pointer("/compactMetadata/durationMs").and_then(Value::as_u64);
         accumulator
             .claude_compaction_observations
             .push(ClaudeCompactionObservation {
                 kind: ClaudeCompactionKind::CurrentBoundary,
                 timestamp: timestamp.clone(),
+                pre_tokens,
+                post_tokens,
+                cumulative_dropped_tokens,
+                duration_ms,
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -19785,6 +19880,10 @@ mod tests {
             last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            compaction_total_pre_tokens: None,
+            compaction_total_post_tokens: None,
+            compaction_total_cumulative_dropped_tokens: None,
+            compaction_total_duration_ms: None,
             activity_summary: None,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
@@ -29113,6 +29212,10 @@ mod tests {
             "first_turn_context_tokens",
             "compaction_count",
             "compaction_timestamps",
+            "compaction_total_pre_tokens",
+            "compaction_total_post_tokens",
+            "compaction_total_cumulative_dropped_tokens",
+            "compaction_total_duration_ms",
             "activity_summary",
             "model_usage",
             "usage_buckets",
@@ -29268,6 +29371,10 @@ mod tests {
             last_turn_context_tokens: None,
             compaction_count: Some(0),
             compaction_timestamps: Vec::new(),
+            compaction_total_pre_tokens: None,
+            compaction_total_post_tokens: None,
+            compaction_total_cumulative_dropped_tokens: None,
+            compaction_total_duration_ms: None,
             activity_summary: Some(SnapshotActivitySummary {
                 capability_collection_version: Some("agent_capability_usage:v1".to_string()),
                 tool_calls: 3,
@@ -29555,6 +29662,10 @@ mod tests {
                 last_turn_context_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
+                compaction_total_pre_tokens: None,
+                compaction_total_post_tokens: None,
+                compaction_total_cumulative_dropped_tokens: None,
+                compaction_total_duration_ms: None,
                 activity_summary: None,
                 model_usage: vec![row.clone()],
                 usage_buckets: vec![SnapshotUsageBucket {
