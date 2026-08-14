@@ -82,6 +82,8 @@ enum Transport {
     Stdio {
         command: String,
         args: Vec<String>,
+        cwd: Option<String>,
+        env: BTreeMap<String, String>,
     },
     /// Streamable HTTP transport. Not yet harvested (see module docs).
     Http {
@@ -109,6 +111,7 @@ impl Transport {
 struct ConfiguredServer {
     name: String,
     transport: Transport,
+    disabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +127,7 @@ struct McpToolInput {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct McpServerInput {
+    disabled: bool,
     server: String,
     transport: Option<String>,
     reachable: bool,
@@ -162,7 +166,7 @@ struct McpInventoryIngestRequest {
 /// eagerly every turn. Mirrors `_effective_loading_mode` in harvest.py.
 fn loading_mode_for(source: SnapshotSource) -> &'static str {
     match source {
-        SnapshotSource::ClaudeCode => "on_demand",
+        SnapshotSource::ClaudeCode => "unknown",
         SnapshotSource::Codex => "always_on",
         SnapshotSource::Pi => "unknown",
     }
@@ -208,11 +212,17 @@ fn normalize_claude_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> 
     } else {
         let command = cfg.get("command").and_then(Value::as_str)?.to_string();
         let args = string_args(cfg.get("args"));
-        Transport::Stdio { command, args }
+        Transport::Stdio {
+            command,
+            args,
+            cwd: cfg.get("cwd").and_then(Value::as_str).map(str::to_string),
+            env: string_env(cfg.get("env")),
+        }
     };
     Some(ConfiguredServer {
         name: name.to_string(),
         transport,
+        disabled: false,
     })
 }
 
@@ -228,11 +238,17 @@ fn normalize_codex_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> {
     } else {
         let command = cfg.get("command").and_then(Value::as_str)?.to_string();
         let args = string_args(cfg.get("args"));
-        Transport::Stdio { command, args }
+        Transport::Stdio {
+            command,
+            args,
+            cwd: cfg.get("cwd").and_then(Value::as_str).map(str::to_string),
+            env: string_env(cfg.get("env")),
+        }
     };
     Some(ConfiguredServer {
         name: name.to_string(),
         transport,
+        disabled: false,
     })
 }
 
@@ -249,6 +265,28 @@ fn string_args(value: Option<&Value>) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// Coerce a JSON `env` object into a BTreeMap of strings.
+fn string_env(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract disabled server names from settings.
+fn get_disabled_servers(value: &Value) -> Vec<String> {
+    value
+        .get("disabledMcpjsonServers")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
 fn mcp_servers_block(value: &Value) -> impl Iterator<Item = (&String, &Value)> {
@@ -691,7 +729,7 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// no tools, so it contributes zero context cost.
 fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv) -> McpServerInput {
     let tools = match &server.transport {
-        Transport::Stdio { command, args } => harvest_stdio(command, args, env).ok(),
+        Transport::Stdio { command, args, .. } => harvest_stdio(command, args, env).ok(),
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
@@ -703,6 +741,8 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             transport: Some(server.transport.label().to_string()),
             reachable: true,
             loading_mode: loading_mode.to_string(),
+            disabled: false,
+            
             tools,
         },
         None => McpServerInput {
@@ -710,6 +750,8 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             transport: Some(server.transport.label().to_string()),
             reachable: false,
             loading_mode: loading_mode.to_string(),
+            disabled: false,
+            
             tools: Vec::new(),
         },
     }
@@ -776,6 +818,8 @@ fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServe
         transport: Some(server.transport.label().to_string()),
         reachable: false,
         loading_mode: loading_mode.to_string(),
+            disabled: false,
+            
         tools: Vec::new(),
     }
 }
@@ -1370,6 +1414,8 @@ mod tests {
             &Transport::Stdio {
                 command: "uvx".to_string(),
                 args: vec!["server".to_string(), "--flag".to_string()]
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
             }
         );
         assert_eq!(
@@ -1389,6 +1435,8 @@ mod tests {
             &Transport::Stdio {
                 command: "node".to_string(),
                 args: vec!["mcp.js".to_string()]
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
             }
         );
 
@@ -1454,6 +1502,8 @@ enabled = true
             Transport::Stdio {
                 command: "uvx".to_string(),
                 args: vec!["mcp-server-fetch".to_string()]
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
             }
         );
         assert_eq!(servers[1].name, "remote");
@@ -1491,6 +1541,7 @@ enabled = true
             name: "remote".to_string(),
             transport: Transport::Http {
                 url: "https://remote.test/mcp".to_string(),
+                disabled: false,
             },
         };
         let harvested = harvest_server(&http, "always_on", &test_spawn_env());
@@ -1509,6 +1560,7 @@ enabled = true
             transport: Transport::Stdio {
                 command: "/nonexistent/ottto-mcp-binary-xyz".to_string(),
                 args: Vec::new(),
+                disabled: false,
             },
         };
         let harvested = harvest_server(&server, "on_demand", &test_spawn_env());
@@ -1681,12 +1733,14 @@ enabled = true
                 transport: Transport::Stdio {
                     command: "true".to_string(),
                     args: Vec::new(),
+                    disabled: false,
                 },
             },
             ConfiguredServer {
                 name: "b".to_string(),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
+                    disabled: false,
                 },
             },
         ];
@@ -1703,6 +1757,7 @@ enabled = true
         // harvests them all with no throttle.
         let configured: Vec<ConfiguredServer> = (0..6)
             .map(|i| ConfiguredServer {
+                    disabled: false,
                 name: format!("s{i}"),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
