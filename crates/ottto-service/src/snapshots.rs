@@ -3740,9 +3740,15 @@ pub(crate) fn snapshot_semantic_component_hashes(
         insert(
             "context_posture",
             json!({
+                // `last_turn_context_tokens` is deliberately ABSENT here. This
+                // component is one of POLICY_NEUTRAL_COMPONENTS, so everything
+                // in it feeds `content_hash`. Adding a field would re-mint every
+                // session's content identity fleet-wide, which SNAPSHOT_CONTENT_HASH_EPOCH
+                // reserves for a deliberate, announced epoch move — never a side
+                // effect of shipping a field. The watermark still travels on the
+                // wire as a SnapshotItem field; it just does not define identity.
                 "peak_context_fill_tokens": item.peak_context_fill_tokens,
                 "first_turn_context_tokens": item.first_turn_context_tokens,
-                "last_turn_context_tokens": item.last_turn_context_tokens,
                 "compaction_count": item.compaction_count,
                 "compaction_timestamps": &item.compaction_timestamps,
             }),

@@ -999,6 +999,7 @@ mod tests {
             max_duration_ms: None,
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: Some(100),
+            last_turn_context_tokens: None,
             first_turn_context_tokens: Some(90),
             compaction_count: Some(1),
             compaction_timestamps: vec!["2026-07-19T09:59:00Z".to_string()],
