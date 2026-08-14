@@ -1,0 +1,8 @@
+@@ -347,6 +348,7 @@
+             last_activity_at: last_activity_at.to_string(),
+             first_turn_context_tokens: first_turn,
+             peak_context_fill_tokens: peak,
++            last_turn_context_tokens: last_turn,
+             compaction_count: compactions,
+             cache_read_tokens: cache_read,
+             dominant_model: model.map(str::to_string),

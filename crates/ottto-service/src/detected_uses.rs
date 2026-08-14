@@ -389,6 +389,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
+            last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
             activity_summary: None,
