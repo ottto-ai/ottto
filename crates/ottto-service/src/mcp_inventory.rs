@@ -552,10 +552,6 @@ impl SpawnEnv {
     /// Resolve `command` to an absolute path against the launchd-safe search dirs
     /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
     /// child (so the launched server and its own subprocesses resolve too).
-    fn command(&self, command: &str, args: &[String]) -> Command {
-        self.command_in(command, args, None, &BTreeMap::new())
-    }
-
     /// Spawn a server with the working directory and environment block its own
     /// config declares.
     ///
@@ -1658,7 +1654,12 @@ enabled = true
         // An unresolvable command falls back to the literal name (still spawnable
         // on a machine where it IS on PATH); a resolvable launcher would become an
         // absolute path. We assert the env wiring, which is what fixes the bug.
-        let cmd = env.command("ottto-not-a-real-binary-xyz", &["--list".to_string()]);
+        let cmd = env.command_in(
+            "ottto-not-a-real-binary-xyz",
+            &["--list".to_string()],
+            None,
+            &BTreeMap::new(),
+        );
         assert_eq!(cmd.get_program(), OsStr::new("ottto-not-a-real-binary-xyz"));
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
