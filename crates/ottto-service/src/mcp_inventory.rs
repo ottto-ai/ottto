@@ -340,6 +340,11 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         }
     }
 
+    // Settings files contribute both `mcpServers` and the enable/disable lists.
+    // Collect the disable list across every settings scope Claude Code reads,
+    // including per-project settings, so a server the agent never loads is not
+    // counted as context cost the user is paying.
+    let mut disabled_names: Vec<String> = Vec::new();
     for settings in [
         home.join(".claude").join("settings.json"),
         home.join(".claude").join("settings.local.json"),
@@ -350,6 +355,32 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                     servers.insert(name.clone(), server);
                 }
             }
+            disabled_names.extend(get_disabled_servers(&value));
+        }
+    }
+    if let Some(root) = claude_json.as_ref() {
+        if let Some(projects) = root.get("projects").and_then(Value::as_object) {
+            for project_dir in projects.keys() {
+                for settings in [
+                    Path::new(project_dir).join(".claude").join("settings.json"),
+                    Path::new(project_dir)
+                        .join(".claude")
+                        .join("settings.local.json"),
+                ] {
+                    if let Some(value) = load_json(&settings) {
+                        disabled_names.extend(get_disabled_servers(&value));
+                    }
+                }
+            }
+        }
+    }
+
+    // Carry the disabled state rather than dropping the server: a server the
+    // user can re-enable is information worth reporting. The backend excludes
+    // disabled servers from server_count / tool_count / grand_total_tokens.
+    for name in disabled_names {
+        if let Some(server) = servers.get_mut(&name) {
+            server.disabled = true;
         }
     }
 
@@ -522,6 +553,30 @@ impl SpawnEnv {
     /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
     /// child (so the launched server and its own subprocesses resolve too).
     fn command(&self, command: &str, args: &[String]) -> Command {
+        self.command_in(command, args, None, &BTreeMap::new())
+    }
+
+    /// Spawn a server with the working directory and environment block its own
+    /// config declares.
+    ///
+    /// A server whose config sets `cwd` (and often a matching `env`) resolves
+    /// its entrypoint relative to that directory. Spawning it from the daemon's
+    /// cwd instead makes it fail to start, and the harvest then reports it
+    /// `reachable = false` with zero tools — indistinguishable on the wire from
+    /// a server that genuinely exposes nothing, and the UI turns it into a
+    /// "fix or remove unreachable servers" recommendation for a server that is
+    /// perfectly healthy under Claude Code.
+    ///
+    /// Per-server env is applied AFTER the provider block so a server can set
+    /// its own value for a key the daemon also sets; PATH stays daemon-owned so
+    /// a config cannot redirect which executable is resolved.
+    fn command_in(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        server_env: &BTreeMap<String, String>,
+    ) -> Command {
         let program = crate::command_env::executable_path(command)
             .map(PathBuf::into_os_string)
             .unwrap_or_else(|| OsString::from(command));
@@ -533,6 +588,14 @@ impl SpawnEnv {
         for (key, value) in &self.provider {
             cmd.env(key, value);
         }
+        for (key, value) in server_env {
+            if key != "PATH" {
+                cmd.env(key, value);
+            }
+        }
+        if let Some(dir) = cwd.filter(|dir| Path::new(dir).is_dir()) {
+            cmd.current_dir(dir);
+        }
         cmd
     }
 }
@@ -541,9 +604,15 @@ impl SpawnEnv {
 /// tool definitions. A handshake-thread + channel keeps the bounded wait off
 /// the sync thread; the child is always killed on timeout or error so no
 /// process is leaked.
-fn harvest_stdio(command: &str, args: &[String], env: &SpawnEnv) -> Result<Vec<McpToolInput>> {
+fn harvest_stdio(
+    command: &str,
+    args: &[String],
+    env: &SpawnEnv,
+    cwd: Option<&str>,
+    server_env: &BTreeMap<String, String>,
+) -> Result<Vec<McpToolInput>> {
     let mut child = env
-        .command(command, args)
+        .command_in(command, args, cwd, server_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -729,7 +798,12 @@ fn parse_tools(response: &Value) -> Vec<McpToolInput> {
 /// no tools, so it contributes zero context cost.
 fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv) -> McpServerInput {
     let tools = match &server.transport {
-        Transport::Stdio { command, args, .. } => harvest_stdio(command, args, env).ok(),
+        Transport::Stdio {
+            command,
+            args,
+            cwd,
+            env: server_env,
+        } => harvest_stdio(command, args, env, cwd.as_deref(), server_env).ok(),
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
@@ -1413,7 +1487,7 @@ mod tests {
             by_name["global-stdio"],
             &Transport::Stdio {
                 command: "uvx".to_string(),
-                args: vec!["server".to_string(), "--flag".to_string()]
+                args: vec!["server".to_string(), "--flag".to_string()],
                 cwd: None,
                 env: std::collections::BTreeMap::new(),
             }
@@ -1434,7 +1508,7 @@ mod tests {
             by_name["settings-stdio"],
             &Transport::Stdio {
                 command: "node".to_string(),
-                args: vec!["mcp.js".to_string()]
+                args: vec!["mcp.js".to_string()],
                 cwd: None,
                 env: std::collections::BTreeMap::new(),
             }
@@ -1501,7 +1575,7 @@ enabled = true
             servers[0].transport,
             Transport::Stdio {
                 command: "uvx".to_string(),
-                args: vec!["mcp-server-fetch".to_string()]
+                args: vec!["mcp-server-fetch".to_string()],
                 cwd: None,
                 env: std::collections::BTreeMap::new(),
             }
@@ -1541,8 +1615,8 @@ enabled = true
             name: "remote".to_string(),
             transport: Transport::Http {
                 url: "https://remote.test/mcp".to_string(),
-                disabled: false,
             },
+            disabled: false,
         };
         let harvested = harvest_server(&http, "always_on", &test_spawn_env());
 
@@ -1560,8 +1634,10 @@ enabled = true
             transport: Transport::Stdio {
                 command: "/nonexistent/ottto-mcp-binary-xyz".to_string(),
                 args: Vec::new(),
-                disabled: false,
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
             },
+            disabled: false,
         };
         let harvested = harvest_server(&server, "on_demand", &test_spawn_env());
 
@@ -1600,8 +1676,103 @@ enabled = true
     }
 
     #[test]
-    fn loading_mode_matches_agent_class() {
-        assert_eq!(loading_mode_for(SnapshotSource::ClaudeCode), "on_demand");
+    fn servers_disabled_in_settings_are_marked_disabled() {
+        // A server listed in `disabledMcpjsonServers` is never loaded by Claude
+        // Code, so counting its schema as context the user pays for overstates
+        // the footprint. Observed in production: the ONE server reporting any
+        // tokens at all was disabled for its project, and it contributed 100%
+        // of the published schema total.
+        let home = test_home("disabled-servers");
+        fs::write(
+            home.join(".claude.json"),
+            json!({
+                "mcpServers": {
+                    "kept": {"command": "uvx", "args": ["kept-server"]},
+                    "turned-off": {"command": "uvx", "args": ["off-server"]},
+                }
+            })
+            .to_string(),
+        )
+        .expect("write .claude.json");
+        fs::create_dir_all(home.join(".claude")).expect("create .claude");
+        fs::write(
+            home.join(".claude").join("settings.local.json"),
+            json!({ "disabledMcpjsonServers": ["turned-off"] }).to_string(),
+        )
+        .expect("write settings.local.json");
+
+        let servers = discover_claude_code(&home);
+        let by_name: BTreeMap<&str, bool> = servers
+            .iter()
+            .map(|server| (server.name.as_str(), server.disabled))
+            .collect();
+
+        // Both are still DISCOVERED — a disabled server the user can re-enable
+        // is information, not absence — but only one is marked active.
+        assert_eq!(by_name.get("kept"), Some(&false));
+        assert_eq!(by_name.get("turned-off"), Some(&true));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stdio_spawn_applies_configured_cwd_and_env() {
+        // A server whose config declares `cwd`/`env` resolves its entrypoint
+        // relative to that directory. Spawning it from the daemon's cwd makes
+        // it fail to start and report reachable:false — indistinguishable from
+        // a server that genuinely exposes nothing.
+        use std::ffi::OsStr;
+
+        let dir = test_home("stdio-cwd");
+        let mut server_env = BTreeMap::new();
+        server_env.insert("MCP_TOKEN".to_string(), "from-config".to_string());
+        // PATH stays daemon-owned: a server config must not redirect which
+        // executable gets resolved.
+        server_env.insert("PATH".to_string(), "/attacker/bin".to_string());
+
+        let env = SpawnEnv {
+            path: Some(OsString::from("/opt/homebrew/bin:/usr/bin")),
+            provider: BTreeMap::new(),
+        };
+        let cmd = env.command_in("true", &[], Some(&dir.to_string_lossy()), &server_env);
+
+        assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
+        let envs: BTreeMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("MCP_TOKEN")).copied().flatten(),
+            Some(OsStr::new("from-config"))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("PATH")).copied().flatten(),
+            Some(OsStr::new("/opt/homebrew/bin:/usr/bin")),
+            "server config must not override the daemon-resolved PATH"
+        );
+
+        // A cwd that no longer exists must not make the spawn fail outright —
+        // the server may still start fine from the default directory.
+        let missing = dir.join("gone");
+        let cmd = env.command_in("true", &[], Some(&missing.to_string_lossy()), &BTreeMap::new());
+        assert_eq!(cmd.get_current_dir(), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_code_loading_mode_is_unmeasured_not_assumed() {
+        // Claude Code decides deferral at RUNTIME, per model and per session
+        // (its tool-search gate, with an automatic threshold). A given server
+        // can be loaded in one session and deferred in the next, so no
+        // per-agent constant is correct — the previous "on_demand" stamp was
+        // wrong in both directions.
+        //
+        // It reports `unknown` rather than guessing because `always_on` feeds
+        // reclaimable_tokens and the bloat detector: a fabricated value there
+        // would recommend REMOVING servers on evidence we do not have. The
+        // binding rule is that absence is "not measured" — never zero, unused,
+        // or reclaimable.
+        assert_eq!(loading_mode_for(SnapshotSource::ClaudeCode), "unknown");
+        // Codex loads its configured servers up front, which IS an agent-class
+        // property, so it keeps a constant.
         assert_eq!(loading_mode_for(SnapshotSource::Codex), "always_on");
     }
 
@@ -1648,6 +1819,7 @@ enabled = true
                 server: "fetch".to_string(),
                 transport: Some("stdio".to_string()),
                 reachable: true,
+                disabled: false,
                 loading_mode: "on_demand".to_string(),
                 tools: vec![McpToolInput {
                     name: "fetch".to_string(),
@@ -1733,15 +1905,17 @@ enabled = true
                 transport: Transport::Stdio {
                     command: "true".to_string(),
                     args: Vec::new(),
-                    disabled: false,
+                    cwd: None,
+                    env: std::collections::BTreeMap::new(),
                 },
+                disabled: false,
             },
             ConfiguredServer {
                 name: "b".to_string(),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
-                    disabled: false,
                 },
+                disabled: false,
             },
         ];
         let past = Instant::now() - Duration::from_secs(1);
@@ -1874,7 +2048,13 @@ done
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
 
-        let tools = harvest_stdio(&script.to_string_lossy(), &[], &test_spawn_env())
+        let tools = harvest_stdio(
+            &script.to_string_lossy(),
+            &[],
+            &test_spawn_env(),
+            None,
+            &std::collections::BTreeMap::new(),
+        )
             .expect("handshake succeeds");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
@@ -1893,6 +2073,7 @@ done
                 server: server.to_string(),
                 transport: Some("stdio".to_string()),
                 reachable: true,
+                disabled: false,
                 loading_mode: "on_demand".to_string(),
                 tools: vec![McpToolInput {
                     name: tool.to_string(),
