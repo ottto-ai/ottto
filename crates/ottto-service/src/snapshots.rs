@@ -25034,9 +25034,7 @@ mod tests {
         let path = temp_file("claude-posture-multi-iteration");
         fs::write(
             &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-12T09:00:00Z\",\"sessionId\":\"claude-posture-multi\",\"requestId\":\"req_011MULTI\",\"message\":{\"id\":\"msg_011MULTI\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":210,\"cache_read_input_tokens\":706730,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":120,\"cache_read_input_tokens\":875886,\"cache_creation\":{\"ephemeral_5m_input_tokens\":4000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":3,\"output_tokens\":90,\"cache_read_input_tokens\":706523,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n"
-            ),
+            "{\"timestamp\":\"2026-08-12T09:00:00Z\",\"sessionId\":\"claude-posture-multi\",\"requestId\":\"req_011MULTI\",\"message\":{\"id\":\"msg_011MULTI\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":210,\"cache_read_input_tokens\":706730,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":120,\"cache_read_input_tokens\":875886,\"cache_creation\":{\"ephemeral_5m_input_tokens\":4000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":3,\"output_tokens\":90,\"cache_read_input_tokens\":706523,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n",
         )
         .expect("write fixture");
 
@@ -25074,9 +25072,7 @@ mod tests {
         let path = temp_file("claude-posture-top-level-wins");
         fs::write(
             &path,
-            concat!(
-                "{\"timestamp\":\"2026-08-13T09:00:00Z\",\"sessionId\":\"claude-posture-top-wins\",\"requestId\":\"req_011TOP\",\"message\":{\"id\":\"msg_011TOP\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":6,\"output_tokens\":140,\"cache_read_input_tokens\":102260,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":70,\"cache_read_input_tokens\":80236,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":4,\"output_tokens\":70,\"cache_read_input_tokens\":80218,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n"
-            ),
+            "{\"timestamp\":\"2026-08-13T09:00:00Z\",\"sessionId\":\"claude-posture-top-wins\",\"requestId\":\"req_011TOP\",\"message\":{\"id\":\"msg_011TOP\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":6,\"output_tokens\":140,\"cache_read_input_tokens\":102260,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":70,\"cache_read_input_tokens\":80236,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":4,\"output_tokens\":70,\"cache_read_input_tokens\":80218,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n",
         )
         .expect("write fixture");
 
