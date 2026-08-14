@@ -9990,10 +9990,18 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             });
     }
     if is_current_compaction {
-        let pre_tokens = value.pointer("/compactMetadata/preTokens").and_then(Value::as_u64);
-        let post_tokens = value.pointer("/compactMetadata/postTokens").and_then(Value::as_u64);
-        let cumulative_dropped_tokens = value.pointer("/compactMetadata/cumulativeDroppedTokens").and_then(Value::as_u64);
-        let duration_ms = value.pointer("/compactMetadata/durationMs").and_then(Value::as_u64);
+        let pre_tokens = value
+            .pointer("/compactMetadata/preTokens")
+            .and_then(Value::as_u64);
+        let post_tokens = value
+            .pointer("/compactMetadata/postTokens")
+            .and_then(Value::as_u64);
+        let cumulative_dropped_tokens = value
+            .pointer("/compactMetadata/cumulativeDroppedTokens")
+            .and_then(Value::as_u64);
+        let duration_ms = value
+            .pointer("/compactMetadata/durationMs")
+            .and_then(Value::as_u64);
         accumulator
             .claude_compaction_observations
             .push(ClaudeCompactionObservation {
