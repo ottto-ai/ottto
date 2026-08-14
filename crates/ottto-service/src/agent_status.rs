@@ -910,13 +910,12 @@ fn collect_claude_status(captured_at: String, expires_at: String) -> AgentStatus
                 Ok(stable) => {
                     match require_claude_auth_identity_agreement(&account, &stable.oauth_account) {
                         Ok(()) => {
-                            // Mutually exclusive by plan_type gate (`team` vs `max`).
-                            refined_seat_plan =
-                                refine_claude_team_seat_plan(&mut account, &stable.oauth_account);
-                            refined_max_plan = refine_claude_max_rate_limit_plan(
+                            let refined = refine_claude_local_plan_metadata(
                                 &mut account,
                                 &stable.oauth_account,
                             );
+                            refined_seat_plan = refined.seat_plan;
+                            refined_max_plan = refined.max_plan;
                             // Positive account + organization agreement is required
                             // before local metadata can stamp full-meter identity.
                             stamp_claude_cli_account_identity(&mut account, &stable.oauth_account);
@@ -1618,6 +1617,7 @@ fn resolve_registered_claude_slot(
         return Err(ClaudeSlotProbeFailure::CredentialUnavailable);
     }
     require_claude_auth_identity_agreement(&account, &stable.oauth_account)?;
+    refine_claude_local_plan_metadata(&mut account, &stable.oauth_account);
     let (account_identifier_hash, organization_identifier_hash) =
         claude_strong_oauth_identity_hashes(&stable.oauth_account)
             .ok_or(ClaudeSlotProbeFailure::IdentityUnknown)?;
@@ -7043,6 +7043,38 @@ fn stamp_claude_cli_account_identity(
     true
 }
 
+/// Outcome of the local-metadata plan refinements, one field per rule.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RefinedClaudeLocalPlan {
+    seat_plan: Option<&'static str>,
+    max_plan: Option<&'static str>,
+}
+
+/// Apply every local-metadata plan refinement to a freshly parsed Claude
+/// account.
+///
+/// `claude auth status` reports a bare `team` for every seat tier and a bare
+/// `max` for BOTH Max tiers, so the only disambiguator is the rate-limit /
+/// seat metadata in the slot's own `.claude.json`. Every collector that parses
+/// `claude auth status` must run these refinements, not just the default slot:
+/// a registered (`CLAUDE_CONFIG_DIR`) slot left unrefined ships a bare plan,
+/// and the backend then prices the conservative lower bound — a Max 20x
+/// account reads as Max 5x ($100 instead of $200), a Team Premium seat as
+/// Team Standard ($25 instead of $125).
+///
+/// Callers must have already established identity agreement between `account`
+/// and `oauth`; each rule additionally re-checks identity itself.
+fn refine_claude_local_plan_metadata(
+    account: &mut AgentAccountStatus,
+    oauth: &ClaudeCliOauthAccount,
+) -> RefinedClaudeLocalPlan {
+    // Mutually exclusive by plan_type gate (`team` vs `max`).
+    RefinedClaudeLocalPlan {
+        seat_plan: refine_claude_team_seat_plan(account, oauth),
+        max_plan: refine_claude_max_rate_limit_plan(account, oauth),
+    }
+}
+
 /// Refine a generic Claude `team` plan into `team_premium` / `team_standard`
 /// when the local Claude Code account metadata carries an explicit seat-tier
 /// signal. Mirrors the Claude Max 5x/20x rule: explicit collector evidence
@@ -11327,6 +11359,175 @@ for line in sys.stdin:
         assert_eq!(
             refine_claude_max_rate_limit_plan(&mut account, &oauth),
             None
+        );
+        assert_eq!(account.plan_type.as_deref(), Some("max"));
+        assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
+    }
+
+    #[test]
+    #[serial]
+    fn registered_slot_resolution_refines_max_20x_from_slot_local_metadata() {
+        // End-to-end regression over `resolve_registered_claude_slot` itself,
+        // which is where the refinement used to be missing. The fake
+        // `claude auth status --json` returns the bare `max` the real CLI
+        // returns for BOTH Max tiers; only the slot's own `.claude.json`
+        // carries `default_claude_max_20x`. Asserting on the resolved account
+        // pins the call site, not just the helper: deleting the
+        // `refine_claude_local_plan_metadata` call from the slot path fails
+        // this test while every helper-level test still passes.
+        let root =
+            std::env::temp_dir().join(format!("ottto-claude-slot-max-tier-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let bin = root.join("bin");
+        let slot_dir = root.join("max-20x-slot");
+        fs::create_dir_all(&home).expect("create home");
+        fs::create_dir_all(&bin).expect("create bin");
+        fs::create_dir_all(&slot_dir).expect("create slot dir");
+
+        let claude = bin.join("claude");
+        fs::write(
+            &claude,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "fixture-version"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  exec /usr/bin/python3 - "$CLAUDE_CONFIG_DIR/.claude.json" <<'PY'
+import json, sys
+account = json.load(open(sys.argv[1]))["oauthAccount"]
+# The real CLI collapses Max 5x and Max 20x to a bare `max`.
+print(json.dumps({
+  "status": "authenticated",
+  "email": account["emailAddress"],
+  "organizationId": account["organizationUuid"],
+  "subscriptionType": "max",
+}))
+PY
+fi
+exit 1
+"#,
+        )
+        .expect("write fake claude");
+        let security = bin.join("security");
+        fs::write(&security, "#!/bin/sh\nexit 1\n").expect("write fake security");
+        for executable in [&claude, &security] {
+            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).expect("chmod executable");
+        }
+
+        fs::write(
+            slot_dir.join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "account-max-20x",
+                    "organizationUuid": "organization-max-20x",
+                    "emailAddress": "max20x@example.invalid",
+                    "organizationType": "claude_max",
+                    "organizationRateLimitTier": "default_claude_max_20x"
+                }
+            }))
+            .expect("serialize identity"),
+        )
+        .expect("write slot identity");
+        fs::write(
+            slot_dir.join(".credentials.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "claudeAiOauth": {"accessToken": "fixture"}
+            }))
+            .expect("serialize credential"),
+        )
+        .expect("write slot credential");
+
+        let _home_guard = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
+        let _command_guard =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
+
+        let descriptor = ClaudeConfigDirSlot::registered(slot_dir.to_string_lossy().to_string())
+            .expect("registered slot")
+            .descriptor(
+                "claude_slot_max_20x".to_string(),
+                ClaudeConfigSlotOwnership::External,
+            );
+        let resolved = resolve_registered_claude_slot(descriptor).expect("resolve slot");
+
+        assert_eq!(resolved.account.plan_type.as_deref(), Some("max_20x"));
+        assert_eq!(
+            resolved.account.subscription_product.as_deref(),
+            Some("claude_max_20x")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_claude_local_plan_metadata_resolves_max_20x_for_a_registered_slot() {
+        // Regression: a registered (`CLAUDE_CONFIG_DIR`) slot used to skip the
+        // refinements the default slot applied, so a Max 20x account in an
+        // external slot shipped a bare `max` and the backend priced it as the
+        // conservative Max 5x lower bound ($100 instead of $200). This is the
+        // exact on-disk shape of such a slot: bare `max` from
+        // `claude auth status --json`, 20x only in the slot's `.claude.json`.
+        let mut account = max_auth_account("user@example.com");
+        assert_eq!(account.plan_type.as_deref(), Some("max"));
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            organization_type: Some("claude_max".to_string()),
+            organization_rate_limit_tier: Some("default_claude_max_20x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        let refined = refine_claude_local_plan_metadata(&mut account, &oauth);
+
+        assert_eq!(refined.max_plan, Some("max_20x"));
+        assert_eq!(refined.seat_plan, None);
+        assert_eq!(account.plan_type.as_deref(), Some("max_20x"));
+        assert_eq!(
+            account.subscription_product.as_deref(),
+            Some("claude_max_20x")
+        );
+    }
+
+    #[test]
+    fn refine_claude_local_plan_metadata_resolves_team_premium_for_a_registered_slot() {
+        // Same gap, the Team seat half: an external-slot Premium seat used to
+        // ship a bare `team` and price as Standard ($25 instead of $125).
+        let mut account = team_auth_account("user@example.com", "org-1");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            organization_type: Some("claude_team".to_string()),
+            seat_tier: Some("team_tier_1".to_string()),
+            user_rate_limit_tier: Some("default_claude_max_5x".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        let refined = refine_claude_local_plan_metadata(&mut account, &oauth);
+
+        assert_eq!(refined.seat_plan, Some("team_premium"));
+        assert_eq!(refined.max_plan, None);
+        assert_eq!(account.plan_type.as_deref(), Some("team_premium"));
+        assert_eq!(
+            account.subscription_product.as_deref(),
+            Some("claude_team_premium")
+        );
+    }
+
+    #[test]
+    fn refine_claude_local_plan_metadata_leaves_a_bare_plan_untouched() {
+        // No explicit signal stays no refinement, through the shared helper
+        // too: the backend's conservative pricing depends on never guessing.
+        let mut account = max_auth_account("user@example.com");
+        let oauth = ClaudeCliOauthAccount {
+            email_address: Some("user@example.com".to_string()),
+            organization_type: Some("claude_max".to_string()),
+            ..ClaudeCliOauthAccount::default()
+        };
+
+        assert_eq!(
+            refine_claude_local_plan_metadata(&mut account, &oauth),
+            RefinedClaudeLocalPlan::default()
         );
         assert_eq!(account.plan_type.as_deref(), Some("max"));
         assert_eq!(account.subscription_product.as_deref(), Some("claude_max"));
