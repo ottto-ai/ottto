@@ -409,7 +409,7 @@ mod tests {
             Some(100),
             Some(200),
             None,
-                Some(3),
+            Some(3),
             50,
             None,
         )];
@@ -567,7 +567,7 @@ mod tests {
             Some(50_000),
             Some(60_000),
             None,
-                None,
+            None,
             0,
             None,
         )];
@@ -576,15 +576,15 @@ mod tests {
 
         // But an observed zero IS zero.
         let rows = vec![row(
-                "a",
-                "2026-07-11T09:00:00Z",
-                Some(50_000),
-                Some(60_000),
-                None,
-                Some(0),
-                0,
-                None,
-            )];
+            "a",
+            "2026-07-11T09:00:00Z",
+            Some(50_000),
+            Some(60_000),
+            None,
+            Some(0),
+            0,
+            None,
+        )];
         let summary = summarize_context_posture(&rows, now).expect("summary");
         assert_eq!(summary.compaction_count, Some(0));
     }
@@ -632,15 +632,15 @@ mod tests {
         let now = test_now();
         assert_eq!(summarize_context_posture(&[], now), None);
         let rows = vec![row(
-                "old",
-                "2026-06-01T09:00:00Z",
-                Some(1),
-                Some(1),
-                None,
-                Some(0),
-                0,
-                None,
-            )];
+            "old",
+            "2026-06-01T09:00:00Z",
+            Some(1),
+            Some(1),
+            None,
+            Some(0),
+            0,
+            None,
+        )];
         assert_eq!(summarize_context_posture(&rows, now), None);
     }
 
