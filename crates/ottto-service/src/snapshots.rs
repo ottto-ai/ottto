@@ -3795,12 +3795,17 @@ pub(crate) fn snapshot_semantic_component_hashes(
                 // wire as a SnapshotItem field; it just does not define identity.
                 "peak_context_fill_tokens": item.peak_context_fill_tokens,
                 "first_turn_context_tokens": item.first_turn_context_tokens,
+                // The compaction NUMERICS are deliberately absent here. This
+                // component is one of POLICY_NEUTRAL_COMPONENTS, so every field
+                // in it feeds `content_hash`; adding one re-mints every
+                // session's content identity fleet-wide, which
+                // SNAPSHOT_CONTENT_HASH_EPOCH reserves for a deliberate,
+                // announced epoch move — never a side effect of shipping a
+                // field. They travel on the wire as SnapshotItem fields
+                // instead. `context_posture_component_fields_are_pinned` guards
+                // this.
                 "compaction_count": item.compaction_count,
                 "compaction_timestamps": &item.compaction_timestamps,
-                "compaction_total_pre_tokens": item.compaction_total_pre_tokens,
-                "compaction_total_post_tokens": item.compaction_total_post_tokens,
-                "compaction_total_cumulative_dropped_tokens": item.compaction_total_cumulative_dropped_tokens,
-                "compaction_total_duration_ms": item.compaction_total_duration_ms,
             }),
         );
     }
@@ -25521,6 +25526,45 @@ mod tests {
     }
 
     #[test]
+    /// Pins the `context_posture` semantic-envelope component.
+    ///
+    /// This component is one of `POLICY_NEUTRAL_COMPONENTS`, so `content_hash`
+    /// is computed over everything in it. Adding a field therefore re-mints
+    /// every session's content identity fleet-wide — which
+    /// `SNAPSHOT_CONTENT_HASH_EPOCH` reserves for a deliberate, announced epoch
+    /// move, never a side effect of shipping a field.
+    ///
+    /// That is easy to do by accident: a new watermark or metric naturally
+    /// "belongs" next to the posture fields, and nothing at the call site says
+    /// otherwise. It has already happened twice.
+    ///
+    /// If this test fails you are changing identity. Either carry the value as
+    /// a plain `SnapshotItem` wire field — which is what almost every new
+    /// signal actually wants, and costs nothing here — or move the epoch on
+    /// purpose and re-pin this hash in the same change.
+    #[test]
+    fn context_posture_component_is_pinned_against_accidental_identity_churn() {
+        let mut item = valid_v6_batch_request()
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("fixture snapshot");
+        item.peak_context_fill_tokens = Some(977_698);
+        item.first_turn_context_tokens = Some(84_043);
+        item.compaction_count = Some(3);
+        item.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
+
+        let hashes = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
+        assert_eq!(
+            hashes
+                .get("context_posture")
+                .map(String::as_str)
+                .expect("claude sessions carry a context_posture component"),
+            "e69a7dbf291f50c62e8298740c57e812d30ea41fadb888fb4d7cb438f699da0d",
+            "context_posture feeds content_hash; read this test's docs before re-pinning"
+        );
+    }
+
     fn context_posture_fields_change_snapshot_fingerprint() {
         // The posture fields are part of the fingerprint payload on purpose
         // (same one-time backfill rationale as `origin`): a daemon that starts
