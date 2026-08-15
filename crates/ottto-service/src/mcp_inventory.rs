@@ -86,13 +86,9 @@ enum Transport {
         env: BTreeMap<String, String>,
     },
     /// Streamable HTTP transport. Not yet harvested (see module docs).
-    Http {
-        url: String,
-    },
+    Http { url: String },
     /// Legacy SSE transport. Not yet harvested (see module docs).
-    Sse {
-        url: String,
-    },
+    Sse { url: String },
 }
 
 impl Transport {
@@ -283,10 +279,13 @@ fn get_disabled_servers(value: &Value) -> Vec<String> {
     value
         .get("disabledMcpjsonServers")
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
-
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
 fn mcp_servers_block(value: &Value) -> impl Iterator<Item = (&String, &Value)> {
@@ -812,7 +811,7 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             reachable: true,
             loading_mode: loading_mode.to_string(),
             disabled: false,
-            
+
             tools,
         },
         None => McpServerInput {
@@ -821,7 +820,7 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             reachable: false,
             loading_mode: loading_mode.to_string(),
             disabled: false,
-            
+
             tools: Vec::new(),
         },
     }
@@ -888,8 +887,8 @@ fn unreachable_server(server: &ConfiguredServer, loading_mode: &str) -> McpServe
         transport: Some(server.transport.label().to_string()),
         reachable: false,
         loading_mode: loading_mode.to_string(),
-            disabled: false,
-            
+        disabled: false,
+
         tools: Vec::new(),
     }
 }
@@ -1752,7 +1751,12 @@ enabled = true
         // A cwd that no longer exists must not make the spawn fail outright —
         // the server may still start fine from the default directory.
         let missing = dir.join("gone");
-        let cmd = env.command_in("true", &[], Some(&missing.to_string_lossy()), &BTreeMap::new());
+        let cmd = env.command_in(
+            "true",
+            &[],
+            Some(&missing.to_string_lossy()),
+            &BTreeMap::new(),
+        );
         assert_eq!(cmd.get_current_dir(), None);
 
         let _ = fs::remove_dir_all(&dir);
@@ -1932,7 +1936,7 @@ enabled = true
         // harvests them all with no throttle.
         let configured: Vec<ConfiguredServer> = (0..6)
             .map(|i| ConfiguredServer {
-                    disabled: false,
+                disabled: false,
                 name: format!("s{i}"),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
@@ -2056,7 +2060,7 @@ done
             None,
             &std::collections::BTreeMap::new(),
         )
-            .expect("handshake succeeds");
+        .expect("handshake succeeds");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         assert_eq!(tools[0].description, "Echo input");
