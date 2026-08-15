@@ -762,6 +762,8 @@ pub struct SnapshotItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_turn_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<String>,
@@ -3738,6 +3740,13 @@ pub(crate) fn snapshot_semantic_component_hashes(
         insert(
             "context_posture",
             json!({
+                // `last_turn_context_tokens` is deliberately ABSENT here. This
+                // component is one of POLICY_NEUTRAL_COMPONENTS, so everything
+                // in it feeds `content_hash`. Adding a field would re-mint every
+                // session's content identity fleet-wide, which SNAPSHOT_CONTENT_HASH_EPOCH
+                // reserves for a deliberate, announced epoch move — never a side
+                // effect of shipping a field. The watermark still travels on the
+                // wire as a SnapshotItem field; it just does not define identity.
                 "peak_context_fill_tokens": item.peak_context_fill_tokens,
                 "first_turn_context_tokens": item.first_turn_context_tokens,
                 "compaction_count": item.compaction_count,
@@ -5371,6 +5380,7 @@ struct SnapshotAccumulator {
     // and emits None.
     peak_context_fill_tokens: u64,
     first_turn_context_tokens: Option<u64>,
+    last_turn_context_tokens: Option<u64>,
     compaction_count: u64,
     compaction_timestamps: Vec<String>,
     claude_compaction_observations: Vec<ClaudeCompactionObservation>,
@@ -5455,6 +5465,7 @@ impl SnapshotAccumulator {
             claude_last_user_ts: None,
             peak_context_fill_tokens: 0,
             first_turn_context_tokens: None,
+            last_turn_context_tokens: None,
             compaction_count: 0,
             compaction_timestamps: Vec::new(),
             claude_compaction_observations: Vec::new(),
@@ -5976,6 +5987,7 @@ impl SnapshotAccumulator {
                 }
                 self.peak_context_fill_tokens =
                     self.peak_context_fill_tokens.max(effective_input_context);
+                self.last_turn_context_tokens = Some(effective_input_context);
             }
             self.add_usage_with_selector(
                 response.model,
@@ -6574,6 +6586,11 @@ impl SnapshotAccumulator {
                 .then_some(self.peak_context_fill_tokens),
             first_turn_context_tokens: if self.source.derives_context_posture() {
                 self.first_turn_context_tokens
+            } else {
+                None
+            },
+            last_turn_context_tokens: if self.source.derives_context_posture() {
+                self.last_turn_context_tokens
             } else {
                 None
             },
@@ -7932,6 +7949,7 @@ fn codex_state_only_snapshot(
         max_time_to_first_token_ms: None,
         peak_context_fill_tokens: None,
         first_turn_context_tokens: None,
+        last_turn_context_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
         activity_summary: None,
@@ -9434,6 +9452,7 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             }
             accumulator.peak_context_fill_tokens =
                 accumulator.peak_context_fill_tokens.max(context_tokens);
+            accumulator.last_turn_context_tokens = Some(context_tokens);
         }
     }
     if let Some(usage) = codex_total_usage(value) {
@@ -19763,6 +19782,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: None,
             first_turn_context_tokens: None,
+            last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
             activity_summary: None,
@@ -29245,6 +29265,7 @@ mod tests {
             max_time_to_first_token_ms: None,
             peak_context_fill_tokens: Some(115),
             first_turn_context_tokens: Some(105),
+            last_turn_context_tokens: None,
             compaction_count: Some(0),
             compaction_timestamps: Vec::new(),
             activity_summary: Some(SnapshotActivitySummary {
@@ -29531,6 +29552,7 @@ mod tests {
                 max_time_to_first_token_ms: None,
                 peak_context_fill_tokens: None,
                 first_turn_context_tokens: None,
+                last_turn_context_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
                 activity_summary: None,

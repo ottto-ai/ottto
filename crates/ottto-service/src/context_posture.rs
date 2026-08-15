@@ -64,6 +64,8 @@ pub struct ContextPostureCacheRow {
     pub peak_context_fill_tokens: Option<u64>,
     /// `Some(0)` = observed, none happened; `None` = no compaction evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_count: Option<u64>,
     /// Session-total cache-read tokens: the measured re-read volume.
     #[serde(default)]
@@ -157,6 +159,7 @@ fn cache_row_from_snapshot(item: &SnapshotItem) -> Option<ContextPostureCacheRow
         last_activity_at,
         first_turn_context_tokens: item.first_turn_context_tokens,
         peak_context_fill_tokens: item.peak_context_fill_tokens,
+        last_turn_context_tokens: item.last_turn_context_tokens,
         compaction_count: item.compaction_count,
         cache_read_tokens: item.cache_read_tokens,
         dominant_model: dominant_model(item),
@@ -332,11 +335,16 @@ mod tests {
         OffsetDateTime::parse("2026-07-12T12:00:00Z", &Rfc3339).unwrap()
     }
 
+    // Eight parameters is one over clippy's threshold, but this is a test-only
+    // constructor mirroring ContextPostureCacheRow field-for-field; grouping
+    // them into a struct would just restate the type it builds.
+    #[allow(clippy::too_many_arguments)]
     fn row(
         session_id: &str,
         last_activity_at: &str,
         first_turn: Option<u64>,
         peak: Option<u64>,
+        last_turn: Option<u64>,
         compactions: Option<u64>,
         cache_read: u64,
         model: Option<&str>,
@@ -346,6 +354,7 @@ mod tests {
             last_activity_at: last_activity_at.to_string(),
             first_turn_context_tokens: first_turn,
             peak_context_fill_tokens: peak,
+            last_turn_context_tokens: last_turn,
             compaction_count: compactions,
             cache_read_tokens: cache_read,
             dominant_model: model.map(str::to_string),
@@ -368,6 +377,7 @@ mod tests {
                 "2026-07-10T09:00:00Z",
                 Some(10),
                 Some(20),
+                None,
                 Some(0),
                 5,
                 None,
@@ -377,6 +387,7 @@ mod tests {
                 "2026-06-01T09:00:00Z",
                 Some(10),
                 Some(20),
+                None,
                 Some(0),
                 5,
                 None,
@@ -386,6 +397,7 @@ mod tests {
                 "2026-07-11T09:00:00Z",
                 Some(1),
                 Some(2),
+                None,
                 Some(0),
                 1,
                 None,
@@ -396,6 +408,7 @@ mod tests {
             "2026-07-12T09:00:00Z",
             Some(100),
             Some(200),
+            None,
             Some(3),
             50,
             None,
@@ -417,6 +430,7 @@ mod tests {
                 "not-a-time",
                 Some(1),
                 Some(1),
+                None,
                 Some(0),
                 0,
                 None,
@@ -437,6 +451,7 @@ mod tests {
                 "2026-07-01T09:00:00Z",
                 Some(999_999),
                 Some(999_999),
+                None,
                 Some(9),
                 999,
                 None,
@@ -447,6 +462,7 @@ mod tests {
                 "2026-07-08T09:00:00Z",
                 Some(50_000),
                 Some(60_000),
+                None,
                 Some(0),
                 1_000,
                 Some("claude-sonnet-4-5"),
@@ -457,6 +473,7 @@ mod tests {
                 "2026-07-10T09:00:00Z",
                 Some(70_000),
                 Some(250_000),
+                None,
                 Some(2),
                 2_000,
                 Some("claude-sonnet-4-5"),
@@ -467,6 +484,7 @@ mod tests {
                 "2026-07-11T09:00:00Z",
                 Some(90_000),
                 Some(400_000),
+                None,
                 Some(1),
                 3_000,
                 Some("claude-opus-4-8[1m]"),
@@ -516,6 +534,7 @@ mod tests {
                 "2026-07-10T09:00:00Z",
                 Some(70_000),
                 Some(400_000),
+                None,
                 Some(0),
                 0,
                 Some("claude-sonnet-4-5"),
@@ -525,6 +544,7 @@ mod tests {
                 "2026-07-11T09:00:00Z",
                 Some(90_000),
                 Some(1_100_000),
+                None,
                 Some(0),
                 0,
                 Some("claude-opus-4-8"),
@@ -547,6 +567,7 @@ mod tests {
             Some(50_000),
             Some(60_000),
             None,
+            None,
             0,
             None,
         )];
@@ -559,6 +580,7 @@ mod tests {
             "2026-07-11T09:00:00Z",
             Some(50_000),
             Some(60_000),
+            None,
             Some(0),
             0,
             None,
@@ -577,6 +599,7 @@ mod tests {
                     &format!("2026-07-11T09:{i:02}:00Z"),
                     Some(10_000),
                     Some(2_000 * (i as u64 + 1)),
+                    None,
                     Some(0),
                     0,
                     Some("claude-sonnet-4-5"),
@@ -613,6 +636,7 @@ mod tests {
             "2026-06-01T09:00:00Z",
             Some(1),
             Some(1),
+            None,
             Some(0),
             0,
             None,
@@ -687,6 +711,7 @@ mod tests {
             max_duration_ms: None,
             max_time_to_first_token_ms: None,
             first_turn_context_tokens: posture.0,
+            last_turn_context_tokens: None,
             peak_context_fill_tokens: posture.1,
             compaction_count: posture.2,
             compaction_timestamps: Vec::new(),
@@ -753,6 +778,7 @@ mod tests {
                 "2026-07-11T09:00:00Z",
                 Some(72_000),
                 Some(150_000),
+                None,
                 Some(1),
                 9_000,
                 Some("claude-sonnet-4-5"),
