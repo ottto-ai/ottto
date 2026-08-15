@@ -1003,6 +1003,10 @@ mod tests {
             first_turn_context_tokens: Some(90),
             compaction_count: Some(1),
             compaction_timestamps: vec!["2026-07-19T09:59:00Z".to_string()],
+            compaction_total_pre_tokens: None,
+            compaction_total_post_tokens: None,
+            compaction_total_cumulative_dropped_tokens: None,
+            compaction_total_duration_ms: None,
             activity_summary: None,
             model_usage: vec![model_usage.clone()],
             usage_buckets: vec![crate::snapshots::SnapshotUsageBucket {
