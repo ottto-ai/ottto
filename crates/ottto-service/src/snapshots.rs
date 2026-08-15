@@ -243,10 +243,15 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // files still converge through the semantic no-op path after the new summary
 // has been uploaded.
 pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v29";
+// v27 adds claude_code_effective_input_context() reconciliation against
+// usage.iterations[] to fix resumed-session first-turn baseline (all-zero
+// top-level fields while iterations carry real prompt), and multi-iteration
+// responses where the largest prompt is an iteration not the top level.
+// Every snapshot rescans to apply the watermark fix retroactively.
 // v26 deliberately revisits Claude history so every snapshot clears the old
 // safety state and future-captured, trace-owned occurrence unions can mint the
 // reported-usage contract. Historical v31 sidecars remain unproven.
-pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v26";
+pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v27";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
 const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
@@ -4420,6 +4425,7 @@ struct ClaudeResponseObservation {
     first_timestamp: Option<String>,
     terminal_timestamp: Option<String>,
     preceding_user_timestamp: Option<String>,
+    computed_effective_input_context: Option<u64>,
     conflict: bool,
 }
 
@@ -4444,6 +4450,7 @@ impl ClaudeResponseObservation {
         request_id: Option<String>,
         timestamp: Option<String>,
         preceding_user_timestamp: Option<String>,
+        computed_effective_input_context: Option<u64>,
     ) -> Self {
         Self {
             sequence,
@@ -4455,6 +4462,7 @@ impl ClaudeResponseObservation {
             first_timestamp: timestamp.clone(),
             terminal_timestamp: timestamp,
             preceding_user_timestamp,
+            computed_effective_input_context,
             conflict: false,
         }
     }
@@ -5885,6 +5893,7 @@ impl SnapshotAccumulator {
         selector: SelectorCapture,
         timestamp: Option<String>,
         reasoning_effort: Option<String>,
+        computed_effective_input_context: Option<u64>,
     ) {
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
@@ -5922,6 +5931,7 @@ impl SnapshotAccumulator {
                 request_id,
                 timestamp,
                 self.claude_last_user_ts.clone(),
+                computed_effective_input_context,
             ),
         );
     }
@@ -5957,7 +5967,9 @@ impl SnapshotAccumulator {
                 response.preceding_user_timestamp.as_deref(),
                 response.first_timestamp.as_deref(),
             );
-            let effective_input_context = response.usage.effective_input_context();
+            let effective_input_context = response
+                .computed_effective_input_context
+                .unwrap_or_else(|| response.usage.effective_input_context());
             if effective_input_context > 0 {
                 if self.first_turn_context_tokens.is_none() {
                     self.first_turn_context_tokens = Some(effective_input_context);
@@ -9915,7 +9927,11 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // increase cumulative output and may add selectors late; neither the first
     // nor an arbitrary line is an authoritative complete response.
     if let Some(usage) = claude_code_delta_usage(value) {
-        let effective_input_context = usage.effective_input_context();
+        // Reconciled against `usage.iterations[]`: on a resumed session's first
+        // response the top-level prompt fields read all-zero while the real
+        // prompt sits in the iterations, and the small non-zero remainder would
+        // otherwise be accepted as this session's baseline.
+        let effective_input_context = claude_code_effective_input_context(value, &usage);
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -9965,6 +9981,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             selector,
             timestamp,
             reasoning_effort,
+            Some(effective_input_context),
         );
     }
     // Artifact scraping clones and tokenizes every tool-result blob on the
@@ -10835,11 +10852,15 @@ fn claude_code_usage_dedup_key(value: &Value) -> Option<String> {
     }
 }
 
-fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
-    let root = value
+fn claude_code_usage_root(value: &Value) -> Option<&Value> {
+    value
         .pointer("/message/usage")
         .or_else(|| value.pointer("/usage"))
-        .or_else(|| value.pointer("/payload/usage"))?;
+        .or_else(|| value.pointer("/payload/usage"))
+}
+
+fn claude_code_delta_usage(value: &Value) -> Option<UsageTotals> {
+    let root = claude_code_usage_root(value)?;
     if !usage_object_has_numeric_field(
         root,
         &[
@@ -10908,6 +10929,65 @@ fn claude_code_cache_creation_split(root: &Value) -> (u64, u64) {
         .or_else(|| u64_at(root, &["cache_creation_tokens"]))
         .unwrap_or_default();
     (flat, 0)
+}
+
+/// This response's effective input context — the largest single prompt the model
+/// saw — reconciled against `usage.iterations[]`.
+///
+/// Claude Code now writes an `iterations[]` array on nearly every assistant
+/// record (103,579 of 104,020 in the 2026-08-14 local corpus), one entry per API
+/// call made while producing the response. The top-level fields normally restate
+/// that call's usage and agree with it, so this reads through as a no-op. Two
+/// observed shapes disagree:
+///
+///   * a resumed session's first response reports all-zero top-level prompt
+///     fields while `iterations[0]` carries the real prompt. `cache_creation`
+///     still states the write, so the top-level formula returns a small POSITIVE
+///     value (1,684 against a true 896,597) — positive enough to be accepted as
+///     the session's first-turn baseline, 532x too low.
+///   * a multi-iteration response, where the top level tracks only one of the
+///     calls (observed: the last) and the largest prompt is another iteration.
+///
+/// Rare but concentrated: re-parsing the whole local corpus moves 5 of 616
+/// sessions, and every one of them is a ~900K-1M context session — the sessions
+/// a context-pressure product exists to describe.
+///
+/// Take the MAX, never the sum: each iteration is its own API call with its own
+/// prompt, so the watermark these values feed (`first_turn_context_tokens`,
+/// `peak_context_fill_tokens`, and the 1M-window `context_bucket` threshold)
+/// models one prompt. One local response iterates prompts of 879,891 and
+/// 708,526; summing would post 1,588,417 for a response whose largest prompt was
+/// 879,891 — past the model window. Maxing against the top level rather than
+/// replacing it also keeps the reverse case honest: another local record reports
+/// 104,266 top-level over iterations of 82,241 and 82,222, and the larger figure
+/// is the one to keep.
+///
+/// Billing is deliberately untouched: `claude_code_delta_usage` still totals the
+/// top-level fields, which are the aggregate the cost path is priced from.
+fn claude_code_effective_input_context(value: &Value, usage: &UsageTotals) -> u64 {
+    let top_level = usage.effective_input_context();
+    let Some(iterations) = claude_code_usage_root(value)
+        .and_then(|root| root.get("iterations"))
+        .and_then(Value::as_array)
+    else {
+        return top_level;
+    };
+    iterations
+        .iter()
+        .map(|iteration| {
+            let (cache_5m, cache_1h) = claude_code_cache_creation_split(iteration);
+            u64_at(iteration, &["input_tokens"])
+                .or_else(|| u64_at(iteration, &["inputTokens"]))
+                .unwrap_or_default()
+                .saturating_add(
+                    u64_at(iteration, &["cache_read_input_tokens"])
+                        .or_else(|| u64_at(iteration, &["cache_read_tokens"]))
+                        .unwrap_or_default(),
+                )
+                .saturating_add(cache_5m)
+                .saturating_add(cache_1h)
+        })
+        .fold(top_level, u64::max)
 }
 
 #[derive(Debug, Clone)]
@@ -24888,6 +24968,127 @@ mod tests {
         assert_eq!(item.compaction_count, Some(0));
         // Dedup really gated the duplicate peak records (4 counted responses).
         assert_eq!(item.request_count, 4);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_context_posture_reads_iterations_when_top_level_is_zero() {
+        // Verbatim first assistant record of resumed session
+        // d0d65dac-58ed-4efc-98a9-26a455bc2a5f (line 8 of its transcript), the
+        // shape that produced a 532x-low baseline. Every top-level prompt field
+        // is zero, but `cache_creation.ephemeral_1h_input_tokens` is 1,684 — so
+        // the top-level formula returns 1,684, which is POSITIVE and therefore
+        // was accepted as the session's first-turn baseline. The prompt the
+        // model actually saw is in `iterations[0]`: 2 + 894,911 + 1,684.
+        let path = temp_file("claude-posture-iterations-zero-top-level");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-11T09:00:00Z\",\"sessionId\":\"d0d65dac-58ed-4efc-98a9-26a455bc2a5f\",\"requestId\":\"req_011ZERO\",\"message\":{\"id\":\"msg_011ZERO\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"cache_creation\":{\"ephemeral_1h_input_tokens\":1684,\"ephemeral_5m_input_tokens\":0},\"iterations\":[{\"input_tokens\":2,\"output_tokens\":312,\"cache_read_input_tokens\":894911,\"cache_creation_input_tokens\":1684,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":1684},\"type\":\"message\"}]}}}\n",
+                // A later, smaller healthy turn: the peak must stay on the
+                // iterations-derived value above, not fall to this one.
+                "{\"timestamp\":\"2026-08-11T09:01:00Z\",\"sessionId\":\"d0d65dac-58ed-4efc-98a9-26a455bc2a5f\",\"requestId\":\"req_011NEXT\",\"message\":{\"id\":\"msg_011NEXT\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":4,\"output_tokens\":90,\"cache_read_input_tokens\":900000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000},\"iterations\":[{\"input_tokens\":4,\"output_tokens\":90,\"cache_read_input_tokens\":900000,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":2000},\"type\":\"message\"}]}}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-11T09:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.first_turn_context_tokens, Some(896_597));
+        // The exact figure this session used to report.
+        assert_ne!(item.first_turn_context_tokens, Some(1_684));
+        assert_eq!(item.peak_context_fill_tokens, Some(902_004));
+
+        // Billing is read from the top-level fields only and must be untouched
+        // by the reconciliation above: the zeroed record contributes its 1,684
+        // cache write and nothing else, NOT the 894,911 cache read that only
+        // `iterations[]` states.
+        assert_eq!(item.input_tokens, 4);
+        assert_eq!(item.cache_read_tokens, 900_000);
+        assert_eq!(item.cache_creation_1h_tokens, 3_684);
+        assert_eq!(item.output_tokens, 90);
+        assert_eq!(item.request_count, 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_context_posture_takes_max_iteration_not_the_sum() {
+        // A response spanning several API calls carries one `iterations[]` entry
+        // per call, each with its own prompt. Figures are the real ones from
+        // session 2418d953: top level 708,733 (it tracks only one of the calls),
+        // iterations of 879,891 and 708,526.
+        //
+        // The watermark models ONE prompt, so the answer is the largest
+        // iteration. Summing would post 1,588,417 — past the 1M window for a
+        // response whose biggest prompt was 879,891.
+        let path = temp_file("claude-posture-multi-iteration");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-12T09:00:00Z\",\"sessionId\":\"claude-posture-multi\",\"requestId\":\"req_011MULTI\",\"message\":{\"id\":\"msg_011MULTI\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":210,\"cache_read_input_tokens\":706730,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":120,\"cache_read_input_tokens\":875886,\"cache_creation\":{\"ephemeral_5m_input_tokens\":4000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":3,\"output_tokens\":90,\"cache_read_input_tokens\":706523,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n",
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-12T09:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.first_turn_context_tokens, Some(879_891));
+        assert_eq!(item.peak_context_fill_tokens, Some(879_891));
+        // Neither the sum of the iterations nor the top-level-only figure.
+        assert_ne!(item.peak_context_fill_tokens, Some(1_588_417));
+        assert_ne!(item.peak_context_fill_tokens, Some(708_733));
+
+        // One API response, so billing counts the top level once.
+        assert_eq!(item.input_tokens, 3);
+        assert_eq!(item.cache_read_tokens, 706_730);
+        assert_eq!(item.cache_creation_5m_tokens, 2_000);
+        assert_eq!(item.request_count, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_code_context_posture_keeps_the_larger_top_level_over_iterations() {
+        // The reverse disagreement, also real (session 58e9c6bc): the top level
+        // reports 104,266 while the two iterations report 82,241 and 82,222. The
+        // reconciliation is a MAX against the top level, not a replacement of
+        // it, so the larger top-level figure survives.
+        let path = temp_file("claude-posture-top-level-wins");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-13T09:00:00Z\",\"sessionId\":\"claude-posture-top-wins\",\"requestId\":\"req_011TOP\",\"message\":{\"id\":\"msg_011TOP\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":6,\"output_tokens\":140,\"cache_read_input_tokens\":102260,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"iterations\":[{\"input_tokens\":5,\"output_tokens\":70,\"cache_read_input_tokens\":80236,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"},{\"input_tokens\":4,\"output_tokens\":70,\"cache_read_input_tokens\":80218,\"cache_creation\":{\"ephemeral_5m_input_tokens\":2000,\"ephemeral_1h_input_tokens\":0},\"type\":\"message\"}]}}}\n",
+        )
+        .expect("write fixture");
+
+        let item = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-13T09:05:00Z",
+            "file-fingerprint".to_string(),
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        assert_eq!(item.first_turn_context_tokens, Some(104_266));
+        assert_eq!(item.peak_context_fill_tokens, Some(104_266));
+        assert_ne!(item.peak_context_fill_tokens, Some(82_241));
 
         let _ = fs::remove_file(path);
     }
