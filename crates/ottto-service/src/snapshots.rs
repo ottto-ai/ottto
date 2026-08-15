@@ -25525,7 +25525,6 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    #[test]
     /// Pins the `context_posture` semantic-envelope component.
     ///
     /// This component is one of `POLICY_NEUTRAL_COMPONENTS`, so `content_hash`
@@ -25565,6 +25564,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn context_posture_fields_change_snapshot_fingerprint() {
         // The posture fields are part of the fingerprint payload on purpose
         // (same one-time backfill rationale as `origin`): a daemon that starts
