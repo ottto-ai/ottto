@@ -754,8 +754,14 @@ pub struct ActiveSession {
     /// additive so provider semantics can evolve without breaking old apps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_token_scope: Option<String>,
-    /// Content-free role used only for a truthful fallback title, e.g.
-    /// `subagent` or `automation`, when no provider title exists.
+    /// Content-free role used only for a truthful fallback title, when no
+    /// provider title exists: `subagent`, `automation`, or `headless`.
+    ///
+    /// `headless` says only that the provider recorded a non-interactive entry
+    /// point for this run. It does not claim a parent, an agent, or a finished
+    /// run, and a person can produce it by typing `codex exec` themselves. Apps
+    /// must word it that way and must never read it as a relationship. Values
+    /// are additive; treat an unknown one as no role rather than failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>,
     /// Canonical provider client that ran the session, when direct transcript

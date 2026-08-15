@@ -191,7 +191,13 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // inter-agent trigger marker otherwise. Usage is accounted from the exact
 // per-response `last_token_usage`; cumulative totals remain a reset-safe
 // fallback/checkpoint. Existing indexed rollouts must be revisited once.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v29";
+// codex v30: resolve `execution_mode` through the provider surface instead of
+// reading `source` alone. This changes the attribution derived from unchanged
+// session headers in both directions -- `codex_exec`-only rollouts gain the
+// headless fact, and desktop-originator rollouts that merely carry
+// `source: "exec"` correctly lose it -- so the derivation must not keep
+// claiming v29 provenance. Existing indexed rollouts must be revisited once.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v30";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -242,7 +248,14 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // scan identity so already-indexed local history is revisited once; unchanged
 // files still converge through the semantic no-op path after the new summary
 // has been uploaded.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v29";
+// codex v30 moves scan identity for the same reason: the execution-mode
+// derivation changed for headers that are already on disk and will never be
+// rewritten, so without the bump the scan index would skip every one of them
+// and the corrected attribution would only ever reach sessions created after
+// the upgrade. The one-time revisit stays bounded - a rollout whose derived
+// facts did not actually change re-parses to the same semantic fingerprint and
+// is suppressed as a no-op instead of being re-uploaded.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v30";
 // v27 adds claude_code_effective_input_context() reconciliation against
 // usage.iterations[] to fix resumed-session first-turn baseline (all-zero
 // top-level fields while iterations carry real prompt), and multi-iteration
