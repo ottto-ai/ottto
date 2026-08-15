@@ -770,6 +770,17 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Model the session was MOST RECENTLY seen running, not its lifetime
+    /// primary. An active session's card answers "what is it running right
+    /// now", so a long session that switched models must not keep showing the
+    /// model it retired hours ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_model: Option<String>,
+    /// Reasoning-effort tier co-located with `latest_model`, on the same
+    /// most-recent basis. `None` when the source stamped no tier - never a
+    /// configured default standing in for observed evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reasoning_effort: Option<String>,
 }
 
 /// One detected billing destination for a source, as observed from local
