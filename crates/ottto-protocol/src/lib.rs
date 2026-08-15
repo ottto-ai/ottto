@@ -5352,6 +5352,8 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                latest_model: Some("claude-opus-5".to_string()),
+                latest_reasoning_effort: Some("high".to_string()),
             }],
         };
 
@@ -5370,6 +5372,9 @@ mod tests {
             value["sessions"][0]["compaction_timestamps"][1],
             "2026-07-19T17:50:00Z"
         );
+        // Snake-case keys the Swift Companion decodes for the session card.
+        assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
+        assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
