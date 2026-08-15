@@ -142,6 +142,7 @@ fn active_session_from_snapshot(
     let attribution = agent_status.and_then(|status| account_attribution(snapshot, status));
     let compaction_timestamps =
         bounded_compaction_timestamps(snapshot.compaction_timestamps.clone());
+    let (latest_model, latest_reasoning_effort) = latest_model_identity(snapshot);
     ActiveSession {
         source_session_id: snapshot.source_session_id.clone(),
         session_display_name: snapshot.session_display_name.clone(),
@@ -177,7 +178,70 @@ fn active_session_from_snapshot(
             .as_ref()
             .and_then(|value| value.subscription_product.clone()),
         account_attribution_source: attribution.map(|value| value.source),
+        latest_model,
+        latest_reasoning_effort,
     }
+}
+
+/// The model + effort tier this session was most recently seen running.
+///
+/// Usage rows are keyed by `(model, selector_hash, reasoning_effort, billing
+/// dims)`, so a session that changed model or effort mid-flight has several
+/// rows and the lifetime-dominant one is NOT what a live card should claim.
+/// Buckets are hourly and carry `last_activity_at`, so recency resolves to the
+/// newest bucket; within that bucket there is no finer ordering, so the row
+/// that did the most work wins. Ties break on model name so two scans of the
+/// same transcript never disagree.
+fn latest_model_identity(snapshot: &SnapshotItem) -> (Option<String>, Option<String>) {
+    let Some(bucket) = snapshot
+        .usage_buckets
+        .iter()
+        .filter(|bucket| !bucket.model_usage.is_empty())
+        .max_by(|left, right| {
+            left.last_activity_at
+                .as_deref()
+                .unwrap_or(left.bucket_start.as_str())
+                .cmp(
+                    right
+                        .last_activity_at
+                        .as_deref()
+                        .unwrap_or(right.bucket_start.as_str()),
+                )
+                .then_with(|| left.bucket_start.cmp(&right.bucket_start))
+        })
+    else {
+        return (None, None);
+    };
+
+    let row = bucket
+        .model_usage
+        .iter()
+        .max_by(|left, right| {
+            row_tokens(left)
+                .cmp(&row_tokens(right))
+                .then_with(|| right.model.cmp(&left.model))
+        })
+        .filter(|row| non_empty(&row.model));
+
+    match row {
+        Some(row) => (
+            Some(row.model.clone()),
+            row.reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty() && !effort.eq_ignore_ascii_case("unknown"))
+                .map(str::to_ascii_lowercase),
+        ),
+        None => (None, None),
+    }
+}
+
+fn row_tokens(row: &SnapshotModelUsage) -> u64 {
+    row.input_tokens
+        .saturating_add(row.output_tokens)
+        .saturating_add(row.cache_read_tokens)
+        .saturating_add(row.cache_creation_5m_tokens)
+        .saturating_add(row.cache_creation_1h_tokens)
 }
 
 fn active_session_provider_surface(
@@ -546,6 +610,181 @@ mod tests {
         AgentAccountStatus, AgentStatusCollectionMethod, AgentStatusPlanObservation,
         AgentStatusState,
     };
+
+    fn usage_row(model: &str, effort: Option<&str>, tokens: u64) -> SnapshotModelUsage {
+        SnapshotModelUsage {
+            model: model.to_string(),
+            input_tokens: 0,
+            output_tokens: tokens,
+            cache_read_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            reasoning_output_tokens: 0,
+            reasoning_effort: effort.map(str::to_string),
+            unattributed_total_tokens: 0,
+            request_count: 1,
+            selector_context: BTreeMap::new(),
+            selector_sources: BTreeMap::new(),
+            auth_mode: None,
+            billing_channel: None,
+            billing_provider: None,
+            gateway_provider: None,
+            model_provider: None,
+            subscription_product: None,
+            account_identifier_hash: None,
+            cost_usd: None,
+            input_cost_usd: None,
+            output_cost_usd: None,
+            cache_read_cost_usd: None,
+            cache_creation_cost_usd: None,
+        }
+    }
+
+    fn bucket(
+        bucket_start: &str,
+        last_activity_at: &str,
+        rows: Vec<SnapshotModelUsage>,
+    ) -> crate::snapshots::SnapshotUsageBucket {
+        crate::snapshots::SnapshotUsageBucket {
+            bucket_start: bucket_start.to_string(),
+            model_usage: rows,
+            first_activity_at: Some(last_activity_at.to_string()),
+            last_activity_at: Some(last_activity_at.to_string()),
+        }
+    }
+
+    #[test]
+    fn latest_identity_follows_the_newest_bucket_not_lifetime_volume() {
+        // The whole point of "latest": a session that spent most of its life on
+        // one model must still report the model it is running NOW.
+        let mut snapshot = test_snapshot("s-latest", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![
+            bucket(
+                "2026-07-19T09:00:00Z",
+                "2026-07-19T09:30:00Z",
+                vec![usage_row("claude-opus-5", Some("max"), 9_000_000)],
+            ),
+            bucket(
+                "2026-07-19T11:00:00Z",
+                "2026-07-19T11:04:00Z",
+                vec![usage_row("claude-haiku-4-5-20251001", Some("low"), 12)],
+            ),
+        ];
+
+        let (model, effort) = latest_model_identity(&snapshot);
+
+        assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn latest_identity_picks_the_dominant_row_inside_the_newest_bucket() {
+        // Buckets are hourly, so there is no finer ordering within one; the row
+        // that did the most work is the honest answer.
+        let mut snapshot = test_snapshot("s-dominant", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![bucket(
+            "2026-07-19T11:00:00Z",
+            "2026-07-19T11:04:00Z",
+            vec![
+                usage_row("claude-opus-5", Some("high"), 10),
+                usage_row("claude-fable-5", Some("xhigh"), 5_000),
+            ],
+        )];
+
+        let (model, effort) = latest_model_identity(&snapshot);
+
+        assert_eq!(model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn latest_identity_reports_no_effort_when_the_source_stamped_none() {
+        let mut snapshot = test_snapshot("s-no-effort", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![bucket(
+            "2026-07-19T11:00:00Z",
+            "2026-07-19T11:04:00Z",
+            vec![usage_row("gpt-5.6-sol", None, 40)],
+        )];
+
+        let (model, effort) = latest_model_identity(&snapshot);
+
+        assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn latest_identity_treats_unknown_and_blank_effort_as_no_evidence() {
+        for raw in ["unknown", "UNKNOWN", "   ", ""] {
+            let mut snapshot = test_snapshot("s-unknown", "2026-07-19T11:04:00Z");
+            snapshot.usage_buckets = vec![bucket(
+                "2026-07-19T11:00:00Z",
+                "2026-07-19T11:04:00Z",
+                vec![usage_row("gpt-5.6-sol", Some(raw), 40)],
+            )];
+
+            assert_eq!(latest_model_identity(&snapshot).1, None, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn latest_identity_normalizes_effort_case() {
+        let mut snapshot = test_snapshot("s-case", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![bucket(
+            "2026-07-19T11:00:00Z",
+            "2026-07-19T11:04:00Z",
+            vec![usage_row("gpt-5.6-sol", Some(" XHigh "), 40)],
+        )];
+
+        assert_eq!(latest_model_identity(&snapshot).1.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn latest_identity_is_absent_without_usage_rows() {
+        let mut snapshot = test_snapshot("s-empty", "2026-07-19T11:04:00Z");
+        snapshot.usage_buckets = vec![bucket(
+            "2026-07-19T11:00:00Z",
+            "2026-07-19T11:04:00Z",
+            vec![],
+        )];
+
+        assert_eq!(latest_model_identity(&snapshot), (None, None));
+
+        snapshot.usage_buckets = Vec::new();
+        assert_eq!(latest_model_identity(&snapshot), (None, None));
+    }
+
+    #[test]
+    fn reconciled_session_carries_latest_model_and_effort() {
+        let dir = temp_dir("latest-identity");
+        let mut snapshot = test_snapshot("s-wire", "2026-07-19T10:04:00Z");
+        snapshot.usage_buckets = vec![bucket(
+            "2026-07-19T10:00:00Z",
+            "2026-07-19T10:04:00Z",
+            vec![usage_row("claude-opus-5", Some("high"), 500)],
+        )];
+
+        let reconciliation = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&snapshot),
+            None,
+            "2026-07-19T10:05:00Z",
+        )
+        .expect("reconciliation");
+
+        assert_eq!(
+            reconciliation.sessions[0].latest_model.as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            reconciliation.sessions[0]
+                .latest_reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

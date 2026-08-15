@@ -770,6 +770,17 @@ pub struct ActiveSession {
     pub subscription_product: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_attribution_source: Option<String>,
+    /// Model the session was MOST RECENTLY seen running, not its lifetime
+    /// primary. An active session's card answers "what is it running right
+    /// now", so a long session that switched models must not keep showing the
+    /// model it retired hours ago.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_model: Option<String>,
+    /// Reasoning-effort tier co-located with `latest_model`, on the same
+    /// most-recent basis. `None` when the source stamped no tier - never a
+    /// configured default standing in for observed evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reasoning_effort: Option<String>,
 }
 
 /// One detected billing destination for a source, as observed from local
@@ -5341,6 +5352,8 @@ mod tests {
                 organization_identifier_hash: Some("org-hash".to_string()),
                 subscription_product: Some("chatgpt_pro".to_string()),
                 account_attribution_source: Some("current_login_at_reconciliation".to_string()),
+                latest_model: Some("claude-opus-5".to_string()),
+                latest_reasoning_effort: Some("high".to_string()),
             }],
         };
 
@@ -5359,6 +5372,9 @@ mod tests {
             value["sessions"][0]["compaction_timestamps"][1],
             "2026-07-19T17:50:00Z"
         );
+        // Snake-case keys the Swift Companion decodes for the session card.
+        assert_eq!(value["sessions"][0]["latest_model"], "claude-opus-5");
+        assert_eq!(value["sessions"][0]["latest_reasoning_effort"], "high");
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
