@@ -857,11 +857,11 @@ pub fn direct_provider_facts(
                     &evidence_context,
                 );
             }
-            if origin.source.as_deref() == Some("exec") {
+            if let Some(value) = execution_mode(SnapshotSource::Codex, &origin) {
                 push_fact(
                     &mut facts,
                     "execution_mode",
-                    "headless",
+                    value,
                     "provider_native",
                     "direct",
                     &evidence_context,
@@ -890,14 +890,7 @@ pub fn direct_provider_facts(
                     &evidence_context,
                 );
             }
-            let execution_mode = if origin.session_kind.as_deref() == Some("bg") {
-                Some("background")
-            } else if origin.entrypoint.as_deref() == Some("sdk-cli") {
-                Some("headless")
-            } else {
-                None
-            };
-            if let Some(value) = execution_mode {
+            if let Some(value) = execution_mode(SnapshotSource::ClaudeCode, &origin) {
                 push_fact(
                     &mut facts,
                     "execution_mode",
@@ -1141,6 +1134,53 @@ fn codex_provider_surface(origin: &SnapshotOrigin) -> Option<&'static str> {
             Some("codex_exec")
         }
         _ => None,
+    }
+}
+
+/// How one session was driven, when the provider's own session header proves it.
+///
+/// `headless` means the run had no interactive terminal attached -- the provider
+/// wrote a non-interactive entry point into its own session metadata. `background`
+/// is Claude Code's own `bg` marker for a run the user pushed off the foreground.
+///
+/// Scope, deliberately narrow: this is an ATTRIBUTE of a single session that says
+/// HOW it ran. It never says WHO or WHAT started it, and it is never lineage
+/// evidence. A person typing `codex exec` and a script calling `codex exec`
+/// produce the identical header, so this function cannot and must not be read as
+/// a parent, an agent, a controller, or a completed run. Parent edges come only
+/// from `parent_session_ref`.
+///
+/// One definition, two readers: the uploaded `execution_mode` attribution fact
+/// and the machine-local active-session role both call this, so the product can
+/// never label the same session two different ways.
+///
+/// Codex is resolved through `codex_provider_surface` rather than by reading
+/// `source` alone, because the two Codex signals disagree in a real shape:
+/// ChatGPT Work desktop rollouts write `source: "exec"` under
+/// `originator: "codex_work_desktop"`. `originator` names the client and wins,
+/// so those stay unlabelled - claiming "no interactive terminal" for a desktop
+/// session would be exactly the overreach this attribute exists to avoid. The
+/// reverse case still resolves: a subagent rollout puts a spawn object in
+/// `source`, leaving the `codex_exec` originator as the only signal, and it is
+/// enough on its own.
+pub(crate) fn execution_mode(
+    source: SnapshotSource,
+    origin: &SnapshotOrigin,
+) -> Option<&'static str> {
+    match source {
+        SnapshotSource::Codex => {
+            (codex_provider_surface(origin) == Some("codex_exec")).then_some("headless")
+        }
+        SnapshotSource::ClaudeCode => {
+            if origin.session_kind.as_deref() == Some("bg") {
+                Some("background")
+            } else if origin.entrypoint.as_deref() == Some("sdk-cli") {
+                Some("headless")
+            } else {
+                None
+            }
+        }
+        SnapshotSource::Pi => None,
     }
 }
 
@@ -1429,6 +1469,113 @@ mod tests {
             .iter()
             .any(|fact| fact.field == "workflow_orchestration"));
         assert!(!facts.iter().any(|fact| fact.field == "origin_kind"));
+    }
+
+    #[test]
+    fn originator_alone_proves_a_headless_codex_run() {
+        // Codex subagent rollouts put the spawn object in `source`, so the only
+        // remaining non-interactive signal is the `codex_exec` originator. The
+        // execution mode still holds; it is an attribute of the run, and the
+        // subagent origin is reported separately as its own fact.
+        let mut origin = origin();
+        origin.originator = Some("codex_exec".to_string());
+        origin.source = None;
+        origin.source_subagent = Some(true);
+
+        let facts = direct_provider_facts(
+            SnapshotSource::Codex,
+            Some(&origin),
+            "session-headless",
+            "2026-07-19T00:00:00Z",
+            "codex_jsonl:v21",
+        );
+
+        assert!(facts
+            .iter()
+            .any(|fact| fact.field == "execution_mode" && fact.value == "headless"));
+        assert!(facts
+            .iter()
+            .any(|fact| fact.field == "origin_kind" && fact.value == "subagent"));
+    }
+
+    #[test]
+    fn interactive_codex_run_reports_no_execution_mode() {
+        let mut origin = origin();
+        origin.originator = Some("Codex Desktop".to_string());
+        origin.source = Some("vscode".to_string());
+
+        let facts = direct_provider_facts(
+            SnapshotSource::Codex,
+            Some(&origin),
+            "session-interactive",
+            "2026-07-19T00:00:00Z",
+            "codex_jsonl:v21",
+        );
+
+        assert!(!facts.iter().any(|fact| fact.field == "execution_mode"));
+    }
+
+    #[test]
+    fn desktop_originator_outranks_an_exec_source() {
+        // Real shape: ChatGPT Work desktop rollouts write `source: "exec"` while
+        // naming a desktop client in `originator`. The signals disagree, the
+        // client wins, and the session stays unlabelled rather than being
+        // called headless on the weaker signal.
+        for surface in ["codex_work_desktop", "Codex Desktop", "codex_desktop"] {
+            let mut origin = origin();
+            origin.originator = Some(surface.to_string());
+            origin.source = Some("exec".to_string());
+
+            assert_eq!(
+                execution_mode(SnapshotSource::Codex, &origin),
+                None,
+                "{surface} must not be reported as headless"
+            );
+
+            let facts = direct_provider_facts(
+                SnapshotSource::Codex,
+                Some(&origin),
+                "session-work-desktop",
+                "2026-07-19T00:00:00Z",
+                "codex_jsonl:v21",
+            );
+            assert!(
+                !facts.iter().any(|fact| fact.field == "execution_mode"),
+                "{surface} must not emit an execution mode"
+            );
+            assert!(facts
+                .iter()
+                .any(|fact| fact.field == "provider_surface" && fact.value == "codex_desktop"));
+        }
+    }
+
+    #[test]
+    fn execution_mode_agrees_with_the_provider_surface_it_is_derived_from() {
+        // The two readers of this rule - the uploaded fact and the local
+        // active-session role - must never disagree with the surface shown
+        // beside them.
+        let cases = [
+            (Some("codex_exec"), Some("exec"), Some("headless")),
+            (Some("codex_exec"), None, Some("headless")),
+            (None, Some("exec"), Some("headless")),
+            (None, Some("codex_exec"), Some("headless")),
+            (Some("Codex Desktop"), Some("exec"), None),
+            (Some("codex_cli_rs"), Some("exec"), None),
+            (Some("Codex Desktop"), Some("vscode"), None),
+            (None, None, None),
+        ];
+
+        for (originator, source, expected) in cases {
+            let mut origin = origin();
+            origin.originator = originator.map(str::to_string);
+            origin.source = source.map(str::to_string);
+
+            assert_eq!(
+                execution_mode(SnapshotSource::Codex, &origin),
+                expected,
+                "originator {originator:?} with source {source:?}"
+            );
+        }
     }
 
     #[test]

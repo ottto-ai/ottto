@@ -166,7 +166,7 @@ fn active_session_from_snapshot(
         unattributed_total_tokens: (snapshot.unattributed_total_tokens > 0)
             .then_some(snapshot.unattributed_total_tokens),
         input_token_scope: snapshot.provenance.input_token_scope.clone(),
-        session_kind: active_session_kind(snapshot),
+        session_kind: active_session_kind(source, snapshot),
         provider_surface: active_session_provider_surface(source, snapshot),
         account_identifier_hash: attribution
             .as_ref()
@@ -272,7 +272,14 @@ fn active_session_provider_surface(
         })
 }
 
-fn active_session_kind(snapshot: &SnapshotItem) -> Option<String> {
+/// Content-free role for a truthful fallback title, from provider metadata only.
+///
+/// Ordered most to least specific, so a subagent that also ran non-interactively
+/// keeps the stronger `subagent` role. `headless` is last because it is the
+/// weakest claim of the three: it describes only HOW the run was driven. It says
+/// nothing about who or what started the session, so it is an attribute, never a
+/// lineage edge and never evidence for one.
+fn active_session_kind(source: SnapshotSource, snapshot: &SnapshotItem) -> Option<String> {
     let origin = snapshot.origin.as_ref();
     let is_subagent = origin.is_some_and(|value| {
         value.thread_source.as_deref() == Some("subagent")
@@ -285,6 +292,11 @@ fn active_session_kind(snapshot: &SnapshotItem) -> Option<String> {
     }
     if origin.and_then(|value| value.thread_source.as_deref()) == Some("automation") {
         return Some("automation".to_string());
+    }
+    if origin.is_some_and(|value| {
+        crate::session_attribution::execution_mode(source, value) == Some("headless")
+    }) {
+        return Some("headless".to_string());
     }
     None
 }
@@ -902,6 +914,108 @@ mod tests {
 
         assert_eq!(active.session_display_name, None);
         assert_eq!(active.session_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn classifies_headless_codex_run_from_its_own_session_header() {
+        // The dominant `codex exec` shape on disk: the provider names the binary
+        // in `originator` and the non-interactive entry point in `source`, while
+        // `thread_source` stays `user` because a person may have typed it.
+        let mut snapshot = test_snapshot("headless", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name = None;
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            originator: Some("codex_exec".to_string()),
+            source: Some("exec".to_string()),
+            thread_source: Some("user".to_string()),
+            ..Default::default()
+        });
+
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
+
+        assert_eq!(active.session_kind.as_deref(), Some("headless"));
+    }
+
+    #[test]
+    fn leaves_interactive_codex_run_unlabelled() {
+        // An interactive Codex Desktop run must stay role-free: labelling it
+        // would be a claim the session header does not support.
+        let mut snapshot = test_snapshot("interactive", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name = None;
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            originator: Some("Codex Desktop".to_string()),
+            source: Some("vscode".to_string()),
+            thread_source: Some("user".to_string()),
+            ..Default::default()
+        });
+
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
+
+        assert_eq!(active.session_kind, None);
+    }
+
+    #[test]
+    fn keeps_subagent_role_for_a_headless_subagent_run() {
+        // Codex spawns subagents through `codex exec`, so both signals appear.
+        // The more specific role wins; headless never overwrites it.
+        let mut snapshot = test_snapshot("headless-subagent", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name = None;
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            originator: Some("codex_exec".to_string()),
+            thread_source: Some("subagent".to_string()),
+            source_subagent: Some(true),
+            ..Default::default()
+        });
+
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
+
+        assert_eq!(active.session_kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn leaves_a_desktop_run_unlabelled_even_when_its_source_says_exec() {
+        // ChatGPT Work desktop rollouts write `source: "exec"` under a desktop
+        // originator. The client wins, so the row keeps its plain title instead
+        // of gaining a headless claim the header does not support.
+        let mut snapshot = test_snapshot("work-desktop", "2026-07-19T10:04:00Z");
+        snapshot.session_display_name = None;
+        snapshot.origin = Some(crate::snapshots::SnapshotOrigin {
+            originator: Some("codex_work_desktop".to_string()),
+            source: Some("exec".to_string()),
+            thread_source: Some("user".to_string()),
+            ..Default::default()
+        });
+
+        let active = active_session_from_snapshot(SnapshotSource::Codex, &snapshot, None);
+
+        assert_eq!(active.session_kind, None);
+    }
+
+    #[test]
+    fn headless_role_never_becomes_a_lineage_fact() {
+        // The attribute describes how a run was driven. It must not manufacture
+        // a parent, a root, or any other relationship the provider never stated.
+        let origin = crate::snapshots::SnapshotOrigin {
+            originator: Some("codex_exec".to_string()),
+            source: Some("exec".to_string()),
+            thread_source: Some("user".to_string()),
+            ..Default::default()
+        };
+
+        let facts = crate::session_attribution::direct_provider_facts(
+            SnapshotSource::Codex,
+            Some(&origin),
+            "headless-session",
+            "2026-07-19T10:04:00Z",
+            "codex_rollout:v1",
+        );
+
+        assert!(facts
+            .iter()
+            .any(|fact| fact.field == "execution_mode" && fact.value == "headless"));
+        assert!(!facts.iter().any(|fact| matches!(
+            fact.field.as_str(),
+            "parent_session_ref" | "root_session_ref" | "agent_ref" | "spawn_depth"
+        )));
     }
 
     #[test]
