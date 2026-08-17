@@ -2089,14 +2089,6 @@ fn retain_verified_claude_slot_binding(
         return;
     }
     retain_exact_claude_slot_binding(status, &current_account, &current_organization);
-    status.last_full_quota_read_at = previous.last_full_quota_read_at;
-    status.has_account_windows = previous.has_account_windows;
-    status.has_scoped_limits = previous.has_scoped_limits;
-    status.has_credit_balances = previous.has_credit_balances;
-    status.quota_snapshot = previous
-        .quota_snapshot
-        .as_ref()
-        .map(stale_local_claude_quota_snapshot);
 }
 
 fn degraded_claude_slot_snapshot(
@@ -2819,7 +2811,11 @@ fn merge_claude_slot_collection_state_at(
                 candidate.has_account_windows = existing.has_account_windows;
                 candidate.has_scoped_limits = existing.has_scoped_limits;
                 candidate.has_credit_balances = existing.has_credit_balances;
-                if candidate.quota_snapshot.is_none() {
+                // A fresh partial exact read may carry a non-empty snapshot (for
+                // example, account windows without scoped limits). Keep the last
+                // bounded full snapshot as one coherent meter bundle instead of
+                // pairing inherited full-proof flags with the partial snapshot.
+                if candidate_is_fresh_partial_observation || candidate.quota_snapshot.is_none() {
                     candidate.quota_snapshot = existing
                         .quota_snapshot
                         .as_ref()
@@ -9046,12 +9042,24 @@ mod tests {
             quota_snapshot: Some(local_meter_fixture(&account_hash, &organization_hash)),
             ..Default::default()
         };
+        let partial_snapshot = local_claude_quota_snapshot(
+            "2026-08-05T01:20:00Z",
+            &existing
+                .quota_snapshot
+                .as_ref()
+                .expect("full snapshot")
+                .quota_windows[..2],
+            &[],
+            true,
+            false,
+        );
         let partial_statusline = ClaudeConfigSlotCollectionStatusV1 {
             state: ClaudeConfigSlotCollectionStateV1::Fresh,
             account_identifier_hash: Some(account_hash.clone()),
             organization_identifier_hash: Some(organization_hash),
             observed_at: Some("2026-08-05T01:20:00Z".to_string()),
             has_account_windows: true,
+            quota_snapshot: Some(partial_snapshot),
             ..Default::default()
         };
         let mut slots = BTreeMap::from([("default".to_string(), existing)]);
@@ -9068,6 +9076,26 @@ mod tests {
         assert!(merged.has_account_windows);
         assert!(merged.has_scoped_limits);
         assert!(merged.has_credit_balances);
+        assert_eq!(
+            merged
+                .quota_snapshot
+                .as_ref()
+                .expect("fresh exact meters")
+                .quota_windows
+                .len(),
+            3,
+            "the retained full bundle keeps model-scoped limits"
+        );
+        assert_eq!(
+            merged
+                .quota_snapshot
+                .as_ref()
+                .expect("fresh exact meters")
+                .credit_balances
+                .len(),
+            1,
+            "the retained full bundle keeps usage credits"
+        );
         assert_eq!(
             merged
                 .quota_snapshot
@@ -14981,15 +15009,42 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             Some(organization_hash.as_str())
         );
         assert_eq!(
-            failed
-                .quota_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.state),
-            Some(ClaudeConfigSlotQuotaSnapshotStateV1::Stale)
+            failed.quota_snapshot, None,
+            "binding verification must not copy older meters before the bounded merge"
         );
         assert_eq!(
             projected_claude_quota_access_state(&failed),
             Some(ClaudeQuotaAccessState::AttentionRequired)
+        );
+
+        let mut current_full = fresh_slot_status(
+            "2026-08-12T10:00:00Z",
+            &account_hash,
+            &organization_hash,
+            true,
+            true,
+            false,
+        );
+        current_full.quota_snapshot = Some(ClaudeConfigSlotQuotaSnapshotV1 {
+            state: ClaudeConfigSlotQuotaSnapshotStateV1::Fresh,
+            captured_at: "2026-08-12T10:00:00Z".to_string(),
+            observed_at: Some("2026-08-12T10:00:00Z".to_string()),
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+        });
+        retain_verified_claude_slot_binding(slot_id, &slot, &mut current_full);
+        assert_eq!(
+            current_full.last_full_quota_read_at.as_deref(),
+            Some("2026-08-12T10:00:00Z"),
+            "a current full read must not be replaced by the prior slot timestamp"
+        );
+        assert_eq!(
+            current_full
+                .quota_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.captured_at.as_str()),
+            Some("2026-08-12T10:00:00Z"),
+            "a current full snapshot must remain authoritative"
         );
 
         write_identity("account-rotated", "organization-rotated");
