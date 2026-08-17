@@ -6,9 +6,9 @@
 //! backend-issued, tenant-scoped HMAC key; provider schedule definitions are
 //! read locally on a six-hour cache and reduced to opaque identifiers before
 //! facts can leave this module. Optional display labels contain only a
-//! sanitized 96-byte prompt prefix or allowlisted skill name; upload policy
-//! removes them unless the existing session-title privacy consent and the
-//! backend capability are both active.
+//! sanitized 96-byte prompt prefix, allowlisted skill name, or content-free
+//! agent task label; upload policy removes them unless the existing
+//! session-title privacy consent and the backend capability are both active.
 
 use crate::snapshots::{SnapshotOrigin, SnapshotSource};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -1030,14 +1030,17 @@ pub fn claude_subagent_facts(
     facts
 }
 
-/// Exact Codex family facts joined from `state_5.sqlite.thread_spawn_edges`.
+/// Exact Codex subagent identity plus optional family facts.
 ///
-/// The database supplies only provider-native thread ids and graph edges. No
-/// prompt, title, command, path, or tool output enters this contract.
+/// The rollout itself supplies the subagent identity and an independently
+/// sanitized logical-agent label. The database may additionally supply the
+/// provider-native root and spawn depth; no raw path, prompt, title, command,
+/// or tool output enters this contract.
 pub fn codex_subagent_facts(
-    root_session_ref: &str,
+    root_session_ref: Option<&str>,
     source_session_id: &str,
     spawn_depth: Option<u64>,
+    agent_label: Option<&str>,
     observed_at: &str,
     source_version: &str,
 ) -> Vec<SessionAttributionFact> {
@@ -1047,18 +1050,22 @@ pub fn codex_subagent_facts(
         observed_at,
         source_version,
     };
-    push_fact(
-        &mut facts,
-        "root_session_ref",
-        root_session_ref,
-        "provider_artifact",
-        "direct",
-        &evidence_context,
-    );
-    push_fact(
+    if let Some(root_session_ref) = root_session_ref {
+        push_fact(
+            &mut facts,
+            "root_session_ref",
+            root_session_ref,
+            "provider_artifact",
+            "direct",
+            &evidence_context,
+        );
+    }
+    push_labeled_fact(
         &mut facts,
         "agent_kind",
         "codex_subagent",
+        agent_label,
+        agent_label.map(|_| "agent_label"),
         "provider_artifact",
         "direct",
         &evidence_context,
@@ -1293,7 +1300,9 @@ pub(crate) fn validate_fact_limits(facts: &[SessionAttributionFact]) -> Result<(
                 }
                 let allowed = matches!(
                     (fact.field.as_str(), source),
-                    ("template_group_id", "prompt_prefix") | ("skill_id", "skill_name")
+                    ("agent_kind", "agent_label")
+                        | ("template_group_id", "prompt_prefix")
+                        | ("skill_id", "skill_name")
                 );
                 if !allowed {
                     return Err("attribution display label source is invalid for field".to_string());
