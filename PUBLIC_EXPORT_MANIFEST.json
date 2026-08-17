@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 327,
-  "content_sha256": "def738920801e18a14e9796e85bdaff2de5d8e9c54f0605e0959e1e1869eb804",
+  "candidate_file_count": 328,
+  "content_sha256": "c3f9f71510a66e5a1009c9629ba6ce555691f8ac2b9c0c0068f1cf17e82e72db",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "c7cdd54af70ed27596a99b2337c6ca18c19a7fcfb78162985ca1e5217388cf3c",
-      "size_bytes": 616288
+      "sha256": "492d03947f51c70958c13d5aacfecb83ebccd46992c9bf249b0bece41b969336",
+      "size_bytes": 618311
     },
     {
       "executable": false,
@@ -1422,6 +1422,13 @@
       "path": "docs/session-2026-08-15-headless-session-role.md",
       "sha256": "607202ddd88f75985c87f47d9b52794a2832ba208acbbaa73910c5f485911063",
       "size_bytes": 5812
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-17-claude-default-slot-freshness.md",
+      "sha256": "fe779f916dcb47d74caf149de18f989dcd66aafe63b343cac958af2cddfd28c2",
+      "size_bytes": 1711
     },
     {
       "executable": false,
@@ -2292,9 +2299,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-15T19:19:28+00:00",
+  "generated_at": "2026-08-17T13:29:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 328,
+  "output_file_count": 329,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2328,5 +2335,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cc553e148f5581714c222bc3026950609923f4fe"
+  "source_commit": "6ef48672b71da72678e8d178d51f6e889efe50c1"
 }
