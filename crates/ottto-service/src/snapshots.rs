@@ -197,7 +197,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // headless fact, and desktop-originator rollouts that merely carry
 // `source: "exec"` correctly lose it -- so the derivation must not keep
 // claiming v29 provenance. Existing indexed rollouts must be revisited once.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v30";
+// codex v31: turn a spawned agent's content-free `agent_path` leaf into the
+// existing consented `agent_label` attribution label. Parent provenance stays
+// in its own graph facts and no prompt material enters the label. Existing
+// indexed subagent rollouts must be revisited once.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v31";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -255,7 +259,10 @@ pub const PI_SNAPSHOT_PARSER_VERSION: &str = "pi_jsonl:v13";
 // the upgrade. The one-time revisit stays bounded - a rollout whose derived
 // facts did not actually change re-parses to the same semantic fingerprint and
 // is suppressed as a no-op instead of being re-uploaded.
-pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v30";
+// codex v31 also moves scan identity: historical rollout headers already carry
+// `agent_path`, but those immutable files would otherwise stay indexed under
+// the version that emitted no label.
+pub const CODEX_SCAN_IDENTITY_VERSION: &str = "codex_jsonl:v31";
 // v27 adds claude_code_effective_input_context() reconciliation against
 // usage.iterations[] to fix resumed-session first-turn baseline (all-zero
 // top-level fields while iterations carry real prompt), and multi-iteration
@@ -5374,6 +5381,9 @@ struct SnapshotAccumulator {
     origin: SnapshotOrigin,
     codex_root_session_ref: Option<String>,
     codex_spawn_depth: Option<u64>,
+    // In-memory only: a sanitized, humanized leaf from Codex's content-free
+    // `/root/<task_name>` agent path. The raw path never enters SnapshotItem.
+    codex_agent_label: Option<String>,
     activity_tool_counts: BTreeMap<String, u64>,
     activity_call_tools: BTreeMap<String, String>,
     activity_mcp_tool_counts: BTreeMap<String, u64>,
@@ -5501,6 +5511,7 @@ impl SnapshotAccumulator {
             origin: SnapshotOrigin::default(),
             codex_root_session_ref: None,
             codex_spawn_depth: None,
+            codex_agent_label: None,
             activity_tool_counts: BTreeMap::new(),
             activity_call_tools: BTreeMap::new(),
             activity_mcp_tool_counts: BTreeMap::new(),
@@ -6490,11 +6501,15 @@ impl SnapshotAccumulator {
             collected_at,
             self.source.parser_version(),
         );
-        if let Some(root_session_ref) = self.codex_root_session_ref.as_deref() {
+        let codex_subagent = self.source == SnapshotSource::Codex
+            && (self.origin.thread_source.as_deref() == Some("subagent")
+                || self.origin.source_subagent == Some(true));
+        if codex_subagent {
             attribution_facts.extend(crate::session_attribution::codex_subagent_facts(
-                root_session_ref,
+                self.codex_root_session_ref.as_deref(),
                 &source_session_id,
                 self.codex_spawn_depth,
+                self.codex_agent_label.as_deref(),
                 collected_at,
                 self.source.parser_version(),
             ));
@@ -9420,6 +9435,9 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
             accumulator.origin.parent_session_ref =
                 string_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
                     .or_else(|| string_at(meta, &["parent_thread_id"]));
+            accumulator.codex_agent_label =
+                string_at(src, &["subagent", "thread_spawn", "agent_path"])
+                    .and_then(safe_codex_agent_display_label);
         }
     }
     accumulator.origin.originator = string_at(meta, &["originator"]);
@@ -14366,6 +14384,37 @@ fn safe_claude_agent_display_label(value: String) -> Option<String> {
     Some(truncated)
 }
 
+/// Derive a useful, content-free label from Codex's logical agent path.
+///
+/// `spawn_agent` constrains task names to compact tokens and records them as
+/// `/root/<task_name>` (possibly with more nested agent segments). Only the
+/// final token is retained; nicknames, parent titles, and task prompts are not
+/// used. Requiring the logical `root` prefix prevents arbitrary filesystem
+/// paths from becoming title material.
+fn safe_codex_agent_display_label(agent_path: String) -> Option<String> {
+    let parts = agent_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 || parts.first().copied() != Some("root") {
+        return None;
+    }
+    if parts[1..].iter().any(|part| {
+        part.is_empty()
+            || part.len() > MAX_CLAUDE_AGENT_LABEL_CHARS
+            || !part.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            })
+    }) {
+        return None;
+    }
+    let task_name = parts.last().copied()?;
+    if task_name == "root" {
+        return None;
+    }
+    safe_claude_agent_display_label(task_name.replace('_', " "))
+}
+
 /// Upper bound for a Workflow run-manifest read (`workflows/wf_*.json`).
 /// Observed manifests are a few hundred KB (they carry per-agent progress rows
 /// including result previews); the cap only stops a pathological file from
@@ -14692,14 +14741,14 @@ mod tests {
         fs::write(
             &path,
             concat!(
-                "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"grandchild-session\",\"thread_source\":\"subagent\"}}\n",
+                "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"grandchild-session\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"child-session\",\"agent_path\":\"/root/repair_batch_branch_cleanup\",\"agent_nickname\":\"Helmholtz\"}}}}}\n",
                 "{\"timestamp\":\"2026-08-02T06:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1},\"model\":\"gpt-5.6\"}}}\n"
             ),
         )
         .expect("write transcript");
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
-        let item = parse_codex_jsonl_file_with_title_metadata(
+        let mut item = parse_codex_jsonl_file_with_title_metadata(
             &path,
             "2026-08-02T06:02:00Z",
             "fingerprint".to_string(),
@@ -14726,6 +14775,117 @@ mod tests {
             .attribution_facts
             .iter()
             .any(|fact| { fact.field == "agent_ref" && fact.value == "grandchild-session" }));
+        let agent_kind = item
+            .attribution_facts
+            .iter()
+            .find(|fact| fact.field == "agent_kind")
+            .expect("agent kind fact");
+        assert_eq!(agent_kind.value, "codex_subagent");
+        assert_eq!(
+            agent_kind.display_label.as_deref(),
+            Some("repair batch branch cleanup")
+        );
+        assert_eq!(
+            agent_kind.display_label_source.as_deref(),
+            Some("agent_label")
+        );
+
+        let local = item.clone();
+        apply_upload_policy(
+            SnapshotSource::Codex,
+            std::slice::from_mut(&mut item),
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+        );
+        assert!(item.attribution_facts.iter().any(|fact| {
+            fact.field == "agent_kind"
+                && fact.display_label.as_deref() == Some("repair batch branch cleanup")
+                && fact.display_label_source.as_deref() == Some("agent_label")
+        }));
+        for policy in [
+            SnapshotUploadPolicy {
+                session_titles_enabled: false,
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: true,
+                ..SnapshotUploadPolicy::default()
+            },
+            SnapshotUploadPolicy {
+                session_attribution_enabled: true,
+                session_attribution_labels_enabled: false,
+                ..SnapshotUploadPolicy::default()
+            },
+        ] {
+            let mut private = local.clone();
+            apply_upload_policy(
+                SnapshotSource::Codex,
+                std::slice::from_mut(&mut private),
+                policy,
+            );
+            let agent_kind = private
+                .attribution_facts
+                .iter()
+                .find(|fact| fact.field == "agent_kind")
+                .expect("agent kind remains as a content-free type fact");
+            assert_eq!(agent_kind.display_label, None);
+            assert_eq!(agent_kind.display_label_source, None);
+        }
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_rollout_emits_agent_label_without_sqlite_lineage() {
+        let home = temp_dir("codex-agent-label-without-sqlite");
+        let sessions_dir = home.join(".codex/sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        let path = sessions_dir.join("rollout-child-session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-02T06:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"child-session\",\"thread_source\":\"subagent\",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent-session\",\"agent_path\":\"/root/repair_baseline_test\"}}}}}\n",
+                "{\"timestamp\":\"2026-08-02T06:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1},\"model\":\"gpt-5.6\"}}}\n"
+            ),
+        )
+        .expect("write transcript");
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-08-02T06:02:00Z",
+            "fingerprint".to_string(),
+            &metadata,
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let agent_kind = item
+            .attribution_facts
+            .iter()
+            .find(|fact| fact.field == "agent_kind")
+            .expect("rollout-native agent kind fact");
+        assert_eq!(agent_kind.value, "codex_subagent");
+        assert_eq!(
+            agent_kind.display_label.as_deref(),
+            Some("repair baseline test")
+        );
+        assert_eq!(
+            agent_kind.display_label_source.as_deref(),
+            Some("agent_label")
+        );
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "agent_ref" && fact.value == "child-session"));
+        assert!(!item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "root_session_ref" || fact.field == "spawn_depth"));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -24502,6 +24662,42 @@ mod tests {
                 safe_claude_agent_display_label(hostile.to_string()),
                 None,
                 "{hostile:?} must be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_agent_path_labels_replay_anonymous_production_subagents() {
+        for (agent_path, expected) in [
+            ("/root/repair_baseline_test", "repair baseline test"),
+            (
+                "/root/repair_docs_ci_disposition",
+                "repair docs ci disposition",
+            ),
+            ("/root/repair_manual_docs_route", "repair manual docs route"),
+            (
+                "/root/repair_batch_branch_cleanup",
+                "repair batch branch cleanup",
+            ),
+            ("/root/codebuild_implementation", "codebuild implementation"),
+        ] {
+            assert_eq!(
+                safe_codex_agent_display_label(agent_path.to_string()).as_deref(),
+                Some(expected),
+                "{agent_path} must derive the deployed session label"
+            );
+        }
+        for unsafe_path in [
+            "/Users/ron/private_task",
+            "/root/",
+            "/root/task name",
+            "/root/task.name",
+            "repair_baseline_test",
+        ] {
+            assert_eq!(
+                safe_codex_agent_display_label(unsafe_path.to_string()),
+                None,
+                "{unsafe_path} must stay out of attribution labels"
             );
         }
     }
