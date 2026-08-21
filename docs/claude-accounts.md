@@ -173,8 +173,11 @@ vendor-command problem; it does not change consent or provider collection.
 
 `refreshTokenExpiresAt` is an absolute login horizon. Within 72 hours the slot
 reports `relogin_approaching`; once elapsed it reports `needs_login` and waits
-for the customer to complete official Claude Code `/login` again. Background
-upkeep cannot promise an indefinitely fresh login.
+for the customer to complete official Claude Code `/login` again. Claude Code
+may also clear the refresh grant while leaving an old future deadline in its
+credential record. Ottto treats a missing refresh grant as `needs_login`
+immediately and does not keep running `doctor` against a login it cannot
+recover. Background upkeep cannot promise an indefinitely fresh login.
 
 ## Tips
 
