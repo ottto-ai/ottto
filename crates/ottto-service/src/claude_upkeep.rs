@@ -332,6 +332,18 @@ fn observe_registered_slot_upkeep_with_gate(
         };
         return observation_with_metadata(true, result, &before);
     }
+    // Claude Code can leave the old refresh deadline behind after signing out
+    // while clearing both token strings. The deadline alone is therefore not
+    // proof that `claude doctor` can refresh the credential. Fail directly to
+    // the official-login state instead of spending the durable retry budget on
+    // a command that cannot recover a missing refresh grant.
+    if !before.has_refresh_token {
+        return observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+            &before,
+        );
+    }
     let Some(refresh_expiry) = refresh_expiry else {
         return observation_with_metadata(
             false,
@@ -844,7 +856,41 @@ mod tests {
         ClaudeOAuthCredentialMetadata {
             access_expires_at: Some(access.to_string()),
             refresh_token_expires_at: Some(refresh.to_string()),
+            has_refresh_token: true,
         }
+    }
+
+    #[test]
+    fn expired_access_without_refresh_token_requires_login_without_spawning() {
+        let now = "2026-08-04T10:00:00Z";
+        let dir = temp_dir("missing-refresh-token");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observation = observe_registered_slot_upkeep_with(
+            &descriptor(),
+            true,
+            true,
+            &dir,
+            &FixedClock(at(now)),
+            &SequenceCredentials::new(vec![Some(ClaudeOAuthCredentialMetadata {
+                access_expires_at: Some("1970-01-01T00:00:00Z".to_string()),
+                // Claude Code may retain this old deadline after clearing the
+                // grant, so it must not make the credential look refreshable.
+                refresh_token_expires_at: Some("2026-09-15T04:52:51Z".to_string()),
+                has_refresh_token: false,
+            })]),
+            &CountingProcess {
+                result: DoctorProcessResult::ExitZero,
+                calls: Arc::clone(&calls),
+            },
+        );
+
+        assert!(!observation.proceed_with_collection);
+        assert_eq!(
+            observation.status.result,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!dir.join(UPKEEP_STATE_FILE).exists());
     }
 
     fn at(value: &str) -> OffsetDateTime {

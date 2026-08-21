@@ -222,6 +222,10 @@ struct StableClaudeSlotCredential {
 /// metadata can be copied into authenticated local status.
 struct ClaudeOAuthCredential {
     access_token: Option<String>,
+    /// Presence only. The refresh token itself is never retained, logged, or
+    /// exposed; upkeep needs this bit to distinguish a signed-out credential
+    /// from a refreshable expired access token.
+    has_refresh_token: bool,
     access_expires_at: Option<String>,
     relogin_required_at: Option<String>,
 }
@@ -232,6 +236,7 @@ struct ClaudeOAuthCredential {
 pub(crate) struct ClaudeOAuthCredentialMetadata {
     pub(crate) access_expires_at: Option<String>,
     pub(crate) refresh_token_expires_at: Option<String>,
+    pub(crate) has_refresh_token: bool,
 }
 
 struct ClaudeSnapshotCandidate {
@@ -4532,6 +4537,7 @@ pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
     Some(ClaudeOAuthCredentialMetadata {
         access_expires_at: credential.access_expires_at,
         refresh_token_expires_at: credential.relogin_required_at,
+        has_refresh_token: credential.has_refresh_token,
     })
 }
 
@@ -4667,6 +4673,10 @@ fn parse_claude_oauth_credential(payload: &str) -> Option<ClaudeOAuthCredential>
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(ToString::to_string);
+    let has_refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
     let timestamp = |field: &str| {
         oauth
             .get(field)
@@ -4675,6 +4685,7 @@ fn parse_claude_oauth_credential(payload: &str) -> Option<ClaudeOAuthCredential>
     };
     Some(ClaudeOAuthCredential {
         access_token,
+        has_refresh_token,
         access_expires_at: timestamp("expiresAt"),
         relogin_required_at: timestamp("refreshTokenExpiresAt"),
     })
@@ -4772,6 +4783,7 @@ fn stable_claude_slot_credential(
         oauth_account: initial_oauth_account,
         credential: initial_credential.unwrap_or(ClaudeOAuthCredential {
             access_token: None,
+            has_refresh_token: false,
             access_expires_at: None,
             relogin_required_at: None,
         }),
@@ -11887,7 +11899,7 @@ exit 1
     }
 
     #[test]
-    fn claude_oauth_token_parser_extracts_only_access_token() {
+    fn claude_oauth_token_parser_extracts_access_and_refresh_presence_only() {
         let payload = r#"{
           "claudeAiOauth": {
             "accessToken": " access-token ",
@@ -11900,6 +11912,28 @@ exit 1
             parse_claude_oauth_access_token(payload).as_deref(),
             Some("access-token")
         );
+        assert!(
+            parse_claude_oauth_credential(payload)
+                .expect("credential")
+                .has_refresh_token
+        );
+
+        let signed_out = r#"{
+          "claudeAiOauth": {
+            "accessToken": "",
+            "refreshToken": "   ",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": 1782750000000
+          }
+        }"#;
+        let credential = parse_claude_oauth_credential(signed_out).expect("signed-out shape");
+        assert!(credential.access_token.is_none());
+        assert!(!credential.has_refresh_token);
+        assert_eq!(
+            credential.access_expires_at.as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert!(credential.relogin_required_at.is_some());
     }
 
     #[test]
