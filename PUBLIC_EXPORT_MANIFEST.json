@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 329,
-  "content_sha256": "05862999212855225bb92f42e3d08ebec1183bd8f23b8c2d9407f96f5f548899",
+  "candidate_file_count": 330,
+  "content_sha256": "0aedd38ba8e8294ccc23150c929e35c85cec46397ad4b26b2b087f1e0c10f99a",
   "files": [
     {
       "executable": false,
@@ -643,8 +643,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "492d03947f51c70958c13d5aacfecb83ebccd46992c9bf249b0bece41b969336",
-      "size_bytes": 618311
+      "sha256": "c3dc6b6cc39a97c9b81bdce538de1884817e13b999f404e1605e7266dc1feb9e",
+      "size_bytes": 619635
     },
     {
       "executable": false,
@@ -671,8 +671,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_upkeep.rs",
-      "sha256": "99a177efee8c87fa284bec758b4c65cb1c1a50c3361140c8251ba6257560bd66",
-      "size_bytes": 55961
+      "sha256": "4ce44888adda219768f3582d553361880db97fde82b047f309a7e854cbbd0e04",
+      "size_bytes": 57893
     },
     {
       "executable": false,
@@ -713,8 +713,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_footprint.rs",
-      "sha256": "6be65628e124a414fe4b8b940bf4786c23c8435827242f597f7e39348d83ca3a",
-      "size_bytes": 52079
+      "sha256": "326bfe94711c3cf97ef2fffc9b4f6aa4825c17d65395652290ea3d5cc1e253eb",
+      "size_bytes": 57132
     },
     {
       "executable": false,
@@ -909,8 +909,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/claude-accounts.md",
-      "sha256": "6a3138082e35e75590a3509233887f9520cfee7fd439e0b7de716fba37cd983d",
-      "size_bytes": 11565
+      "sha256": "bd20feb13cf182d5d24c655a9060d72cd318dc338f95d0c3ea46fb4e5042dbfb",
+      "size_bytes": 11809
     },
     {
       "executable": false,
@@ -1436,6 +1436,13 @@
       "path": "docs/session-2026-08-17-codex-subagent-agent-label.md",
       "sha256": "3fcb279738394adb41cb6d5cb9c444916475f49591227bf106afcf55aa457cdd",
       "size_bytes": 1196
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-08-21-claude-empty-refresh-token.md",
+      "sha256": "b6f82cde038d18e27dbbf899ce565f73ebfe6d44483cd7f356a448345e173fa5",
+      "size_bytes": 1648
     },
     {
       "executable": false,
@@ -2306,9 +2313,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-17T18:15:09+00:00",
+  "generated_at": "2026-08-22T11:16:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 330,
+  "output_file_count": 331,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2342,5 +2349,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "51fb82cf2d6049b5cb3971714a598af161749f27"
+  "source_commit": "35270d4c232d577470ae151bb0d14d1692b3c22d"
 }
