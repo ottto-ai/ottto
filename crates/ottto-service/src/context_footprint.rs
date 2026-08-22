@@ -643,11 +643,9 @@ fn parse_context_markdown(markdown: &str) -> Result<ParsedContextFootprint> {
                     custom_agents.push(item);
                 }
             }
-            "mcp tools" => {
-                if mcp_tools.len() < MAX_MCP_TOOLS_PER_CAPTURE {
-                    if let Some(item) = parse_mcp_tool_row(&cells) {
-                        mcp_tools.push(item);
-                    }
+            "mcp tools" if mcp_tools.len() < MAX_MCP_TOOLS_PER_CAPTURE => {
+                if let Some(item) = parse_mcp_tool_row(&cells) {
+                    mcp_tools.push(item);
                 }
             }
             _ => {}
