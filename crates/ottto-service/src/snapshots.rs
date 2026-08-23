@@ -11800,21 +11800,7 @@ fn codex_state_timestamp(ms: Option<i64>, seconds: Option<i64>) -> Option<String
     bounded_rfc3339_millis(timestamp_ms)
 }
 
-fn load_codex_config_selector(path: &Path) -> SelectorCapture {
-    let Ok(file) = File::open(path) else {
-        return SelectorCapture::default();
-    };
-    let mut raw = String::new();
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            return SelectorCapture::default();
-        };
-        raw.push_str(line.as_str());
-        raw.push('\n');
-    }
-    let Ok(document) = raw.parse::<DocumentMut>() else {
-        return SelectorCapture::default();
-    };
+fn codex_config_selector(document: &DocumentMut) -> SelectorCapture {
     let mut selector = SelectorCapture::default();
     if let Some(service_tier) = document
         .get("service_tier")
@@ -11921,6 +11907,7 @@ impl CodexConfigDefaults {
 
 /// Read Codex `config.toml` into display-safe runtime defaults. Returns `None`
 /// when the file is missing, unparseable, or carries no relevant keys.
+#[cfg(test)]
 pub(crate) fn load_codex_config_defaults(path: &Path) -> Option<CodexConfigDefaults> {
     // Read line-by-line to satisfy the streaming guard (no whole-file reads in
     // this module); config.toml is small, so the accumulated string is fine.
@@ -11931,6 +11918,10 @@ pub(crate) fn load_codex_config_defaults(path: &Path) -> Option<CodexConfigDefau
         raw.push_str(line.as_str());
         raw.push('\n');
     }
+    parse_codex_config_defaults(&raw)
+}
+
+pub(crate) fn parse_codex_config_defaults(raw: &str) -> Option<CodexConfigDefaults> {
     let document = raw.parse::<DocumentMut>().ok()?;
     let read_top_str = |key: &str| {
         document
@@ -11964,7 +11955,7 @@ pub(crate) fn load_codex_config_defaults(path: &Path) -> Option<CodexConfigDefau
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     let fast_default_opt_out = top_level_opt_out || notice_opt_out;
-    let selector = load_codex_config_selector(path);
+    let selector = codex_config_selector(&document);
     let has_any = model.is_some()
         || service_tier.is_some()
         || reasoning_effort.is_some()

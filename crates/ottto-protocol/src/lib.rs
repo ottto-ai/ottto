@@ -1220,6 +1220,11 @@ impl AgentStatusSnapshot {
             .drain(..)
             .filter_map(redact_capability_for_backend)
             .collect();
+        for window in &mut self.quota_windows {
+            window.rate_limit_reached_type =
+                safe_optional_text(window.rate_limit_reached_type.take());
+            window.limit_id = safe_optional_text(window.limit_id.take());
+        }
         self.credit_balances = self
             .credit_balances
             .drain(..)
@@ -1526,6 +1531,16 @@ pub struct AgentQuotaWindow {
     /// Whether the provider marks this limit currently active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_active: Option<bool>,
+    /// Provider-reported spend-control state for the snapshot containing this
+    /// window. `None` means unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_control_reached: Option<bool>,
+    /// Provider-reported capacity-reached reason for this snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reached_type: Option<String>,
+    /// Stable provider limit identifier that owns this window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1605,8 +1620,8 @@ pub struct AgentCreditBalance {
     /// nominal credit figure remains. Additive and drift-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_control_reached: Option<bool>,
-    /// Provider-reported rate-limit-reached classifier (e.g. `primary`,
-    /// `secondary`), when the account has hit a limit. Free-form string.
+    /// Provider-reported capacity-reached classifier (for example,
+    /// `workspaceMemberCreditsDepleted`). Free-form string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_reached_type: Option<String>,
     /// Provider-reported limit identifier the balance is scoped to (e.g.
@@ -3329,7 +3344,9 @@ pub enum LocalControlCommand {
         schema_version: u16,
         operation_id: String,
     },
-    /// Remove a durable registration without deleting its credential home.
+    /// Remove a daemon-managed durable registration and permanently delete its
+    /// daemon-managed credential home. The default Codex home and external
+    /// user-owned directories are never deletion targets.
     CodexAccountRemove {
         schema_version: u16,
         slot_id: String,
