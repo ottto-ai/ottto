@@ -6,6 +6,7 @@ use ottto_protocol::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use thiserror::Error;
@@ -32,10 +33,19 @@ struct PersistedCodexAccountSlotsV1 {
     managed_slot_ids: Vec<String>,
     #[serde(default)]
     managed_bindings: BTreeMap<String, PersistedCodexAccountBindingV1>,
+    /// Slots whose managed credential trees must be removed before their
+    /// registry rows can be forgotten. This makes deletion restart-safe.
+    #[serde(default)]
+    deleting_managed_slot_ids: Vec<String>,
     #[serde(default)]
     setup_operation: CodexAccountSetupOperationV1,
     #[serde(default)]
     setup_preserves_accepted_binding: bool,
+    /// True after the workspace restriction is durable but before a fresh
+    /// restricted provider session has been accepted. The public operation
+    /// remains `validating` for backward-compatible clients.
+    #[serde(default)]
+    verifying_pinned_workspace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,8 +62,10 @@ impl Default for PersistedCodexAccountSlotsV1 {
             schema_version: CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
             managed_slot_ids: Vec::new(),
             managed_bindings: BTreeMap::new(),
+            deleting_managed_slot_ids: Vec::new(),
             setup_operation: CodexAccountSetupOperationV1::default(),
             setup_preserves_accepted_binding: false,
+            verifying_pinned_workspace: false,
         }
     }
 }
@@ -76,6 +88,7 @@ impl FileCodexAccountSlotSettingsStore {
     }
 
     pub fn load(&self) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        self.recover_pending_deletions()?;
         let persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
         Ok(status_contract(&persisted))
@@ -138,7 +151,8 @@ impl FileCodexAccountSlotSettingsStore {
             persisted.setup_operation.state,
             CodexAccountSetupOperationStateV1::WaitingForUserLogin
                 | CodexAccountSetupOperationStateV1::Validating
-        ) {
+        ) || persisted.verifying_pinned_workspace
+        {
             return Err(CodexAccountSlotSettingsError::Invalid(
                 "another Codex account setup operation is already active".to_string(),
             ));
@@ -212,16 +226,14 @@ impl FileCodexAccountSlotSettingsStore {
             expected_workspace_identifier_hash: Some(expected_workspace_identifier_hash),
             account_identifier_hash: None,
             workspace_identifier_hash: None,
-            launch_command: Some(format!(
-                "CODEX_HOME={} codex login",
-                shell_single_quote(home.to_string_lossy().as_ref())
-            )),
+            launch_command: Some(codex_login_command(&home)),
             message: Some(
                 "Complete the official Codex sign-in and select the intended workspace."
                     .to_string(),
             ),
         };
         persisted.setup_preserves_accepted_binding = false;
+        persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
     }
@@ -265,7 +277,8 @@ impl FileCodexAccountSlotSettingsStore {
             persisted.setup_operation.state,
             CodexAccountSetupOperationStateV1::WaitingForUserLogin
                 | CodexAccountSetupOperationStateV1::Validating
-        ) {
+        ) || persisted.verifying_pinned_workspace
+        {
             return Err(CodexAccountSlotSettingsError::Invalid(
                 "another Codex account setup operation is already active".to_string(),
             ));
@@ -291,15 +304,13 @@ impl FileCodexAccountSlotSettingsStore {
             expected_workspace_identifier_hash: Some(expected_workspace_identifier_hash),
             account_identifier_hash: None,
             workspace_identifier_hash: None,
-            launch_command: Some(format!(
-                "CODEX_HOME={} codex login",
-                shell_single_quote(home.to_string_lossy().as_ref())
-            )),
+            launch_command: Some(codex_login_command(&home)),
             message: Some(
                 "Sign in again through Codex for this exact account and workspace.".to_string(),
             ),
         };
         persisted.setup_preserves_accepted_binding = true;
+        persisted.verifying_pinned_workspace = false;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
     }
@@ -313,7 +324,9 @@ impl FileCodexAccountSlotSettingsStore {
         validate_setup_operation_id(operation_id)?;
         self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
-            if persisted.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
+            if persisted.setup_operation.state == CodexAccountSetupOperationStateV1::Complete
+                || persisted.verifying_pinned_workspace
+            {
                 return Ok(());
             }
             persisted.setup_operation.state = CodexAccountSetupOperationStateV1::Validating;
@@ -323,6 +336,10 @@ impl FileCodexAccountSlotSettingsStore {
         })
     }
 
+    /// Persist the provider-supported workspace restriction while leaving a
+    /// new binding unaccepted. A caller must perform a fresh provider
+    /// collection and call [`Self::complete_pinned_verification`] before the
+    /// connection becomes durable.
     pub fn finish_validation(
         &self,
         schema_version: u16,
@@ -361,10 +378,7 @@ impl FileCodexAccountSlotSettingsStore {
                 )
             })?;
             let home = self.slot_home(&slot_id)?;
-            persisted.setup_operation.launch_command = Some(format!(
-                "CODEX_HOME={} codex login",
-                shell_single_quote(home.to_string_lossy().as_ref())
-            ));
+            persisted.setup_operation.launch_command = Some(codex_login_command(&home));
             persisted.setup_operation.message = Some(
                 "Signed-in Codex account or workspace does not match the selected target."
                     .to_string(),
@@ -384,23 +398,82 @@ impl FileCodexAccountSlotSettingsStore {
             })?;
             let home = self.slot_home(&slot_id)?;
             write_codex_home_config(&home, Some(raw_workspace_id))?;
-            persisted
-                .managed_bindings
-                .get_mut(&slot_id)
-                .ok_or_else(|| {
-                    CodexAccountSlotSettingsError::State(
-                        "setup operation lost its Codex identity binding".to_string(),
-                    )
-                })?
-                .accepted = true;
-            persisted.setup_operation.state = CodexAccountSetupOperationStateV1::Complete;
+            if !persisted.setup_preserves_accepted_binding {
+                persisted
+                    .managed_bindings
+                    .get_mut(&slot_id)
+                    .ok_or_else(|| {
+                        CodexAccountSlotSettingsError::State(
+                            "setup operation lost its Codex identity binding".to_string(),
+                        )
+                    })?
+                    .accepted = false;
+            }
+            persisted.setup_operation.state = CodexAccountSetupOperationStateV1::Validating;
+            persisted.verifying_pinned_workspace = true;
             persisted.setup_operation.message = Some(
-                "Codex limits will remain available for this exact account and workspace."
-                    .to_string(),
+                "Verifying the restricted Codex workspace in a fresh provider session.".to_string(),
             );
         }
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
+    }
+
+    pub fn complete_pinned_verification(
+        &self,
+        schema_version: u16,
+        operation_id: &str,
+        account_identifier_hash: &str,
+        workspace_identifier_hash: &str,
+    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
+        validate_schema_version(schema_version)?;
+        validate_setup_operation_id(operation_id)?;
+        validate_strong_hash(account_identifier_hash, "account")?;
+        validate_strong_hash(workspace_identifier_hash, "workspace")?;
+        self.mutate(|persisted| {
+            require_setup_operation(persisted, operation_id)?;
+            if persisted.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
+                return Ok(());
+            }
+            if !persisted.verifying_pinned_workspace
+                || persisted.setup_operation.account_identifier_hash.as_deref()
+                    != Some(account_identifier_hash)
+                || persisted
+                    .setup_operation
+                    .workspace_identifier_hash
+                    .as_deref()
+                    != Some(workspace_identifier_hash)
+            {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "pinned Codex verification does not match the pending identity".to_string(),
+                ));
+            }
+            let slot_id = persisted
+                .setup_operation
+                .slot_id
+                .as_deref()
+                .ok_or_else(|| {
+                    CodexAccountSlotSettingsError::State(
+                        "pinned verification lost its Codex slot binding".to_string(),
+                    )
+                })?;
+            persisted
+                .managed_bindings
+                .get_mut(slot_id)
+                .ok_or_else(|| {
+                    CodexAccountSlotSettingsError::State(
+                        "pinned verification lost its Codex identity binding".to_string(),
+                    )
+                })?
+                .accepted = true;
+            persisted.setup_operation.state = CodexAccountSetupOperationStateV1::Complete;
+            persisted.verifying_pinned_workspace = false;
+            persisted.setup_operation.message = Some(
+                "Codex limits will remain available for this exact account and workspace."
+                    .to_string(),
+            );
+            Ok(())
+        })
     }
 
     pub fn fail_validation(
@@ -421,6 +494,7 @@ impl FileCodexAccountSlotSettingsStore {
                 }
             }
             persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupFailed;
+            persisted.verifying_pinned_workspace = false;
             persisted.setup_operation.launch_command = None;
             persisted.setup_operation.message = Some(message.to_string());
             Ok(())
@@ -437,6 +511,7 @@ impl FileCodexAccountSlotSettingsStore {
         self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             persisted.setup_operation.state = CodexAccountSetupOperationStateV1::SetupStopped;
+            persisted.verifying_pinned_workspace = false;
             persisted.setup_operation.launch_command = None;
             persisted.setup_operation.message = Some(
                 "Stopped waiting; the Codex home and provider credential were left untouched."
@@ -453,23 +528,33 @@ impl FileCodexAccountSlotSettingsStore {
     ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         validate_schema_version(schema_version)?;
         validate_opaque_slot_id(slot_id)?;
-        self.mutate(|persisted| {
-            let initial = persisted.managed_slot_ids.len();
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        if !persisted
+            .managed_slot_ids
+            .iter()
+            .any(|candidate| candidate == slot_id)
+        {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "unknown managed Codex account slot".to_string(),
+            ));
+        }
+        if !persisted
+            .deleting_managed_slot_ids
+            .iter()
+            .any(|candidate| candidate == slot_id)
+        {
             persisted
-                .managed_slot_ids
-                .retain(|candidate| candidate != slot_id);
-            if persisted.managed_slot_ids.len() == initial {
-                return Err(CodexAccountSlotSettingsError::Invalid(
-                    "unknown managed Codex account slot".to_string(),
-                ));
-            }
-            persisted.managed_bindings.remove(slot_id);
-            if persisted.setup_operation.slot_id.as_deref() == Some(slot_id) {
-                persisted.setup_operation = CodexAccountSetupOperationV1::default();
-                persisted.setup_preserves_accepted_binding = false;
-            }
-            Ok(())
-        })
+                .deleting_managed_slot_ids
+                .push(slot_id.to_string());
+            persisted.deleting_managed_slot_ids.sort();
+            self.write_persisted(&persisted)?;
+        }
+        self.delete_managed_slot_tree(slot_id)?;
+        finalize_managed_slot_deletion(&mut persisted, slot_id);
+        self.write_persisted(&persisted)?;
+        Ok(status_contract(&persisted))
     }
 
     pub fn slot_home(&self, slot_id: &str) -> Result<PathBuf, CodexAccountSlotSettingsError> {
@@ -503,6 +588,17 @@ impl FileCodexAccountSlotSettingsStore {
         Ok(persisted.setup_operation)
     }
 
+    pub fn is_verifying_pinned_workspace(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool, CodexAccountSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        require_setup_operation(&persisted, operation_id)?;
+        Ok(persisted.verifying_pinned_workspace)
+    }
+
     pub fn has_registered_binding(
         &self,
         account_identifier_hash: &str,
@@ -534,6 +630,29 @@ impl FileCodexAccountSlotSettingsStore {
         self.validate_persisted(&persisted)?;
         self.write_persisted(&persisted)?;
         Ok(status_contract(&persisted))
+    }
+
+    fn recover_pending_deletions(&self) -> Result<(), CodexAccountSlotSettingsError> {
+        let initial = self.read_persisted()?;
+        if initial.deleting_managed_slot_ids.is_empty() {
+            return Ok(());
+        }
+        let _transaction = self.transaction_lock()?;
+        let mut persisted = self.read_persisted()?;
+        self.validate_persisted(&persisted)?;
+        for slot_id in persisted.deleting_managed_slot_ids.clone() {
+            self.delete_managed_slot_tree(&slot_id)?;
+            finalize_managed_slot_deletion(&mut persisted, &slot_id);
+        }
+        self.write_persisted(&persisted)
+    }
+
+    fn delete_managed_slot_tree(&self, slot_id: &str) -> Result<(), CodexAccountSlotSettingsError> {
+        remove_managed_slot_tree_fd(&self.managed_accounts_root()?, slot_id).map_err(|error| {
+            CodexAccountSlotSettingsError::State(format!(
+                "delete managed Codex credential home: {error}"
+            ))
+        })
     }
 
     fn read_persisted(
@@ -600,6 +719,26 @@ impl FileCodexAccountSlotSettingsStore {
             validate_strong_hash(&binding.account_identifier_hash, "account")?;
             validate_strong_hash(&binding.workspace_identifier_hash, "workspace")?;
         }
+        let mut deleting = persisted.deleting_managed_slot_ids.clone();
+        for slot_id in &deleting {
+            validate_opaque_slot_id(slot_id)?;
+            if !persisted
+                .managed_slot_ids
+                .iter()
+                .any(|candidate| candidate == slot_id)
+            {
+                return Err(CodexAccountSlotSettingsError::Invalid(
+                    "Codex deletion tombstone references an unregistered slot".to_string(),
+                ));
+            }
+        }
+        deleting.sort();
+        deleting.dedup();
+        if deleting.len() != persisted.deleting_managed_slot_ids.len() {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "duplicate Codex deletion tombstone".to_string(),
+            ));
+        }
         if let Some(operation_id) = persisted.setup_operation.operation_id.as_deref() {
             validate_setup_operation_id(operation_id)?;
         }
@@ -634,6 +773,18 @@ impl FileCodexAccountSlotSettingsStore {
                     "reconnect state does not reference an accepted Codex binding".to_string(),
                 ));
             }
+        }
+        if persisted.verifying_pinned_workspace
+            && (persisted.setup_operation.state != CodexAccountSetupOperationStateV1::Validating
+                || persisted.setup_operation.account_identifier_hash.is_none()
+                || persisted
+                    .setup_operation
+                    .workspace_identifier_hash
+                    .is_none())
+        {
+            return Err(CodexAccountSlotSettingsError::Invalid(
+                "pinned Codex verification state is incomplete".to_string(),
+            ));
         }
         Ok(())
     }
@@ -764,6 +915,159 @@ fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsSta
     }
 }
 
+fn finalize_managed_slot_deletion(persisted: &mut PersistedCodexAccountSlotsV1, slot_id: &str) {
+    persisted
+        .managed_slot_ids
+        .retain(|candidate| candidate != slot_id);
+    persisted.managed_bindings.remove(slot_id);
+    persisted
+        .deleting_managed_slot_ids
+        .retain(|candidate| candidate != slot_id);
+    if persisted.setup_operation.slot_id.as_deref() == Some(slot_id) {
+        persisted.setup_operation = CodexAccountSetupOperationV1::default();
+        persisted.setup_preserves_accepted_binding = false;
+        persisted.verifying_pinned_workspace = false;
+    }
+}
+
+#[cfg(unix)]
+fn remove_managed_slot_tree_fd(managed_root: &Path, slot_id: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let parent = open_private_directory_chain(managed_root)?;
+    let name = CString::new(slot_id).expect("validated opaque slot id");
+    let root_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let root = unsafe { fs::File::from_raw_fd(root_fd) };
+    let mut opened_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(root.as_raw_fd(), opened_stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let opened_stat = unsafe { opened_stat.assume_init() };
+    if opened_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || opened_stat.st_uid != unsafe { libc::geteuid() }
+        || opened_stat.st_mode & 0o777 != 0o700
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed Codex slot root ownership or mode is unsafe",
+        ));
+    }
+    remove_directory_contents_fd(&root)?;
+    let mut linked_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            linked_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let linked_stat = unsafe { linked_stat.assume_init() };
+    if linked_stat.st_dev != opened_stat.st_dev || linked_stat.st_ino != opened_stat.st_ino {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed Codex slot root changed during deletion",
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    parent.sync_all()
+}
+
+#[cfg(unix)]
+fn remove_directory_contents_fd(directory: &fs::File) -> std::io::Result<()> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = (|| loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            return Ok(());
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let child = unsafe { fs::File::from_raw_fd(fd) };
+            remove_directory_contents_fd(&child)?;
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        } else if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    })();
+    unsafe { libc::closedir(stream) };
+    result
+}
+
+#[cfg(not(unix))]
+fn remove_managed_slot_tree_fd(managed_root: &Path, slot_id: &str) -> std::io::Result<()> {
+    fs::remove_dir_all(managed_root.join(slot_id))
+}
+
 fn require_setup_operation(
     persisted: &PersistedCodexAccountSlotsV1,
     operation_id: &str,
@@ -864,9 +1168,257 @@ fn write_codex_home_config(
         ));
     }
     body.push_str("\n[analytics]\nenabled = false\n");
-    crate::write_owner_only_file_atomic(&home.join("config.toml"), body.as_bytes()).map_err(
-        |error| CodexAccountSlotSettingsError::State(format!("write Codex home config: {error}")),
-    )
+    write_owner_only_file_at(home, "config.toml", body.as_bytes()).map_err(|error| {
+        CodexAccountSlotSettingsError::State(format!("write Codex home config: {error}"))
+    })
+}
+
+/// Read an exact Codex credential file without following any path component or
+/// final-file symlink. The credential home must be owner-controlled mode 0700;
+/// the file, when present, must be a regular owner-controlled mode 0600 file.
+pub fn read_codex_auth_file_secure(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    read_safe_file_at(home, "auth.json", true)
+}
+
+/// Read Codex configuration without following any path component or final-file
+/// symlink. Config must be a regular owner-controlled file and must not be
+/// group- or world-writable. Unlike `auth.json`, an existing config may be
+/// mode 0644 because Codex historically creates non-secret config that way.
+pub fn read_codex_config_file_secure(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    read_safe_file_at(home, "config.toml", false)
+}
+
+fn reject_cloud_sync_root(path: &Path) -> std::io::Result<()> {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let cloud_component = components.iter().any(|component| {
+        component == "mobile documents"
+            || component == "cloudstorage"
+            || component == "dropbox"
+            || component.starts_with("onedrive")
+            || component == "google drive"
+            || component.starts_with("googledrive")
+    });
+    if cloud_component {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Codex credential homes cannot be stored under a cloud-sync root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_directory_chain(path: &Path) -> std::io::Result<fs::File> {
+    open_directory_chain(path, true)
+}
+
+#[cfg(unix)]
+fn open_directory_chain(path: &Path, final_private: bool) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    reject_cloud_sync_root(path)?;
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Codex credential home must be absolute",
+        ));
+    }
+    let mut directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    let mut components = path.components().peekable();
+    let _ = components.next();
+    while let Some(component) = components.next() {
+        let name = CString::new(component.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in credential path")
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let next = unsafe { fs::File::from_raw_fd(fd) };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(next.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        let mode = stat.st_mode & 0o777;
+        let current_uid = unsafe { libc::geteuid() };
+        let is_home = final_private && components.peek().is_none();
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || (is_home && (stat.st_uid != current_uid || mode != 0o700))
+            || (!is_home && ((stat.st_uid != current_uid && stat.st_uid != 0) || mode & 0o022 != 0))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Codex credential path ownership or mode is unsafe",
+            ));
+        }
+        directory = next;
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_private_directory_chain(path: &Path) -> std::io::Result<fs::File> {
+    reject_cloud_sync_root(path)?;
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn read_safe_file_at(
+    home: &Path,
+    name: &str,
+    require_mode_0600: bool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let directory = open_private_directory_chain(home)?;
+    let name = CString::new(name).expect("static Codex file name");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mode = metadata.permissions().mode() & 0o777;
+    let unsafe_mode = if require_mode_0600 {
+        mode != 0o600
+    } else {
+        mode & 0o022 != 0 || mode & 0o400 == 0
+    };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || unsafe_mode
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Codex credential file ownership, type, or mode is unsafe",
+        ));
+    }
+    if metadata.len() > 4 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex credential file is too large",
+        ));
+    }
+    let mut body = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut body)?;
+    Ok(Some(body))
+}
+
+#[cfg(not(unix))]
+fn read_safe_file_at(
+    home: &Path,
+    name: &str,
+    _require_mode_0600: bool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(home.join(name)) {
+        Ok(body) => Ok(Some(body)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn write_owner_only_file_at(home: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let directory = open_private_directory_chain(home)?;
+    let target = CString::new(name).expect("static Codex file name");
+    let existing = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if existing >= 0 {
+        let existing = unsafe { fs::File::from_raw_fd(existing) };
+        let metadata = existing.metadata()?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if !metadata.file_type().is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "existing Codex config ownership, type, or mode is unsafe",
+            ));
+        }
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    let nonce = crate::generate_control_token().map_err(std::io::Error::other)?;
+    let temp_name = CString::new(format!(".{name}.{}.tmp", &nonce[..16])).expect("temp name");
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut temp = unsafe { fs::File::from_raw_fd(fd) };
+    let result = temp.write_all(bytes).and_then(|()| temp.sync_all());
+    drop(temp);
+    if let Err(error) = result {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+        return Err(error);
+    }
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+        return Err(error);
+    }
+    directory.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_owner_only_file_at(home: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    crate::write_owner_only_file_atomic(&home.join(name), bytes)
 }
 
 fn ensure_managed_directory(path: &Path) -> Result<(), CodexAccountSlotSettingsError> {
@@ -901,10 +1453,27 @@ fn create_managed_slot_directory(path: &Path) -> Result<bool, CodexAccountSlotSe
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path)
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+
+        reject_cloud_sync_root(path)?;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory has no parent")
+        })?;
+        let directory = open_directory_chain(parent, false)?;
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "directory has no file name",
+            )
+        })?;
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        directory.sync_all()
     }
     #[cfg(not(unix))]
     {
@@ -915,38 +1484,11 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
 fn verify_private_directory_descriptor(path: &Path) -> Result<(), CodexAccountSlotSettingsError> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
-        let directory = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|error| {
-                CodexAccountSlotSettingsError::State(format!(
-                    "open managed Codex account directory safely: {error}"
-                ))
-            })?;
-        let fd = directory.as_raw_fd();
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-            return Err(CodexAccountSlotSettingsError::State(format!(
-                "inspect managed Codex account directory: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || stat.st_uid != unsafe { libc::geteuid() }
-        {
-            return Err(CodexAccountSlotSettingsError::State(
-                "managed Codex account path is not an owner-controlled directory".to_string(),
-            ));
-        }
-        if unsafe { libc::fchmod(fd, 0o700) } != 0 {
-            return Err(CodexAccountSlotSettingsError::State(format!(
-                "protect managed Codex account directory: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        open_private_directory_chain(path).map_err(|error| {
+            CodexAccountSlotSettingsError::State(format!(
+                "open managed Codex account directory safely: {error}"
+            ))
+        })?;
     }
     #[cfg(not(unix))]
     {
@@ -968,6 +1510,11 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn codex_login_command(home: &Path) -> String {
+    let home = shell_single_quote(home.to_string_lossy().as_ref());
+    format!("CODEX_HOME={home} CODEX_SQLITE_HOME={home} codex login")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,6 +1530,12 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
+        }
+        let root = root.canonicalize().expect("canonical test root");
         let store = FileCodexAccountSlotSettingsStore::new(
             root.join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
         );
@@ -1019,11 +1572,204 @@ mod tests {
         assert!(config.contains("cli_auth_credentials_store = \"file\""));
         assert!(config.contains("forced_login_method = \"chatgpt\""));
         assert!(!config.contains("forced_chatgpt_workspace_id"));
+        assert_eq!(
+            first.setup_operation.launch_command.as_deref(),
+            Some(codex_login_command(&home).as_str())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_preexisting_credential_root_is_rejected_without_mode_repair() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, store) = test_store("unsafe-root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).expect("unsafe mode");
+        let result = store.prepare_managed_account(
+            CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            format!("codex_setup_{}", "1".repeat(32)),
+            "2".repeat(64),
+            "3".repeat(64),
+        );
+
+        assert!(
+            result.is_err(),
+            "unsafe pre-existing state must fail closed"
+        );
+        assert_eq!(
+            fs::metadata(&root)
+                .expect("root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777,
+            "validation must not chmod-repair unsafe state"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("cleanup mode");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_credential_ancestor_is_rejected_component_by_component() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "ottto-codex-slots-unsafe-ancestor-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let ancestor = base.join("unsafe-parent");
+        let support = ancestor.join("support");
+        fs::create_dir_all(&support).expect("nested support root");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("private base");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).expect("unsafe ancestor");
+        fs::set_permissions(&support, fs::Permissions::from_mode(0o700)).expect("private support");
+        let store = FileCodexAccountSlotSettingsStore::new(
+            support.join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
+        );
+
+        assert!(store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "a".repeat(32)),
+                "b".repeat(64),
+                "c".repeat(64),
+            )
+            .is_err());
+        assert_eq!(
+            fs::metadata(&ancestor)
+                .expect("ancestor metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777,
+            "ancestor validation must not repair unsafe state"
+        );
+
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).expect("cleanup mode");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_sync_credential_root_and_unsafe_auth_file_are_rejected() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (root, _) = test_store("cloud-root");
+        let cloud_support = root.join("Dropbox").join("Ottto");
+        fs::create_dir_all(&cloud_support).expect("cloud fixture");
+        fs::set_permissions(root.join("Dropbox"), fs::Permissions::from_mode(0o700))
+            .expect("cloud parent mode");
+        fs::set_permissions(&cloud_support, fs::Permissions::from_mode(0o700))
+            .expect("cloud support mode");
+        let cloud_store = FileCodexAccountSlotSettingsStore::new(
+            cloud_support.join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
+        );
+        assert!(cloud_store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "4".repeat(32)),
+                "5".repeat(64),
+                "6".repeat(64),
+            )
+            .is_err());
+
+        let (safe_root, safe_store) = test_store("unsafe-auth");
+        let prepared = safe_store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "7".repeat(32)),
+                "8".repeat(64),
+                "9".repeat(64),
+            )
+            .expect("prepare safe home");
+        let home = safe_store
+            .slot_home(&prepared.managed_slots[0].slot_id)
+            .expect("home");
+        fs::write(home.join("auth.json"), b"{}").expect("auth fixture");
+        assert!(
+            read_codex_auth_file_secure(&home).is_err(),
+            "0644 auth must fail"
+        );
+        fs::remove_file(home.join("auth.json")).expect("remove mode fixture");
+        let outside = safe_root.join("outside-auth");
+        fs::write(&outside, b"{}").expect("outside fixture");
+        symlink(&outside, home.join("auth.json")).expect("auth symlink");
+        assert!(
+            read_codex_auth_file_secure(&home).is_err(),
+            "auth symlink must fail"
+        );
+        fs::remove_file(home.join("auth.json")).expect("remove auth symlink");
+        fs::remove_file(home.join("config.toml")).expect("remove config fixture");
+        symlink(&outside, home.join("config.toml")).expect("config symlink");
+        assert!(
+            read_codex_config_file_secure(&home).is_err(),
+            "config symlink must fail"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(safe_root);
+    }
+
+    #[test]
+    fn pinned_workspace_verification_resumes_unaccepted_after_restart() {
+        let (root, store) = test_store("pinned-restart");
+        let operation = format!("codex_setup_{}", "a".repeat(32));
+        store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                operation.clone(),
+                "b".repeat(64),
+                "c".repeat(64),
+            )
+            .expect("prepare");
+        let verifying = store
+            .finish_validation(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                &operation,
+                "b".repeat(64),
+                "c".repeat(64),
+                "synthetic_workspace",
+                false,
+            )
+            .expect("persist pin");
+        assert_eq!(
+            verifying.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Validating
+        );
+        assert!(store
+            .is_verifying_pinned_workspace(&operation)
+            .expect("pinned phase"));
+        assert!(!store.registered_bindings().expect("bindings")[0].accepted);
+
+        let restarted = FileCodexAccountSlotSettingsStore::new(store.path.clone());
+        let resumed = restarted
+            .begin_validation(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, &operation)
+            .expect("resume after restart");
+        assert_eq!(
+            resumed.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Validating
+        );
+        assert!(restarted
+            .is_verifying_pinned_workspace(&operation)
+            .expect("resumed pinned phase"));
+        assert!(!restarted.registered_bindings().expect("bindings")[0].accepted);
+        restarted
+            .complete_pinned_verification(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                &operation,
+                &"b".repeat(64),
+                &"c".repeat(64),
+            )
+            .expect("complete after fresh verification");
+        assert!(restarted.registered_bindings().expect("bindings")[0].accepted);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn exact_completion_pins_workspace_and_removal_preserves_home() {
+    fn managed_removal_deletes_only_managed_home_and_preserves_default_bytes() {
         let (root, store) = test_store("complete");
         let operation = format!("codex_setup_{}", "d".repeat(32));
         let prepared = store
@@ -1036,7 +1782,7 @@ mod tests {
             .expect("prepare");
         let slot_id = prepared.managed_slots[0].slot_id.clone();
         let home = store.slot_home(&slot_id).expect("home");
-        let complete = store
+        let verifying = store
             .finish_validation(
                 CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
                 &operation,
@@ -1046,6 +1792,22 @@ mod tests {
                 false,
             )
             .expect("complete");
+        assert_eq!(
+            verifying.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Validating
+        );
+        assert!(store
+            .is_verifying_pinned_workspace(&operation)
+            .expect("pinned phase"));
+        assert!(!store.registered_bindings().expect("bindings")[0].accepted);
+        let complete = store
+            .complete_pinned_verification(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                &operation,
+                &"e".repeat(64),
+                &"f".repeat(64),
+            )
+            .expect("complete pinned verification");
         assert_eq!(
             complete.setup_operation.state,
             CodexAccountSetupOperationStateV1::Complete
@@ -1090,11 +1852,62 @@ mod tests {
             store.registered_bindings().expect("bindings")[0].accepted,
             "a failed reconnect must preserve the prior durable registration"
         );
+        let default_home = root.join("default-codex-home");
+        fs::create_dir(&default_home).expect("default home fixture");
+        let default_bytes = b"synthetic-default-credential-bytes";
+        fs::write(default_home.join("auth.json"), default_bytes).expect("default fixture");
+        let outside = root.join("external-credential");
+        fs::write(&outside, b"synthetic-external-credential").expect("external fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&outside, home.join("credential-link")).expect("managed symlink fixture");
+        }
         let removed = store
             .remove(CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION, &slot_id)
             .expect("remove");
         assert!(removed.managed_slots.is_empty());
-        assert!(home.is_dir());
+        assert!(!home.exists(), "managed credential home must be deleted");
+        assert_eq!(
+            fs::read(default_home.join("auth.json")).expect("unchanged default fixture"),
+            default_bytes
+        );
+        assert_eq!(
+            fs::read(&outside).expect("external credential preserved"),
+            b"synthetic-external-credential"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_removal_tombstone_recovers_after_restart() {
+        let (root, store) = test_store("remove-recovery");
+        let prepared = store
+            .prepare_managed_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "d".repeat(32)),
+                "e".repeat(64),
+                "f".repeat(64),
+            )
+            .expect("prepare");
+        let slot_id = prepared.managed_slots[0].slot_id.clone();
+        let home = store.slot_home(&slot_id).expect("managed home");
+        let mut persisted = store.read_persisted().expect("persisted state");
+        persisted.deleting_managed_slot_ids.push(slot_id.clone());
+        store
+            .write_persisted(&persisted)
+            .expect("deletion tombstone");
+        fs::remove_dir_all(&home).expect("simulate crash after deleting credential home");
+
+        let restarted = FileCodexAccountSlotSettingsStore::new(store.path.clone());
+        let recovered = restarted.load().expect("restart recovery");
+        assert!(recovered.managed_slots.is_empty());
+        assert!(!home.exists());
+        assert!(restarted
+            .read_persisted()
+            .expect("recovered state")
+            .deleting_managed_slot_ids
+            .is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1139,6 +1952,14 @@ mod tests {
                 workspace.clone(),
                 "workspace_accepted",
                 false,
+            )
+            .expect("pin binding");
+        store
+            .complete_pinned_verification(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                &second_operation,
+                &account,
+                &workspace,
             )
             .expect("accept binding");
 

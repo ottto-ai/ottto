@@ -1693,6 +1693,51 @@ fn check_codex_account(
             "Codex setup operation has no durable connection slot".to_string(),
         )
     })?;
+    if store
+        .is_verifying_pinned_workspace(operation_id)
+        .map_err(codex_account_slot_settings_error)?
+    {
+        let account_hash = operation
+            .account_identifier_hash
+            .as_deref()
+            .ok_or_else(|| {
+                LocalApiError::InvalidRequest(
+                    "Pinned Codex verification has no account identity.".to_string(),
+                )
+            })?;
+        let workspace_hash = operation
+            .workspace_identifier_hash
+            .as_deref()
+            .ok_or_else(|| {
+                LocalApiError::InvalidRequest(
+                    "Pinned Codex verification has no workspace identity.".to_string(),
+                )
+            })?;
+        return match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
+            Ok((pinned, _))
+                if pinned.account_identifier_hash == account_hash
+                    && pinned.workspace_identifier_hash == workspace_hash =>
+            {
+                store
+                    .complete_pinned_verification(
+                        schema_version,
+                        operation_id,
+                        account_hash,
+                        workspace_hash,
+                    )
+                    .map_err(codex_account_slot_settings_error)
+                    .map(crate::agent_status::annotate_codex_accounts_status)
+            }
+            _ => store
+                .fail_validation(
+                    schema_version,
+                    operation_id,
+                    "Codex workspace restriction did not survive a fresh provider restart.",
+                )
+                .map_err(codex_account_slot_settings_error)
+                .map(crate::agent_status::annotate_codex_accounts_status),
+        };
+    }
     let (identity, _) = match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id)
     {
         Ok(result) => result,
@@ -1720,11 +1765,25 @@ fn check_codex_account(
             duplicate,
         )
         .map_err(codex_account_slot_settings_error)?;
-    if status.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
+    if store
+        .is_verifying_pinned_workspace(operation_id)
+        .map_err(codex_account_slot_settings_error)?
+    {
         match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
             Ok((pinned, _))
                 if pinned.account_identifier_hash == identity.account_identifier_hash
-                    && pinned.workspace_identifier_hash == identity.workspace_identifier_hash => {}
+                    && pinned.workspace_identifier_hash == identity.workspace_identifier_hash =>
+            {
+                return store
+                    .complete_pinned_verification(
+                        schema_version,
+                        operation_id,
+                        &identity.account_identifier_hash,
+                        &identity.workspace_identifier_hash,
+                    )
+                    .map_err(codex_account_slot_settings_error)
+                    .map(crate::agent_status::annotate_codex_accounts_status);
+            }
             _ => {
                 return store
                     .fail_validation(
