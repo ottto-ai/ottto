@@ -8,10 +8,12 @@ Review tier: `official`
 - `otel_config` requires setup and user/org telemetry controls before live telemetry is enabled.
 - `quota_status` requires setup. It should prefer the local Codex app-server
   `account/rateLimits/read` protocol for quota windows and ChatGPT credit
-  balance metadata. Any older/private quota path that reads the local Codex
-  OAuth credential or calls an undocumented ChatGPT usage endpoint remains
-  setup-gated and must redact local paths, account secrets, and token material
-  from all uploads.
+  balance metadata. Explicit durable connections may decode ID-token claims
+  from their exact owner-only `CODEX_HOME` solely to hash the ChatGPT user and
+  active workspace and to configure Codex's supported workspace restriction.
+  Any older/private quota path that calls an undocumented ChatGPT usage
+  endpoint remains disabled for durable connections and must redact local
+  paths, account secrets, and token material from all uploads.
 - `identity_probe` requires setup because `~/.codex/auth.json` is the file that also stores OAuth access / refresh / id tokens; reading the file at all is classified as a hidden-credential-file read by the connector-manifest safety rules. Once the user enables it, the probe subprocesses `codex doctor --json` and reads `~/.codex/auth.json` solely to derive a hashed `tokens.account_id`. Token bytes (access/refresh/id) are never read into memory. Keychain is never accessed. The fsevents watcher fires only when `tokens.account_id` changes (full OpenAI user swap), not for Personal-vs-Team toggling.
 - `cloud_sessions` requires explicit setup. Its single supervisor starts normally but remains inert until a versioned local grant exactly matches the connected user, organization, and Codex relay device. It invokes only the officially documented, upstream-experimental `codex cloud list --json` command as the effective user, with local pause/revoke, a runtime kill switch, bounded pagination, and a grant-epoch-scoped circuit breaker. Every provider cycle first requires one bounded authenticated backend grant-list result for the exact bound grant; only a strict `server_policy_state: "approved"` response permits that cycle to invoke Codex. Missing/unknown policy, disabled/revoked grants, list absence, authentication failure, and network or parse errors fail closed before provider invocation. Healthy polling is limited to one cycle every five minutes plus up to 20 seconds of jitter; semantic no-ops suppress unchanged uploads and failures use exponential circuit backoff. It does not read `auth.json`, browser state, OpenAI provider credentials, or provider endpoints directly. After consent, exact local identity, and trusted relay destination checks, it loads only Ottto's existing relay device binding and device secret from local credential storage to authenticate the Ottto backend; that secret remains in memory and never enters browser control payloads, logs, checkpoints, or observation wire data. Later consent or server approval activates the existing supervisor on its next cycle without daemon restart. `ottto-service cloud-sessions-status --json` reflects local grant/policy/readiness; `provider_cli_invocation_permitted` becomes true only when those local runtime checks are complete, while backend authority is still revalidated immediately before provider admission.
 
@@ -28,6 +30,10 @@ Review tier: `official`
   `individualLimit` may be represented separately as
   `workspace_monthly_credits`, preserving only used/quota/remaining,
   utilization, reset, status, and safe limit metadata.
+- Authenticated local control may create owner-only Codex homes, launch the
+  official `codex login` flow, and accept a durable connection only after an
+  exact user/workspace match plus a fresh post-restriction App Server read.
+  The normal default home remains additive and user-controlled.
 - The documented `codex doctor --json` CLI may be subprocessed by `identity_probe`. Only `auth.credentials.details` fields that do not expose token bytes (`auth storage mode`, `stored auth mode`, presence flags) may be parsed.
 - The officially documented, upstream-experimental `codex cloud list --json` CLI may be subprocessed by `cloud_sessions` after explicit setup. Only task identity (immediately HMAC-transformed), lifecycle, safe timestamps, attempt count, and a closed normalized environment kind are emitted.
 - Any nonempty provider page containing a row without valid task identity and status strings is rejected locally as `provider_payload_invalid`; it cannot be reported as an empty healthy collection or fabricate mandatory status coverage. The strict backend health wire uses only the allowed coarse `provider_error` category; local detail never crosses that boundary.
@@ -37,6 +43,8 @@ Review tier: `official`
 ## Undocumented Surfaces
 
 - Do not scrape browser sessions, cookies, private web UI state, or account pages.
+- Do not automate passwords or MFA, pool entitlements, rotate work to evade a
+  provider limit, or treat two subscriptions as one combined allowance.
 - Do not default-enable quota/status probes that read `auth.json` token material or call private ChatGPT endpoints.
 - Do not infer undocumented selector fields from model names or provider identity.
 - Do not add static platform fields to the manifest. Runtime operation state reports unsupported or degraded local availability.

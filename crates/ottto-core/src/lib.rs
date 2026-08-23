@@ -2,6 +2,7 @@ pub mod account_store;
 pub mod claude_account;
 pub mod claude_config_slots;
 pub mod claude_statusline;
+pub mod codex_account_slots;
 pub mod lifecycle;
 pub mod local_client;
 pub mod local_service;
@@ -45,6 +46,11 @@ pub use claude_statusline::{
     CLAUDE_STATUSLINE_CONTEXT_CACHE_FILE_NAME, CLAUDE_STATUSLINE_CONTEXT_HISTORY_FILE_NAME,
     CLAUDE_STATUSLINE_CONTEXT_HISTORY_MAX_SAMPLES,
     CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
+};
+pub use codex_account_slots::{
+    CodexAccountSlotSettingsError, CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
+    CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME, CODEX_MANAGED_ACCOUNTS_DIR_NAME,
+    MAX_CODEX_ACCOUNT_SLOTS, MAX_MANAGED_CODEX_ACCOUNT_SLOTS,
 };
 pub use lifecycle::{
     execute_local_uninstall, launch_agent_path, launchd_target, local_lifecycle_home_dir,

@@ -26,6 +26,9 @@ CLI and `ottto-service` daemon, not private development scripts.
 - [Claude Accounts](claude-accounts.md): default and registered credential
   slots, full-meter identity gates, partial statusLine data, and local failure
   isolation.
+- [Codex Accounts](codex-accounts.md): additive default and durable
+  connections, exact user/workspace validation, quota collection, and
+  duplicate prevention.
 - [Release Verification](release-verification.md): checksums, signing,
   notarization, SBOM, and provenance checks.
 - [Troubleshooting](troubleshooting.md): common exit codes and recovery steps.

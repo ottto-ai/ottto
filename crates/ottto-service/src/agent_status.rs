@@ -7,7 +7,7 @@ use ottto_core::{
     read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
     ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
     ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache,
-    FileClaudeConfigSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
+    FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -24,7 +24,10 @@ use ottto_protocol::{
     ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1, ClaudeConfigSlotOwnership,
     ClaudeConfigSlotQuotaSnapshotStateV1, ClaudeConfigSlotQuotaSnapshotV1,
     ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState, ClaudeUnresolvedAccountDescriptorV1,
-    ClaudeUnresolvedAccountEvidenceKind, SourceKind,
+    ClaudeUnresolvedAccountEvidenceKind, CodexAccountSlotCollectionStateV1,
+    CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotDiagnosticV1,
+    CodexAccountSlotOwnershipV1, CodexAccountSlotQuotaSnapshotV1, CodexAccountSlotRelationshipV1,
+    CodexAccountsStatusV1, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -139,6 +142,32 @@ struct CodexAuthCredentials {
 struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
+}
+
+/// Strong active Codex identity from one exact credential home. This type is
+/// intentionally neither `Debug` nor serializable because the raw workspace
+/// id is needed only to write Codex's supported workspace restriction after a
+/// target-bound setup succeeds.
+pub(crate) struct CodexStrongIdentity {
+    pub(crate) account_identifier_hash: String,
+    pub(crate) workspace_identifier_hash: String,
+    pub(crate) raw_workspace_id: String,
+}
+
+#[derive(Clone)]
+struct CodexHomeSlot {
+    slot_id: String,
+    ownership: CodexAccountSlotOwnershipV1,
+    home: PathBuf,
+    registered_binding: Option<(String, String)>,
+}
+
+struct CodexSlotCandidate {
+    slot: CodexHomeSlot,
+    snapshot: AgentStatusSnapshot,
+    status: CodexAccountSlotCollectionStatusV1,
+    binding: Option<(String, String)>,
+    quality: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -725,9 +754,7 @@ pub(crate) fn collect_agent_status_collection(
     expires_at: String,
 ) -> AgentStatusCollection {
     match source {
-        SourceKind::Codex => {
-            single_agent_status_collection(collect_codex_status(captured_at, expires_at))
-        }
+        SourceKind::Codex => collect_codex_status_snapshots(captured_at, expires_at),
         SourceKind::ClaudeCode => collect_claude_status_snapshots(captured_at, expires_at),
         SourceKind::Pi => {
             single_agent_status_collection(collect_pi_status(captured_at, expires_at))
@@ -739,6 +766,415 @@ fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusC
     AgentStatusCollection {
         snapshots: vec![snapshot.clone()],
         source_health_snapshot: snapshot,
+    }
+}
+
+fn collect_codex_status_snapshots(
+    captured_at: String,
+    expires_at: String,
+) -> AgentStatusCollection {
+    let settings = FileCodexAccountSlotSettingsStore::default()
+        .load()
+        .unwrap_or_else(|_| empty_codex_accounts_status());
+    let (mut status, mut candidates) =
+        collect_codex_slot_candidates(settings, &captured_at, &expires_at);
+    canonicalize_codex_candidates(&mut candidates);
+    apply_codex_candidate_statuses(&mut status, &candidates);
+
+    let mut snapshots = Vec::new();
+    let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(binding) = candidate.binding.clone() else {
+            continue;
+        };
+        let replace = winning_by_binding.get(&binding).map_or(true, |current| {
+            codex_candidate_is_better(candidate, &candidates[*current])
+        });
+        if replace {
+            winning_by_binding.insert(binding, index);
+        }
+    }
+    for index in winning_by_binding.into_values() {
+        snapshots.push(candidates[index].snapshot.clone());
+    }
+
+    let source_health_snapshot =
+        codex_source_health_snapshot(&candidates, &captured_at, &expires_at);
+    if snapshots.is_empty() {
+        snapshots.push(source_health_snapshot.clone());
+    }
+    AgentStatusCollection {
+        snapshots,
+        source_health_snapshot,
+    }
+}
+
+fn codex_source_health_snapshot(
+    candidates: &[CodexSlotCandidate],
+    captured_at: &str,
+    expires_at: &str,
+) -> AgentStatusSnapshot {
+    let mut source_health_snapshot = candidates
+        .iter()
+        .find(|candidate| candidate.slot.slot_id == "default")
+        .map(|candidate| candidate.snapshot.clone())
+        .unwrap_or_else(|| {
+            not_installed_snapshot(
+                SourceKind::Codex,
+                "codex",
+                captured_at.to_string(),
+                expires_at.to_string(),
+            )
+        });
+    let custom_needs_attention = candidates.iter().any(|candidate| {
+        candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
+            && !matches!(
+                candidate.status.state,
+                CodexAccountSlotCollectionStateV1::Fresh
+                    | CodexAccountSlotCollectionStateV1::DuplicateAccount
+            )
+    });
+    if !custom_needs_attention && source_health_snapshot.status != AgentStatusState::Available {
+        if let Some(healthy_anchor) = candidates.iter().find(|candidate| {
+            candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
+                && candidate.status.state == CodexAccountSlotCollectionStateV1::Fresh
+        }) {
+            source_health_snapshot = healthy_anchor.snapshot.clone();
+        }
+    }
+    if custom_needs_attention {
+        source_health_snapshot.status = AgentStatusState::Degraded;
+        source_health_snapshot
+            .diagnostics
+            .push(AgentStatusDiagnostic::source(
+                "codex_registered_slot_needs_attention",
+                AgentDiagnosticSeverity::Warning,
+                "One or more durable Codex account connections need local attention; healthy accounts continue collecting independently.",
+            ));
+    }
+    source_health_snapshot
+}
+
+pub(crate) fn annotate_codex_accounts_status(
+    status: CodexAccountsStatusV1,
+) -> CodexAccountsStatusV1 {
+    let captured_at = crate::current_rfc3339_timestamp();
+    let expires_at = captured_at.clone();
+    let (mut status, mut candidates) =
+        collect_codex_slot_candidates(status, &captured_at, &expires_at);
+    canonicalize_codex_candidates(&mut candidates);
+    apply_codex_candidate_statuses(&mut status, &candidates);
+    status
+}
+
+pub(crate) fn collect_registered_codex_slot_for_setup(
+    slot_id: &str,
+) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), String> {
+    let store = FileCodexAccountSlotSettingsStore::default();
+    let home = store
+        .slot_home(slot_id)
+        .map_err(|_| "Codex durable connection state is unavailable.".to_string())?;
+    let captured_at = crate::current_rfc3339_timestamp();
+    let snapshot = collect_codex_status_for_home(captured_at.clone(), captured_at, &home, false);
+    let identity = read_codex_strong_identity_for_home(&home).ok_or_else(|| {
+        "Codex sign-in has not produced a complete account and workspace identity.".to_string()
+    })?;
+    let status = codex_collection_status_from_snapshot(&snapshot);
+    if status.state != CodexAccountSlotCollectionStateV1::Fresh
+        || status.account_identifier_hash.as_deref()
+            != Some(identity.account_identifier_hash.as_str())
+        || status.workspace_identifier_hash.as_deref()
+            != Some(identity.workspace_identifier_hash.as_str())
+    {
+        return Err(
+            "Codex sign-in is present, but fresh quota for its exact account and workspace is not yet available."
+                .to_string(),
+        );
+    }
+    Ok((identity, status))
+}
+
+fn collect_codex_slot_candidates(
+    status: CodexAccountsStatusV1,
+    captured_at: &str,
+    expires_at: &str,
+) -> (CodexAccountsStatusV1, Vec<CodexSlotCandidate>) {
+    let store = FileCodexAccountSlotSettingsStore::default();
+    let mut slots = vec![CodexHomeSlot {
+        slot_id: "default".to_string(),
+        ownership: CodexAccountSlotOwnershipV1::Default,
+        home: default_codex_home(),
+        registered_binding: None,
+    }];
+    let registered = store
+        .registered_bindings()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|binding| binding.accepted)
+        .map(|binding| (binding.slot_id.clone(), binding))
+        .collect::<BTreeMap<_, _>>();
+    for descriptor in &status.managed_slots {
+        if let Some(binding) = registered.get(&descriptor.slot_id) {
+            let Ok(home) = store.slot_home(&descriptor.slot_id) else {
+                continue;
+            };
+            slots.push(CodexHomeSlot {
+                slot_id: descriptor.slot_id.clone(),
+                ownership: CodexAccountSlotOwnershipV1::Managed,
+                home,
+                registered_binding: Some((
+                    binding.account_identifier_hash.clone(),
+                    binding.workspace_identifier_hash.clone(),
+                )),
+            });
+        }
+    }
+    let candidates = thread::scope(|scope| {
+        let handles = slots
+            .into_iter()
+            .map(|slot| {
+                scope.spawn(move || collect_codex_home_candidate(slot, captured_at, expires_at))
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
+    (status, candidates)
+}
+
+fn collect_codex_home_candidate(
+    slot: CodexHomeSlot,
+    captured_at: &str,
+    expires_at: &str,
+) -> CodexSlotCandidate {
+    let mut snapshot = collect_codex_status_for_home(
+        captured_at.to_string(),
+        expires_at.to_string(),
+        &slot.home,
+        slot.ownership == CodexAccountSlotOwnershipV1::Default,
+    );
+    let mut status = codex_collection_status_from_snapshot(&snapshot);
+    let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
+    let quality = codex_snapshot_quality(&snapshot, &status);
+    CodexSlotCandidate {
+        slot,
+        snapshot,
+        status,
+        binding,
+        quality,
+    }
+}
+
+fn enforce_codex_registered_binding(
+    slot: &CodexHomeSlot,
+    snapshot: &mut AgentStatusSnapshot,
+    status: &mut CodexAccountSlotCollectionStatusV1,
+) -> Option<(String, String)> {
+    let live_binding = status
+        .account_identifier_hash
+        .clone()
+        .zip(status.workspace_identifier_hash.clone());
+    match (&slot.registered_binding, live_binding) {
+        (Some(expected), Some(live)) if expected != &live => {
+            status.state = CodexAccountSlotCollectionStateV1::IdentityMismatch;
+            status.quota_snapshot = None;
+            status.diagnostics.push(CodexAccountSlotDiagnosticV1 {
+                code: "codex_registered_identity_mismatch".to_string(),
+                message:
+                    "This durable Codex connection no longer matches its registered account and workspace."
+                        .to_string(),
+            });
+            snapshot.quota_windows.clear();
+            snapshot.credit_balances.clear();
+            snapshot.status = AgentStatusState::Degraded;
+            snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                "codex_registered_identity_mismatch",
+                AgentDiagnosticSeverity::Warning,
+                "The durable Codex home changed identity; its meters were suppressed.",
+            ));
+            None
+        }
+        (_, live) => live,
+    }
+}
+
+fn codex_snapshot_quality(
+    snapshot: &AgentStatusSnapshot,
+    status: &CodexAccountSlotCollectionStatusV1,
+) -> u8 {
+    let fresh_windows = snapshot
+        .quota_windows
+        .iter()
+        .filter(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)
+        .count();
+    if status.state == CodexAccountSlotCollectionStateV1::Fresh {
+        4_u8.saturating_add(fresh_windows.min(u8::MAX as usize) as u8)
+    } else if status.account_identifier_hash.is_some() && status.workspace_identifier_hash.is_some()
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn codex_candidate_is_better(candidate: &CodexSlotCandidate, current: &CodexSlotCandidate) -> bool {
+    candidate.quality > current.quality
+        || (candidate.quality == current.quality
+            && match (candidate.slot.ownership, current.slot.ownership) {
+                (CodexAccountSlotOwnershipV1::Managed, CodexAccountSlotOwnershipV1::Default) => {
+                    true
+                }
+                (CodexAccountSlotOwnershipV1::Default, CodexAccountSlotOwnershipV1::Managed) => {
+                    false
+                }
+                _ => candidate.slot.slot_id < current.slot.slot_id,
+            })
+}
+
+fn canonicalize_codex_candidates(candidates: &mut [CodexSlotCandidate]) {
+    let mut canonical_managed = BTreeMap::<(String, String), usize>::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.slot.ownership != CodexAccountSlotOwnershipV1::Managed {
+            continue;
+        }
+        let Some(binding) = candidate.binding.clone() else {
+            continue;
+        };
+        let replace = canonical_managed.get(&binding).map_or(true, |current| {
+            codex_candidate_is_better(candidate, &candidates[*current])
+        });
+        if replace {
+            canonical_managed.insert(binding, index);
+        }
+    }
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        let Some(binding) = candidate.binding.as_ref() else {
+            continue;
+        };
+        match candidate.slot.ownership {
+            CodexAccountSlotOwnershipV1::Default if canonical_managed.contains_key(binding) => {
+                candidate.status.relationship =
+                    Some(CodexAccountSlotRelationshipV1::ShadowedByAnchor);
+            }
+            CodexAccountSlotOwnershipV1::Managed
+                if canonical_managed.get(binding) == Some(&index) =>
+            {
+                candidate.status.relationship =
+                    Some(CodexAccountSlotRelationshipV1::CanonicalAnchor);
+            }
+            CodexAccountSlotOwnershipV1::Managed => {
+                candidate.status.state = CodexAccountSlotCollectionStateV1::DuplicateAccount;
+                candidate.status.relationship =
+                    Some(CodexAccountSlotRelationshipV1::DuplicateAnchor);
+                candidate.status.diagnostics.push(CodexAccountSlotDiagnosticV1 {
+                    code: "codex_duplicate_account_workspace".to_string(),
+                    message: "Another durable Codex connection already owns this exact account and workspace.".to_string(),
+                });
+            }
+            CodexAccountSlotOwnershipV1::Default => {}
+        }
+    }
+}
+
+fn apply_codex_candidate_statuses(
+    status: &mut CodexAccountsStatusV1,
+    candidates: &[CodexSlotCandidate],
+) {
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.slot.slot_id == "default")
+    {
+        status.default_slot.collection = candidate.status.clone();
+    }
+    for descriptor in &mut status.managed_slots {
+        if let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
+        {
+            descriptor.collection = candidate.status.clone();
+        }
+    }
+}
+
+fn codex_collection_status_from_snapshot(
+    snapshot: &AgentStatusSnapshot,
+) -> CodexAccountSlotCollectionStatusV1 {
+    let account = snapshot.account.as_ref();
+    let account_identifier_hash =
+        account.and_then(|account| account.account_identifier_hash.clone());
+    let workspace_identifier_hash =
+        account.and_then(|account| account.organization_identifier_hash.clone());
+    let has_fresh_quota = snapshot
+        .quota_windows
+        .iter()
+        .any(|window| window.freshness == AgentQuotaWindowFreshness::Fresh);
+    let state = if snapshot.status == AgentStatusState::AuthRequired
+        || account.is_some_and(|account| account.login_state == AgentLoginState::SignedOut)
+    {
+        CodexAccountSlotCollectionStateV1::NeedsLogin
+    } else if account.is_some_and(|account| account.login_state == AgentLoginState::SignedIn)
+        && (account_identifier_hash.is_none() || workspace_identifier_hash.is_none())
+    {
+        CodexAccountSlotCollectionStateV1::IdentityUnknown
+    } else if account_identifier_hash.is_some()
+        && workspace_identifier_hash.is_some()
+        && has_fresh_quota
+    {
+        CodexAccountSlotCollectionStateV1::Fresh
+    } else {
+        CodexAccountSlotCollectionStateV1::ProviderUnavailable
+    };
+    let diagnostics = match state {
+        CodexAccountSlotCollectionStateV1::NeedsLogin => vec![CodexAccountSlotDiagnosticV1 {
+            code: "codex_account_needs_login".to_string(),
+            message: "Codex must be signed in again for this durable connection.".to_string(),
+        }],
+        CodexAccountSlotCollectionStateV1::IdentityUnknown => vec![CodexAccountSlotDiagnosticV1 {
+            code: "codex_identity_unknown".to_string(),
+            message: "Codex did not provide a complete active user and workspace identity."
+                .to_string(),
+        }],
+        CodexAccountSlotCollectionStateV1::ProviderUnavailable => {
+            vec![CodexAccountSlotDiagnosticV1 {
+                code: "codex_quota_unavailable".to_string(),
+                message: "Codex quota is temporarily unavailable for this connection.".to_string(),
+            }]
+        }
+        _ => Vec::new(),
+    };
+    CodexAccountSlotCollectionStatusV1 {
+        state,
+        account_identifier_hash,
+        workspace_identifier_hash,
+        plan_type: account.and_then(|account| account.plan_type.clone()),
+        observed_at: Some(snapshot.captured_at.clone()),
+        quota_snapshot: has_fresh_quota.then(|| CodexAccountSlotQuotaSnapshotV1 {
+            captured_at: snapshot.captured_at.clone(),
+            quota_windows: snapshot.quota_windows.clone(),
+            credit_balances: snapshot.credit_balances.clone(),
+        }),
+        relationship: None,
+        diagnostics,
+    }
+}
+
+fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
+    CodexAccountsStatusV1 {
+        schema_version: ottto_protocol::CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+        setup_operation: Default::default(),
+        default_slot: CodexAccountSlotDescriptorV1 {
+            slot_id: "default".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Default,
+            collection: Default::default(),
+        },
+        managed_slots: Vec::new(),
+        capacity: ottto_protocol::CodexAccountCapacityV1 {
+            max_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS,
+            used_slots: 1,
+            remaining_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS.saturating_sub(1),
+        },
     }
 }
 
@@ -762,8 +1198,13 @@ pub fn parse_codex_status_fallback(
     snapshot
 }
 
-fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusSnapshot {
-    if !executable_exists("codex") && !codex_config_path().exists() {
+fn collect_codex_status_for_home(
+    captured_at: String,
+    expires_at: String,
+    codex_home: &Path,
+    allow_legacy_oauth: bool,
+) -> AgentStatusSnapshot {
+    if !executable_exists("codex") && !codex_config_path_for_home(codex_home).exists() {
         return not_installed_snapshot(SourceKind::Codex, "codex", captured_at, expires_at);
     }
 
@@ -799,7 +1240,12 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         confidence: AgentStatusConfidence::Unknown,
     });
 
-    let login = run_command_capture("codex", &["login", "status"], COMMAND_TIMEOUT);
+    let login = run_codex_home_command(
+        codex_home,
+        &["login", "status"],
+        COMMAND_TIMEOUT,
+        allow_legacy_oauth,
+    );
     if login.command_found {
         snapshot.collection_method = AgentStatusCollectionMethod::CliText;
         if login.success {
@@ -825,16 +1271,21 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
             }
         }
     }
-    if let Some(auth_account) = read_codex_auth_account() {
+    if let Some(auth_account) = read_codex_auth_account_at(codex_home) {
         snapshot.status = AgentStatusState::Available;
         snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), auth_account));
     }
 
-    let models = run_command_capture("codex", &["debug", "models", "--bundled"], COMMAND_TIMEOUT);
+    let models = run_codex_home_command(
+        codex_home,
+        &["debug", "models", "--bundled"],
+        COMMAND_TIMEOUT,
+        allow_legacy_oauth,
+    );
     let mut model_status = collect_codex_model_status_from_output(&models);
     apply_codex_config_model(
         &mut model_status,
-        read_codex_config_model(),
+        read_codex_config_model_at(codex_home),
         &mut snapshot.collection_method,
     );
     snapshot.model = Some(model_status);
@@ -846,7 +1297,7 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         "credits",
         "Codex credit balance was not available from the local account probe.",
     );
-    match collect_codex_usage() {
+    match collect_codex_usage_for_home(codex_home, allow_legacy_oauth) {
         Ok(usage) => {
             if !usage.quota_windows.is_empty() {
                 snapshot.collection_method = AgentStatusCollectionMethod::AppServer;
@@ -906,16 +1357,20 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         snapshot.status = AgentStatusState::Available;
     }
     append_current_plan_observation(&mut snapshot);
-    append_codex_workspace_observations(&mut snapshot);
-    snapshot.runtime_defaults = build_codex_runtime_defaults(&snapshot.captured_at);
+    append_codex_workspace_observations_at(&mut snapshot, codex_home);
+    stamp_codex_meter_identity(&mut snapshot);
+    snapshot.runtime_defaults = build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home);
     snapshot
 }
 
-fn collect_codex_usage() -> Result<CodexUsageProbe, String> {
-    match collect_codex_app_server_usage() {
+fn collect_codex_usage_for_home(
+    codex_home: &Path,
+    allow_legacy_oauth: bool,
+) -> Result<CodexUsageProbe, String> {
+    match collect_codex_app_server_usage_for_home(codex_home, allow_legacy_oauth) {
         Ok(usage) => Ok(usage),
-        Err(app_server_message) if legacy_codex_oauth_usage_enabled() => {
-            collect_codex_oauth_usage().map_err(|oauth_message| {
+        Err(app_server_message) if allow_legacy_oauth && legacy_codex_oauth_usage_enabled() => {
+            collect_codex_oauth_usage_at(codex_home).map_err(|oauth_message| {
                 format!("{app_server_message} Legacy OAuth usage fallback failed: {oauth_message}")
             })
         }
@@ -923,11 +1378,31 @@ fn collect_codex_usage() -> Result<CodexUsageProbe, String> {
     }
 }
 
+fn stamp_codex_meter_identity(snapshot: &mut AgentStatusSnapshot) {
+    let Some(account) = snapshot.account.as_ref() else {
+        return;
+    };
+    let account_identifier_hash = account.account_identifier_hash.clone();
+    let organization_identifier_hash = account.organization_identifier_hash.clone();
+    for window in &mut snapshot.quota_windows {
+        window.account_identifier_hash = account_identifier_hash.clone();
+        window.organization_identifier_hash = organization_identifier_hash.clone();
+    }
+    for balance in &mut snapshot.credit_balances {
+        balance.account_identifier_hash = account_identifier_hash.clone();
+        balance.organization_identifier_hash = organization_identifier_hash.clone();
+    }
+}
+
 /// Assemble display-safe Codex runtime defaults from `~/.codex/config.toml` for
 /// the agent-status upload. The backend overwrites `machine_id` from the stored
 /// snapshot, so it is left unset here.
-fn build_codex_runtime_defaults(captured_at: &str) -> Option<AgentRuntimeDefaults> {
-    let defaults = crate::snapshots::load_codex_config_defaults(&codex_config_path())?;
+fn build_codex_runtime_defaults_at(
+    captured_at: &str,
+    codex_home: &Path,
+) -> Option<AgentRuntimeDefaults> {
+    let defaults =
+        crate::snapshots::load_codex_config_defaults(&codex_config_path_for_home(codex_home))?;
     let fast_mode_enabled = defaults.display_fast_mode();
     Some(AgentRuntimeDefaults {
         captured_at: Some(captured_at.to_string()),
@@ -6457,8 +6932,8 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
     }
 }
 
-fn append_codex_workspace_observations(snapshot: &mut AgentStatusSnapshot) {
-    let Some(credentials) = read_codex_auth_credentials() else {
+fn append_codex_workspace_observations_at(snapshot: &mut AgentStatusSnapshot, codex_home: &Path) {
+    let Some(credentials) = read_codex_auth_credentials_at(codex_home) else {
         return;
     };
     let Some(token) = credentials.id_token.as_deref() else {
@@ -6652,14 +7127,14 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
     })
 }
 
-fn read_codex_auth_account() -> Option<AgentAccountStatus> {
-    let credentials = read_codex_auth_credentials()?;
+fn read_codex_auth_account_at(codex_home: &Path) -> Option<AgentAccountStatus> {
+    let credentials = read_codex_auth_credentials_at(codex_home)?;
     let token = credentials.id_token.as_deref()?;
     parse_codex_id_token_account(token)
 }
 
-fn read_codex_auth_credentials() -> Option<CodexAuthCredentials> {
-    let body = fs::read_to_string(codex_auth_path()).ok()?;
+fn read_codex_auth_credentials_at(codex_home: &Path) -> Option<CodexAuthCredentials> {
+    let body = fs::read_to_string(codex_auth_path_for_home(codex_home)).ok()?;
     let json: Value = serde_json::from_str(&body).ok()?;
     let access_token = json
         .get("tokens")
@@ -6708,12 +7183,16 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         .and_then(|value| first_json_string(value, &["chatgpt_plan_type"]))
         .map(normalize_plan_type)
         .filter(|value| !value.is_empty());
+    // `chatgpt_user_id` is the stable user. `chatgpt_account_id` is the
+    // currently selected ChatGPT workspace/account and is the value Codex's
+    // supported `forced_chatgpt_workspace_id` restriction consumes. Treating
+    // the latter as the user collapses two workspaces into two fake users.
     let account_id = auth_claim
-        .and_then(|value| {
-            first_json_string(value, &["chatgpt_account_id", "chatgpt_user_id", "user_id"])
-        })
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
         .or_else(|| first_json_string(&claims, &["sub"]));
-    let organization = auth_claim.and_then(default_codex_organization);
+    let workspace_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
+        .or_else(|| first_json_string(&claims, &["chatgpt_account_id"]));
     let email = first_json_string(&claims, &["email"]);
     // The same claim object that carries `chatgpt_plan_type` also carries the
     // real subscription period and the time that period evidence was checked.
@@ -6731,17 +7210,15 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
     // Deliberately unchanged: a period with no plan, account, email, or
     // organization is not a useful account row, so it does not by itself
     // resurrect one.
-    if plan_type.is_none() && account_id.is_none() && email.is_none() && organization.is_none() {
+    if plan_type.is_none() && account_id.is_none() && email.is_none() && workspace_id.is_none() {
         return None;
     }
-    let organization_id = organization.as_ref().and_then(|org| org.id.clone());
-    let organization_label = organization.and_then(|org| org.label);
     let account_identifier_hash = account_id
         .as_deref()
         .and_then(|value| billing_identity_hash("openai", "account", value));
-    let organization_identifier_hash = organization_id
+    let organization_identifier_hash = workspace_id
         .as_deref()
-        .and_then(|value| billing_identity_hash("openai", "organization", value));
+        .and_then(|value| billing_identity_hash("openai", "workspace", value));
     let billing_identity_evidence = billing_identity_evidence_for(
         &account_identifier_hash,
         &organization_identifier_hash,
@@ -6753,8 +7230,8 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         auth_method: Some("oauth".to_string()),
         email,
         account_id,
-        organization_id,
-        organization_label,
+        organization_id: workspace_id,
+        organization_label: None,
         plan_type: plan_type.clone(),
         subscription_product: plan_type.map(chatgpt_subscription_product),
         billing_channel: Some("subscription".to_string()),
@@ -6770,6 +7247,28 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
+    })
+}
+
+pub(crate) fn read_codex_strong_identity_for_home(
+    codex_home: &Path,
+) -> Option<CodexStrongIdentity> {
+    let credentials = read_codex_auth_credentials_at(codex_home)?;
+    let token = credentials.id_token.as_deref()?;
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let auth_claim = claims.get("https://api.openai.com/auth");
+    let account_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(&claims, &["sub"]))?;
+    let raw_workspace_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
+        .or_else(|| first_json_string(&claims, &["chatgpt_account_id"]))?;
+    Some(CodexStrongIdentity {
+        account_identifier_hash: billing_identity_hash("openai", "account", &account_id)?,
+        workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
+        raw_workspace_id,
     })
 }
 
@@ -6799,24 +7298,44 @@ fn subscription_period_timestamp(value: &Value, key: &str) -> Option<String> {
     parsed.to_offset(UtcOffset::UTC).format(&Rfc3339).ok()
 }
 
-fn collect_codex_app_server_usage() -> Result<CodexUsageProbe, String> {
-    let value = call_codex_app_server_rate_limits()?;
+fn collect_codex_app_server_usage_for_home(
+    codex_home: &Path,
+    allow_ambient_environment: bool,
+) -> Result<CodexUsageProbe, String> {
+    let value = call_codex_app_server_rate_limits_for_home(codex_home, allow_ambient_environment)?;
     Ok(CodexUsageProbe {
         quota_windows: codex_app_server_quota_windows(&value),
         credit_balances: codex_app_server_credit_balances(&value),
     })
 }
 
-fn call_codex_app_server_rate_limits() -> Result<Value, String> {
+fn call_codex_app_server_rate_limits_for_home(
+    codex_home: &Path,
+    allow_ambient_environment: bool,
+) -> Result<Value, String> {
     let Some(program_path) = crate::command_env::executable_path("codex") else {
         return Err("Codex CLI was not found for app-server rate-limit collection.".to_string());
     };
+    let Some(identity) = effective_user_identity() else {
+        return Err("Codex app-server user identity was unavailable.".to_string());
+    };
     let mut command = Command::new(program_path);
+    command.args(["app-server", "--stdio"]);
+    if !allow_ambient_environment {
+        command.env_clear();
+    }
     command
-        .args(["app-server", "--stdio"])
+        .env("HOME", &identity.home_dir)
+        .env("USER", identity.account_name)
+        .env("CODEX_HOME", codex_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(locale_key) {
+            command.env(locale_key, value);
+        }
+    }
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
     }
@@ -6913,40 +7432,61 @@ fn call_codex_app_server_rate_limits() -> Result<Value, String> {
     Err("Codex app-server rate-limit read timed out.".to_string())
 }
 
+#[cfg(test)]
+fn call_codex_app_server_rate_limits() -> Result<Value, String> {
+    call_codex_app_server_rate_limits_for_home(&default_codex_home(), true)
+}
+
 fn codex_app_server_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
-    let Some(rate_limit) = codex_app_server_rate_limit_snapshot(value) else {
-        return Vec::new();
-    };
     let mut windows = Vec::new();
-    if let Some(primary) = rate_limit.get("primary") {
-        if let Some(window) = codex_app_server_quota_window("session", primary) {
-            windows.push(window);
-        }
-    }
-    if let Some(secondary) = rate_limit.get("secondary") {
-        if let Some(window) = codex_app_server_quota_window("weekly", secondary) {
-            windows.push(window);
+    let mut names = BTreeSet::new();
+    for (limit_id, rate_limit) in codex_app_server_rate_limit_snapshots(value) {
+        for (position, field) in ["primary", "secondary"].iter().enumerate() {
+            let Some(raw_window) = rate_limit.get(*field) else {
+                continue;
+            };
+            let window_seconds =
+                json_u64(raw_window, &["windowDurationMins", "window_duration_mins"])
+                    .map(|minutes| minutes.saturating_mul(60));
+            let semantic = codex_usage_window_name(window_seconds, position);
+            let name = if limit_id == "codex" {
+                semantic.to_string()
+            } else {
+                format!("{limit_id}_{semantic}")
+            };
+            if names.insert(name.clone()) {
+                if let Some(window) = codex_app_server_quota_window(&name, raw_window) {
+                    windows.push(window);
+                }
+            }
         }
     }
     windows
 }
 
-fn codex_app_server_rate_limit_snapshot(value: &Value) -> Option<&Value> {
-    let by_limit_id = value.get("rateLimitsByLimitId").and_then(Value::as_object);
-    by_limit_id
-        .and_then(|map| map.get("codex"))
+fn codex_app_server_rate_limit_snapshots(value: &Value) -> Vec<(String, &Value)> {
+    if let Some(by_limit_id) = value.get("rateLimitsByLimitId").and_then(Value::as_object) {
+        let mut snapshots = by_limit_id
+            .iter()
+            .filter(|(_, snapshot)| codex_rate_limit_snapshot_has_usage(snapshot))
+            .map(|(limit_id, snapshot)| (limit_id.clone(), snapshot))
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+        if !snapshots.is_empty() {
+            return snapshots;
+        }
+    }
+    value
+        .get("rateLimits")
         .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
-        .or_else(|| {
-            value
-                .get("rateLimits")
-                .filter(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
+        .map(|snapshot| {
+            vec![(
+                first_json_string(snapshot, &["limitId", "limit_id"])
+                    .unwrap_or_else(|| "codex".to_string()),
+                snapshot,
+            )]
         })
-        .or_else(|| {
-            by_limit_id.and_then(|map| {
-                map.values()
-                    .find(|snapshot| codex_rate_limit_snapshot_has_usage(snapshot))
-            })
-        })
+        .unwrap_or_default()
 }
 
 fn codex_rate_limit_snapshot_has_usage(value: &Value) -> bool {
@@ -6993,20 +7533,28 @@ fn codex_app_server_quota_window(name: &str, value: &Value) -> Option<AgentQuota
 }
 
 fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
-    let mut balances = Vec::new();
-    if let Some(rate_limit) = codex_app_server_rate_limit_snapshot(value) {
+    let mut balances = BTreeMap::<String, AgentCreditBalance>::new();
+    for (limit_id, rate_limit) in codex_app_server_rate_limit_snapshots(value) {
         if let Some(credits) = rate_limit.get("credits") {
-            if let Some(balance) = codex_credit_balance_from_credits_snapshot(credits, rate_limit) {
-                balances.push(balance);
+            if let Some(mut balance) =
+                codex_credit_balance_from_credits_snapshot(credits, rate_limit)
+            {
+                if limit_id != "codex" {
+                    balance.name = format!("{limit_id}_{}", balance.name);
+                }
+                balances.insert(balance.name.clone(), balance);
             }
         }
-        if let Some(balance) = codex_monthly_credit_limit_from_snapshot(rate_limit) {
-            balances.push(balance);
+        if let Some(mut balance) = codex_monthly_credit_limit_from_snapshot(rate_limit) {
+            if limit_id != "codex" {
+                balance.name = format!("{limit_id}_{}", balance.name);
+            }
+            balances.insert(balance.name.clone(), balance);
         }
     }
     if let Some(reset_credits) = value.get("rateLimitResetCredits") {
         if let Some(remaining) = json_u64(reset_credits, &["availableCount", "available_count"]) {
-            balances.push(AgentCreditBalance {
+            let balance = AgentCreditBalance {
                 name: "reset_bank".to_string(),
                 status: if remaining == 0 {
                     AgentCreditBalanceStatus::Exhausted
@@ -7022,10 +7570,11 @@ fn codex_app_server_credit_balances(value: &Value) -> Vec<AgentCreditBalance> {
                 unlimited: Some(false),
                 updated_at: None,
                 ..Default::default()
-            });
+            };
+            balances.insert(balance.name.clone(), balance);
         }
     }
-    balances
+    balances.into_values().collect()
 }
 
 /// Parse Codex's effective workspace monthly credit limit.
@@ -7168,8 +7717,8 @@ fn legacy_codex_oauth_usage_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn collect_codex_oauth_usage() -> Result<CodexUsageProbe, String> {
-    let credentials = read_codex_auth_credentials()
+fn collect_codex_oauth_usage_at(codex_home: &Path) -> Result<CodexUsageProbe, String> {
+    let credentials = read_codex_auth_credentials_at(codex_home)
         .ok_or_else(|| "Codex OAuth credentials were not found.".to_string())?;
     let access_token = credentials
         .access_token
@@ -7372,15 +7921,6 @@ struct CodexOrganization {
     plan_type: Option<String>,
 }
 
-fn default_codex_organization(value: &Value) -> Option<CodexOrganization> {
-    let organizations = codex_organizations(value);
-    organizations
-        .iter()
-        .find(|organization| organization.is_default)
-        .cloned()
-        .or_else(|| organizations.into_iter().next())
-}
-
 fn codex_workspace_observations_from_id_token(
     token: &str,
     observed_at: &str,
@@ -7391,11 +7931,8 @@ fn codex_workspace_observations_from_id_token(
     let claims: Value = serde_json::from_slice(&decoded).ok()?;
     let auth_claim = claims.get("https://api.openai.com/auth")?;
     let email = first_json_string(&claims, &["email"]);
-    let account_id = first_json_string(
-        auth_claim,
-        &["chatgpt_account_id", "chatgpt_user_id", "user_id"],
-    )
-    .or_else(|| first_json_string(&claims, &["sub"]));
+    let account_id = first_json_string(auth_claim, &["chatgpt_user_id", "user_id"])
+        .or_else(|| first_json_string(&claims, &["sub"]));
     let account_identifier_hash = account_id
         .as_deref()
         .and_then(|value| billing_identity_hash("openai", "account", value));
@@ -8906,8 +9443,8 @@ fn looks_like_safe_model_id(value: &str) -> bool {
         && !lower.contains("/.pi/")
 }
 
-fn read_codex_config_model() -> Option<String> {
-    let body = fs::read_to_string(codex_config_path()).ok()?;
+fn read_codex_config_model_at(codex_home: &Path) -> Option<String> {
+    let body = fs::read_to_string(codex_config_path_for_home(codex_home)).ok()?;
     for line in body.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || !trimmed.contains('=') {
@@ -9439,6 +9976,60 @@ fn run_command_capture(program: &str, args: &[&str], timeout: Duration) -> Comma
     run_command_capture_with_exact_env(program, args, timeout, None)
 }
 
+fn run_codex_home_command(
+    codex_home: &Path,
+    args: &[&str],
+    timeout: Duration,
+    allow_ambient_environment: bool,
+) -> CommandOutput {
+    let Some(mut command) =
+        resolved_codex_home_command(codex_home, args, allow_ambient_environment)
+    else {
+        return CommandOutput {
+            command_found: false,
+            success: false,
+            status_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_prepared_command_capture(command, timeout)
+}
+
+/// Resolve Codex once and run it with one exact credential home. Ambient
+/// provider credentials are deliberately excluded so a managed slot cannot
+/// silently fall back to the default account or an API key.
+fn resolved_codex_home_command(
+    codex_home: &Path,
+    args: &[&str],
+    allow_ambient_environment: bool,
+) -> Option<Command> {
+    let identity = effective_user_identity()?;
+    let program_path = crate::command_env::executable_path("codex")?;
+    let mut command = Command::new(program_path);
+    command.args(args);
+    if !allow_ambient_environment {
+        command.env_clear();
+    }
+    command
+        .env("HOME", &identity.home_dir)
+        .env("USER", identity.account_name)
+        .env("CODEX_HOME", codex_home);
+    for locale_key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = std::env::var_os(locale_key) {
+            command.env(locale_key, value);
+        }
+    }
+    if let Some(path_env) = crate::command_env::path_env() {
+        command.env("PATH", path_env);
+    }
+    Some(command)
+}
+
 fn run_claude_slot_command(
     slot: &ClaudeConfigDirSlot,
     args: &[&str],
@@ -9619,12 +10210,16 @@ fn executable_exists(program: &str) -> bool {
     crate::command_env::executable_path(program).is_some()
 }
 
-fn codex_config_path() -> PathBuf {
-    home_path(".codex/config.toml")
+fn default_codex_home() -> PathBuf {
+    home_path(".codex")
 }
 
-fn codex_auth_path() -> PathBuf {
-    home_path(".codex/auth.json")
+fn codex_config_path_for_home(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
+fn codex_auth_path_for_home(codex_home: &Path) -> PathBuf {
+    codex_home.join("auth.json")
 }
 
 fn home_path(relative: &str) -> PathBuf {
@@ -10949,6 +11544,54 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
+    fn codex_home_command_is_exact_and_drops_ambient_provider_credentials() {
+        let dir =
+            std::env::temp_dir().join(format!("ottto-codex-exact-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let executable = dir.join("codex");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s|%s' \"$CODEX_HOME\" \"${OPENAI_API_KEY+present}\"\n",
+        )
+        .expect("write executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).expect("chmod executable");
+        let managed_home = dir.join("managed-home");
+        std::fs::create_dir(&managed_home).expect("managed home");
+
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+        let _provider = EnvVarGuard::set_os("OPENAI_API_KEY", OsString::from("must-not-pass"));
+        let output = run_codex_home_command(
+            &managed_home,
+            &["login", "status"],
+            Duration::from_secs(2),
+            false,
+        );
+
+        assert!(output.success, "{output:?}");
+        assert_eq!(output.stdout, format!("{}|", managed_home.display()));
+
+        let default_style_output = run_codex_home_command(
+            &managed_home,
+            &["login", "status"],
+            Duration::from_secs(2),
+            true,
+        );
+        assert!(default_style_output.success, "{default_style_output:?}");
+        assert_eq!(
+            default_style_output.stdout,
+            format!("{}|present", managed_home.display())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn codex_text_parser_extracts_account_model_quota_and_context() {
         let snapshot = parse_codex_status_fallback(
             "Logged in as test@example.com\nPlan: Pro\nModel: gpt-5.1\nUsage quota: 18% left\nContext: 72% used",
@@ -11124,6 +11767,175 @@ for line in sys.stdin:
         assert_eq!(status.context_window_tokens, Some(258_400));
     }
 
+    fn codex_candidate_for_test(
+        slot_id: &str,
+        ownership: CodexAccountSlotOwnershipV1,
+        account_hash: &str,
+        workspace_hash: &str,
+        quality: u8,
+    ) -> CodexSlotCandidate {
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-08-23T00:00:00Z".to_string(),
+            "2026-08-23T00:15:00Z".to_string(),
+        );
+        let mut account = unsupported_account("openai");
+        account.login_state = AgentLoginState::SignedIn;
+        account.account_identifier_hash = Some(account_hash.to_string());
+        account.organization_identifier_hash = Some(workspace_hash.to_string());
+        snapshot.account = Some(account);
+        let status = CodexAccountSlotCollectionStatusV1 {
+            state: CodexAccountSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some(account_hash.to_string()),
+            workspace_identifier_hash: Some(workspace_hash.to_string()),
+            ..Default::default()
+        };
+        CodexSlotCandidate {
+            slot: CodexHomeSlot {
+                slot_id: slot_id.to_string(),
+                ownership,
+                home: PathBuf::from("/tmp/codex-candidate-test"),
+                registered_binding: (ownership == CodexAccountSlotOwnershipV1::Managed)
+                    .then(|| (account_hash.to_string(), workspace_hash.to_string())),
+            },
+            snapshot,
+            status,
+            binding: Some((account_hash.to_string(), workspace_hash.to_string())),
+            quality,
+        }
+    }
+
+    #[test]
+    fn codex_composite_dedup_shadows_default_but_keeps_two_workspaces() {
+        let mut candidates = vec![
+            codex_candidate_for_test(
+                "default",
+                CodexAccountSlotOwnershipV1::Default,
+                "same_user",
+                "personal_workspace",
+                5,
+            ),
+            codex_candidate_for_test(
+                "codex_slot_a",
+                CodexAccountSlotOwnershipV1::Managed,
+                "same_user",
+                "personal_workspace",
+                5,
+            ),
+            codex_candidate_for_test(
+                "codex_slot_b",
+                CodexAccountSlotOwnershipV1::Managed,
+                "same_user",
+                "business_workspace",
+                5,
+            ),
+            codex_candidate_for_test(
+                "codex_slot_c",
+                CodexAccountSlotOwnershipV1::Managed,
+                "same_user",
+                "personal_workspace",
+                4,
+            ),
+        ];
+
+        canonicalize_codex_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates[0].status.relationship,
+            Some(CodexAccountSlotRelationshipV1::ShadowedByAnchor)
+        );
+        assert_eq!(
+            candidates[1].status.relationship,
+            Some(CodexAccountSlotRelationshipV1::CanonicalAnchor)
+        );
+        assert_eq!(
+            candidates[2].status.relationship,
+            Some(CodexAccountSlotRelationshipV1::CanonicalAnchor)
+        );
+        assert_eq!(
+            candidates[3].status.state,
+            CodexAccountSlotCollectionStateV1::DuplicateAccount
+        );
+        assert_eq!(
+            candidates[3].status.relationship,
+            Some(CodexAccountSlotRelationshipV1::DuplicateAnchor)
+        );
+    }
+
+    #[test]
+    fn codex_healthy_anchor_restores_source_health_when_default_is_signed_out() {
+        let mut default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "default_user",
+            "default_workspace",
+            1,
+        );
+        default.snapshot.status = AgentStatusState::AuthRequired;
+        default.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+        let managed = codex_candidate_for_test(
+            "codex_slot_a",
+            CodexAccountSlotOwnershipV1::Managed,
+            "managed_user",
+            "managed_workspace",
+            5,
+        );
+
+        let health = codex_source_health_snapshot(
+            &[default, managed],
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+
+        assert_eq!(health.status, AgentStatusState::Available);
+        assert_eq!(
+            health
+                .account
+                .and_then(|account| account.account_identifier_hash),
+            Some("managed_user".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_accepted_slot_suppresses_meters_after_identity_change() {
+        let mut candidate = codex_candidate_for_test(
+            "codex_slot_a",
+            CodexAccountSlotOwnershipV1::Managed,
+            "registered_user",
+            "registered_workspace",
+            5,
+        );
+        candidate.status.account_identifier_hash = Some("different_user".to_string());
+        candidate.status.workspace_identifier_hash = Some("different_workspace".to_string());
+        candidate.snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "weekly".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+        candidate.snapshot.credit_balances.push(AgentCreditBalance {
+            name: "credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        let binding = enforce_codex_registered_binding(
+            &candidate.slot,
+            &mut candidate.snapshot,
+            &mut candidate.status,
+        );
+
+        assert_eq!(binding, None);
+        assert_eq!(
+            candidate.status.state,
+            CodexAccountSlotCollectionStateV1::IdentityMismatch
+        );
+        assert!(candidate.status.quota_snapshot.is_none());
+        assert!(candidate.snapshot.quota_windows.is_empty());
+        assert!(candidate.snapshot.credit_balances.is_empty());
+    }
+
     #[test]
     fn codex_id_token_parser_extracts_chatgpt_plan_claims() {
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
@@ -11152,9 +11964,9 @@ for line in sys.stdin:
         assert_eq!(account.login_state, AgentLoginState::SignedIn);
         assert_eq!(account.provider.as_deref(), Some("openai"));
         assert_eq!(account.email.as_deref(), Some("codex@example.com"));
-        assert_eq!(account.account_id.as_deref(), Some("account_123"));
-        assert_eq!(account.organization_id.as_deref(), Some("org_current"));
-        assert_eq!(account.organization_label.as_deref(), Some("Current Org"));
+        assert_eq!(account.account_id.as_deref(), Some("user_123"));
+        assert_eq!(account.organization_id.as_deref(), Some("account_123"));
+        assert_eq!(account.organization_label, None);
         assert_eq!(account.plan_type.as_deref(), Some("team"));
         assert_eq!(
             account.subscription_product.as_deref(),
@@ -11427,7 +12239,7 @@ for line in sys.stdin:
         assert_eq!(team.plan_type.as_deref(), Some("team"));
         assert_eq!(team.subscription_product.as_deref(), Some("chatgpt_team"));
         assert_eq!(team.organization_label.as_deref(), Some("Team Org"));
-        assert_eq!(team.account_id.as_deref(), Some("account_123"));
+        assert_eq!(team.account_id.as_deref(), Some("account_sub"));
         assert_eq!(team.organization_id.as_deref(), Some("org_team"));
         assert_eq!(team.is_current, Some(false));
         assert!(team.account_identifier_hash.is_some());
@@ -11657,7 +12469,7 @@ for line in sys.stdin:
         let windows = codex_app_server_quota_windows(&json);
         let credits = codex_app_server_credit_balances(&json);
 
-        assert_eq!(windows.len(), 2);
+        assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].name, "session");
         assert_eq!(windows[0].left_percent, Some(97));
         assert_eq!(
@@ -11666,6 +12478,8 @@ for line in sys.stdin:
         );
         assert_eq!(windows[1].name, "weekly");
         assert_eq!(windows[1].left_percent, Some(95));
+        assert_eq!(windows[2].name, "codex_bengalfox_session");
+        assert_eq!(windows[2].left_percent, Some(91));
         assert_eq!(credits.len(), 2);
         assert_eq!(credits[0].name, "credits");
         assert_eq!(credits[0].remaining, Some(12));
@@ -11716,6 +12530,35 @@ for line in sys.stdin:
             Some("primary")
         );
         assert_eq!(credits[0].limit_id.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn codex_app_server_preserves_credit_balances_from_multiple_limit_buckets() {
+        let json = serde_json::json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "credits": {"hasCredits": true, "balance": "12"}
+                },
+                "codex_business": {
+                    "limitId": "codex_business",
+                    "credits": {"hasCredits": true, "balance": "4"}
+                }
+            }
+        });
+
+        let balances = codex_app_server_credit_balances(&json);
+        let by_name = balances
+            .into_iter()
+            .map(|balance| (balance.name.clone(), balance))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(by_name["credits"].remaining, Some(12));
+        assert_eq!(by_name["codex_business_credits"].remaining, Some(4));
+        assert_eq!(
+            by_name["codex_business_credits"].limit_id.as_deref(),
+            Some("codex_business")
+        );
     }
 
     #[test]

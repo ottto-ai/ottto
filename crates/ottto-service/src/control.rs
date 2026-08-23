@@ -17,12 +17,13 @@ use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version, default_support_dir,
     execute_local_uninstall, generate_control_token, install_owner_for_path,
     local_lifecycle_home_dir, plan_local_uninstall, redact_inline, release_channel_from_str,
-    ClaudeConfigSlotSettingsError, ControlTokenStore, FileAccountStore,
-    FileClaudeConfigSlotSettingsStore, FileConnectionStore, FileDeviceStore,
-    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
-    LocalDeviceBinding, LocalDeviceCredentialBinding, PendingClaimCredentialCommit,
-    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority, TokenStoreError,
-    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
+    ClaudeConfigSlotSettingsError, CodexAccountSlotSettingsError, ControlTokenStore,
+    FileAccountStore, FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore,
+    FileConnectionStore, FileDeviceStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
+    LocalConnectionBinding, LocalDeviceBinding, LocalDeviceCredentialBinding,
+    PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
+    PendingDeviceCredentialRequestAuthority, TokenStoreError, UninstallExecutionOptions,
+    OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
     OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
@@ -32,18 +33,18 @@ use ottto_protocol::{
     AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
     AuthStartResponse, ClaudeAccountSetupOperationState, ClaudeConfigSlotCollectionStateV1,
     CliError, CliErrorCode, CloudSessionBackendGrantResponseV1, CloudSessionsControlAction,
-    ConfigDrift, ControlResult, ControlResultStatus, DiagnosticsBundle,
-    DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval, DiagnosticsUploadAuthorization,
-    DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding,
-    LocalAccountOrganization, LocalAccountState, LocalAccountUser, LocalClientKind,
-    LocalControlCommand, LocalControlRequest, LocalControlResponse, MachineIdentity,
-    ProviderDailyReferenceBackendGrantResponseV1, ProviderDailyReferenceControlAction,
-    RedactedValue, RelayRuntimeState, RelayState, ReleaseChannel, RepairAction,
-    RepairActionApproval, RepairActionKind, RepairApprovalSurface, RepairPlan, RepairPlanStatus,
-    SecretString, ServiceOwnerState, SourceConfigState, SourceKind, SourceRouteVerificationResult,
-    SourceVerificationResult, SourceVerificationStatus, StableMessage, TelemetryControlAction,
-    UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
+    CodexAccountSetupOperationStateV1, ConfigDrift, ControlResult, ControlResultStatus,
+    DiagnosticsBundle, DiagnosticsRetentionDisclosure, DiagnosticsUploadApproval,
+    DiagnosticsUploadAuthorization, DiagnosticsUploadReport, DiagnosticsUploadStatus, InstallOwner,
+    LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
+    LocalClientKind, LocalControlCommand, LocalControlRequest, LocalControlResponse,
+    MachineIdentity, ProviderDailyReferenceBackendGrantResponseV1,
+    ProviderDailyReferenceControlAction, RedactedValue, RelayRuntimeState, RelayState,
+    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
+    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
+    SourceRouteVerificationResult, SourceVerificationResult, SourceVerificationStatus,
+    StableMessage, TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState,
+    UpdateStatus, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -743,6 +744,64 @@ fn handle_command(
                 schema_version,
                 &operation_id,
             )?)
+        }
+        LocalControlCommand::CodexAccountsStatus => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(load_codex_account_settings()?)
+        }
+        LocalControlCommand::CodexAccountPrepare {
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            expected_workspace_identifier_hash,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(prepare_codex_account(
+                schema_version,
+                operation_id,
+                expected_account_identifier_hash,
+                expected_workspace_identifier_hash,
+            )?)
+        }
+        LocalControlCommand::CodexAccountReconnect {
+            schema_version,
+            operation_id,
+            slot_id,
+            expected_account_identifier_hash,
+            expected_workspace_identifier_hash,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(reconnect_codex_account(
+                schema_version,
+                operation_id,
+                &slot_id,
+                expected_account_identifier_hash,
+                expected_workspace_identifier_hash,
+            )?)
+        }
+        LocalControlCommand::CodexAccountCheck {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(check_codex_account(schema_version, &operation_id)?)
+        }
+        LocalControlCommand::CodexAccountStopWaiting {
+            schema_version,
+            operation_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(stop_waiting_for_codex_account(
+                schema_version,
+                &operation_id,
+            )?)
+        }
+        LocalControlCommand::CodexAccountRemove {
+            schema_version,
+            slot_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(remove_codex_account(schema_version, &slot_id)?)
         }
         LocalControlCommand::Detect { source } => {
             require_authorized_local_client(daemon, &authorization)?;
@@ -1565,6 +1624,146 @@ fn claude_config_slot_settings_error(error: ClaudeConfigSlotSettingsError) -> Lo
     match error {
         ClaudeConfigSlotSettingsError::Invalid(message) => LocalApiError::InvalidRequest(message),
         ClaudeConfigSlotSettingsError::State(_) => LocalApiError::StatePoisoned,
+    }
+}
+
+fn load_codex_account_settings() -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .load()
+        .map_err(codex_account_slot_settings_error)
+        .map(crate::agent_status::annotate_codex_accounts_status)
+}
+
+fn prepare_codex_account(
+    schema_version: u16,
+    operation_id: String,
+    expected_account_identifier_hash: String,
+    expected_workspace_identifier_hash: String,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .prepare_managed_account(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            expected_workspace_identifier_hash,
+        )
+        .map_err(codex_account_slot_settings_error)
+}
+
+fn reconnect_codex_account(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    expected_account_identifier_hash: String,
+    expected_workspace_identifier_hash: String,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .begin_reconnect(
+            schema_version,
+            operation_id,
+            slot_id,
+            expected_account_identifier_hash,
+            expected_workspace_identifier_hash,
+        )
+        .map_err(codex_account_slot_settings_error)
+}
+
+fn check_codex_account(
+    schema_version: u16,
+    operation_id: &str,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    let store = FileCodexAccountSlotSettingsStore::default();
+    let current_operation = store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    if current_operation.state == CodexAccountSetupOperationStateV1::Complete {
+        return store
+            .load()
+            .map_err(codex_account_slot_settings_error)
+            .map(crate::agent_status::annotate_codex_accounts_status);
+    }
+    store
+        .begin_validation(schema_version, operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    let operation = store
+        .setup_operation(operation_id)
+        .map_err(codex_account_slot_settings_error)?;
+    let slot_id = operation.slot_id.ok_or_else(|| {
+        LocalApiError::InvalidRequest(
+            "Codex setup operation has no durable connection slot".to_string(),
+        )
+    })?;
+    let (identity, _) = match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id)
+    {
+        Ok(result) => result,
+        Err(message) => {
+            return store
+                .fail_validation(schema_version, operation_id, &message)
+                .map_err(codex_account_slot_settings_error)
+                .map(crate::agent_status::annotate_codex_accounts_status);
+        }
+    };
+    let duplicate = store
+        .has_registered_binding(
+            &identity.account_identifier_hash,
+            &identity.workspace_identifier_hash,
+            Some(&slot_id),
+        )
+        .map_err(codex_account_slot_settings_error)?;
+    let status = store
+        .finish_validation(
+            schema_version,
+            operation_id,
+            identity.account_identifier_hash.clone(),
+            identity.workspace_identifier_hash.clone(),
+            &identity.raw_workspace_id,
+            duplicate,
+        )
+        .map_err(codex_account_slot_settings_error)?;
+    if status.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
+        match crate::agent_status::collect_registered_codex_slot_for_setup(&slot_id) {
+            Ok((pinned, _))
+                if pinned.account_identifier_hash == identity.account_identifier_hash
+                    && pinned.workspace_identifier_hash == identity.workspace_identifier_hash => {}
+            _ => {
+                return store
+                    .fail_validation(
+                        schema_version,
+                        operation_id,
+                        "Codex workspace restriction did not survive a fresh provider restart.",
+                    )
+                    .map_err(codex_account_slot_settings_error)
+                    .map(crate::agent_status::annotate_codex_accounts_status);
+            }
+        }
+    }
+    Ok(crate::agent_status::annotate_codex_accounts_status(status))
+}
+
+fn stop_waiting_for_codex_account(
+    schema_version: u16,
+    operation_id: &str,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .stop_waiting(schema_version, operation_id)
+        .map_err(codex_account_slot_settings_error)
+        .map(crate::agent_status::annotate_codex_accounts_status)
+}
+
+fn remove_codex_account(
+    schema_version: u16,
+    slot_id: &str,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    FileCodexAccountSlotSettingsStore::default()
+        .remove(schema_version, slot_id)
+        .map_err(codex_account_slot_settings_error)
+        .map(crate::agent_status::annotate_codex_accounts_status)
+}
+
+fn codex_account_slot_settings_error(error: CodexAccountSlotSettingsError) -> LocalApiError {
+    match error {
+        CodexAccountSlotSettingsError::Invalid(message) => LocalApiError::InvalidRequest(message),
+        CodexAccountSlotSettingsError::State(_) => LocalApiError::StatePoisoned,
     }
 }
 

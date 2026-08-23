@@ -17,7 +17,12 @@ pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
 /// Command-scoped version for mutations that bind a daemon-authored anchor
 /// target to an exact account+organization pair.
 pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
+/// Command-scoped version for the machine-local Codex durable-account registry.
+/// The base protocol remains unchanged so older clients continue to use every
+/// unrelated command during a rolling local-runtime upgrade.
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 20;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
+pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
 
@@ -2473,6 +2478,12 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::ClaudeAccountReconnectTarget { .. } => {
             CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::CodexAccountsStatus
+        | LocalControlCommand::CodexAccountPrepare { .. }
+        | LocalControlCommand::CodexAccountReconnect { .. }
+        | LocalControlCommand::CodexAccountCheck { .. }
+        | LocalControlCommand::CodexAccountStopWaiting { .. }
+        | LocalControlCommand::CodexAccountRemove { .. } => CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION,
         _ => LOCAL_CONTROL_PROTOCOL_VERSION,
     }
 }
@@ -2886,6 +2897,152 @@ pub struct ClaudeAccountsStatusV1 {
     pub capacity: ClaudeAccountCapacityV1,
 }
 
+/// Provider-owned Codex sign-in observation for one daemon-created home. The
+/// daemon creates and validates local state, while Codex owns OAuth, browser
+/// callbacks, token persistence, and token refresh.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSetupOperationStateV1 {
+    #[default]
+    Idle,
+    WaitingForUserLogin,
+    Validating,
+    Complete,
+    SetupStopped,
+    SetupFailed,
+    IdentityMismatch,
+    DuplicateAccount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSetupOperationV1 {
+    pub state: CodexAccountSetupOperationStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_workspace_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    /// Exact local command returned only through authenticated local control.
+    /// Clients launch it but do not display or upload it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl Default for CodexAccountSetupOperationV1 {
+    fn default() -> Self {
+        Self {
+            state: CodexAccountSetupOperationStateV1::Idle,
+            operation_id: None,
+            slot_id: None,
+            expected_account_identifier_hash: None,
+            expected_workspace_identifier_hash: None,
+            account_identifier_hash: None,
+            workspace_identifier_hash: None,
+            launch_command: None,
+            message: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotOwnershipV1 {
+    Default,
+    Managed,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotCollectionStateV1 {
+    #[default]
+    Unverified,
+    Fresh,
+    NeedsLogin,
+    IdentityUnknown,
+    IdentityMismatch,
+    ProviderUnavailable,
+    DuplicateAccount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountSlotRelationshipV1 {
+    CanonicalAnchor,
+    ShadowedByAnchor,
+    DuplicateAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotDiagnosticV1 {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotQuotaSnapshotV1 {
+    pub captured_at: Rfc3339Timestamp,
+    #[serde(default)]
+    pub quota_windows: Vec<AgentQuotaWindow>,
+    #[serde(default)]
+    pub credit_balances: Vec<AgentCreditBalance>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotCollectionStatusV1 {
+    #[serde(default)]
+    pub state: CodexAccountSlotCollectionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_snapshot: Option<CodexAccountSlotQuotaSnapshotV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<CodexAccountSlotRelationshipV1>,
+    #[serde(default)]
+    pub diagnostics: Vec<CodexAccountSlotDiagnosticV1>,
+}
+
+/// One Codex credential home. The path is deliberately absent from this
+/// authenticated status contract; it is deterministic daemon-owned state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountSlotDescriptorV1 {
+    pub slot_id: String,
+    pub ownership: CodexAccountSlotOwnershipV1,
+    #[serde(default)]
+    pub collection: CodexAccountSlotCollectionStatusV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountCapacityV1 {
+    pub max_slots: u8,
+    pub used_slots: u8,
+    pub remaining_slots: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountsStatusV1 {
+    pub schema_version: u16,
+    pub setup_operation: CodexAccountSetupOperationV1,
+    pub default_slot: CodexAccountSlotDescriptorV1,
+    #[serde(default)]
+    pub managed_slots: Vec<CodexAccountSlotDescriptorV1>,
+    pub capacity: CodexAccountCapacityV1,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentContextQuery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3144,6 +3301,38 @@ pub enum LocalControlCommand {
     ClaudeAccountStopWaiting {
         schema_version: u16,
         operation_id: String,
+    },
+    /// Read machine-local Codex durable-account state.
+    CodexAccountsStatus,
+    /// Create one opaque Codex home and return its official CLI login command.
+    CodexAccountPrepare {
+        schema_version: u16,
+        operation_id: String,
+        expected_account_identifier_hash: String,
+        expected_workspace_identifier_hash: String,
+    },
+    /// Reuse one accepted durable home for provider-owned sign-in again.
+    CodexAccountReconnect {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        expected_account_identifier_hash: String,
+        expected_workspace_identifier_hash: String,
+    },
+    /// Re-read the prepared home and accept only its exact expected composite.
+    CodexAccountCheck {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// Stop setup observation without signing out or deleting provider state.
+    CodexAccountStopWaiting {
+        schema_version: u16,
+        operation_id: String,
+    },
+    /// Remove a durable registration without deleting its credential home.
+    CodexAccountRemove {
+        schema_version: u16,
+        slot_id: String,
     },
     Detect {
         source: SourceKind,
@@ -3686,6 +3875,61 @@ mod tests {
             request["client_kind"] = serde_json::json!("companion_app");
             serde_json::from_value::<LocalControlRequest>(request).expect("account mutation");
         }
+    }
+
+    #[test]
+    fn codex_account_commands_round_trip_exact_registered_strings() {
+        for command in [
+            serde_json::json!({"command": "codex_accounts_status"}),
+            serde_json::json!({
+                "command": "codex_account_prepare",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            serde_json::json!({
+                "command": "codex_account_reconnect",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "slot_id": "codex_slot_0123456789abcdef0123456789abcdef",
+                "expected_account_identifier_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }),
+            serde_json::json!({
+                "command": "codex_account_check",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_stop_waiting",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
+                "command": "codex_account_remove",
+                "schema_version": 1,
+                "slot_id": "codex_slot_0123456789abcdef0123456789abcdef"
+            }),
+        ] {
+            let mut request = command;
+            request["request_id"] = serde_json::json!("req_codex_account");
+            request["protocol_version"] =
+                serde_json::json!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION);
+            request["client_kind"] = serde_json::json!("companion_app");
+            serde_json::from_value::<LocalControlRequest>(request).expect("Codex account command");
+        }
+    }
+
+    #[test]
+    fn codex_account_commands_fail_closed_on_base_protocol_version() {
+        let request = serde_json::json!({
+            "request_id": "req_codex_account",
+            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "client_kind": "companion_app",
+            "command": "codex_accounts_status"
+        });
+        assert!(serde_json::from_value::<LocalControlRequest>(request).is_err());
     }
 
     #[test]
