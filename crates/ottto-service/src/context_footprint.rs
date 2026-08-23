@@ -2,7 +2,8 @@
 //!
 //! This is a low-cadence, per-workspace collector for the static context
 //! footprint Claude Code reports from `/context`: category totals plus memory
-//! files, skills, and custom agents. It is intentionally separate from
+//! files, skills, custom agents, and a bounded sample of MCP tool token costs.
+//! It is intentionally separate from
 //! `AgentContextStatus`/`context_live`, which reflects active session load from
 //! statusLine `context_window`.
 
@@ -23,12 +24,24 @@ use std::time::{Duration, Instant, SystemTime};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const CONTEXT_FOOTPRINT_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
-const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(5 * 60);
+const CONTEXT_COMMAND_TIMEOUT_SECS: u64 = 25;
+const CONTEXT_MCP_COMMAND_TIMEOUT_SECS: u64 = 120;
+const CONTEXT_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_COMMAND_TIMEOUT_SECS);
+const CONTEXT_MCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(CONTEXT_MCP_COMMAND_TIMEOUT_SECS);
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTEXT_MAX_STALENESS_SECS: i64 = 7 * 24 * 60 * 60;
 const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_WORKSPACES_PER_CYCLE: usize = 12;
+const MAX_MCP_TOOLS_PER_CAPTURE: usize = 500;
+// One MCP-enabled capture may use its full cold-start allowance while every
+// other workspace uses the existing strict allowance. Thirty seconds covers
+// bounded git identity checks and uploads without pretending all 12 commands
+// still fit inside the old five-minute budget.
+const CONTEXT_CYCLE_BUDGET: Duration = Duration::from_secs(
+    CONTEXT_MCP_COMMAND_TIMEOUT_SECS
+        + ((MAX_WORKSPACES_PER_CYCLE as u64 - 1) * CONTEXT_COMMAND_TIMEOUT_SECS)
+        + 30,
+);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct ContextFootprintCategoryInput {
@@ -50,6 +63,13 @@ struct ContextFootprintItemInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     relative_path: Option<String>,
     loading_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ContextFootprintMcpToolInput {
+    name: String,
+    server: String,
+    tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -85,6 +105,7 @@ struct ContextFootprintIngestRequest {
     memory_files: Vec<ContextFootprintItemInput>,
     skills: Vec<ContextFootprintItemInput>,
     custom_agents: Vec<ContextFootprintItemInput>,
+    mcp_tools: Vec<ContextFootprintMcpToolInput>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +119,7 @@ struct ParsedContextFootprint {
     memory_files: Vec<ContextFootprintItemInput>,
     skills: Vec<ContextFootprintItemInput>,
     custom_agents: Vec<ContextFootprintItemInput>,
+    mcp_tools: Vec<ContextFootprintMcpToolInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,15 +279,19 @@ fn harvest_recent_workspaces(
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    for workspace in workspaces {
+    for (workspace_index, workspace) in workspaces.into_iter().enumerate() {
         if Instant::now() >= deadline {
             break;
         }
+        // Discovery is sorted newest-first, so index zero is the deterministic
+        // most-recently-active workspace selected for the cycle's sole MCP run.
+        let include_mcp_servers = should_include_mcp_servers(workspace_index);
         match build_request_for_workspace(
             &workspace.path,
             machine_id,
             &env,
             workspace_labels_enabled,
+            include_mcp_servers,
         ) {
             Ok(request) => {
                 match upload_if_changed(client, relay_token, support_dir, identity, &request) {
@@ -305,13 +331,18 @@ fn harvest_recent_workspaces(
     Ok(())
 }
 
+fn should_include_mcp_servers(workspace_index: usize) -> bool {
+    workspace_index == 0
+}
+
 fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
     env: &SpawnEnv,
     workspace_labels_enabled: bool,
+    include_mcp_servers: bool,
 ) -> Result<ContextFootprintIngestRequest> {
-    let stdout = run_claude_context(workspace, env)?;
+    let stdout = run_claude_context(workspace, env, include_mcp_servers)?;
     let value: Value = serde_json::from_str(&stdout)
         .map_err(|_| anyhow!("Claude Code /context JSON was invalid"))?;
     if value
@@ -362,22 +393,21 @@ fn build_request_for_workspace(
         memory_files: parsed.memory_files,
         skills: parsed.skills,
         custom_agents: parsed.custom_agents,
+        mcp_tools: parsed.mcp_tools,
     })
 }
 
-fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
+fn run_claude_context(
+    workspace: &Path,
+    env: &SpawnEnv,
+    include_mcp_servers: bool,
+) -> Result<String> {
     let mut command = env.claude_command()?;
     command
         .current_dir(workspace)
-        .args([
-            "-p",
-            "/context",
-            "--output-format",
-            "json",
-            "--strict-mcp-config",
-        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    let command_timeout = configure_claude_context_command(&mut command, include_mcp_servers);
     let mut child = command
         .spawn()
         .map_err(|_| anyhow!("Claude Code /context could not be started"))?;
@@ -394,7 +424,7 @@ fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
                 return String::from_utf8(output.stdout)
                     .map_err(|_| anyhow!("Claude Code /context stdout was not UTF-8"));
             }
-            Ok(None) if started.elapsed() >= CONTEXT_COMMAND_TIMEOUT => {
+            Ok(None) if started.elapsed() >= command_timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(anyhow!("Claude Code /context timed out"));
@@ -402,6 +432,22 @@ fn run_claude_context(workspace: &Path, env: &SpawnEnv) -> Result<String> {
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
             Err(_) => return Err(anyhow!("Claude Code /context status could not be read")),
         }
+    }
+}
+
+fn configure_claude_context_command(command: &mut Command, include_mcp_servers: bool) -> Duration {
+    command.args(["-p", "/context", "--output-format", "json"]);
+    if !include_mcp_servers {
+        // Keep strict mode everywhere except the single sampled workspace.
+        // Dropping it globally would double-count MCP across the context and
+        // inventory spines, multiply unattended user-server spawns by 12 per
+        // cycle, and put every capture behind a timeout one cold server blows.
+        command.arg("--strict-mcp-config");
+    }
+    if include_mcp_servers {
+        CONTEXT_MCP_COMMAND_TIMEOUT
+    } else {
+        CONTEXT_COMMAND_TIMEOUT
     }
 }
 
@@ -548,6 +594,7 @@ fn parse_context_markdown(markdown: &str) -> Result<ParsedContextFootprint> {
     let mut memory_files = Vec::new();
     let mut skills = Vec::new();
     let mut custom_agents = Vec::new();
+    let mut mcp_tools = Vec::new();
     let mut section = String::new();
 
     for line in markdown.lines() {
@@ -596,6 +643,11 @@ fn parse_context_markdown(markdown: &str) -> Result<ParsedContextFootprint> {
                     custom_agents.push(item);
                 }
             }
+            "mcp tools" if mcp_tools.len() < MAX_MCP_TOOLS_PER_CAPTURE => {
+                if let Some(item) = parse_mcp_tool_row(&cells) {
+                    mcp_tools.push(item);
+                }
+            }
             _ => {}
         }
     }
@@ -620,6 +672,7 @@ fn parse_context_markdown(markdown: &str) -> Result<ParsedContextFootprint> {
         memory_files,
         skills,
         custom_agents,
+        mcp_tools,
     })
 }
 
@@ -691,6 +744,31 @@ fn parse_named_item_row(cells: &[String], kind: &str) -> Option<ContextFootprint
         relative_path: None,
         loading_mode: "always_on".to_string(),
     })
+}
+
+fn parse_mcp_tool_row(cells: &[String]) -> Option<ContextFootprintMcpToolInput> {
+    if cells.len() < 3 {
+        return None;
+    }
+    Some(ContextFootprintMcpToolInput {
+        name: safe_mcp_identity(&cells[0])?,
+        server: safe_mcp_identity(&cells[1])?,
+        tokens: parse_token_count(&cells[2])?,
+    })
+}
+
+fn safe_mcp_identity(raw: &str) -> Option<String> {
+    let value = safe_text(raw, 256)?;
+    if value.starts_with('/')
+        || value.starts_with('\\')
+        || value.starts_with('~')
+        || value.contains('/')
+        || value.contains('\\')
+        || value.contains("://")
+    {
+        return None;
+    }
+    Some(value)
 }
 
 fn parse_token_count(raw: &str) -> Option<u64> {
@@ -991,6 +1069,7 @@ fn request_content_hash(parsed: &ParsedContextFootprint) -> Result<String> {
         "memory_files": &parsed.memory_files,
         "skills": &parsed.skills,
         "custom_agents": &parsed.custom_agents,
+        "mcp_tools": &parsed.mcp_tools,
     }))
     .map_err(|error| anyhow!("hash encode failed: {error}"))?;
     Ok(sha256_bytes(&canonical))
@@ -998,7 +1077,7 @@ fn request_content_hash(parsed: &ParsedContextFootprint) -> Result<String> {
 
 fn request_content_hash_for_request(request: &ContextFootprintIngestRequest) -> Result<String> {
     let canonical = serde_json::to_vec(&json!({
-        "cache_schema": "context_footprint_request_v2",
+        "cache_schema": "context_footprint_request_v3",
         "agent_source": &request.agent_source,
         "machine_id": &request.machine_id,
         "workspace_hash": &request.workspace_hash,
@@ -1021,6 +1100,7 @@ fn request_content_hash_for_request(request: &ContextFootprintIngestRequest) -> 
         "memory_files": &request.memory_files,
         "skills": &request.skills,
         "custom_agents": &request.custom_agents,
+        "mcp_tools": &request.mcp_tools,
     }))
     .map_err(|error| anyhow!("hash encode failed: {error}"))?;
     Ok(sha256_bytes(&canonical))
@@ -1181,6 +1261,7 @@ mod tests {
 |---|---:|---:|
 | System prompt | 2.5k | 0.2% |
 | System tools (deferred) | 13.9k | 1.4% |
+| MCP tools (deferred) | 1.75k | 0.2% |
 | Memory files | 22.2k | 2.2% |
 | Free space | 957.8k | 95.8% |
 
@@ -1198,6 +1279,13 @@ mod tests {
 | Agent Type | Source | Tokens |
 |---|---|---:|
 | reviewer | global | 3.6k |
+
+### MCP Tools
+| Tool | Server | Tokens |
+|---|---|---:|
+| leaks_path | /Users/example/private/server | 999 |
+| create_artifact | claude_design | 1.25k |
+| read_artifact | claude_design | 500 |
 "#,
         )
         .expect("parse");
@@ -1206,8 +1294,10 @@ mod tests {
         assert_eq!(parsed.used_tokens, 42_200);
         assert_eq!(parsed.context_window_tokens, 1_000_000);
         assert_eq!(parsed.free_space_tokens, Some(957_800));
-        assert_eq!(parsed.categories.len(), 4);
+        assert_eq!(parsed.categories.len(), 5);
         assert_eq!(parsed.categories[1].loading_mode, "on_demand");
+        assert_eq!(parsed.categories[2].name, "MCP tools (deferred)");
+        assert_eq!(parsed.categories[2].loading_mode, "on_demand");
         assert_eq!(parsed.memory_files[0].name, "CLAUDE.md");
         assert_eq!(
             parsed.memory_files[0].relative_path.as_deref(),
@@ -1215,8 +1305,15 @@ mod tests {
         );
         assert_eq!(parsed.skills[0].name, "frontend-flow-change");
         assert_eq!(parsed.custom_agents[0].name, "reviewer");
+        assert_eq!(parsed.mcp_tools.len(), 2);
+        assert_eq!(parsed.mcp_tools[0].name, "create_artifact");
+        assert_eq!(parsed.mcp_tools[0].server, "claude_design");
+        assert_eq!(parsed.mcp_tools[0].tokens, 1_250);
+        assert_eq!(parsed.mcp_tools[1].tokens, 500);
         let encoded = serde_json::to_string(&parsed.memory_files).unwrap();
         assert!(!encoded.contains("/Users/example"));
+        let encoded_mcp = serde_json::to_string(&parsed.mcp_tools).unwrap();
+        assert!(!encoded_mcp.contains("description"));
     }
 
     #[test]
@@ -1225,6 +1322,29 @@ mod tests {
         assert_eq!(parse_token_count("1m"), Some(1_000_000));
         assert_eq!(parse_token_count("8"), Some(8));
         assert_eq!(parse_percent("95.8%"), Some(95.8));
+    }
+
+    #[test]
+    fn only_newest_workspace_enables_mcp_with_the_long_timeout() {
+        assert!(should_include_mcp_servers(0));
+        assert!((1..MAX_WORKSPACES_PER_CYCLE).all(|index| !should_include_mcp_servers(index)));
+
+        let mut sampled = Command::new("claude");
+        let sampled_timeout = configure_claude_context_command(&mut sampled, true);
+        let sampled_args: Vec<_> = sampled.get_args().collect();
+        assert!(!sampled_args.iter().any(|arg| *arg == "--strict-mcp-config"));
+        assert_eq!(sampled_timeout, CONTEXT_MCP_COMMAND_TIMEOUT);
+
+        let mut strict = Command::new("claude");
+        let strict_timeout = configure_claude_context_command(&mut strict, false);
+        let strict_args: Vec<_> = strict.get_args().collect();
+        assert!(strict_args.iter().any(|arg| *arg == "--strict-mcp-config"));
+        assert_eq!(strict_timeout, CONTEXT_COMMAND_TIMEOUT);
+        assert!(
+            CONTEXT_CYCLE_BUDGET
+                >= CONTEXT_MCP_COMMAND_TIMEOUT
+                    + CONTEXT_COMMAND_TIMEOUT * (MAX_WORKSPACES_PER_CYCLE as u32 - 1)
+        );
     }
 
     #[test]
@@ -1493,6 +1613,7 @@ mod tests {
             memory_files: Vec::new(),
             skills: Vec::new(),
             custom_agents: Vec::new(),
+            mcp_tools: Vec::new(),
         }
     }
 
