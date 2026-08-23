@@ -283,6 +283,8 @@ pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revisio
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
+const MAX_TOOL_USAGE_NAMES: usize = 200;
 
 /// Hash epoch of the policy-neutral `content_hash`.
 ///
@@ -685,6 +687,15 @@ pub struct SnapshotActivityCount {
     pub count: u64,
 }
 
+/// One privacy-safe transcript-observed tool-name aggregate. Only the bounded
+/// name and count cross the wire; tool ids, arguments, results, and paths stay
+/// local to the parser.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotToolUsage {
+    pub name: String,
+    pub count: u64,
+}
+
 /// One privacy-safe agent capability count. The identifiers are collector-owned
 /// constants; raw tool arguments, results, URLs, browser ids, and screenshots
 /// never enter this shape.
@@ -835,6 +846,13 @@ pub struct SnapshotItem {
     pub compaction_total_duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_summary: Option<SnapshotActivitySummary>,
+    /// Names of tools actually invoked by counted Claude assistant responses.
+    /// This is deliberately a plain additive wire field: it is not part of any
+    /// semantic-envelope component and therefore cannot churn content identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_usage: Option<Vec<SnapshotToolUsage>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_usage_truncated: bool,
     pub model_usage: Vec<SnapshotModelUsage>,
     pub usage_buckets: Vec<SnapshotUsageBucket>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -980,6 +998,10 @@ const MAX_SESSION_ARTIFACTS: usize = 50;
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_true() -> bool {
@@ -4510,6 +4532,7 @@ struct ClaudeResponseObservation {
     terminal_timestamp: Option<String>,
     preceding_user_timestamp: Option<String>,
     computed_effective_input_context: Option<u64>,
+    tool_uses: BTreeMap<String, String>,
     conflict: bool,
 }
 
@@ -4535,6 +4558,7 @@ impl ClaudeResponseObservation {
         timestamp: Option<String>,
         preceding_user_timestamp: Option<String>,
         computed_effective_input_context: Option<u64>,
+        tool_uses: BTreeMap<String, String>,
     ) -> Self {
         Self {
             sequence,
@@ -4547,6 +4571,7 @@ impl ClaudeResponseObservation {
             terminal_timestamp: timestamp,
             preceding_user_timestamp,
             computed_effective_input_context,
+            tool_uses,
             conflict: false,
         }
     }
@@ -4576,6 +4601,22 @@ impl ClaudeResponseObservation {
             self.terminal_timestamp = timestamp;
         }
     }
+}
+
+fn merge_claude_response_tool_uses(
+    current: &mut BTreeMap<String, String>,
+    next: BTreeMap<String, String>,
+) -> bool {
+    for (tool_use_id, name) in next {
+        if current
+            .get(&tool_use_id)
+            .is_some_and(|existing| existing != &name)
+        {
+            return false;
+        }
+        current.insert(tool_use_id, name);
+    }
+    true
 }
 
 fn merge_optional_claude_field(current: &mut Option<String>, next: Option<String>) -> bool {
@@ -5428,6 +5469,8 @@ struct SnapshotAccumulator {
     // coverage and never serialized.
     claude_usage_request_ids: BTreeSet<String>,
     claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    tool_usage_counts: BTreeMap<String, u64>,
+    tool_usage_truncated: bool,
     // Current Pi transcripts carry usage on `type=message` assistant records;
     // older exporters used `type=message_end`. When both representations are
     // present, their response id is the exact occurrence key that prevents a
@@ -5539,6 +5582,8 @@ impl SnapshotAccumulator {
             claude_response_sequence: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            tool_usage_counts: BTreeMap::new(),
+            tool_usage_truncated: false,
             seen_pi_usage_keys: BTreeMap::new(),
             dropped_usage_record_count: 0,
             claude_last_user_ts: None,
@@ -5985,6 +6030,7 @@ impl SnapshotAccumulator {
         reasoning_effort: Option<String>,
         computed_effective_input_context: Option<u64>,
     ) {
+        let tool_uses = claude_response_tool_uses(value);
         let request_id =
             string_at(value, &["requestId"]).or_else(|| string_at(value, &["request_id"]));
         let key = match claude_code_usage_dedup_key(value) {
@@ -5998,6 +6044,10 @@ impl SnapshotAccumulator {
             }
         };
         if let Some(existing) = self.claude_responses.get_mut(&key) {
+            if !merge_claude_response_tool_uses(&mut existing.tool_uses, tool_uses) {
+                existing.conflict = true;
+                return;
+            }
             existing.merge(
                 usage,
                 model,
@@ -6022,6 +6072,7 @@ impl SnapshotAccumulator {
                 timestamp,
                 self.claude_last_user_ts.clone(),
                 computed_effective_input_context,
+                tool_uses,
             ),
         );
     }
@@ -6068,6 +6119,9 @@ impl SnapshotAccumulator {
                     self.peak_context_fill_tokens.max(effective_input_context);
                 self.last_turn_context_tokens = Some(effective_input_context);
             }
+            for name in response.tool_uses.into_values() {
+                self.note_tool_usage(name);
+            }
             self.add_usage_with_selector(
                 response.model,
                 response.usage,
@@ -6075,6 +6129,16 @@ impl SnapshotAccumulator {
                 response.terminal_timestamp.as_deref(),
                 response.reasoning_effort,
             );
+        }
+    }
+
+    fn note_tool_usage(&mut self, name: String) {
+        if let Some(count) = self.tool_usage_counts.get_mut(&name) {
+            *count = count.saturating_add(1);
+        } else if self.tool_usage_counts.len() < MAX_TOOL_USAGE_NAMES {
+            self.tool_usage_counts.insert(name, 1);
+        } else {
+            self.tool_usage_truncated = true;
         }
     }
 
@@ -6586,6 +6650,13 @@ impl SnapshotAccumulator {
             SnapshotSource::Pi => Some("uncached".to_string()),
         };
         let activity_summary = self.activity_summary();
+        // Claude is the only parser that currently derives this new contract.
+        // Emit an explicit empty list for a counted Claude transcript so a
+        // newer cumulative scan can clear a previously observed aggregate;
+        // omit the field for Codex/Pi, whose parsers do not populate it.
+        let tool_usage = (self.source == SnapshotSource::ClaudeCode)
+            .then(|| bounded_tool_usage_counts(&self.tool_usage_counts));
+        let tool_usage_truncated = self.tool_usage_truncated;
         // Per-row session-wide aggregation (sum across all buckets keyed by
         // RowKey). Drives the top-level model_usage list and the snapshot
         // totals so the backend validator sees the two reconcile exactly.
@@ -6716,6 +6787,8 @@ impl SnapshotAccumulator {
                 None
             },
             activity_summary,
+            tool_usage,
+            tool_usage_truncated,
             model_usage,
             usage_buckets,
             cost: totals.costs.snapshot_cost(),
@@ -8069,6 +8142,8 @@ fn codex_state_only_snapshot(
         compaction_total_cumulative_dropped_tokens: None,
         compaction_total_duration_ms: None,
         activity_summary: None,
+        tool_usage: None,
+        tool_usage_truncated: false,
         model_usage,
         usage_buckets,
         cost: None,
@@ -9397,6 +9472,23 @@ fn bounded_activity_counts(
     rows
 }
 
+fn bounded_tool_usage_counts(counts: &BTreeMap<String, u64>) -> Vec<SnapshotToolUsage> {
+    let mut rows = counts
+        .iter()
+        .map(|(name, count)| SnapshotToolUsage {
+            name: name.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
+}
+
 fn codex_session_meta_payload(value: &Value) -> Option<&Value> {
     if string_eq_at(value, &["type"], "session_meta") {
         return value.get("payload");
@@ -10166,6 +10258,39 @@ fn claude_capability_from_tool_name(name: &str) -> Option<(&'static str, &'stati
         return Some(("computer.use", "computer-use"));
     }
     None
+}
+
+fn bounded_tool_usage_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return None;
+    }
+    Some(value.chars().take(MAX_TOOL_USAGE_NAME_LENGTH).collect())
+}
+
+fn claude_response_tool_uses(value: &Value) -> BTreeMap<String, String> {
+    if !string_eq_at(value, &["message", "role"], "assistant") {
+        return BTreeMap::new();
+    }
+    let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return BTreeMap::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| string_eq_at(block, &["type"], "tool_use"))
+        .filter_map(|(index, block)| {
+            let name =
+                string_at(block, &["name"]).and_then(|name| bounded_tool_usage_name(&name))?;
+            let occurrence =
+                string_at(block, &["id"]).unwrap_or_else(|| format!("anonymous:{index}:{name}"));
+            Some((occurrence, name))
+        })
+        .collect()
 }
 
 fn note_claude_capability_calls(
@@ -15063,10 +15188,119 @@ mod tests {
                 && row.raw_origin == "computer-use"
                 && row.count == 1
         }));
+        assert_eq!(
+            item.tool_usage.as_deref(),
+            Some(
+                &[
+                    SnapshotToolUsage {
+                        name: "mcp__Claude_Browser__computer".to_string(),
+                        count: 1,
+                    },
+                    SnapshotToolUsage {
+                        name: "mcp__claude-in-chrome__navigate".to_string(),
+                        count: 1,
+                    },
+                    SnapshotToolUsage {
+                        name: "mcp__computer-use__computer_batch".to_string(),
+                        count: 1,
+                    },
+                ][..]
+            )
+        );
+        assert!(!item.tool_usage_truncated);
         let encoded = serde_json::to_string(summary).expect("serialize");
         assert!(!encoded.contains("private.example"));
         assert!(!encoded.contains("screenshot"));
         assert!(!encoded.contains("actions"));
+        let wire = serde_json::to_string(&item).expect("serialize snapshot item");
+        assert!(wire.contains("mcp__claude-in-chrome__navigate"));
+        assert!(!wire.contains("private.example"));
+        assert!(!wire.contains("screenshot"));
+        assert!(!wire.contains("actions"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_tool_usage_caps_distinct_names_and_marks_truncation() {
+        let path = temp_file("claude-tool-usage-cap");
+        let mut lines = vec![json!({
+            "timestamp": "2026-08-02T06:00:00Z",
+            "type": "user",
+            "sessionId": "claude-tool-cap-session",
+            "message": {"role": "user", "content": "exercise tools"}
+        })];
+        for index in 0..=MAX_TOOL_USAGE_NAMES {
+            lines.push(json!({
+                "timestamp": "2026-08-02T06:01:00Z",
+                "type": "assistant",
+                "sessionId": "claude-tool-cap-session",
+                "requestId": format!("req-{index}"),
+                "message": {
+                    "id": format!("msg-{index}"),
+                    "role": "assistant",
+                    "model": "claude-opus-4-1",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [{
+                        "type": "tool_use",
+                        "id": format!("tool-{index}"),
+                        "name": format!("mcp__fixture__tool_{index}"),
+                        "input": {"secret": format!("never-upload-{index}")}
+                    }]
+                }
+            }));
+        }
+        fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        let tool_usage = item.tool_usage.as_deref().expect("Claude tool contract");
+        assert_eq!(tool_usage.len(), MAX_TOOL_USAGE_NAMES);
+        assert!(item.tool_usage_truncated);
+        assert!(tool_usage
+            .iter()
+            .all(|row| row.name.chars().count() <= MAX_TOOL_USAGE_NAME_LENGTH));
+        assert!(!serde_json::to_string(&item)
+            .expect("serialize snapshot item")
+            .contains("never-upload"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_tool_usage_emits_explicit_empty_contract() {
+        let path = temp_file("claude-tool-usage-empty");
+        fs::write(
+            &path,
+            [
+                json!({"timestamp":"2026-08-02T06:00:00Z","type":"user","sessionId":"claude-tool-empty-session","message":{"role":"user","content":"hello"}}),
+                json!({"timestamp":"2026-08-02T06:01:00Z","type":"assistant","sessionId":"claude-tool-empty-session","requestId":"req-1","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-1","usage":{"input_tokens":10,"output_tokens":2},"content":[{"type":"text","text":"hello"}]}}),
+            ]
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .expect("write transcript");
+
+        let item = parse_claude_code_jsonl_file(&path, "2026-08-02T07:02:00Z", "fp".to_string())
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("snapshot");
+        assert_eq!(item.tool_usage, Some(Vec::new()));
+        assert!(serde_json::to_string(&item)
+            .expect("serialize snapshot item")
+            .contains("\"tool_usage\":[]"));
         let _ = fs::remove_file(path);
     }
 
@@ -20071,6 +20305,8 @@ mod tests {
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
             activity_summary: None,
+            tool_usage: None,
+            tool_usage_truncated: false,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             cost: None,
@@ -29444,17 +29680,20 @@ mod tests {
         // Golden daemon<->backend contract guard. Companion to the backend's
         // backend/tests/unit/test_daemon_snapshot_contract.py (master 6fa4deeff),
         // which validates the canonical daemon payload (generated from THIS
-        // serializer) against AgentSessionSnapshotBatchRequest, declared
-        // `extra="forbid"`. The v5->v6 break shipped silent because no
+        // serializer) against AgentSessionSnapshotBatchRequest. The v5->v6
+        // break shipped silent because the then-current contract forbade
+        // unknown fields and no
         // cross-language test existed: the daemon emitted item-level
         // gateway_provider / plan_fingerprint / backfill_source while the backend
         // forbade them, so every batch 422'd. Keep the two tests in lockstep:
         // when the snapshot schema changes, update the field sets below AND the
         // backend fixture/model together.
 
-        // Allowed AgentSessionSnapshotItem fields (extra="forbid"), copied from
-        // app/schemas/agent_session_snapshots.py. Pi emits `cost`; the other
-        // collectors omit it.
+        // Registered AgentSessionSnapshotItem fields, copied from
+        // app/schemas/agent_session_snapshots.py. The current ingest model is
+        // forward-tolerant, but keeping this registry synchronized prevents a
+        // new daemon field from being silently ignored by an older backend.
+        // Pi emits `cost`; the other collectors omit it.
         const ALLOWED_ITEM_FIELDS: &[&str] = &[
             "source_session_id",
             "snapshot_fingerprint",
@@ -29478,6 +29717,8 @@ mod tests {
             "compaction_total_cumulative_dropped_tokens",
             "compaction_total_duration_ms",
             "activity_summary",
+            "tool_usage",
+            "tool_usage_truncated",
             "model_usage",
             "usage_buckets",
             "cost",
@@ -29659,6 +29900,8 @@ mod tests {
                 capability_buckets: Vec::new(),
                 skills: vec!["repo-task-lifecycle".to_string()],
             }),
+            tool_usage: None,
+            tool_usage_truncated: false,
             model_usage: vec![vertex_row.clone()],
             usage_buckets: vec![SnapshotUsageBucket {
                 bucket_start: "2026-05-28T17:00:00Z".to_string(),
@@ -29928,6 +30171,8 @@ mod tests {
                 compaction_total_cumulative_dropped_tokens: None,
                 compaction_total_duration_ms: None,
                 activity_summary: None,
+                tool_usage: None,
+                tool_usage_truncated: false,
                 model_usage: vec![row.clone()],
                 usage_buckets: vec![SnapshotUsageBucket {
                     bucket_start: "2026-05-28T17:00:00Z".to_string(),

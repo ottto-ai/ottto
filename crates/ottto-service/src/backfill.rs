@@ -500,6 +500,8 @@ mod tests {
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
             activity_summary: None,
+            tool_usage: None,
+            tool_usage_truncated: false,
             model_usage: Vec::new(),
             usage_buckets: Vec::new(),
             cost: None,

@@ -1365,6 +1365,8 @@ mod tests {
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
             activity_summary: None,
+            tool_usage: None,
+            tool_usage_truncated: false,
             model_usage: vec![model_usage.clone()],
             usage_buckets: vec![crate::snapshots::SnapshotUsageBucket {
                 bucket_start: "2026-07-19T10:00:00Z".to_string(),
