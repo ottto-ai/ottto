@@ -8,9 +8,11 @@ Review tier: `official`
 - `otel_config` requires setup and user/org telemetry controls before live telemetry is enabled.
 - `quota_status` requires setup. It should prefer the local Codex app-server
   `account/rateLimits/read` protocol for quota windows and ChatGPT credit
-  balance metadata. Explicit durable connections may decode ID-token claims
-  from their exact owner-only `CODEX_HOME` solely to hash the ChatGPT user and
-  active workspace and to configure Codex's supported workspace restriction.
+  balance metadata. Explicit durable connections may decode access-token claims
+  from their exact owner-only `CODEX_HOME` only after expiry, issuer, audience,
+  stored workspace metadata, any ID token, and the same authenticated provider
+  session agree. Uncorroborated claims remain low-confidence and never carry
+  meters.
   Any older/private quota path that calls an undocumented ChatGPT usage
   endpoint remains disabled for durable connections and must redact local
   paths, account secrets, and token material from all uploads.

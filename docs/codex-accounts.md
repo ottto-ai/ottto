@@ -30,9 +30,9 @@ The setup check accepts the connection only when all of these are true:
 
 An incorrect account or workspace remains unaccepted and can be retried in the
 same home. A stopped or failed setup also reuses its existing home. An accepted
-binding cannot be prepared again. Removing the Ottto registration does not
-delete the provider credential directory, so credential deletion remains an
-explicit user action.
+binding cannot be prepared again. Removing an Ottto-managed connection
+permanently deletes only that daemon-created credential home; recovery requires
+a fresh provider login. The default Codex home is never a deletion target.
 
 The default connection plus up to nine durable connections can coexist. Every
 directory and settings file is owner-only. Settings persist only opaque slot
@@ -43,12 +43,14 @@ restriction.
 ## Quota collection and failure isolation
 
 Each collection pass probes the default and durable homes independently using
-the installed Codex binary with an exact `CODEX_HOME`, a cleared environment,
-and no ambient provider API keys. Durable homes never use Ottto's legacy OAuth
+the installed Codex binary with exact per-slot `CODEX_HOME` and
+`CODEX_SQLITE_HOME` values, a cleared environment, and no ambient provider API
+keys. Durable homes never use Ottto's legacy OAuth
 HTTP fallback. Collection uses the documented local Codex App Server
 `account/rateLimits/read` method and preserves every reported
-`rateLimitsByLimitId` bucket. Five-hour and seven-day windows are named by
-their reported durations rather than by their primary/secondary position.
+`rateLimitsByLimitId` bucket. Every window key combines its limit id, field,
+reported duration, and reset availability; unknown durations remain unique and
+no bucket meaning is inferred from position.
 
 Homes are probed concurrently under the ten-slot cap, so one provider timeout
 does not serialize or suppress healthy siblings. One backend-safe snapshot is

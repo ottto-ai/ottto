@@ -48,7 +48,8 @@ pub use claude_statusline::{
     CLAUDE_STATUSLINE_RATE_LIMIT_CACHE_SCHEMA_VERSION,
 };
 pub use codex_account_slots::{
-    CodexAccountSlotSettingsError, CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
+    read_codex_auth_file_secure, read_codex_config_file_secure, CodexAccountSlotSettingsError,
+    CodexRegisteredSlotBinding, FileCodexAccountSlotSettingsStore,
     CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME, CODEX_MANAGED_ACCOUNTS_DIR_NAME,
     MAX_CODEX_ACCOUNT_SLOTS, MAX_MANAGED_CODEX_ACCOUNT_SLOTS,
 };
