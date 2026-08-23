@@ -42,6 +42,11 @@ command. Each successful slot schedules normal collection/upload immediately.
 The last exact coherent bundle can remain visible as stale for at most 24
 hours, without overwriting a newer current read.
 
+The public protocol fixtures include a Rust-serialized, backend-redacted W3
+snapshot pair plus its deterministic leaf-path/type manifest. The pair pins an
+anchored healthy account and a default-only account with intentionally absent
+anchor health, both under strong account-and-organization bindings.
+
 ## Guardrails
 
 No raw OAuth refresh, Keychain write, automated `/login`, inference prompt,
@@ -52,7 +57,7 @@ timestamps, and typed events.
 ## Validation
 
 - `cargo check --workspace`
-- `cargo test -p ottto-protocol` (51 passed, 1 ignored)
+- `cargo test -p ottto-protocol` (52 passed, 1 ignored)
 - `cargo test -p ottto-core` (109 passed)
 - `cargo test -p ottto-cli` (80 passed)
 - `cargo test -p ottto-service` (1,464 passed across library and binary, 2

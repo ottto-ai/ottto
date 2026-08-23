@@ -3841,6 +3841,169 @@ mod tests {
         }
     }
 
+    fn w3_multi_anchor_snapshot(
+        account_identifier_hash: &str,
+        organization_identifier_hash: &str,
+        durability: ClaudeAccountAnchorDurabilityV1,
+        health: Option<ClaudeAccountAnchorHealthV1>,
+    ) -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            source: SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::CliJson,
+            captured_at: "2026-08-23T08:00:00Z".to_string(),
+            expires_at: "2026-08-23T08:05:00Z".to_string(),
+            account: Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                provider: Some("anthropic".to_string()),
+                auth_method: Some("oauth".to_string()),
+                email: None,
+                account_id: None,
+                organization_id: None,
+                organization_label: None,
+                plan_type: None,
+                subscription_product: None,
+                billing_channel: Some("subscription".to_string()),
+                subscription_period_start: None,
+                subscription_period_end: None,
+                subscription_period_last_checked_at: None,
+                account_identifier_hash: Some(account_identifier_hash.to_string()),
+                organization_identifier_hash: Some(organization_identifier_hash.to_string()),
+                credential_fingerprint_hash: None,
+                billing_identity_evidence: Some("provider_account_id".to_string()),
+                claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
+                claude_anchor_durability: Some(durability),
+                claude_anchor_health: health,
+                billing_identity_confidence: AgentStatusConfidence::High,
+                confidence: AgentStatusConfidence::High,
+            }),
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        }
+        .redacted_for_backend()
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct GoldenLeafType {
+        path: String,
+        value_type: &'static str,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct GoldenLeafManifest {
+        schema_version: u16,
+        leaves: Vec<GoldenLeafType>,
+    }
+
+    fn collect_golden_leaf_types(
+        value: &serde_json::Value,
+        path: &str,
+        leaves: &mut Vec<GoldenLeafType>,
+    ) {
+        match value {
+            serde_json::Value::Null => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "null",
+            }),
+            serde_json::Value::Bool(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "boolean",
+            }),
+            serde_json::Value::Number(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "number",
+            }),
+            serde_json::Value::String(_) => leaves.push(GoldenLeafType {
+                path: path.to_string(),
+                value_type: "string",
+            }),
+            serde_json::Value::Array(values) if values.is_empty() => {
+                leaves.push(GoldenLeafType {
+                    path: path.to_string(),
+                    value_type: "array",
+                });
+            }
+            serde_json::Value::Array(values) => {
+                for (index, item) in values.iter().enumerate() {
+                    collect_golden_leaf_types(item, &format!("{path}[{index}]"), leaves);
+                }
+            }
+            serde_json::Value::Object(values) if values.is_empty() => {
+                leaves.push(GoldenLeafType {
+                    path: path.to_string(),
+                    value_type: "object",
+                });
+            }
+            serde_json::Value::Object(values) => {
+                for (key, item) in values {
+                    collect_golden_leaf_types(item, &format!("{path}.{key}"), leaves);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w3_multi_anchor_backend_fixture_and_leaf_manifest_match_typed_wire() {
+        let snapshots = vec![
+            w3_multi_anchor_snapshot(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ClaudeAccountAnchorDurabilityV1::Anchored,
+                Some(ClaudeAccountAnchorHealthV1::Healthy),
+            ),
+            w3_multi_anchor_snapshot(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ClaudeAccountAnchorDurabilityV1::DefaultOnly,
+                None,
+            ),
+        ];
+        let value = serde_json::to_value(&snapshots).expect("serialize typed W3 snapshots");
+        let fixture = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).expect("pretty-print typed W3 snapshots")
+        );
+        assert_eq!(
+            fixture,
+            include_str!("../../../fixtures/agent-status/claude-multi-anchor-snapshots.v1.json")
+        );
+
+        let mut leaves = Vec::new();
+        collect_golden_leaf_types(&value, "$", &mut leaves);
+        leaves.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = GoldenLeafManifest {
+            schema_version: 1,
+            leaves,
+        };
+        let manifest = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&manifest).expect("pretty-print W3 leaf manifest")
+        );
+        assert_eq!(
+            manifest,
+            include_str!("../../../fixtures/agent-status/claude-multi-anchor-leaf-types.v1.json")
+        );
+
+        let wire = serde_json::to_string(&snapshots).expect("serialize W3 backend fixture");
+        for forbidden in [
+            "config_dir",
+            "slot_id",
+            "service_name",
+            "credential",
+            "access_token",
+            "refresh_token",
+            "/Users/",
+        ] {
+            assert!(!wire.contains(forbidden), "fixture leaked {forbidden}");
+        }
+    }
+
     #[test]
     fn claude_account_commands_fail_closed_on_base_protocol_version() {
         for command in [
