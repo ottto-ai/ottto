@@ -10,10 +10,13 @@ pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 /// rather than silently doing nothing. Every unrelated command stays on the
 /// base version for mixed-owner upgrade compatibility.
 pub const PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION: u16 = 18;
-/// Command-scoped version for the four machine-local Claude account registry
-/// operations. Version 15 predates ownership and opaque slot identifiers, so
-/// accepting it would let clients silently misclassify external paths.
+/// Command-scoped version for the machine-local Claude account registry
+/// operations. Additive v18 fields are presence-gated by newer clients so old
+/// status callers and commands remain valid during a rolling upgrade.
 pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
+/// Command-scoped version for mutations that bind a daemon-authored anchor
+/// target to an exact account+organization pair.
+pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
     "Uploaded diagnostics are retained by Ottto support for 30 days and may be attached to the support request.";
@@ -1293,6 +1296,28 @@ pub enum ClaudeQuotaAccessState {
     AttentionRequired,
 }
 
+/// Machine-local durability of one strongly account-and-organization-bound
+/// Claude observation. This is orthogonal to meter freshness and access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorDurabilityV1 {
+    Anchored,
+    DefaultOnly,
+    Unresolved,
+}
+
+/// Current health of the registered anchor that supplies continuity. Absent
+/// means the observation is not anchored or came from an older daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorHealthV1 {
+    Healthy,
+    TemporarilyUnavailable,
+    ReconnectRequired,
+    Paused,
+    AttentionRequired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentAccountStatus {
     pub login_state: AgentLoginState,
@@ -1333,6 +1358,12 @@ pub struct AgentAccountStatus {
     /// consumer must treat absence as unknown rather than setup-required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_quota_access_state: Option<ClaudeQuotaAccessState>,
+    /// Backend-safe continuity evidence. Producers set these only when both
+    /// strong account and organization hashes are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_anchor_durability: Option<ClaudeAccountAnchorDurabilityV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_anchor_health: Option<ClaudeAccountAnchorHealthV1>,
     #[serde(default)]
     pub billing_identity_confidence: AgentStatusConfidence,
     pub confidence: AgentStatusConfidence,
@@ -2438,6 +2469,10 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::ClaudeAccountStopWaiting { .. } => {
             CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION
         }
+        LocalControlCommand::ClaudeAccountPrepareTarget { .. }
+        | LocalControlCommand::ClaudeAccountReconnectTarget { .. } => {
+            CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION
+        }
         _ => LOCAL_CONTROL_PROTOCOL_VERSION,
     }
 }
@@ -2511,10 +2546,18 @@ pub struct ClaudeAccountSetupOperationV1 {
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_id: Option<String>,
+    /// Daemon-authored opaque local setup target. It contains no path or raw
+    /// provider identifier and is stable across status -> prepare replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
     /// Exact copyable command returned only by authenticated local control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_command: Option<String>,
@@ -2588,6 +2631,10 @@ pub struct ClaudeConfigSlotCollectionStatusV1 {
     /// decision. This never contains credential material or a config path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upkeep: Option<ClaudeConfigSlotUpkeepStatusV1>,
+    /// Orthogonal relationship to the daemon-selected durable anchor. Older
+    /// clients ignore this additive field and continue decoding `state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<ClaudeConfigSlotRelationshipV1>,
     #[serde(default)]
     pub diagnostics: Vec<ClaudeConfigSlotDiagnosticV1>,
 }
@@ -2704,6 +2751,34 @@ pub enum ClaudeConfigSlotDiagnosticCodeV1 {
     UpkeepDisabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeConfigSlotRelationshipV1 {
+    CanonicalAnchor,
+    ShadowedByAnchor,
+    DuplicateAnchor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorTransitionKindV1 {
+    DefaultIdentityChanged,
+    AnchorRemainedBound,
+    AnchorGrantDisappeared,
+    RefreshDeadlineAdvanced,
+    OfficialReconnectCompleted,
+    DefaultShadowObserved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorTransitionV1 {
+    pub kind: ClaudeAccountAnchorTransitionKindV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
 /// Safe evidence for an account that cannot yet be associated with a config
 /// slot. It intentionally has no path, slot identifier, or Keychain service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2724,6 +2799,55 @@ pub struct ClaudeUnresolvedAccountDescriptorV1 {
     pub observed_at: Option<Rfc3339Timestamp>,
     #[serde(default)]
     pub evidence: Vec<ClaudeUnresolvedAccountEvidenceKind>,
+}
+
+/// Machine-local continuity state for one strongly observed Claude account.
+/// This projection is derived by the daemon from the default observer,
+/// explicitly registered slots, and unresolved strong evidence. It never
+/// contains a config path, Keychain service, raw provider identifier, or
+/// credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAccountAnchorSetupBlockerV1 {
+    CapacityReached,
+    AmbiguousIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorDescriptorV1 {
+    /// Present only for a strongly bound, daemon-selectable local target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub account_identifier_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_identifier_hash: Option<String>,
+    pub durability: ClaudeAccountAnchorDurabilityV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<ClaudeAccountAnchorHealthV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_blockers: Vec<ClaudeAccountAnchorSetupBlockerV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
+/// Daemon-owned account-set arithmetic for the machine. Clients may render or
+/// count these typed rows, but must not re-derive anchor coverage from slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeAccountAnchorCoverageV1 {
+    #[serde(default)]
+    pub accounts: Vec<ClaudeAccountAnchorDescriptorV1>,
+    #[serde(default)]
+    pub observed_accounts: u8,
+    #[serde(default)]
+    pub anchored_accounts: u8,
+    #[serde(default)]
+    pub default_only_accounts: u8,
+    #[serde(default)]
+    pub unresolved_accounts: u8,
+    #[serde(default)]
+    pub capacity_blocked_accounts: u8,
+    #[serde(default)]
+    pub ambiguous_identity_accounts: u8,
 }
 
 /// Capacity of the bounded Claude snapshot registry. The default slot always
@@ -2751,6 +2875,14 @@ pub struct ClaudeAccountsStatusV1 {
     /// never probes additional Claude paths or infers registrations.
     #[serde(default)]
     pub unresolved_accounts: Vec<ClaudeUnresolvedAccountDescriptorV1>,
+    /// Shared machine-local continuity projection. Additive and empty when an
+    /// older persisted/local fixture does not carry anchor evidence.
+    #[serde(default)]
+    pub anchor_coverage: ClaudeAccountAnchorCoverageV1,
+    /// Bounded, secret-free local continuity evidence. Contains only opaque
+    /// slot identifiers and typed transitions, never account hashes or paths.
+    #[serde(default)]
+    pub anchor_transitions: Vec<ClaudeAccountAnchorTransitionV1>,
     pub capacity: ClaudeAccountCapacityV1,
 }
 
@@ -2979,6 +3111,13 @@ pub enum LocalControlCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_account_identifier_hash: Option<String>,
     },
+    /// v19 target-bound prepare. The daemon resolves `target_id` from its own
+    /// current projection and persists the exact composite binding atomically.
+    ClaudeAccountPrepareTarget {
+        schema_version: u16,
+        operation_id: String,
+        target_id: String,
+    },
     /// Begin observing customer-owned official `/login` for one already
     /// registered custom slot. No directory or credential is created.
     ClaudeAccountReconnect {
@@ -2986,6 +3125,13 @@ pub enum LocalControlCommand {
         operation_id: String,
         slot_id: String,
         expected_account_identifier_hash: String,
+    },
+    /// v19 target-bound reconnect for one exact already-registered anchor.
+    ClaudeAccountReconnectTarget {
+        schema_version: u16,
+        operation_id: String,
+        slot_id: String,
+        target_id: String,
     },
     /// Advance one persisted setup observation using the existing collector.
     ClaudeAccountCheck {
@@ -3569,6 +3715,72 @@ mod tests {
         assert_eq!(value["diagnostics"][0]["code"], "identity_mismatch");
         assert!(value.get("account_identifier_hash").is_none());
         assert!(value.get("organization_identifier_hash").is_none());
+
+        let shadow = serde_json::to_value(ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            relationship: Some(ClaudeConfigSlotRelationshipV1::ShadowedByAnchor),
+            ..Default::default()
+        })
+        .expect("serialize neutral default shadow");
+        assert_eq!(shadow["state"], "fresh");
+        assert_eq!(shadow["relationship"], "shadowed_by_anchor");
+    }
+
+    #[test]
+    fn claude_anchor_coverage_is_additive_typed_and_secret_free() {
+        let legacy: ClaudeAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "consent": "consent_required",
+            "setup_operation": {"state": "idle"},
+            "default_slot": {
+                "slot_id": "default",
+                "ownership": "external",
+                "service_name": "Claude Code-credentials"
+            },
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("legacy status without anchor coverage");
+        assert_eq!(
+            legacy.anchor_coverage,
+            ClaudeAccountAnchorCoverageV1::default()
+        );
+
+        let coverage = ClaudeAccountAnchorCoverageV1 {
+            accounts: (0..5)
+                .map(|index| ClaudeAccountAnchorDescriptorV1 {
+                    target_id: Some(format!("claude_anchor_target_{index:032x}")),
+                    account_identifier_hash: format!("account-hash-{index}"),
+                    organization_identifier_hash: Some(format!("organization-hash-{index}")),
+                    durability: if index == 4 {
+                        ClaudeAccountAnchorDurabilityV1::DefaultOnly
+                    } else {
+                        ClaudeAccountAnchorDurabilityV1::Anchored
+                    },
+                    health: (index != 4).then_some(ClaudeAccountAnchorHealthV1::Healthy),
+                    setup_blockers: Vec::new(),
+                    observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                })
+                .collect(),
+            observed_accounts: 5,
+            anchored_accounts: 4,
+            default_only_accounts: 1,
+            unresolved_accounts: 0,
+            capacity_blocked_accounts: 0,
+            ambiguous_identity_accounts: 0,
+        };
+        let wire = serde_json::to_value(coverage).expect("serialize anchor coverage");
+        assert_eq!(wire["observed_accounts"], 5);
+        assert_eq!(wire["accounts"][4]["durability"], "default_only");
+        let encoded = wire.to_string();
+        for forbidden in [
+            "config_dir",
+            "service_name",
+            "access_token",
+            "refresh_token",
+            "credential",
+        ] {
+            assert!(!encoded.contains(forbidden), "coverage leaked {forbidden}");
+        }
     }
 
     #[test]
@@ -3691,6 +3903,21 @@ mod tests {
             .to_string()
             .contains(&format!("expected {LOCAL_CONTROL_PROTOCOL_VERSION}")));
         assert_eq!(CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 18);
+        assert_eq!(CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION, 19);
+
+        let target: LocalControlRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "req_target_v19",
+            "protocol_version": CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION,
+            "command": "claude_account_prepare_target",
+            "schema_version": 1,
+            "operation_id": "claude_setup_0123456789abcdef0123456789abcdef",
+            "target_id": "claude_anchor_target_0123456789abcdef0123456789abcdef"
+        }))
+        .expect("target mutation accepts only its command-scoped version");
+        assert!(matches!(
+            target.command,
+            LocalControlCommand::ClaudeAccountPrepareTarget { .. }
+        ));
     }
 
     #[test]
@@ -4217,6 +4444,8 @@ mod tests {
                 credential_fingerprint_hash: None,
                 billing_identity_evidence: Some("provider_account_id".to_string()),
                 claude_quota_access_state: Some(ClaudeQuotaAccessState::Full),
+                claude_anchor_durability: None,
+                claude_anchor_health: None,
                 billing_identity_confidence: AgentStatusConfidence::High,
                 confidence: AgentStatusConfidence::High,
             }),

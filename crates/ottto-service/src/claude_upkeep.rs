@@ -18,7 +18,7 @@ use ottto_protocol::{
     ClaudeConfigSlotUpkeepStatusV1,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::Stdio;
@@ -39,6 +39,14 @@ const INITIAL_BACKOFF_SECONDS: i64 = 5 * 60;
 const MAX_BACKOFF_SECONDS: i64 = 6 * 60 * 60;
 
 static UPKEEP_STATE_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
+static PRODUCTION_UPKEEP_QUEUE: OnceLock<Mutex<ProductionUpkeepQueue>> = OnceLock::new();
+
+#[derive(Default)]
+struct ProductionUpkeepQueue {
+    running: bool,
+    queued_slot_ids: BTreeSet<String>,
+    descriptors: VecDeque<ClaudeConfigSlotDescriptorV1>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClaudeUpkeepObservation {
@@ -150,15 +158,33 @@ impl CredentialMetadataReader for ProductionCredentialMetadataReader {
 
 trait DoctorProcessRunner {
     fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult;
+
+    fn start(&self, config_dir: &str) -> DoctorProcessStart {
+        DoctorProcessStart::Finished(self.run(config_dir, DOCTOR_TIMEOUT))
+    }
+}
+
+enum DoctorProcessStart {
+    Started(std::process::Child),
+    Finished(DoctorProcessResult),
+}
+
+impl DoctorProcessStart {
+    fn wait(self, timeout: Duration) -> DoctorProcessResult {
+        match self {
+            Self::Finished(result) => result,
+            Self::Started(child) => wait_for_doctor_process(child, timeout),
+        }
+    }
 }
 
 trait FinalSpawnGate {
-    fn run_if_allowed(
+    fn start_if_allowed(
         &self,
         descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
-    ) -> Result<DoctorProcessResult, ClaudeConfigSlotUpkeepResultV1>;
+    ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1>;
 }
 
 #[cfg(test)]
@@ -170,12 +196,12 @@ struct FixedFinalSpawnGate<'a> {
 
 #[cfg(test)]
 impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
-    fn run_if_allowed(
+    fn start_if_allowed(
         &self,
         _descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
-    ) -> Result<DoctorProcessResult, ClaudeConfigSlotUpkeepResultV1> {
+    ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1> {
         if !self.network_enabled {
             return Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused);
         }
@@ -185,19 +211,19 @@ impl FinalSpawnGate for FixedFinalSpawnGate<'_> {
         if self.support_dir.join(UPKEEP_DISABLED_FILE).is_file() {
             return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled);
         }
-        Ok(process.run(config_dir, DOCTOR_TIMEOUT))
+        Ok(process.start(config_dir))
     }
 }
 
 struct ProductionFinalSpawnGate;
 
 impl FinalSpawnGate for ProductionFinalSpawnGate {
-    fn run_if_allowed(
+    fn start_if_allowed(
         &self,
         descriptor: &ClaudeConfigSlotDescriptorV1,
         process: &dyn DoctorProcessRunner,
         config_dir: &str,
-    ) -> Result<DoctorProcessResult, ClaudeConfigSlotUpkeepResultV1> {
+    ) -> Result<DoctorProcessStart, ClaudeConfigSlotUpkeepResultV1> {
         FileClaudeConfigSlotSettingsStore::default()
             .with_locked_status(|status| {
                 if status.consent != ClaudeAccountUpkeepConsentState::Granted {
@@ -217,9 +243,9 @@ impl FinalSpawnGate for ProductionFinalSpawnGate {
                 if default_support_dir().join(UPKEEP_DISABLED_FILE).is_file() {
                     return Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled);
                 }
-                // The registry lock remains held through process start/run, so
-                // any consent revocation committed before this point wins.
-                Ok(process.run(config_dir, DOCTOR_TIMEOUT))
+                // Serialize the final consent/removal check with process spawn,
+                // then release settings before the bounded wait.
+                Ok(process.start(config_dir))
             })
             .unwrap_or(Err(ClaudeConfigSlotUpkeepResultV1::ProbeFailed))
     }
@@ -231,6 +257,10 @@ impl DoctorProcessRunner for ProductionDoctorProcessRunner {
     fn run(&self, config_dir: &str, timeout: Duration) -> DoctorProcessResult {
         run_doctor_process(config_dir, timeout)
     }
+
+    fn start(&self, config_dir: &str) -> DoctorProcessStart {
+        start_doctor_process(config_dir)
+    }
 }
 
 pub(crate) fn observe_registered_slot_upkeep(
@@ -238,16 +268,141 @@ pub(crate) fn observe_registered_slot_upkeep(
     consent: bool,
     network_enabled: bool,
 ) -> ClaudeUpkeepObservation {
-    observe_registered_slot_upkeep_with_gate(
-        descriptor,
-        consent,
-        network_enabled,
-        &default_support_dir(),
-        &SystemClock,
-        &ProductionCredentialMetadataReader,
-        &ProductionDoctorProcessRunner,
-        &ProductionFinalSpawnGate,
-    )
+    let now = OffsetDateTime::now_utc();
+    let metadata = ClaudeOAuthCredentialMetadata {
+        access_expires_at: descriptor.collection.access_expires_at.clone(),
+        refresh_token_expires_at: descriptor.collection.relogin_required_at.clone(),
+        // Persisted local status intentionally records deadlines, not grant
+        // contents. The background worker performs the authoritative read.
+        has_refresh_token: true,
+    };
+    if !network_enabled {
+        return observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::CollectionPaused,
+            &metadata,
+        );
+    }
+    let Some(access_expiry) = parse_timestamp(metadata.access_expires_at.as_deref()) else {
+        return observation_with_metadata(
+            true,
+            ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable,
+            &metadata,
+        );
+    };
+    if access_expiry > now {
+        let approaching = parse_timestamp(metadata.refresh_token_expires_at.as_deref())
+            .is_some_and(|expiry| {
+                expiry > now && expiry - now <= TimeDuration::seconds(RELLOGIN_APPROACHING_SECONDS)
+            });
+        return observation_with_metadata(
+            true,
+            if approaching {
+                ClaudeConfigSlotUpkeepResultV1::ReloginApproaching
+            } else if consent {
+                ClaudeConfigSlotUpkeepResultV1::NotRequired
+            } else {
+                ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented
+            },
+            &metadata,
+        );
+    }
+    if descriptor
+        .collection
+        .upkeep
+        .as_ref()
+        .is_some_and(|status| status.result == ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
+    {
+        return observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::NeedsLogin,
+            &metadata,
+        );
+    }
+    if !consent {
+        return observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented,
+            &metadata,
+        );
+    }
+    if default_support_dir().join(UPKEEP_DISABLED_FILE).is_file() {
+        return observation_with_metadata(
+            false,
+            ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled,
+            &metadata,
+        );
+    }
+    enqueue_production_upkeep(descriptor.clone());
+    observation_with_metadata(false, ClaudeConfigSlotUpkeepResultV1::InProgress, &metadata)
+}
+
+fn enqueue_production_upkeep(descriptor: ClaudeConfigSlotDescriptorV1) {
+    let queue =
+        PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
+    let should_spawn = {
+        let mut queue = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.queued_slot_ids.insert(descriptor.slot_id.clone()) {
+            queue.descriptors.push_back(descriptor);
+        }
+        if queue.running {
+            false
+        } else {
+            queue.running = true;
+            true
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+    let spawn = thread::Builder::new()
+        .name("ottto-claude-upkeep".to_string())
+        .spawn(run_production_upkeep_queue);
+    if spawn.is_err() {
+        let mut queue = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.running = false;
+        queue.queued_slot_ids.clear();
+        queue.descriptors.clear();
+    }
+}
+
+fn run_production_upkeep_queue() {
+    let queue =
+        PRODUCTION_UPKEEP_QUEUE.get_or_init(|| Mutex::new(ProductionUpkeepQueue::default()));
+    loop {
+        let descriptor = {
+            let mut queue = queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(descriptor) = queue.descriptors.pop_front() else {
+                queue.running = false;
+                break;
+            };
+            descriptor
+        };
+        let observation = observe_registered_slot_upkeep_with_gate(
+            &descriptor,
+            true,
+            true,
+            &default_support_dir(),
+            &SystemClock,
+            &ProductionCredentialMetadataReader,
+            &ProductionDoctorProcessRunner,
+            &ProductionFinalSpawnGate,
+        );
+        if observation.status.result == ClaudeConfigSlotUpkeepResultV1::Refreshed {
+            crate::snapshot_sync::spawn_claude_agent_status_refresh("upkeep");
+        }
+        queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queued_slot_ids
+            .remove(&descriptor.slot_id);
+    }
 }
 
 #[cfg(test)]
@@ -408,7 +563,7 @@ fn observe_registered_slot_upkeep_with_gate(
         ClaimOutcome::Claimed(token, status) => (token, status),
     };
 
-    let process_result = match final_gate.run_if_allowed(descriptor, process, config_dir) {
+    let process_start = match final_gate.start_if_allowed(descriptor, process, config_dir) {
         Ok(result) => result,
         Err(result) => {
             let completed = complete_attempt(support_dir, &token, result, clock.now()).unwrap_or(
@@ -429,7 +584,7 @@ fn observe_registered_slot_upkeep_with_gate(
             };
         }
     };
-    let (result, proceed) = match process_result {
+    let (result, proceed) = match process_start.wait(DOCTOR_TIMEOUT) {
         DoctorProcessResult::ExitZero => match credentials.read(
             &ClaudeConfigDirSlot::registered(config_dir.to_string())
                 .expect("registered descriptor must retain a valid exact path"),
@@ -699,19 +854,30 @@ fn upkeep_state_guard(support_dir: &Path) -> std::io::Result<UpkeepStateGuard> {
 }
 
 fn run_doctor_process(config_dir: &str, timeout: Duration) -> DoctorProcessResult {
+    start_doctor_process(config_dir).wait(timeout)
+}
+
+fn start_doctor_process(config_dir: &str) -> DoctorProcessStart {
     let slot = ClaudeConfigDirSlot::registered(config_dir.to_string())
         .expect("registered descriptor must retain a valid exact path");
     let Some(mut command) = crate::agent_status::resolved_claude_slot_command(&slot, &["doctor"])
     else {
-        return DoctorProcessResult::MissingBinary;
+        return DoctorProcessStart::Finished(DoctorProcessResult::MissingBinary);
     };
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return DoctorProcessResult::SpawnFailed;
+    let Ok(child) = command.spawn() else {
+        return DoctorProcessStart::Finished(DoctorProcessResult::SpawnFailed);
     };
+    DoctorProcessStart::Started(child)
+}
+
+fn wait_for_doctor_process(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> DoctorProcessResult {
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -858,6 +1024,80 @@ mod tests {
             refresh_token_expires_at: Some(refresh.to_string()),
             has_refresh_token: true,
         }
+    }
+
+    #[test]
+    #[serial]
+    fn five_due_registered_anchors_enqueue_without_blocking_collection_or_settings() {
+        let root = temp_dir("five-due-production-queue");
+        let _support_guard = EnvGuard::set(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            root.as_os_str().to_os_string(),
+        );
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        store
+            .set_upkeep_consent(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                true,
+            )
+            .expect("grant upkeep consent");
+        let mut descriptors = Vec::new();
+        for index in 0..5 {
+            let config_dir = root.join(format!("account-{index}"));
+            fs::create_dir_all(&config_dir).expect("create config dir");
+            let status = store
+                .register_path(
+                    ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                    config_dir.to_string_lossy().into_owned(),
+                )
+                .expect("register anchor");
+            let mut descriptor = status
+                .external_slots
+                .last()
+                .expect("registered slot")
+                .clone();
+            descriptor.collection.access_expires_at = Some("2020-01-01T00:00:00Z".to_string());
+            descriptor.collection.relogin_required_at = Some("2099-01-01T00:00:00Z".to_string());
+            descriptors.push(descriptor);
+        }
+
+        let collection_started = Instant::now();
+        for descriptor in &descriptors {
+            let observation = observe_registered_slot_upkeep(descriptor, true, true);
+            assert!(!observation.proceed_with_collection);
+            assert_eq!(
+                observation.status.result,
+                ClaudeConfigSlotUpkeepResultV1::InProgress
+            );
+        }
+        assert!(
+            collection_started.elapsed() < Duration::from_millis(250),
+            "five due anchors must enqueue without synchronous credential or doctor waits"
+        );
+
+        let settings_started = Instant::now();
+        store
+            .set_upkeep_consent(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                false,
+            )
+            .expect("settings remain responsive while worker owns upkeep");
+        assert!(
+            settings_started.elapsed() < Duration::from_millis(250),
+            "background upkeep must not retain the registry lock while waiting"
+        );
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        while PRODUCTION_UPKEEP_QUEUE.get().is_some_and(|queue| {
+            !queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .queued_slot_ids
+                .is_empty()
+        }) && Instant::now() < drain_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1084,11 +1324,13 @@ mod tests {
             .set_upkeep_consent(CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION, false)
             .expect("revoke");
         assert_eq!(
-            ProductionFinalSpawnGate.run_if_allowed(
-                &descriptor,
-                &process,
-                descriptor.config_dir.as_deref().expect("config")
-            ),
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config")
+                )
+                .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::UpkeepNotConsented)
         );
 
@@ -1101,11 +1343,13 @@ mod tests {
         )
         .expect("network sentinel");
         assert_eq!(
-            ProductionFinalSpawnGate.run_if_allowed(
-                &descriptor,
-                &process,
-                descriptor.config_dir.as_deref().expect("config")
-            ),
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config")
+                )
+                .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::CollectionPaused)
         );
         fs::remove_file(root.join(crate::agent_status::CLAUDE_OAUTH_USAGE_NETWORK_DISABLED_FILE))
@@ -1113,11 +1357,13 @@ mod tests {
 
         fs::write(root.join(UPKEEP_DISABLED_FILE), b"disabled\n").expect("kill sentinel");
         assert_eq!(
-            ProductionFinalSpawnGate.run_if_allowed(
-                &descriptor,
-                &process,
-                descriptor.config_dir.as_deref().expect("config")
-            ),
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config")
+                )
+                .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::UpkeepDisabled)
         );
         fs::remove_file(root.join(UPKEEP_DISABLED_FILE)).expect("remove kill sentinel");
@@ -1129,11 +1375,13 @@ mod tests {
             )
             .expect("remove slot");
         assert_eq!(
-            ProductionFinalSpawnGate.run_if_allowed(
-                &descriptor,
-                &process,
-                descriptor.config_dir.as_deref().expect("config")
-            ),
+            ProductionFinalSpawnGate
+                .start_if_allowed(
+                    &descriptor,
+                    &process,
+                    descriptor.config_dir.as_deref().expect("config")
+                )
+                .map(|start| start.wait(DOCTOR_TIMEOUT)),
             Err(ClaudeConfigSlotUpkeepResultV1::NeedsLogin)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);

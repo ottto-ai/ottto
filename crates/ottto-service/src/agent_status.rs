@@ -16,12 +16,15 @@ use ottto_protocol::{
     AgentLoginState, AgentModelStatus, AgentQuotaWindow, AgentQuotaWindowFreshness,
     AgentQuotaWindowScope, AgentQuotaWindowStatus, AgentRuntimeDefaults,
     AgentStatusCollectionMethod, AgentStatusConfidence, AgentStatusDiagnostic,
-    AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState, ClaudeAccountsStatusV1,
-    ClaudeConfigSlotCollectionStateV1, ClaudeConfigSlotCollectionStatusV1,
-    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1,
-    ClaudeConfigSlotOwnership, ClaudeConfigSlotQuotaSnapshotStateV1,
-    ClaudeConfigSlotQuotaSnapshotV1, ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState,
-    ClaudeUnresolvedAccountDescriptorV1, ClaudeUnresolvedAccountEvidenceKind, SourceKind,
+    AgentStatusPlanObservation, AgentStatusSnapshot, AgentStatusState,
+    ClaudeAccountAnchorCoverageV1, ClaudeAccountAnchorDescriptorV1,
+    ClaudeAccountAnchorDurabilityV1, ClaudeAccountAnchorHealthV1,
+    ClaudeAccountAnchorSetupBlockerV1, ClaudeAccountsStatusV1, ClaudeConfigSlotCollectionStateV1,
+    ClaudeConfigSlotCollectionStatusV1, ClaudeConfigSlotDescriptorV1,
+    ClaudeConfigSlotDiagnosticCodeV1, ClaudeConfigSlotDiagnosticV1, ClaudeConfigSlotOwnership,
+    ClaudeConfigSlotQuotaSnapshotStateV1, ClaudeConfigSlotQuotaSnapshotV1,
+    ClaudeConfigSlotUpkeepResultV1, ClaudeQuotaAccessState, ClaudeUnresolvedAccountDescriptorV1,
+    ClaudeUnresolvedAccountEvidenceKind, SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -241,10 +244,201 @@ pub(crate) struct ClaudeOAuthCredentialMetadata {
 
 struct ClaudeSnapshotCandidate {
     slot_id: String,
-    account_identifier_hash: String,
-    organization_identifier_hash: Option<String>,
-    rank: u8,
+    slot_class: ClaudeSnapshotSlotClass,
+    binding: ClaudeStrongBinding,
+    quality: ClaudeSnapshotQuality,
     snapshot: AgentStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeStrongBinding {
+    account_identifier_hash: String,
+    organization_identifier_hash: String,
+}
+
+impl ClaudeStrongBinding {
+    fn new(account_identifier_hash: &str, organization_identifier_hash: &str) -> Option<Self> {
+        (!account_identifier_hash.is_empty() && !organization_identifier_hash.is_empty()).then(
+            || Self {
+                account_identifier_hash: account_identifier_hash.to_string(),
+                organization_identifier_hash: organization_identifier_hash.to_string(),
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ClaudeSnapshotQuality {
+    tier: u8,
+    provider_observed_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeSnapshotSlotClass {
+    Default,
+    Registered,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaudeSnapshotSelection {
+    winning_by_binding: BTreeMap<ClaudeStrongBinding, usize>,
+    preferred_anchor_by_binding: BTreeMap<ClaudeStrongBinding, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeSnapshotDisposition {
+    Upload,
+    ShadowDefault,
+    PreserveRegisteredAnchor,
+    DuplicateRegistered,
+}
+
+fn claude_candidate_is_better(
+    candidate: &ClaudeSnapshotCandidate,
+    current: &ClaudeSnapshotCandidate,
+) -> bool {
+    candidate.quality > current.quality
+        || (candidate.quality == current.quality
+            && match (candidate.slot_class, current.slot_class) {
+                (ClaudeSnapshotSlotClass::Registered, ClaudeSnapshotSlotClass::Default) => true,
+                (ClaudeSnapshotSlotClass::Default, ClaudeSnapshotSlotClass::Registered) => false,
+                _ => candidate.slot_id < current.slot_id,
+            })
+}
+
+fn select_claude_snapshot_candidates(
+    candidates: &[ClaudeSnapshotCandidate],
+) -> ClaudeSnapshotSelection {
+    let mut selection = ClaudeSnapshotSelection::default();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let replace_winner = selection
+            .winning_by_binding
+            .get(&candidate.binding)
+            .map_or(true, |current| {
+                claude_candidate_is_better(candidate, &candidates[*current])
+            });
+        if replace_winner {
+            selection
+                .winning_by_binding
+                .insert(candidate.binding.clone(), index);
+        }
+        if candidate.slot_class == ClaudeSnapshotSlotClass::Registered {
+            let replace_anchor = selection
+                .preferred_anchor_by_binding
+                .get(&candidate.binding)
+                .map_or(true, |current| {
+                    claude_candidate_is_better(candidate, &candidates[*current])
+                });
+            if replace_anchor {
+                selection
+                    .preferred_anchor_by_binding
+                    .insert(candidate.binding.clone(), index);
+            }
+        }
+    }
+    selection
+}
+
+fn claude_snapshot_candidate_disposition(
+    index: usize,
+    candidate: &ClaudeSnapshotCandidate,
+    selection: &ClaudeSnapshotSelection,
+) -> ClaudeSnapshotDisposition {
+    if selection.winning_by_binding.get(&candidate.binding) == Some(&index) {
+        return ClaudeSnapshotDisposition::Upload;
+    }
+    match candidate.slot_class {
+        ClaudeSnapshotSlotClass::Default
+            if selection
+                .preferred_anchor_by_binding
+                .contains_key(&candidate.binding) =>
+        {
+            ClaudeSnapshotDisposition::ShadowDefault
+        }
+        ClaudeSnapshotSlotClass::Registered
+            if selection
+                .preferred_anchor_by_binding
+                .get(&candidate.binding)
+                != Some(&index) =>
+        {
+            ClaudeSnapshotDisposition::DuplicateRegistered
+        }
+        ClaudeSnapshotSlotClass::Registered => ClaudeSnapshotDisposition::PreserveRegisteredAnchor,
+        ClaudeSnapshotSlotClass::Default => ClaudeSnapshotDisposition::Upload,
+    }
+}
+
+fn claude_slot_projection_quality(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> ClaudeSnapshotQuality {
+    let complete = status.has_account_windows && status.has_scoped_limits;
+    let fresh = status.state == ClaudeConfigSlotCollectionStateV1::Fresh;
+    let tier = match (fresh, complete) {
+        (true, true) => 4,
+        (true, false) => 3,
+        (false, true) => 2,
+        (false, false) => 1,
+    };
+    let provider_observed_at = status
+        .quota_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.observed_at.clone())
+        .or_else(|| status.last_full_quota_read_at.clone())
+        .or_else(|| status.observed_at.clone())
+        .unwrap_or_default();
+    ClaudeSnapshotQuality {
+        tier,
+        provider_observed_at,
+    }
+}
+
+fn canonical_registered_anchors(
+    registered_slot_ids: impl IntoIterator<Item = String>,
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> BTreeMap<ClaudeStrongBinding, String> {
+    let mut canonical = BTreeMap::<ClaudeStrongBinding, String>::new();
+    for slot_id in registered_slot_ids {
+        let Some(status) = slot_states.get(&slot_id) else {
+            continue;
+        };
+        let Some(binding) = status
+            .account_identifier_hash
+            .as_deref()
+            .and_then(|account| {
+                ClaudeStrongBinding::new(account, status.organization_identifier_hash.as_deref()?)
+            })
+        else {
+            continue;
+        };
+        let replace = canonical.get(&binding).map_or(true, |current_slot_id| {
+            let current = slot_states
+                .get(current_slot_id)
+                .expect("canonical registered slot remains present");
+            claude_slot_projection_quality(status) > claude_slot_projection_quality(current)
+                || (claude_slot_projection_quality(status)
+                    == claude_slot_projection_quality(current)
+                    && slot_id < *current_slot_id)
+        });
+        if replace {
+            canonical.insert(binding, slot_id);
+        }
+    }
+    canonical
+}
+
+fn canonical_anchor_health(
+    canonical: &BTreeMap<ClaudeStrongBinding, String>,
+    slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
+) -> BTreeMap<ClaudeStrongBinding, Option<ClaudeAccountAnchorHealthV1>> {
+    canonical
+        .iter()
+        .filter_map(|(binding, slot_id)| {
+            Some((
+                binding.clone(),
+                projected_claude_anchor_health(slot_states.get(slot_id)?),
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +500,8 @@ struct PersistedClaudeSlotCollectionStateV1 {
     slots: BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
     #[serde(default)]
     unresolved_accounts: Vec<ClaudeUnresolvedAccountDescriptorV1>,
+    #[serde(default)]
+    anchor_transitions: Vec<ottto_protocol::ClaudeAccountAnchorTransitionV1>,
 }
 
 struct ClaudeSlotCollectionStateGuard {
@@ -385,6 +581,8 @@ struct ClaudeOAuthUsageBreaker {
     schema_version: u16,
     #[serde(default)]
     account_identifier_hash: String,
+    #[serde(default)]
+    organization_identifier_hash: String,
     /// Fingerprint of the call's own configuration (endpoint, headers, honest
     /// User-Agent, sentinel state). Changing any of them means the thing that
     /// was failing is not the thing we would call next, so the breaker resets.
@@ -595,6 +793,8 @@ fn collect_codex_status(captured_at: String, expires_at: String) -> AgentStatusS
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Unknown,
     });
@@ -1225,7 +1425,9 @@ fn collect_claude_status_snapshots(
 ) -> AgentStatusCollection {
     let mut default_snapshot = collect_claude_status(captured_at.clone(), expires_at.clone());
     let mut candidates = Vec::new();
-    let settings = FileClaudeConfigSlotSettingsStore::default().load();
+    let settings = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map(annotate_claude_accounts_status);
     let upkeep_consent = settings.as_ref().is_ok_and(|status| {
         status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
     });
@@ -1252,26 +1454,18 @@ fn collect_claude_status_snapshots(
     apply_claude_quota_access_state(&mut default_snapshot, &default_state);
     slot_states.insert("default".to_string(), default_state.clone());
     if claude_slot_status_carries_meters(&default_state) {
-        if let Some(rank) = claude_snapshot_candidate_rank(&default_snapshot) {
-            if let Some(account_identifier_hash) = default_snapshot
-                .account
-                .as_ref()
-                .and_then(|account| account.account_identifier_hash.clone())
-                .or_else(|| {
-                    default_snapshot
-                        .quota_windows
-                        .first()
-                        .and_then(|window| window.account_identifier_hash.clone())
-                })
-            {
+        if let Some(quality) = claude_snapshot_candidate_rank(&default_snapshot) {
+            if let Some(binding) = default_snapshot.account.as_ref().and_then(|account| {
+                ClaudeStrongBinding::new(
+                    account.account_identifier_hash.as_deref()?,
+                    account.organization_identifier_hash.as_deref()?,
+                )
+            }) {
                 candidates.push(ClaudeSnapshotCandidate {
                     slot_id: "default".to_string(),
-                    account_identifier_hash,
-                    organization_identifier_hash: default_snapshot
-                        .account
-                        .as_ref()
-                        .and_then(|account| account.organization_identifier_hash.clone()),
-                    rank,
+                    slot_class: ClaudeSnapshotSlotClass::Default,
+                    binding,
+                    quality,
                     snapshot: default_snapshot.clone(),
                 });
             }
@@ -1340,13 +1534,16 @@ fn collect_claude_status_snapshots(
                 let mut snapshot = snapshot;
                 apply_claude_quota_access_state(&mut snapshot, &state);
                 if claude_slot_status_carries_meters(&state) {
-                    let rank = claude_snapshot_candidate_rank(&snapshot)
+                    let quality = claude_snapshot_candidate_rank(&snapshot)
                         .expect("validated custom meter snapshot is rankable");
                     candidates.push(ClaudeSnapshotCandidate {
                         slot_id: slot_id.clone(),
-                        account_identifier_hash: account_hash,
-                        organization_identifier_hash: Some(organization_hash),
-                        rank,
+                        slot_class: ClaudeSnapshotSlotClass::Registered,
+                        binding: ClaudeStrongBinding {
+                            account_identifier_hash: account_hash,
+                            organization_identifier_hash: organization_hash,
+                        },
+                        quality,
                         snapshot,
                     });
                 }
@@ -1359,34 +1556,107 @@ fn collect_claude_status_snapshots(
             }
         }
     }
-    let mut best_by_account = BTreeMap::<String, usize>::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        match best_by_account.get(&candidate.account_identifier_hash) {
-            Some(previous) if candidates[*previous].rank >= candidate.rank => {}
-            _ => {
-                best_by_account.insert(candidate.account_identifier_hash.clone(), index);
+    let selection = select_claude_snapshot_candidates(&candidates);
+    let winning_accounts = selection
+        .winning_by_binding
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let dispositions = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            claude_snapshot_candidate_disposition(index, candidate, &selection)
+        })
+        .collect::<Vec<_>>();
+    let mut registered_slot_ids = settings
+        .as_ref()
+        .map(|status| {
+            status
+                .managed_slots
+                .iter()
+                .chain(status.external_slots.iter())
+                .map(|slot| slot.slot_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    registered_slot_ids.sort();
+    let canonical_anchors = canonical_registered_anchors(registered_slot_ids.clone(), &slot_states);
+    let anchor_health_by_binding = canonical_anchor_health(&canonical_anchors, &slot_states);
+    for (binding, slot_id) in &canonical_anchors {
+        if let Some(status) = slot_states.get_mut(slot_id) {
+            status.relationship =
+                Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::CanonicalAnchor);
+        }
+        for duplicate_slot_id in &registered_slot_ids {
+            if duplicate_slot_id == slot_id {
+                continue;
+            }
+            let duplicate_matches = slot_states.get(duplicate_slot_id).is_some_and(|status| {
+                status.account_identifier_hash.as_deref()
+                    == Some(binding.account_identifier_hash.as_str())
+                    && status.organization_identifier_hash.as_deref()
+                        == Some(binding.organization_identifier_hash.as_str())
+            });
+            if duplicate_matches {
+                if let Some(status) = slot_states.get_mut(duplicate_slot_id) {
+                    status.state = ClaudeConfigSlotCollectionStateV1::DuplicateAccount;
+                    status.relationship =
+                        Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::DuplicateAnchor);
+                }
             }
         }
     }
-    let winners = best_by_account.values().copied().collect::<BTreeSet<_>>();
-    let winning_accounts = best_by_account.keys().cloned().collect::<BTreeSet<_>>();
-    let mut snapshots = Vec::with_capacity(winners.len());
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        if winners.contains(&index) {
-            snapshots.push(candidate.snapshot);
-        } else {
-            slot_states.insert(
-                candidate.slot_id,
-                duplicate_account_status(
-                    &captured_at,
-                    &candidate.account_identifier_hash,
-                    candidate.organization_identifier_hash.as_deref(),
-                ),
-            );
+    if let Some(default_status) = slot_states.get_mut("default") {
+        if default_status
+            .account_identifier_hash
+            .as_deref()
+            .and_then(|account| {
+                ClaudeStrongBinding::new(
+                    account,
+                    default_status.organization_identifier_hash.as_deref()?,
+                )
+            })
+            .is_some_and(|binding| canonical_anchors.contains_key(&binding))
+        {
+            default_status.relationship =
+                Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor);
+        }
+    }
+    let mut snapshots = Vec::with_capacity(selection.winning_by_binding.len());
+    for (index, mut candidate) in candidates.into_iter().enumerate() {
+        match dispositions[index] {
+            ClaudeSnapshotDisposition::Upload => {
+                let (durability, health) = anchor_health_by_binding
+                    .get(&candidate.binding)
+                    .map(|health| (ClaudeAccountAnchorDurabilityV1::Anchored, *health))
+                    .unwrap_or((ClaudeAccountAnchorDurabilityV1::DefaultOnly, None));
+                apply_claude_anchor_continuity(&mut candidate.snapshot, durability, health);
+                snapshots.push(candidate.snapshot);
+            }
+            ClaudeSnapshotDisposition::ShadowDefault => {
+                if let Some(status) = slot_states.get_mut(&candidate.slot_id) {
+                    status.relationship =
+                        Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor);
+                }
+            }
+            ClaudeSnapshotDisposition::DuplicateRegistered => {
+                if let Some(status) = slot_states.get_mut(&candidate.slot_id) {
+                    status.state = ClaudeConfigSlotCollectionStateV1::DuplicateAccount;
+                    status.relationship =
+                        Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::DuplicateAnchor);
+                }
+            }
+            ClaudeSnapshotDisposition::PreserveRegisteredAnchor => {
+                // A healthier default may temporarily supply the uploaded
+                // meters. Keep the best registered anchor's exact collection,
+                // upkeep, and reconnect state intact for continuity.
+            }
         }
     }
     snapshots.extend(degraded_claude_slot_snapshots(
         &slot_states,
+        &canonical_anchors,
         &winning_accounts,
         &captured_at,
         &expires_at,
@@ -1440,12 +1710,35 @@ fn collect_claude_status_snapshots(
     }
 }
 
+fn apply_claude_anchor_continuity(
+    snapshot: &mut AgentStatusSnapshot,
+    durability: ClaudeAccountAnchorDurabilityV1,
+    health: Option<ClaudeAccountAnchorHealthV1>,
+) {
+    let Some(account) = snapshot.account.as_mut() else {
+        return;
+    };
+    if account
+        .account_identifier_hash
+        .as_deref()
+        .map_or(true, str::is_empty)
+        || account
+            .organization_identifier_hash
+            .as_deref()
+            .map_or(true, str::is_empty)
+    {
+        return;
+    }
+    account.claude_anchor_durability = Some(durability);
+    account.claude_anchor_health = health;
+}
+
 #[cfg(test)]
 fn claude_default_snapshot_is_uploadable(snapshot: &AgentStatusSnapshot) -> bool {
     claude_snapshot_candidate_rank(snapshot).is_some()
 }
 
-fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> {
+fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<ClaudeSnapshotQuality> {
     if snapshot.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == ClaudeSlotProbeFailure::ConcurrentMutation.diagnostic_code()
     }) {
@@ -1457,7 +1750,7 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> 
             account.organization_identifier_hash.as_deref()?,
         ))
     }) {
-        let full_oauth_meters = !snapshot.quota_windows.is_empty()
+        let exact_oauth_meters = !snapshot.quota_windows.is_empty()
             && snapshot.quota_windows.iter().all(|window| {
                 window.account_identifier_hash.as_deref() == Some(account_hash)
                     && window.organization_identifier_hash.as_deref() == Some(organization_hash)
@@ -1466,7 +1759,7 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> 
                 balance.account_identifier_hash.as_deref() == Some(account_hash)
                     && balance.organization_identifier_hash.as_deref() == Some(organization_hash)
             });
-        if full_oauth_meters {
+        if exact_oauth_meters {
             let fresh = snapshot
                 .quota_windows
                 .iter()
@@ -1475,7 +1768,24 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> 
                     .credit_balances
                     .iter()
                     .all(|balance| balance.freshness == AgentQuotaWindowFreshness::Fresh);
-            return Some(if fresh { 3 } else { 2 });
+            let complete = snapshot.quota_windows.iter().any(|window| {
+                window.scope == AgentQuotaWindowScope::Account && window.name == "session"
+            }) && snapshot.quota_windows.iter().any(|window| {
+                window.scope == AgentQuotaWindowScope::Account && window.name == "weekly"
+            }) && snapshot.quota_windows.iter().any(|window| {
+                window.scope == AgentQuotaWindowScope::Model
+                    || window.model.is_some()
+                    || window.group.is_some()
+            });
+            return Some(ClaudeSnapshotQuality {
+                tier: match (fresh, complete) {
+                    (true, true) => 4,
+                    (true, false) => 3,
+                    (false, true) => 2,
+                    (false, false) => 1,
+                },
+                provider_observed_at: coherent_claude_provider_observed_at(snapshot),
+            });
         }
     }
     if snapshot.collection_method != AgentStatusCollectionMethod::StatusLine
@@ -1496,7 +1806,34 @@ fn claude_snapshot_candidate_rank(snapshot: &AgentStatusSnapshot) -> Option<u8> 
             window.account_identifier_hash.as_deref() == Some(attributed_account)
                 && window.organization_identifier_hash.is_none()
         })
-        .then_some(1)
+        .then(|| ClaudeSnapshotQuality {
+            tier: if snapshot
+                .quota_windows
+                .iter()
+                .all(|window| window.freshness == AgentQuotaWindowFreshness::Fresh)
+            {
+                3
+            } else {
+                1
+            },
+            provider_observed_at: coherent_claude_provider_observed_at(snapshot),
+        })
+}
+
+fn coherent_claude_provider_observed_at(snapshot: &AgentStatusSnapshot) -> String {
+    snapshot
+        .quota_windows
+        .iter()
+        .filter_map(|window| window.observed_at.as_deref())
+        .chain(
+            snapshot
+                .credit_balances
+                .iter()
+                .filter_map(|balance| balance.updated_at.as_deref()),
+        )
+        .min()
+        .unwrap_or(snapshot.captured_at.as_str())
+        .to_string()
 }
 
 fn bounded_claude_custom_descriptors(
@@ -1537,7 +1874,10 @@ pub(crate) fn collect_registered_claude_slot_status(
     captured_at: String,
     expires_at: String,
 ) -> ClaudeConfigSlotCollectionStatusV1 {
-    let settings = FileClaudeConfigSlotSettingsStore::default().load().ok();
+    let settings = FileClaudeConfigSlotSettingsStore::default()
+        .load()
+        .map(annotate_claude_accounts_status)
+        .ok();
     let upkeep_consent = settings.as_ref().is_some_and(|status| {
         status.consent == ottto_protocol::ClaudeAccountUpkeepConsentState::Granted
     });
@@ -1849,6 +2189,7 @@ fn local_claude_quota_snapshot_within_retention(
 fn local_claude_quota_snapshot_is_fresh_for_account(
     snapshot: &ClaudeConfigSlotQuotaSnapshotV1,
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     now: OffsetDateTime,
 ) -> bool {
     if snapshot.state != ClaudeConfigSlotQuotaSnapshotStateV1::Fresh
@@ -1871,7 +2212,11 @@ fn local_claude_quota_snapshot_is_fresh_for_account(
         return false;
     };
     let age_seconds = now.unix_timestamp() - represented_at.unix_timestamp();
-    (0..=claude_oauth_usage_fresh_age_seconds(account_identifier_hash) as i64)
+    (0
+        ..=claude_oauth_usage_fresh_age_seconds(
+            account_identifier_hash,
+            organization_identifier_hash,
+        ) as i64)
         .contains(&age_seconds)
 }
 
@@ -2094,10 +2439,31 @@ fn retain_verified_claude_slot_binding(
         return;
     }
     retain_exact_claude_slot_binding(status, &current_account, &current_organization);
+    let current_has_complete_read = status.last_full_quota_read_at.is_some()
+        && status.has_account_windows
+        && status.has_scoped_limits;
+    if !current_has_complete_read
+        && previous.last_full_quota_read_at.is_some()
+        && previous.has_account_windows
+        && previous.has_scoped_limits
+    {
+        status.last_full_quota_read_at = previous.last_full_quota_read_at;
+        status.has_account_windows = true;
+        status.has_scoped_limits = true;
+        status.has_credit_balances = previous.has_credit_balances;
+        status.quota_snapshot = previous
+            .quota_snapshot
+            .filter(|snapshot| {
+                local_claude_quota_snapshot_within_retention(snapshot, OffsetDateTime::now_utc())
+            })
+            .map(|snapshot| stale_local_claude_quota_snapshot(&snapshot));
+    }
 }
 
 fn degraded_claude_slot_snapshot(
     status: &ClaudeConfigSlotCollectionStatusV1,
+    durability: ClaudeAccountAnchorDurabilityV1,
+    anchor_health: Option<ClaudeAccountAnchorHealthV1>,
     captured_at: &str,
     expires_at: &str,
 ) -> Option<AgentStatusSnapshot> {
@@ -2140,9 +2506,33 @@ fn degraded_claude_slot_snapshot(
         credential_fingerprint_hash: None,
         billing_identity_evidence: Some("provider_account_id".to_string()),
         claude_quota_access_state: Some(access_state),
+        claude_anchor_durability: Some(durability),
+        claude_anchor_health: anchor_health,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     });
+    if let Some(local) = status.quota_snapshot.as_ref().filter(|local| {
+        local_claude_quota_snapshot_within_retention(local, OffsetDateTime::now_utc())
+    }) {
+        snapshot.quota_windows = local
+            .quota_windows
+            .iter()
+            .cloned()
+            .map(|mut window| {
+                window.freshness = AgentQuotaWindowFreshness::Stale;
+                window
+            })
+            .collect();
+        snapshot.credit_balances = local
+            .credit_balances
+            .iter()
+            .cloned()
+            .map(|mut balance| {
+                balance.freshness = AgentQuotaWindowFreshness::Stale;
+                balance
+            })
+            .collect();
+    }
     ensure_claude_quota_access_capability(&mut snapshot);
     let (code, message) = match access_state {
         ClaudeQuotaAccessState::TemporarilyUnavailable => (
@@ -2187,33 +2577,57 @@ fn claude_quota_access_priority(snapshot: &AgentStatusSnapshot) -> u8 {
 
 fn degraded_claude_slot_snapshots(
     slot_states: &BTreeMap<String, ClaudeConfigSlotCollectionStatusV1>,
-    winning_accounts: &BTreeSet<String>,
+    canonical_anchors: &BTreeMap<ClaudeStrongBinding, String>,
+    winning_bindings: &BTreeSet<ClaudeStrongBinding>,
     captured_at: &str,
     expires_at: &str,
 ) -> Vec<AgentStatusSnapshot> {
-    let mut degraded_by_account = BTreeMap::<String, AgentStatusSnapshot>::new();
-    for status in slot_states.values() {
-        let Some(snapshot) = degraded_claude_slot_snapshot(status, captured_at, expires_at) else {
+    let mut degraded_by_binding = BTreeMap::<ClaudeStrongBinding, AgentStatusSnapshot>::new();
+    for (slot_id, status) in slot_states {
+        let Some(binding) = status
+            .account_identifier_hash
+            .as_deref()
+            .and_then(|account| {
+                ClaudeStrongBinding::new(account, status.organization_identifier_hash.as_deref()?)
+            })
+        else {
             continue;
         };
-        let account_hash = snapshot
-            .account
-            .as_ref()
-            .and_then(|account| account.account_identifier_hash.clone())
-            .expect("degraded Claude slot snapshots require a strong account binding");
-        if winning_accounts.contains(&account_hash) {
+        let canonical_slot_id = canonical_anchors.get(&binding);
+        if canonical_slot_id.is_some_and(|canonical| canonical != slot_id) {
             continue;
         }
-        match degraded_by_account.get(&account_hash) {
+        let (durability, anchor_health) = canonical_slot_id
+            .and_then(|canonical| slot_states.get(canonical))
+            .map(|anchor| {
+                (
+                    ClaudeAccountAnchorDurabilityV1::Anchored,
+                    projected_claude_anchor_health(anchor),
+                )
+            })
+            .unwrap_or((ClaudeAccountAnchorDurabilityV1::DefaultOnly, None));
+        let Some(snapshot) = degraded_claude_slot_snapshot(
+            status,
+            durability,
+            anchor_health,
+            captured_at,
+            expires_at,
+        ) else {
+            continue;
+        };
+        if winning_bindings.contains(&binding) {
+            continue;
+        }
+        match degraded_by_binding.get(&binding) {
             Some(previous)
                 if claude_quota_access_priority(previous)
                     >= claude_quota_access_priority(&snapshot) => {}
             _ => {
-                degraded_by_account.insert(account_hash, snapshot);
+                degraded_by_binding.insert(binding, snapshot);
             }
         }
     }
-    degraded_by_account.into_values().collect()
+    degraded_by_binding.into_values().collect()
 }
 
 fn claude_default_slot_collection_status(
@@ -2598,6 +3012,7 @@ fn collection_in_progress_status(
     }
 }
 
+#[cfg(test)]
 fn duplicate_account_status(
     observed_at: &str,
     account_hash: &str,
@@ -2617,6 +3032,7 @@ fn duplicate_account_status(
             message: "This registered slot resolves to an account already collected by an earlier valid slot."
                 .to_string(),
         }],
+        relationship: Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::DuplicateAnchor),
         ..Default::default()
     }
 }
@@ -2645,7 +3061,19 @@ fn persist_claude_slot_collection_states(
     let _guard = claude_slot_collection_state_guard()?;
     let mut persisted = read_persisted_claude_slot_collection_state();
     for (slot_id, candidate) in slots {
+        let previous = persisted.slots.get(slot_id).cloned();
         merge_claude_slot_collection_state(&mut persisted.slots, slot_id, candidate);
+        if persisted.slots.get(slot_id) != previous.as_ref() {
+            record_claude_anchor_transitions(
+                &mut persisted.anchor_transitions,
+                slot_id,
+                previous.as_ref(),
+                persisted
+                    .slots
+                    .get(slot_id)
+                    .expect("merged slot remains present"),
+            );
+        }
     }
     persisted.unresolved_accounts = unresolved_accounts.to_vec();
     // The unresolved candidates were derived before this transaction lock was
@@ -2663,7 +3091,7 @@ fn persist_claude_slot_collection_states(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_else(|_| slots.keys().cloned().collect());
-    let resolved_full_accounts = persisted
+    let resolved_full_bindings = persisted
         .slots
         .iter()
         .filter(|(slot_id, state)| {
@@ -2672,13 +3100,22 @@ fn persist_claude_slot_collection_states(
                 && state.has_account_windows
                 && state.has_scoped_limits
         })
-        .filter_map(|(_, state)| state.account_identifier_hash.as_deref())
+        .filter_map(|(_, state)| {
+            ClaudeStrongBinding::new(
+                state.account_identifier_hash.as_deref()?,
+                state.organization_identifier_hash.as_deref()?,
+            )
+        })
         .collect::<BTreeSet<_>>();
     persisted.unresolved_accounts.retain(|unresolved| {
-        unresolved
-            .account_identifier_hash
-            .as_deref()
-            .map_or(true, |hash| !resolved_full_accounts.contains(hash))
+        let Some(account_hash) = unresolved.account_identifier_hash.as_deref() else {
+            return true;
+        };
+        resolved_full_bindings
+            .iter()
+            .filter(|binding| binding.account_identifier_hash == account_hash)
+            .count()
+            != 1
     });
     write_persisted_claude_slot_collection_state(&persisted)
 }
@@ -2696,15 +3133,42 @@ pub(crate) fn persist_one_claude_slot_collection_state(
 ) -> std::io::Result<()> {
     let _guard = claude_slot_collection_state_guard()?;
     let mut persisted = read_persisted_claude_slot_collection_state();
+    let previous = persisted.slots.get(slot_id).cloned();
     merge_claude_slot_collection_state(&mut persisted.slots, slot_id, status);
+    if persisted.slots.get(slot_id) != previous.as_ref() {
+        record_claude_anchor_transitions(
+            &mut persisted.anchor_transitions,
+            slot_id,
+            previous.as_ref(),
+            persisted
+                .slots
+                .get(slot_id)
+                .expect("merged slot remains present"),
+        );
+    }
     if let Some(merged) = persisted.slots.get(slot_id).filter(|merged| {
         merged.last_full_quota_read_at.is_some()
             && merged.has_account_windows
             && merged.has_scoped_limits
     }) {
-        if let Some(account_hash) = merged.account_identifier_hash.as_deref() {
+        if let (Some(account_hash), Some(organization_hash)) = (
+            merged.account_identifier_hash.as_deref(),
+            merged.organization_identifier_hash.as_deref(),
+        ) {
+            let exact_binding_count = persisted
+                .slots
+                .values()
+                .filter(|state| {
+                    state.account_identifier_hash.as_deref() == Some(account_hash)
+                        && state.organization_identifier_hash.as_deref() == Some(organization_hash)
+                        && state.last_full_quota_read_at.is_some()
+                        && state.has_account_windows
+                        && state.has_scoped_limits
+                })
+                .count();
             persisted.unresolved_accounts.retain(|unresolved| {
                 unresolved.account_identifier_hash.as_deref() != Some(account_hash)
+                    || exact_binding_count != 1
             });
         }
     }
@@ -2720,7 +3184,96 @@ fn read_persisted_claude_slot_collection_state() -> PersistedClaudeSlotCollectio
             schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
             slots: BTreeMap::new(),
             unresolved_accounts: Vec::new(),
+            anchor_transitions: Vec::new(),
         })
+}
+
+fn record_claude_anchor_transitions(
+    transitions: &mut Vec<ottto_protocol::ClaudeAccountAnchorTransitionV1>,
+    slot_id: &str,
+    previous: Option<&ClaudeConfigSlotCollectionStatusV1>,
+    current: &ClaudeConfigSlotCollectionStatusV1,
+) {
+    use ottto_protocol::ClaudeAccountAnchorTransitionKindV1 as Kind;
+    let previous_binding = previous.and_then(|status| {
+        ClaudeStrongBinding::new(
+            status.account_identifier_hash.as_deref()?,
+            status.organization_identifier_hash.as_deref()?,
+        )
+    });
+    let current_binding = ClaudeStrongBinding::new(
+        current
+            .account_identifier_hash
+            .as_deref()
+            .unwrap_or_default(),
+        current
+            .organization_identifier_hash
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    let mut kinds = Vec::new();
+    if slot_id == "default"
+        && previous_binding.is_some()
+        && current_binding.is_some()
+        && previous_binding != current_binding
+    {
+        kinds.push(Kind::DefaultIdentityChanged);
+    }
+    if slot_id != "default" && previous_binding.is_some() && previous_binding == current_binding {
+        kinds.push(Kind::AnchorRemainedBound);
+    }
+    if previous.is_some_and(|status| status.has_account_windows && status.has_scoped_limits)
+        && matches!(
+            current.state,
+            ClaudeConfigSlotCollectionStateV1::NeedsLogin
+                | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+        )
+    {
+        kinds.push(Kind::AnchorGrantDisappeared);
+    }
+    let previous_deadline = previous
+        .and_then(|status| status.upkeep.as_ref())
+        .and_then(|upkeep| upkeep.due_access_expires_at.as_deref());
+    let current_deadline = current
+        .upkeep
+        .as_ref()
+        .and_then(|upkeep| upkeep.due_access_expires_at.as_deref());
+    if matches!((previous_deadline, current_deadline), (Some(before), Some(after)) if after > before)
+    {
+        kinds.push(Kind::RefreshDeadlineAdvanced);
+    }
+    if previous.is_some_and(|status| {
+        matches!(
+            status.state,
+            ClaudeConfigSlotCollectionStateV1::NeedsLogin
+                | ClaudeConfigSlotCollectionStateV1::CredentialUnavailable
+        )
+    }) && current.state == ClaudeConfigSlotCollectionStateV1::Fresh
+    {
+        kinds.push(Kind::OfficialReconnectCompleted);
+    }
+    if slot_id == "default"
+        && current.relationship
+            == Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor)
+        && previous.and_then(|status| status.relationship)
+            != Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor)
+    {
+        kinds.push(Kind::DefaultShadowObserved);
+    }
+    for kind in kinds {
+        let transition = ottto_protocol::ClaudeAccountAnchorTransitionV1 {
+            kind,
+            slot_id: Some(slot_id.to_string()),
+            observed_at: current.observed_at.clone(),
+        };
+        if transitions.last() != Some(&transition) {
+            transitions.push(transition);
+        }
+    }
+    const MAX_TRANSITIONS: usize = 64;
+    if transitions.len() > MAX_TRANSITIONS {
+        transitions.drain(..transitions.len() - MAX_TRANSITIONS);
+    }
 }
 
 fn merge_claude_slot_collection_state(
@@ -2837,6 +3390,12 @@ fn merge_claude_slot_collection_state_at(
                                         local_claude_quota_snapshot_is_fresh_for_account(
                                             snapshot,
                                             account_hash,
+                                            candidate
+                                                .organization_identifier_hash
+                                                .as_deref()
+                                                .expect(
+                                                "retained full snapshot has strong organization",
+                                            ),
                                             now,
                                         )
                                     },
@@ -2888,6 +3447,168 @@ fn claude_slot_collection_state_guard() -> std::io::Result<ClaudeSlotCollectionS
     })
 }
 
+fn derive_claude_account_anchor_coverage(
+    status: &ClaudeAccountsStatusV1,
+) -> ClaudeAccountAnchorCoverageV1 {
+    let mut by_binding = BTreeMap::<ClaudeStrongBinding, ClaudeAccountAnchorDescriptorV1>::new();
+    let mut registered = status
+        .managed_slots
+        .iter()
+        .chain(status.external_slots.iter())
+        .collect::<Vec<_>>();
+    registered.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
+    let registered_states = registered
+        .iter()
+        .map(|slot| (slot.slot_id.clone(), slot.collection.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let canonical = canonical_registered_anchors(
+        registered.iter().map(|slot| slot.slot_id.clone()),
+        &registered_states,
+    );
+    for (binding, slot_id) in canonical {
+        let slot = registered
+            .iter()
+            .find(|slot| slot.slot_id == slot_id)
+            .expect("canonical registered slot remains present");
+        by_binding.insert(
+            binding.clone(),
+            ClaudeAccountAnchorDescriptorV1 {
+                target_id: Some(claude_anchor_target_id(&binding)),
+                account_identifier_hash: binding.account_identifier_hash,
+                organization_identifier_hash: Some(binding.organization_identifier_hash),
+                durability: ClaudeAccountAnchorDurabilityV1::Anchored,
+                health: projected_claude_anchor_health(&slot.collection),
+                setup_blockers: Vec::new(),
+                observed_at: slot.collection.observed_at.clone(),
+            },
+        );
+    }
+
+    if let Some(binding) = status
+        .default_slot
+        .collection
+        .account_identifier_hash
+        .as_deref()
+        .and_then(|account| {
+            ClaudeStrongBinding::new(
+                account,
+                status
+                    .default_slot
+                    .collection
+                    .organization_identifier_hash
+                    .as_deref()?,
+            )
+        })
+    {
+        by_binding
+            .entry(binding.clone())
+            .or_insert_with(|| ClaudeAccountAnchorDescriptorV1 {
+                target_id: Some(claude_anchor_target_id(&binding)),
+                account_identifier_hash: binding.account_identifier_hash,
+                organization_identifier_hash: Some(binding.organization_identifier_hash),
+                durability: ClaudeAccountAnchorDurabilityV1::DefaultOnly,
+                health: None,
+                setup_blockers: Vec::new(),
+                observed_at: status.default_slot.collection.observed_at.clone(),
+            });
+    }
+
+    let mut ambiguous = Vec::new();
+    for unresolved in &status.unresolved_accounts {
+        let Some(account_hash) = unresolved
+            .account_identifier_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+        else {
+            continue;
+        };
+        let matching_bindings = by_binding
+            .keys()
+            .filter(|binding| binding.account_identifier_hash == account_hash)
+            .count();
+        if matching_bindings != 1 {
+            ambiguous.push(ClaudeAccountAnchorDescriptorV1 {
+                target_id: None,
+                account_identifier_hash: account_hash.to_string(),
+                organization_identifier_hash: None,
+                durability: ClaudeAccountAnchorDurabilityV1::Unresolved,
+                health: None,
+                setup_blockers: vec![ClaudeAccountAnchorSetupBlockerV1::AmbiguousIdentity],
+                observed_at: unresolved.observed_at.clone(),
+            });
+        }
+    }
+
+    if status.capacity.remaining_slots == 0 {
+        for account in by_binding.values_mut().chain(ambiguous.iter_mut()) {
+            if account.durability != ClaudeAccountAnchorDurabilityV1::Anchored {
+                account
+                    .setup_blockers
+                    .push(ClaudeAccountAnchorSetupBlockerV1::CapacityReached);
+            }
+        }
+    }
+
+    let mut accounts = by_binding.into_values().collect::<Vec<_>>();
+    accounts.extend(ambiguous);
+    let bounded_count = |predicate: fn(&ClaudeAccountAnchorDescriptorV1) -> bool| {
+        u8::try_from(accounts.iter().filter(|account| predicate(account)).count())
+            .unwrap_or(u8::MAX)
+    };
+    ClaudeAccountAnchorCoverageV1 {
+        observed_accounts: u8::try_from(accounts.len()).unwrap_or(u8::MAX),
+        anchored_accounts: bounded_count(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::Anchored
+        }),
+        default_only_accounts: bounded_count(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::DefaultOnly
+        }),
+        unresolved_accounts: bounded_count(|account| {
+            account.durability == ClaudeAccountAnchorDurabilityV1::Unresolved
+        }),
+        capacity_blocked_accounts: bounded_count(|account| {
+            account
+                .setup_blockers
+                .contains(&ClaudeAccountAnchorSetupBlockerV1::CapacityReached)
+        }),
+        ambiguous_identity_accounts: bounded_count(|account| {
+            account
+                .setup_blockers
+                .contains(&ClaudeAccountAnchorSetupBlockerV1::AmbiguousIdentity)
+        }),
+        accounts,
+    }
+}
+
+fn claude_anchor_target_id(binding: &ClaudeStrongBinding) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:claude-anchor-target:v1\0");
+    digest.update(binding.account_identifier_hash.as_bytes());
+    digest.update(b"\0");
+    digest.update(binding.organization_identifier_hash.as_bytes());
+    format!("claude_anchor_target_{:.32x}", digest.finalize())
+}
+
+fn projected_claude_anchor_health(
+    status: &ClaudeConfigSlotCollectionStatusV1,
+) -> Option<ClaudeAccountAnchorHealthV1> {
+    match projected_claude_quota_access_state(status)? {
+        ClaudeQuotaAccessState::Full | ClaudeQuotaAccessState::Partial => {
+            Some(ClaudeAccountAnchorHealthV1::Healthy)
+        }
+        ClaudeQuotaAccessState::TemporarilyUnavailable => {
+            Some(ClaudeAccountAnchorHealthV1::TemporarilyUnavailable)
+        }
+        ClaudeQuotaAccessState::ReconnectRequired => {
+            Some(ClaudeAccountAnchorHealthV1::ReconnectRequired)
+        }
+        ClaudeQuotaAccessState::Paused => Some(ClaudeAccountAnchorHealthV1::Paused),
+        ClaudeQuotaAccessState::AttentionRequired => {
+            Some(ClaudeAccountAnchorHealthV1::AttentionRequired)
+        }
+    }
+}
+
 pub(crate) fn annotate_claude_accounts_status(
     mut status: ClaudeAccountsStatusV1,
 ) -> ClaudeAccountsStatusV1 {
@@ -2914,6 +3635,8 @@ pub(crate) fn annotate_claude_accounts_status(
         }
     }
     status.unresolved_accounts = persisted.unresolved_accounts;
+    status.anchor_transitions = persisted.anchor_transitions;
+    status.anchor_coverage = derive_claude_account_anchor_coverage(&status);
     status
 }
 
@@ -3779,41 +4502,6 @@ fn collect_claude_statusline_context_status() -> Result<AgentContextStatus, Stri
     Ok(claude_statusline_context_from_cache(cache, history))
 }
 
-/// Collect Claude OAuth usage and stamp every served window and credit balance
-/// with the account the numbers belong to.
-///
-/// The caller resolves the identity once (`collect_claude_status`) and this
-/// path scopes every cache read to it. Fresh responses are stamped before
-/// persistence; every cache fallback must already carry the exact same account
-/// and organization hashes on the cache and every embedded meter. An
-/// unresolved identity stays unstamped: unknown must read as unknown
-/// downstream, never as a guess.
-#[cfg(test)]
-fn collect_claude_oauth_usage(
-    account_identifier_hash: &str,
-    organization_identifier_hash: Option<&str>,
-) -> ClaudeOAuthUsageOutcome {
-    collect_claude_oauth_usage_for_slot(
-        account_identifier_hash,
-        organization_identifier_hash.unwrap_or_default(),
-        &ClaudeConfigDirSlot::Default,
-    )
-}
-
-#[cfg(test)]
-fn collect_claude_oauth_usage_for_slot(
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    slot: &ClaudeConfigDirSlot,
-) -> ClaudeOAuthUsageOutcome {
-    collect_claude_oauth_usage_with_access_token(
-        account_identifier_hash,
-        organization_identifier_hash,
-        read_claude_oauth_credential_for_slot(slot).and_then(|credential| credential.access_token),
-        matches!(slot, ClaudeConfigDirSlot::Default),
-    )
-}
-
 fn collect_claude_oauth_usage_with_access_token(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
@@ -3880,7 +4568,8 @@ fn collect_claude_oauth_usage_unstamped(
         };
     }
 
-    let Some(_collection_attempt) = try_claude_oauth_collection_attempt(account_identifier_hash)
+    let Some(_collection_attempt) =
+        try_claude_oauth_collection_attempt(account_identifier_hash, organization_identifier_hash)
     else {
         if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
             account_identifier_hash,
@@ -3907,6 +4596,7 @@ fn collect_claude_oauth_usage_unstamped(
     let config_fingerprint = claude_oauth_usage_config_fingerprint();
     let open_breaker = read_claude_oauth_usage_breaker_with_legacy_migration(
         account_identifier_hash,
+        organization_identifier_hash,
         &config_fingerprint,
         mirror_legacy_default,
     )
@@ -3929,7 +4619,11 @@ fn collect_claude_oauth_usage_unstamped(
         let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
         if !cache.windows.is_empty()
             && cache_age <= CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-            && (cache_age <= claude_oauth_usage_fresh_age_seconds(account_identifier_hash)
+            && (cache_age
+                <= claude_oauth_usage_fresh_age_seconds(
+                    account_identifier_hash,
+                    organization_identifier_hash,
+                )
                 || now < cache.next_refresh_after_epoch_seconds)
         {
             return ClaudeOAuthUsageOutcome::from(Ok(claude_oauth_usage_from_cache(cache, now)));
@@ -4021,6 +4715,7 @@ fn collect_claude_oauth_usage_unstamped(
             let diagnostics = record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::RateLimited,
                 account_identifier_hash,
+                organization_identifier_hash,
                 &config_fingerprint,
                 now,
                 mirror_legacy_default,
@@ -4044,6 +4739,7 @@ fn collect_claude_oauth_usage_unstamped(
                 Some(failure) => record_claude_oauth_usage_failure_with_legacy(
                     failure,
                     account_identifier_hash,
+                    organization_identifier_hash,
                     &config_fingerprint,
                     now,
                     mirror_legacy_default,
@@ -4077,6 +4773,7 @@ fn collect_claude_oauth_usage_unstamped(
             diagnostics: record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::ResponseShape,
                 account_identifier_hash,
+                organization_identifier_hash,
                 &config_fingerprint,
                 now,
                 mirror_legacy_default,
@@ -4096,6 +4793,7 @@ fn collect_claude_oauth_usage_unstamped(
             diagnostics: record_claude_oauth_usage_failure_with_legacy(
                 ClaudeOAuthUsageFailure::ResponseShape,
                 account_identifier_hash,
+                organization_identifier_hash,
                 &config_fingerprint,
                 now,
                 mirror_legacy_default,
@@ -4122,7 +4820,11 @@ fn collect_claude_oauth_usage_unstamped(
     }
     // One clean answer clears the accumulated failure counters: the thresholds
     // below are about *consecutive* failures.
-    clear_claude_oauth_usage_breaker_with_legacy(account_identifier_hash, mirror_legacy_default);
+    clear_claude_oauth_usage_breaker_with_legacy(
+        account_identifier_hash,
+        organization_identifier_hash,
+        mirror_legacy_default,
+    );
     ClaudeOAuthUsageOutcome::from(Ok(usage))
 }
 
@@ -4148,10 +4850,15 @@ impl From<Result<ClaudeOAuthUsage, String>> for ClaudeOAuthUsageOutcome {
 /// Derived from the account hash rather than a random draw so the gate is
 /// stable for a machine: a per-tick random offset would make the cadence
 /// jitter around every refresh instead of holding one steady phase.
-fn claude_oauth_usage_fresh_age_seconds(seed: &str) -> u64 {
+fn claude_oauth_usage_fresh_age_seconds(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(b"ottto:claude-oauth-usage-cadence:");
-    hasher.update(seed.as_bytes());
+    hasher.update(account_identifier_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(organization_identifier_hash.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
@@ -4170,22 +4877,38 @@ pub(crate) fn claude_oauth_usage_network_disabled() -> bool {
         .is_file()
 }
 
-fn claude_oauth_usage_account_state_dir(account_identifier_hash: &str) -> PathBuf {
-    let component = if account_identifier_hash.is_empty() {
+fn claude_oauth_binding_key(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:claude-oauth-strong-binding:v1\0");
+    hasher.update(account_identifier_hash.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(organization_identifier_hash.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn claude_oauth_usage_account_state_dir(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> PathBuf {
+    let component = if account_identifier_hash.is_empty() || organization_identifier_hash.is_empty()
+    {
         "unresolved".to_string()
     } else {
-        let mut hasher = Sha256::new();
-        hasher.update(b"ottto:claude-oauth-account-state:");
-        hasher.update(account_identifier_hash.as_bytes());
-        format!("{:x}", hasher.finalize())
+        claude_oauth_binding_key(account_identifier_hash, organization_identifier_hash)
     };
     default_support_dir()
         .join(CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR)
         .join(component)
 }
 
-fn claude_oauth_usage_breaker_path(account_identifier_hash: &str) -> PathBuf {
-    claude_oauth_usage_account_state_dir(account_identifier_hash)
+fn claude_oauth_usage_breaker_path(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> PathBuf {
+    claude_oauth_usage_account_state_dir(account_identifier_hash, organization_identifier_hash)
         .join(CLAUDE_OAUTH_USAGE_BREAKER_FILE)
 }
 
@@ -4193,19 +4916,26 @@ fn claude_oauth_usage_legacy_breaker_path() -> PathBuf {
     default_support_dir().join(CLAUDE_OAUTH_USAGE_LEGACY_BREAKER_FILE)
 }
 
-fn claude_oauth_account_state_lock(account_identifier_hash: &str) -> Arc<Mutex<()>> {
+fn claude_oauth_account_state_lock(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> Arc<Mutex<()>> {
     let mut locks = CLAUDE_OAUTH_ACCOUNT_STATE_LOCKS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     locks
-        .entry(account_identifier_hash.to_string())
+        .entry(claude_oauth_binding_key(
+            account_identifier_hash,
+            organization_identifier_hash,
+        ))
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
 
 fn try_claude_oauth_collection_attempt(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
 ) -> Option<ClaudeOAuthCollectionAttemptGuard> {
     let process_lock = {
         let mut locks = CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS
@@ -4213,7 +4943,10 @@ fn try_claude_oauth_collection_attempt(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *locks
-            .entry(account_identifier_hash.to_string())
+            .entry(claude_oauth_binding_key(
+                account_identifier_hash,
+                organization_identifier_hash,
+            ))
             .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
     };
     let process = match process_lock.try_lock() {
@@ -4221,7 +4954,8 @@ fn try_claude_oauth_collection_attempt(
         Err(std::sync::TryLockError::WouldBlock) => return None,
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
     };
-    let account_root = claude_oauth_usage_account_state_dir(account_identifier_hash);
+    let account_root =
+        claude_oauth_usage_account_state_dir(account_identifier_hash, organization_identifier_hash);
     if fs::create_dir_all(&account_root).is_err() {
         return None;
     }
@@ -4291,10 +5025,12 @@ fn claude_oauth_usage_config_fingerprint_for(
 #[cfg(test)]
 fn read_claude_oauth_usage_breaker(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
 ) -> Option<ClaudeOAuthUsageBreaker> {
     read_claude_oauth_usage_breaker_with_legacy_migration(
         account_identifier_hash,
+        organization_identifier_hash,
         config_fingerprint,
         true,
     )
@@ -4302,15 +5038,18 @@ fn read_claude_oauth_usage_breaker(
 
 fn read_claude_oauth_usage_breaker_with_legacy_migration(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
     allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
-    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let lock =
+        claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     read_claude_oauth_usage_breaker_locked(
         account_identifier_hash,
+        organization_identifier_hash,
         config_fingerprint,
         allow_legacy_migration,
     )
@@ -4318,19 +5057,26 @@ fn read_claude_oauth_usage_breaker_with_legacy_migration(
 
 fn read_claude_oauth_usage_breaker_locked(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
     allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
     if allow_legacy_migration {
         migrate_legacy_claude_oauth_usage_breaker_locked(
             account_identifier_hash,
+            organization_identifier_hash,
             config_fingerprint,
         );
     }
-    let body = fs::read_to_string(claude_oauth_usage_breaker_path(account_identifier_hash)).ok()?;
+    let body = fs::read_to_string(claude_oauth_usage_breaker_path(
+        account_identifier_hash,
+        organization_identifier_hash,
+    ))
+    .ok()?;
     let breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
     if breaker.schema_version != CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
         || breaker.account_identifier_hash != account_identifier_hash
+        || breaker.organization_identifier_hash != organization_identifier_hash
         || breaker.config_fingerprint != config_fingerprint
     {
         return None;
@@ -4341,7 +5087,10 @@ fn read_claude_oauth_usage_breaker_locked(
 fn write_claude_oauth_usage_breaker_locked(
     breaker: &ClaudeOAuthUsageBreaker,
 ) -> std::io::Result<()> {
-    let path = claude_oauth_usage_breaker_path(&breaker.account_identifier_hash);
+    let path = claude_oauth_usage_breaker_path(
+        &breaker.account_identifier_hash,
+        &breaker.organization_identifier_hash,
+    );
     let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
     write_owner_only_file_atomic(&path, &body)
 }
@@ -4354,19 +5103,31 @@ fn write_legacy_claude_oauth_usage_breaker(
 }
 
 #[cfg(test)]
-fn clear_claude_oauth_usage_breaker(account_identifier_hash: &str) {
-    clear_claude_oauth_usage_breaker_with_legacy(account_identifier_hash, false);
+fn clear_claude_oauth_usage_breaker(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) {
+    clear_claude_oauth_usage_breaker_with_legacy(
+        account_identifier_hash,
+        organization_identifier_hash,
+        false,
+    );
 }
 
 fn clear_claude_oauth_usage_breaker_with_legacy(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     mirror_legacy_default: bool,
 ) {
-    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let lock =
+        claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = fs::remove_file(claude_oauth_usage_breaker_path(account_identifier_hash));
+    let _ = fs::remove_file(claude_oauth_usage_breaker_path(
+        account_identifier_hash,
+        organization_identifier_hash,
+    ));
     if mirror_legacy_default {
         let _ = fs::remove_file(claude_oauth_usage_legacy_breaker_path());
     }
@@ -4374,9 +5135,11 @@ fn clear_claude_oauth_usage_breaker_with_legacy(
 
 fn migrate_legacy_claude_oauth_usage_breaker_locked(
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
 ) {
-    let target = claude_oauth_usage_breaker_path(account_identifier_hash);
+    let target =
+        claude_oauth_usage_breaker_path(account_identifier_hash, organization_identifier_hash);
     if target.exists() {
         return;
     }
@@ -4394,6 +5157,7 @@ fn migrate_legacy_claude_oauth_usage_breaker_locked(
         .filter(|breaker| {
             breaker.schema_version == CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
                 && breaker.account_identifier_hash == account_identifier_hash
+                && breaker.organization_identifier_hash == organization_identifier_hash
                 && breaker.config_fingerprint == config_fingerprint
         })
     else {
@@ -4416,12 +5180,14 @@ fn claude_oauth_usage_breaker_after_failure(
     previous: Option<ClaudeOAuthUsageBreaker>,
     failure: ClaudeOAuthUsageFailure,
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
 ) -> ClaudeOAuthUsageBreaker {
     let mut breaker = previous.unwrap_or_default();
     breaker.schema_version = CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION;
     breaker.account_identifier_hash = account_identifier_hash.to_string();
+    breaker.organization_identifier_hash = organization_identifier_hash.to_string();
     breaker.config_fingerprint = config_fingerprint.to_string();
     let counter = match failure {
         ClaudeOAuthUsageFailure::AuthRejected => &mut breaker.auth_failures,
@@ -4441,12 +5207,14 @@ fn claude_oauth_usage_breaker_after_failure(
 fn record_claude_oauth_usage_failure(
     failure: ClaudeOAuthUsageFailure,
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
 ) -> Vec<AgentStatusDiagnostic> {
     record_claude_oauth_usage_failure_with_legacy(
         failure,
         account_identifier_hash,
+        organization_identifier_hash,
         config_fingerprint,
         now,
         false,
@@ -4456,16 +5224,19 @@ fn record_claude_oauth_usage_failure(
 fn record_claude_oauth_usage_failure_with_legacy(
     failure: ClaudeOAuthUsageFailure,
     account_identifier_hash: &str,
+    organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
     mirror_legacy_default: bool,
 ) -> Vec<AgentStatusDiagnostic> {
-    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let lock =
+        claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = read_claude_oauth_usage_breaker_locked(
         account_identifier_hash,
+        organization_identifier_hash,
         config_fingerprint,
         mirror_legacy_default,
     );
@@ -4476,6 +5247,7 @@ fn record_claude_oauth_usage_failure_with_legacy(
         previous,
         failure,
         account_identifier_hash,
+        organization_identifier_hash,
         config_fingerprint,
         now,
     );
@@ -4715,8 +5487,11 @@ fn claude_oauth_usage_error(error: ureq::Error) -> String {
     }
 }
 
-fn claude_oauth_usage_cache_path(account_identifier_hash: &str) -> PathBuf {
-    claude_oauth_usage_account_state_dir(account_identifier_hash)
+fn claude_oauth_usage_cache_path(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+) -> PathBuf {
+    claude_oauth_usage_account_state_dir(account_identifier_hash, organization_identifier_hash)
         .join(CLAUDE_OAUTH_USAGE_CACHE_FILE)
 }
 
@@ -4807,7 +5582,8 @@ fn read_claude_oauth_usage_cache_with_legacy_migration(
     organization_identifier_hash: &str,
     allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
-    let lock = claude_oauth_account_state_lock(account_identifier_hash);
+    let lock =
+        claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4829,7 +5605,7 @@ fn read_claude_oauth_usage_cache_locked(
             organization_identifier_hash,
         );
     }
-    let path = claude_oauth_usage_cache_path(account_identifier_hash);
+    let path = claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
     let body = fs::read_to_string(path).ok()?;
     let cache: ClaudeOAuthUsageCache = serde_json::from_str(&body).ok()?;
     if cache.schema_version != CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION {
@@ -4875,7 +5651,10 @@ fn claude_oauth_usage_cache_belongs_to_identity(
 }
 
 fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
-    let lock = claude_oauth_account_state_lock(&cache.account_identifier_hash);
+    let lock = claude_oauth_account_state_lock(
+        &cache.account_identifier_hash,
+        &cache.organization_identifier_hash,
+    );
     let _transaction = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4883,7 +5662,10 @@ fn write_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Res
 }
 
 fn write_claude_oauth_usage_cache_locked(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
-    let path = claude_oauth_usage_cache_path(&cache.account_identifier_hash);
+    let path = claude_oauth_usage_cache_path(
+        &cache.account_identifier_hash,
+        &cache.organization_identifier_hash,
+    );
     let body = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
     write_owner_only_file_atomic(&path, &body)
 }
@@ -4899,7 +5681,8 @@ fn migrate_legacy_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
 ) {
-    let target = claude_oauth_usage_cache_path(account_identifier_hash);
+    let target =
+        claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
     if target.exists() {
         return;
     }
@@ -5231,8 +6014,11 @@ fn claude_oauth_usage_from_cache(cache: ClaudeOAuthUsageCache, now: u64) -> Clau
     let cache_age = now.saturating_sub(cache.observed_at_epoch_seconds);
     // Same jittered gate the refresh decision uses, seeded from the account the
     // cache belongs to: a payload served as fresh must not be labelled stale.
-    let cache_is_stale =
-        cache_age > claude_oauth_usage_fresh_age_seconds(&cache.account_identifier_hash);
+    let cache_is_stale = cache_age
+        > claude_oauth_usage_fresh_age_seconds(
+            &cache.account_identifier_hash,
+            &cache.organization_identifier_hash,
+        );
     let observed_at = rfc3339_from_unix_seconds(cache.observed_at_epoch_seconds);
     ClaudeOAuthUsage {
         windows: cache
@@ -5510,6 +6296,8 @@ fn collect_pi_status(captured_at: String, expires_at: String) -> AgentStatusSnap
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Low,
     });
@@ -5784,6 +6572,8 @@ fn not_installed_snapshot(
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::High,
     });
@@ -5821,6 +6611,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
             claude_quota_access_state: None,
+            claude_anchor_durability: None,
+            claude_anchor_health: None,
             billing_identity_confidence: AgentStatusConfidence::Unknown,
             confidence: AgentStatusConfidence::Medium,
         });
@@ -5853,6 +6645,8 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Medium,
     })
@@ -5972,6 +6766,8 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
         credential_fingerprint_hash: None,
         billing_identity_evidence,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     })
@@ -6761,6 +7557,12 @@ fn merge_codex_accounts(
         claude_quota_access_state: auth_account
             .claude_quota_access_state
             .or(existing.claude_quota_access_state),
+        claude_anchor_durability: auth_account
+            .claude_anchor_durability
+            .or(existing.claude_anchor_durability),
+        claude_anchor_health: auth_account
+            .claude_anchor_health
+            .or(existing.claude_anchor_health),
         billing_identity_confidence: if auth_account.billing_identity_confidence
             != AgentStatusConfidence::Unknown
         {
@@ -6888,6 +7690,8 @@ fn parse_claude_auth_json(value: &Value) -> AgentAccountStatus {
         credential_fingerprint_hash: None,
         billing_identity_evidence,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::High,
         confidence: AgentStatusConfidence::High,
     }
@@ -8522,6 +9326,8 @@ fn unsupported_account(provider: &str) -> AgentAccountStatus {
         credential_fingerprint_hash: None,
         billing_identity_evidence: None,
         claude_quota_access_state: None,
+        claude_anchor_durability: None,
+        claude_anchor_health: None,
         billing_identity_confidence: AgentStatusConfidence::Unknown,
         confidence: AgentStatusConfidence::Unknown,
     }
@@ -12208,7 +13014,7 @@ exit 1
         // Past the account's own jittered gate, not the bare base constant.
         let usage = claude_oauth_usage_from_cache(
             cache,
-            100 + claude_oauth_usage_fresh_age_seconds("account-a") + 1,
+            100 + claude_oauth_usage_fresh_age_seconds("account-a", "organization-a") + 1,
         );
 
         assert_eq!(usage.windows.len(), 1);
@@ -12365,7 +13171,7 @@ exit 1
         let served = read_claude_oauth_usage_cache(&account_a, organization_a)
             .expect("own account is served");
         assert_eq!(served.windows[0].used_percent, Some(44));
-        assert!(claude_oauth_usage_cache_path(&account_a).is_file());
+        assert!(claude_oauth_usage_cache_path(&account_a, organization_a).is_file());
         assert!(
             read_claude_oauth_usage_cache(&account_a, organization_b).is_none(),
             "an account-only match must not relabel cached meters under another organization"
@@ -12405,10 +13211,10 @@ exit 1
         // both accounts independently.
         write_claude_oauth_usage_cache(&fallback).expect("write fallback cache");
         assert!(read_claude_oauth_usage_cache(&account_a, organization_a).is_some());
-        assert!(claude_oauth_usage_cache_path(&account_b).is_file());
+        assert!(claude_oauth_usage_cache_path(&account_b, organization_b).is_file());
         assert_ne!(
-            claude_oauth_usage_cache_path(&account_a),
-            claude_oauth_usage_cache_path(&account_b)
+            claude_oauth_usage_cache_path(&account_a, organization_a),
+            claude_oauth_usage_cache_path(&account_b, organization_b)
         );
 
         let _ = std::fs::remove_dir_all(&support_dir);
@@ -12441,6 +13247,50 @@ exit 1
             "account-a",
             "organization-a",
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn same_account_two_organizations_have_independent_state_and_admission() {
+        let support_dir = std::env::temp_dir().join(format!(
+            "ottto-claude-composite-state-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&support_dir);
+        fs::create_dir_all(&support_dir).expect("create support dir");
+        let _guard = EnvVarGuard::set_os(
+            "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+            support_dir.as_os_str().to_os_string(),
+        );
+        let account = "same-account";
+        let organization_a = "organization-a";
+        let organization_b = "organization-b";
+        assert_ne!(
+            claude_oauth_usage_cache_path(account, organization_a),
+            claude_oauth_usage_cache_path(account, organization_b)
+        );
+        let held = try_claude_oauth_collection_attempt(account, organization_a)
+            .expect("organization A admission");
+        assert!(
+            try_claude_oauth_collection_attempt(account, organization_a).is_none(),
+            "same composite binding must coalesce"
+        );
+        let other = try_claude_oauth_collection_attempt(account, organization_b)
+            .expect("organization B remains independent");
+        drop(other);
+        drop(held);
+
+        let fingerprint = "composite-fingerprint";
+        record_claude_oauth_usage_failure(
+            ClaudeOAuthUsageFailure::AuthRejected,
+            account,
+            organization_a,
+            fingerprint,
+            1_000,
+        );
+        assert!(read_claude_oauth_usage_breaker(account, organization_a, fingerprint).is_some());
+        assert!(read_claude_oauth_usage_breaker(account, organization_b, fingerprint).is_none());
+        let _ = fs::remove_dir_all(support_dir);
     }
 
     #[test]
@@ -12483,12 +13333,15 @@ exit 1
             record_claude_oauth_usage_failure(
                 ClaudeOAuthUsageFailure::AuthRejected,
                 account,
+                organization,
                 &fingerprint,
                 now,
             );
         }
-        assert!(read_claude_oauth_usage_breaker(account, &fingerprint)
-            .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(&breaker, now)));
+        assert!(
+            read_claude_oauth_usage_breaker(account, organization, &fingerprint)
+                .is_some_and(|breaker| claude_oauth_usage_breaker_is_open(&breaker, now))
+        );
         let calls_before = CLAUDE_OAUTH_PROVIDER_CALLS.load(std::sync::atomic::Ordering::SeqCst);
 
         let outcome =
@@ -12589,7 +13442,7 @@ exit 1
                 .account_identifier_hash,
             "account-a"
         );
-        assert!(claude_oauth_usage_cache_path("account-a").is_file());
+        assert!(claude_oauth_usage_cache_path("account-a", "organization-a").is_file());
         assert!(!claude_oauth_usage_legacy_cache_path().exists());
         let _ = fs::remove_dir_all(support_dir);
     }
@@ -12670,12 +13523,14 @@ exit 1
         record_claude_oauth_usage_failure_with_legacy(
             ClaudeOAuthUsageFailure::AuthRejected,
             "account-default",
+            "organization-default",
             fingerprint,
             1_000,
             true,
         );
         assert!(read_claude_oauth_usage_breaker_with_legacy_migration(
             "account-custom",
+            "organization-custom",
             "fingerprint-custom",
             false,
         )
@@ -12687,6 +13542,7 @@ exit 1
         record_claude_oauth_usage_failure_with_legacy(
             ClaudeOAuthUsageFailure::ResponseShape,
             "account-custom",
+            "organization-custom",
             "fingerprint-custom",
             1_000,
             false,
@@ -12701,16 +13557,34 @@ exit 1
         assert_eq!(legacy_breaker.auth_failures, 1);
         assert_eq!(legacy_breaker.shape_failures, 0);
         assert_eq!(
-            read_claude_oauth_usage_breaker("account-custom", "fingerprint-custom")
-                .expect("read custom breaker")
-                .shape_failures,
+            read_claude_oauth_usage_breaker(
+                "account-custom",
+                "organization-custom",
+                "fingerprint-custom"
+            )
+            .expect("read custom breaker")
+            .shape_failures,
             1
         );
 
-        clear_claude_oauth_usage_breaker_with_legacy("account-default", true);
+        clear_claude_oauth_usage_breaker_with_legacy(
+            "account-default",
+            "organization-default",
+            true,
+        );
         assert!(!claude_oauth_usage_legacy_breaker_path().exists());
-        assert!(read_claude_oauth_usage_breaker("account-default", fingerprint).is_none());
-        assert!(read_claude_oauth_usage_breaker("account-custom", "fingerprint-custom").is_some());
+        assert!(read_claude_oauth_usage_breaker(
+            "account-default",
+            "organization-default",
+            fingerprint
+        )
+        .is_none());
+        assert!(read_claude_oauth_usage_breaker(
+            "account-custom",
+            "organization-custom",
+            "fingerprint-custom"
+        )
+        .is_some());
         let _ = fs::remove_dir_all(support_dir);
     }
 
@@ -12759,7 +13633,7 @@ exit 1
         for worker in workers {
             assert_eq!(worker.join().expect("worker"), "account-concurrent");
         }
-        let target = claude_oauth_usage_cache_path("account-concurrent");
+        let target = claude_oauth_usage_cache_path("account-concurrent", "organization-concurrent");
         assert!(target.is_file());
         assert!(!claude_oauth_usage_legacy_cache_path().exists());
         #[cfg(unix)]
@@ -12804,7 +13678,7 @@ exit 1
         #[cfg(unix)]
         {
             use std::os::unix::fs::{symlink, PermissionsExt};
-            let cache_path = claude_oauth_usage_cache_path(account);
+            let cache_path = claude_oauth_usage_cache_path(account, "organization-atomic");
             fs::create_dir_all(cache_path.parent().expect("cache parent"))
                 .expect("create cache parent");
             let sentinel = support_dir.join("sentinel.json");
@@ -12832,10 +13706,11 @@ exit 1
         record_claude_oauth_usage_failure(
             ClaudeOAuthUsageFailure::AuthRejected,
             account,
+            "organization-atomic",
             "fingerprint-atomic",
             100,
         );
-        let breaker_path = claude_oauth_usage_breaker_path(account);
+        let breaker_path = claude_oauth_usage_breaker_path(account, "organization-atomic");
         let _: ClaudeOAuthUsageBreaker =
             serde_json::from_slice(&fs::read(&breaker_path).expect("read complete breaker JSON"))
                 .expect("parse complete breaker JSON");
@@ -12852,7 +13727,7 @@ exit 1
             );
         }
         for entry in fs::read_dir(
-            claude_oauth_usage_cache_path(account)
+            claude_oauth_usage_cache_path(account, "organization-atomic")
                 .parent()
                 .expect("account state dir"),
         )
@@ -12923,28 +13798,28 @@ exit 1
             "account-b",
             "9f1c0c1a4b5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
         ] {
-            let gate = claude_oauth_usage_fresh_age_seconds(seed);
+            let gate = claude_oauth_usage_fresh_age_seconds(seed, "organization-test");
             assert!(
                 (55 * 60..=65 * 60).contains(&gate),
                 "gate for {seed:?} out of the 55-65 minute band: {gate}"
             );
             assert_eq!(
                 gate,
-                claude_oauth_usage_fresh_age_seconds(seed),
+                claude_oauth_usage_fresh_age_seconds(seed, "organization-test"),
                 "gate must be stable for a given account, not redrawn per call"
             );
         }
         // Different accounts land on different phases; that is the whole point.
         assert_ne!(
-            claude_oauth_usage_fresh_age_seconds("account-a"),
-            claude_oauth_usage_fresh_age_seconds("account-b")
+            claude_oauth_usage_fresh_age_seconds("account-a", "organization-test"),
+            claude_oauth_usage_fresh_age_seconds("account-b", "organization-test")
         );
         // Sanity on the base cadence itself: ~24 calls/day, not ~96.
         assert_eq!(CLAUDE_OAUTH_USAGE_CACHE_FRESH_AGE_SECONDS, 60 * 60);
         // The 24h max age stays a display fallback, well clear of the gate.
         assert!(
             CLAUDE_OAUTH_USAGE_CACHE_MAX_AGE_SECONDS
-                > claude_oauth_usage_fresh_age_seconds("account-a")
+                > claude_oauth_usage_fresh_age_seconds("account-a", "organization-test")
         );
     }
 
@@ -12973,6 +13848,7 @@ exit 1
                     breaker,
                     failure,
                     "account-a",
+                    "organization-a",
                     "fingerprint-a",
                     1_000,
                 ));
@@ -13004,6 +13880,7 @@ exit 1
                 breaker,
                 ClaudeOAuthUsageFailure::RateLimited,
                 "account-a",
+                "organization-a",
                 "fingerprint-a",
                 1_000,
             ));
@@ -13022,6 +13899,7 @@ exit 1
                 breaker,
                 ClaudeOAuthUsageFailure::AuthRejected,
                 "account-a",
+                "organization-a",
                 "fingerprint-a",
                 1_000,
             ));
@@ -13101,25 +13979,39 @@ exit 1
             support_dir.as_os_str().to_os_string(),
         );
 
-        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-a").is_none());
+        assert!(
+            read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-a")
+                .is_none()
+        );
         for _ in 0..CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD {
             record_claude_oauth_usage_failure(
                 ClaudeOAuthUsageFailure::AuthRejected,
                 "account-a",
+                "organization-a",
                 "fingerprint-a",
                 1_000,
             );
         }
         let stored =
-            read_claude_oauth_usage_breaker("account-a", "fingerprint-a").expect("stored breaker");
+            read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-a")
+                .expect("stored breaker");
         assert!(claude_oauth_usage_breaker_is_open(&stored, 1_000));
         // Account-keyed and config-keyed, exactly like the usage cache: a
         // different account or a changed call configuration starts clean.
-        assert!(read_claude_oauth_usage_breaker("account-b", "fingerprint-a").is_none());
-        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-b").is_none());
+        assert!(
+            read_claude_oauth_usage_breaker("account-b", "organization-b", "fingerprint-a")
+                .is_none()
+        );
+        assert!(
+            read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-b")
+                .is_none()
+        );
 
-        clear_claude_oauth_usage_breaker("account-a");
-        assert!(read_claude_oauth_usage_breaker("account-a", "fingerprint-a").is_none());
+        clear_claude_oauth_usage_breaker("account-a", "organization-a");
+        assert!(
+            read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-a")
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&support_dir);
     }
@@ -13144,6 +14036,7 @@ exit 1
                     record_claude_oauth_usage_failure(
                         ClaudeOAuthUsageFailure::AuthRejected,
                         "account-concurrent-breaker",
+                        "organization-concurrent-breaker",
                         "fingerprint-concurrent-breaker",
                         1_000,
                     )
@@ -13156,6 +14049,7 @@ exit 1
             .collect::<Vec<_>>();
         let breaker = read_claude_oauth_usage_breaker(
             "account-concurrent-breaker",
+            "organization-concurrent-breaker",
             "fingerprint-concurrent-breaker",
         )
         .expect("concurrent breaker");
@@ -13180,6 +14074,7 @@ exit 1
         let breaker = ClaudeOAuthUsageBreaker {
             schema_version: CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION,
             account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
             config_fingerprint: "fingerprint-a".to_string(),
             auth_failures: 2,
             ..Default::default()
@@ -13190,15 +14085,18 @@ exit 1
         )
         .expect("write legacy breaker");
 
-        assert!(read_claude_oauth_usage_breaker("account-b", "fingerprint-a").is_none());
+        assert!(
+            read_claude_oauth_usage_breaker("account-b", "organization-b", "fingerprint-a")
+                .is_none()
+        );
         assert!(claude_oauth_usage_legacy_breaker_path().is_file());
         assert_eq!(
-            read_claude_oauth_usage_breaker("account-a", "fingerprint-a")
+            read_claude_oauth_usage_breaker("account-a", "organization-a", "fingerprint-a")
                 .expect("migrated breaker")
                 .auth_failures,
             2
         );
-        assert!(claude_oauth_usage_breaker_path("account-a").is_file());
+        assert!(claude_oauth_usage_breaker_path("account-a", "organization-a").is_file());
         assert!(!claude_oauth_usage_legacy_breaker_path().exists());
         let _ = fs::remove_dir_all(support_dir);
     }
@@ -13229,6 +14127,7 @@ exit 1
             emitted.extend(record_claude_oauth_usage_failure(
                 ClaudeOAuthUsageFailure::RateLimited,
                 &account,
+                "organization-alert",
                 &fingerprint,
                 now,
             ));
@@ -13245,6 +14144,7 @@ exit 1
         assert!(record_claude_oauth_usage_failure(
             ClaudeOAuthUsageFailure::RateLimited,
             &account,
+            "organization-alert",
             &fingerprint,
             now + 100,
         )
@@ -13252,7 +14152,12 @@ exit 1
 
         // While open, the collector never reaches the network: it returns the
         // breaker error plus the alert without a token read or a request.
-        let outcome = collect_claude_oauth_usage(&account, None);
+        let outcome = collect_claude_oauth_usage_with_access_token(
+            &account,
+            "organization-alert",
+            None,
+            false,
+        );
         assert!(outcome.result.is_err());
         assert!(outcome
             .diagnostics
@@ -13362,7 +14267,7 @@ exit 1
             outcome.diagnostics[0].severity,
             AgentDiagnosticSeverity::Info
         );
-        assert!(claude_oauth_usage_cache_path(account_hash).exists());
+        assert!(claude_oauth_usage_cache_path(account_hash, organization_hash).exists());
 
         std::fs::remove_file(support_dir.join("claude-oauth-usage-network-disabled"))
             .expect("re-enable collection");
@@ -14012,7 +14917,10 @@ exit 1
         }];
 
         assert!(claude_default_snapshot_is_uploadable(&snapshot));
-        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(2));
+        assert_eq!(
+            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
+            Some(1)
+        );
         assert_eq!(
             claude_default_slot_collection_status(&snapshot).state,
             ClaudeConfigSlotCollectionStateV1::ProviderUnavailable
@@ -14046,7 +14954,11 @@ exit 1
             claude_default_snapshot_is_uploadable(&snapshot),
             "an attributed default statusLine partial remains uploadable"
         );
-        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(1));
+        assert_eq!(
+            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
+            Some(1),
+            "stale statusLine meters are the stale-partial tier"
+        );
         let partial = claude_default_slot_collection_status(&snapshot);
         assert_eq!(partial.state, ClaudeConfigSlotCollectionStateV1::Fresh);
         assert_eq!(
@@ -14078,9 +14990,359 @@ exit 1
             organization_identifier_hash: Some("organization-a".to_string()),
             ..Default::default()
         }];
-        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(3));
+        assert_eq!(
+            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
+            Some(3)
+        );
         snapshot.quota_windows[0].freshness = AgentQuotaWindowFreshness::Stale;
-        assert_eq!(claude_snapshot_candidate_rank(&snapshot), Some(2));
+        assert_eq!(
+            claude_snapshot_candidate_rank(&snapshot).map(|quality| quality.tier),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn claude_candidate_selection_prefers_anchor_only_on_equal_quality() {
+        let candidate = |slot_id: &str, slot_class: ClaudeSnapshotSlotClass, rank: u8| {
+            ClaudeSnapshotCandidate {
+                slot_id: slot_id.to_string(),
+                slot_class,
+                binding: ClaudeStrongBinding {
+                    account_identifier_hash: "account-a".to_string(),
+                    organization_identifier_hash: "organization-a".to_string(),
+                },
+                quality: ClaudeSnapshotQuality {
+                    tier: rank,
+                    provider_observed_at: "2026-08-23T00:00:00Z".to_string(),
+                },
+                snapshot: base_snapshot(
+                    SourceKind::ClaudeCode,
+                    AgentStatusState::Available,
+                    AgentStatusCollectionMethod::CliJson,
+                    "2026-08-23T00:00:00Z".to_string(),
+                    "2026-08-23T00:05:00Z".to_string(),
+                ),
+            }
+        };
+
+        let equal = vec![
+            candidate("default", ClaudeSnapshotSlotClass::Default, 3),
+            candidate(
+                "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ClaudeSnapshotSlotClass::Registered,
+                3,
+            ),
+            candidate(
+                "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ClaudeSnapshotSlotClass::Registered,
+                3,
+            ),
+        ];
+        let selected = select_claude_snapshot_candidates(&equal);
+        let binding = ClaudeStrongBinding {
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
+        };
+        assert_eq!(selected.winning_by_binding[&binding], 2);
+        assert_eq!(selected.preferred_anchor_by_binding[&binding], 2);
+        assert_eq!(
+            claude_snapshot_candidate_disposition(0, &equal[0], &selected),
+            ClaudeSnapshotDisposition::ShadowDefault
+        );
+        assert_eq!(
+            claude_snapshot_candidate_disposition(1, &equal[1], &selected),
+            ClaudeSnapshotDisposition::DuplicateRegistered
+        );
+        assert_eq!(
+            claude_snapshot_candidate_disposition(2, &equal[2], &selected),
+            ClaudeSnapshotDisposition::Upload
+        );
+
+        let fresher_default = vec![
+            candidate("default", ClaudeSnapshotSlotClass::Default, 3),
+            candidate(
+                "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ClaudeSnapshotSlotClass::Registered,
+                2,
+            ),
+            candidate(
+                "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ClaudeSnapshotSlotClass::Registered,
+                2,
+            ),
+        ];
+        let selected = select_claude_snapshot_candidates(&fresher_default);
+        assert_eq!(selected.winning_by_binding[&binding], 0);
+        assert_eq!(
+            selected.preferred_anchor_by_binding[&binding], 1,
+            "the preferred registered anchor remains stable while fresher default meters win"
+        );
+        assert_eq!(
+            claude_snapshot_candidate_disposition(1, &fresher_default[1], &selected),
+            ClaudeSnapshotDisposition::PreserveRegisteredAnchor
+        );
+        assert_eq!(
+            claude_snapshot_candidate_disposition(2, &fresher_default[2], &selected),
+            ClaudeSnapshotDisposition::DuplicateRegistered
+        );
+
+        let shadow = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            relationship: Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor),
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow.relationship,
+            Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor)
+        );
+        assert!(!shadow.has_account_windows);
+        assert!(shadow.quota_snapshot.is_none());
+        let duplicate =
+            duplicate_account_status("2026-08-23T00:00:00Z", "account-a", Some("organization-a"));
+        assert_eq!(
+            duplicate.state,
+            ClaudeConfigSlotCollectionStateV1::DuplicateAccount
+        );
+    }
+
+    #[test]
+    fn claude_candidate_selection_keeps_same_account_under_two_organizations() {
+        let candidate = |slot_id: &str, organization: &str| ClaudeSnapshotCandidate {
+            slot_id: slot_id.to_string(),
+            slot_class: ClaudeSnapshotSlotClass::Registered,
+            binding: ClaudeStrongBinding {
+                account_identifier_hash: "shared-account".to_string(),
+                organization_identifier_hash: organization.to_string(),
+            },
+            quality: ClaudeSnapshotQuality {
+                tier: 4,
+                provider_observed_at: "2026-08-23T00:00:00Z".to_string(),
+            },
+            snapshot: base_snapshot(
+                SourceKind::ClaudeCode,
+                AgentStatusState::Available,
+                AgentStatusCollectionMethod::CliJson,
+                "2026-08-23T00:00:00Z".to_string(),
+                "2026-08-23T00:05:00Z".to_string(),
+            ),
+        };
+        let candidates = vec![
+            candidate(
+                "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "organization-a",
+            ),
+            candidate(
+                "claude_slot_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "organization-b",
+            ),
+        ];
+        let selected = select_claude_snapshot_candidates(&candidates);
+        assert_eq!(selected.winning_by_binding.len(), 2);
+        assert_eq!(selected.preferred_anchor_by_binding.len(), 2);
+    }
+
+    #[test]
+    fn fresh_default_meters_do_not_hide_broken_registered_anchor_health() {
+        let binding = ClaudeStrongBinding {
+            account_identifier_hash: "account-a".to_string(),
+            organization_identifier_hash: "organization-a".to_string(),
+        };
+        let slot_id = "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let slot_states = BTreeMap::from([(
+            slot_id.clone(),
+            ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+                account_identifier_hash: Some(binding.account_identifier_hash.clone()),
+                organization_identifier_hash: Some(binding.organization_identifier_hash.clone()),
+                observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let canonical = canonical_registered_anchors([slot_id], &slot_states);
+        let health = canonical_anchor_health(&canonical, &slot_states);
+        assert_eq!(
+            health.get(&binding),
+            Some(&Some(ClaudeAccountAnchorHealthV1::ReconnectRequired))
+        );
+        let mut default_snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            "2026-08-23T00:01:00Z".to_string(),
+            "2026-08-23T00:06:00Z".to_string(),
+        );
+        default_snapshot.account = Some(AgentAccountStatus {
+            account_identifier_hash: Some(binding.account_identifier_hash),
+            organization_identifier_hash: Some(binding.organization_identifier_hash),
+            ..unsupported_account("anthropic")
+        });
+        apply_claude_anchor_continuity(
+            &mut default_snapshot,
+            ClaudeAccountAnchorDurabilityV1::Anchored,
+            *health.values().next().expect("anchor health"),
+        );
+        assert_eq!(
+            default_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_anchor_durability),
+            Some(ClaudeAccountAnchorDurabilityV1::Anchored)
+        );
+        assert_eq!(
+            default_snapshot
+                .account
+                .as_ref()
+                .and_then(|account| account.claude_anchor_health),
+            Some(ClaudeAccountAnchorHealthV1::ReconnectRequired)
+        );
+    }
+
+    #[test]
+    fn claude_anchor_projection_supports_five_accounts_and_default_switching() {
+        let collection = |account: &str, organization: &str| ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some(account.to_string()),
+            organization_identifier_hash: Some(organization.to_string()),
+            observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+            last_full_quota_read_at: Some("2026-08-23T00:00:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            ..Default::default()
+        };
+        let mut managed_slots = (0..5)
+            .map(|index| {
+                let mut slot = test_slot_descriptor(index);
+                slot.ownership = ClaudeConfigSlotOwnership::Managed;
+                slot.collection = collection(
+                    &format!("account-{index}"),
+                    &format!("organization-{index}"),
+                );
+                slot
+            })
+            .collect::<Vec<_>>();
+        managed_slots.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
+        let mut status = ClaudeAccountsStatusV1 {
+            schema_version: 1,
+            consent: ottto_protocol::ClaudeAccountUpkeepConsentState::Granted,
+            setup_operation: ottto_protocol::ClaudeAccountSetupOperationV1 {
+                kind: ottto_protocol::ClaudeAccountSetupOperationKind::ConnectManagedAccount,
+                state: ottto_protocol::ClaudeAccountSetupOperationState::Idle,
+                operation_id: None,
+                slot_id: None,
+                target_id: None,
+                expected_account_identifier_hash: None,
+                expected_organization_identifier_hash: None,
+                account_identifier_hash: None,
+                organization_identifier_hash: None,
+                launch_command: None,
+                message: None,
+            },
+            default_slot: ClaudeConfigDirSlot::Default
+                .descriptor("default", ClaudeConfigSlotOwnership::External),
+            managed_slots,
+            external_slots: Vec::new(),
+            unresolved_accounts: Vec::new(),
+            anchor_coverage: ClaudeAccountAnchorCoverageV1::default(),
+            anchor_transitions: Vec::new(),
+            capacity: ottto_protocol::ClaudeAccountCapacityV1 {
+                max_slots: 10,
+                used_slots: 6,
+                remaining_slots: 4,
+            },
+        };
+
+        for switched_to in [0, 1, 4, 2, 0] {
+            status.default_slot.collection = collection(
+                &format!("account-{switched_to}"),
+                &format!("organization-{switched_to}"),
+            );
+            let coverage = derive_claude_account_anchor_coverage(&status);
+            assert_eq!(coverage.observed_accounts, 5);
+            assert_eq!(coverage.anchored_accounts, 5);
+            assert_eq!(coverage.default_only_accounts, 0);
+            assert_eq!(coverage.unresolved_accounts, 0);
+            assert_eq!(coverage.capacity_blocked_accounts, 0);
+            assert!(coverage
+                .accounts
+                .iter()
+                .all(|account| account.durability == ClaudeAccountAnchorDurabilityV1::Anchored));
+        }
+
+        status.default_slot.collection = collection("account-5", "organization-5");
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        assert_eq!(coverage.observed_accounts, 6);
+        assert_eq!(coverage.anchored_accounts, 5);
+        assert_eq!(coverage.default_only_accounts, 1);
+        assert_eq!(
+            coverage
+                .accounts
+                .iter()
+                .find(|account| account.account_identifier_hash == "account-5")
+                .map(|account| account.durability),
+            Some(ClaudeAccountAnchorDurabilityV1::DefaultOnly)
+        );
+
+        status.capacity.remaining_slots = 0;
+        let coverage = derive_claude_account_anchor_coverage(&status);
+        assert_eq!(coverage.default_only_accounts, 1);
+        assert_eq!(coverage.capacity_blocked_accounts, 1);
+    }
+
+    #[test]
+    fn claude_anchor_transition_ledger_is_bounded_and_secret_free() {
+        let previous = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some("account-secret-a".to_string()),
+            organization_identifier_hash: Some("organization-secret-a".to_string()),
+            observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let current = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some("account-secret-b".to_string()),
+            organization_identifier_hash: Some("organization-secret-b".to_string()),
+            relationship: Some(ottto_protocol::ClaudeConfigSlotRelationshipV1::ShadowedByAnchor),
+            observed_at: Some("2026-08-23T00:01:00Z".to_string()),
+            ..Default::default()
+        };
+        let mut transitions = Vec::new();
+        record_claude_anchor_transitions(&mut transitions, "default", Some(&previous), &current);
+        assert!(transitions.iter().any(|transition| {
+            transition.kind
+                == ottto_protocol::ClaudeAccountAnchorTransitionKindV1::DefaultIdentityChanged
+        }));
+        assert!(transitions.iter().any(|transition| {
+            transition.kind
+                == ottto_protocol::ClaudeAccountAnchorTransitionKindV1::DefaultShadowObserved
+        }));
+        let wire = serde_json::to_string(&transitions).expect("serialize transitions");
+        for forbidden in [
+            "account-secret",
+            "organization-secret",
+            "config_dir",
+            "access_token",
+            "refresh_token",
+        ] {
+            assert!(!wire.contains(forbidden), "ledger leaked {forbidden}");
+        }
+
+        let bound = ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some("same-account".to_string()),
+            organization_identifier_hash: Some("same-organization".to_string()),
+            ..Default::default()
+        };
+        for second in 0..80 {
+            let mut observed = bound.clone();
+            observed.observed_at = Some(format!("2026-08-23T00:{:02}:00Z", second % 60));
+            record_claude_anchor_transitions(
+                &mut transitions,
+                "claude_slot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Some(&bound),
+                &observed,
+            );
+        }
+        assert_eq!(transitions.len(), 64);
     }
 
     #[test]
@@ -14910,9 +16172,15 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             ("claude_slot_b".to_string(), reconnect),
             ("claude_slot_c".to_string(), unbound),
         ]);
+        let binding = ClaudeStrongBinding {
+            account_identifier_hash: "account-hash".to_string(),
+            organization_identifier_hash: "organization-hash".to_string(),
+        };
+        let anchors = BTreeMap::from([(binding.clone(), "claude_slot_b".to_string())]);
 
         let snapshots = degraded_claude_slot_snapshots(
             &slots,
+            &anchors,
             &BTreeSet::new(),
             "2026-08-12T10:00:00Z",
             "2026-08-12T10:05:00Z",
@@ -14938,7 +16206,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
 
         let suppressed = degraded_claude_slot_snapshots(
             &slots,
-            &BTreeSet::from(["account-hash".to_string()]),
+            &anchors,
+            &BTreeSet::from([binding]),
             "2026-08-12T10:00:00Z",
             "2026-08-12T10:05:00Z",
         );
@@ -14946,6 +16215,33 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             suppressed.is_empty(),
             "a healthy winner for the account must suppress its failed duplicate slot"
         );
+    }
+
+    #[test]
+    fn degraded_default_only_witness_is_never_reported_as_anchored() {
+        let slots = BTreeMap::from([(
+            "default".to_string(),
+            ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::ProviderUnavailable,
+                account_identifier_hash: Some("account-hash".to_string()),
+                organization_identifier_hash: Some("organization-hash".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let snapshots = degraded_claude_slot_snapshots(
+            &slots,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            "2026-08-12T10:00:00Z",
+            "2026-08-12T10:05:00Z",
+        );
+        let account = snapshots[0].account.as_ref().expect("default account");
+        assert_eq!(
+            account.claude_anchor_durability,
+            Some(ClaudeAccountAnchorDurabilityV1::DefaultOnly)
+        );
+        assert_eq!(account.claude_anchor_health, None);
     }
 
     #[test]
@@ -15029,6 +16325,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 ),
             ]),
             unresolved_accounts: Vec::new(),
+            anchor_transitions: Vec::new(),
         })
         .expect("seed exact slot binding");
 
@@ -15210,6 +16507,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             credential_fingerprint_hash: None,
             billing_identity_evidence: None,
             claude_quota_access_state: None,
+            claude_anchor_durability: None,
+            claude_anchor_health: None,
             billing_identity_confidence: AgentStatusConfidence::High,
             confidence: AgentStatusConfidence::High,
         });
@@ -15309,6 +16608,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 },
             )]),
             unresolved_accounts: Vec::new(),
+            anchor_transitions: Vec::new(),
         })
         .expect("seed slot state");
 
@@ -15365,6 +16665,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
                 observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                 evidence: vec![ClaudeUnresolvedAccountEvidenceKind::DesktopSession],
             }],
+            anchor_transitions: Vec::new(),
         })
         .expect("seed unresolved state");
         persist_one_claude_slot_collection_state(
@@ -15372,6 +16673,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             &ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::Fresh,
                 account_identifier_hash: Some("account-full".to_string()),
+                organization_identifier_hash: Some("organization-full".to_string()),
                 observed_at: Some("2026-08-04T10:01:00Z".to_string()),
                 last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
                 has_account_windows: true,
@@ -15426,6 +16728,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             schema_version: CLAUDE_CONFIG_SLOT_COLLECTION_STATE_SCHEMA_VERSION,
             slots: BTreeMap::new(),
             unresolved_accounts: vec![stale_unresolved.clone()],
+            anchor_transitions: Vec::new(),
         })
         .expect("seed unresolved state");
         persist_one_claude_slot_collection_state(
@@ -15433,6 +16736,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
             &ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::Fresh,
                 account_identifier_hash: Some("account-full".to_string()),
+                organization_identifier_hash: Some("organization-full".to_string()),
                 observed_at: Some("2026-08-04T10:01:00Z".to_string()),
                 last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
                 has_account_windows: true,
@@ -15461,7 +16765,7 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         };
         let mode = std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_MODE").expect("child mode");
         if mode == "contender" {
-            assert!(try_claude_oauth_collection_attempt(&account).is_none());
+            assert!(try_claude_oauth_collection_attempt(&account, "organization-a").is_none());
             return;
         }
         let ready =
@@ -15469,7 +16773,8 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let release = PathBuf::from(
             std::env::var("OTTTO_TEST_CLAUDE_ATTEMPT_RELEASE").expect("release path"),
         );
-        let guard = try_claude_oauth_collection_attempt(&account).expect("holder lock");
+        let guard =
+            try_claude_oauth_collection_attempt(&account, "organization-a").expect("holder lock");
         fs::write(&ready, b"ready").expect("signal ready");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !release.exists() && Instant::now() < deadline {
@@ -15541,14 +16846,18 @@ amazon-bedrock  global.anthropic.claude-sonnet-4-6     1M       64K      yes    
         let (release_tx, release_rx) = mpsc::channel();
         let scheduled_calls = Arc::clone(&provider_calls);
         let scheduled = thread::spawn(move || {
-            let _guard = try_claude_oauth_collection_attempt("same-strong-account")
-                .expect("scheduled collector admission");
+            let _guard = try_claude_oauth_collection_attempt(
+                "same-strong-account",
+                "same-strong-organization",
+            )
+            .expect("scheduled collector admission");
             scheduled_calls.fetch_add(1, Ordering::SeqCst);
             entered_tx.send(()).expect("entered");
             release_rx.recv().expect("release");
         });
         entered_rx.recv().expect("scheduled admitted");
-        let exact_check_admission = try_claude_oauth_collection_attempt("same-strong-account");
+        let exact_check_admission =
+            try_claude_oauth_collection_attempt("same-strong-account", "same-strong-organization");
         if exact_check_admission.is_some() {
             provider_calls.fetch_add(1, Ordering::SeqCst);
         }
