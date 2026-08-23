@@ -674,10 +674,22 @@ fn handle_command(
             expected_account_identifier_hash,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            to_value(prepare_claude_account(
+            to_value(prepare_claude_account_legacy(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
+            )?)
+        }
+        LocalControlCommand::ClaudeAccountPrepareTarget {
+            schema_version,
+            operation_id,
+            target_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(prepare_claude_account_target(
+                schema_version,
+                operation_id,
+                target_id,
             )?)
         }
         LocalControlCommand::ClaudeAccountReconnect {
@@ -691,7 +703,23 @@ fn handle_command(
                 schema_version,
                 operation_id,
                 &slot_id,
+                None,
                 expected_account_identifier_hash,
+                None,
+            )?)
+        }
+        LocalControlCommand::ClaudeAccountReconnectTarget {
+            schema_version,
+            operation_id,
+            slot_id,
+            target_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(reconnect_claude_account_target(
+                schema_version,
+                operation_id,
+                &slot_id,
+                target_id,
             )?)
         }
         LocalControlCommand::ClaudeAccountCheck {
@@ -949,6 +977,13 @@ fn load_claude_config_slot_settings(
         .map(crate::agent_status::annotate_claude_accounts_status)
 }
 
+fn complete_claude_registry_mutation(
+    status: ottto_protocol::ClaudeAccountsStatusV1,
+) -> ottto_protocol::ClaudeAccountsStatusV1 {
+    crate::snapshot_sync::spawn_claude_agent_status_refresh("registry_mutation");
+    crate::agent_status::annotate_claude_accounts_status(status)
+}
+
 fn set_claude_account_upkeep_consent(
     schema_version: u16,
     consent: bool,
@@ -956,7 +991,7 @@ fn set_claude_account_upkeep_consent(
     FileClaudeConfigSlotSettingsStore::default()
         .set_upkeep_consent(schema_version, consent)
         .map_err(claude_config_slot_settings_error)
-        .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(complete_claude_registry_mutation)
 }
 
 fn remove_claude_account(
@@ -972,7 +1007,7 @@ fn remove_claude_account(
     // failure that cannot be retried honestly.
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
-    Ok(crate::agent_status::annotate_claude_accounts_status(status))
+    Ok(complete_claude_registry_mutation(status))
 }
 
 fn register_claude_account_path(
@@ -982,29 +1017,151 @@ fn register_claude_account_path(
     FileClaudeConfigSlotSettingsStore::default()
         .register_path(schema_version, config_dir)
         .map_err(claude_config_slot_settings_error)
-        .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(complete_claude_registry_mutation)
 }
 
 fn prepare_claude_account(
     schema_version: u16,
     operation_id: String,
+    target_id: Option<String>,
     expected_account_identifier_hash: Option<String>,
+    expected_organization_identifier_hash: Option<String>,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
-    FileClaudeConfigSlotSettingsStore::default()
-        .prepare_managed_account(
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    store
+        .prepare_managed_account_target(
             schema_version,
             operation_id,
+            target_id,
             expected_account_identifier_hash,
+            expected_organization_identifier_hash,
         )
         .map_err(claude_config_slot_settings_error)
-        .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(complete_claude_registry_mutation)
+}
+
+fn prepare_claude_account_legacy(
+    schema_version: u16,
+    operation_id: String,
+    expected_account_identifier_hash: Option<String>,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    if store
+        .setup_operation_if_exists(&operation_id)
+        .map_err(claude_config_slot_settings_error)?
+        .is_some()
+    {
+        return store
+            .replay_legacy_managed_account_setup(
+                schema_version,
+                &operation_id,
+                expected_account_identifier_hash.as_deref(),
+            )
+            .map_err(claude_config_slot_settings_error)
+            .map(complete_claude_registry_mutation);
+    }
+
+    let expected_organization_identifier_hash = expected_account_identifier_hash
+        .as_deref()
+        .map(|account_hash| {
+            let current = crate::agent_status::annotate_claude_accounts_status(
+                store.load().map_err(claude_config_slot_settings_error)?,
+            );
+            let organizations = current
+                .anchor_coverage
+                .accounts
+                .iter()
+                .filter(|account| account.account_identifier_hash == account_hash)
+                .filter_map(|account| account.organization_identifier_hash.clone())
+                .collect::<BTreeSet<_>>();
+            if organizations.len() != 1 {
+                return Err(LocalApiError::InvalidRequest(
+                    "legacy Claude setup requires exactly one strong organization binding for the expected account"
+                        .to_string(),
+                ));
+            }
+            Ok(organizations
+                .into_iter()
+                .next()
+                .expect("one organization was required"))
+        })
+        .transpose()?;
+
+    prepare_claude_account(
+        schema_version,
+        operation_id,
+        None,
+        expected_account_identifier_hash,
+        expected_organization_identifier_hash,
+    )
+}
+
+fn prepare_claude_account_target(
+    schema_version: u16,
+    operation_id: String,
+    target_id: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    if let Some(existing) = store
+        .setup_operation_if_exists(&operation_id)
+        .map_err(claude_config_slot_settings_error)?
+    {
+        if existing.setup_operation.target_id.as_deref() != Some(target_id.as_str()) {
+            return Err(LocalApiError::InvalidRequest(
+                "setup operation target does not match its original binding".to_string(),
+            ));
+        }
+        return prepare_claude_account(
+            schema_version,
+            operation_id,
+            Some(target_id),
+            existing.setup_operation.expected_account_identifier_hash,
+            existing
+                .setup_operation
+                .expected_organization_identifier_hash,
+        );
+    }
+    let current = crate::agent_status::annotate_claude_accounts_status(
+        store.load().map_err(claude_config_slot_settings_error)?,
+    );
+    let target = current
+        .anchor_coverage
+        .accounts
+        .iter()
+        .find(|account| account.target_id.as_deref() == Some(target_id.as_str()))
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Claude account is not a current daemon-selected setup target".to_string(),
+            )
+        })?;
+    if target.durability == ottto_protocol::ClaudeAccountAnchorDurabilityV1::Anchored
+        || !target.setup_blockers.is_empty()
+    {
+        return Err(LocalApiError::InvalidRequest(
+            "Claude anchor target is not currently eligible for managed setup".to_string(),
+        ));
+    }
+    let organization_hash = target.organization_identifier_hash.clone().ok_or_else(|| {
+        LocalApiError::InvalidRequest(
+            "Claude anchor target does not have an unambiguous organization binding".to_string(),
+        )
+    })?;
+    prepare_claude_account(
+        schema_version,
+        operation_id,
+        Some(target_id),
+        Some(target.account_identifier_hash.clone()),
+        Some(organization_hash),
+    )
 }
 
 fn reconnect_claude_account(
     schema_version: u16,
     operation_id: String,
     slot_id: &str,
+    target_id: Option<String>,
     expected_account_identifier_hash: String,
+    expected_organization_identifier_hash: Option<String>,
 ) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
     let store = FileClaudeConfigSlotSettingsStore::default();
     let current = crate::agent_status::annotate_claude_accounts_status(
@@ -1027,15 +1184,93 @@ fn reconnect_claude_account(
             "reconnect account binding does not match the slot's last strong identity".to_string(),
         ));
     }
+    let organization_hash = descriptor
+        .collection
+        .organization_identifier_hash
+        .clone()
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "reconnect requires the slot's last strong organization binding".to_string(),
+            )
+        })?;
+    if expected_organization_identifier_hash
+        .as_deref()
+        .is_some_and(|expected| expected != organization_hash)
+    {
+        return Err(LocalApiError::InvalidRequest(
+            "reconnect organization binding does not match the slot's last strong identity"
+                .to_string(),
+        ));
+    }
     store
-        .begin_registered_slot_reconnect(
+        .begin_registered_slot_reconnect_target(
             schema_version,
             operation_id,
             slot_id,
+            target_id,
             expected_account_identifier_hash,
+            Some(organization_hash),
         )
         .map_err(claude_config_slot_settings_error)
-        .map(crate::agent_status::annotate_claude_accounts_status)
+        .map(complete_claude_registry_mutation)
+}
+
+fn reconnect_claude_account_target(
+    schema_version: u16,
+    operation_id: String,
+    slot_id: &str,
+    target_id: String,
+) -> Result<ottto_protocol::ClaudeAccountsStatusV1, LocalApiError> {
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    if let Some(existing) = store
+        .setup_operation_if_exists(&operation_id)
+        .map_err(claude_config_slot_settings_error)?
+    {
+        if existing.setup_operation.target_id.as_deref() != Some(target_id.as_str()) {
+            return Err(LocalApiError::InvalidRequest(
+                "reconnect operation target does not match its original binding".to_string(),
+            ));
+        }
+        return reconnect_claude_account(
+            schema_version,
+            operation_id,
+            slot_id,
+            Some(target_id),
+            existing
+                .setup_operation
+                .expected_account_identifier_hash
+                .ok_or_else(|| {
+                    LocalApiError::InvalidRequest("reconnect lost account binding".to_string())
+                })?,
+            existing
+                .setup_operation
+                .expected_organization_identifier_hash,
+        );
+    }
+    let current = crate::agent_status::annotate_claude_accounts_status(
+        store.load().map_err(claude_config_slot_settings_error)?,
+    );
+    let target = current
+        .anchor_coverage
+        .accounts
+        .iter()
+        .find(|account| account.target_id.as_deref() == Some(target_id.as_str()))
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest("unknown Claude anchor reconnect target".to_string())
+        })?;
+    if target.durability != ottto_protocol::ClaudeAccountAnchorDurabilityV1::Anchored {
+        return Err(LocalApiError::InvalidRequest(
+            "Claude reconnect target is not a registered anchor".to_string(),
+        ));
+    }
+    reconnect_claude_account(
+        schema_version,
+        operation_id,
+        slot_id,
+        Some(target_id),
+        target.account_identifier_hash.clone(),
+        target.organization_identifier_hash.clone(),
+    )
 }
 
 fn check_claude_account(
@@ -1141,14 +1376,21 @@ where
     };
     let historical_state = current.setup_operation.state.clone();
     let historical_account_hash = current.setup_operation.account_identifier_hash.clone();
+    let expected_organization_hash = current
+        .setup_operation
+        .expected_organization_identifier_hash
+        .clone();
+    let historical_organization_hash = current.setup_operation.organization_identifier_hash.clone();
     before_validating();
     let validating = store
-        .transition_setup_operation(
+        .transition_setup_operation_with_binding(
             schema_version,
             operation_id,
             expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
             ClaudeAccountSetupOperationState::Validating,
             historical_account_hash.as_deref(),
+            historical_organization_hash.as_deref(),
             Some("Checking the exact registered Claude Code login."),
         )
         .map_err(claude_config_slot_settings_error)?;
@@ -1173,23 +1415,31 @@ where
         .setup_operation(operation_id)
         .map_err(claude_config_slot_settings_error)?;
     let observed_account_hash = direct_slot_status.account_identifier_hash.as_deref();
+    let observed_organization_hash = direct_slot_status.organization_identifier_hash.as_deref();
     let bound_account_hash = refreshed
         .setup_operation
         .expected_account_identifier_hash
         .as_deref()
         .or(expected_account_identifier_hash);
+    let bound_organization_hash = refreshed
+        .setup_operation
+        .expected_organization_identifier_hash
+        .as_deref();
     if matches!(
         direct_slot_status.state,
         ClaudeConfigSlotCollectionStateV1::IdentityMismatch
             | ClaudeConfigSlotCollectionStateV1::ConcurrentMutation
     ) || matches!((bound_account_hash, observed_account_hash), (Some(bound), Some(observed)) if bound != observed)
+        || matches!((bound_organization_hash, observed_organization_hash), (Some(bound), Some(observed)) if bound != observed)
     {
         return store
-            .transition_setup_operation(
+            .transition_setup_operation_with_binding(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
+                expected_organization_hash.as_deref(),
                 ClaudeAccountSetupOperationState::IdentityMismatch,
+                None,
                 None,
                 Some("The exact slot did not match the expected Claude account. Complete /login with the intended account, then retry."),
             )
@@ -1202,56 +1452,70 @@ where
         && direct_slot_status.has_account_windows
         && direct_slot_status.has_scoped_limits;
     let result = if full_read {
-        let Some(account_hash) = observed_account_hash else {
+        let (Some(account_hash), Some(organization_hash)) =
+            (observed_account_hash, observed_organization_hash)
+        else {
             return Err(LocalApiError::StatePoisoned);
         };
         store
-            .transition_setup_operation(
+            .transition_setup_operation_with_binding(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
+                expected_organization_hash.as_deref(),
                 ClaudeAccountSetupOperationState::Reading,
                 Some(account_hash),
+                Some(organization_hash),
                 Some("Identity matched. Reading full Claude quota for this exact account."),
             )
             .map_err(claude_config_slot_settings_error)?;
-        store.transition_setup_operation(
+        store.transition_setup_operation_with_binding(
             schema_version,
             operation_id,
             expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
             ClaudeAccountSetupOperationState::Complete,
             Some(account_hash),
+            Some(organization_hash),
             Some("Claude account identity and full quota read are complete."),
         )
-    } else if let Some(account_hash) = observed_account_hash {
+    } else if let (Some(account_hash), Some(organization_hash)) =
+        (observed_account_hash, observed_organization_hash)
+    {
         if historical_state == ClaudeAccountSetupOperationState::Complete {
-            store.transition_setup_operation(
+            store.transition_setup_operation_with_binding(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
+                expected_organization_hash.as_deref(),
                 ClaudeAccountSetupOperationState::Complete,
                 Some(account_hash),
+                Some(organization_hash),
                 Some(
                     "Claude account remains identity-validated; the last full reading is retained.",
                 ),
             )
         } else {
-            store.transition_setup_operation(
+            store.transition_setup_operation_with_binding(
                 schema_version,
                 operation_id,
                 expected_account_identifier_hash,
+                expected_organization_hash.as_deref(),
                 ClaudeAccountSetupOperationState::Reading,
                 Some(account_hash),
+                Some(organization_hash),
                 Some("Identity is validated; the full quota read has not completed yet."),
             )
         }
     } else if historical_state == ClaudeAccountSetupOperationState::Complete {
-        store.transition_setup_operation(
+        store.transition_setup_operation_with_binding(
             schema_version,
             operation_id,
             expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
             ClaudeAccountSetupOperationState::Complete,
             historical_account_hash.as_deref(),
+            historical_organization_hash.as_deref(),
             Some("This setup remains complete, but current exact-slot identity or quota evidence is temporarily unavailable."),
         )
     } else if matches!(
@@ -1260,20 +1524,24 @@ where
             | ClaudeConfigSlotCollectionStateV1::IdentityUnknown
             | ClaudeConfigSlotCollectionStateV1::Unverified
     ) {
-        store.transition_setup_operation(
+        store.transition_setup_operation_with_binding(
             schema_version,
             operation_id,
             expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
             ClaudeAccountSetupOperationState::WaitingForUserLogin,
+            None,
             None,
             Some("Waiting for the customer to complete official Claude Code /login."),
         )
     } else {
-        store.transition_setup_operation(
+        store.transition_setup_operation_with_binding(
             schema_version,
             operation_id,
             expected_account_identifier_hash,
+            expected_organization_hash.as_deref(),
             ClaudeAccountSetupOperationState::SetupFailed,
+            None,
             None,
             Some("Claude account validation could not complete from safe local evidence."),
         )
@@ -15802,16 +16070,22 @@ mod tests {
             &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::NeedsLogin,
                 account_identifier_hash: Some(account_hash.clone()),
-                organization_identifier_hash: Some(organization_hash),
+                organization_identifier_hash: Some(organization_hash.clone()),
                 observed_at: Some("2026-08-05T00:00:00Z".to_string()),
                 ..Default::default()
             },
         )
         .expect("persist last strong identity");
         let operation_id = "claude_setup_99999999999999999999999999999999";
-        let begun =
-            reconnect_claude_account(1, operation_id.to_string(), &slot_id, account_hash.clone())
-                .expect("begin reconnect");
+        let begun = reconnect_claude_account(
+            1,
+            operation_id.to_string(),
+            &slot_id,
+            None,
+            account_hash.clone(),
+            None,
+        )
+        .expect("begin reconnect");
         assert_eq!(
             begun.setup_operation.kind,
             ottto_protocol::ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
@@ -15837,7 +16111,9 @@ mod tests {
                 1,
                 "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 &slot_id,
+                None,
                 "c".repeat(64),
+                None,
             ),
             Err(LocalApiError::InvalidRequest(_))
         ));
@@ -15850,7 +16126,7 @@ mod tests {
                 assert_eq!(observed_slot_id, slot_id);
                 ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                    account_identifier_hash: Some("d".repeat(64)),
+                    account_identifier_hash: Some(account_hash.clone()),
                     organization_identifier_hash: Some("e".repeat(64)),
                     observed_at: Some("2026-08-05T00:01:00Z".to_string()),
                     last_full_quota_read_at: Some("2026-08-05T00:01:00Z".to_string()),
@@ -15878,11 +16154,100 @@ mod tests {
 
     #[test]
     #[serial]
+    fn legacy_prepare_requires_one_unambiguous_organization_for_expected_account() {
+        let root = control_test_root("claude-legacy-prepare-composite");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let store = FileClaudeConfigSlotSettingsStore::default();
+        let account_hash = "a".repeat(64);
+        let organization_a = "b".repeat(64);
+        let organization_b = "c".repeat(64);
+        let first = store
+            .register_path(1, root.join("first").display().to_string())
+            .expect("register first legacy witness");
+        let first_slot = first.external_slots[0].slot_id.clone();
+        let second = store
+            .register_path(1, root.join("second").display().to_string())
+            .expect("register second legacy witness");
+        let second_slot = second
+            .external_slots
+            .iter()
+            .find(|slot| slot.slot_id != first_slot)
+            .expect("second slot")
+            .slot_id
+            .clone();
+        for (slot_id, organization_hash) in [
+            (&first_slot, &organization_a),
+            (&second_slot, &organization_b),
+        ] {
+            crate::agent_status::persist_one_claude_slot_collection_state(
+                slot_id,
+                &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ClaudeConfigSlotCollectionStateV1::NeedsLogin,
+                    account_identifier_hash: Some(account_hash.clone()),
+                    organization_identifier_hash: Some(organization_hash.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect("persist composite legacy witness");
+        }
+
+        assert!(matches!(
+            prepare_claude_account_legacy(
+                1,
+                "claude_setup_11111111111111111111111111111111".to_string(),
+                Some(account_hash.clone()),
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            prepare_claude_account_legacy(
+                1,
+                "claude_setup_22222222222222222222222222222222".to_string(),
+                Some("d".repeat(64)),
+            ),
+            Err(LocalApiError::InvalidRequest(_))
+        ));
+
+        store.remove(1, &second_slot).expect("remove ambiguity");
+        crate::agent_status::prune_claude_slot_collection_state(&second_slot)
+            .expect("prune removed witness");
+        let prepared = prepare_claude_account_legacy(
+            1,
+            "claude_setup_33333333333333333333333333333333".to_string(),
+            Some(account_hash.clone()),
+        )
+        .expect("unique legacy binding prepares");
+        assert_eq!(
+            prepared.setup_operation.expected_account_identifier_hash,
+            Some(account_hash.clone())
+        );
+        assert_eq!(
+            prepared
+                .setup_operation
+                .expected_organization_identifier_hash,
+            Some(organization_a)
+        );
+        let replayed = prepare_claude_account_legacy(
+            1,
+            "claude_setup_33333333333333333333333333333333".to_string(),
+            Some(account_hash),
+        )
+        .expect("legacy replay remains idempotent");
+        assert_eq!(
+            replayed.setup_operation.slot_id,
+            prepared.setup_operation.slot_id
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
     fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fanout() {
         let root = control_test_root("claude-account-check-orchestration");
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let account_a = "a".repeat(64);
         let account_b = "b".repeat(64);
+        let organization_a = "f".repeat(64);
         let operation_a = "claude_setup_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let store = FileClaudeConfigSlotSettingsStore::default();
         store
@@ -15894,6 +16259,7 @@ mod tests {
                 ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: ClaudeConfigSlotCollectionStateV1::Fresh,
                     account_identifier_hash: Some(account_a.clone()),
+                    organization_identifier_hash: Some(organization_a.clone()),
                     observed_at: Some("2026-08-04T10:00:00Z".to_string()),
                     last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
                     has_account_windows: true,
@@ -15932,6 +16298,7 @@ mod tests {
                 ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: ClaudeConfigSlotCollectionStateV1::Fresh,
                     account_identifier_hash: Some(account_b),
+                    organization_identifier_hash: Some(organization_a.clone()),
                     observed_at: Some("2026-08-04T10:01:00Z".to_string()),
                     last_full_quota_read_at: Some("2026-08-04T10:01:00Z".to_string()),
                     has_account_windows: true,
@@ -15947,6 +16314,7 @@ mod tests {
 
         let operation_partial = "claude_setup_cccccccccccccccccccccccccccccccc";
         let account_c = "c".repeat(64);
+        let organization_c = "d".repeat(64);
         store
             .prepare_managed_account(1, operation_partial.to_string(), Some(account_c.clone()))
             .expect("prepare partial account");
@@ -15957,6 +16325,7 @@ mod tests {
             |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::Fresh,
                 account_identifier_hash: Some(account_c.clone()),
+                organization_identifier_hash: Some(organization_c.clone()),
                 observed_at: Some("2026-08-04T10:02:00Z".to_string()),
                 has_account_windows: true,
                 has_scoped_limits: false,
@@ -15976,6 +16345,7 @@ mod tests {
             |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                 state: ClaudeConfigSlotCollectionStateV1::CollectionPaused,
                 account_identifier_hash: Some(account_c.clone()),
+                organization_identifier_hash: Some(organization_c.clone()),
                 observed_at: Some("2026-08-04T10:03:00Z".to_string()),
                 ..Default::default()
             },
@@ -15985,6 +16355,9 @@ mod tests {
             paused.setup_operation.state,
             ClaudeAccountSetupOperationState::Reading
         );
+        store
+            .stop_waiting(1, operation_partial)
+            .expect("stop partial operation before next setup");
 
         let cases = [
             (
@@ -16035,6 +16408,7 @@ mod tests {
                 |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: collection_state.clone(),
                     account_identifier_hash: account_hash.clone(),
+                    organization_identifier_hash: account_hash.as_ref().map(|_| "9".repeat(64)),
                     observed_at: Some("2026-08-04T10:04:00Z".to_string()),
                     ..Default::default()
                 },
@@ -16048,7 +16422,86 @@ mod tests {
                 .find(|slot| slot.slot_id == slot_id)
                 .expect("managed slot");
             assert_eq!(slot.collection.state, collection_state);
+            if matches!(
+                result.setup_operation.state,
+                ClaudeAccountSetupOperationState::WaitingForUserLogin
+                    | ClaudeAccountSetupOperationState::Reading
+            ) {
+                store
+                    .stop_waiting(1, operation_id)
+                    .expect("stop matrix operation before next setup");
+            }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial]
+    fn target_prepare_anchors_default_only_binding_and_replays_after_it_is_anchored() {
+        let root = control_test_root("claude-target-prepare-default-only");
+        let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let account_hash = "a".repeat(64);
+        let organization_hash = "b".repeat(64);
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            "default",
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some(account_hash.clone()),
+                organization_identifier_hash: Some(organization_hash.clone()),
+                observed_at: Some("2026-08-23T00:00:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("persist default-only binding");
+        let discovered = load_claude_config_slot_settings().expect("discover target");
+        let target = discovered
+            .anchor_coverage
+            .accounts
+            .iter()
+            .find(|account| {
+                account.durability == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
+            })
+            .and_then(|account| account.target_id.clone())
+            .expect("daemon-authored target");
+        let operation_id = "claude_setup_12121212121212121212121212121212";
+        let prepared = prepare_claude_account_target(1, operation_id.to_string(), target.clone())
+            .expect("prepare exact default-only target");
+        assert_eq!(
+            prepared.setup_operation.expected_account_identifier_hash,
+            Some(account_hash.clone())
+        );
+        assert_eq!(
+            prepared
+                .setup_operation
+                .expected_organization_identifier_hash,
+            Some(organization_hash.clone())
+        );
+        let slot_id = prepared
+            .setup_operation
+            .slot_id
+            .clone()
+            .expect("managed slot");
+        crate::agent_status::persist_one_claude_slot_collection_state(
+            &slot_id,
+            &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some(account_hash),
+                organization_identifier_hash: Some(organization_hash),
+                observed_at: Some("2026-08-23T00:01:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: true,
+                ..Default::default()
+            },
+        )
+        .expect("persist new anchor");
+        let replay = prepare_claude_account_target(1, operation_id.to_string(), target)
+            .expect("replay remains idempotent after target becomes anchored");
+        assert_eq!(
+            replay.setup_operation.slot_id.as_deref(),
+            Some(slot_id.as_str())
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -16060,6 +16513,7 @@ mod tests {
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let operation_id = "claude_setup_77777777777777777777777777777777";
         let account_hash = "7".repeat(64);
+        let organization_hash = "6".repeat(64);
         let store = FileClaudeConfigSlotSettingsStore::default();
         store
             .prepare_managed_account(1, operation_id.to_string(), Some(account_hash.clone()))
@@ -16068,6 +16522,7 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first_hash = account_hash.clone();
+        let first_organization_hash = organization_hash.clone();
         let first_probes = Arc::clone(&probes);
         let first = thread::spawn(move || {
             check_claude_account_with_collector(1, operation_id, Some(&first_hash), |_, _, _| {
@@ -16077,6 +16532,7 @@ mod tests {
                 ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
                     state: ClaudeConfigSlotCollectionStateV1::Fresh,
                     account_identifier_hash: Some(first_hash.clone()),
+                    organization_identifier_hash: Some(first_organization_hash.clone()),
                     observed_at: Some("2026-08-04T11:00:00Z".to_string()),
                     last_full_quota_read_at: Some("2026-08-04T11:00:00Z".to_string()),
                     has_account_windows: true,

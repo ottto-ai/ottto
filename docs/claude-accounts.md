@@ -69,17 +69,31 @@ honestly does not know its limits.
   whichever account happens to be signed in.
 
 When several Claude Code slots are registered, one collection pass uses one
-capture time and produces at most one row per distinct strong account hash.
-The default slot is considered first, then custom slots in stable opaque-id
-order. One failed slot does not stop healthy siblings. If a registered slot
+capture time and produces one row per distinct strong **account + organization**
+binding. The same account identifier under two organizations remains two quota
+subscriptions with independent caches, cadence, retries, and circuit breakers.
+One failed slot does not stop healthy siblings. If a registered slot
 temporarily fails after Ottto has already proved both its account and
-organization, the daemon sends a meterless, degraded witness for that same
-strong identity. Its typed quota-access state says whether collection is full,
+organization, the daemon sends a degraded witness for that same strong
+identity. When the last exact coherent bundle is still inside the 24-hour local
+retention bound, that witness may carry those meters explicitly marked stale;
+otherwise it is meterless. Its typed quota-access state says whether collection is full,
 partial, temporarily unavailable, paused, needs reconnection, or needs local
 attention. This lets a dashboard distinguish "already configured and retrying"
 from "not configured" without receiving a config path, slot id, credential
 deadline, token, or local diagnostic payload. A healthy reading for the same
-account always wins over a failed duplicate slot.
+binding always wins over a failed duplicate slot.
+
+Meter authority and anchor durability are separate. The best coherent meter
+bundle wins in this order: fresh complete, fresh partial, stale complete, stale
+partial; newer provider observation wins inside a tier. A registered anchor
+wins only an exact quality-and-time tie. Therefore a freshly switched default
+slot may temporarily supply the displayed meters while the registered slot
+remains the durable anchor and still reports its own reconnect or paused health.
+The default slot is then locally marked `shadowed_by_anchor`; its truthful
+collection state is not rewritten. A second registered directory for the same
+binding remains an actionable duplicate instead of being silently treated as
+another account.
 
 The `claude_quota_access_state_v1` capability marks daemon versions that know
 this contract. On an older daemon, or for a desktop/status-line observation
@@ -91,7 +105,7 @@ stale freshness; it is never borrowed or relabeled under another organization.
 When a same-slot read temporarily fails, authenticated machine-local status may
 retain that slot's last full values only if both its strong account and
 organization hashes still match; the retained values and every meter are marked
-stale. The backend witness remains meterless. Identity mismatch, another
+stale. Identity mismatch, another
 organization, or another slot never inherits the retained values.
 
 A fresh default-slot status-line observation is lower fidelity, not a failure:
@@ -132,6 +146,25 @@ and daemon restart retain the same operation/slot binding. After completion,
 another reconnect may start for the same slot; prior operation ids remain
 retired in bounded fail-closed state and can never be rebound.
 
+Ottto does not assign special “Team” or “Personal” directories. Every distinct
+account-and-organization binding can receive its own daemon-managed anchor,
+whether a Mac has two personal accounts, several organizations, or a mixture.
+The daemon presents an opaque setup target, atomically binds the operation to
+that exact composite identity, and allows only one setup or reconnect operation
+to be active at a time. The customer performs official `/login` once in each
+returned directory. After that, changing or repeatedly replacing the default
+Claude Code login does not replace those anchors. Up to nine custom anchors can
+coexist with the default slot (ten slots total).
+
+Account-only evidence is not enough to merge two organizations. It attaches to
+an existing binding only when exactly one organization is possible; otherwise
+it remains an explicit ambiguous-identity setup blocker. Capacity is a separate
+blocker, so the UI can explain both truths at once. Authenticated local status
+also includes a bounded, secret-free transition history using opaque slot ids
+and typed events such as default identity changed, anchor remained bound,
+refresh deadline advanced, or official reconnect completed. It contains no
+account hashes, paths, tokens, or token fingerprints.
+
 When the machine off-switch is enabled, exact-slot usage collection reports
 `collection_paused`, makes no provider request, and retains registrations,
 consent, and account-scoped caches with their original age. Re-enabling resumes
@@ -144,9 +177,15 @@ credential expires without keeping the Companion app open. One explicit
 machine-level consent applies to every registered custom slot and persists until
 revoked. It does not apply to Claude Code's default slot.
 
-At daemon startup, after wake/network restoration, and when normal quota
-collection is already due, Ottto reads only the slot's credential deadlines. It
-does nothing before the exact access expiry. After expiry, and only while the
+At daemon startup, after wake/network restoration, after registry or consent
+changes, and on the daemon's bounded five-minute collection cadence, Ottto
+checks persisted slot deadlines without synchronously reading Keychain. Due
+slots are coalesced into one background queue, so five due anchors cannot turn a
+settings request or snapshot pass into five serial 20-second waits. The worker
+owns the authoritative credential reads and vendor command outside the snapshot
+and settings locks, and schedules a normal collection/upload after each
+successful slot rather than waiting for later siblings. Ottto does nothing
+before the exact access expiry. After expiry, and only while the
 absolute refresh deadline remains valid, the daemon may run the resolved
 installed Claude binary once with argument `doctor` and the exact registered
 `CLAUDE_CONFIG_DIR`. The command receives a cleared minimal environment, closed

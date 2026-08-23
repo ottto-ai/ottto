@@ -9,9 +9,10 @@
 
 use anyhow::Result;
 use ottto_protocol::{
-    ClaudeAccountCapacityV1, ClaudeAccountSetupOperationKind, ClaudeAccountSetupOperationState,
-    ClaudeAccountSetupOperationV1, ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1,
-    ClaudeConfigSlotCollectionStatusV1, ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotOwnership,
+    ClaudeAccountAnchorCoverageV1, ClaudeAccountCapacityV1, ClaudeAccountSetupOperationKind,
+    ClaudeAccountSetupOperationState, ClaudeAccountSetupOperationV1,
+    ClaudeAccountUpkeepConsentState, ClaudeAccountsStatusV1, ClaudeConfigSlotCollectionStatusV1,
+    ClaudeConfigSlotDescriptorV1, ClaudeConfigSlotOwnership,
     CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub const MAX_REGISTERED_CLAUDE_CONFIG_SLOTS: usize = MAX_CLAUDE_ACCOUNT_SLOTS -
 pub const MAX_CLAUDE_CONFIG_DIR_BYTES: usize = 4096;
 const RETIRED_RECONNECT_FILTER_WORDS: usize = 512;
 const RETIRED_RECONNECT_FILTER_HASHES: usize = 8;
+const CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION: u16 = 2;
 
 static CLAUDE_CONFIG_SLOT_SETTINGS_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 static CLAUDE_SETUP_OPERATION_LOCKS: OnceLock<Mutex<BTreeMap<String, &'static Mutex<()>>>> =
@@ -190,13 +192,21 @@ struct PersistedClaudeAccountSetupOperationV1 {
     slot_id: String,
     config_dir: String,
     state: ClaudeAccountSetupOperationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_id: Option<String>,
     /// Immutable prepare-request binding used for idempotent replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requested_expected_account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_expected_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_account_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_organization_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    organization_identifier_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
@@ -204,7 +214,7 @@ struct PersistedClaudeAccountSetupOperationV1 {
 impl Default for PersistedClaudeConfigSlotSettingsV1 {
     fn default() -> Self {
         Self {
-            schema_version: CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+            schema_version: CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION,
             background_upkeep_consent: false,
             registered_slots: Vec::new(),
             setup_operations: Vec::new(),
@@ -291,8 +301,31 @@ impl FileClaudeConfigSlotSettingsStore {
         operation_id: String,
         expected_account_identifier_hash: Option<String>,
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.prepare_managed_account_target(
+            schema_version,
+            operation_id,
+            None,
+            expected_account_identifier_hash,
+            None,
+        )
+    }
+
+    pub fn prepare_managed_account_target(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+        target_id: Option<String>,
+        expected_account_identifier_hash: Option<String>,
+        expected_organization_identifier_hash: Option<String>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         validate_setup_operation_id(&operation_id)?;
         validate_expected_account_hash(expected_account_identifier_hash.as_deref())?;
+        validate_expected_account_hash(expected_organization_identifier_hash.as_deref())?;
+        validate_anchor_target_binding(
+            target_id.as_deref(),
+            expected_account_identifier_hash.as_deref(),
+            expected_organization_identifier_hash.as_deref(),
+        )?;
         let _transaction = self.settings_transaction_lock()?;
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
@@ -313,12 +346,14 @@ impl FileClaudeConfigSlotSettingsStore {
             .find(|operation| operation.operation_id == operation_id)
             .cloned()
         {
-            if existing.requested_expected_account_identifier_hash
-                != expected_account_identifier_hash
+            if existing.target_id != target_id
+                || existing.requested_expected_account_identifier_hash
+                    != expected_account_identifier_hash
+                || existing.requested_expected_organization_identifier_hash
+                    != expected_organization_identifier_hash
             {
                 return Err(ClaudeConfigSlotSettingsError::Invalid(
-                    "setup operation expected account does not match its original binding"
-                        .to_string(),
+                    "setup operation target does not match its original strong binding".to_string(),
                 ));
             }
             if let Some(slot) = persisted
@@ -335,6 +370,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 }
                 ensure_managed_directory(Path::new(&slot.config_dir))?;
                 if existing.state == ClaudeAccountSetupOperationState::SetupStopped {
+                    reject_other_nonterminal_operation(&persisted, &operation_id)?;
                     let operation = persisted
                         .setup_operations
                         .iter_mut()
@@ -359,6 +395,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 ));
             }
             if existing.state == ClaudeAccountSetupOperationState::SetupStopped {
+                reject_other_nonterminal_operation(&persisted, &operation_id)?;
                 let operation = persisted
                     .setup_operations
                     .iter_mut()
@@ -377,6 +414,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 "setup operation id was retired by reconnect and cannot be rebound".to_string(),
             ));
         }
+        reject_other_nonterminal_operation(&persisted, &operation_id)?;
 
         let reserved_slots = persisted.registered_slots.len()
             + persisted
@@ -414,10 +452,15 @@ impl FileClaudeConfigSlotSettingsStore {
                 slot_id,
                 config_dir: config_dir.to_string(),
                 state: ClaudeAccountSetupOperationState::Preparing,
+                target_id,
                 requested_expected_account_identifier_hash: expected_account_identifier_hash
                     .clone(),
+                requested_expected_organization_identifier_hash:
+                    expected_organization_identifier_hash.clone(),
                 expected_account_identifier_hash,
+                expected_organization_identifier_hash,
                 account_identifier_hash: None,
+                organization_identifier_hash: None,
                 message: Some("Preparing a private Claude Code directory.".to_string()),
             });
         validate_persisted(&persisted)?;
@@ -436,9 +479,34 @@ impl FileClaudeConfigSlotSettingsStore {
         slot_id: &str,
         expected_account_identifier_hash: String,
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.begin_registered_slot_reconnect_target(
+            schema_version,
+            operation_id,
+            slot_id,
+            None,
+            expected_account_identifier_hash,
+            None,
+        )
+    }
+
+    pub fn begin_registered_slot_reconnect_target(
+        &self,
+        schema_version: u16,
+        operation_id: String,
+        slot_id: &str,
+        target_id: Option<String>,
+        expected_account_identifier_hash: String,
+        expected_organization_identifier_hash: Option<String>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         validate_setup_operation_id(&operation_id)?;
         validate_opaque_slot_id(slot_id)?;
         validate_expected_account_hash(Some(&expected_account_identifier_hash))?;
+        validate_expected_account_hash(expected_organization_identifier_hash.as_deref())?;
+        validate_anchor_target_binding(
+            target_id.as_deref(),
+            Some(&expected_account_identifier_hash),
+            expected_organization_identifier_hash.as_deref(),
+        )?;
         let _transaction = self.settings_transaction_lock()?;
         validate_schema_version(schema_version)?;
         let mut persisted = self.load_persisted()?;
@@ -460,10 +528,15 @@ impl FileClaudeConfigSlotSettingsStore {
         {
             if existing.kind != ClaudeAccountSetupOperationKind::ReconnectRegisteredSlot
                 || existing.slot_id != slot_id
+                || existing.target_id != target_id
                 || existing
                     .requested_expected_account_identifier_hash
                     .as_deref()
                     != Some(expected_account_identifier_hash.as_str())
+                || existing
+                    .requested_expected_organization_identifier_hash
+                    .as_deref()
+                    != expected_organization_identifier_hash.as_deref()
             {
                 return Err(ClaudeConfigSlotSettingsError::Invalid(
                     "reconnect operation does not match its original slot/account binding"
@@ -485,6 +558,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 ));
             }
             if existing.state == ClaudeAccountSetupOperationState::SetupStopped {
+                reject_other_nonterminal_operation(&persisted, &operation_id)?;
                 let operation = persisted
                     .reconnect_operations
                     .iter_mut()
@@ -504,6 +578,7 @@ impl FileClaudeConfigSlotSettingsStore {
                 "reconnect operation id was retired and cannot be rebound".to_string(),
             ));
         }
+        reject_other_nonterminal_operation(&persisted, &operation_id)?;
 
         let slot = persisted
             .registered_slots
@@ -550,11 +625,16 @@ impl FileClaudeConfigSlotSettingsStore {
                 slot_id: slot.slot_id,
                 config_dir: slot.config_dir,
                 state: ClaudeAccountSetupOperationState::WaitingForUserLogin,
+                target_id,
                 requested_expected_account_identifier_hash: Some(
                     expected_account_identifier_hash.clone(),
                 ),
+                requested_expected_organization_identifier_hash:
+                    expected_organization_identifier_hash.clone(),
                 expected_account_identifier_hash: Some(expected_account_identifier_hash.clone()),
+                expected_organization_identifier_hash: expected_organization_identifier_hash.clone(),
                 account_identifier_hash: Some(expected_account_identifier_hash),
+                organization_identifier_hash: expected_organization_identifier_hash,
                 message: Some(
                     "Waiting for the customer to complete official Claude Code /login in this exact registered directory."
                         .to_string(),
@@ -573,6 +653,62 @@ impl FileClaudeConfigSlotSettingsStore {
         let persisted = self.load_persisted()?;
         require_setup_operation(&persisted, operation_id)?;
         Ok(status_contract_for_operation(&persisted, operation_id))
+    }
+
+    /// Replay discovery without turning an unknown operation into an error.
+    /// Target-bound control checks this before consulting current eligibility,
+    /// so a successful operation remains idempotent after it becomes anchored.
+    pub fn setup_operation_if_exists(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<ClaudeAccountsStatusV1>, ClaudeConfigSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let persisted = self.load_persisted()?;
+        Ok(require_setup_operation(&persisted, operation_id)
+            .ok()
+            .map(|_| status_contract_for_operation(&persisted, operation_id)))
+    }
+
+    /// Replay an existing legacy v18 managed setup with its exact originally
+    /// persisted binding. This prevents a legacy caller from changing a
+    /// target-bound operation or turning an observed organization into the
+    /// operation's requested organization during replay.
+    pub fn replay_legacy_managed_account_setup(
+        &self,
+        schema_version: u16,
+        operation_id: &str,
+        expected_account_identifier_hash: Option<&str>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        validate_setup_operation_id(operation_id)?;
+        let persisted = self.load_persisted()?;
+        let operation = require_setup_operation(&persisted, operation_id)?;
+        if operation.kind != ClaudeAccountSetupOperationKind::ConnectManagedAccount
+            || operation.target_id.is_some()
+        {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "legacy setup replay requires an existing non-target managed operation".to_string(),
+            ));
+        }
+        if operation
+            .requested_expected_account_identifier_hash
+            .as_deref()
+            != expected_account_identifier_hash
+        {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "setup operation expected account does not match its original binding".to_string(),
+            ));
+        }
+        let requested_account = operation.requested_expected_account_identifier_hash.clone();
+        let requested_organization = operation
+            .requested_expected_organization_identifier_hash
+            .clone();
+        self.prepare_managed_account_target(
+            schema_version,
+            operation_id.to_string(),
+            None,
+            requested_account,
+            requested_organization,
+        )
     }
 
     /// Claim the exact operation's validation/read side effects without
@@ -667,9 +803,38 @@ impl FileClaudeConfigSlotSettingsStore {
         account_identifier_hash: Option<&str>,
         message: Option<&str>,
     ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
+        self.transition_setup_operation_with_binding(
+            schema_version,
+            operation_id,
+            expected_account_identifier_hash,
+            None,
+            state,
+            account_identifier_hash,
+            None,
+            message,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one atomic transition validates expected and observed composite bindings"
+    )]
+    pub fn transition_setup_operation_with_binding(
+        &self,
+        schema_version: u16,
+        operation_id: &str,
+        expected_account_identifier_hash: Option<&str>,
+        expected_organization_identifier_hash: Option<&str>,
+        state: ClaudeAccountSetupOperationState,
+        account_identifier_hash: Option<&str>,
+        organization_identifier_hash: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<ClaudeAccountsStatusV1, ClaudeConfigSlotSettingsError> {
         validate_setup_operation_id(operation_id)?;
         validate_expected_account_hash(expected_account_identifier_hash)?;
+        validate_expected_account_hash(expected_organization_identifier_hash)?;
         validate_expected_account_hash(account_identifier_hash)?;
+        validate_expected_account_hash(organization_identifier_hash)?;
         self.transact_for_operation(schema_version, operation_id, |operation| {
             if operation.state == ClaudeAccountSetupOperationState::SetupStopped {
                 return Ok(());
@@ -689,6 +854,21 @@ impl FileClaudeConfigSlotSettingsStore {
                 }
                 _ => {}
             }
+            match (
+                operation.expected_organization_identifier_hash.as_deref(),
+                expected_organization_identifier_hash,
+            ) {
+                (Some(bound), Some(requested)) if bound != requested => {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "setup operation expected organization does not match its original binding"
+                            .to_string(),
+                    ));
+                }
+                (None, Some(requested)) => {
+                    operation.expected_organization_identifier_hash = Some(requested.to_string());
+                }
+                _ => {}
+            }
             if let (Some(bound), Some(observed)) = (
                 operation.expected_account_identifier_hash.as_deref(),
                 account_identifier_hash,
@@ -703,8 +883,25 @@ impl FileClaudeConfigSlotSettingsStore {
                 operation.expected_account_identifier_hash =
                     account_identifier_hash.map(ToString::to_string);
             }
+            if let (Some(bound), Some(observed)) = (
+                operation.expected_organization_identifier_hash.as_deref(),
+                organization_identifier_hash,
+            ) {
+                if bound != observed {
+                    return Err(ClaudeConfigSlotSettingsError::Invalid(
+                        "setup operation observed organization does not match its binding"
+                            .to_string(),
+                    ));
+                }
+            }
+            if operation.expected_organization_identifier_hash.is_none() {
+                operation.expected_organization_identifier_hash =
+                    organization_identifier_hash.map(ToString::to_string);
+            }
             operation.state = state;
             operation.account_identifier_hash = account_identifier_hash.map(ToString::to_string);
+            operation.organization_identifier_hash =
+                organization_identifier_hash.map(ToString::to_string);
             operation.message = message.map(ToString::to_string);
             Ok(())
         })
@@ -827,6 +1024,15 @@ impl FileClaudeConfigSlotSettingsStore {
         } else {
             PersistedClaudeConfigSlotSettingsV1::default()
         };
+        match persisted.schema_version {
+            1 => persisted.schema_version = CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION,
+            CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION => {}
+            other => {
+                return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
+                    "unsupported persisted Claude config-slot schema {other}; expected 1 or {CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION}"
+                )))
+            }
+        }
         if let Some(sidecar) = self.read_retired_reconnect_filter()? {
             if persisted.retired_reconnect_operation_filter.is_empty() {
                 persisted.retired_reconnect_operation_filter = sidecar;
@@ -1084,7 +1290,12 @@ impl Default for FileClaudeConfigSlotSettingsStore {
 fn validate_persisted(
     settings: &PersistedClaudeConfigSlotSettingsV1,
 ) -> Result<(), ClaudeConfigSlotSettingsError> {
-    validate_schema_version(settings.schema_version)?;
+    if settings.schema_version != CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
+            "unsupported persisted Claude config-slot schema {}; expected {CLAUDE_CONFIG_SLOT_PERSISTED_SCHEMA_VERSION}",
+            settings.schema_version
+        )));
+    }
     if settings.registered_slots.len() > MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
         return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
             "at most {MAX_REGISTERED_CLAUDE_CONFIG_SLOTS} registered config dirs are allowed"
@@ -1163,8 +1374,34 @@ fn validate_persisted(
                 .requested_expected_account_identifier_hash
                 .as_deref(),
         )?;
+        validate_expected_account_hash(
+            operation
+                .requested_expected_organization_identifier_hash
+                .as_deref(),
+        )?;
         validate_expected_account_hash(operation.expected_account_identifier_hash.as_deref())?;
+        validate_expected_account_hash(operation.expected_organization_identifier_hash.as_deref())?;
         validate_expected_account_hash(operation.account_identifier_hash.as_deref())?;
+        validate_expected_account_hash(operation.organization_identifier_hash.as_deref())?;
+        validate_anchor_target_binding(
+            operation.target_id.as_deref(),
+            operation
+                .requested_expected_account_identifier_hash
+                .as_deref(),
+            operation
+                .requested_expected_organization_identifier_hash
+                .as_deref(),
+        )?;
+        if operation.target_id.is_some()
+            && (operation.expected_account_identifier_hash
+                != operation.requested_expected_account_identifier_hash
+                || operation.expected_organization_identifier_hash
+                    != operation.requested_expected_organization_identifier_hash)
+        {
+            return Err(ClaudeConfigSlotSettingsError::Invalid(
+                "target-bound Claude operation changed its composite identity".to_string(),
+            ));
+        }
         if !operation_ids.insert(operation.operation_id.as_str()) {
             return Err(ClaudeConfigSlotSettingsError::Invalid(
                 "Claude setup operation ids must be unique".to_string(),
@@ -1238,6 +1475,17 @@ fn validate_persisted(
                 && !registered_slot_ids.contains(operation.slot_id.as_str())
         })
         .count();
+    let nonterminal_count = settings
+        .setup_operations
+        .iter()
+        .chain(settings.reconnect_operations.iter())
+        .filter(|operation| operation_is_nonterminal(operation))
+        .count();
+    if nonterminal_count > 1 {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "only one Claude setup or reconnect operation may be active".to_string(),
+        ));
+    }
     if settings.registered_slots.len() + preparing_count > MAX_REGISTERED_CLAUDE_CONFIG_SLOTS {
         return Err(ClaudeConfigSlotSettingsError::Invalid(
             "Claude registered and preparing slots exceed capacity".to_string(),
@@ -1503,6 +1751,66 @@ fn operation_allows_reconnect_successor(
     )
 }
 
+fn operation_is_nonterminal(operation: &PersistedClaudeAccountSetupOperationV1) -> bool {
+    matches!(
+        operation.state,
+        ClaudeAccountSetupOperationState::Preparing
+            | ClaudeAccountSetupOperationState::WaitingForUserLogin
+            | ClaudeAccountSetupOperationState::Validating
+            | ClaudeAccountSetupOperationState::Reading
+    )
+}
+
+fn reject_other_nonterminal_operation(
+    settings: &PersistedClaudeConfigSlotSettingsV1,
+    operation_id: &str,
+) -> Result<(), ClaudeConfigSlotSettingsError> {
+    if let Some(active) = settings
+        .setup_operations
+        .iter()
+        .chain(settings.reconnect_operations.iter())
+        .find(|operation| {
+            operation.operation_id != operation_id && operation_is_nonterminal(operation)
+        })
+    {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(format!(
+            "Claude account setup already has active operation {}; replay or stop it first",
+            active.operation_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_anchor_target_binding(
+    target_id: Option<&str>,
+    account_hash: Option<&str>,
+    organization_hash: Option<&str>,
+) -> Result<(), ClaudeConfigSlotSettingsError> {
+    let Some(target_id) = target_id else {
+        return Ok(());
+    };
+    let Some(suffix) = target_id.strip_prefix("claude_anchor_target_") else {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "Claude anchor target id has an unsupported shape".to_string(),
+        ));
+    };
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "Claude anchor target id has an unsupported shape".to_string(),
+        ));
+    }
+    if account_hash.is_none() || organization_hash.is_none() {
+        return Err(ClaudeConfigSlotSettingsError::Invalid(
+            "Claude anchor target requires an exact account and organization binding".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn retired_reconnect_filter_indexes(
     operation_id: &str,
 ) -> [usize; RETIRED_RECONNECT_FILTER_HASHES] {
@@ -1616,10 +1924,15 @@ fn status_contract_with_selected_operation(
                 state: operation.state.clone(),
                 operation_id: Some(operation.operation_id.clone()),
                 slot_id: Some(operation.slot_id.clone()),
+                target_id: operation.target_id.clone(),
                 expected_account_identifier_hash: operation
                     .expected_account_identifier_hash
                     .clone(),
+                expected_organization_identifier_hash: operation
+                    .expected_organization_identifier_hash
+                    .clone(),
                 account_identifier_hash: operation.account_identifier_hash.clone(),
+                organization_identifier_hash: operation.organization_identifier_hash.clone(),
                 launch_command,
                 message: operation.message.clone(),
             }
@@ -1629,13 +1942,16 @@ fn status_contract_with_selected_operation(
             state: ClaudeAccountSetupOperationState::Idle,
             operation_id: None,
             slot_id: None,
+            target_id: None,
             expected_account_identifier_hash: None,
+            expected_organization_identifier_hash: None,
             account_identifier_hash: None,
+            organization_identifier_hash: None,
             launch_command: None,
             message: None,
         });
     ClaudeAccountsStatusV1 {
-        schema_version: persisted.schema_version,
+        schema_version: CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
         consent: if persisted.background_upkeep_consent {
             ClaudeAccountUpkeepConsentState::Granted
         } else {
@@ -1647,6 +1963,8 @@ fn status_contract_with_selected_operation(
         managed_slots,
         external_slots,
         unresolved_accounts: Vec::new(),
+        anchor_coverage: ClaudeAccountAnchorCoverageV1::default(),
+        anchor_transitions: Vec::new(),
         capacity: ClaudeAccountCapacityV1 {
             max_slots: MAX_CLAUDE_ACCOUNT_SLOTS as u8,
             used_slots: used_slots as u8,
@@ -2180,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_status_selects_newest_operation_across_setup_and_reconnect() {
+    fn ordinary_status_allows_only_one_active_operation_across_setup_and_reconnect() {
         let path = temp_path("cross-kind-operation-order");
         let root = path.parent().expect("parent");
         let _ = fs::remove_dir_all(root);
@@ -2195,6 +2513,13 @@ mod tests {
             .expect("persist reconnect");
 
         let managed_id = "claude_setup_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matches!(
+            store.prepare_managed_account(1, managed_id.to_string(), None),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        store
+            .stop_waiting(1, reconnect_id)
+            .expect("stop reconnect before starting managed setup");
         store
             .prepare_managed_account(1, managed_id.to_string(), None)
             .expect("persist newer managed setup");
@@ -2766,9 +3091,13 @@ mod tests {
                 slot_id: slot_id.to_string(),
                 config_dir: config_dir.to_string_lossy().into_owned(),
                 state: ClaudeAccountSetupOperationState::Preparing,
+                target_id: None,
                 requested_expected_account_identifier_hash: None,
+                requested_expected_organization_identifier_hash: None,
                 expected_account_identifier_hash: None,
+                expected_organization_identifier_hash: None,
                 account_identifier_hash: None,
+                organization_identifier_hash: None,
                 message: Some("Preparing".to_string()),
             }],
             ..Default::default()
@@ -2810,6 +3139,78 @@ mod tests {
         );
         assert!(config_dir.is_dir());
         assert_eq!(restarted.capacity.used_slots, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_bound_setup_rejects_same_account_under_another_organization() {
+        let path = temp_path("target-composite-binding");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        let operation_id = "claude_setup_abababababababababababababababab";
+        let account = "a".repeat(64);
+        let organization = "b".repeat(64);
+        store
+            .prepare_managed_account_target(
+                1,
+                operation_id.to_string(),
+                Some("claude_anchor_target_abababababababababababababababab".to_string()),
+                Some(account.clone()),
+                Some(organization.clone()),
+            )
+            .expect("prepare target-bound operation");
+
+        assert!(matches!(
+            store.transition_setup_operation_with_binding(
+                1,
+                operation_id,
+                Some(&account),
+                Some(&organization),
+                ClaudeAccountSetupOperationState::Validating,
+                Some(&account),
+                Some(&"c".repeat(64)),
+                None,
+            ),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
+        let status = store.load().expect("binding remains persisted");
+        assert_eq!(
+            status.setup_operation.expected_organization_identifier_hash,
+            Some(organization)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v1_migration_fails_closed_when_multiple_operations_are_active() {
+        let path = temp_path("v1-multiple-active");
+        let root = path.parent().expect("parent");
+        let _ = fs::remove_dir_all(root);
+        let store = FileClaudeConfigSlotSettingsStore::new(&path);
+        store
+            .prepare_managed_account(
+                1,
+                "claude_setup_cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_string(),
+                None,
+            )
+            .expect("prepare first operation");
+        let mut persisted = store.load_persisted().expect("read prepared settings");
+        let mut duplicate = persisted.setup_operations[0].clone();
+        duplicate.operation_id = "claude_setup_efefefefefefefefefefefefefefefef".to_string();
+        duplicate.created_sequence = duplicate.created_sequence.saturating_add(1);
+        persisted.setup_operations.push(duplicate);
+        persisted.schema_version = 1;
+        crate::write_owner_only_file_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&persisted).expect("serialize v1 settings"),
+        )
+        .expect("write v1 settings");
+
+        assert!(matches!(
+            store.load(),
+            Err(ClaudeConfigSlotSettingsError::Invalid(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
