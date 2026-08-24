@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::session_attribution::SessionAttributionContext;
 use crate::snapshots::{
-    scan_source_roots_with_attribution, ScanIndex, SnapshotItem, SnapshotSource,
-    CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SNAPSHOT_PARSER_VERSION, PI_SNAPSHOT_PARSER_VERSION,
+    scan_source_roots_with_attribution_and_claude_effort_and_hints, ScanIndex, SnapshotItem,
+    SnapshotSource, CLAUDE_CODE_SNAPSHOT_PARSER_VERSION, CODEX_SNAPSHOT_PARSER_VERSION,
+    PI_SNAPSHOT_PARSER_VERSION,
 };
 
 const BACKFILL_STATE_FILENAME: &str = "snapshot_backfill_state.json";
@@ -343,7 +344,7 @@ pub fn run_backfill(
     for source in pending {
         let roots = source.default_roots(home_dir);
         let mut index = ScanIndex::default();
-        let result = scan_source_roots_with_attribution(
+        let result = scan_source_roots_with_attribution_and_claude_effort_and_hints(
             *source,
             &roots,
             &mut index,
@@ -351,6 +352,10 @@ pub fn run_backfill(
             u64::MAX,
             artifacts_enabled,
             attribution_context,
+            None,
+            false,
+            &[],
+            false,
         )?;
         match source {
             SnapshotSource::ClaudeCode => {
@@ -499,6 +504,11 @@ mod tests {
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
+            context_curve: None,
+            claude_context_curve_boundaries: Vec::new(),
+            claude_context_curve_identity_complete: false,
+            claude_context_curve_request_index_complete: false,
+            claude_context_curve_owned_start_proven: false,
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
@@ -849,6 +859,34 @@ mod tests {
             run_backfill(&home, &pending, "2026-05-28T10:00:00Z", true, None).expect("backfill ok");
         assert_eq!(snapshots.len(), 0);
         assert_eq!(report.total_snapshots(), 0);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn backfill_without_activity_hint_never_emits_context_curve() {
+        let home = temp_dir("curve-capability-absent");
+        let sessions = home.join(".codex").join("sessions");
+        fs::create_dir_all(&sessions).expect("create Codex session root");
+        fs::write(
+            sessions.join("rollout-2026-08-20T10-00-00-curve-capability.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-20T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"backfill-curve-capability\"}}\n",
+                "{\"timestamp\":\"2026-08-20T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"output_tokens\":2,\"request_count\":1},\"last_token_usage\":{\"input_tokens\":100,\"output_tokens\":2},\"model\":\"gpt-5.6\"}}}\n"
+            ),
+        )
+        .expect("write Codex transcript");
+
+        let (snapshots, _) = run_backfill(
+            &home,
+            &[SnapshotSource::Codex],
+            "2026-08-20T10:02:00Z",
+            false,
+            None,
+        )
+        .expect("backfill succeeds");
+
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].context_curve.is_none());
         fs::remove_dir_all(&home).ok();
     }
 

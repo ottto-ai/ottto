@@ -208,7 +208,10 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // The per-session sidecar fingerprint already includes family position, so
 // affected immutable rollouts are selected without a global scan-identity
 // bump; unrelated sessions stay untouched.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v32";
+// codex v33 adds the bounded, content-free context-curve derivation and its
+// owned-request indexing. This must remain a distinct parser revision from
+// v32's created-thread lineage import so both derivation changes replay once.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v33";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -225,7 +228,7 @@ pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v32";
 // same census may exclude a legacy top-level fork's duplicated leading
 // response prefix, but only when exact current API/trace evidence assigns each
 // excluded request to another root; provider graph facts remain untouched.
-pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v32";
+pub const CLAUDE_CODE_SNAPSHOT_PARSER_VERSION: &str = "claude_code_jsonl:v33";
 // v13 makes the provider response timestamp authoritative for both Pi usage
 // record shapes and reconciles every exact cross-shape occurrence for a reused
 // response id. This prevents envelope write time from moving current records
@@ -289,6 +292,7 @@ pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v
 pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES: usize = 129 * 1024;
 pub(crate) const MAX_SNAPSHOT_BATCH_WIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_USAGE_NAME_LENGTH: usize = 128;
 const MAX_TOOL_USAGE_NAMES: usize = 200;
@@ -358,9 +362,55 @@ pub const MAX_WATCHER_HINTED_FILES_PER_TICK: usize = 256;
 const UNHEALTHY_SCAN_RETRY_BASE_SECONDS: u64 = 60;
 const UNHEALTHY_SCAN_RETRY_MAX_SECONDS: u64 = 60 * 60;
 pub(crate) const MAX_COMPACTION_TIMESTAMPS: usize = 64;
+pub(crate) const MAX_CONTEXT_CURVE_POINTS: usize = 256;
+pub(crate) const MAX_CONTEXT_CURVE_BOUNDARIES: usize = 64;
+pub(crate) const MAX_CONTEXT_CURVE_MODEL_WINDOWS: usize = 16;
+pub(crate) const MAX_CONTEXT_CURVE_WIRE_BYTES: usize = 64 * 1024;
+pub(crate) const CONTEXT_CURVE_CONTRACT_VERSION: &str = "session_context_curve:v1";
+const CONTEXT_CURVE_SAMPLING_REVISION: &str = "deterministic_even_gap:v1";
+const CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "codex_owned_rollout_occurrences:v1";
+const CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str =
+    "codex_token_count_model_context_window:v1";
+const CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION: &str = "claude_owned_request_start_proof:v1";
+const CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION: &str = "claude_transcript_model:v1";
+const CONTEXT_CURVE_RETENTION_ANCHOR: u16 = 0x01;
+const CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE: u16 = 0x02;
+const CONTEXT_CURVE_RETENTION_COMPACTION_AFTER: u16 = 0x04;
+const CONTEXT_CURVE_RETENTION_PEAK: u16 = 0x08;
+const CONTEXT_CURVE_RETENTION_TAIL: u16 = 0x10;
+const CONTEXT_CURVE_RETENTION_FILL: u16 = 0x20;
 const REPOSITORY_IDENTITY_CACHE_MAX_ENTRIES: usize = 512;
 const REPOSITORY_IDENTITY_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 pub const BACKFILL_WINDOW_DAYS: u64 = 730;
+
+fn context_curve_derivation_revision_key(
+    parser_revision: &str,
+    ownership_revision: &str,
+    sampling_revision: &str,
+    model_evidence_revision: &str,
+) -> String {
+    format!(
+        "parser={parser_revision};ownership={ownership_revision};sampling={sampling_revision};model_window={model_evidence_revision}"
+    )
+}
+
+pub(crate) fn context_curve_derivation_revision(source: SnapshotSource) -> Option<String> {
+    match source {
+        SnapshotSource::Codex => Some(context_curve_derivation_revision_key(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
+            CONTEXT_CURVE_SAMPLING_REVISION,
+            CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+        )),
+        SnapshotSource::ClaudeCode => Some(context_curve_derivation_revision_key(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+            CONTEXT_CURVE_SAMPLING_REVISION,
+            CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+        )),
+        SnapshotSource::Pi => None,
+    }
+}
 
 pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<String> {
     timestamps.sort();
@@ -373,7 +423,6 @@ pub(crate) fn bounded_compaction_timestamps(mut timestamps: Vec<String>) -> Vec<
 }
 
 const CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS: i128 = 100;
-
 #[derive(Debug, Clone, Default)]
 struct CompactionMetrics {
     total_pre_tokens: u64,
@@ -390,13 +439,78 @@ enum ClaudeCompactionKind {
 }
 
 #[derive(Debug, Clone)]
-struct ClaudeCompactionObservation {
+pub(crate) struct ClaudeCompactionObservation {
     kind: ClaudeCompactionKind,
     timestamp: Option<String>,
     pre_tokens: Option<u64>,
     post_tokens: Option<u64>,
     cumulative_dropped_tokens: Option<u64>,
     duration_ms: Option<u64>,
+    /// Number of provider responses first observed before this boundary. This
+    /// stays local and lets the post-census ownership pass attach the boundary
+    /// to exact owned request ordinals without uploading provider identities.
+    response_count_before: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ContextCurveCandidatePoint {
+    observed_at: Option<String>,
+    effective_input_tokens: u64,
+    model: Option<String>,
+    context_window_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextCurveCandidateBoundary {
+    observed_at: Option<String>,
+    point_count_before: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotContextCurvePoint {
+    pub owned_request_ordinal: u64,
+    pub observed_at: String,
+    pub effective_input_tokens: u64,
+    pub model_window_index: u16,
+    pub segment_ordinal: u64,
+    pub retention_flags: u16,
+    pub compaction_before_request_boundary_index: Option<u64>,
+    pub compaction_after_request_boundary_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotContextCurveBoundary {
+    pub boundary_index: u64,
+    pub observed_at: String,
+    pub before_owned_request_ordinal: u64,
+    pub after_owned_request_ordinal: u64,
+    pub segment_before_ordinal: u64,
+    pub segment_after_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotContextCurveModelWindow {
+    pub model_window_index: u16,
+    pub model: String,
+    pub context_window_tokens: Option<u64>,
+    pub evidence_kind: String,
+    pub evidence_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotContextCurve {
+    pub contract_version: String,
+    pub parser_revision: String,
+    pub ownership_revision: String,
+    pub sampling_revision: String,
+    pub coverage: String,
+    pub total_owned_request_count: u64,
+    pub retained_point_count: u64,
+    pub total_compaction_boundary_count: u64,
+    pub retained_boundary_count: u64,
+    pub points: Vec<SnapshotContextCurvePoint>,
+    pub boundaries: Vec<SnapshotContextCurveBoundary>,
+    pub model_windows: Vec<SnapshotContextCurveModelWindow>,
 }
 
 fn claude_compaction_summary(
@@ -476,6 +590,437 @@ fn claude_compaction_summary(
         bounded_compaction_timestamps(timestamps),
         metrics,
     )
+}
+
+fn canonical_claude_curve_boundaries(
+    observations: &[ClaudeCompactionObservation],
+) -> Vec<ClaudeCompactionObservation> {
+    let mut matched_legacy = BTreeSet::new();
+    for current in observations
+        .iter()
+        .filter(|observation| observation.kind == ClaudeCompactionKind::CurrentBoundary)
+    {
+        let Some(current_timestamp) = current
+            .timestamp
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        else {
+            continue;
+        };
+        let current_millis = current_timestamp.unix_timestamp_nanos() / 1_000_000;
+        if let Some((_, legacy_index)) = observations
+            .iter()
+            .enumerate()
+            .filter(|(index, observation)| {
+                observation.kind == ClaudeCompactionKind::LegacySummary
+                    && !matched_legacy.contains(index)
+            })
+            .filter_map(|(index, observation)| {
+                let legacy_timestamp = observation
+                    .timestamp
+                    .as_deref()
+                    .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())?;
+                let delta =
+                    (legacy_timestamp.unix_timestamp_nanos() / 1_000_000 - current_millis).abs();
+                (delta <= CLAUDE_COMPACTION_PAIR_TOLERANCE_MILLISECONDS).then_some((delta, index))
+            })
+            .min()
+        {
+            matched_legacy.insert(legacy_index);
+        }
+    }
+    let mut boundaries = observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.kind == ClaudeCompactionKind::CurrentBoundary
+                || !matched_legacy.contains(index)
+        })
+        .map(|(_, observation)| observation.clone())
+        .collect::<Vec<_>>();
+    boundaries.sort_by(|left, right| {
+        left.response_count_before
+            .cmp(&right.response_count_before)
+            .then_with(|| left.timestamp.cmp(&right.timestamp))
+    });
+    boundaries
+}
+
+fn unavailable_context_curve(
+    parser_revision: &str,
+    ownership_revision: &str,
+    coverage: &str,
+    _total_owned_request_count: u64,
+    _total_compaction_boundary_count: u64,
+) -> SnapshotContextCurve {
+    SnapshotContextCurve {
+        contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+        parser_revision: parser_revision.to_string(),
+        ownership_revision: ownership_revision.to_string(),
+        sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
+        coverage: coverage.to_string(),
+        total_owned_request_count: 0,
+        retained_point_count: 0,
+        total_compaction_boundary_count: 0,
+        retained_boundary_count: 0,
+        points: Vec::new(),
+        boundaries: Vec::new(),
+        model_windows: Vec::new(),
+    }
+}
+
+fn safe_context_curve_model(value: Option<&str>) -> String {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "unknown".to_string();
+    };
+    if value.len() > 128
+        || value
+            .chars()
+            .any(|character| !(character.is_ascii_alphanumeric() || "-._:".contains(character)))
+    {
+        return "unknown".to_string();
+    }
+    value.to_string()
+}
+
+fn context_curve_revision_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._:".contains(character))
+}
+
+fn canonical_context_curve_timestamp(value: &str) -> Option<String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn mark_context_curve_retention(
+    retention_flags: &mut BTreeMap<u64, u16>,
+    total_points: u64,
+    ordinal: u64,
+    flag: u16,
+) {
+    if ordinal > 0 && ordinal <= total_points {
+        *retention_flags.entry(ordinal).or_default() |= flag;
+    }
+}
+
+fn build_context_curve(
+    parser_revision: &str,
+    ownership_revision: &str,
+    model_evidence_revision: &str,
+    candidates: &[ContextCurveCandidatePoint],
+    boundary_candidates: &[ContextCurveCandidateBoundary],
+    unavailable_coverage: &str,
+) -> SnapshotContextCurve {
+    let total_points = candidates.len() as u64;
+    let total_boundaries = boundary_candidates.len() as u64;
+    let unavailable = || {
+        unavailable_context_curve(
+            parser_revision,
+            ownership_revision,
+            unavailable_coverage,
+            total_points,
+            total_boundaries,
+        )
+    };
+    if candidates.is_empty()
+        || candidates.iter().any(|point| {
+            point.effective_input_tokens == 0
+                || point.observed_at.as_deref().map_or(true, |timestamp| {
+                    OffsetDateTime::parse(timestamp, &Rfc3339).is_err()
+                })
+        })
+        || boundary_candidates.iter().any(|boundary| {
+            boundary.point_count_before == 0
+                || boundary.point_count_before >= total_points
+                || boundary.observed_at.as_deref().map_or(true, |timestamp| {
+                    OffsetDateTime::parse(timestamp, &Rfc3339).is_err()
+                })
+                || boundary.observed_at.as_deref().is_some_and(|timestamp| {
+                    let before = candidates[boundary.point_count_before as usize - 1]
+                        .observed_at
+                        .as_deref()
+                        .expect("candidate timestamps validated together");
+                    let after = candidates[boundary.point_count_before as usize]
+                        .observed_at
+                        .as_deref()
+                        .expect("candidate timestamps validated together");
+                    timestamp_is_after(before, timestamp) || timestamp_is_after(timestamp, after)
+                })
+        })
+        || boundary_candidates.windows(2).any(|pair| {
+            pair[0].point_count_before >= pair[1].point_count_before
+                || pair[0]
+                    .observed_at
+                    .as_deref()
+                    .zip(pair[1].observed_at.as_deref())
+                    .is_some_and(|(left, right)| timestamp_is_after(left, right))
+        })
+        || candidates.windows(2).any(|pair| {
+            pair[0]
+                .observed_at
+                .as_deref()
+                .zip(pair[1].observed_at.as_deref())
+                .is_some_and(|(left, right)| timestamp_is_after(left, right))
+        })
+    {
+        return unavailable();
+    }
+
+    let retained_boundary_candidates = if boundary_candidates.len() > MAX_CONTEXT_CURVE_BOUNDARIES {
+        let edge_count = MAX_CONTEXT_CURVE_BOUNDARIES / 2;
+        boundary_candidates
+            .iter()
+            .enumerate()
+            .take(edge_count)
+            .chain(
+                boundary_candidates
+                    .iter()
+                    .enumerate()
+                    .skip(boundary_candidates.len() - edge_count),
+            )
+            .collect::<Vec<_>>()
+    } else {
+        boundary_candidates.iter().enumerate().collect::<Vec<_>>()
+    };
+
+    let mut retention_flags = BTreeMap::<u64, u16>::new();
+    for ordinal in [1_u64, 2, 5, 10, 20] {
+        mark_context_curve_retention(
+            &mut retention_flags,
+            total_points,
+            ordinal,
+            CONTEXT_CURVE_RETENTION_ANCHOR,
+        );
+    }
+    for (_, boundary) in &retained_boundary_candidates {
+        mark_context_curve_retention(
+            &mut retention_flags,
+            total_points,
+            boundary.point_count_before,
+            CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE,
+        );
+        mark_context_curve_retention(
+            &mut retention_flags,
+            total_points,
+            boundary.point_count_before + 1,
+            CONTEXT_CURVE_RETENTION_COMPACTION_AFTER,
+        );
+    }
+    let peak_ordinal = candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, point)| point.effective_input_tokens)
+        .map(|(index, _)| index as u64 + 1)
+        .unwrap_or(1);
+    mark_context_curve_retention(
+        &mut retention_flags,
+        total_points,
+        peak_ordinal,
+        CONTEXT_CURVE_RETENTION_PEAK,
+    );
+    for ordinal in total_points.saturating_sub(9)..=total_points {
+        mark_context_curve_retention(
+            &mut retention_flags,
+            total_points,
+            ordinal.max(1),
+            CONTEXT_CURVE_RETENTION_TAIL,
+        );
+    }
+
+    if retention_flags.len() > MAX_CONTEXT_CURVE_POINTS {
+        return unavailable();
+    }
+    let target = candidates.len().min(MAX_CONTEXT_CURVE_POINTS);
+    while retention_flags.len() < target {
+        let selected = retention_flags.keys().copied().collect::<Vec<_>>();
+        let mut best: Option<(u64, u64)> = None;
+        let mut left = 0_u64;
+        for right in selected
+            .iter()
+            .copied()
+            .chain(std::iter::once(total_points + 1))
+        {
+            if right > left + 1 {
+                let gap = right - left - 1;
+                let midpoint = left + (right - left) / 2;
+                match best {
+                    Some((best_gap, best_midpoint))
+                        if gap < best_gap || (gap == best_gap && midpoint >= best_midpoint) => {}
+                    _ => best = Some((gap, midpoint)),
+                }
+            }
+            left = right;
+        }
+        let Some((_, ordinal)) = best else { break };
+        mark_context_curve_retention(
+            &mut retention_flags,
+            total_points,
+            ordinal,
+            CONTEXT_CURVE_RETENTION_FILL,
+        );
+    }
+
+    let mut before_boundary_by_request = BTreeMap::new();
+    let mut after_boundary_by_request = BTreeMap::new();
+    let boundaries = retained_boundary_candidates
+        .iter()
+        .map(|(original_index, boundary)| {
+            let boundary_index = *original_index as u64 + 1;
+            before_boundary_by_request.insert(boundary.point_count_before + 1, boundary_index);
+            after_boundary_by_request.insert(boundary.point_count_before, boundary_index);
+            SnapshotContextCurveBoundary {
+                boundary_index,
+                observed_at: boundary
+                    .observed_at
+                    .as_deref()
+                    .and_then(canonical_context_curve_timestamp)
+                    .expect("validated boundary timestamp canonicalizes"),
+                before_owned_request_ordinal: boundary.point_count_before,
+                after_owned_request_ordinal: boundary.point_count_before + 1,
+                segment_before_ordinal: *original_index as u64,
+                segment_after_ordinal: *original_index as u64 + 1,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut model_window_indexes = BTreeMap::new();
+    let mut model_windows = Vec::new();
+    let mut model_window_overflow = false;
+    let mut points = Vec::with_capacity(retention_flags.len());
+    for (ordinal, flags) in retention_flags {
+        let candidate = &candidates[ordinal as usize - 1];
+        let model = safe_context_curve_model(candidate.model.as_deref());
+        let evidence_kind = if candidate.context_window_tokens.is_some() {
+            "provider_reported_window"
+        } else if model != "unknown" {
+            "provider_reported_model"
+        } else {
+            "unavailable"
+        };
+        let model_key = (
+            model.clone(),
+            candidate.context_window_tokens,
+            evidence_kind.to_string(),
+        );
+        let model_window_index = if let Some(index) = model_window_indexes.get(&model_key) {
+            *index
+        } else if model_windows.len() < MAX_CONTEXT_CURVE_MODEL_WINDOWS {
+            let index = model_windows.len() as u16;
+            model_window_indexes.insert(model_key, index);
+            model_windows.push(SnapshotContextCurveModelWindow {
+                model_window_index: index,
+                model,
+                context_window_tokens: candidate.context_window_tokens,
+                evidence_kind: evidence_kind.to_string(),
+                evidence_revision: model_evidence_revision.to_string(),
+            });
+            index
+        } else {
+            model_window_overflow = true;
+            0
+        };
+        let segment_ordinal = boundary_candidates
+            .iter()
+            .take_while(|boundary| boundary.point_count_before < ordinal)
+            .count() as u64;
+        points.push(SnapshotContextCurvePoint {
+            owned_request_ordinal: ordinal,
+            observed_at: candidate
+                .observed_at
+                .as_deref()
+                .and_then(canonical_context_curve_timestamp)
+                .expect("validated point timestamp canonicalizes"),
+            effective_input_tokens: candidate.effective_input_tokens,
+            model_window_index,
+            segment_ordinal,
+            retention_flags: flags,
+            compaction_before_request_boundary_index: before_boundary_by_request
+                .get(&ordinal)
+                .copied(),
+            compaction_after_request_boundary_index: after_boundary_by_request
+                .get(&ordinal)
+                .copied(),
+        });
+    }
+
+    if model_window_overflow {
+        return unavailable();
+    }
+    let mut curve = SnapshotContextCurve {
+        contract_version: CONTEXT_CURVE_CONTRACT_VERSION.to_string(),
+        parser_revision: parser_revision.to_string(),
+        ownership_revision: ownership_revision.to_string(),
+        sampling_revision: CONTEXT_CURVE_SAMPLING_REVISION.to_string(),
+        coverage: if candidates.len() > MAX_CONTEXT_CURVE_POINTS
+            || boundary_candidates.len() > MAX_CONTEXT_CURVE_BOUNDARIES
+        {
+            "sampled".to_string()
+        } else {
+            "complete".to_string()
+        },
+        total_owned_request_count: total_points,
+        retained_point_count: points.len() as u64,
+        total_compaction_boundary_count: total_boundaries,
+        retained_boundary_count: boundaries.len() as u64,
+        points,
+        boundaries,
+        model_windows,
+    };
+    loop {
+        let encoded_size = serde_json::to_vec(&curve)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if encoded_size <= MAX_CONTEXT_CURVE_WIRE_BYTES {
+            return curve;
+        }
+        if !prune_one_context_curve_fill_point(&mut curve) {
+            return unavailable();
+        }
+    }
+}
+
+fn compact_context_curve_model_windows(curve: &mut SnapshotContextCurve) {
+    let used = curve
+        .points
+        .iter()
+        .map(|point| point.model_window_index)
+        .collect::<BTreeSet<_>>();
+    let mut old_to_new = BTreeMap::new();
+    curve.model_windows.retain(|window| {
+        if !used.contains(&window.model_window_index) {
+            return false;
+        }
+        let next = old_to_new.len() as u16;
+        old_to_new.insert(window.model_window_index, next);
+        true
+    });
+    for (index, window) in curve.model_windows.iter_mut().enumerate() {
+        window.model_window_index = index as u16;
+    }
+    for point in &mut curve.points {
+        point.model_window_index = old_to_new[&point.model_window_index];
+    }
+}
+
+fn prune_one_context_curve_fill_point(curve: &mut SnapshotContextCurve) -> bool {
+    let Some(remove_index) = curve
+        .points
+        .iter()
+        .rposition(|point| point.retention_flags == CONTEXT_CURVE_RETENTION_FILL)
+    else {
+        return false;
+    };
+    curve.points.remove(remove_index);
+    curve.retained_point_count = curve.points.len() as u64;
+    curve.coverage = "sampled".to_string();
+    compact_context_curve_model_windows(curve);
+    true
 }
 
 // Defensive size ceilings for the streaming JSONL read path. The scan caps the
@@ -851,6 +1396,24 @@ pub struct SnapshotItem {
     pub compaction_total_cumulative_dropped_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_total_duration_ms: Option<u64>,
+    /// Versioned, content-free per-owned-request context evidence. The curve is
+    /// intentionally excluded from semantic component/content hashes; the
+    /// backend accepted-body witness owns correction identity for this additive
+    /// evidence contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_curve: Option<SnapshotContextCurve>,
+    /// Local-only raw Claude boundaries retained until the complete scan census
+    /// suppresses copied-prefix ownership. Never serialized.
+    #[serde(skip)]
+    pub(crate) claude_context_curve_boundaries: Vec<ClaudeCompactionObservation>,
+    /// Missing provider request identities make a Claude curve unavailable even
+    /// when aggregate usage can still be conservatively counted.
+    #[serde(skip)]
+    pub(crate) claude_context_curve_identity_complete: bool,
+    #[serde(skip)]
+    pub(crate) claude_context_curve_request_index_complete: bool,
+    #[serde(skip)]
+    pub(crate) claude_context_curve_owned_start_proven: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_summary: Option<SnapshotActivitySummary>,
     /// Names of tools actually invoked by counted Claude assistant responses.
@@ -1217,6 +1780,16 @@ pub struct ScanIndex {
     /// clears only derived transcript settlement state once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     historical_replay_generation: Option<String>,
+    /// Last successfully settled server capability epoch for request-index
+    /// curves. False is omitted for byte-compatible old indexes. An enabled ->
+    /// disabled -> enabled transition forces one fresh replay so files changed
+    /// while durable curve admission was unavailable are not skipped forever.
+    #[serde(default, skip_serializing_if = "is_false")]
+    context_curve_capability_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    context_curve_replay_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_context_curve_replay_generation: Option<String>,
     /// Files that were fully read and valid but intentionally produced no
     /// snapshot. Separate from `last_snapshot_fingerprint=None`, which legacy
     /// indexes can only treat as unknown/incomplete.
@@ -1278,6 +1851,9 @@ impl Default for ScanIndex {
             bounded_sweep_had_unsettled_upload: false,
             traversal: None,
             historical_replay_generation: None,
+            context_curve_capability_enabled: false,
+            context_curve_replay_epoch: 0,
+            completed_context_curve_replay_generation: None,
             confirmed_empty_files: BTreeSet::new(),
             file_snapshot_fingerprints: BTreeMap::new(),
             snapshot_activity_at: BTreeMap::new(),
@@ -1305,6 +1881,10 @@ pub struct SnapshotQuarantineWitness {
 pub struct SnapshotQuarantineRecord {
     pub witness: SnapshotQuarantineWitness,
     pub retry_after_unix_seconds: u64,
+    /// Optional exact hash-neutral body rejected under this contract. A body
+    /// correction with the same semantic fingerprint bypasses quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_body_witness: Option<String>,
 }
 
 pub fn snapshot_quarantine_witness(source: SnapshotSource) -> SnapshotQuarantineWitness {
@@ -1326,6 +1906,7 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
     SnapshotQuarantineRecord {
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
+        upload_body_witness: None,
     }
 }
 
@@ -1358,6 +1939,11 @@ pub struct ScanIndexEntry {
     pub modified_unix_nanos: Option<u64>,
     pub source_file_fingerprint: String,
     pub last_snapshot_fingerprint: Option<String>,
+    /// Local-only witness for additive wire evidence intentionally excluded
+    /// from semantic identity. This lets an absent/present/corrected context
+    /// curve upload once without changing the server entity fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upload_body_witness: Option<String>,
     /// Marks entries written by the semantic-sync scan derivation. `None`
     /// identifies a pre-cutover entry that can be adopted without reparsing
     /// when transcript size and mtime are unchanged.
@@ -1538,6 +2124,7 @@ struct PendingIndexFinalization {
     index_key: String,
     source_file_fingerprint: String,
     previous_snapshot_fingerprint: Option<String>,
+    previous_upload_body_witness: Option<String>,
     parse_complete: bool,
     parsed_snapshot_count: usize,
 }
@@ -1628,7 +2215,69 @@ pub fn apply_upload_policy(
         if fingerprint_needs_refresh {
             item.snapshot_fingerprint = snapshot_fingerprint(source, item);
         }
+        fit_context_curve_to_snapshot_item_budget(
+            source,
+            item,
+            policy,
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+        );
     }
+}
+
+fn snapshot_item_wire_size(
+    source: SnapshotSource,
+    item: &SnapshotItem,
+    policy: SnapshotUploadPolicy,
+) -> usize {
+    serde_json::to_vec(&SnapshotItemWire {
+        snapshot: item,
+        semantic_envelope: snapshot_semantic_envelope(source, item, policy),
+    })
+    .map(|encoded| encoded.len())
+    .unwrap_or(usize::MAX)
+}
+
+fn fit_context_curve_to_snapshot_item_budget(
+    source: SnapshotSource,
+    item: &mut SnapshotItem,
+    policy: SnapshotUploadPolicy,
+    item_wire_budget: usize,
+) {
+    if item.context_curve.is_none()
+        || snapshot_item_wire_size(source, item, policy) <= item_wire_budget
+    {
+        return;
+    }
+    while item
+        .context_curve
+        .as_mut()
+        .is_some_and(prune_one_context_curve_fill_point)
+    {
+        if snapshot_item_wire_size(source, item, policy) <= item_wire_budget {
+            return;
+        }
+    }
+    let Some(curve) = item.context_curve.as_ref() else {
+        return;
+    };
+    item.context_curve = Some(unavailable_context_curve(
+        &curve.parser_revision,
+        &curve.ownership_revision,
+        "payload_budget_exceeded",
+        0,
+        0,
+    ));
+}
+
+fn snapshot_item_wire_size_is_allowed(
+    item_size: usize,
+    item_without_curve_size: usize,
+    context_curve_coverage: Option<&str>,
+) -> bool {
+    item_size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES
+        || (context_curve_coverage == Some("payload_budget_exceeded")
+            && item_without_curve_size <= MAX_SNAPSHOT_ITEM_WIRE_BYTES
+            && item_size <= MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES)
 }
 
 /// Bind incremental state to the exact bytes/semantics that will go on the
@@ -1649,12 +2298,17 @@ pub fn finalize_scan_after_policy(
     }
 
     let mut by_source_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut by_source_file_body_witness: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for snapshot in &result.snapshots {
         if let Some(source_file_fingerprint) = snapshot.source_file_fingerprint.as_ref() {
             by_source_file
                 .entry(source_file_fingerprint.clone())
                 .or_default()
                 .insert(snapshot.snapshot_fingerprint.clone());
+            by_source_file_body_witness
+                .entry(source_file_fingerprint.clone())
+                .or_default()
+                .insert(snapshot_upload_body_witness(snapshot));
         }
     }
 
@@ -1675,11 +2329,28 @@ pub fn finalize_scan_after_policy(
             }
             format!("{:x}", digest.finalize())
         });
-        let quarantine_retry_required = final_fingerprints
-            .iter()
-            .any(|fingerprint| index.quarantine_requires_retry(fingerprint));
+        let final_upload_body_witness = by_source_file_body_witness
+            .get(&pending.source_file_fingerprint)
+            .filter(|witnesses| !witnesses.is_empty())
+            .map(|witnesses| {
+                let mut digest = Sha256::new();
+                update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
+                for witness in witnesses {
+                    update_length_prefixed(&mut digest, witness.as_bytes());
+                }
+                format!("{:x}", digest.finalize())
+            });
+        let quarantine_retry_required = result.snapshots.iter().any(|snapshot| {
+            snapshot.source_file_fingerprint.as_deref()
+                == Some(pending.source_file_fingerprint.as_str())
+                && index.quarantine_requires_retry_body(
+                    &snapshot.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(snapshot),
+                )
+        });
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
+            entry.last_upload_body_witness = final_upload_body_witness.clone();
         }
         if final_fingerprints.is_empty() {
             index.file_snapshot_fingerprints.remove(&pending.index_key);
@@ -1694,6 +2365,7 @@ pub fn finalize_scan_after_policy(
         }
         if final_group_fingerprint.is_some()
             && final_group_fingerprint == pending.previous_snapshot_fingerprint
+            && final_upload_body_witness == pending.previous_upload_body_witness
             && !quarantine_retry_required
         {
             noop_source_files.insert(pending.source_file_fingerprint.clone());
@@ -2181,6 +2853,145 @@ pub fn apply_claude_reported_usage_with_index(
                 Some("session_exclusive_reported_usage:v1".to_string());
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
         }
+    }
+
+    // The complete local transcript census can disprove ownership through a
+    // duplicated request id, but uniqueness is not positive ownership: the
+    // predecessor may be missing or deleted. Exact inherited-prefix or
+    // session-exclusive provider/local proof below must establish the start;
+    // all duplicate, missing-id, or unproven-start shapes fail closed.
+    let duplicated_request_hashes = if census_complete {
+        let mut owners = BTreeMap::<String, BTreeSet<(String, String)>>::new();
+        for (root_session_id, pending) in &index.claude_usage_family_pending {
+            if pending.invalid || pending.census_window_end != census_window_end {
+                continue;
+            }
+            for (member_session_id, occurrences) in &pending.member_occurrences {
+                for request_hash in occurrences.keys() {
+                    owners
+                        .entry(request_hash.clone())
+                        .or_default()
+                        .insert((root_session_id.clone(), member_session_id.clone()));
+                }
+            }
+        }
+        owners
+            .into_iter()
+            .filter_map(|(request_hash, owners)| (owners.len() > 1).then_some(request_hash))
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    for item in snapshots.iter_mut() {
+        if item.context_curve.is_none() {
+            // Activity hint did not advertise durable curve admission for this
+            // cycle. Do not mint additive evidence that cannot be settled.
+            continue;
+        }
+        let unavailable_coverage = if item.claude_context_curve_request_index_complete {
+            "ownership_unresolved"
+        } else {
+            "parser_unsupported"
+        };
+        item.context_curve = Some(unavailable_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+            unavailable_coverage,
+            0,
+            0,
+        ));
+        if !census_complete
+            || !item.claude_context_curve_identity_complete
+            || !item.claude_context_curve_request_index_complete
+        {
+            continue;
+        }
+        let root_session_id = claude_snapshot_family_root(item);
+        if index
+            .claude_usage_family_pending
+            .get(&root_session_id)
+            .is_some_and(|pending| {
+                pending.invalid || pending.census_window_end != census_window_end
+            })
+        {
+            continue;
+        }
+        let family = proven
+            .get(&root_session_id)
+            .or_else(|| reconstructed.get(&root_session_id));
+        let excluded_request_hashes = family
+            .and_then(|family| {
+                family
+                    .witness
+                    .legacy_excluded_request_id_hashes
+                    .get(&item.source_session_id)
+            })
+            .cloned()
+            .unwrap_or_default();
+        let owned_start_proven = item.claude_context_curve_owned_start_proven
+            || !excluded_request_hashes.is_empty()
+            || item.usage_accounting_contract.as_deref()
+                == Some("session_exclusive_reported_usage:v1");
+        if !owned_start_proven {
+            // Unique request ids in the bounded census do not prove ownership:
+            // a missing/deleted/out-of-window predecessor can leave a Fable or
+            // takeover transcript's copied prefix looking unique. Require an
+            // explicit provider fork boundary, an exactly excluded copied
+            // prefix, or complete provider-reported ownership evidence.
+            continue;
+        }
+        let unresolved_duplicate = item.claude_usage_request_ids.iter().any(|request_id| {
+            let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+            duplicated_request_hashes.contains(&request_hash)
+                && !excluded_request_hashes.contains(&request_hash)
+        });
+        if unresolved_duplicate {
+            continue;
+        }
+
+        let mut owned_occurrences = item
+            .claude_usage_occurrences
+            .iter()
+            .filter_map(|(request_id, occurrence)| {
+                let request_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
+                (!excluded_request_hashes.contains(&request_hash)).then_some(occurrence)
+            })
+            .collect::<Vec<_>>();
+        owned_occurrences.sort_by_key(|occurrence| occurrence.sequence);
+        let candidates = owned_occurrences
+            .iter()
+            .map(|occurrence| ContextCurveCandidatePoint {
+                observed_at: occurrence.timestamp.clone(),
+                effective_input_tokens: occurrence.effective_input_context,
+                model: occurrence.model.clone(),
+                context_window_tokens: None,
+            })
+            .collect::<Vec<_>>();
+        let first_owned_sequence = owned_occurrences
+            .first()
+            .map(|occurrence| occurrence.sequence)
+            .unwrap_or(u64::MAX);
+        let boundaries = canonical_claude_curve_boundaries(&item.claude_context_curve_boundaries)
+            .into_iter()
+            // A copied-prefix compaction belongs to the predecessor, just like the
+            // copied responses before the first owned request.
+            .filter(|boundary| boundary.response_count_before > first_owned_sequence)
+            .map(|boundary| ContextCurveCandidateBoundary {
+                observed_at: boundary.timestamp,
+                point_count_before: owned_occurrences
+                    .iter()
+                    .filter(|occurrence| occurrence.sequence < boundary.response_count_before)
+                    .count() as u64,
+            })
+            .collect::<Vec<_>>();
+        item.context_curve = Some(build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+            CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+            &candidates,
+            &boundaries,
+            "parser_unsupported",
+        ));
     }
 
     if census_complete {
@@ -3904,6 +4715,67 @@ fn snapshot_fingerprint(source: SnapshotSource, item: &SnapshotItem) -> String {
     )
 }
 
+pub(crate) const SNAPSHOT_BODY_WITNESS_TOOL_VERSION: u64 = 3;
+pub(crate) const SNAPSHOT_BODY_WITNESS_EXCLUSIVE_TOOL_VERSION: u64 = 4;
+pub(crate) const SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION: u64 = 5;
+pub(crate) const SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION: u64 = 6;
+
+/// Backend-compatible, hash-neutral witness version for additive snapshot-body
+/// evidence. Curve-bearing bodies use v5/v6; legacy tool-only bodies use v3/v4.
+/// Semantic identity remains owned exclusively by the component/content hashes.
+pub(crate) fn snapshot_upload_body_witness_version(item: &SnapshotItem) -> Option<u64> {
+    let exclusive =
+        item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1");
+    if item.context_curve.is_some() {
+        return Some(if exclusive {
+            SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION
+        } else {
+            SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION
+        });
+    }
+    if item.tool_usage.is_some() || item.tool_usage_truncated {
+        return Some(if exclusive {
+            SNAPSHOT_BODY_WITNESS_EXCLUSIVE_TOOL_VERSION
+        } else {
+            SNAPSHOT_BODY_WITNESS_TOOL_VERSION
+        });
+    }
+    None
+}
+
+fn snapshot_upload_body_witness_payload(item: &SnapshotItem) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    if let Some(context_curve) = &item.context_curve {
+        payload.insert("context_curve".to_string(), json!(context_curve));
+    }
+    // Mirror wire declaration exactly. Serde omits `None` and false; backend
+    // witnesses include only fields actually declared in the accepted item.
+    if let Some(tool_usage) = &item.tool_usage {
+        payload.insert("tool_usage".to_string(), json!(tool_usage));
+    }
+    if item.tool_usage_truncated {
+        payload.insert(
+            "tool_usage_truncated".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    serde_json::Value::Object(payload)
+}
+
+/// RFC 8785 SHA-256 digest of additive snapshot-body evidence.
+///
+/// `context_curve` and tool evidence must not re-mint semantic entity identity,
+/// but absent -> present and later corrections still need delivery. The digest
+/// intentionally excludes the semantic fingerprint and witness version so its
+/// bytes match the backend accepted-log/body-witness contract exactly. Local
+/// progress keys it by fingerprint separately.
+pub(crate) fn snapshot_upload_body_witness(item: &SnapshotItem) -> String {
+    let payload = snapshot_upload_body_witness_payload(item);
+    let canonical = crate::canonical_json::canonicalize(&payload)
+        .expect("snapshot additive body witness canonicalizes");
+    format!("{:x}", Sha256::digest(canonical))
+}
+
 /// The policy-neutral component hashes, in canonical order.
 pub(crate) fn policy_neutral_component_hashes(
     component_hashes: &BTreeMap<&'static str, String>,
@@ -4337,9 +5209,19 @@ pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result
         })
         .map_err(|error| format!("snapshot[{index}] wire encoding: {error}"))?
         .len();
-        if item_size > MAX_SNAPSHOT_ITEM_WIRE_BYTES {
+        let mut item_without_curve = item.clone();
+        item_without_curve.context_curve = None;
+        let item_without_curve_size =
+            snapshot_item_wire_size(source, &item_without_curve, request.upload_policy);
+        if !snapshot_item_wire_size_is_allowed(
+            item_size,
+            item_without_curve_size,
+            item.context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+        ) {
             return Err(format!(
-                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES}"
+                "snapshot[{index}] wire body is {item_size} bytes; maximum is {MAX_SNAPSHOT_ITEM_WIRE_BYTES} (or {MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES} only for an explicit payload_budget_exceeded clear whose ordinary item fits)"
             ));
         }
     }
@@ -4359,6 +5241,16 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
         return Err(format!(
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
         ));
+    }
+    if let Some(curve) = item.context_curve.as_ref() {
+        validate_context_curve(index, curve)?;
+        if item.provenance.collector == "codex_state_sqlite"
+            && matches!(curve.coverage.as_str(), "complete" | "sampled")
+        {
+            return Err(format!(
+                "snapshot[{index}] state-only Codex evidence cannot carry an available context_curve"
+            ));
+        }
     }
     crate::session_attribution::validate_fact_limits(&item.attribution_facts)
         .map_err(|error| format!("snapshot[{index}] {error}"))?;
@@ -4431,6 +5323,224 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
         }
     }
 
+    Ok(())
+}
+
+fn validate_context_curve(index: usize, curve: &SnapshotContextCurve) -> Result<(), String> {
+    let fail = |message: &str| format!("snapshot[{index}] context_curve {message}");
+    if curve.contract_version != CONTEXT_CURVE_CONTRACT_VERSION {
+        return Err(fail("has unsupported contract_version"));
+    }
+    if !context_curve_revision_is_safe(&curve.parser_revision)
+        || !context_curve_revision_is_safe(&curve.ownership_revision)
+        || curve.sampling_revision != CONTEXT_CURVE_SAMPLING_REVISION
+    {
+        return Err(fail("has invalid revision evidence"));
+    }
+    if curve.points.len() > MAX_CONTEXT_CURVE_POINTS
+        || curve.boundaries.len() > MAX_CONTEXT_CURVE_BOUNDARIES
+        || curve.model_windows.len() > MAX_CONTEXT_CURVE_MODEL_WINDOWS
+    {
+        return Err(fail("exceeds element caps"));
+    }
+    let encoded_size = serde_json::to_vec(curve)
+        .map_err(|error| fail(&format!("cannot serialize: {error}")))?
+        .len();
+    if encoded_size > MAX_CONTEXT_CURVE_WIRE_BYTES {
+        return Err(fail("exceeds 64 KiB wire cap"));
+    }
+    let available = matches!(curve.coverage.as_str(), "complete" | "sampled");
+    if !available {
+        if !matches!(
+            curve.coverage.as_str(),
+            "ownership_unresolved"
+                | "parser_unsupported"
+                | "pre_capture"
+                | "payload_budget_exceeded"
+        ) {
+            return Err(fail("has invalid coverage"));
+        }
+        if curve.total_owned_request_count != 0
+            || curve.retained_point_count != 0
+            || curve.total_compaction_boundary_count != 0
+            || curve.retained_boundary_count != 0
+            || !curve.points.is_empty()
+            || !curve.boundaries.is_empty()
+            || !curve.model_windows.is_empty()
+        {
+            return Err(fail("unavailable coverage must carry zero evidence"));
+        }
+        return Ok(());
+    }
+    if curve.total_owned_request_count == 0
+        || curve.retained_point_count != curve.points.len() as u64
+        || curve.retained_boundary_count != curve.boundaries.len() as u64
+        || curve.retained_point_count > curve.total_owned_request_count
+        || curve.retained_boundary_count > curve.total_compaction_boundary_count
+    {
+        return Err(fail("has inconsistent counts"));
+    }
+    if curve.coverage == "complete"
+        && (curve.retained_point_count != curve.total_owned_request_count
+            || curve.retained_boundary_count != curve.total_compaction_boundary_count)
+    {
+        return Err(fail("complete coverage must retain all evidence"));
+    }
+    if curve.coverage == "sampled"
+        && curve.retained_point_count == curve.total_owned_request_count
+        && curve.retained_boundary_count == curve.total_compaction_boundary_count
+    {
+        return Err(fail("sampled coverage must omit evidence"));
+    }
+    for (position, window) in curve.model_windows.iter().enumerate() {
+        if window.model_window_index != position as u16
+            || safe_context_curve_model(Some(&window.model)) != window.model
+            || window.context_window_tokens == Some(0)
+            || !matches!(
+                window.evidence_kind.as_str(),
+                "provider_reported_window" | "provider_reported_model" | "unavailable"
+            )
+            || (window.evidence_kind == "provider_reported_window"
+                && window.context_window_tokens.is_none())
+            || (window.evidence_kind == "provider_reported_model"
+                && (window.context_window_tokens.is_some() || window.model == "unknown"))
+            || (window.evidence_kind == "unavailable"
+                && (window.context_window_tokens.is_some() || window.model != "unknown"))
+            || !context_curve_revision_is_safe(&window.evidence_revision)
+        {
+            return Err(fail("has invalid model-window evidence"));
+        }
+    }
+    let boundary_by_index = curve
+        .boundaries
+        .iter()
+        .map(|boundary| (boundary.boundary_index, boundary))
+        .collect::<BTreeMap<_, _>>();
+    if boundary_by_index.len() != curve.boundaries.len()
+        || curve
+            .boundaries
+            .windows(2)
+            .any(|pair| pair[0].boundary_index >= pair[1].boundary_index)
+    {
+        return Err(fail("boundary indexes must be unique and increasing"));
+    }
+    for boundary in &curve.boundaries {
+        if boundary.boundary_index == 0
+            || boundary.boundary_index > curve.total_compaction_boundary_count
+            || boundary.after_owned_request_ordinal
+                != boundary.before_owned_request_ordinal.saturating_add(1)
+            || boundary.segment_after_ordinal != boundary.segment_before_ordinal.saturating_add(1)
+            || OffsetDateTime::parse(&boundary.observed_at, &Rfc3339).is_err()
+        {
+            return Err(fail("has invalid boundary evidence"));
+        }
+    }
+    if curve.points.windows(2).any(|pair| {
+        pair[0].owned_request_ordinal >= pair[1].owned_request_ordinal
+            || timestamp_is_after(&pair[0].observed_at, &pair[1].observed_at)
+            || pair[0].segment_ordinal > pair[1].segment_ordinal
+    }) {
+        return Err(fail(
+            "point ordinals, timestamps, and segments must be nondecreasing",
+        ));
+    }
+    if curve.boundaries.windows(2).any(|pair| {
+        timestamp_is_after(&pair[0].observed_at, &pair[1].observed_at)
+            || pair[0].segment_before_ordinal > pair[1].segment_before_ordinal
+    }) {
+        return Err(fail(
+            "boundary timestamps and segments must be nondecreasing",
+        ));
+    }
+    for point in &curve.points {
+        if point.owned_request_ordinal == 0
+            || point.owned_request_ordinal > curve.total_owned_request_count
+            || point.model_window_index as usize >= curve.model_windows.len()
+            || point.effective_input_tokens == 0
+            || point.retention_flags == 0
+            || point.retention_flags > 0x3f
+            || OffsetDateTime::parse(&point.observed_at, &Rfc3339).is_err()
+        {
+            return Err(fail("has invalid point evidence"));
+        }
+        if let Some(boundary_index) = point.compaction_after_request_boundary_index {
+            let boundary = boundary_by_index
+                .get(&boundary_index)
+                .ok_or_else(|| fail("point references missing after-request boundary"))?;
+            if boundary.before_owned_request_ordinal != point.owned_request_ordinal
+                || boundary.segment_before_ordinal != point.segment_ordinal
+                || point.retention_flags & CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE == 0
+            {
+                return Err(fail("after-request boundary reference is inconsistent"));
+            }
+        }
+        if let Some(boundary_index) = point.compaction_before_request_boundary_index {
+            let boundary = boundary_by_index
+                .get(&boundary_index)
+                .ok_or_else(|| fail("point references missing before-request boundary"))?;
+            if boundary.after_owned_request_ordinal != point.owned_request_ordinal
+                || boundary.segment_after_ordinal != point.segment_ordinal
+                || point.retention_flags & CONTEXT_CURVE_RETENTION_COMPACTION_AFTER == 0
+            {
+                return Err(fail("before-request boundary reference is inconsistent"));
+            }
+        }
+        if (point.retention_flags & CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE != 0)
+            != point.compaction_after_request_boundary_index.is_some()
+            || (point.retention_flags & CONTEXT_CURVE_RETENTION_COMPACTION_AFTER != 0)
+                != point.compaction_before_request_boundary_index.is_some()
+        {
+            return Err(fail("compaction retention flags do not match references"));
+        }
+    }
+    for anchor in [1_u64, 2, 5, 10, 20]
+        .into_iter()
+        .filter(|ordinal| *ordinal <= curve.total_owned_request_count)
+    {
+        if !curve.points.iter().any(|point| {
+            point.owned_request_ordinal == anchor
+                && point.retention_flags & CONTEXT_CURVE_RETENTION_ANCHOR != 0
+        }) {
+            return Err(fail("does not retain a required anchor"));
+        }
+    }
+    if !curve.points.iter().any(|point| {
+        point.owned_request_ordinal == curve.total_owned_request_count
+            && point.retention_flags & CONTEXT_CURVE_RETENTION_TAIL != 0
+    }) {
+        return Err(fail("does not retain the final tail point"));
+    }
+    let retained_max = curve
+        .points
+        .iter()
+        .map(|point| point.effective_input_tokens)
+        .max()
+        .unwrap_or_default();
+    if !curve.points.iter().any(|point| {
+        point.effective_input_tokens == retained_max
+            && point.retention_flags & CONTEXT_CURVE_RETENTION_PEAK != 0
+    }) {
+        return Err(fail("does not retain a flagged peak"));
+    }
+    for boundary in &curve.boundaries {
+        let before = curve
+            .points
+            .iter()
+            .find(|point| point.owned_request_ordinal == boundary.before_owned_request_ordinal)
+            .ok_or_else(|| fail("does not retain the request before a boundary"))?;
+        let after = curve
+            .points
+            .iter()
+            .find(|point| point.owned_request_ordinal == boundary.after_owned_request_ordinal)
+            .ok_or_else(|| fail("does not retain the request after a boundary"))?;
+        if before.compaction_after_request_boundary_index != Some(boundary.boundary_index)
+            || after.compaction_before_request_boundary_index != Some(boundary.boundary_index)
+            || timestamp_is_after(&before.observed_at, &boundary.observed_at)
+            || timestamp_is_after(&boundary.observed_at, &after.observed_at)
+        {
+            return Err(fail("boundary adjacency references are incomplete"));
+        }
+    }
     Ok(())
 }
 
@@ -4551,6 +5661,7 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     selector: SelectorCapture,
     reasoning_effort: Option<String>,
     timestamp: Option<String>,
+    effective_input_context: u64,
 }
 
 impl ClaudeResponseObservation {
@@ -4583,6 +5694,7 @@ impl ClaudeResponseObservation {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn merge(
         &mut self,
         usage: UsageTotals,
@@ -4591,6 +5703,7 @@ impl ClaudeResponseObservation {
         reasoning_effort: Option<String>,
         request_id: Option<String>,
         timestamp: Option<String>,
+        computed_effective_input_context: Option<u64>,
     ) {
         if !claude_usage_is_progressive_after(&usage, &self.usage)
             || !merge_optional_claude_field(&mut self.model, model)
@@ -4604,6 +5717,12 @@ impl ClaudeResponseObservation {
         // The provider's terminal cumulative output is authoritative. Equal
         // repeats remain harmless; a regression was rejected above.
         self.usage = usage;
+        if let Some(next) = computed_effective_input_context {
+            self.computed_effective_input_context = Some(
+                self.computed_effective_input_context
+                    .map_or(next, |current| current.max(next)),
+            );
+        }
         if timestamp.is_some() {
             self.terminal_timestamp = timestamp;
         }
@@ -4670,6 +5789,7 @@ struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
     spawn_parents: BTreeMap<String, String>,
+    spawn_parent_conflicts: BTreeSet<String>,
     /// True only when an existing state DB could not be read completely. A
     /// missing DB means there is no state-only source and is complete-empty.
     state_census_incomplete: bool,
@@ -5359,6 +6479,7 @@ enum CodexOwnershipBoundary {
 
 struct SnapshotAccumulator {
     source: SnapshotSource,
+    context_curve_enabled: bool,
     source_session_id: Option<String>,
     account_identifier_hash: Option<String>,
     title: Option<String>,
@@ -5399,6 +6520,14 @@ struct SnapshotAccumulator {
     codex_legacy_bootstrap_valid: bool,
     codex_parent_ownership_ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    // Trusted, content-free child -> parent edge loaded from Codex's local
+    // state DB before the rollout is parsed. It is consulted only when the
+    // rollout's own first header says `agent_created_thread`; ordinary files
+    // and user-authored delegation lookalikes cannot activate it.
+    codex_sidecar_parent: Option<(String, String)>,
+    // Marks the stricter created-thread prefix path so unsigned records at the
+    // ownership boundary are never replayed as child-owned.
+    codex_trusted_sidecar_boundary: bool,
     codex_parent_session_ref: Option<String>,
     codex_parent_signatures: Option<Vec<String>>,
     codex_parent_ledger_identity_used: Option<String>,
@@ -5412,6 +6541,9 @@ struct SnapshotAccumulator {
     codex_inherited_usage_records_skipped: u64,
     codex_duplicate_usage_records_skipped: u64,
     codex_cumulative_reset_count: u64,
+    codex_context_curve_candidates: Vec<ContextCurveCandidatePoint>,
+    codex_context_curve_boundaries: Vec<ContextCurveCandidateBoundary>,
+    codex_context_curve_exact_supported: bool,
     // Identity of the last provider usage event, used only to collapse an
     // exact repeated physical checkpoint. Cumulative totals alone are not an
     // occurrence key: a restarted epoch can legitimately reach the same total.
@@ -5476,6 +6608,9 @@ struct SnapshotAccumulator {
     // coverage and never serialized.
     claude_usage_request_ids: BTreeSet<String>,
     claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
+    claude_context_curve_identity_complete: bool,
+    claude_context_curve_request_index_complete: bool,
+    claude_context_curve_owned_start_proven: bool,
     tool_usage_counts: BTreeMap<String, u64>,
     tool_usage_truncated: bool,
     // Current Pi transcripts carry usage on `type=message` assistant records;
@@ -5518,6 +6653,7 @@ impl SnapshotAccumulator {
     fn new(source: SnapshotSource) -> Self {
         Self {
             source,
+            context_curve_enabled: true,
             source_session_id: None,
             account_identifier_hash: None,
             title: None,
@@ -5541,6 +6677,8 @@ impl SnapshotAccumulator {
             codex_legacy_trigger_seen: false,
             codex_legacy_bootstrap_valid: true,
             codex_parent_ownership_ledgers: None,
+            codex_sidecar_parent: None,
+            codex_trusted_sidecar_boundary: false,
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
             codex_parent_ledger_identity_used: None,
@@ -5554,6 +6692,9 @@ impl SnapshotAccumulator {
             codex_inherited_usage_records_skipped: 0,
             codex_duplicate_usage_records_skipped: 0,
             codex_cumulative_reset_count: 0,
+            codex_context_curve_candidates: Vec::new(),
+            codex_context_curve_boundaries: Vec::new(),
+            codex_context_curve_exact_supported: true,
             codex_last_usage_event_identity: None,
             codex_legacy_bootstrap_buffer: Vec::new(),
             accepted_usage_totals: UsageTotals::default(),
@@ -5589,6 +6730,9 @@ impl SnapshotAccumulator {
             claude_response_sequence: 0,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            claude_context_curve_identity_complete: true,
+            claude_context_curve_request_index_complete: true,
+            claude_context_curve_owned_start_proven: false,
             tool_usage_counts: BTreeMap::new(),
             tool_usage_truncated: false,
             seen_pi_usage_keys: BTreeMap::new(),
@@ -5601,6 +6745,19 @@ impl SnapshotAccumulator {
             compaction_timestamps: Vec::new(),
             claude_compaction_observations: Vec::new(),
         }
+    }
+
+    fn seed_codex_sidecar_parent(&mut self, path: &Path, metadata: &CodexTitleMetadata) {
+        if metadata.state_census_incomplete || metadata.sidecar_census_incomplete {
+            return;
+        }
+        let Some(child) = codex_session_id_from_path(path) else {
+            return;
+        };
+        let Some((parent, _, _)) = metadata.family_position(child.as_str()) else {
+            return;
+        };
+        self.codex_sidecar_parent = Some((child, parent));
     }
 
     fn configure_codex_ownership(&mut self, value: &Value) {
@@ -5617,11 +6774,75 @@ impl SnapshotAccumulator {
             .and_then(Value::as_object)
             .is_some_and(|source| source.contains_key("subagent"));
         let is_subagent = thread_source.as_deref() == Some("subagent") || source_subagent;
+        // Until exact curve admission is advertised, preserve the established
+        // session parser byte-for-byte: the collector PR must be inert. Once
+        // enabled, created-thread ownership becomes load-bearing for every
+        // posture/curve field and therefore uses the trusted sidecar proof.
+        let is_created_thread =
+            self.context_curve_enabled && thread_source.as_deref() == Some("agent_created_thread");
         let forked_from_id = string_at(meta, &["forked_from_id"]);
         self.codex_parent_session_ref = forked_from_id.clone();
         let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
         let exact_start = u64_at(meta, &["subagent_history_start_ordinal"]);
-        self.codex_is_fork = forked_from_id.is_some() || has_history_base || exact_start.is_some();
+        self.codex_is_fork = is_created_thread
+            || forked_from_id.is_some()
+            || has_history_base
+            || exact_start.is_some();
+
+        if is_created_thread {
+            let source_session_id =
+                string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"]));
+            let trusted_parent = self
+                .codex_sidecar_parent
+                .as_ref()
+                .filter(|(child, _)| {
+                    source_session_id
+                        .as_deref()
+                        .is_some_and(|session_id| session_id.eq_ignore_ascii_case(child))
+                })
+                .map(|(_, parent)| parent.clone());
+            self.codex_parent_session_ref = trusted_parent.clone();
+            if trusted_parent
+                .as_ref()
+                .zip(forked_from_id.as_ref())
+                .is_some_and(|(sidecar_parent, transcript_parent)| {
+                    !sidecar_parent.eq_ignore_ascii_case(transcript_parent)
+                })
+            {
+                self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                return;
+            }
+            if let (Some(_), Some(start)) = (trusted_parent.as_ref(), exact_start) {
+                self.codex_ordinal_expected = Some(0);
+                self.codex_ownership_boundary = CodexOwnershipBoundary::Ordinal { start };
+                return;
+            }
+            if trusted_parent.is_some() && has_history_base {
+                // The provider states that inherited history is external to
+                // this physical file, so every local record is child-owned.
+                self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+                return;
+            }
+            let parent_ledger = trusted_parent.as_deref().and_then(|parent_id| {
+                self.codex_parent_ownership_ledgers
+                    .as_ref()
+                    .and_then(|ledgers| ledgers.lock().ok())
+                    .and_then(|ledgers| ledgers.get(parent_id).cloned())
+                    .filter(|ledger| ledger.complete && !ledger.signatures.is_empty())
+            });
+            self.codex_ownership_boundary = if let Some(parent_ledger) = parent_ledger {
+                self.codex_parent_ledger_identity_used = Some(parent_ledger.opened_object_identity);
+                self.codex_parent_signatures = Some(parent_ledger.signatures);
+                self.codex_trusted_sidecar_boundary = true;
+                CodexOwnershipBoundary::AwaitingParentPrefix
+            } else {
+                // The rollout declares a created-thread successor, but an
+                // exact trusted parent edge/ledger is unavailable. Counting it
+                // as all-local would re-admit a copied predecessor prefix.
+                CodexOwnershipBoundary::AmbiguousFork
+            };
+            return;
+        }
 
         self.codex_ownership_boundary = if let Some(start) = exact_start {
             self.codex_ordinal_expected = Some(0);
@@ -5697,6 +6918,13 @@ impl SnapshotAccumulator {
                         // A non-empty ordered common prefix proves copied
                         // history; the first divergent turn/usage signature is
                         // the child's first provider-owned occurrence.
+                        if self.codex_trusted_sidecar_boundary {
+                            // Unsigned records after the final matched parent
+                            // signature are ownership-ambiguous. In particular,
+                            // a copied trailing compaction must not be replayed
+                            // as child-owned at the first divergent request.
+                            self.codex_legacy_bootstrap_buffer.clear();
+                        }
                         self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                         self.codex_owned_record_seen = true;
                         true
@@ -6062,6 +7290,7 @@ impl SnapshotAccumulator {
                 reasoning_effort,
                 request_id,
                 timestamp,
+                computed_effective_input_context,
             );
             return;
         }
@@ -6097,9 +7326,12 @@ impl SnapshotAccumulator {
                 self.note_dropped_usage();
                 continue;
             }
+            let effective_input_context = response
+                .computed_effective_input_context
+                .unwrap_or_else(|| response.usage.effective_input_context());
             if let Some(request_id) = response.request_id.take() {
-                self.claude_usage_request_ids.insert(request_id.clone());
-                self.claude_usage_occurrences.insert(
+                let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
+                let prior_occurrence = self.claude_usage_occurrences.insert(
                     request_id,
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
@@ -6108,16 +7340,23 @@ impl SnapshotAccumulator {
                         selector: response.selector.clone(),
                         reasoning_effort: response.reasoning_effort.clone(),
                         timestamp: response.terminal_timestamp.clone(),
+                        effective_input_context,
                     },
                 );
+                // Progressive rows for one response were merged by response
+                // key above. Reaching this point twice for one provider request
+                // id therefore means two distinct responses claim the same
+                // request identity; their request index is not trustworthy.
+                if !request_id_was_new || prior_occurrence.is_some() {
+                    self.claude_context_curve_identity_complete = false;
+                }
+            } else {
+                self.claude_context_curve_identity_complete = false;
             }
             self.note_claude_turn_duration_between(
                 response.preceding_user_timestamp.as_deref(),
                 response.first_timestamp.as_deref(),
             );
-            let effective_input_context = response
-                .computed_effective_input_context
-                .unwrap_or_else(|| response.usage.effective_input_context());
             if effective_input_context > 0 {
                 if self.first_turn_context_tokens.is_none() {
                     self.first_turn_context_tokens = Some(effective_input_context);
@@ -6713,6 +7952,37 @@ impl SnapshotAccumulator {
                     CompactionMetrics::default(),
                 )
             };
+        let context_curve = if !self.context_curve_enabled {
+            None
+        } else {
+            match self.source {
+                SnapshotSource::Codex if self.codex_context_curve_exact_supported => {
+                    Some(build_context_curve(
+                        self.source.parser_version(),
+                        CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                        CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                        &self.codex_context_curve_candidates,
+                        &self.codex_context_curve_boundaries,
+                        "pre_capture",
+                    ))
+                }
+                SnapshotSource::Codex => Some(unavailable_context_curve(
+                    self.source.parser_version(),
+                    CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                    "pre_capture",
+                    0,
+                    0,
+                )),
+                SnapshotSource::ClaudeCode => Some(unavailable_context_curve(
+                    self.source.parser_version(),
+                    CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                    "ownership_unresolved",
+                    0,
+                    0,
+                )),
+                SnapshotSource::Pi => None,
+            }
+        };
         let mut item = SnapshotItem {
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),
@@ -6793,6 +8063,12 @@ impl SnapshotAccumulator {
             } else {
                 None
             },
+            context_curve,
+            claude_context_curve_boundaries: self.claude_compaction_observations,
+            claude_context_curve_identity_complete: self.claude_context_curve_identity_complete,
+            claude_context_curve_request_index_complete: self
+                .claude_context_curve_request_index_complete,
+            claude_context_curve_owned_start_proven: self.claude_context_curve_owned_start_proven,
             activity_summary,
             tool_usage,
             tool_usage_truncated,
@@ -7127,10 +8403,11 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     claude_effort_support_dir: Option<&Path>,
+    context_curve_enabled: bool,
     hinted_paths: &[PathBuf],
     watcher_overflowed: bool,
 ) -> Result<SourceScanResult> {
-    scan_source_roots_with_limit_and_attribution(
+    scan_source_roots_with_limit_and_attribution_and_curve(
         source,
         roots,
         index,
@@ -7142,6 +8419,7 @@ pub fn scan_source_roots_with_attribution_and_claude_effort_and_hints(
         claude_effort_support_dir,
         hinted_paths,
         watcher_overflowed,
+        context_curve_enabled,
     )
 }
 
@@ -7167,6 +8445,7 @@ pub fn scan_source_roots_with_attribution_and_claude_effort(
         artifacts_enabled,
         attribution_context,
         claude_effort_support_dir,
+        true,
         &[],
         false,
     )
@@ -7345,6 +8624,37 @@ fn scan_source_roots_with_limit_and_attribution(
     claude_effort_support_dir: Option<&Path>,
     hinted_paths: &[PathBuf],
     watcher_overflowed: bool,
+) -> Result<SourceScanResult> {
+    scan_source_roots_with_limit_and_attribution_and_curve(
+        source,
+        roots,
+        index,
+        collected_at,
+        requested_backfill_window_days,
+        file_limit,
+        artifacts_enabled,
+        attribution_context,
+        claude_effort_support_dir,
+        hinted_paths,
+        watcher_overflowed,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_source_roots_with_limit_and_attribution_and_curve(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    requested_backfill_window_days: u64,
+    file_limit: usize,
+    artifacts_enabled: bool,
+    attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    claude_effort_support_dir: Option<&Path>,
+    hinted_paths: &[PathBuf],
+    watcher_overflowed: bool,
+    context_curve_enabled: bool,
 ) -> Result<SourceScanResult> {
     index.activate_quarantine_witness(source);
     let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
@@ -7655,6 +8965,7 @@ fn scan_source_roots_with_limit_and_attribution(
         }
         scanned_file_count += 1;
         let previous_snapshot_fingerprint = index.last_snapshot_fingerprint(&candidate);
+        let previous_upload_body_witness = index.last_upload_body_witness(&candidate);
         let source_file_fingerprint = candidate.source_file_fingerprint.clone();
         let parsed_file = match source {
             SnapshotSource::Codex => parse_opened_jsonl_file(
@@ -7671,6 +8982,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 codex_parent_ownership_ledgers.clone(),
                 true,
                 attribution_context,
+                context_curve_enabled,
             ),
             SnapshotSource::ClaudeCode => parse_opened_jsonl_file(
                 opened_file,
@@ -7686,6 +8998,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 artifacts_enabled,
                 attribution_context,
+                context_curve_enabled,
             ),
             SnapshotSource::Pi => parse_opened_jsonl_file(
                 opened_file,
@@ -7701,6 +9014,7 @@ fn scan_source_roots_with_limit_and_attribution(
                 None,
                 true,
                 attribution_context,
+                context_curve_enabled,
             ),
         };
         let mut parsed_file = match parsed_file {
@@ -7786,6 +9100,9 @@ fn scan_source_roots_with_limit_and_attribution(
             source_file_fingerprint: source_file_fingerprint.clone(),
             previous_snapshot_fingerprint: (decision != CandidateDecision::ReconcileLegacy)
                 .then_some(previous_snapshot_fingerprint)
+                .flatten(),
+            previous_upload_body_witness: (decision != CandidateDecision::ReconcileLegacy)
+                .then_some(previous_upload_body_witness)
                 .flatten(),
             parse_complete,
             parsed_snapshot_count,
@@ -7956,6 +9273,11 @@ fn scan_source_roots_with_limit_and_attribution(
     let zero_snapshot_confirmed_count = index.confirmed_empty_files.len();
     let zero_snapshot_usage_evidence_count = counts.zero_snapshot_usage_evidence_count;
     let dropped_usage_record_count = counts.dropped_usage_record_count;
+    if !context_curve_enabled {
+        for snapshot in &mut snapshots {
+            snapshot.context_curve = None;
+        }
+    }
     Ok(SourceScanResult {
         source,
         backfill_window_days,
@@ -8148,6 +9470,17 @@ fn codex_state_only_snapshot(
         compaction_total_post_tokens: None,
         compaction_total_cumulative_dropped_tokens: None,
         compaction_total_duration_ms: None,
+        context_curve: Some(unavailable_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
+            "pre_capture",
+            0,
+            0,
+        )),
+        claude_context_curve_boundaries: Vec::new(),
+        claude_context_curve_identity_complete: false,
+        claude_context_curve_request_index_complete: false,
+        claude_context_curve_owned_start_proven: false,
         activity_summary: None,
         tool_usage: None,
         tool_usage_truncated: false,
@@ -8425,6 +9758,7 @@ fn parse_jsonl_file(
         None,
         artifacts_enabled,
         attribution_context,
+        true,
     )?;
     Ok(ParsedSnapshotFile {
         snapshots: parsed.snapshots,
@@ -8477,6 +9811,7 @@ fn parse_opened_jsonl_file(
     >,
     artifacts_enabled: bool,
     attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    context_curve_enabled: bool,
 ) -> Result<ParsedJsonlFile> {
     let mut reader = BufReader::new(file);
     // Snapshot semantics come from provider-native session evidence. Mutable
@@ -8484,9 +9819,15 @@ fn parse_opened_jsonl_file(
     // today's defaults to cumulative historical usage would retroactively
     // rewrite old sessions and make a config edit a global replay trigger.
     let mut accumulator = SnapshotAccumulator::new(source);
+    accumulator.context_curve_enabled = context_curve_enabled;
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
     accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
+    if source == SnapshotSource::Codex && context_curve_enabled {
+        if let Some(metadata) = codex_title_metadata {
+            accumulator.seed_codex_sidecar_parent(path, metadata);
+        }
+    }
     let mut recognized_usage_drop_count = 0;
     let mut positive_recognized_usage_count: usize = 0;
     let mut positive_usage_evidence = false;
@@ -9640,6 +10981,14 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     // the `isCompactSummary` record the Claude parser counts.
     if string_eq_at(value, &["type"], "compacted") {
         accumulator.compaction_count += 1;
+        if accumulator.context_curve_enabled {
+            accumulator
+                .codex_context_curve_boundaries
+                .push(ContextCurveCandidateBoundary {
+                    observed_at: timestamp.clone(),
+                    point_count_before: accumulator.codex_context_curve_candidates.len() as u64,
+                });
+        }
         if let Some(timestamp) = timestamp.clone() {
             accumulator.compaction_timestamps.push(timestamp);
         }
@@ -9696,19 +11045,38 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 "derived_from_logs_2",
             );
         }
-        accumulator.set_cumulative_usage_with_selector(
-            string_at(value, &["token_count", "info", "model"])
-                .or_else(|| string_at(value, &["payload", "info", "model"]))
-                .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
-                .or_else(|| string_at(value, &["payload", "model"])),
+        let model = string_at(value, &["token_count", "info", "model"])
+            .or_else(|| string_at(value, &["payload", "info", "model"]))
+            .or_else(|| string_at(value, &["turn_context", "payload", "model"]))
+            .or_else(|| string_at(value, &["payload", "model"]));
+        let last_usage = codex_last_usage(value);
+        let usage_event_identity = codex_usage_event_identity(value);
+        let admitted = accumulator.set_cumulative_usage_with_selector(
+            model.clone(),
             usage,
-            codex_last_usage(value),
-            codex_usage_event_identity(value),
+            last_usage.clone(),
+            usage_event_identity.clone(),
             usage_selector,
             timestamp.as_deref(),
             implicit_request_count,
             accumulator.latest_reasoning_effort.clone(),
         );
+        if admitted.is_some() && accumulator.context_curve_enabled {
+            match (last_usage, usage_event_identity) {
+                (Some(last_usage), Some(_)) if last_usage.input_tokens > 0 => {
+                    accumulator
+                        .codex_context_curve_candidates
+                        .push(ContextCurveCandidatePoint {
+                            observed_at: timestamp.clone(),
+                            // Codex input_tokens already includes cached input.
+                            effective_input_tokens: last_usage.input_tokens,
+                            model: model.or_else(|| accumulator.latest_model.clone()),
+                            context_window_tokens: codex_model_context_window(value),
+                        });
+                }
+                _ => accumulator.codex_context_curve_exact_supported = false,
+            }
+        }
     }
     if string_eq_at(value, &["type"], "response_item") {
         let payload_type = string_at(value, &["payload", "type"]);
@@ -10078,6 +11446,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             // excludes its usage, lifecycle, activity, title, model, context,
             // compaction, and artifacts from the child while leaving graph
             // attribution untouched (that is path/sidecar-derived later).
+            accumulator.claude_context_curve_owned_start_proven = true;
             return;
         }
         ClaudeForkLineProvenance::Invalid => {
@@ -10122,6 +11491,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 post_tokens: None,
                 cumulative_dropped_tokens: None,
                 duration_ms: None,
+                response_count_before: accumulator.claude_response_sequence,
             });
     }
     if is_current_compaction {
@@ -10146,6 +11516,7 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 post_tokens,
                 cumulative_dropped_tokens,
                 duration_ms,
+                response_count_before: accumulator.claude_response_sequence,
             });
     }
     accumulator.note_time(timestamp.clone());
@@ -10189,6 +11560,17 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         // prompt sits in the iterations, and the small non-zero remainder would
         // otherwise be accepted as this session's baseline.
         let effective_input_context = claude_code_effective_input_context(value, &usage);
+        if claude_code_usage_root(value)
+            .and_then(|root| root.get("iterations"))
+            .and_then(Value::as_array)
+            .is_some_and(|iterations| iterations.len() > 1)
+        {
+            // Each iteration is a distinct model request, but the containing
+            // response exposes only one stable request id and one terminal
+            // timestamp. Keep the response-level peak watermarks, but never
+            // claim this collapsed shape is an exact request-indexed curve.
+            accumulator.claude_context_curve_request_index_complete = false;
+        }
         let mut selector = claude_code_selector_from_line(value);
         // Tag the 1M-context attribution bucket from this turn's effective input
         // volume. Claude Code logs the BASE model id (e.g. `claude-opus-4-8`)
@@ -10535,6 +11917,14 @@ fn codex_last_usage(value: &Value) -> Option<UsageTotals> {
         .or_else(|| value.pointer("/payload/last_token_usage"))
         .or_else(|| value.pointer("/last_token_usage"))?;
     codex_usage_from_root(root, false)
+}
+
+fn codex_model_context_window(value: &Value) -> Option<u64> {
+    raw_value_at(value, &["token_count", "info", "model_context_window"])
+        .or_else(|| raw_value_at(value, &["payload", "info", "model_context_window"]))
+        .or_else(|| raw_value_at(value, &["info", "model_context_window"]))
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)
 }
 
 fn codex_usage_event_identity(value: &Value) -> Option<String> {
@@ -11393,12 +12783,18 @@ impl BoundedCandidateSelection {
 
 impl CodexTitleMetadata {
     fn family_position(&self, child: &str) -> Option<(String, String, u64)> {
+        if self.spawn_parent_conflicts.contains(child) {
+            return None;
+        }
         let parent = self.spawn_parents.get(child)?.clone();
         let mut root = parent.clone();
         let mut depth = 1_u64;
         let mut seen = BTreeSet::from([child.to_string()]);
         while let Some(next) = self.spawn_parents.get(root.as_str()) {
-            if !seen.insert(root.clone()) || depth >= 128 {
+            if self.spawn_parent_conflicts.contains(root.as_str())
+                || !seen.insert(root.clone())
+                || depth >= 128
+            {
                 return None;
             }
             root = next.clone();
@@ -11438,7 +12834,13 @@ impl CodexTitleMetadata {
             family
                 .as_ref()
                 .map(|(parent, _, _)| parent.as_str())
-                .unwrap_or(""),
+                .unwrap_or_else(|| {
+                    if self.spawn_parent_conflicts.contains(source_session_id) {
+                        "conflict"
+                    } else {
+                        ""
+                    }
+                }),
             family
                 .as_ref()
                 .map(|(_, root, _)| root.as_str())
@@ -11471,8 +12873,11 @@ impl CodexTitleMetadata {
             let title_census = load_codex_sqlite_titles(&state_path, &mut metadata.titles);
             let state_census =
                 load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
-            let spawn_census =
-                load_codex_sqlite_spawn_edges(&state_path, &mut metadata.spawn_parents);
+            let spawn_census = load_codex_sqlite_spawn_edges(
+                &state_path,
+                &mut metadata.spawn_parents,
+                &mut metadata.spawn_parent_conflicts,
+            );
             if title_census.is_err() || state_census.is_err() || spawn_census.is_err() {
                 metadata.state_census_incomplete = true;
                 metadata.sidecar_census_incomplete = true;
@@ -11753,6 +13158,7 @@ fn load_codex_sqlite_state_threads(
 fn load_codex_sqlite_spawn_edges(
     path: &Path,
     spawn_parents: &mut BTreeMap<String, String>,
+    spawn_parent_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -11785,7 +13191,7 @@ fn load_codex_sqlite_spawn_edges(
                 .as_deref()
                 .and_then(|message| codex_created_thread_parent(&child, message))
             {
-                spawn_parents.entry(child).or_insert(parent);
+                record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
             }
         }
     }
@@ -11806,10 +13212,31 @@ fn load_codex_sqlite_spawn_edges(
     }
     for (parent, child) in loaded {
         if !parent.is_empty() && !child.is_empty() && parent != child {
-            spawn_parents.insert(child, parent);
+            record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
         }
     }
     Ok(())
+}
+
+fn record_codex_spawn_parent(
+    spawn_parents: &mut BTreeMap<String, String>,
+    spawn_parent_conflicts: &mut BTreeSet<String>,
+    child: String,
+    parent: String,
+) {
+    if spawn_parent_conflicts.contains(child.as_str()) {
+        return;
+    }
+    match spawn_parents.get(child.as_str()) {
+        Some(existing) if existing != &parent => {
+            spawn_parents.remove(child.as_str());
+            spawn_parent_conflicts.insert(child);
+        }
+        Some(_) => {}
+        None => {
+            spawn_parents.insert(child, parent);
+        }
+    }
 }
 
 /// Extract the provider-owned parent id from Codex Desktop's create-thread
@@ -13385,6 +14812,26 @@ impl ScanIndex {
         self.snapshot_activity_at.clear();
     }
 
+    pub(crate) fn context_curve_replay_epoch(&self) -> u64 {
+        self.context_curve_replay_epoch
+    }
+
+    pub(crate) fn context_curve_replay_needed(&self, generation: &str) -> bool {
+        self.completed_context_curve_replay_generation.as_deref() != Some(generation)
+    }
+
+    pub(crate) fn mark_context_curve_replay_complete(&mut self, generation: String) {
+        self.context_curve_capability_enabled = true;
+        self.completed_context_curve_replay_generation = Some(generation);
+    }
+
+    pub(crate) fn mark_context_curve_capability_disabled(&mut self) {
+        if self.context_curve_capability_enabled {
+            self.context_curve_replay_epoch = self.context_curve_replay_epoch.saturating_add(1);
+        }
+        self.context_curve_capability_enabled = false;
+    }
+
     fn activate_quarantine_witness(&mut self, source: SnapshotSource) {
         self.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
     }
@@ -13399,6 +14846,15 @@ impl ScanIndex {
             .zip(self.active_quarantine_witness.as_ref())
             .is_some_and(|(persisted, active)| {
                 &persisted.witness != active || persisted.retry_after_unix_seconds <= now
+            })
+    }
+
+    fn quarantine_requires_retry_body(&self, fingerprint: &str, body_witness: &str) -> bool {
+        self.quarantined_snapshot_fingerprints
+            .get(fingerprint)
+            .is_some_and(|record| {
+                record.upload_body_witness.as_deref() != Some(body_witness)
+                    || self.quarantine_requires_retry(fingerprint)
             })
     }
 
@@ -13795,6 +15251,11 @@ impl ScanIndex {
             bounded_sweep_had_unsettled_upload: self.bounded_sweep_had_unsettled_upload,
             traversal: self.traversal.clone(),
             historical_replay_generation: self.historical_replay_generation.clone(),
+            context_curve_capability_enabled: previous.context_curve_capability_enabled,
+            context_curve_replay_epoch: previous.context_curve_replay_epoch,
+            completed_context_curve_replay_generation: previous
+                .completed_context_curve_replay_generation
+                .clone(),
             confirmed_empty_files,
             file_snapshot_fingerprints,
             snapshot_activity_at,
@@ -13907,12 +15368,22 @@ impl ScanIndex {
             .and_then(|entry| entry.last_snapshot_fingerprint.clone())
     }
 
+    fn last_upload_body_witness(&self, candidate: &CandidateFile) -> Option<String> {
+        self.files
+            .get(&local_index_key(&candidate.path))
+            .and_then(|entry| entry.last_upload_body_witness.clone())
+    }
+
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
         let last_snapshot_fingerprint = self
             .files
             .get(&key)
             .and_then(|entry| entry.last_snapshot_fingerprint.clone());
+        let last_upload_body_witness = self
+            .files
+            .get(&key)
+            .and_then(|entry| entry.last_upload_body_witness.clone());
         self.files.insert(
             key,
             ScanIndexEntry {
@@ -13921,6 +15392,7 @@ impl ScanIndex {
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
+                last_upload_body_witness,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -13933,6 +15405,10 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        let last_upload_body_witness = self
+            .files
+            .get(&key)
+            .and_then(|entry| entry.last_upload_body_witness.clone());
         self.files.insert(
             key.clone(),
             ScanIndexEntry {
@@ -13941,6 +15417,7 @@ impl ScanIndex {
                 modified_unix_nanos: Some(candidate.modified_unix_nanos),
                 source_file_fingerprint: candidate.source_file_fingerprint,
                 last_snapshot_fingerprint,
+                last_upload_body_witness,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -14876,6 +16353,35 @@ mod tests {
         path
     }
 
+    fn max_fractional_context_curve_fixture() -> SnapshotContextCurve {
+        let candidates = (0..1_300_u64)
+            .map(|index| ContextCurveCandidatePoint {
+                observed_at: Some(format!(
+                    "2037-01-15T10:{:02}:{:02}.003000000+02:00",
+                    (index / 60) % 60,
+                    index % 60
+                )),
+                effective_input_tokens: u64::MAX - index,
+                model: Some(format!("model-{:02}-{}", index % 16, "x".repeat(119))),
+                context_window_tokens: Some(u64::MAX - index % 16),
+            })
+            .collect::<Vec<_>>();
+        let boundaries = (1..=70_u64)
+            .map(|index| ContextCurveCandidateBoundary {
+                observed_at: candidates[index as usize * 10].observed_at.clone(),
+                point_count_before: index * 10,
+            })
+            .collect::<Vec<_>>();
+        build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &candidates,
+            &boundaries,
+            "parser_unsupported",
+        )
+    }
+
     fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalCheckpoint {
         ScanTraversalCheckpoint {
             context_fingerprint,
@@ -15023,6 +16529,9 @@ mod tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions");
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
+        let all_local_child = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
+        let conflicting_child = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let conflicting_parent = "01a02590-5e24-7f10-8a93-a0c1968d8a3a";
         let untrusted_child = "01a03eae-2513-78f1-a5cc-b0fc720b3bac";
         let database = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
         database
@@ -15030,6 +16539,9 @@ mod tests {
                 "CREATE TABLE threads (\
                     id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
                     thread_source TEXT, first_user_message TEXT\
+                );\
+                CREATE TABLE thread_spawn_edges (\
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL\
                 );",
             )
             .expect("create threads table");
@@ -15052,6 +16564,34 @@ mod tests {
             .expect("seed child");
         database
             .execute(
+                "INSERT INTO threads VALUES (?1, 'All-local child', 10, 'agent_created_thread', ?2)",
+                rusqlite::params![
+                    all_local_child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Start a fresh bounded task.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed all-local child");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Conflicting child', 10, 'agent_created_thread', ?2)",
+                rusqlite::params![
+                    conflicting_child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Conflicting edge.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed conflicting child");
+        database
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES (?1, ?2)",
+                rusqlite::params![conflicting_parent, conflicting_child],
+            )
+            .expect("seed conflicting edge");
+        database
+            .execute(
                 "INSERT INTO threads VALUES (?1, 'User task', 10, 'vscode', ?2)",
                 rusqlite::params![
                     untrusted_child,
@@ -15069,32 +16609,111 @@ mod tests {
             .expect("seed empty created thread");
         drop(database);
 
+        let parent_values = vec![
+            json!({"timestamp":"2026-08-26T15:00:00Z","type":"session_meta","payload":{"id":parent,"thread_source":"vscode","source":"vscode"}}),
+            json!({"timestamp":"2026-08-26T15:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.6"}}),
+            codex_test_token_line(
+                "2026-08-26T15:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-26T15:00:03Z","type":"compacted","payload":{"replacement_history":[]}}),
+        ];
+        let parent_path = sessions_dir.join(format!("rollout-{parent}.jsonl"));
+        fs::write(
+            &parent_path,
+            parent_values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write parent rollout");
+
+        let child_values = vec![
+            json!({"timestamp":"2026-08-26T15:00:10Z","type":"session_meta","payload":{"id":child,"thread_source":"agent_created_thread","source":"vscode"}}),
+            parent_values[0].clone(),
+            parent_values[1].clone(),
+            parent_values[2].clone(),
+            parent_values[3].clone(),
+            json!({"timestamp":"2026-08-26T15:01:01Z","type":"turn_context","payload":{"turn_id":"child-turn-1","model":"gpt-5.6"}}),
+            codex_test_token_line(
+                "2026-08-26T15:01:02Z",
+                None,
+                (130, 100, 15, 3),
+                Some((30, 20, 5, 1)),
+            ),
+            json!({"timestamp":"2026-08-26T15:01:03Z","type":"compacted","payload":{"replacement_history":[]}}),
+            json!({"timestamp":"2026-08-26T15:01:04Z","type":"turn_context","payload":{"turn_id":"child-turn-2","model":"gpt-5.6"}}),
+            codex_test_token_line(
+                "2026-08-26T15:01:05Z",
+                None,
+                (150, 115, 19, 4),
+                Some((20, 15, 4, 1)),
+            ),
+        ];
         let path = sessions_dir.join(format!("rollout-{child}.jsonl"));
         fs::write(
             &path,
-            format!(
-                "{{\"timestamp\":\"2026-08-26T15:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child}\",\"thread_source\":\"agent_created_thread\",\"source\":\"vscode\"}}}}\n\
-                 {{\"timestamp\":\"2026-08-26T15:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1}},\"model\":\"gpt-5.6\"}}}}}}\n"
-            ),
+            child_values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
         )
         .expect("write child rollout");
+
+        let all_local_path = sessions_dir.join(format!("rollout-{all_local_child}.jsonl"));
+        let all_local_values = vec![
+            json!({"timestamp":"2026-08-26T15:02:00Z","type":"session_meta","payload":{"id":all_local_child,"thread_source":"agent_created_thread","source":"vscode"}}),
+            json!({"timestamp":"2026-08-26T15:02:01Z","type":"turn_context","payload":{"turn_id":"fresh-child-turn","model":"gpt-5.6"}}),
+            codex_test_token_line(
+                "2026-08-26T15:02:02Z",
+                None,
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        fs::write(
+            &all_local_path,
+            all_local_values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write all-local child rollout");
 
         let without_edge = CodexTitleMetadata::default().session_sidecar_fingerprint(child);
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert_eq!(metadata.family_position(untrusted_child), None);
+        assert_eq!(metadata.family_position(conflicting_child), None);
+        assert!(metadata.spawn_parent_conflicts.contains(conflicting_child));
         assert!(!metadata.state_census_incomplete);
-        let item = parse_codex_jsonl_file_with_title_metadata(
-            &path,
-            "2026-08-26T15:02:00Z",
-            "fingerprint".to_string(),
-            &metadata,
-            None,
-        )
-        .expect("parse")
-        .into_iter()
-        .next()
-        .expect("snapshot");
+        let parent_ledger = CodexParentOwnershipLedger {
+            signatures: parent_values
+                .iter()
+                .filter_map(codex_ownership_signature)
+                .collect(),
+            complete: true,
+            opened_object_identity: String::new(),
+        };
+        let ledgers = BTreeMap::from([(parent.to_string(), parent_ledger)]);
+        let unresolved =
+            parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
+        assert!(unresolved.snapshots.is_empty());
+        assert!(unresolved.codex_parent_resolution_pending);
+        assert_eq!(unresolved.codex_parent_session_ref.as_deref(), Some(parent));
+        let item = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers.clone())
+            .snapshots
+            .into_iter()
+            .next()
+            .expect("snapshot");
 
         let origin = item.origin.as_ref().expect("child origin");
         assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
@@ -15115,6 +16734,53 @@ mod tests {
             .attribution_facts
             .iter()
             .any(|fact| fact.field == "agent_kind" && fact.value == "codex_subagent"));
+        assert_eq!(
+            (
+                item.input_tokens,
+                item.cache_read_tokens,
+                item.output_tokens,
+                item.reasoning_output_tokens,
+                item.request_count,
+            ),
+            (50, 35, 9, 2, 2),
+        );
+        assert_eq!(item.first_turn_context_tokens, Some(30));
+        assert_eq!(item.peak_context_fill_tokens, Some(30));
+        assert_eq!(item.compaction_count, Some(1));
+        let curve = item.context_curve.as_ref().expect("created-thread curve");
+        assert_eq!(curve.coverage, "complete");
+        assert_eq!(curve.total_owned_request_count, 2);
+        assert_eq!(curve.total_compaction_boundary_count, 1);
+        assert_eq!(
+            curve
+                .points
+                .iter()
+                .map(|point| (point.owned_request_ordinal, point.effective_input_tokens))
+                .collect::<Vec<_>>(),
+            vec![(1, 30), (2, 20)],
+        );
+
+        let all_local_unresolved =
+            parse_codex_test_with_metadata_and_ledgers(&all_local_path, &metadata, ledgers.clone());
+        assert!(all_local_unresolved.snapshots.is_empty());
+        assert!(!all_local_unresolved.codex_parent_resolution_pending);
+
+        let capability_off = parse_codex_test_with_metadata_ledgers_and_curve(
+            &all_local_path,
+            &metadata,
+            ledgers,
+            false,
+        )
+        .snapshots
+        .into_iter()
+        .next()
+        .expect("capability-off parser remains inert");
+        assert_eq!(
+            (capability_off.input_tokens, capability_off.request_count),
+            (12, 1)
+        );
+        assert_eq!(capability_off.first_turn_context_tokens, Some(12));
+        assert!(capability_off.context_curve.is_none());
 
         let _ = fs::remove_dir_all(home);
     }
@@ -15514,6 +17180,7 @@ mod tests {
                     modified_unix_nanos: Some(1_700_000_000_000_000_000),
                     source_file_fingerprint: "sha256:test".to_string(),
                     last_snapshot_fingerprint: Some("sha256:snapshot".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -15573,6 +17240,7 @@ mod tests {
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
+            upload_body_witness: None,
         };
         assert!(snapshot_quarantine_deadline_is_bounded_at(
             &record,
@@ -15788,6 +17456,114 @@ mod tests {
         index.prepare_historical_replay("replay-v2".to_string());
         assert!(index.files.is_empty());
         assert!(index.resume_after_path.is_none());
+    }
+
+    #[test]
+    fn context_curve_replay_completion_survives_shed_and_replays_after_toggle() {
+        let previous = ScanIndex::default();
+        let generation_zero = "codex:curve:0:destination".to_string();
+        let mut in_flight = previous.clone();
+        assert!(in_flight.context_curve_replay_needed(&generation_zero));
+        in_flight.prepare_historical_replay(generation_zero.clone());
+
+        // A partial/shed commit may retain accepted entity checkpoints and the
+        // active cursor, but must not claim the all-history curve replay done.
+        let partial = in_flight.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+        assert!(partial.context_curve_replay_needed(&generation_zero));
+
+        let mut settled = in_flight;
+        settled.mark_context_curve_replay_complete(generation_zero.clone());
+        assert!(!settled.context_curve_replay_needed(&generation_zero));
+        assert_eq!(settled.context_curve_replay_epoch(), 0);
+
+        // The off transition is part of the baseline taken before scanning.
+        // A shed may commit no-curve file changes, so the partial checkpoint
+        // must carry the incremented epoch even if capability returns before
+        // any fully completed off cycle.
+        let mut off_baseline = settled.clone();
+        off_baseline.mark_context_curve_capability_disabled();
+        let mut off_in_flight = off_baseline.clone();
+        off_in_flight.files.insert(
+            "changed-while-off.jsonl".to_string(),
+            manifest_index_entry(Some("accepted-without-curve")),
+        );
+        let off_partial = off_in_flight.committable_subset(
+            &off_baseline,
+            &BTreeSet::from(["accepted-without-curve".to_string()]),
+            &BTreeMap::new(),
+        );
+        assert!(off_partial.files.contains_key("changed-while-off.jsonl"));
+        assert!(!off_partial.context_curve_capability_enabled);
+        assert_eq!(off_partial.context_curve_replay_epoch(), 1);
+        let generation_one = "codex:curve:1:destination".to_string();
+        assert!(off_partial.context_curve_replay_needed(&generation_one));
+        settled = off_partial;
+        settled.prepare_historical_replay(generation_one.clone());
+        settled.mark_context_curve_replay_complete(generation_one.clone());
+        assert!(!settled.context_curve_replay_needed(&generation_one));
+
+        // Repeated disabled cycles are inert; one off epoch creates one replay.
+        settled.mark_context_curve_capability_disabled();
+        assert_eq!(settled.context_curve_replay_epoch(), 2);
+        settled.mark_context_curve_capability_disabled();
+        assert_eq!(settled.context_curve_replay_epoch(), 2);
+    }
+
+    #[test]
+    fn every_context_curve_derivation_revision_rearms_exactly_one_replay() {
+        let base = context_curve_derivation_revision_key(
+            "parser:v1",
+            "ownership:v1",
+            "sampling:v1",
+            "model:v1",
+        );
+        let variants = [
+            context_curve_derivation_revision_key(
+                "parser:v2",
+                "ownership:v1",
+                "sampling:v1",
+                "model:v1",
+            ),
+            context_curve_derivation_revision_key(
+                "parser:v1",
+                "ownership:v2",
+                "sampling:v1",
+                "model:v1",
+            ),
+            context_curve_derivation_revision_key(
+                "parser:v1",
+                "ownership:v1",
+                "sampling:v2",
+                "model:v1",
+            ),
+            context_curve_derivation_revision_key(
+                "parser:v1",
+                "ownership:v1",
+                "sampling:v1",
+                "model:v2",
+            ),
+        ];
+        let mut settled = ScanIndex::default();
+        settled.mark_context_curve_replay_complete(base.clone());
+        assert!(!settled.context_curve_replay_needed(&base));
+        for variant in variants {
+            assert!(settled.context_curve_replay_needed(&variant));
+            settled.mark_context_curve_replay_complete(variant.clone());
+            assert!(!settled.context_curve_replay_needed(&variant));
+        }
+
+        let codex = context_curve_derivation_revision(SnapshotSource::Codex).expect("Codex curve");
+        assert!(codex.contains(CODEX_SNAPSHOT_PARSER_VERSION));
+        assert!(codex.contains(CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION));
+        assert!(codex.contains(CONTEXT_CURVE_SAMPLING_REVISION));
+        assert!(codex.contains(CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION));
+        let claude =
+            context_curve_derivation_revision(SnapshotSource::ClaudeCode).expect("Claude curve");
+        assert!(claude.contains(CLAUDE_CODE_SNAPSHOT_PARSER_VERSION));
+        assert!(claude.contains(CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION));
+        assert!(claude.contains(CONTEXT_CURVE_SAMPLING_REVISION));
+        assert!(claude.contains(CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION));
+        assert_eq!(context_curve_derivation_revision(SnapshotSource::Pi), None);
     }
 
     #[test]
@@ -16041,6 +17817,7 @@ mod tests {
                     modified_unix_nanos: Some(candidate.modified_unix_nanos),
                     source_file_fingerprint: candidate.source_file_fingerprint.clone(),
                     last_snapshot_fingerprint: Some("group".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -16057,6 +17834,7 @@ mod tests {
                 SnapshotQuarantineRecord {
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
+                    upload_body_witness: None,
                 },
             )]),
             ..ScanIndex::default()
@@ -16103,6 +17881,7 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: legacy_source_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot-fingerprint".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: None,
                 },
             )]),
@@ -16186,6 +17965,7 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: legacy_file_fingerprint,
                     last_snapshot_fingerprint: Some("legacy-snapshot".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: None,
                 },
             )]),
@@ -16236,6 +18016,7 @@ mod tests {
                     modified_unix_nanos: Some(1_777_777_777_000_000_001),
                     source_file_fingerprint: "old".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
                 },
             )]),
@@ -16273,6 +18054,7 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: "legacy-previous-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: None,
                 },
             )]),
@@ -16307,6 +18089,7 @@ mod tests {
                     modified_unix_nanos: None,
                     source_file_fingerprint: "legacy-matching-sidecar".to_string(),
                     last_snapshot_fingerprint: Some("snapshot".to_string()),
+                    last_upload_body_witness: None,
                     scan_identity_version: None,
                 },
             )]),
@@ -16401,6 +18184,7 @@ mod tests {
             SnapshotQuarantineRecord {
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
+                upload_body_witness: None,
             },
         );
 
@@ -19901,6 +21685,7 @@ mod tests {
             modified_unix_nanos: None,
             source_file_fingerprint: v6_key.clone(),
             last_snapshot_fingerprint: None,
+            last_upload_body_witness: None,
             scan_identity_version: None,
         };
 
@@ -20496,6 +22281,11 @@ mod tests {
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
+            context_curve: None,
+            claude_context_curve_boundaries: Vec::new(),
+            claude_context_curve_identity_complete: false,
+            claude_context_curve_request_index_complete: false,
+            claude_context_curve_owned_start_proven: false,
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
@@ -22879,6 +24669,11 @@ mod tests {
         assert!(items.iter().all(|item| {
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         }));
+        let child_curve = items[1].context_curve.as_ref().expect("child curve");
+        assert_eq!(child_curve.coverage, "complete");
+        assert_eq!(child_curve.total_owned_request_count, 1);
+        assert_eq!(child_curve.points[0].effective_input_tokens, 10);
+        assert_eq!(child_curve.points[0].owned_request_ordinal, 1);
         assert_eq!(
             items[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.0005")
@@ -23161,6 +24956,13 @@ mod tests {
         assert!(items.iter().all(|item| {
             item.usage_accounting_contract.as_deref() == Some("session_exclusive_reported_usage:v1")
         }));
+        let child_curve = items[1]
+            .context_curve
+            .as_ref()
+            .expect("legacy child owned curve");
+        assert_eq!(child_curve.coverage, "complete");
+        assert_eq!(child_curve.total_owned_request_count, 1);
+        assert_eq!(child_curve.points[0].effective_input_tokens, 12);
         let child_witness = index
             .claude_usage_family_witnesses
             .get(child)
@@ -23223,6 +25025,13 @@ mod tests {
         );
         assert_eq!(unproven[0].request_count, 2);
         assert_eq!(unproven[0].usage_accounting_contract, None);
+        assert_eq!(
+            unproven[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
         let mut unhealthy_terminal = Vec::new();
         apply_claude_reported_usage_with_index(
             &mut unhealthy_terminal,
@@ -25913,6 +27722,248 @@ mod tests {
     }
 
     #[test]
+    fn claude_context_curve_waits_for_complete_local_ownership_census() {
+        let path = temp_file("claude-context-curve-owned");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-20T10:00:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"forkedFrom\":{\"sessionId\":\"claude-curve-parent\",\"messageUuid\":\"parent-message\"},\"requestId\":\"req_parent\",\"message\":{\"id\":\"msg_parent\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":900000,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:01:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:01:01Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:02:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_2\",\"message\":{\"id\":\"msg_curve_2\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3,\"cache_read_input_tokens\":200}}}\n",
+                "{\"timestamp\":\"2026-08-20T10:02:30Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\"}}\n",
+                "{\"timestamp\":\"2026-08-20T10:03:00Z\",\"sessionId\":\"claude-curve-owned\",\"type\":\"assistant\",\"requestId\":\"req_curve_3\",\"message\":{\"id\":\"msg_curve_3\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":30,\"output_tokens\":4,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":7}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T10:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(
+            items[0]
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.coverage.as_str()),
+            Some("ownership_unresolved")
+        );
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let mut index = ScanIndex::default();
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut index,
+            true,
+            "2026-08-20T10:04:00Z",
+        );
+        let curve = items[0].context_curve.as_ref().expect("owned curve");
+        assert_eq!(curve.coverage, "complete");
+        assert_eq!(curve.total_owned_request_count, 3);
+        assert_eq!(curve.points[0].observed_at, "2026-08-20T10:01:01Z");
+        assert_eq!(
+            curve
+                .points
+                .iter()
+                .map(|point| point.effective_input_tokens)
+                .collect::<Vec<_>>(),
+            vec![115, 220, 337]
+        );
+        assert_eq!(curve.boundaries[0].before_owned_request_ordinal, 2);
+        assert_eq!(curve.boundaries[0].after_owned_request_ordinal, 3);
+        assert_eq!(curve.model_windows[0].model, "claude-opus-4-8");
+        assert_eq!(curve.model_windows[0].context_window_tokens, None);
+        assert_eq!(
+            curve.model_windows[0].evidence_kind,
+            "provider_reported_model"
+        );
+        assert_eq!(items[0].usage_accounting_contract, None);
+        validate_context_curve(0, curve).expect("Claude curve validates");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_context_curve_missing_request_identity_fails_closed() {
+        let path = temp_file("claude-context-curve-no-request-id");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-missing-id\",\"type\":\"assistant\",\"message\":{\"id\":\"msg_curve_missing\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T11:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        };
+        let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &trace_report,
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        let curve = items[0].context_curve.as_ref().expect("coverage object");
+        assert_eq!(curve.coverage, "ownership_unresolved");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_context_curve_duplicate_request_identity_fails_closed() {
+        let path = temp_file("claude-context-curve-duplicate-request-id");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_first\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"claude-curve-duplicate\",\"type\":\"assistant\",\"requestId\":\"req_curve_duplicate\",\"message\":{\"id\":\"msg_curve_second\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T11:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+
+        let curve = items[0].context_curve.as_ref().expect("coverage object");
+        assert_eq!(curve.coverage, "ownership_unresolved");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_context_curve_multi_iteration_response_is_not_request_indexed() {
+        let path = temp_file("claude-context-curve-multi-iteration");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"claude-curve-multi\",\"type\":\"assistant\",\"requestId\":\"req_curve_multi\",\"message\":{\"id\":\"msg_curve_multi\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":3,\"output_tokens\":20,\"iterations\":[{\"input_tokens\":10,\"cache_read_input_tokens\":100},{\"input_tokens\":20,\"cache_read_input_tokens\":200}]}}}\n",
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T11:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        assert_eq!(items[0].peak_context_fill_tokens, Some(220));
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        };
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        let curve = items[0].context_curve.as_ref().expect("coverage object");
+        assert_eq!(curve.coverage, "parser_unsupported");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_context_curve_missing_predecessor_does_not_own_copied_prefix() {
+        let path = temp_file("claude-context-curve-missing-predecessor");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-20T11:01:00Z\",\"sessionId\":\"fable-takeover\",\"type\":\"assistant\",\"requestId\":\"req_copied_unique\",\"message\":{\"id\":\"msg_copied_unique\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":895000,\"output_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-08-20T11:02:00Z\",\"sessionId\":\"fable-takeover\",\"type\":\"assistant\",\"requestId\":\"req_owned_unique\",\"message\":{\"id\":\"msg_owned_unique\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":100,\"output_tokens\":3}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items = parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-20T11:04:00Z",
+            "curve-fingerprint".to_string(),
+        )
+        .expect("parse");
+        let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+            evidence: BTreeMap::new(),
+            health: Default::default(),
+        };
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &api_report,
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            "2026-08-20T11:04:00Z",
+        );
+        let curve = items[0].context_curve.as_ref().expect("coverage object");
+        assert_eq!(curve.coverage, "ownership_unresolved");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claude_fresh_root_without_provider_marker_remains_unresolved() {
+        let path = temp_file("claude-context-curve-native-root");
+        let root_timestamp = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("format root timestamp");
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"custom-title\",\"customTitle\":\"Native root\"}}\n{{\"type\":\"mode\",\"mode\":\"default\"}}\n{{\"type\":\"queue-operation\",\"operation\":\"dequeue\"}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"user\",\"parentUuid\":null,\"isCompactSummary\":false,\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n{{\"timestamp\":\"{root_timestamp}\",\"sessionId\":\"claude-native-root\",\"type\":\"assistant\",\"requestId\":\"req_native_root\",\"message\":{{\"id\":\"msg_native_root\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":2}}}}}}\n"
+            ),
+        )
+        .expect("write fixture");
+        let mut items =
+            parse_claude_code_jsonl_file(&path, &root_timestamp, "curve-fingerprint".to_string())
+                .expect("parse");
+        assert!(!items[0].claude_context_curve_owned_start_proven);
+        apply_claude_reported_usage_with_index(
+            &mut items,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+                evidence: BTreeMap::new(),
+                health: Default::default(),
+            },
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            &mut ScanIndex::default(),
+            true,
+            &root_timestamp,
+        );
+        let curve = items[0].context_curve.as_ref().expect("coverage object");
+        assert_eq!(curve.coverage, "ownership_unresolved");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn compaction_timeline_keeps_newest_64_for_snapshot_upload() {
         let mut timestamps = (0..72)
             .map(|index| {
@@ -25984,6 +28035,33 @@ mod tests {
             item.compaction_timestamps,
             vec!["2026-07-17T03:04:00Z".to_string()]
         );
+        let curve = item.context_curve.as_ref().expect("Codex curve");
+        assert_eq!(curve.coverage, "complete");
+        assert_eq!(curve.total_owned_request_count, 4);
+        assert_eq!(curve.retained_point_count, 4);
+        assert_eq!(
+            curve
+                .points
+                .iter()
+                .map(|point| point.effective_input_tokens)
+                .collect::<Vec<_>>(),
+            vec![22_817, 33_205, 45_272, 25_182]
+        );
+        assert_eq!(curve.boundaries.len(), 1);
+        assert_eq!(curve.boundaries[0].boundary_index, 1);
+        assert_eq!(curve.boundaries[0].before_owned_request_ordinal, 3);
+        assert_eq!(curve.boundaries[0].after_owned_request_ordinal, 4);
+        assert_eq!(
+            curve.points[2].compaction_after_request_boundary_index,
+            Some(1)
+        );
+        assert_eq!(
+            curve.points[3].compaction_before_request_boundary_index,
+            Some(1)
+        );
+        assert_eq!(curve.model_windows[0].model_window_index, 0);
+        assert_eq!(curve.model_windows[0].context_window_tokens, Some(258_400));
+        validate_context_curve(0, curve).expect("Codex curve is wire-valid");
 
         let _ = fs::remove_file(path);
     }
@@ -26075,6 +28153,13 @@ mod tests {
         let serialized = serde_json::to_value(&item).expect("serialize");
         assert!(serialized.get("peak_context_fill_tokens").is_none());
         assert!(serialized.get("first_turn_context_tokens").is_none());
+        let curve = item
+            .context_curve
+            .as_ref()
+            .expect("explicit curve coverage");
+        assert_eq!(curve.coverage, "pre_capture");
+        assert_eq!(curve.total_owned_request_count, 0);
+        assert!(curve.points.is_empty());
 
         let _ = fs::remove_file(path);
     }
@@ -26199,6 +28284,756 @@ mod tests {
             "e69a7dbf291f50c62e8298740c57e812d30ea41fadb888fb4d7cb438f699da0d",
             "context_posture feeds content_hash; read this test's docs before re-pinning"
         );
+    }
+
+    #[test]
+    fn context_curve_is_hash_neutral_and_deterministically_bounded() {
+        let first = max_fractional_context_curve_fixture();
+        let second = max_fractional_context_curve_fixture();
+        assert_eq!(first, second);
+        assert_eq!(first.coverage, "sampled");
+        assert_eq!(first.total_owned_request_count, 1_300);
+        assert_eq!(first.total_compaction_boundary_count, 70);
+        assert_eq!(first.retained_boundary_count, 64);
+        assert_eq!(first.model_windows.len(), MAX_CONTEXT_CURVE_MODEL_WINDOWS);
+        assert!(first
+            .model_windows
+            .iter()
+            .all(|window| window.model.len() == 128));
+        assert!(first.retained_point_count <= MAX_CONTEXT_CURVE_POINTS as u64);
+        assert!(
+            serde_json::to_vec(&first).expect("serialize").len() <= MAX_CONTEXT_CURVE_WIRE_BYTES
+        );
+        assert_eq!(
+            first
+                .boundaries
+                .iter()
+                .map(|boundary| boundary.boundary_index)
+                .collect::<Vec<_>>(),
+            (1..=32).chain(39..=70).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first
+                .points
+                .iter()
+                .filter(|point| {
+                    point.compaction_before_request_boundary_index.is_some()
+                        || point.compaction_after_request_boundary_index.is_some()
+                })
+                .count(),
+            128,
+            "all before/after points for 64 retained boundaries stay present"
+        );
+        for ordinal in [1_u64, 2, 5, 10, 20] {
+            assert!(first.points.iter().any(|point| {
+                point.owned_request_ordinal == ordinal
+                    && point.retention_flags & CONTEXT_CURVE_RETENTION_ANCHOR != 0
+            }));
+        }
+        assert!(first.points.iter().any(|point| {
+            point.owned_request_ordinal == 1
+                && point.retention_flags & CONTEXT_CURVE_RETENTION_PEAK != 0
+        }));
+        assert!(first.points.iter().any(|point| {
+            point.owned_request_ordinal == 1_300
+                && point.retention_flags & CONTEXT_CURVE_RETENTION_TAIL != 0
+        }));
+        validate_context_curve(0, &first).expect("sampled curve validates");
+
+        let mut item = valid_v6_batch_request().snapshots.remove(0);
+        let before = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
+        item.context_curve = Some(first.clone());
+        let after = snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, &item);
+        assert_eq!(before, after, "curve stays out of semantic/content hashes");
+
+        let mut request = valid_v6_batch_request();
+        {
+            let item = &mut request.snapshots[0];
+            item.context_curve = Some(first.clone());
+            item.compaction_timestamps = (0..MAX_COMPACTION_TIMESTAMPS)
+                .map(|second| format!("2026-08-20T12:00:{:02}Z", second % 60))
+                .collect();
+            item.tool_usage = Some(
+                (0..MAX_TOOL_USAGE_NAMES)
+                    .map(|index| SnapshotToolUsage {
+                        name: format!("tool_{index:03}_{}", "x".repeat(119)),
+                        count: u64::MAX,
+                    })
+                    .collect(),
+            );
+            item.tool_usage_truncated = true;
+            item.session_artifacts = (0..MAX_SESSION_ARTIFACTS)
+                .map(|index| SessionArtifact {
+                    kind: "pull_request".to_string(),
+                    value: format!("https://example.invalid/org/repository/pull/{index}"),
+                })
+                .collect();
+            item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        }
+        validate_snapshot_batch_request(&request).expect("max curve fits populated item");
+        let item = &request.snapshots[0];
+        let envelope =
+            snapshot_semantic_envelope(SnapshotSource::ClaudeCode, item, request.upload_policy);
+        let curve_bytes = serde_json::to_vec(item.context_curve.as_ref().expect("curve"))
+            .expect("serialize curve")
+            .len();
+        let item_bytes = serde_json::to_vec(&SnapshotItemWire {
+            snapshot: item,
+            semantic_envelope: envelope,
+        })
+        .expect("serialize item")
+        .len();
+        let batch_bytes = serde_json::to_vec(&request).expect("serialize batch").len();
+        eprintln!(
+            "max context curve bytes={curve_bytes}; retained points={}; populated item bytes={item_bytes}; batch bytes={batch_bytes}",
+            first.retained_point_count
+        );
+        assert!(curve_bytes <= MAX_CONTEXT_CURVE_WIRE_BYTES);
+        assert!(item_bytes <= MAX_SNAPSHOT_ITEM_WIRE_BYTES);
+        assert!(batch_bytes <= MAX_SNAPSHOT_BATCH_WIRE_BYTES);
+    }
+
+    #[test]
+    fn context_curve_wire_is_content_free_and_field_allowlisted() {
+        fn collect_keys(value: &Value, keys: &mut BTreeSet<String>) {
+            match value {
+                Value::Object(object) => {
+                    for (key, child) in object {
+                        keys.insert(key.clone());
+                        collect_keys(child, keys);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        collect_keys(child, keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let value =
+            serde_json::to_value(max_fractional_context_curve_fixture()).expect("curve serializes");
+        let mut keys = BTreeSet::new();
+        collect_keys(&value, &mut keys);
+        let expected = BTreeSet::from_iter(
+            [
+                "contract_version",
+                "parser_revision",
+                "ownership_revision",
+                "sampling_revision",
+                "coverage",
+                "total_owned_request_count",
+                "retained_point_count",
+                "total_compaction_boundary_count",
+                "retained_boundary_count",
+                "points",
+                "boundaries",
+                "model_windows",
+                "owned_request_ordinal",
+                "observed_at",
+                "effective_input_tokens",
+                "model_window_index",
+                "segment_ordinal",
+                "retention_flags",
+                "compaction_before_request_boundary_index",
+                "compaction_after_request_boundary_index",
+                "boundary_index",
+                "before_owned_request_ordinal",
+                "after_owned_request_ordinal",
+                "segment_before_ordinal",
+                "segment_after_ordinal",
+                "model",
+                "context_window_tokens",
+                "evidence_kind",
+                "evidence_revision",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        assert_eq!(keys, expected);
+        let encoded = serde_json::to_string(&value).expect("curve encodes");
+        for forbidden in [
+            "http://",
+            "https://",
+            "/Users/",
+            "prompt",
+            "tool_result",
+            "command",
+            "screenshot",
+            "reasoning",
+        ] {
+            assert!(!encoded.contains(forbidden), "curve leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn context_curve_yields_to_the_whole_snapshot_item_budget() {
+        let mut request = valid_v6_batch_request();
+        let policy = request.upload_policy;
+        let item = &mut request.snapshots[0];
+        item.context_curve = Some(max_fractional_context_curve_fixture());
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        let original_points = item
+            .context_curve
+            .as_ref()
+            .expect("curve")
+            .retained_point_count;
+        let current_size = snapshot_item_wire_size(SnapshotSource::ClaudeCode, item, policy);
+        let synthetic_budget = current_size - 2_048;
+        fit_context_curve_to_snapshot_item_budget(
+            SnapshotSource::ClaudeCode,
+            item,
+            policy,
+            synthetic_budget,
+        );
+        let fitted = item
+            .context_curve
+            .as_ref()
+            .expect("fitted curve remains explicit");
+        assert_eq!(fitted.coverage, "sampled");
+        assert!(fitted.retained_point_count < original_points);
+        assert!(
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, item, policy) <= synthetic_budget
+        );
+        validate_snapshot_batch_request(&request).expect("pruned curve keeps snapshot uploadable");
+
+        let mut mandatory_request = valid_v6_batch_request();
+        let policy = mandatory_request.upload_policy;
+        let mandatory_item = &mut mandatory_request.snapshots[0];
+        let mut mandatory_curve = max_fractional_context_curve_fixture();
+        while prune_one_context_curve_fill_point(&mut mandatory_curve) {}
+        mandatory_item.context_curve = Some(mandatory_curve);
+        mandatory_item.snapshot_fingerprint =
+            snapshot_fingerprint(SnapshotSource::ClaudeCode, mandatory_item);
+        let mandatory_size =
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, mandatory_item, policy);
+        let mut unavailable_probe = mandatory_item.clone();
+        let mandatory_curve = unavailable_probe.context_curve.as_ref().expect("curve");
+        unavailable_probe.context_curve = Some(unavailable_context_curve(
+            &mandatory_curve.parser_revision,
+            &mandatory_curve.ownership_revision,
+            "payload_budget_exceeded",
+            0,
+            0,
+        ));
+        let unavailable_size =
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &unavailable_probe, policy);
+        assert!(mandatory_size > unavailable_size);
+        fit_context_curve_to_snapshot_item_budget(
+            SnapshotSource::ClaudeCode,
+            mandatory_item,
+            policy,
+            unavailable_size,
+        );
+        let unavailable = mandatory_item
+            .context_curve
+            .as_ref()
+            .expect("budget reason remains explicit");
+        assert_eq!(unavailable.coverage, "payload_budget_exceeded");
+        assert_eq!(unavailable.total_owned_request_count, 0);
+        assert!(unavailable.points.is_empty());
+        assert!(
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, mandatory_item, policy)
+                <= unavailable_size
+        );
+        validate_snapshot_batch_request(&mandatory_request)
+            .expect("unavailable curve never quarantines ordinary snapshot evidence");
+
+        let mut reserve_item = unavailable_probe;
+        let mut reserve_base = reserve_item.clone();
+        reserve_base.context_curve = None;
+        let reserve_base_size =
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &reserve_base, policy);
+        let near_limit_budget = reserve_base_size + 1;
+        fit_context_curve_to_snapshot_item_budget(
+            SnapshotSource::ClaudeCode,
+            &mut reserve_item,
+            policy,
+            near_limit_budget,
+        );
+        assert_eq!(
+            reserve_item
+                .context_curve
+                .as_ref()
+                .expect("explicit clear is never omitted")
+                .coverage,
+            "payload_budget_exceeded"
+        );
+        let reserve_item_size =
+            snapshot_item_wire_size(SnapshotSource::ClaudeCode, &reserve_item, policy);
+        assert!(reserve_item_size > near_limit_budget);
+        assert!(reserve_item_size <= near_limit_budget + 1_024);
+
+        assert!(snapshot_item_wire_size_is_allowed(
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES + 1,
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+            Some("payload_budget_exceeded")
+        ));
+        assert!(!snapshot_item_wire_size_is_allowed(
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES + 1,
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+            Some("sampled")
+        ));
+        assert!(!snapshot_item_wire_size_is_allowed(
+            MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES + 1,
+            MAX_SNAPSHOT_ITEM_WIRE_BYTES,
+            Some("payload_budget_exceeded")
+        ));
+    }
+
+    #[test]
+    fn context_curve_collection_is_inert_without_server_capability() {
+        let root = temp_dir("context-curve-capability-gate");
+        let path = root.join("rollout-capability-gate.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-08-24T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"capability-gate\"}}\n",
+                "{\"timestamp\":\"2026-08-24T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":42,\"output_tokens\":2,\"request_count\":1},\"last_token_usage\":{\"input_tokens\":42,\"output_tokens\":2},\"model_context_window\":258400,\"model\":\"gpt-5.5\"}}}\n"
+            ),
+        )
+        .expect("write rollout");
+        let scan = |context_curve_enabled| {
+            scan_source_roots_with_limit_and_attribution_and_curve(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&root),
+                &mut ScanIndex::default(),
+                "2026-08-24T10:02:00Z",
+                730,
+                10,
+                true,
+                None,
+                None,
+                &[],
+                false,
+                context_curve_enabled,
+            )
+            .expect("scan")
+        };
+        assert_eq!(scan(false).snapshots[0].context_curve, None);
+        assert!(scan(true).snapshots[0].context_curve.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn context_curve_fails_closed_on_unsafe_or_unbounded_model_evidence() {
+        let hostile_path = "/Users/operator/private/repository/session.jsonl";
+        let hostile = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &[ContextCurveCandidatePoint {
+                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+                effective_input_tokens: 10,
+                model: Some(hostile_path.to_string()),
+                context_window_tokens: None,
+            }],
+            &[],
+            "parser_unsupported",
+        );
+        assert_eq!(hostile.coverage, "complete");
+        assert_eq!(hostile.model_windows[0].model, "unknown");
+        assert_eq!(hostile.model_windows[0].evidence_kind, "unavailable");
+        assert!(!serde_json::to_string(&hostile)
+            .expect("serialize hostile evidence")
+            .contains(hostile_path));
+
+        let window_without_safe_model = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &[ContextCurveCandidatePoint {
+                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+                effective_input_tokens: 10,
+                model: Some(hostile_path.to_string()),
+                context_window_tokens: Some(258_400),
+            }],
+            &[],
+            "parser_unsupported",
+        );
+        assert_eq!(window_without_safe_model.coverage, "complete");
+        assert_eq!(window_without_safe_model.model_windows[0].model, "unknown");
+        assert_eq!(
+            window_without_safe_model.model_windows[0].evidence_kind,
+            "provider_reported_window"
+        );
+
+        let too_many_models = (0..17_u64)
+            .map(|index| ContextCurveCandidatePoint {
+                observed_at: Some(format!("2026-08-20T12:00:{:02}Z", index + 1)),
+                effective_input_tokens: index + 1,
+                model: Some(format!("model-{index}")),
+                context_window_tokens: None,
+            })
+            .collect::<Vec<_>>();
+        let unavailable = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &too_many_models,
+            &[],
+            "parser_unsupported",
+        );
+        assert_eq!(unavailable.coverage, "parser_unsupported");
+        assert_eq!(unavailable.total_owned_request_count, 0);
+        assert!(unavailable.points.is_empty());
+    }
+
+    #[test]
+    fn context_curve_fails_closed_without_exact_boundary_adjacency() {
+        let candidates = [1_u64, 2]
+            .into_iter()
+            .map(|ordinal| ContextCurveCandidatePoint {
+                observed_at: Some(format!("2026-08-20T12:00:0{ordinal}Z")),
+                effective_input_tokens: ordinal * 10,
+                model: Some("gpt-5.5".to_string()),
+                context_window_tokens: Some(258_400),
+            })
+            .collect::<Vec<_>>();
+        for point_count_before in [0_u64, 2] {
+            let curve = build_context_curve(
+                CODEX_SNAPSHOT_PARSER_VERSION,
+                "codex_owned_rollout_occurrences:v1",
+                "codex_token_count_model_context_window:v1",
+                &candidates,
+                &[ContextCurveCandidateBoundary {
+                    observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+                    point_count_before,
+                }],
+                "ownership_unresolved",
+            );
+            assert_eq!(curve.coverage, "ownership_unresolved");
+            assert!(curve.boundaries.is_empty());
+        }
+        let out_of_interval = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &candidates,
+            &[ContextCurveCandidateBoundary {
+                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
+                point_count_before: 1,
+            }],
+            "ownership_unresolved",
+        );
+        assert_eq!(out_of_interval.coverage, "ownership_unresolved");
+        assert!(out_of_interval.boundaries.is_empty());
+    }
+
+    #[test]
+    fn context_curve_cross_language_golden_is_canonical_and_current() {
+        let point = |timestamp: &str, tokens: u64, model: &str, window: Option<u64>| {
+            ContextCurveCandidatePoint {
+                observed_at: Some(timestamp.to_string()),
+                effective_input_tokens: tokens,
+                model: Some(model.to_string()),
+                context_window_tokens: window,
+            }
+        };
+        let codex = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &[
+                point("2026-08-20T12:00:01Z", 18_000, "gpt-5.5", Some(258_400)),
+                point("2026-08-20T12:00:02Z", 42_000, "gpt-5.5", Some(258_400)),
+                point("2026-08-20T12:00:04Z", 21_000, "gpt-5.5", Some(258_400)),
+            ],
+            &[ContextCurveCandidateBoundary {
+                observed_at: Some("2026-08-20T12:00:03Z".to_string()),
+                point_count_before: 2,
+            }],
+            "parser_unsupported",
+        );
+        let claude = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[
+                point("2026-08-20T13:00:01Z", 115, "claude-opus-4-8", None),
+                point("2026-08-20T13:00:03Z", 220, "claude-opus-4-8", None),
+                point("2026-08-20T13:00:04Z", 337, "claude-opus-4-8", None),
+            ],
+            &[ContextCurveCandidateBoundary {
+                observed_at: Some("2026-08-20T13:00:02Z".to_string()),
+                point_count_before: 1,
+            }],
+            "parser_unsupported",
+        );
+        let witness = |curve: SnapshotContextCurve,
+                       tool_usage: Option<Vec<SnapshotToolUsage>>,
+                       tool_usage_truncated: bool| {
+            let mut item = sample_session_artifact_item();
+            item.context_curve = Some(curve);
+            item.tool_usage = tool_usage;
+            item.tool_usage_truncated = tool_usage_truncated;
+            json!({
+                "version": snapshot_upload_body_witness_version(&item),
+                "digest": snapshot_upload_body_witness(&item),
+            })
+        };
+        let body_witnesses = json!({
+            "codex_curve_only_v5": witness(codex.clone(), None, false),
+            "claude_curve_only_v5": witness(claude.clone(), None, false),
+            "curve_with_empty_tool_usage_v5": witness(codex.clone(), Some(Vec::new()), false),
+            "curve_with_truncated_only_v5": witness(codex.clone(), None, true),
+            "curve_with_both_tool_fields_v5": witness(
+                codex.clone(),
+                Some(vec![SnapshotToolUsage { name: "Read".to_string(), count: 2 }]),
+                true,
+            ),
+        });
+        let fixture = json!({
+            "fixture_version": "local_context_curve_wire:v1",
+            "codex": codex,
+            "claude_code": claude,
+        });
+        let canonical =
+            crate::canonical_json::canonicalize(&fixture).expect("curve fixture canonicalizes");
+        let fixture_hash = format!("{:x}", Sha256::digest(&canonical));
+        let max_fractional_curve = max_fractional_context_curve_fixture();
+        let max_fractional_canonical = crate::canonical_json::canonicalize(
+            &serde_json::to_value(&max_fractional_curve).expect("max fractional curve serializes"),
+        )
+        .expect("max fractional curve canonicalizes");
+        let max_fractional_hash = format!("{:x}", Sha256::digest(&max_fractional_canonical));
+        let manifest = json!({
+            "manifest_version": "local_context_curve_wire_manifest:v1",
+            "contract_version": CONTEXT_CURVE_CONTRACT_VERSION,
+            "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
+            "fixture_file": "context-curve-v1-golden.json",
+            "fixture_trailing_newline": true,
+            "fixture_canonical_sha256": fixture_hash,
+            "max_fractional_fixture_file": "context-curve-v1-max-fractional.json",
+            "max_fractional_fixture_trailing_newline": true,
+            "max_fractional_fixture_canonical_sha256": max_fractional_hash,
+            "max_fractional_fixture_wire_bytes": max_fractional_canonical.len(),
+            "caps": {
+                "points": MAX_CONTEXT_CURVE_POINTS,
+                "boundaries": MAX_CONTEXT_CURVE_BOUNDARIES,
+                "model_windows": MAX_CONTEXT_CURVE_MODEL_WINDOWS,
+                "wire_bytes": MAX_CONTEXT_CURVE_WIRE_BYTES,
+            },
+            "retention_flags": {
+                "anchor": CONTEXT_CURVE_RETENTION_ANCHOR,
+                "compaction_before": CONTEXT_CURVE_RETENTION_COMPACTION_BEFORE,
+                "compaction_after": CONTEXT_CURVE_RETENTION_COMPACTION_AFTER,
+                "peak": CONTEXT_CURVE_RETENTION_PEAK,
+                "tail": CONTEXT_CURVE_RETENTION_TAIL,
+                "deterministic_fill": CONTEXT_CURVE_RETENTION_FILL,
+            },
+            "revisions": {
+                "sampling": CONTEXT_CURVE_SAMPLING_REVISION,
+                "codex_parser": CODEX_SNAPSHOT_PARSER_VERSION,
+                "codex_ownership": CODEX_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                "codex_model_window_evidence": CODEX_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+                "claude_parser": CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                "claude_ownership": CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                "claude_model_window_evidence": CLAUDE_CONTEXT_CURVE_MODEL_EVIDENCE_REVISION,
+            },
+            "body_witnesses": body_witnesses,
+        });
+        let canonical_manifest =
+            crate::canonical_json::canonicalize(&manifest).expect("curve manifest canonicalizes");
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit/context-curve-v1-golden.json");
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit/context-curve-v1-manifest.json");
+        let max_fractional_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/snapshot-audit/context-curve-v1-max-fractional.json");
+        if std::env::var_os("UPDATE_CONTEXT_CURVE_GOLDEN").is_some() {
+            let mut fixture_file = canonical.clone();
+            fixture_file.push(b'\n');
+            fs::write(&fixture_path, fixture_file).expect("write curve fixture");
+            let mut manifest_file = canonical_manifest.clone();
+            manifest_file.push(b'\n');
+            fs::write(&manifest_path, manifest_file).expect("write curve manifest");
+            let mut max_fractional_file = max_fractional_canonical.clone();
+            max_fractional_file.push(b'\n');
+            fs::write(&max_fractional_path, max_fractional_file)
+                .expect("write max fractional curve fixture");
+        }
+        let mut expected_fixture = canonical;
+        expected_fixture.push(b'\n');
+        let mut expected_manifest = canonical_manifest;
+        expected_manifest.push(b'\n');
+        let mut expected_max_fractional = max_fractional_canonical;
+        expected_max_fractional.push(b'\n');
+        assert_eq!(
+            fs::read(&fixture_path).expect("read curve fixture"),
+            expected_fixture,
+            "run UPDATE_CONTEXT_CURVE_GOLDEN=1 cargo test -p ottto-service --lib context_curve_cross_language_golden_is_canonical_and_current"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("read curve manifest"),
+            expected_manifest,
+            "run UPDATE_CONTEXT_CURVE_GOLDEN=1 cargo test -p ottto-service --lib context_curve_cross_language_golden_is_canonical_and_current"
+        );
+        assert_eq!(
+            fs::read(&max_fractional_path).expect("read max fractional curve fixture"),
+            expected_max_fractional,
+            "run UPDATE_CONTEXT_CURVE_GOLDEN=1 cargo test -p ottto-service --lib context_curve_cross_language_golden_is_canonical_and_current"
+        );
+    }
+
+    #[test]
+    fn context_curve_requires_exact_durable_entity_ack_proof() {
+        let curve = build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &[ContextCurveCandidatePoint {
+                observed_at: Some("2026-08-20T12:00:00.003Z".to_string()),
+                effective_input_tokens: 42,
+                model: Some("gpt-5.5".to_string()),
+                context_window_tokens: Some(258_400),
+            }],
+            &[],
+            "parser_unsupported",
+        );
+        let mut item = sample_session_artifact_item();
+        item.context_curve = Some(curve);
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "claude_code".to_string(),
+            machine_id: "machine".to_string(),
+            collector_version: None,
+            snapshots: vec![item.clone()],
+            upload_policy: SnapshotUploadPolicy::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let response = |version: Option<u64>, digest: Option<String>| {
+            crate::snapshot_client::SnapshotBatchResponse {
+                accepted: 1,
+                sessions_reconciled: 0,
+                session_ids: Vec::new(),
+                disabled: false,
+                disabled_reason: None,
+                entity_ack_contract: Some(SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
+                accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    occurrence_count: 1,
+                    body_witness_version: version,
+                    body_witness_digest: digest,
+                }],
+                unchanged_entities: Vec::new(),
+                rejected_entities: Vec::new(),
+                conflict_entities: Vec::new(),
+            }
+        };
+        let legacy = crate::snapshot_client::SnapshotBatchResponse {
+            accepted: 1,
+            sessions_reconciled: 0,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: None,
+            accepted_entities: Vec::new(),
+            unchanged_entities: Vec::new(),
+            rejected_entities: Vec::new(),
+            conflict_entities: Vec::new(),
+        };
+        legacy
+            .validate_entity_ack(&request)
+            .expect_err("legacy/routing-off ACK cannot settle curve evidence");
+        response(None, None)
+            .validate_entity_ack(&request)
+            .expect_err("generic entity ACK cannot settle curve evidence");
+        response(
+            Some(SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION),
+            Some("0".repeat(64)),
+        )
+        .validate_entity_ack(&request)
+        .expect_err("mismatched durable proof cannot settle curve evidence");
+        response(
+            snapshot_upload_body_witness_version(&item),
+            Some(snapshot_upload_body_witness(&item)),
+        )
+        .validate_entity_ack(&request)
+        .expect("exact accepted-log proof settles curve evidence");
+    }
+
+    #[test]
+    fn context_curve_body_witness_uploads_absent_present_corrections_once() {
+        let root = temp_dir("context-curve-body-witness");
+        let path = root.join("curve-session.jsonl");
+        let base = "{\"timestamp\":\"2026-08-20T12:00:01Z\",\"sessionId\":\"curve-session\",\"requestId\":\"req_curve_1\",\"message\":{\"id\":\"msg_curve_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}\n";
+        let point = |tokens| ContextCurveCandidatePoint {
+            observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+            effective_input_tokens: tokens,
+            model: Some("claude-opus-4-8".to_string()),
+            context_window_tokens: None,
+        };
+        let curve_a = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[point(100)],
+            &[],
+            "ownership_unresolved",
+        );
+        let curve_b = build_context_curve(
+            CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+            "claude_owned_request_start_proof:v1",
+            "claude_transcript_model:v1",
+            &[point(125)],
+            &[],
+            "ownership_unresolved",
+        );
+        let mut index = ScanIndex::default();
+        let mut revision = 0_usize;
+        let mut run = |curve: Option<SnapshotContextCurve>| {
+            revision += 1;
+            fs::write(&path, format!("{base}{}", "{}\n".repeat(revision)))
+                .expect("write forced-parse fixture");
+            let mut result = scan_source_roots_with_limit(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-08-20T12:05:00Z",
+                BACKFILL_WINDOW_DAYS,
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+            )
+            .expect("scan forced-parse fixture");
+            assert_eq!(result.snapshots.len(), 1);
+            result.snapshots[0].context_curve = curve;
+            finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+            (
+                result.snapshots.len(),
+                result.semantic_noop_count,
+                index
+                    .files
+                    .get(&local_index_key(&path))
+                    .and_then(|entry| entry.last_upload_body_witness.clone())
+                    .expect("body witness persisted"),
+            )
+        };
+
+        let (baseline_count, _, baseline_witness) = run(None);
+        assert_eq!(baseline_count, 1);
+        let (present_count, _, curve_a_witness) = run(Some(curve_a.clone()));
+        assert_eq!(present_count, 1, "absent -> present uploads once");
+        assert_ne!(baseline_witness, curve_a_witness);
+        let (identical_count, identical_noops, identical_witness) = run(Some(curve_a.clone()));
+        assert_eq!((identical_count, identical_noops), (0, 1));
+        assert_eq!(curve_a_witness, identical_witness);
+        let (corrected_count, _, curve_b_witness) = run(Some(curve_b));
+        assert_eq!(corrected_count, 1, "curve A -> B uploads");
+        assert_ne!(curve_a_witness, curve_b_witness);
+        let (restored_count, _, restored_witness) = run(Some(curve_a));
+        assert_eq!(restored_count, 1, "curve B -> A uploads");
+        assert_eq!(restored_witness, curve_a_witness);
+        let (rollback_count, _, rollback_witness) = run(None);
+        assert_eq!(rollback_count, 1, "rollback omission uploads once");
+        assert_eq!(rollback_witness, baseline_witness);
+        let (settled_count, settled_noops, _) = run(None);
+        assert_eq!((settled_count, settled_noops), (0, 1));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -28675,6 +31510,23 @@ mod tests {
         path: &Path,
         ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
     ) -> ParsedJsonlFile {
+        parse_codex_test_with_metadata_and_ledgers(path, &CodexTitleMetadata::default(), ledgers)
+    }
+
+    fn parse_codex_test_with_metadata_and_ledgers(
+        path: &Path,
+        metadata: &CodexTitleMetadata,
+        ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+    ) -> ParsedJsonlFile {
+        parse_codex_test_with_metadata_ledgers_and_curve(path, metadata, ledgers, true)
+    }
+
+    fn parse_codex_test_with_metadata_ledgers_and_curve(
+        path: &Path,
+        metadata: &CodexTitleMetadata,
+        ledgers: BTreeMap<String, CodexParentOwnershipLedger>,
+        context_curve_enabled: bool,
+    ) -> ParsedJsonlFile {
         let mut file = File::open(path).expect("open Codex parent-prefix fixture");
         let identity = opened_object_identity(SnapshotSource::Codex, &mut file)
             .expect("identify Codex parent-prefix fixture");
@@ -28686,12 +31538,13 @@ mod tests {
             "fp".to_string(),
             SnapshotSource::Codex,
             apply_codex_line,
-            Some(&CodexTitleMetadata::default()),
+            Some(metadata),
             None,
             None,
             Some(Arc::new(Mutex::new(ledgers))),
             true,
             None,
+            context_curve_enabled,
         )
         .expect("parse Codex parent-prefix fixture")
     }
@@ -29432,6 +32285,7 @@ mod tests {
                 modified_unix_nanos: Some(modified_unix_nanos),
                 source_file_fingerprint: "stale-parent-file".to_string(),
                 last_snapshot_fingerprint: None,
+                last_upload_body_witness: None,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
@@ -29902,12 +32756,14 @@ mod tests {
             "usage_accounting_contract",
             "peak_context_fill_tokens",
             "first_turn_context_tokens",
+            "last_turn_context_tokens",
             "compaction_count",
             "compaction_timestamps",
             "compaction_total_pre_tokens",
             "compaction_total_post_tokens",
             "compaction_total_cumulative_dropped_tokens",
             "compaction_total_duration_ms",
+            "context_curve",
             "activity_summary",
             "tool_usage",
             "tool_usage_truncated",
@@ -30069,6 +32925,23 @@ mod tests {
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
             compaction_total_duration_ms: None,
+            context_curve: Some(build_context_curve(
+                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                "claude_owned_request_start_proof:v1",
+                "claude_transcript_model:v1",
+                &[ContextCurveCandidatePoint {
+                    observed_at: Some("2026-05-28T17:05:00Z".to_string()),
+                    effective_input_tokens: 115,
+                    model: Some("claude-opus-4-7".to_string()),
+                    context_window_tokens: None,
+                }],
+                &[],
+                "parser_unsupported",
+            )),
+            claude_context_curve_boundaries: Vec::new(),
+            claude_context_curve_identity_complete: false,
+            claude_context_curve_request_index_complete: false,
+            claude_context_curve_owned_start_proven: false,
             activity_summary: Some(SnapshotActivitySummary {
                 capability_collection_version: Some("agent_capability_usage:v1".to_string()),
                 tool_calls: 3,
@@ -30153,6 +33026,15 @@ mod tests {
         let snapshot = item_value
             .as_object()
             .expect("snapshot item serializes to an object");
+        assert_eq!(
+            snapshot["context_curve"]["contract_version"],
+            json!(CONTEXT_CURVE_CONTRACT_VERSION)
+        );
+        assert_eq!(snapshot["context_curve"]["retained_point_count"], json!(1));
+        assert_eq!(
+            snapshot["context_curve"]["points"][0]["model_window_index"],
+            json!(0)
+        );
 
         // (2) every snapshot-item key is within the backend's allowed item set.
         for key in snapshot.keys() {
@@ -30263,6 +33145,31 @@ mod tests {
     }
 
     #[test]
+    fn v6_snapshot_preflight_rejects_available_curve_for_state_only_codex() {
+        let mut request = valid_v6_batch_request();
+        request.source = SnapshotSource::Codex.api_slug().to_string();
+        let item = &mut request.snapshots[0];
+        item.provenance.collector = "codex_state_sqlite".to_string();
+        item.context_curve = Some(build_context_curve(
+            CODEX_SNAPSHOT_PARSER_VERSION,
+            "codex_owned_rollout_occurrences:v1",
+            "codex_token_count_model_context_window:v1",
+            &[ContextCurveCandidatePoint {
+                observed_at: Some("2026-08-20T12:00:01Z".to_string()),
+                effective_input_tokens: 10,
+                model: Some("gpt-5.5".to_string()),
+                context_window_tokens: Some(258_400),
+            }],
+            &[],
+            "pre_capture",
+        ));
+        item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::Codex, item);
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+        assert!(error.contains("state-only Codex evidence"), "{error}");
+    }
+
+    #[test]
     fn v6_snapshot_preflight_rejects_bucket_total_mismatch() {
         let mut request = valid_v6_batch_request();
         request.snapshots[0].usage_buckets[0].model_usage[0].input_tokens = 99;
@@ -30362,6 +33269,11 @@ mod tests {
                 compaction_total_post_tokens: None,
                 compaction_total_cumulative_dropped_tokens: None,
                 compaction_total_duration_ms: None,
+                context_curve: None,
+                claude_context_curve_boundaries: Vec::new(),
+                claude_context_curve_identity_complete: false,
+                claude_context_curve_request_index_complete: false,
+                claude_context_curve_owned_start_proven: false,
                 activity_summary: None,
                 tool_usage: None,
                 tool_usage_truncated: false,
@@ -30807,6 +33719,7 @@ mod tests {
             modified_unix_nanos: Some(3),
             source_file_fingerprint: "source".to_string(),
             last_snapshot_fingerprint: fingerprint.map(str::to_string),
+            last_upload_body_witness: None,
             scan_identity_version: Some("semantic_sync:v1".to_string()),
         }
     }
@@ -31212,6 +34125,7 @@ mod tests {
                 modified_unix_nanos: Some(u64::MAX),
                 source_file_fingerprint: "local-mtime-is-not-membership".to_string(),
                 last_snapshot_fingerprint: Some("group".to_string()),
+                last_upload_body_witness: None,
                 scan_identity_version: Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string()),
             },
         );
