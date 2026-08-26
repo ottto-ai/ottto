@@ -1941,7 +1941,7 @@ fn sync_source(
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
     // index and remain pending across restarts.
-    let backfill_succeeded = backfill_pending && scan_result.census_complete;
+    let mut backfill_succeeded = backfill_pending && scan_result.census_complete;
     if backfill_pending && !backfill_succeeded {
         eprintln!(
             "local snapshot backfill remains pending for {}: census incomplete",
@@ -2160,7 +2160,10 @@ fn sync_source(
         |progress| progress.save(&upload_progress_path),
     )
     .and_then(|result| {
-        if matches!(result, ResumableUploadResult::Completed) {
+        if matches!(
+            result,
+            ResumableUploadResult::Completed | ResumableUploadResult::Conflicted { .. }
+        ) {
             // A setup/account switch can replace the relay binding while a
             // long historical scan is uploading. Never commit destination A's
             // delivery cursor after the machine has moved to destination B.
@@ -2175,8 +2178,24 @@ fn sync_source(
     // only after their exact replacement index is durable.
     withdraw_source_manifest(&upload_destination_namespace, source);
 
+    let mut upload_fully_settled = true;
     match upload_result {
         Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
+        Ok(ResumableUploadResult::Conflicted { count }) => {
+            clear_shed_streak(source);
+            // Accepted siblings are safe to commit, but a retryable conflict
+            // is not proof that a broad historical replay is complete. Force
+            // one clean follow-up sweep and leave the destination's backfill
+            // marker pending until every replacement entity settles.
+            index.mark_bounded_sweep_unsettled();
+            backfill_succeeded = false;
+            upload_fully_settled = false;
+            eprintln!(
+                "local snapshot upload checkpointed accepted siblings but left {count} \
+                 conflicting entity(ies) pending for {}; a clean follow-up scan is required",
+                source.api_slug()
+            );
+        }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
@@ -2339,6 +2358,21 @@ fn sync_source(
                     },
                     1,
                 );
+                // Everything above this arm names its own cause. This arm is
+                // the catch-all, and it used to log the bare phrase "local
+                // snapshot upload failed" with no status code, endpoint, or
+                // body — which is undiagnosable from a log alone and cost a
+                // full reverse-engineering pass to classify. Always emit the
+                // redacted failure shape here: the typed transport/HTTP
+                // diagnostic when the request reached the wire, and the
+                // classified reason when it failed before that.
+                eprintln!(
+                    "ottto-service: local snapshot upload failed for {} — {}; \
+                     daemon SNAPSHOT_SCHEMA_VERSION={}.",
+                    source.api_slug(),
+                    upload_failure_diagnostic(&error),
+                    SNAPSHOT_SCHEMA_VERSION,
+                );
                 (
                     CollectorState::Error {
                         code: "network_error",
@@ -2371,7 +2405,7 @@ fn sync_source(
     settle_context_curve_replay_state(
         &mut index,
         context_curve_enabled,
-        scan_result.census_complete,
+        scan_result.census_complete && upload_fully_settled,
         &replay_generation,
     );
     save_index_and_publish_manifest(
@@ -2518,6 +2552,11 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
 #[derive(Debug, PartialEq, Eq)]
 enum ResumableUploadResult {
     Completed,
+    /// Every accepted sibling is durably checkpointed, while one or more
+    /// retryable entity conflicts remain quarantined for a later clean sweep.
+    Conflicted {
+        count: usize,
+    },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
     /// checkpointed; this is a "come back later", not a failure.
@@ -2772,6 +2811,7 @@ where
     }
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
+    let mut conflicted_entities = 0usize;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -2819,14 +2859,6 @@ where
                         accepted: response.accepted,
                     }));
                 }
-                if entity_ack && !response.conflict_entities.is_empty() {
-                    // A conflict is never a settlement. A future head-challenge
-                    // retry may proceed only after a fresh complete scan; this
-                    // cycle keeps every conflicting fingerprint pending.
-                    return Err(anyhow!(
-                        "snapshot entity conflict requires a fresh complete scan"
-                    ));
-                }
                 if entity_ack {
                     let settled = response
                         .accepted_entities
@@ -2846,13 +2878,36 @@ where
                         .iter()
                         .map(|entity| entity.snapshot_fingerprint.as_str())
                         .collect::<BTreeSet<_>>();
+                    let conflicted = response
+                        .conflict_entities
+                        .iter()
+                        .map(|entity| entity.snapshot_fingerprint.as_str())
+                        .collect::<BTreeSet<_>>();
                     for index in &indices {
                         let item = &items[*index];
                         let item_fingerprint = fingerprint(item);
-                        if rejected.contains(item_fingerprint) {
+                        if rejected.contains(item_fingerprint)
+                            || conflicted.contains(item_fingerprint)
+                        {
                             progress.quarantine_body(item_fingerprint, &body_witness(item));
                         }
                     }
+                    // A conflict is not a settlement, but it IS retryable: the
+                    // backend is asking for this entity again later, not never.
+                    // It therefore shares the quarantine ledger's bounded
+                    // backoff with permanent rejections, so one conflicting
+                    // entity defers only itself.
+                    //
+                    // Returning the whole page as an error here (the previous
+                    // behaviour) discarded the entities the backend had ALREADY
+                    // written in this same response, so nothing was ever
+                    // checkpointed: the identical page replayed every cycle,
+                    // the scan index could never commit, and the "fresh
+                    // complete scan" that recovery waited on could never
+                    // happen. One conflicting entity deadlocked its whole
+                    // source permanently, across restarts.
+                    conflicted_entities =
+                        conflicted_entities.saturating_add(response.conflict_entities.len());
                 } else {
                     for index in &indices {
                         let item = &items[*index];
@@ -2974,8 +3029,23 @@ where
         }
     }
 
+    if conflicted_entities > 0 {
+        // Every conflicting entity is durably quarantined with the same
+        // bounded backoff a rejection gets, and every sibling in the page is
+        // checkpointed. The distinct result prevents the caller from marking
+        // a broad historical backfill complete while preserving that progress.
+        eprintln!(
+            "local snapshot upload deferred {conflicted_entities} conflicting \
+             entity(ies) for {poison_scope}; they are quarantined for a bounded \
+             retry while every other entity in the page settled."
+        );
+    }
     if let Some(error) = deferred_validation_error {
         Err(error)
+    } else if conflicted_entities > 0 {
+        Ok(ResumableUploadResult::Conflicted {
+            count: conflicted_entities,
+        })
     } else {
         Ok(ResumableUploadResult::Completed)
     }
@@ -3566,6 +3636,68 @@ fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
         .and_then(|value| value.format(&Rfc3339).ok())
 }
 
+/// Bounded, redacted cause for the catch-all snapshot upload failure log.
+///
+/// The catch-all arm has no status code of its own, so this reconstructs the
+/// most specific failure shape still present in the error chain. Everything it
+/// emits is either a typed redacted diagnostic (endpoint + status family, never
+/// a URL or token) or one of this module's own compile-time reason literals —
+/// never raw error text, which can carry file paths.
+fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
+    if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
+        return diagnostics.safe_message();
+    }
+    if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, status={}, kind=payload_rejected, backend_detail={}",
+            rejected.status,
+            rejected
+                .body_excerpt
+                .as_deref()
+                .unwrap_or("backend returned no validation detail"),
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<BatchAuthorizationRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, status={}, kind=authorization_rejected",
+            rejected.status,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, kind=daemon_contract_preflight, detail={}",
+            rejected.reason,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotBatchResponseRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, kind=response_count_mismatch, expected={}, accepted={}",
+            rejected.expected, rejected.accepted,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotLocalStateRejected>() {
+        return format!("kind=local_state, operation={}", rejected.operation);
+    }
+    // This module's own upload-loop reasons. Matching on the literals keeps the
+    // emitted text a fixed vocabulary rather than arbitrary chain content.
+    let text = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    for reason in [
+        "snapshot adaptive upload attempt limit reached",
+        "snapshot adaptive upload split limit reached",
+        "snapshot response uses an unsupported entity ACK contract",
+        "local snapshot preflight index was out of bounds",
+    ] {
+        if text.contains(reason) {
+            return format!("kind=uploader_guard, detail={reason}");
+        }
+    }
+    "kind=unclassified (no typed diagnostic in the error chain)".to_string()
+}
+
 pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
@@ -3609,6 +3741,15 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
         || text.contains("backend rejected snapshot batch payload")
     {
         "local snapshot payload validation failed".to_string()
+    } else if text.contains("snapshot adaptive upload attempt limit reached")
+        || text.contains("snapshot adaptive upload split limit reached")
+    {
+        // Distinct from a network failure: the page reached the backend and the
+        // uploader exhausted its bounded poison-isolation budget. Collapsing
+        // this into the generic upload message hid a whole failure family.
+        "local snapshot upload isolation limit reached".to_string()
+    } else if text.contains("snapshot response uses an unsupported entity ACK contract") {
+        "backend snapshot response was invalid".to_string()
     } else if text.contains("upload local snapshots")
         || text.contains("upload snapshot batch failed")
     {
@@ -3974,6 +4115,93 @@ mod tests {
             counted_poison_fingerprints_for_test(&poison_scope),
             BTreeSet::from([rejected_fingerprint])
         );
+        reset_for_test();
+    }
+
+    /// A conflicting entity must not strand the page it arrived in.
+    ///
+    /// Regression for the codex-only sync deadlock: the uploader used to return
+    /// an error the moment `conflict_entities` was non-empty, BEFORE recording
+    /// the entities the backend had already written in that same response. So
+    /// nothing was ever checkpointed, the identical page replayed every cycle,
+    /// the scan index could never commit, and the "fresh complete scan" the old
+    /// comment said recovery needed could never happen. One conflicting entity
+    /// deadlocked its whole source permanently, across daemon restarts, while
+    /// its siblings kept being re-accepted by the backend every five minutes.
+    #[test]
+    #[serial(client_report)]
+    fn entity_ack_conflict_settles_siblings_and_defers_only_the_conflict() {
+        use crate::client_report::{observe, reset_for_test, ClientReportReason};
+
+        reset_for_test();
+        let poison_scope = unique_poison_scope();
+        let items = test_fingerprints(2);
+        let accepted_fingerprint = items[0].clone();
+        let conflicted_fingerprint = items[1].clone();
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut persists = 0usize;
+
+        let result = upload_resumable_batches(
+            &items,
+            &poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: 1,
+                    sessions_reconciled: 1,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                    ),
+                    accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: "accepted".to_string(),
+                        snapshot_fingerprint: accepted_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
+                    }],
+                    unchanged_entities: Vec::new(),
+                    rejected_entities: Vec::new(),
+                    conflict_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: "conflicted".to_string(),
+                        snapshot_fingerprint: conflicted_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
+                    }],
+                })
+            },
+            |_| {
+                persists += 1;
+                Ok(())
+            },
+        )
+        .expect("a per-entity conflict is retryable, not a whole-page failure");
+
+        // The caller can commit accepted siblings without treating the broad
+        // historical backfill as complete.
+        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        // The entity the backend actually wrote is settled.
+        assert_eq!(accepted, 1);
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&accepted_fingerprint));
+        // The conflict is deferred with the quarantine ledger's bounded
+        // backoff, so it retries later rather than blocking its siblings.
+        assert!(progress
+            .quarantined_fingerprints
+            .contains_key(&conflicted_fingerprint));
+        // A conflict is retryable, so it is NOT counted as permanent loss the
+        // way a `rejected_entities` poison item is.
+        assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
+        assert!(counted_poison_fingerprints_for_test(&poison_scope).is_empty());
+        // The settlement is durable before the pass returns.
+        assert!(persists >= 1);
         reset_for_test();
     }
 
