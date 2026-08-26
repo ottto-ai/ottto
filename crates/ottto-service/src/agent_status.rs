@@ -6,7 +6,7 @@ use ottto_core::{
     read_claude_statusline_cache, read_claude_statusline_context_cache,
     read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
     ClaudeStatusLineContextWindowCache, ClaudeStatusLineContextWindowHistory,
-    ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache,
+    ClaudeStatusLineContextWindowSample, ClaudeStatusLineRateLimitCache, CodexHomeTrust,
     FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 use ottto_protocol::{
@@ -142,12 +142,16 @@ struct CodexAuthCredentials {
     account_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CodexCredentialReadError;
+
 #[derive(Clone)]
 struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
     account: Option<AgentAccountStatus>,
     identity: Option<CodexStrongIdentity>,
+    credential_read_failed: bool,
 }
 
 /// Strong active Codex identity from one exact credential home. This type is
@@ -882,8 +886,12 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         .slot_home(slot_id)
         .map_err(|_| "Codex durable connection state is unavailable.".to_string())?;
     let captured_at = crate::current_rfc3339_timestamp();
-    let (snapshot, identity) =
-        collect_codex_status_for_home(captured_at.clone(), captured_at, &home, false);
+    let (snapshot, identity) = collect_codex_status_for_home(
+        captured_at.clone(),
+        captured_at,
+        &home,
+        CodexHomeTrust::Managed,
+    );
     let identity = identity.ok_or_else(|| {
         "Codex sign-in has not produced a complete account and workspace identity.".to_string()
     })?;
@@ -957,11 +965,15 @@ fn collect_codex_home_candidate(
     captured_at: &str,
     expires_at: &str,
 ) -> CodexSlotCandidate {
+    let home_trust = match slot.ownership {
+        CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
+        CodexAccountSlotOwnershipV1::Managed => CodexHomeTrust::Managed,
+    };
     let (mut snapshot, _) = collect_codex_status_for_home(
         captured_at.to_string(),
         expires_at.to_string(),
         &slot.home,
-        slot.ownership == CodexAccountSlotOwnershipV1::Default,
+        home_trust,
     );
     let mut status = codex_collection_status_from_snapshot(&snapshot);
     let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut status);
@@ -1218,10 +1230,12 @@ fn collect_codex_status_for_home(
     captured_at: String,
     expires_at: String,
     codex_home: &Path,
-    allow_legacy_oauth: bool,
+    home_trust: CodexHomeTrust,
 ) -> (AgentStatusSnapshot, Option<CodexStrongIdentity>) {
+    let allow_legacy_oauth = home_trust == CodexHomeTrust::ProviderDefault;
     if !executable_exists("codex")
-        && !ottto_core::read_codex_config_file_secure(codex_home).is_ok_and(|body| body.is_some())
+        && !ottto_core::read_codex_config_file_secure(codex_home, home_trust)
+            .is_ok_and(|body| body.is_some())
     {
         return (
             not_installed_snapshot(SourceKind::Codex, "codex", captured_at, expires_at),
@@ -1292,9 +1306,13 @@ fn collect_codex_status_for_home(
             }
         }
     }
-    if let Some(auth_account) = read_codex_auth_account_at(codex_home) {
-        snapshot.status = AgentStatusState::Available;
-        snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), auth_account));
+    match read_codex_auth_account_at(codex_home, home_trust) {
+        Ok(Some(auth_account)) => {
+            snapshot.status = AgentStatusState::Available;
+            snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), auth_account));
+        }
+        Ok(None) => {}
+        Err(_) => append_codex_credential_read_failed_diagnostic(&mut snapshot),
     }
 
     let models = run_codex_home_command(
@@ -1306,7 +1324,7 @@ fn collect_codex_status_for_home(
     let mut model_status = collect_codex_model_status_from_output(&models);
     apply_codex_config_model(
         &mut model_status,
-        read_codex_config_model_at(codex_home),
+        read_codex_config_model_at(codex_home, home_trust),
         &mut snapshot.collection_method,
     );
     snapshot.model = Some(model_status);
@@ -1319,8 +1337,11 @@ fn collect_codex_status_for_home(
         "Codex credit balance was not available from the local account probe.",
     );
     let mut strong_identity = None;
-    match collect_codex_usage_for_home(codex_home, allow_legacy_oauth) {
+    match collect_codex_usage_for_home(codex_home, home_trust) {
         Ok(usage) => {
+            if usage.credential_read_failed {
+                append_codex_credential_read_failed_diagnostic(&mut snapshot);
+            }
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
@@ -1402,20 +1423,22 @@ fn collect_codex_status_for_home(
         snapshot.status = AgentStatusState::Available;
     }
     append_current_plan_observation(&mut snapshot);
-    append_codex_workspace_observations_at(&mut snapshot, codex_home);
+    append_codex_workspace_observations_at(&mut snapshot, codex_home, home_trust);
     stamp_codex_meter_identity(&mut snapshot);
-    snapshot.runtime_defaults = build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home);
+    snapshot.runtime_defaults =
+        build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home, home_trust);
     (snapshot, strong_identity)
 }
 
 fn collect_codex_usage_for_home(
     codex_home: &Path,
-    allow_legacy_oauth: bool,
+    home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
-    match collect_codex_app_server_usage_for_home(codex_home, allow_legacy_oauth) {
+    let allow_legacy_oauth = home_trust == CodexHomeTrust::ProviderDefault;
+    match collect_codex_app_server_usage_for_home(codex_home, home_trust) {
         Ok(usage) => Ok(usage),
         Err(app_server_message) if legacy_codex_oauth_fallback_allowed(allow_legacy_oauth) => {
-            collect_codex_oauth_usage_at(codex_home).map_err(|oauth_message| {
+            collect_codex_oauth_usage_at(codex_home, home_trust).map_err(|oauth_message| {
                 format!("{app_server_message} Legacy OAuth usage fallback failed: {oauth_message}")
             })
         }
@@ -1446,14 +1469,30 @@ fn stamp_codex_meter_identity(snapshot: &mut AgentStatusSnapshot) {
     }
 }
 
+fn append_codex_credential_read_failed_diagnostic(snapshot: &mut AgentStatusSnapshot) {
+    if snapshot
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "codex_credential_read_failed")
+    {
+        return;
+    }
+    snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+        "codex_credential_read_failed",
+        AgentDiagnosticSeverity::Warning,
+        "Codex credentials could not be read safely; account-bound meters were suppressed.",
+    ));
+}
+
 /// Assemble display-safe Codex runtime defaults from `~/.codex/config.toml` for
 /// the agent-status upload. The backend overwrites `machine_id` from the stored
 /// snapshot, so it is left unset here.
 fn build_codex_runtime_defaults_at(
     captured_at: &str,
     codex_home: &Path,
+    home_trust: CodexHomeTrust,
 ) -> Option<AgentRuntimeDefaults> {
-    let body = ottto_core::read_codex_config_file_secure(codex_home).ok()??;
+    let body = ottto_core::read_codex_config_file_secure(codex_home, home_trust).ok()??;
     let raw = std::str::from_utf8(&body).ok()?;
     let defaults = crate::snapshots::parse_codex_config_defaults(raw)?;
     let fast_mode_enabled = defaults.display_fast_mode();
@@ -6985,9 +7024,18 @@ fn append_pi_route_plan_observations(snapshot: &mut AgentStatusSnapshot) {
     }
 }
 
-fn append_codex_workspace_observations_at(snapshot: &mut AgentStatusSnapshot, codex_home: &Path) {
-    let Some(credentials) = read_codex_auth_credentials_at(codex_home) else {
-        return;
+fn append_codex_workspace_observations_at(
+    snapshot: &mut AgentStatusSnapshot,
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) {
+    let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(Some(credentials)) => credentials,
+        Ok(None) => return,
+        Err(_) => {
+            append_codex_credential_read_failed_diagnostic(snapshot);
+            return;
+        }
     };
     let Some(token) = credentials.id_token.as_deref() else {
         return;
@@ -7180,15 +7228,29 @@ fn parse_codex_account_text(text: &str) -> Option<AgentAccountStatus> {
     })
 }
 
-fn read_codex_auth_account_at(codex_home: &Path) -> Option<AgentAccountStatus> {
-    let credentials = read_codex_auth_credentials_at(codex_home)?;
-    let token = credentials.id_token.as_deref()?;
-    parse_codex_id_token_account(token)
+fn read_codex_auth_account_at(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) -> Result<Option<AgentAccountStatus>, CodexCredentialReadError> {
+    let Some(credentials) = read_codex_auth_credentials_at(codex_home, home_trust)? else {
+        return Ok(None);
+    };
+    let Some(token) = credentials.id_token.as_deref() else {
+        return Ok(None);
+    };
+    Ok(parse_codex_id_token_account(token))
 }
 
-fn read_codex_auth_credentials_at(codex_home: &Path) -> Option<CodexAuthCredentials> {
-    let body = ottto_core::read_codex_auth_file_secure(codex_home).ok()??;
-    let json: Value = serde_json::from_slice(&body).ok()?;
+fn read_codex_auth_credentials_at(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) -> Result<Option<CodexAuthCredentials>, CodexCredentialReadError> {
+    let Some(body) = ottto_core::read_codex_auth_file_secure(codex_home, home_trust)
+        .map_err(|_| CodexCredentialReadError)?
+    else {
+        return Ok(None);
+    };
+    let json: Value = serde_json::from_slice(&body).map_err(|_| CodexCredentialReadError)?;
     let access_token = json
         .get("tokens")
         .and_then(|tokens| tokens.get("access_token"))
@@ -7208,13 +7270,13 @@ fn read_codex_auth_credentials_at(codex_home: &Path) -> Option<CodexAuthCredenti
         })
         .or_else(|| id_token.as_deref().and_then(codex_account_id_from_id_token));
     if access_token.is_none() && id_token.is_none() {
-        return None;
+        return Ok(None);
     }
-    Some(CodexAuthCredentials {
+    Ok(Some(CodexAuthCredentials {
         access_token,
         id_token,
         account_id,
-    })
+    }))
 }
 
 fn codex_account_id_from_id_token(token: &str) -> Option<String> {
@@ -7335,7 +7397,7 @@ fn validated_codex_identity(
         if active.get("type").and_then(Value::as_str) != Some("chatgpt") {
             return None;
         }
-        let claim_email = first_json_string(&claims, &["email"])?;
+        let claim_email = codex_access_token_email(&claims)?;
         let active_email = first_json_string(active, &["email"])?;
         if claim_email != active_email {
             return None;
@@ -7363,6 +7425,21 @@ fn validated_codex_identity(
         workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
         raw_workspace_id,
     })
+}
+
+fn codex_access_token_email(claims: &Value) -> Option<String> {
+    claims
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(|value| value.trim().to_string())
 }
 
 fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
@@ -7452,10 +7529,9 @@ fn subscription_period_timestamp(value: &Value, key: &str) -> Option<String> {
 
 fn collect_codex_app_server_usage_for_home(
     codex_home: &Path,
-    allow_ambient_environment: bool,
+    home_trust: CodexHomeTrust,
 ) -> Result<CodexUsageProbe, String> {
-    let observation =
-        call_codex_app_server_rate_limits_for_home(codex_home, allow_ambient_environment)?;
+    let observation = call_codex_app_server_rate_limits_for_home(codex_home, home_trust)?;
     let identity = observation
         .refreshed_credentials
         .as_ref()
@@ -7472,6 +7548,7 @@ fn collect_codex_app_server_usage_for_home(
         credit_balances: codex_app_server_credit_balances(&observation.rate_limits),
         account: codex_app_server_account(&observation.account),
         identity,
+        credential_read_failed: observation.credential_read_failed,
     })
 }
 
@@ -7479,11 +7556,12 @@ struct CodexAppServerObservation {
     account: Value,
     rate_limits: Value,
     refreshed_credentials: Option<CodexAuthCredentials>,
+    credential_read_failed: bool,
 }
 
 fn call_codex_app_server_rate_limits_for_home(
     codex_home: &Path,
-    _allow_ambient_environment: bool,
+    home_trust: CodexHomeTrust,
 ) -> Result<CodexAppServerObservation, String> {
     let Some(program_path) = crate::command_env::executable_path("codex") else {
         return Err("Codex CLI was not found for app-server rate-limit collection.".to_string());
@@ -7627,7 +7705,11 @@ fn call_codex_app_server_rate_limits_for_home(
                     let rate_limits = rate_limits_result
                         .take()
                         .expect("checked rate-limit result");
-                    let refreshed_credentials = read_codex_auth_credentials_at(codex_home);
+                    let (refreshed_credentials, credential_read_failed) =
+                        match read_codex_auth_credentials_at(codex_home, home_trust) {
+                            Ok(credentials) => (credentials, false),
+                            Err(_) => (None, true),
+                        };
                     drop(stdin);
                     let _ = child.kill();
                     let _ = child.wait();
@@ -7635,6 +7717,7 @@ fn call_codex_app_server_rate_limits_for_home(
                         account,
                         rate_limits,
                         refreshed_credentials,
+                        credential_read_failed,
                     });
                 }
             }
@@ -7699,8 +7782,11 @@ fn read_bounded_codex_app_server_stdout<R: BufRead>(
 
 #[cfg(test)]
 fn call_codex_app_server_rate_limits() -> Result<Value, String> {
-    call_codex_app_server_rate_limits_for_home(&default_codex_home(), true)
-        .map(|observation| observation.rate_limits)
+    call_codex_app_server_rate_limits_for_home(
+        &default_codex_home(),
+        CodexHomeTrust::ProviderDefault,
+    )
+    .map(|observation| observation.rate_limits)
 }
 
 fn codex_app_server_quota_windows(value: &Value) -> Vec<AgentQuotaWindow> {
@@ -8035,8 +8121,12 @@ fn legacy_codex_oauth_fallback_allowed(is_default_slot: bool) -> bool {
     is_default_slot && legacy_codex_oauth_usage_enabled()
 }
 
-fn collect_codex_oauth_usage_at(codex_home: &Path) -> Result<CodexUsageProbe, String> {
-    let credentials = read_codex_auth_credentials_at(codex_home)
+fn collect_codex_oauth_usage_at(
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+) -> Result<CodexUsageProbe, String> {
+    let credentials = read_codex_auth_credentials_at(codex_home, home_trust)
+        .map_err(|_| "Codex OAuth credentials could not be read safely.".to_string())?
         .ok_or_else(|| "Codex OAuth credentials were not found.".to_string())?;
     let access_token = credentials
         .access_token
@@ -8061,6 +8151,7 @@ fn collect_codex_oauth_usage_at(codex_home: &Path) -> Result<CodexUsageProbe, St
         credit_balances: codex_usage_credit_balances(&value),
         account: None,
         identity,
+        credential_read_failed: false,
     })
 }
 
@@ -9756,8 +9847,8 @@ fn looks_like_safe_model_id(value: &str) -> bool {
         && !lower.contains("/.pi/")
 }
 
-fn read_codex_config_model_at(codex_home: &Path) -> Option<String> {
-    let body = ottto_core::read_codex_config_file_secure(codex_home).ok()??;
+fn read_codex_config_model_at(codex_home: &Path, home_trust: CodexHomeTrust) -> Option<String> {
+    let body = ottto_core::read_codex_config_file_secure(codex_home, home_trust).ok()??;
     let body = std::str::from_utf8(&body).ok()?;
     for line in body.lines() {
         let trimmed = line.trim();
@@ -11791,6 +11882,160 @@ exit 1
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    fn synthetic_codex_collector_home(label: &str, auth_mode: u32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ottto-codex-collector-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("collector fixture root");
+        let root = root.canonicalize().expect("canonical collector root");
+        let home = root.join("provider-home");
+        std::fs::create_dir(&home).expect("provider home");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))
+            .expect("provider home mode");
+
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let access_token = synthetic_codex_access_jwt_with_profile_email(
+            "synthetic-user",
+            "synthetic-workspace",
+            "synthetic-account",
+            "pro",
+            expires_at,
+        );
+        let id_token = synthetic_codex_jwt(
+            "synthetic-user",
+            "synthetic-workspace",
+            "synthetic-account",
+            "pro",
+            expires_at,
+        );
+        let auth = home.join("auth.json");
+        std::fs::write(
+            &auth,
+            serde_json::json!({
+                "tokens": {
+                    "access_token": access_token,
+                    "id_token": id_token
+                },
+                "account_id": "synthetic-workspace"
+            })
+            .to_string(),
+        )
+        .expect("auth fixture");
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(auth_mode))
+            .expect("auth mode");
+
+        let executable = root.join("codex");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import sys
+
+if sys.argv[1:] == ["login", "status"]:
+    print("Logged in")
+    sys.exit(0)
+if sys.argv[1:] == ["debug", "models", "--bundled"]:
+    print('{"models":[{"id":"synthetic-model"}]}')
+    sys.exit(0)
+if sys.argv[1:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+
+for line in sys.stdin:
+    if '"id":1' in line:
+        print('{"id":1,"result":{"userAgent":"synthetic"}}', flush=True)
+    elif '"id":"ottto_account"' in line:
+        print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-account","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
+    elif "account/rateLimits/read" in line:
+        print('{"id":"ottto_rate_limits","result":{"rateLimits":{"limitId":"synthetic-limit","planType":"pro","primary":{"usedPercent":25,"windowDurationMins":300}},"rateLimitResetCredits":{"availableCount":2}}}', flush=True)
+"#,
+        )
+        .expect("fake Codex executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+
+        (root, home)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn provider_default_0755_home_retains_identity_and_real_quota() {
+        let (root, home) = synthetic_codex_collector_home("default-0755", 0o600);
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        assert!(
+            read_codex_auth_credentials_at(&home, CodexHomeTrust::ProviderDefault).is_ok(),
+            "the safe fixture must be readable before collection"
+        );
+
+        let (snapshot, identity) = collect_codex_status_for_home(
+            "2026-08-26T00:00:00Z".to_string(),
+            "2026-08-26T00:15:00Z".to_string(),
+            &home,
+            CodexHomeTrust::ProviderDefault,
+        );
+
+        assert!(
+            identity.is_some(),
+            "diagnostic codes: {:?}; quota names: {:?}",
+            snapshot
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            snapshot
+                .quota_windows
+                .iter()
+                .map(|window| window.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let account = snapshot.account.expect("provider account");
+        assert!(account.account_identifier_hash.is_some());
+        assert!(account.organization_identifier_hash.is_some());
+        assert!(!snapshot.quota_windows.is_empty());
+        assert!(snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.name != "usage"));
+        assert!(snapshot
+            .quota_windows
+            .iter()
+            .all(|window| window.account_identifier_hash.is_some()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn credential_read_failure_emits_typed_diagnostic_with_fail_closed_meters() {
+        let (root, home) = synthetic_codex_collector_home("unsafe-auth", 0o644);
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+
+        let (snapshot, identity) = collect_codex_status_for_home(
+            "2026-08-26T00:00:00Z".to_string(),
+            "2026-08-26T00:15:00Z".to_string(),
+            &home,
+            CodexHomeTrust::ProviderDefault,
+        );
+
+        assert!(identity.is_none());
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "codex_credential_read_failed"
+                && diagnostic.message
+                    == "Codex credentials could not be read safely; account-bound meters were suppressed."
+        }));
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     #[serial]
     fn codex_app_server_reader_keeps_stdin_open_until_async_response() {
@@ -12388,6 +12633,33 @@ for line in sys.stdin:
         format!("{header}.{payload}.synthetic-signature")
     }
 
+    fn synthetic_codex_access_jwt_with_profile_email(
+        user: &str,
+        workspace: &str,
+        account_label: &str,
+        plan: &str,
+        expires_at: i64,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "iss": "https://auth.openai.com",
+                "aud": "synthetic-client",
+                "exp": expires_at,
+                "https://api.openai.com/profile": {
+                    "email": account_label
+                },
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": user,
+                    "chatgpt_account_id": workspace,
+                    "chatgpt_plan_type": plan
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.synthetic-signature")
+    }
+
     #[test]
     fn unrefreshed_or_mismatched_jwt_identity_never_carries_provider_meters() {
         let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
@@ -12501,6 +12773,182 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn codex_profile_email_identity_retains_provider_meters() {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "synthetic-account",
+                "planType": "pro"
+            }
+        });
+        let rate_limits = serde_json::json!({
+            "rateLimits": {
+                "limitId": "synthetic-limit",
+                "planType": "pro",
+                "primary": {"usedPercent": 25, "windowDurationMins": 300}
+            }
+        });
+
+        let identity = validated_codex_identity(
+            &credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        )
+        .expect("profile email should correlate the authenticated identity");
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-08-23T00:00:00Z".to_string(),
+            "2026-08-23T00:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: Some(identity.account_identifier_hash.clone()),
+            organization_identifier_hash: Some(identity.workspace_identifier_hash.clone()),
+            ..unsupported_account("openai")
+        });
+        snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "synthetic_primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
+
+        assert_eq!(snapshot.quota_windows.len(), 1);
+        assert_eq!(snapshot.credit_balances.len(), 1);
+        assert_eq!(
+            snapshot.quota_windows[0].account_identifier_hash.as_deref(),
+            Some(identity.account_identifier_hash.as_str())
+        );
+        assert_eq!(
+            snapshot.credit_balances[0]
+                .organization_identifier_hash
+                .as_deref(),
+            Some(identity.workspace_identifier_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_profile_email_mismatch_clears_provider_meters() {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let matching_credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "synthetic-account",
+                "planType": "pro"
+            }
+        });
+        let rate_limits = serde_json::json!({
+            "rateLimits": {
+                "limitId": "synthetic-limit",
+                "planType": "pro",
+                "primary": {"usedPercent": 25, "windowDurationMins": 300}
+            }
+        });
+        assert!(validated_codex_identity(
+            &matching_credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        )
+        .is_some());
+
+        let mismatched_credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "different-synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            ..matching_credentials
+        };
+        let identity = validated_codex_identity(
+            &mismatched_credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        );
+        assert!(identity.is_none());
+
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-08-23T00:00:00Z".to_string(),
+            "2026-08-23T00:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: identity
+                .as_ref()
+                .map(|value| value.account_identifier_hash.clone()),
+            organization_identifier_hash: identity
+                .as_ref()
+                .map(|value| value.workspace_identifier_hash.clone()),
+            ..unsupported_account("openai")
+        });
+        snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "synthetic_primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
+
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+    }
+
+    #[test]
     fn codex_partial_identity_never_emits_hash_or_quota_snapshot() {
         let mut snapshot = base_snapshot(
             SourceKind::Codex,
@@ -12520,6 +12968,13 @@ for line in sys.stdin:
             freshness: AgentQuotaWindowFreshness::Fresh,
             ..Default::default()
         });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
 
         let status = codex_collection_status_from_snapshot(&snapshot);
         assert_eq!(
@@ -12529,6 +12984,8 @@ for line in sys.stdin:
         assert_eq!(status.account_identifier_hash, None);
         assert_eq!(status.workspace_identifier_hash, None);
         assert!(status.quota_snapshot.is_none());
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
     }
 
     fn codex_id_token_with_auth_claim(auth_claim: &str) -> String {
