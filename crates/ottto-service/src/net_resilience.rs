@@ -1240,12 +1240,12 @@ pub(crate) fn handle_sync_failure(daemon: &LocalDaemon) {
             eprintln!(
                 "OTTTO-SYNC-WATCHDOG: local snapshot sync has failed continuously for \
                  {stalled_minutes} minute(s) while the {} upload path is healthy, with NO \
-                 DNS or transport-layer outage underneath it. The requests are reaching \
-                 the backend, so this is not a network or resolver problem and restarting \
-                 ottto-service will NOT clear it. Look for a per-source payload or \
-                 contract failure: check which source(s) the \"local snapshot sync \
-                 skipped for <source>\" lines name, and the cause on the \"local snapshot \
-                 upload failed for <source>\" line beneath them.",
+                 DNS or transport-layer outage evidence underneath it. That does not prove \
+                 whether the failure happened locally or at the backend, so a restart is \
+                 not an evidence-backed remedy. Check which source(s) the \"local snapshot \
+                 sync skipped for <source>\" lines name and use the typed cause on the \
+                 accompanying failure line to distinguish local state, authorization, \
+                 payload, backend, and transport failures.",
                 stall.healthy_path,
             );
         }
@@ -1587,8 +1587,9 @@ mod tests {
                 .transport_shaped
         );
 
-        // Neither ladder running: the requests are reaching the backend, so the
-        // stall is payload- or contract-shaped and must not be blamed on DNS.
+        // Neither ladder running: there is no transport evidence, but the
+        // failure could still be local or backend-shaped and must not be
+        // assigned a stronger cause here.
         let mut upstream = SyncWatchdogState::default();
         assert_eq!(
             upstream.decide_sync_failure(None, false, None, false, start),
