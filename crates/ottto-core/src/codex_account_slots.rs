@@ -16,6 +16,12 @@ pub const CODEX_MANAGED_ACCOUNTS_DIR_NAME: &str = "codex-accounts";
 pub const MAX_CODEX_ACCOUNT_SLOTS: u8 = 10;
 pub const MAX_MANAGED_CODEX_ACCOUNT_SLOTS: usize = MAX_CODEX_ACCOUNT_SLOTS as usize - 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHomeTrust {
+    Managed,
+    ProviderDefault,
+}
+
 static CODEX_ACCOUNT_SLOT_SETTINGS_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Error)]
@@ -1174,18 +1180,25 @@ fn write_codex_home_config(
 }
 
 /// Read an exact Codex credential file without following any path component or
-/// final-file symlink. The credential home must be owner-controlled mode 0700;
-/// the file, when present, must be a regular owner-controlled mode 0600 file.
-pub fn read_codex_auth_file_secure(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    read_safe_file_at(home, "auth.json", true)
+/// final-file symlink. Managed homes must remain owner-controlled mode 0700;
+/// provider-default homes may use the provider's non-writable directory mode.
+/// The file, when present, must be a regular owner-controlled mode 0600 file.
+pub fn read_codex_auth_file_secure(
+    home: &Path,
+    trust: CodexHomeTrust,
+) -> std::io::Result<Option<Vec<u8>>> {
+    read_safe_file_at(home, "auth.json", true, trust)
 }
 
 /// Read Codex configuration without following any path component or final-file
 /// symlink. Config must be a regular owner-controlled file and must not be
 /// group- or world-writable. Unlike `auth.json`, an existing config may be
 /// mode 0644 because Codex historically creates non-secret config that way.
-pub fn read_codex_config_file_secure(home: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    read_safe_file_at(home, "config.toml", false)
+pub fn read_codex_config_file_secure(
+    home: &Path,
+    trust: CodexHomeTrust,
+) -> std::io::Result<Option<Vec<u8>>> {
+    read_safe_file_at(home, "config.toml", false, trust)
 }
 
 fn reject_cloud_sync_root(path: &Path) -> std::io::Result<()> {
@@ -1213,11 +1226,29 @@ fn reject_cloud_sync_root(path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn open_private_directory_chain(path: &Path) -> std::io::Result<fs::File> {
-    open_directory_chain(path, true)
+    open_directory_chain(path, Some(CodexHomeTrust::Managed))
 }
 
 #[cfg(unix)]
-fn open_directory_chain(path: &Path, final_private: bool) -> std::io::Result<fs::File> {
+fn codex_home_directory_is_safe(
+    trust: CodexHomeTrust,
+    owner_uid: libc::uid_t,
+    current_uid: libc::uid_t,
+    mode: libc::mode_t,
+) -> bool {
+    match trust {
+        CodexHomeTrust::Managed => owner_uid == current_uid && mode == 0o700,
+        CodexHomeTrust::ProviderDefault => {
+            (owner_uid == current_uid || owner_uid == 0) && mode & 0o022 == 0
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_chain(
+    path: &Path,
+    final_trust: Option<CodexHomeTrust>,
+) -> std::io::Result<fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -1258,10 +1289,13 @@ fn open_directory_chain(path: &Path, final_private: bool) -> std::io::Result<fs:
         let stat = unsafe { stat.assume_init() };
         let mode = stat.st_mode & 0o777;
         let current_uid = unsafe { libc::geteuid() };
-        let is_home = final_private && components.peek().is_none();
+        let home_trust = final_trust.filter(|_| components.peek().is_none());
         if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-            || (is_home && (stat.st_uid != current_uid || mode != 0o700))
-            || (!is_home && ((stat.st_uid != current_uid && stat.st_uid != 0) || mode & 0o022 != 0))
+            || home_trust.is_some_and(|trust| {
+                !codex_home_directory_is_safe(trust, stat.st_uid, current_uid, mode)
+            })
+            || (home_trust.is_none()
+                && ((stat.st_uid != current_uid && stat.st_uid != 0) || mode & 0o022 != 0))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1284,11 +1318,12 @@ fn read_safe_file_at(
     home: &Path,
     name: &str,
     require_mode_0600: bool,
+    trust: CodexHomeTrust,
 ) -> std::io::Result<Option<Vec<u8>>> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let directory = open_private_directory_chain(home)?;
+    let directory = open_directory_chain(home, Some(trust))?;
     let name = CString::new(name).expect("static Codex file name");
     let fd = unsafe {
         libc::openat(
@@ -1339,6 +1374,7 @@ fn read_safe_file_at(
     home: &Path,
     name: &str,
     _require_mode_0600: bool,
+    _trust: CodexHomeTrust,
 ) -> std::io::Result<Option<Vec<u8>>> {
     match fs::read(home.join(name)) {
         Ok(body) => Ok(Some(body)),
@@ -1461,7 +1497,7 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
         let parent = path.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "directory has no parent")
         })?;
-        let directory = open_directory_chain(parent, false)?;
+        let directory = open_directory_chain(parent, None)?;
         let name = path.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1690,7 +1726,7 @@ mod tests {
             .expect("home");
         fs::write(home.join("auth.json"), b"{}").expect("auth fixture");
         assert!(
-            read_codex_auth_file_secure(&home).is_err(),
+            read_codex_auth_file_secure(&home, CodexHomeTrust::Managed).is_err(),
             "0644 auth must fail"
         );
         fs::remove_file(home.join("auth.json")).expect("remove mode fixture");
@@ -1698,19 +1734,114 @@ mod tests {
         fs::write(&outside, b"{}").expect("outside fixture");
         symlink(&outside, home.join("auth.json")).expect("auth symlink");
         assert!(
-            read_codex_auth_file_secure(&home).is_err(),
+            read_codex_auth_file_secure(&home, CodexHomeTrust::Managed).is_err(),
             "auth symlink must fail"
         );
         fs::remove_file(home.join("auth.json")).expect("remove auth symlink");
         fs::remove_file(home.join("config.toml")).expect("remove config fixture");
         symlink(&outside, home.join("config.toml")).expect("config symlink");
         assert!(
-            read_codex_config_file_secure(&home).is_err(),
+            read_codex_config_file_secure(&home, CodexHomeTrust::Managed).is_err(),
             "config symlink must fail"
         );
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(safe_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_default_home_reads_0600_auth_from_0755_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _) = test_store("provider-default-0755");
+        let home = root.join("provider-home");
+        fs::create_dir(&home).expect("provider home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).expect("provider home mode");
+        let auth = home.join("auth.json");
+        fs::write(&auth, b"{}").expect("auth fixture");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("auth mode");
+
+        assert_eq!(
+            read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault)
+                .expect("safe provider auth"),
+            Some(b"{}".to_vec())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_default_home_rejects_writable_or_wrong_owner_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _) = test_store("provider-default-unsafe-home");
+        let home = root.join("provider-home");
+        fs::create_dir(&home).expect("provider home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).expect("provider home mode");
+        let auth = home.join("auth.json");
+        fs::write(&auth, b"{}").expect("auth fixture");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("auth mode");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_ok());
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o777)).expect("unsafe home mode");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_err());
+        assert!(!codex_home_directory_is_safe(
+            CodexHomeTrust::ProviderDefault,
+            unsafe { libc::geteuid() }.saturating_add(1),
+            unsafe { libc::geteuid() },
+            0o755,
+        ));
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("cleanup home mode");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_default_home_rejects_unsafe_auth_mode_and_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (root, _) = test_store("provider-default-unsafe-auth");
+        let home = root.join("provider-home");
+        fs::create_dir(&home).expect("provider home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).expect("provider home mode");
+        let auth = home.join("auth.json");
+        fs::write(&auth, b"{}").expect("auth fixture");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("safe auth mode");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_ok());
+
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).expect("unsafe auth mode");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_err());
+        fs::remove_file(&auth).expect("remove auth fixture");
+        let outside = root.join("outside-auth");
+        fs::write(&outside, b"{}").expect("outside fixture");
+        symlink(&outside, &auth).expect("auth symlink");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_home_keeps_exact_0700_directory_requirement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, _) = test_store("managed-home-mode");
+        let home = root.join("managed-home");
+        fs::create_dir(&home).expect("managed home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).expect("non-private mode");
+        let auth = home.join("auth.json");
+        fs::write(&auth, b"{}").expect("auth fixture");
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).expect("auth mode");
+
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::ProviderDefault).is_ok());
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::Managed).is_err());
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).expect("managed home mode");
+        assert!(read_codex_auth_file_secure(&home, CodexHomeTrust::Managed).is_ok());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
