@@ -16609,7 +16609,7 @@ mod tests {
             .expect("seed empty created thread");
         drop(database);
 
-        let parent_values = vec![
+        let parent_values = [
             json!({"timestamp":"2026-08-26T15:00:00Z","type":"session_meta","payload":{"id":parent,"thread_source":"vscode","source":"vscode"}}),
             json!({"timestamp":"2026-08-26T15:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.6"}}),
             codex_test_token_line(
@@ -16667,7 +16667,7 @@ mod tests {
         .expect("write child rollout");
 
         let all_local_path = sessions_dir.join(format!("rollout-{all_local_child}.jsonl"));
-        let all_local_values = vec![
+        let all_local_values = [
             json!({"timestamp":"2026-08-26T15:02:00Z","type":"session_meta","payload":{"id":all_local_child,"thread_source":"agent_created_thread","source":"vscode"}}),
             json!({"timestamp":"2026-08-26T15:02:01Z","type":"turn_context","payload":{"turn_id":"fresh-child-turn","model":"gpt-5.6"}}),
             codex_test_token_line(

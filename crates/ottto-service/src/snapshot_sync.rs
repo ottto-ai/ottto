@@ -1941,7 +1941,7 @@ fn sync_source(
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
     // index and remain pending across restarts.
-    let backfill_succeeded = backfill_pending && scan_result.census_complete;
+    let mut backfill_succeeded = backfill_pending && scan_result.census_complete;
     if backfill_pending && !backfill_succeeded {
         eprintln!(
             "local snapshot backfill remains pending for {}: census incomplete",
@@ -2160,7 +2160,10 @@ fn sync_source(
         |progress| progress.save(&upload_progress_path),
     )
     .and_then(|result| {
-        if matches!(result, ResumableUploadResult::Completed) {
+        if matches!(
+            result,
+            ResumableUploadResult::Completed | ResumableUploadResult::Conflicted { .. }
+        ) {
             // A setup/account switch can replace the relay binding while a
             // long historical scan is uploading. Never commit destination A's
             // delivery cursor after the machine has moved to destination B.
@@ -2175,8 +2178,24 @@ fn sync_source(
     // only after their exact replacement index is durable.
     withdraw_source_manifest(&upload_destination_namespace, source);
 
+    let mut upload_fully_settled = true;
     match upload_result {
         Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
+        Ok(ResumableUploadResult::Conflicted { count }) => {
+            clear_shed_streak(source);
+            // Accepted siblings are safe to commit, but a retryable conflict
+            // is not proof that a broad historical replay is complete. Force
+            // one clean follow-up sweep and leave the destination's backfill
+            // marker pending until every replacement entity settles.
+            index.mark_bounded_sweep_unsettled();
+            backfill_succeeded = false;
+            upload_fully_settled = false;
+            eprintln!(
+                "local snapshot upload checkpointed accepted siblings but left {count} \
+                 conflicting entity(ies) pending for {}; a clean follow-up scan is required",
+                source.api_slug()
+            );
+        }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
@@ -2386,7 +2405,7 @@ fn sync_source(
     settle_context_curve_replay_state(
         &mut index,
         context_curve_enabled,
-        scan_result.census_complete,
+        scan_result.census_complete && upload_fully_settled,
         &replay_generation,
     );
     save_index_and_publish_manifest(
@@ -2533,6 +2552,11 @@ fn claude_evidence_root_session_ids(snapshots: &[SnapshotItem]) -> Vec<String> {
 #[derive(Debug, PartialEq, Eq)]
 enum ResumableUploadResult {
     Completed,
+    /// Every accepted sibling is durably checkpointed, while one or more
+    /// retryable entity conflicts remain quarantined for a later clean sweep.
+    Conflicted {
+        count: usize,
+    },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
     /// checkpointed; this is a "come back later", not a failure.
@@ -3006,10 +3030,10 @@ where
     }
 
     if conflicted_entities > 0 {
-        // Not a failure: every conflicting entity is durably quarantined with
-        // the same bounded backoff a rejection gets, and every sibling in the
-        // page is checkpointed. Log it so a recurring conflict is still
-        // visible instead of silently costing a retry every cycle.
+        // Every conflicting entity is durably quarantined with the same
+        // bounded backoff a rejection gets, and every sibling in the page is
+        // checkpointed. The distinct result prevents the caller from marking
+        // a broad historical backfill complete while preserving that progress.
         eprintln!(
             "local snapshot upload deferred {conflicted_entities} conflicting \
              entity(ies) for {poison_scope}; they are quarantined for a bounded \
@@ -3018,6 +3042,10 @@ where
     }
     if let Some(error) = deferred_validation_error {
         Err(error)
+    } else if conflicted_entities > 0 {
+        Ok(ResumableUploadResult::Conflicted {
+            count: conflicted_entities,
+        })
     } else {
         Ok(ResumableUploadResult::Completed)
     }
@@ -4134,6 +4162,8 @@ mod tests {
                         source_session_id: "accepted".to_string(),
                         snapshot_fingerprint: accepted_fingerprint.clone(),
                         occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: Vec::new(),
@@ -4141,6 +4171,8 @@ mod tests {
                         source_session_id: "conflicted".to_string(),
                         snapshot_fingerprint: conflicted_fingerprint.clone(),
                         occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
                     }],
                 })
             },
@@ -4151,9 +4183,9 @@ mod tests {
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        // The cycle completes, so the caller can commit its scan index instead
-        // of replaying this exact page forever.
-        assert_eq!(result, ResumableUploadResult::Completed);
+        // The caller can commit accepted siblings without treating the broad
+        // historical backfill as complete.
+        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
         // The entity the backend actually wrote is settled.
         assert_eq!(accepted, 1);
         assert!(progress
