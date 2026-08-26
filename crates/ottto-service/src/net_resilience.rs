@@ -1054,6 +1054,17 @@ pub(crate) struct SyncStallReport {
     /// True the first time this stall is reported; drives the one-shot
     /// degraded-posture health event (re-logs do not re-push events).
     pub first_report: bool,
+    /// True only when a DNS or transport-layer outage ladder is actually
+    /// running underneath this stall.
+    ///
+    /// The stall message used to assert pinned DNS unconditionally. That is a
+    /// network-shaped explanation, and it is wrong whenever the stall is
+    /// source-discriminating (one source failing while its siblings upload on
+    /// the same cycle, over the same resolver and the same connection pool) —
+    /// which is exactly the shape a payload or contract failure has. Naming
+    /// the wrong cause on every re-log actively misdirects diagnosis, and it
+    /// also promises that a restart clears something a restart cannot touch.
+    pub transport_shaped: bool,
 }
 
 #[derive(Default)]
@@ -1112,6 +1123,7 @@ impl SyncWatchdogState {
                     stalled_for: failing_for,
                     healthy_path: self.last_other_upload_path.unwrap_or("unknown"),
                     first_report: !self.stall_marked,
+                    transport_shaped: dns_outage.is_some() || transport_outage.is_some(),
                 });
                 self.stall_marked = true;
             }
@@ -1214,14 +1226,29 @@ pub(crate) fn handle_sync_failure(daemon: &LocalDaemon) {
 
     if let Some(stall) = &decision.stall {
         let stalled_minutes = stall.stalled_for.as_secs() / 60;
-        eprintln!(
-            "OTTTO-SYNC-WATCHDOG: local snapshot sync has failed continuously for \
-             {stalled_minutes} minute(s) while the {} upload path is healthy — this is \
-             process-local upstream breakage (e.g. pinned DNS after a network/VPN \
-             transition), and server-side source freshness is stalling. Restarting \
-             ottto-service clears it.",
-            stall.healthy_path,
-        );
+        if stall.transport_shaped {
+            eprintln!(
+                "OTTTO-SYNC-WATCHDOG: local snapshot sync has failed continuously for \
+                 {stalled_minutes} minute(s) while the {} upload path is healthy, and a \
+                 DNS or transport-layer outage is running underneath it — this is \
+                 process-local upstream breakage (e.g. pinned DNS after a network/VPN \
+                 transition), and server-side source freshness is stalling. Restarting \
+                 ottto-service clears it.",
+                stall.healthy_path,
+            );
+        } else {
+            eprintln!(
+                "OTTTO-SYNC-WATCHDOG: local snapshot sync has failed continuously for \
+                 {stalled_minutes} minute(s) while the {} upload path is healthy, with NO \
+                 DNS or transport-layer outage underneath it. The requests are reaching \
+                 the backend, so this is not a network or resolver problem and restarting \
+                 ottto-service will NOT clear it. Look for a per-source payload or \
+                 contract failure: check which source(s) the \"local snapshot sync \
+                 skipped for <source>\" lines name, and the cause on the \"local snapshot \
+                 upload failed for <source>\" line beneath them.",
+                stall.healthy_path,
+            );
+        }
         if stall.first_report {
             let _ = daemon.record_snapshot_sync_stalled(stalled_minutes, Some(stall.healthy_path));
         }
@@ -1516,6 +1543,67 @@ mod tests {
         );
     }
 
+    /// The stall log picks its explanation from evidence, not from a guess.
+    ///
+    /// The message used to assert "pinned DNS after a network/VPN transition"
+    /// unconditionally. That is a network-shaped cause, and it is wrong for a
+    /// source-discriminating stall — one source failing while its siblings
+    /// upload on the same cycle, over the same resolver and connection pool.
+    /// Naming the wrong cause on every re-log misdirects diagnosis and promises
+    /// a restart fixes something a restart cannot touch.
+    #[test]
+    fn watchdog_stall_claims_transport_only_with_transport_evidence() {
+        let start = Instant::now();
+        let later = start + SYNC_STALL_THRESHOLD + Duration::from_secs(1);
+        let outage = Some(SYNC_STALL_THRESHOLD);
+
+        // A real DNS outage underneath the stall: the transport explanation
+        // is earned.
+        let mut dns = SyncWatchdogState::default();
+        assert_eq!(
+            dns.decide_sync_failure(outage, false, None, false, start),
+            SyncFailureDecision::default()
+        );
+        dns.note_other_upload("agent_status", later - Duration::from_secs(30));
+        assert!(
+            dns.decide_sync_failure(outage, false, None, false, later)
+                .stall
+                .expect("stall reported")
+                .transport_shaped
+        );
+
+        // A transport-layer outage earns it too.
+        let mut transport = SyncWatchdogState::default();
+        assert_eq!(
+            transport.decide_sync_failure(None, false, outage, false, start),
+            SyncFailureDecision::default()
+        );
+        transport.note_other_upload("agent_status", later - Duration::from_secs(30));
+        assert!(
+            transport
+                .decide_sync_failure(None, false, outage, false, later)
+                .stall
+                .expect("stall reported")
+                .transport_shaped
+        );
+
+        // Neither ladder running: the requests are reaching the backend, so the
+        // stall is payload- or contract-shaped and must not be blamed on DNS.
+        let mut upstream = SyncWatchdogState::default();
+        assert_eq!(
+            upstream.decide_sync_failure(None, false, None, false, start),
+            SyncFailureDecision::default()
+        );
+        upstream.note_other_upload("agent_status", later - Duration::from_secs(30));
+        assert!(
+            !upstream
+                .decide_sync_failure(None, false, None, false, later)
+                .stall
+                .expect("stall reported")
+                .transport_shaped
+        );
+    }
+
     #[test]
     fn watchdog_reports_a_stall_only_for_the_split_brain_shape() {
         let start = Instant::now();
@@ -1545,6 +1633,10 @@ mod tests {
         assert_eq!(stall.healthy_path, "agent_status");
         assert!(stall.stalled_for >= SYNC_STALL_THRESHOLD);
         assert!(decision.self_restart.is_none());
+        // No DNS or transport outage ladder is running underneath this stall,
+        // so the operator log must NOT offer the pinned-DNS explanation or
+        // promise that a restart clears it.
+        assert!(!stall.transport_shaped);
 
         // Immediately after, the stall keeps holding but must not re-log or
         // re-mark until the re-log interval passes.
