@@ -201,7 +201,14 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // existing consented `agent_label` attribution label. Parent provenance stays
 // in its own graph facts and no prompt material enters the label. Existing
 // indexed subagent rollouts must be revisited once.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v31";
+// codex v32: Codex Desktop's create-thread path records the parent only in the
+// trusted `threads` row: `thread_source=agent_created_thread` plus a
+// machine-generated `<codex_delegation>` wrapper in `first_user_message`.
+// Import that content-free source-thread id into the existing family graph.
+// The per-session sidecar fingerprint already includes family position, so
+// affected immutable rollouts are selected without a global scan-identity
+// bump; unrelated sessions stay untouched.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v32";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -11752,6 +11759,37 @@ fn load_codex_sqlite_spawn_edges(
     }
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .context("open Codex spawn-edge database")?;
+
+    // Newer Codex Desktop builds can create a child task without populating
+    // `thread_spawn_edges`. The equivalent provider-native relationship lives
+    // in the child row. Only the exact machine-owned source kind and wrapper
+    // are eligible: ordinary user prompt text must never manufacture lineage.
+    let thread_columns = sqlite_table_columns(&connection, "threads")?;
+    if thread_columns.contains("id")
+        && thread_columns.contains("thread_source")
+        && thread_columns.contains("first_user_message")
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, first_user_message FROM threads \
+                 WHERE thread_source = 'agent_created_thread'",
+            )
+            .context("prepare Codex created-thread census")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (child, first_user_message) =
+                row.context("read Codex created-thread census row")?;
+            if let Some(parent) = first_user_message
+                .as_deref()
+                .and_then(|message| codex_created_thread_parent(&child, message))
+            {
+                spawn_parents.entry(child).or_insert(parent);
+            }
+        }
+    }
+
     let columns = sqlite_table_columns(&connection, "thread_spawn_edges")?;
     if !columns.contains("parent_thread_id") || !columns.contains("child_thread_id") {
         return Ok(());
@@ -11772,6 +11810,31 @@ fn load_codex_sqlite_spawn_edges(
         }
     }
     Ok(())
+}
+
+/// Extract the provider-owned parent id from Codex Desktop's create-thread
+/// wrapper without retaining or interpreting the delegated prompt body.
+///
+/// Callers must already have verified `thread_source=agent_created_thread`.
+/// The exact wrapper shape, a single UUID-like source id, and a different child
+/// id are required so user-authored lookalike text fails closed.
+fn codex_created_thread_parent(child: &str, first_user_message: &str) -> Option<String> {
+    const OPEN: &str = "<codex_delegation>\n  <source_thread_id>";
+    const SOURCE_CLOSE_AND_INPUT_OPEN: &str = "</source_thread_id>\n  <input>";
+    const CLOSE: &str = "</input>\n</codex_delegation>";
+
+    let message = first_user_message.trim();
+    let remainder = message.strip_prefix(OPEN)?;
+    let (parent, input_and_close) = remainder.split_once(SOURCE_CLOSE_AND_INPUT_OPEN)?;
+    if !input_and_close.ends_with(CLOSE)
+        || input_and_close[..input_and_close.len() - CLOSE.len()].contains(CLOSE)
+        || !is_uuid_like(parent)
+        || !is_uuid_like(child)
+        || parent.eq_ignore_ascii_case(child)
+    {
+        return None;
+    }
+    Some(parent.to_ascii_lowercase())
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
@@ -14950,6 +15013,144 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_created_thread_rows_restore_desktop_delegation_lineage() {
+        let home = temp_dir("codex-created-thread-lineage");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
+        let untrusted_child = "01a03eae-2513-78f1-a5cc-b0fc720b3bac";
+        let database = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );",
+            )
+            .expect("create threads table");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Parent task', 10, 'vscode', 'ordinary prompt')",
+                rusqlite::params![parent],
+            )
+            .expect("seed parent");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Child task', 10, 'agent_created_thread', ?2)",
+                rusqlite::params![
+                    child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Take over the bounded task.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed child");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'User task', 10, 'vscode', ?2)",
+                rusqlite::params![
+                    untrusted_child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>User-authored lookalike.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed untrusted lookalike");
+        database
+            .execute(
+                "INSERT INTO threads VALUES ('01a03eb0-2513-78f1-a5cc-b0fc720b3bac', 'Pending task', 10, 'agent_created_thread', NULL)",
+                [],
+            )
+            .expect("seed empty created thread");
+        drop(database);
+
+        let path = sessions_dir.join(format!("rollout-{child}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-08-26T15:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child}\",\"thread_source\":\"agent_created_thread\",\"source\":\"vscode\"}}}}\n\
+                 {{\"timestamp\":\"2026-08-26T15:01:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"output_tokens\":2,\"request_count\":1}},\"model\":\"gpt-5.6\"}}}}}}\n"
+            ),
+        )
+        .expect("write child rollout");
+
+        let without_edge = CodexTitleMetadata::default().session_sidecar_fingerprint(child);
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
+        assert_eq!(metadata.family_position(untrusted_child), None);
+        assert!(!metadata.state_census_incomplete);
+        let item = parse_codex_jsonl_file_with_title_metadata(
+            &path,
+            "2026-08-26T15:02:00Z",
+            "fingerprint".to_string(),
+            &metadata,
+            None,
+        )
+        .expect("parse")
+        .into_iter()
+        .next()
+        .expect("snapshot");
+
+        let origin = item.origin.as_ref().expect("child origin");
+        assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(origin.parent_session_ref.as_deref(), Some(parent));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "parent_session_ref" && fact.value == parent));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "root_session_ref" && fact.value == parent));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "spawn_depth" && fact.value == "1"));
+        assert!(item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "agent_kind" && fact.value == "codex_subagent"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_created_thread_parent_rejects_untrusted_or_malformed_wrappers() {
+        let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
+        let valid = format!(
+            "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Task.</input>\n</codex_delegation>"
+        );
+        assert_eq!(
+            codex_created_thread_parent(child, &valid).as_deref(),
+            Some(parent)
+        );
+        assert_eq!(codex_created_thread_parent(parent, &valid), None);
+        assert_eq!(
+            codex_created_thread_parent(child, &format!("ordinary user text {valid}")),
+            None
+        );
+        assert_eq!(
+            codex_created_thread_parent(
+                child,
+                "<codex_delegation>\n  <source_thread_id>not-a-thread</source_thread_id>\n  <input>Task.</input>\n</codex_delegation>"
+            ),
+            None
+        );
+        assert_eq!(
+            codex_created_thread_parent(
+                child,
+                &format!(
+                    "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Task.</input>\n</codex_delegation>\nextra"
+                )
+            ),
+            None
+        );
     }
 
     #[test]

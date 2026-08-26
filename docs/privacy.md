@@ -196,6 +196,15 @@ hours, and reprocesses only files whose size or modification time changed.
 Missing or ambiguous evidence produces no attribution label; it is never
 reclassified as human activity.
 
+For Codex Desktop tasks created by another task, the daemon may also inspect
+the child row's first-user-message field in memory only when Codex itself marks
+that row `agent_created_thread`. It accepts only the exact machine-generated
+`codex_delegation` wrapper and extracts only its UUID-shaped source-thread id.
+The delegated prompt body is neither retained nor uploaded. Ordinary prompt
+text, malformed wrappers, self-links, and ambiguous ids produce no family edge.
+The uploaded result uses the same content-free parent/root/depth attribution
+facts as Codex's native spawn-edge table.
+
 This label transport reuses data already read by the incremental transcript
 scanner. It adds no filesystem polling, process inspection, permission prompt,
 or always-on watcher.
