@@ -1,5 +1,7 @@
 use crate::snapshots::{
-    SnapshotBatchRequest, SnapshotSource, SnapshotSourceManifest, SNAPSHOT_ENTITY_ACK_CONTRACT,
+    snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
+    SnapshotSource, SnapshotSourceManifest, SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION,
+    SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
 use anyhow::{anyhow, Result};
 use flate2::write::GzEncoder;
@@ -535,6 +537,11 @@ pub struct ActivityHintResponse {
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
+    /// Durable accepted-log capability for content-free request-index curves.
+    /// Missing/null/unknown is fail-closed: the daemon neither derives nor
+    /// emits curves that the server cannot durably acknowledge.
+    #[serde(default)]
+    pub session_context_curve_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -567,6 +574,10 @@ pub struct SnapshotEntityRef {
     pub snapshot_fingerprint: String,
     #[serde(default = "default_occurrence_count")]
     pub occurrence_count: u64,
+    #[serde(default)]
+    pub body_witness_version: Option<u64>,
+    #[serde(default)]
+    pub body_witness_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -607,6 +618,15 @@ impl SnapshotBatchResponse {
                 if self.accepted != request.snapshots.len() as u64 {
                     return Err(anyhow!("legacy snapshot response accepted count mismatch"));
                 }
+                if request
+                    .snapshots
+                    .iter()
+                    .any(|item| item.context_curve.is_some())
+                {
+                    return Err(anyhow!(
+                        "legacy snapshot response cannot durably acknowledge context curve evidence"
+                    ));
+                }
                 return Ok(());
             }
             Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => {}
@@ -621,7 +641,60 @@ impl SnapshotBatchResponse {
                 item.source_session_id.as_str(),
                 item.snapshot_fingerprint.as_str(),
             )
-        }))
+        }))?;
+        self.validate_body_witness_ack(request)
+    }
+
+    fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
+        let mut expected = std::collections::BTreeMap::new();
+        for item in &request.snapshots {
+            if item.context_curve.is_none() {
+                continue;
+            }
+            let version = snapshot_upload_body_witness_version(item)
+                .filter(|version| {
+                    matches!(
+                        *version,
+                        SNAPSHOT_BODY_WITNESS_CONTEXT_CURVE_VERSION
+                            | SNAPSHOT_BODY_WITNESS_EXCLUSIVE_CONTEXT_CURVE_VERSION
+                    )
+                })
+                .ok_or_else(|| anyhow!("context curve has no supported body witness version"))?;
+            let key = (
+                item.source_session_id.clone(),
+                item.snapshot_fingerprint.clone(),
+            );
+            let proof = (version, snapshot_upload_body_witness(item));
+            if expected
+                .insert(key, proof.clone())
+                .is_some_and(|previous| previous != proof)
+            {
+                return Err(anyhow!(
+                    "snapshot request contains conflicting context curve body witnesses"
+                ));
+            }
+        }
+        for reference in self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+        {
+            let key = (
+                reference.source_session_id.clone(),
+                reference.snapshot_fingerprint.clone(),
+            );
+            let Some((expected_version, expected_digest)) = expected.get(&key) else {
+                continue;
+            };
+            if reference.body_witness_version.as_ref() != Some(expected_version)
+                || reference.body_witness_digest.as_ref() != Some(expected_digest)
+            {
+                return Err(anyhow!(
+                    "snapshot ACK lacks exact durable context curve body witness proof"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_entity_ack_identities<'a>(
@@ -665,6 +738,8 @@ impl SnapshotBatchResponse {
                 source_session_id: rejection.source_session_id.clone(),
                 snapshot_fingerprint: rejection.snapshot_fingerprint.clone(),
                 occurrence_count: rejection.occurrence_count,
+                body_witness_version: None,
+                body_witness_digest: None,
             };
             validate_snapshot_entity_ref(&reference)?;
             if !rejection.permanent {
@@ -749,6 +824,19 @@ fn validate_snapshot_entity_ref(reference: &SnapshotEntityRef) -> Result<()> {
             .all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(anyhow!("snapshot ACK entity identity is malformed"));
+    }
+    match (
+        reference.body_witness_version,
+        reference.body_witness_digest.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(version), Some(digest))
+            if matches!(version, 3..=6)
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
+        _ => return Err(anyhow!("snapshot ACK body witness proof is malformed")),
     }
     Ok(())
 }
@@ -1893,6 +1981,22 @@ mod tests {
     }
 
     #[test]
+    fn context_curve_capability_defaults_off_and_requires_exact_contract() {
+        let old_backend: ActivityHintResponse =
+            serde_json::from_str(&activity_hint_json("")).expect("old activity hint");
+        assert_eq!(old_backend.session_context_curve_contract, None);
+
+        let admitted: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "session_context_curve_contract":"session_context_curve:v1""#,
+        ))
+        .expect("curve-capable activity hint");
+        assert_eq!(
+            admitted.session_context_curve_contract.as_deref(),
+            Some("session_context_curve:v1")
+        );
+    }
+
+    #[test]
     fn batch_rejected_downcasts_from_anyhow_and_keeps_status() {
         // The upload_batch validation path wraps BatchRejected in anyhow::Error;
         // the snapshot_sync caller relies on downcast_ref to choose the loud
@@ -2197,6 +2301,8 @@ mod tests {
             source_session_id: session.to_string(),
             snapshot_fingerprint: fingerprint.to_string(),
             occurrence_count,
+            body_witness_version: None,
+            body_witness_digest: None,
         }
     }
 

@@ -17,13 +17,14 @@ use crate::snapshot_client::{
     UploadFailureDiagnostics, UploadShed,
 };
 use crate::snapshots::{
-    apply_upload_policy, collector_version, finalize_scan_after_policy,
-    scan_source_roots_with_attribution_and_claude_effort_and_hints,
+    apply_upload_policy, collector_version, context_curve_derivation_revision,
+    finalize_scan_after_policy, scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
-    validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest, SnapshotItem,
-    SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
-    SnapshotUploadPolicy, SourceScanResult, MAX_BACKFILL_FILES_PER_SOURCE,
-    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
+    SnapshotItem, SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource,
+    SnapshotSourceManifest, SnapshotUploadPolicy, SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION,
+    SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -74,7 +75,7 @@ const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
-const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 2;
+const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static CLAUDE_REFRESH_ACTIVITY: OnceLock<Mutex<ClaudeRefreshActivity>> = OnceLock::new();
 
@@ -100,6 +101,12 @@ struct SnapshotUploadProgress {
     destination_namespace_hash: String,
     #[serde(default)]
     accepted_fingerprints: BTreeSet<String>,
+    /// Exact local body witness accepted for each semantic entity. Schema v3
+    /// prevents a crash-resume ledger for curve A from suppressing corrected
+    /// curve B, while the backend continues to ACK the stable semantic
+    /// fingerprint.
+    #[serde(default)]
+    accepted_body_witnesses: BTreeMap<String, String>,
     #[serde(default)]
     quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
     #[serde(skip)]
@@ -116,6 +123,7 @@ impl SnapshotUploadProgress {
             generation: 0,
             destination_namespace_hash,
             accepted_fingerprints: BTreeSet::new(),
+            accepted_body_witnesses: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
         }
@@ -137,7 +145,7 @@ impl SnapshotUploadProgress {
             .context("read snapshot upload progress")
             .and_then(|bytes| {
                 serde_json::from_slice::<Self>(&bytes)
-                    .context("parse v2 local snapshot upload progress")
+                    .context("parse v3 local snapshot upload progress")
             });
         let mut progress = match parsed {
             Ok(progress)
@@ -149,14 +157,27 @@ impl SnapshotUploadProgress {
                         .accepted_fingerprints
                         .iter()
                         .all(|value| is_snapshot_fingerprint(value))
+                    && progress.accepted_body_witnesses.len()
+                        == progress.accepted_fingerprints.len()
+                    && progress.accepted_body_witnesses.keys().all(|value| {
+                        is_snapshot_fingerprint(value)
+                            && progress.accepted_fingerprints.contains(value)
+                    })
+                    && progress
+                        .accepted_body_witnesses
+                        .values()
+                        .all(|value| is_snapshot_fingerprint(value))
                     && progress
                         .quarantined_fingerprints
                         .keys()
                         .all(|value| is_snapshot_fingerprint(value))
-                    && progress
-                        .quarantined_fingerprints
-                        .values()
-                        .all(snapshot_quarantine_deadline_is_bounded) =>
+                    && progress.quarantined_fingerprints.values().all(|record| {
+                        snapshot_quarantine_deadline_is_bounded(record)
+                            && record
+                                .upload_body_witness
+                                .as_deref()
+                                .map_or(true, is_snapshot_fingerprint)
+                    }) =>
             {
                 progress
             }
@@ -208,31 +229,55 @@ impl SnapshotUploadProgress {
             .retain(|fingerprint, _| !retry.contains(fingerprint));
     }
 
+    #[cfg(test)]
     fn contains(&self, fingerprint: &str) -> bool {
         self.accepted_fingerprints.contains(fingerprint)
             || self.quarantined_fingerprints.contains_key(fingerprint)
     }
 
-    fn record<'a>(&mut self, fingerprints: impl IntoIterator<Item = &'a str>) {
-        self.accepted_fingerprints
-            .extend(fingerprints.into_iter().map(str::to_string));
+    fn contains_body(&self, fingerprint: &str, body_witness: &str) -> bool {
+        self.accepted_body_witnesses
+            .get(fingerprint)
+            .is_some_and(|accepted| accepted == body_witness)
+            || self
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| record.upload_body_witness.as_deref() == Some(body_witness))
     }
 
+    #[cfg(test)]
+    fn record<'a>(&mut self, fingerprints: impl IntoIterator<Item = &'a str>) {
+        for fingerprint in fingerprints {
+            self.record_body(fingerprint, fingerprint);
+        }
+    }
+
+    fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        self.accepted_fingerprints.insert(fingerprint.to_string());
+        self.accepted_body_witnesses
+            .insert(fingerprint.to_string(), body_witness.to_string());
+    }
+
+    #[cfg(test)]
     fn quarantine<'a>(&mut self, fingerprints: impl IntoIterator<Item = &'a str>) {
+        for fingerprint in fingerprints {
+            self.quarantine_body(fingerprint, fingerprint);
+        }
+    }
+
+    fn quarantine_body(&mut self, fingerprint: &str, body_witness: &str) {
         let witness = self
             .active_quarantine_witness
             .clone()
             .expect("upload progress always has an active quarantine witness");
-        self.quarantined_fingerprints
-            .extend(fingerprints.into_iter().map(|fingerprint| {
-                (
-                    fingerprint.to_string(),
-                    SnapshotQuarantineRecord {
-                        witness: witness.clone(),
-                        retry_after_unix_seconds: quarantine_retry_after(fingerprint),
-                    },
-                )
-            }));
+        self.quarantined_fingerprints.insert(
+            fingerprint.to_string(),
+            SnapshotQuarantineRecord {
+                witness,
+                retry_after_unix_seconds: quarantine_retry_after(fingerprint),
+                upload_body_witness: Some(body_witness.to_string()),
+            },
+        );
     }
 
     fn retain_current_quarantines(&mut self, current: &BTreeSet<String>) -> bool {
@@ -1629,6 +1674,9 @@ fn sync_source(
     let scan_started_at = current_rfc3339();
     let relay_token = client.issue_relay_token(device, device_secret, source)?;
     let mut activity_hint = client.get_activity_hint(&relay_token)?;
+    let context_curve_enabled = source != SnapshotSource::Pi
+        && activity_hint.session_context_curve_contract.as_deref()
+            == Some(CONTEXT_CURVE_CONTRACT_VERSION);
     // The server's scan directive was parsed and discarded before this. It is a
     // cost lever, so it may only lengthen the local cadence (see
     // `negotiated_wait`), never shorten it.
@@ -1802,19 +1850,43 @@ fn sync_source(
         upload_policy,
         checkpoint_namespace.as_deref(),
     ));
+    if !context_curve_enabled {
+        // Stamp the off transition before taking the partial-commit baseline.
+        // If an ordinary no-curve upload is partially accepted and then shed,
+        // `committable_subset` must persist the new epoch so an immediate
+        // re-enable replays every file changed during that off cycle.
+        index.mark_context_curve_capability_disabled();
+    }
     upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     let backfill_state = load_backfill_state(support_dir);
     let backfill_pending =
         pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
             .contains(&source);
-    if backfill_pending {
-        let replay = current_historical_replay(source);
-        index.prepare_historical_replay(format!(
+    let replay = current_historical_replay(source);
+    let replay_generation = if context_curve_enabled {
+        let curve_derivation_revision = context_curve_derivation_revision(source)
+            .expect("curve capability is supported only for local Codex and Claude sources");
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            source.api_slug(),
+            replay.revision,
+            CONTEXT_CURVE_CONTRACT_VERSION,
+            curve_derivation_revision,
+            index.context_curve_replay_epoch(),
+            upload_destination_namespace
+        )
+    } else {
+        format!(
             "{}:{}:{}",
             source.api_slug(),
             replay.revision,
             upload_destination_namespace
-        ));
+        )
+    };
+    let curve_replay_pending =
+        context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
+    if backfill_pending || curve_replay_pending {
+        index.prepare_historical_replay(replay_generation.clone());
     }
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
@@ -1832,7 +1904,7 @@ fn sync_source(
         &roots,
         &mut index,
         &scan_started_at,
-        if backfill_pending {
+        if backfill_pending || curve_replay_pending {
             u64::MAX
         } else {
             activity_hint.backfill_window_days
@@ -1840,6 +1912,7 @@ fn sync_source(
         upload_policy.session_artifacts_enabled,
         attribution_context.as_ref(),
         (source == SnapshotSource::ClaudeCode).then_some(support_dir),
+        context_curve_enabled,
         &watcher_hints.paths,
         watcher_hints.overflowed,
     ) {
@@ -2045,12 +2118,13 @@ fn sync_source(
     }
 
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches(
+    let upload_result = upload_resumable_batches_with_body_witness(
         &scan_result.snapshots,
         source.api_slug(),
         &mut upload_progress,
         &mut accepted,
         |snapshot| snapshot.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -2294,6 +2368,12 @@ fn sync_source(
     }
 
     index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+    settle_context_curve_replay_state(
+        &mut index,
+        context_curve_enabled,
+        scan_result.census_complete,
+        &replay_generation,
+    );
     save_index_and_publish_manifest(
         &mut index,
         &index_path,
@@ -2365,6 +2445,26 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+fn settle_context_curve_replay_state(
+    index: &mut ScanIndex,
+    context_curve_enabled: bool,
+    census_complete: bool,
+    replay_generation: &str,
+) {
+    if context_curve_enabled && census_complete {
+        // This point is reached only after every curve-bearing entity received
+        // an exact durable v5/v6 proof and the bounded traversal reached the
+        // end of its frozen census. Partial pages retain the replay epoch so a
+        // later cycle keeps the full historical window and traversal cursor.
+        index.mark_context_curve_replay_complete(replay_generation.to_string());
+    } else if !context_curve_enabled {
+        // Mark the off epoch only after the ordinary no-curve cycle succeeds.
+        // A later re-enable uses the incremented epoch to force exactly one
+        // fresh historical replay, including files changed while off.
+        index.mark_context_curve_capability_disabled();
+    }
 }
 
 fn reconciliation_agent_status(collection: &AgentStatusCollection) -> &AgentStatusSnapshot {
@@ -2541,18 +2641,49 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
 /// client or gateway deadline are also bisected to reduce per-request
 /// reconciliation work. Splits are capped so an outage or broad contract
 /// mismatch cannot fan out into unbounded calls.
+#[cfg(test)]
 fn upload_resumable_batches<T, Fingerprint, Upload, Persist>(
     items: &[T],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     accepted: &mut u64,
     fingerprint: Fingerprint,
+    upload: Upload,
+    persist: Persist,
+) -> Result<ResumableUploadResult>
+where
+    T: Clone + Serialize,
+    Fingerprint: Fn(&T) -> &str + Copy,
+    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+{
+    upload_resumable_batches_with_body_witness(
+        items,
+        poison_scope,
+        progress,
+        accepted,
+        fingerprint,
+        move |item| fingerprint(item).to_string(),
+        upload,
+        persist,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Upload, Persist>(
+    items: &[T],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    accepted: &mut u64,
+    fingerprint: Fingerprint,
+    body_witness: BodyWitness,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
 where
     T: Clone + Serialize,
     Fingerprint: Fn(&T) -> &str,
+    BodyWitness: Fn(&T) -> String,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -2560,14 +2691,30 @@ where
     // across many cycles while valid sessions continue changing. Retain only
     // fingerprints present in this cycle's policy/cutoff-filtered work so the
     // hash-only ledger stays O(current scan), not O(all historical revisions).
-    let current_fingerprints = items
-        .iter()
-        .map(|item| fingerprint(item).to_string())
+    let mut current_body_witnesses = BTreeMap::new();
+    for item in items {
+        let item_fingerprint = fingerprint(item).to_string();
+        let item_body_witness = body_witness(item);
+        if current_body_witnesses
+            .insert(item_fingerprint.clone(), item_body_witness.clone())
+            .is_some_and(|previous| previous != item_body_witness)
+        {
+            return Err(anyhow::Error::new(SnapshotLocalStateRejected {
+                operation: "resolve conflicting snapshot body witnesses",
+            }));
+        }
+    }
+    let current_fingerprints = current_body_witnesses
+        .keys()
+        .cloned()
         .collect::<BTreeSet<_>>();
     let progress_len_before_prune = progress.accepted_fingerprints.len();
     progress
+        .accepted_body_witnesses
+        .retain(|fingerprint, witness| current_body_witnesses.get(fingerprint) == Some(witness));
+    progress
         .accepted_fingerprints
-        .retain(|value| current_fingerprints.contains(value));
+        .retain(|value| progress.accepted_body_witnesses.contains_key(value));
     retain_counted_poison_fingerprints(poison_scope, &current_fingerprints);
     if progress.accepted_fingerprints.len() != progress_len_before_prune {
         persist(progress).map_err(|_| {
@@ -2577,9 +2724,10 @@ where
         })?;
     }
 
-    let mut pending_by_fingerprint: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
+    let mut pending_by_fingerprint: BTreeMap<String, (usize, Vec<u8>, String)> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
-        if !progress.contains(fingerprint(item)) {
+        let witness = body_witness(item);
+        if !progress.contains_body(fingerprint(item), &witness) {
             match pending_by_fingerprint.entry(fingerprint(item).to_string()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     let body = serde_json::to_vec(item).map_err(|_| {
@@ -2587,7 +2735,7 @@ where
                             operation: "serialize snapshot for batch packing",
                         })
                     })?;
-                    entry.insert((index, body));
+                    entry.insert((index, body, witness));
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {
                     // The finalized fingerprint covers every post-policy
@@ -2607,7 +2755,7 @@ where
     let mut batches = VecDeque::new();
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
-    for (index, body) in pending_by_fingerprint.into_values() {
+    for (index, body, _) in pending_by_fingerprint.into_values() {
         let item_bytes = body.len().saturating_add(1);
         if !batch.is_empty()
             && (batch.len() == SNAPSHOT_BATCH_LIMIT
@@ -2630,7 +2778,9 @@ where
         // bootstrap. Re-check after earlier batches checkpointed it.
         let indices = indices
             .into_iter()
-            .filter(|index| !progress.contains(fingerprint(&items[*index])))
+            .filter(|index| {
+                !progress.contains_body(fingerprint(&items[*index]), &body_witness(&items[*index]))
+            })
             .collect::<Vec<_>>();
         if indices.is_empty() {
             continue;
@@ -2678,21 +2828,36 @@ where
                     ));
                 }
                 if entity_ack {
-                    progress.record(
-                        response
-                            .accepted_entities
-                            .iter()
-                            .chain(&response.unchanged_entities)
-                            .map(|entity| entity.snapshot_fingerprint.as_str()),
-                    );
-                    progress.quarantine(
-                        response
-                            .rejected_entities
-                            .iter()
-                            .map(|entity| entity.snapshot_fingerprint.as_str()),
-                    );
+                    let settled = response
+                        .accepted_entities
+                        .iter()
+                        .chain(&response.unchanged_entities)
+                        .map(|entity| entity.snapshot_fingerprint.as_str())
+                        .collect::<BTreeSet<_>>();
+                    for index in &indices {
+                        let item = &items[*index];
+                        let item_fingerprint = fingerprint(item);
+                        if settled.contains(item_fingerprint) {
+                            progress.record_body(item_fingerprint, &body_witness(item));
+                        }
+                    }
+                    let rejected = response
+                        .rejected_entities
+                        .iter()
+                        .map(|entity| entity.snapshot_fingerprint.as_str())
+                        .collect::<BTreeSet<_>>();
+                    for index in &indices {
+                        let item = &items[*index];
+                        let item_fingerprint = fingerprint(item);
+                        if rejected.contains(item_fingerprint) {
+                            progress.quarantine_body(item_fingerprint, &body_witness(item));
+                        }
+                    }
                 } else {
-                    progress.record(indices.iter().map(|index| fingerprint(&items[*index])));
+                    for index in &indices {
+                        let item = &items[*index];
+                        progress.record_body(fingerprint(item), &body_witness(item));
+                    }
                 }
                 // The remote write happened first. If this local atomic save
                 // fails, stop: at most this one idempotent page can replay.
@@ -2722,7 +2887,10 @@ where
                 };
                 let poison_fingerprint = fingerprint(&items[poison_index]);
                 let progress_before_quarantine = progress.clone();
-                progress.quarantine([fingerprint(&items[poison_index])]);
+                progress.quarantine_body(
+                    fingerprint(&items[poison_index]),
+                    &body_witness(&items[poison_index]),
+                );
                 if persist(progress).is_err() {
                     *progress = progress_before_quarantine;
                     return Err(anyhow::Error::new(SnapshotLocalStateRejected {
@@ -3489,6 +3657,19 @@ mod tests {
     static TEST_POISON_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     #[test]
+    fn partial_curve_replay_page_keeps_historical_epoch_pending() {
+        let mut index = ScanIndex::default();
+        let generation = "session_context_curve:v1:parser-test";
+
+        assert!(index.context_curve_replay_needed(generation));
+        settle_context_curve_replay_state(&mut index, true, false, generation);
+        assert!(index.context_curve_replay_needed(generation));
+
+        settle_context_curve_replay_state(&mut index, true, true, generation);
+        assert!(!index.context_curve_replay_needed(generation));
+    }
+
+    #[test]
     #[serial]
     fn claude_refresh_hook_coalesces_and_raii_releases() {
         reset_claude_refresh_activity();
@@ -3523,6 +3704,132 @@ mod tests {
             format!("{:064x}", 99),
             snapshot_quarantine_witness(SnapshotSource::Codex),
         )
+    }
+
+    #[derive(Clone, Serialize)]
+    struct BodyWitnessTestItem {
+        snapshot_fingerprint: String,
+        body_revision: String,
+    }
+
+    #[test]
+    fn resumable_progress_tracks_hash_neutral_body_corrections() {
+        let fingerprint = format!("{:064x}", 42);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut uploads = Vec::new();
+        let mut run =
+            |body_revision: &str, progress: &mut SnapshotUploadProgress, accepted: &mut u64| {
+                let item = BodyWitnessTestItem {
+                    snapshot_fingerprint: fingerprint.clone(),
+                    body_revision: body_revision.to_string(),
+                };
+                upload_resumable_batches_with_body_witness(
+                    &[item],
+                    &unique_poison_scope(),
+                    progress,
+                    accepted,
+                    |item| item.snapshot_fingerprint.as_str(),
+                    |item| format!("{:064x}", if item.body_revision == "a" { 10 } else { 11 }),
+                    |batch| {
+                        uploads.push(batch[0].body_revision.clone());
+                        Ok(accepted_batch(batch.len()))
+                    },
+                    |_| Ok(()),
+                )
+                .expect("body-witness upload")
+            };
+
+        assert_eq!(
+            run("a", &mut progress, &mut accepted),
+            ResumableUploadResult::Completed
+        );
+        assert_eq!(
+            run("a", &mut progress, &mut accepted),
+            ResumableUploadResult::Completed
+        );
+        assert_eq!(
+            run("b", &mut progress, &mut accepted),
+            ResumableUploadResult::Completed
+        );
+        assert_eq!(
+            run("a", &mut progress, &mut accepted),
+            ResumableUploadResult::Completed
+        );
+        assert_eq!(uploads, ["a", "b", "a"]);
+        assert_eq!(accepted, 3);
+        assert_eq!(
+            progress.accepted_fingerprints,
+            BTreeSet::from([fingerprint])
+        );
+
+        let mut corrected_progress = test_upload_progress();
+        let witness_a = format!("{:064x}", 10);
+        let witness_b = format!("{:064x}", 11);
+        corrected_progress.quarantine_body(&format!("{:064x}", 42), &witness_a);
+        assert!(corrected_progress.contains_body(&format!("{:064x}", 42), &witness_a));
+        assert!(
+            !corrected_progress.contains_body(&format!("{:064x}", 42), &witness_b),
+            "a corrected hash-neutral body bypasses the old body's quarantine"
+        );
+        let mut corrected_accepted = 0;
+        let mut corrected_uploads = 0;
+        let corrected_item = BodyWitnessTestItem {
+            snapshot_fingerprint: format!("{:064x}", 42),
+            body_revision: "b".to_string(),
+        };
+        upload_resumable_batches_with_body_witness(
+            &[corrected_item],
+            &unique_poison_scope(),
+            &mut corrected_progress,
+            &mut corrected_accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |_| witness_b.clone(),
+            |batch| {
+                corrected_uploads += 1;
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect("corrected body bypasses quarantine");
+        assert_eq!((corrected_uploads, corrected_accepted), (1, 1));
+    }
+
+    #[test]
+    fn resumable_progress_rejects_conflicting_bodies_for_one_semantic_entity() {
+        let fingerprint = format!("{:064x}", 42);
+        let items = [
+            BodyWitnessTestItem {
+                snapshot_fingerprint: fingerprint.clone(),
+                body_revision: "a".to_string(),
+            },
+            BodyWitnessTestItem {
+                snapshot_fingerprint: fingerprint,
+                body_revision: "b".to_string(),
+            },
+        ];
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut uploads = 0;
+        let error = upload_resumable_batches_with_body_witness(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            |item| format!("{:064x}", if item.body_revision == "a" { 10 } else { 11 }),
+            |batch| {
+                uploads += 1;
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect_err("conflicting bodies fail before upload");
+        assert!(error
+            .to_string()
+            .contains("resolve conflicting snapshot body witnesses"));
+        assert_eq!((uploads, accepted), (0, 0));
+        assert!(progress.accepted_fingerprints.is_empty());
     }
 
     fn test_quarantine_witness() -> SnapshotQuarantineWitness {
@@ -3635,6 +3942,8 @@ mod tests {
                         source_session_id: "accepted".to_string(),
                         snapshot_fingerprint: accepted_fingerprint.clone(),
                         occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
                     }],
                     unchanged_entities: Vec::new(),
                     rejected_entities: vec![crate::snapshot_client::SnapshotEntityRejection {
@@ -5325,6 +5634,7 @@ mod tests {
             SnapshotQuarantineRecord {
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
+                upload_body_witness: None,
             },
         );
         corrupt.save(&path).expect("persist far-future deadline");
@@ -5440,6 +5750,7 @@ mod tests {
                 SnapshotQuarantineRecord {
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
+                    upload_body_witness: None,
                 },
             );
         }
