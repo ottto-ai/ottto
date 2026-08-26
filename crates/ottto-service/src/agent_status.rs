@@ -7335,7 +7335,7 @@ fn validated_codex_identity(
         if active.get("type").and_then(Value::as_str) != Some("chatgpt") {
             return None;
         }
-        let claim_email = first_json_string(&claims, &["email"])?;
+        let claim_email = codex_access_token_email(&claims)?;
         let active_email = first_json_string(active, &["email"])?;
         if claim_email != active_email {
             return None;
@@ -7363,6 +7363,21 @@ fn validated_codex_identity(
         workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
         raw_workspace_id,
     })
+}
+
+fn codex_access_token_email(claims: &Value) -> Option<String> {
+    claims
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(|value| value.trim().to_string())
 }
 
 fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
@@ -12388,6 +12403,33 @@ for line in sys.stdin:
         format!("{header}.{payload}.synthetic-signature")
     }
 
+    fn synthetic_codex_access_jwt_with_profile_email(
+        user: &str,
+        workspace: &str,
+        account_label: &str,
+        plan: &str,
+        expires_at: i64,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "iss": "https://auth.openai.com",
+                "aud": "synthetic-client",
+                "exp": expires_at,
+                "https://api.openai.com/profile": {
+                    "email": account_label
+                },
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": user,
+                    "chatgpt_account_id": workspace,
+                    "chatgpt_plan_type": plan
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.synthetic-signature")
+    }
+
     #[test]
     fn unrefreshed_or_mismatched_jwt_identity_never_carries_provider_meters() {
         let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
@@ -12501,6 +12543,182 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn codex_profile_email_identity_retains_provider_meters() {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "synthetic-account",
+                "planType": "pro"
+            }
+        });
+        let rate_limits = serde_json::json!({
+            "rateLimits": {
+                "limitId": "synthetic-limit",
+                "planType": "pro",
+                "primary": {"usedPercent": 25, "windowDurationMins": 300}
+            }
+        });
+
+        let identity = validated_codex_identity(
+            &credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        )
+        .expect("profile email should correlate the authenticated identity");
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-08-23T00:00:00Z".to_string(),
+            "2026-08-23T00:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: Some(identity.account_identifier_hash.clone()),
+            organization_identifier_hash: Some(identity.workspace_identifier_hash.clone()),
+            ..unsupported_account("openai")
+        });
+        snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "synthetic_primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
+
+        assert_eq!(snapshot.quota_windows.len(), 1);
+        assert_eq!(snapshot.credit_balances.len(), 1);
+        assert_eq!(
+            snapshot.quota_windows[0].account_identifier_hash.as_deref(),
+            Some(identity.account_identifier_hash.as_str())
+        );
+        assert_eq!(
+            snapshot.credit_balances[0]
+                .organization_identifier_hash
+                .as_deref(),
+            Some(identity.workspace_identifier_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_profile_email_mismatch_clears_provider_meters() {
+        let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+        let matching_credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            id_token: Some(synthetic_codex_jwt(
+                "synthetic-user",
+                "synthetic-workspace",
+                "synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            account_id: Some("synthetic-workspace".to_string()),
+        };
+        let provider_account = serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "synthetic-account",
+                "planType": "pro"
+            }
+        });
+        let rate_limits = serde_json::json!({
+            "rateLimits": {
+                "limitId": "synthetic-limit",
+                "planType": "pro",
+                "primary": {"usedPercent": 25, "windowDurationMins": 300}
+            }
+        });
+        assert!(validated_codex_identity(
+            &matching_credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        )
+        .is_some());
+
+        let mismatched_credentials = CodexAuthCredentials {
+            access_token: Some(synthetic_codex_access_jwt_with_profile_email(
+                "synthetic-user",
+                "synthetic-workspace",
+                "different-synthetic-account",
+                "pro",
+                expires_at,
+            )),
+            ..matching_credentials
+        };
+        let identity = validated_codex_identity(
+            &mismatched_credentials,
+            Some(&provider_account),
+            Some(&rate_limits),
+            true,
+        );
+        assert!(identity.is_none());
+
+        let mut snapshot = base_snapshot(
+            SourceKind::Codex,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::AppServer,
+            "2026-08-23T00:00:00Z".to_string(),
+            "2026-08-23T00:15:00Z".to_string(),
+        );
+        snapshot.account = Some(AgentAccountStatus {
+            login_state: AgentLoginState::SignedIn,
+            account_identifier_hash: identity
+                .as_ref()
+                .map(|value| value.account_identifier_hash.clone()),
+            organization_identifier_hash: identity
+                .as_ref()
+                .map(|value| value.workspace_identifier_hash.clone()),
+            ..unsupported_account("openai")
+        });
+        snapshot.quota_windows.push(AgentQuotaWindow {
+            name: "synthetic_primary".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
+
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
+    }
+
+    #[test]
     fn codex_partial_identity_never_emits_hash_or_quota_snapshot() {
         let mut snapshot = base_snapshot(
             SourceKind::Codex,
@@ -12520,6 +12738,13 @@ for line in sys.stdin:
             freshness: AgentQuotaWindowFreshness::Fresh,
             ..Default::default()
         });
+        snapshot.credit_balances.push(AgentCreditBalance {
+            name: "synthetic_credits".to_string(),
+            freshness: AgentQuotaWindowFreshness::Fresh,
+            ..Default::default()
+        });
+
+        stamp_codex_meter_identity(&mut snapshot);
 
         let status = codex_collection_status_from_snapshot(&snapshot);
         assert_eq!(
@@ -12529,6 +12754,8 @@ for line in sys.stdin:
         assert_eq!(status.account_identifier_hash, None);
         assert_eq!(status.workspace_identifier_hash, None);
         assert!(status.quota_snapshot.is_none());
+        assert!(snapshot.quota_windows.is_empty());
+        assert!(snapshot.credit_balances.is_empty());
     }
 
     fn codex_id_token_with_auth_claim(auth_claim: &str) -> String {
