@@ -14812,6 +14812,10 @@ impl ScanIndex {
         self.snapshot_activity_at.clear();
     }
 
+    pub(crate) fn historical_replay_generation_matches(&self, generation: &str) -> bool {
+        self.historical_replay_generation.as_deref() == Some(generation)
+    }
+
     pub(crate) fn context_curve_replay_epoch(&self) -> u64 {
         self.context_curve_replay_epoch
     }
