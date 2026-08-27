@@ -226,11 +226,11 @@ pub struct HistoricalReplayDirective {
 pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDirective {
     match source {
         SnapshotSource::ClaudeCode => HistoricalReplayDirective {
-            revision: "claude_reported_usage_union:v3",
+            revision: "claude_reported_usage_union:v4",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Codex => HistoricalReplayDirective {
-            revision: "codex_session_exclusive_usage:v2",
+            revision: "codex_session_exclusive_usage:v3",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Pi => HistoricalReplayDirective {
@@ -765,10 +765,10 @@ mod tests {
     }
 
     #[test]
-    fn current_founder_backfill_replays_are_one_shot_and_source_scoped() {
+    fn accepted_log_recovery_replays_are_one_shot_and_source_scoped() {
         let expected = [
-            (SnapshotSource::ClaudeCode, "claude_reported_usage_union:v3"),
-            (SnapshotSource::Codex, "codex_session_exclusive_usage:v2"),
+            (SnapshotSource::ClaudeCode, "claude_reported_usage_union:v4"),
+            (SnapshotSource::Codex, "codex_session_exclusive_usage:v3"),
             (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
         ];
         let mut state = BackfillState::default();
@@ -778,32 +778,34 @@ mod tests {
                 current_parser_version(source).to_string(),
             );
         }
-        state.completed_replay_revisions.insert(
-            SnapshotSource::ClaudeCode.api_slug().to_string(),
-            "claude_compact_boundary_dedup:v2".to_string(),
-        );
+        for (source, revision) in [
+            (SnapshotSource::ClaudeCode, "claude_reported_usage_union:v3"),
+            (SnapshotSource::Codex, "codex_session_exclusive_usage:v2"),
+            (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
+        ] {
+            state
+                .completed_replay_revisions
+                .insert(source.api_slug().to_string(), revision.to_string());
+        }
 
         assert_eq!(
             pending_backfill_sources(&state),
-            vec![
-                SnapshotSource::ClaudeCode,
-                SnapshotSource::Codex,
-                SnapshotSource::Pi,
-            ]
+            vec![SnapshotSource::ClaudeCode, SnapshotSource::Codex],
+            "the recovery revision must rearm Codex and Claude without replaying Pi"
         );
-        for (completed_index, (source, revision)) in expected.into_iter().enumerate() {
+        for (source, revision) in expected {
             let directive = current_historical_replay(source);
             assert_eq!(directive.policy, HistoricalReplayPolicy::Full);
             assert_eq!(directive.revision, revision);
-
-            mark_backfill_complete(&mut state, source);
-            assert!(!pending_backfill_sources(&state).contains(&source));
-            for (pending_source, _) in &expected[completed_index + 1..] {
-                assert!(pending_backfill_sources(&state).contains(pending_source));
-            }
         }
 
-        let dir = temp_dir("founder-replay-state");
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            mark_backfill_complete(&mut state, source);
+            assert!(!pending_backfill_sources(&state).contains(&source));
+        }
+        assert!(pending_backfill_sources(&state).is_empty());
+
+        let dir = temp_dir("accepted-log-recovery-replay-state");
         save_backfill_state(&dir, &state).expect("save completed replay revisions");
         let loaded = load_backfill_state(&dir);
         assert!(pending_backfill_sources(&loaded).is_empty());

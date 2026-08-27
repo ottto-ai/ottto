@@ -99,6 +99,11 @@ struct SnapshotUploadProgress {
     #[serde(default)]
     generation: u64,
     destination_namespace_hash: String,
+    /// Full replay generation whose ACKs populate this ledger. A new reviewed
+    /// replay must not inherit ACKs for identical entities from an older
+    /// generation, while a restart of the same generation must still resume.
+    #[serde(default)]
+    historical_replay_generation: Option<String>,
     #[serde(default)]
     accepted_fingerprints: BTreeSet<String>,
     /// Exact local body witness accepted for each semantic entity. Schema v3
@@ -122,6 +127,7 @@ impl SnapshotUploadProgress {
             schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
             generation: 0,
             destination_namespace_hash,
+            historical_replay_generation: None,
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
             quarantined_fingerprints: BTreeMap::new(),
@@ -227,6 +233,23 @@ impl SnapshotUploadProgress {
             .collect::<BTreeSet<_>>();
         self.quarantined_fingerprints
             .retain(|fingerprint, _| !retry.contains(fingerprint));
+    }
+
+    /// Rearm every current entity exactly once for a new historical replay.
+    ///
+    /// The scan index independently clears its file checkpoints, but stable
+    /// semantic fingerprints mean an older accepted/quarantined progress entry
+    /// could otherwise suppress the re-derived upload. Keep same-generation
+    /// progress intact so page ACKs and conflict retries remain resumable.
+    fn prepare_historical_replay(&mut self, generation: &str) -> bool {
+        if self.historical_replay_generation.as_deref() == Some(generation) {
+            return false;
+        }
+        self.historical_replay_generation = Some(generation.to_string());
+        self.accepted_fingerprints.clear();
+        self.accepted_body_witnesses.clear();
+        self.quarantined_fingerprints.clear();
+        true
     }
 
     #[cfg(test)]
@@ -1857,7 +1880,6 @@ fn sync_source(
         // re-enable replays every file changed during that off cycle.
         index.mark_context_curve_capability_disabled();
     }
-    upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
     let backfill_state = load_backfill_state(support_dir);
     let backfill_pending =
         pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
@@ -1885,7 +1907,19 @@ fn sync_source(
     };
     let curve_replay_pending =
         context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
-    if backfill_pending || curve_replay_pending {
+    let historical_replay_pending = backfill_pending || curve_replay_pending;
+    if prepare_upload_progress_for_cycle(
+        &mut upload_progress,
+        &index,
+        &replay_generation,
+        historical_replay_pending,
+    ) {
+        // Claim the new generation before the potentially long historical
+        // scan. This prevents ACKs from the prior revision from suppressing
+        // identical entities and gives overlapping writers a CAS boundary.
+        upload_progress.save(&upload_progress_path)?;
+    }
+    if historical_replay_pending {
         index.prepare_historical_replay(replay_generation.clone());
     }
     // The committed state, before the scan advances it. A partial commit needs
@@ -2479,6 +2513,32 @@ fn sync_source(
         },
     )?;
     Ok(())
+}
+
+/// Prepare the disposable upload ledger against the durable scan-index replay.
+///
+/// The index owns both the replay generation and conflict quarantine after a
+/// completed cycle clears upload progress. For a new generation, old index
+/// quarantine must not be restored after progress is rearmed. For the same
+/// generation, restore it only after progress has claimed that generation so a
+/// clean follow-up cannot erase a replacement conflict before its retry.
+fn prepare_upload_progress_for_cycle(
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    historical_replay_pending: bool,
+) -> bool {
+    if !historical_replay_pending {
+        upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        return false;
+    }
+
+    let same_index_replay = index.historical_replay_generation_matches(replay_generation);
+    let progress_changed = upload_progress.prepare_historical_replay(replay_generation);
+    if same_index_replay {
+        upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    }
+    progress_changed
 }
 
 fn settle_context_curve_replay_state(
@@ -3845,6 +3905,245 @@ mod tests {
             format!("{:064x}", 99),
             snapshot_quarantine_witness(SnapshotSource::Codex),
         )
+    }
+
+    #[test]
+    fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
+        let poison_scope = &unique_poison_scope();
+        let root = test_dir("snapshot-replay-generation-progress");
+        let path = root.join("codex-scan-index-v3-upload-progress.json");
+        let items = test_fingerprints(2);
+        let destination = format!("{:064x}", 99);
+        let old_generation = format!("codex:codex_session_exclusive_usage:v2:{destination}");
+        let new_generation = format!("codex:codex_session_exclusive_usage:v3:{destination}");
+
+        // Model the exact pre-change v3 file from the admission gap: it has no
+        // replay-generation field, one current entity was ACKed, and another
+        // was quarantined while both backend heads still need replacement.
+        let mut progress = test_upload_progress();
+        progress.record([items[0].as_str()]);
+        progress.quarantine([items[1].as_str()]);
+        let mut old_index = ScanIndex::default();
+        old_index.prepare_historical_replay(old_generation);
+        old_index.file_snapshot_fingerprints.insert(
+            "old-generation.jsonl".to_string(),
+            BTreeSet::from([items[1].clone()]),
+        );
+        old_index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        let mut current_v3 = serde_json::to_value(&progress).expect("serialize v3 progress");
+        current_v3
+            .as_object_mut()
+            .expect("progress is an object")
+            .remove("historical_replay_generation");
+        std::fs::create_dir_all(&root).expect("create progress fixture directory");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&current_v3).expect("serialize pre-change v3 progress"),
+        )
+        .expect("save pre-change v3 progress");
+
+        let mut rearmed = SnapshotUploadProgress::load(
+            &path,
+            &destination,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .expect("load pre-change v3 progress");
+        assert!(rearmed.historical_replay_generation.is_none());
+        assert!(prepare_upload_progress_for_cycle(
+            &mut rearmed,
+            &old_index,
+            &new_generation,
+            true,
+        ));
+        assert!(rearmed.accepted_fingerprints.is_empty());
+        assert!(rearmed.quarantined_fingerprints.is_empty());
+        rearmed
+            .save(&path)
+            .expect("persist replay rearm before scan");
+
+        let mut accepted = 0;
+        let mut upload_calls = 0;
+        let result = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut rearmed,
+            &mut accepted,
+            String::as_str,
+            |batch| {
+                upload_calls += 1;
+                assert_eq!(batch, items);
+                Ok(accepted_batch(batch.len()))
+            },
+            |state| state.save(&path),
+        )
+        .expect("new replay uploads every prior old-generation entity");
+        assert_eq!(result, ResumableUploadResult::Completed);
+        assert_eq!((upload_calls, accepted), (1, 2));
+
+        let mut resumed = SnapshotUploadProgress::load(
+            &path,
+            &destination,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .expect("reload new replay progress");
+        assert!(!resumed.prepare_historical_replay(&new_generation));
+        let mut resumed_accepted = 0;
+        let mut resumed_upload_calls = 0;
+        let resumed_result = upload_resumable_batches(
+            &items,
+            poison_scope,
+            &mut resumed,
+            &mut resumed_accepted,
+            String::as_str,
+            |_| {
+                resumed_upload_calls += 1;
+                Ok(accepted_batch(0))
+            },
+            |state| state.save(&path),
+        )
+        .expect("same replay generation resumes from its durable ACKs");
+        assert_eq!(resumed_result, ResumableUploadResult::Completed);
+        assert_eq!((resumed_upload_calls, resumed_accepted), (0, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial(client_report)]
+    fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
+        use crate::client_report::reset_for_test;
+
+        reset_for_test();
+        let poison_scope = unique_poison_scope();
+        let root = test_dir("snapshot-replay-conflict-progress-restore");
+        let index_path = root.join("codex-scan-index-v3.json");
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        let destination = format!("{:064x}", 99);
+        let replay_generation = format!("codex:codex_session_exclusive_usage:v3:{destination}");
+        let conflicted_fingerprint = test_fingerprints(1).remove(0);
+
+        let mut index = ScanIndex::default();
+        index.prepare_historical_replay(replay_generation.clone());
+        index.file_snapshot_fingerprints.insert(
+            "conflicted.jsonl".to_string(),
+            BTreeSet::from([conflicted_fingerprint.clone()]),
+        );
+
+        let mut progress = test_upload_progress();
+        assert!(progress.prepare_historical_replay(&replay_generation));
+        let mut accepted = 0;
+        let result = upload_resumable_batches(
+            std::slice::from_ref(&conflicted_fingerprint),
+            &poison_scope,
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| {
+                Ok(crate::snapshot_client::SnapshotBatchResponse {
+                    accepted: 0,
+                    sessions_reconciled: 0,
+                    session_ids: Vec::new(),
+                    disabled: false,
+                    disabled_reason: None,
+                    entity_ack_contract: Some(
+                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
+                    ),
+                    accepted_entities: Vec::new(),
+                    unchanged_entities: Vec::new(),
+                    rejected_entities: Vec::new(),
+                    conflict_entities: vec![crate::snapshot_client::SnapshotEntityRef {
+                        source_session_id: "conflicted".to_string(),
+                        snapshot_fingerprint: conflicted_fingerprint.clone(),
+                        occurrence_count: 1,
+                        body_witness_version: None,
+                        body_witness_digest: None,
+                    }],
+                })
+            },
+            |state| state.save(&progress_path),
+        )
+        .expect("conflict remains retryable");
+        assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
+        assert_eq!(accepted, 0);
+
+        index.mark_bounded_sweep_unsettled();
+        index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+        index.save(&index_path).expect("persist conflicted index");
+        progress
+            .clear(&progress_path)
+            .expect("completed conflict cycle clears disposable progress");
+
+        let persisted_index = ScanIndex::load(&index_path).expect("reload conflicted index");
+        let mut restored = SnapshotUploadProgress::load(
+            &progress_path,
+            &destination,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .expect("load cleared progress");
+        assert!(prepare_upload_progress_for_cycle(
+            &mut restored,
+            &persisted_index,
+            &replay_generation,
+            true,
+        ));
+        assert!(
+            restored
+                .quarantined_fingerprints
+                .contains_key(&conflicted_fingerprint),
+            "same-generation historical preparation must restore index-owned conflict"
+        );
+        restored
+            .save(&progress_path)
+            .expect("persist restored same-generation conflict");
+        restored
+            .clear(&progress_path)
+            .expect("model another completed follow-up cycle");
+
+        let mut due_index = persisted_index;
+        due_index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&conflicted_fingerprint)
+            .expect("conflict remains in index")
+            .retry_after_unix_seconds = 0;
+        due_index.save(&index_path).expect("persist due conflict");
+
+        let due_index = ScanIndex::load(&index_path).expect("reload due conflict index");
+        let mut retry_progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &destination,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .expect("load progress for due retry");
+        assert!(prepare_upload_progress_for_cycle(
+            &mut retry_progress,
+            &due_index,
+            &replay_generation,
+            true,
+        ));
+        assert!(
+            !retry_progress.contains(&conflicted_fingerprint),
+            "due same-generation conflict must be released for upload retry"
+        );
+
+        let mut retry_accepted = 0;
+        let mut retry_uploads = 0;
+        let retry_result = upload_resumable_batches(
+            std::slice::from_ref(&conflicted_fingerprint),
+            &poison_scope,
+            &mut retry_progress,
+            &mut retry_accepted,
+            String::as_str,
+            |batch| {
+                retry_uploads += 1;
+                Ok(accepted_batch(batch.len()))
+            },
+            |_| Ok(()),
+        )
+        .expect("due same-generation conflict is retried");
+        assert_eq!(retry_result, ResumableUploadResult::Completed);
+        assert_eq!((retry_uploads, retry_accepted), (1, 1));
+
+        let _ = std::fs::remove_dir_all(root);
+        reset_for_test();
     }
 
     #[derive(Clone, Serialize)]
