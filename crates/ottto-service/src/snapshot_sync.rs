@@ -2213,6 +2213,7 @@ fn sync_source(
     withdraw_source_manifest(&upload_destination_namespace, source);
 
     let mut upload_fully_settled = true;
+    let mut deferred_entity_conflict_count = None;
     match upload_result {
         Ok(ResumableUploadResult::Completed) => clear_shed_streak(source),
         Ok(ResumableUploadResult::Conflicted { count }) => {
@@ -2224,6 +2225,7 @@ fn sync_source(
             index.mark_bounded_sweep_unsettled();
             backfill_succeeded = false;
             upload_fully_settled = false;
+            deferred_entity_conflict_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
                  conflicting entity(ies) pending for {}; a clean follow-up scan is required",
@@ -2452,13 +2454,18 @@ fn sync_source(
         &manifest_window_end,
     )?;
     // A completed cycle is what moves the tier: uploads keep a source warm, a
-    // quiet cycle lets it fall to idle and then cold. The sweep marker is stamped
-    // on the same event, which is what keeps the 6-hour full sweep independent of
-    // the watcher.
+    // quiet cycle lets it fall to idle and then cold. A conflict pass has still
+    // durably committed its accepted siblings, but remains a source failure so
+    // it returns to the retry cadence instead of advertising a clean terminal
+    // scan. The sweep marker is stamped only for fully settled scans.
     with_source_cadence(source, |cadence| {
         let now = Instant::now();
-        cadence.record_scan_success(now, accepted);
-        cadence.record_full_sweep(now);
+        if deferred_entity_conflict_count.is_some() {
+            cadence.record_scan_failure(now);
+        } else {
+            cadence.record_scan_success(now, accepted);
+            cadence.record_full_sweep(now);
+        }
     });
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -2498,6 +2505,32 @@ fn sync_source(
     // crash anywhere above leaves the hash-only ledger in place; the next run
     // safely resumes/finalizes without replaying accepted pages.
     upload_progress.clear(&upload_progress_path)?;
+
+    if let Some(count) = deferred_entity_conflict_count {
+        // The uploader drained its frozen, scan-capped queue before returning
+        // `Conflicted`, and the index above now owns both accepted siblings and
+        // retryable conflict quarantine. Surface the conflict only after those
+        // facts are durable: returning earlier would recreate the per-source
+        // starvation wedge, while reporting success would hide the backend's
+        // capacity condition from source-level isolation and cadence handling.
+        let _ = report_status_with_fresh_relay_token(
+            client,
+            device,
+            device_secret,
+            source,
+            CollectorStatus {
+                source,
+                machine_id,
+                scan_started_at: terminal_scan_started_at,
+                counts: SyncCounts::from_scan_result(&scan_result, accepted),
+                state: CollectorState::Error {
+                    code: "server_error",
+                    message: "backend deferred conflicting snapshot entities",
+                },
+            },
+        );
+        return Err(snapshot_entity_conflict_deferred(count));
+    }
 
     report_status_with_fresh_relay_token(
         client,
@@ -2676,6 +2709,27 @@ impl std::fmt::Display for SnapshotBatchResponseRejected {
 }
 
 impl std::error::Error for SnapshotBatchResponseRejected {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotEntityConflictDeferred {
+    count: usize,
+}
+
+impl std::fmt::Display for SnapshotEntityConflictDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "snapshot upload deferred {} conflicting entity(ies)",
+            self.count
+        )
+    }
+}
+
+impl std::error::Error for SnapshotEntityConflictDeferred {}
+
+fn snapshot_entity_conflict_deferred(count: usize) -> anyhow::Error {
+    anyhow::Error::new(SnapshotEntityConflictDeferred { count })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotUploadErrorClass {
@@ -3762,6 +3816,12 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
     if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
         return diagnostics.safe_message();
     }
+    if error
+        .downcast_ref::<SnapshotEntityConflictDeferred>()
+        .is_some()
+    {
+        return "local snapshot upload deferred by entity conflict".to_string();
+    }
     match snapshot_upload_error_class(error) {
         Some(SnapshotUploadErrorClass::LocalState) => {
             return "local snapshot state failed".to_string();
@@ -4291,6 +4351,44 @@ mod tests {
         }
     }
 
+    fn entity_ack_ref(fingerprint: &str) -> crate::snapshot_client::SnapshotEntityRef {
+        crate::snapshot_client::SnapshotEntityRef {
+            source_session_id: format!("session-{fingerprint}"),
+            snapshot_fingerprint: fingerprint.to_string(),
+            occurrence_count: 1,
+            body_witness_version: None,
+            body_witness_digest: None,
+        }
+    }
+
+    fn entity_ack_batch(
+        accepted: &[String],
+        unchanged: &[String],
+        conflicted: &[String],
+    ) -> crate::snapshot_client::SnapshotBatchResponse {
+        crate::snapshot_client::SnapshotBatchResponse {
+            accepted: accepted.len().saturating_add(unchanged.len()) as u64,
+            sessions_reconciled: accepted.len().saturating_add(unchanged.len()) as u64,
+            session_ids: Vec::new(),
+            disabled: false,
+            disabled_reason: None,
+            entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
+            accepted_entities: accepted
+                .iter()
+                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .collect(),
+            unchanged_entities: unchanged
+                .iter()
+                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .collect(),
+            rejected_entities: Vec::new(),
+            conflict_entities: conflicted
+                .iter()
+                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .collect(),
+        }
+    }
+
     #[test]
     fn snapshot_upload_batches_enforce_the_entity_count_bound() {
         let poison_scope = &unique_poison_scope();
@@ -4417,29 +4515,31 @@ mod tests {
         reset_for_test();
     }
 
-    /// A conflicting entity must not strand the page it arrived in.
+    /// A conflicting entity must not strand its accepted siblings or later pages.
     ///
-    /// Regression for the codex-only sync deadlock: the uploader used to return
-    /// an error the moment `conflict_entities` was non-empty, BEFORE recording
-    /// the entities the backend had already written in that same response. So
-    /// nothing was ever checkpointed, the identical page replayed every cycle,
-    /// the scan index could never commit, and the "fresh complete scan" the old
-    /// comment said recovery needed could never happen. One conflicting entity
-    /// deadlocked its whole source permanently, across daemon restarts, while
-    /// its siblings kept being re-accepted by the backend every five minutes.
+    /// Regression for the per-source starvation wedge: the uploader used to
+    /// return the moment `conflict_entities` was non-empty, before recording the
+    /// entities the backend had already written in that response and before
+    /// visiting the next fingerprint-sorted page. A persistent capacity conflict
+    /// therefore replayed its accepted siblings and starved every later entity on
+    /// the source at the five-minute cadence.
     #[test]
     #[serial(client_report)]
-    fn entity_ack_conflict_settles_siblings_and_defers_only_the_conflict() {
+    fn entity_ack_conflict_checkpoints_siblings_drains_later_batch_and_clears_on_revision() {
         use crate::client_report::{observe, reset_for_test, ClientReportReason};
 
         reset_for_test();
         let poison_scope = unique_poison_scope();
-        let items = test_fingerprints(2);
-        let accepted_fingerprint = items[0].clone();
-        let conflicted_fingerprint = items[1].clone();
+        let items = test_fingerprints(SNAPSHOT_BATCH_LIMIT + 1);
+        let first_batch = items[..SNAPSHOT_BATCH_LIMIT].to_vec();
+        let later_batch = items[SNAPSHOT_BATCH_LIMIT..].to_vec();
+        let conflicted_fingerprint = first_batch[0].clone();
+        let first_accepted = first_batch[1..SNAPSHOT_BATCH_LIMIT / 2].to_vec();
+        let first_unchanged = first_batch[SNAPSHOT_BATCH_LIMIT / 2..].to_vec();
         let mut progress = test_upload_progress();
         let mut accepted = 0;
-        let mut persists = 0usize;
+        let mut uploaded_batches = Vec::new();
+        let mut persisted = Vec::new();
 
         let result = upload_resumable_batches(
             &items,
@@ -4447,61 +4547,138 @@ mod tests {
             &mut progress,
             &mut accepted,
             String::as_str,
-            |_| {
-                Ok(crate::snapshot_client::SnapshotBatchResponse {
-                    accepted: 1,
-                    sessions_reconciled: 1,
-                    session_ids: Vec::new(),
-                    disabled: false,
-                    disabled_reason: None,
-                    entity_ack_contract: Some(
-                        crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
-                    ),
-                    accepted_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                        source_session_id: "accepted".to_string(),
-                        snapshot_fingerprint: accepted_fingerprint.clone(),
-                        occurrence_count: 1,
-                        body_witness_version: None,
-                        body_witness_digest: None,
-                    }],
-                    unchanged_entities: Vec::new(),
-                    rejected_entities: Vec::new(),
-                    conflict_entities: vec![crate::snapshot_client::SnapshotEntityRef {
-                        source_session_id: "conflicted".to_string(),
-                        snapshot_fingerprint: conflicted_fingerprint.clone(),
-                        occurrence_count: 1,
-                        body_witness_version: None,
-                        body_witness_digest: None,
-                    }],
-                })
+            |batch| {
+                uploaded_batches.push(batch.clone());
+                if uploaded_batches.len() == 1 {
+                    Ok(entity_ack_batch(
+                        &first_accepted,
+                        &first_unchanged,
+                        std::slice::from_ref(&conflicted_fingerprint),
+                    ))
+                } else {
+                    Ok(entity_ack_batch(&batch, &[], &[]))
+                }
             },
-            |_| {
-                persists += 1;
+            |state| {
+                persisted.push(state.clone());
                 Ok(())
             },
         )
         .expect("a per-entity conflict is retryable, not a whole-page failure");
 
-        // The caller can commit accepted siblings without treating the broad
-        // historical backfill as complete.
         assert_eq!(result, ResumableUploadResult::Conflicted { count: 1 });
-        // The entity the backend actually wrote is settled.
-        assert_eq!(accepted, 1);
-        assert!(progress
+        assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
+        assert_eq!(accepted, SNAPSHOT_BATCH_LIMIT as u64);
+        assert_eq!(persisted.len(), 2);
+        assert!(first_accepted
+            .iter()
+            .chain(&first_unchanged)
+            .all(|fingerprint| persisted[0].accepted_fingerprints.contains(fingerprint)));
+        assert!(persisted[0]
+            .quarantined_fingerprints
+            .contains_key(&conflicted_fingerprint));
+        assert!(!progress
             .accepted_fingerprints
-            .contains(&accepted_fingerprint));
-        // The conflict is deferred with the quarantine ledger's bounded
-        // backoff, so it retries later rather than blocking its siblings.
+            .contains(&conflicted_fingerprint));
         assert!(progress
             .quarantined_fingerprints
             .contains_key(&conflicted_fingerprint));
-        // A conflict is retryable, so it is NOT counted as permanent loss the
-        // way a `rejected_entities` poison item is.
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&items[SNAPSHOT_BATCH_LIMIT]));
+
+        let deferred = snapshot_entity_conflict_deferred(1);
+        assert_eq!(
+            deferred
+                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .map(|error| error.count),
+            Some(1)
+        );
+        assert_eq!(
+            safe_error(&deferred),
+            "local snapshot upload deferred by entity conflict"
+        );
+
+        // Model the next authoritative scan replacing the oversized canonical
+        // body with a fitting revision. The old fingerprint disappears, so its
+        // quarantine is pruned before the replacement is uploaded and settled.
+        let replacement_fingerprint = format!("{:064x}", SNAPSHOT_BATCH_LIMIT + 1000);
+        let mut revised_items = items[1..].to_vec();
+        revised_items.push(replacement_fingerprint.clone());
+        let revised_fingerprints = revised_items.iter().cloned().collect::<BTreeSet<_>>();
+        assert!(progress.retain_current_quarantines(&revised_fingerprints));
+        let mut revision_accepted = 0;
+        let mut revision_uploads = Vec::new();
+        let revision_result = upload_resumable_batches(
+            &revised_items,
+            &poison_scope,
+            &mut progress,
+            &mut revision_accepted,
+            String::as_str,
+            |batch| {
+                revision_uploads.push(batch.clone());
+                Ok(entity_ack_batch(&batch, &[], &[]))
+            },
+            |_| Ok(()),
+        )
+        .expect("a fitting replacement revision clears the conflict");
+
+        assert_eq!(revision_result, ResumableUploadResult::Completed);
+        assert_eq!(
+            revision_uploads,
+            vec![vec![replacement_fingerprint.clone()]]
+        );
+        assert_eq!(revision_accepted, 1);
+        assert!(progress.quarantined_fingerprints.is_empty());
+        assert!(progress
+            .accepted_fingerprints
+            .contains(&replacement_fingerprint));
         assert_eq!(observe().quantity(ClientReportReason::Poisoned), 0);
         assert!(counted_poison_fingerprints_for_test(&poison_scope).is_empty());
-        // The settlement is durable before the pass returns.
-        assert!(persists >= 1);
         reset_for_test();
+    }
+
+    #[test]
+    fn entity_ack_all_conflict_page_stays_pending_and_surfaces_deferred_error() {
+        let items = test_fingerprints(3);
+        let mut progress = test_upload_progress();
+        let mut accepted = 0;
+        let mut persisted = Vec::new();
+
+        let result = upload_resumable_batches(
+            &items,
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |batch| Ok(entity_ack_batch(&[], &[], &batch)),
+            |state| {
+                persisted.push(state.clone());
+                Ok(())
+            },
+        )
+        .expect("an all-conflict page remains retryable");
+
+        assert_eq!(result, ResumableUploadResult::Conflicted { count: 3 });
+        assert_eq!(accepted, 0);
+        assert!(progress.accepted_fingerprints.is_empty());
+        assert_eq!(
+            progress
+                .quarantined_fingerprints
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            items.iter().cloned().collect()
+        );
+        assert_eq!(persisted.last(), Some(&progress));
+
+        let deferred = snapshot_entity_conflict_deferred(3);
+        assert_eq!(
+            deferred
+                .downcast_ref::<SnapshotEntityConflictDeferred>()
+                .map(|error| error.count),
+            Some(3)
+        );
     }
 
     #[test]
