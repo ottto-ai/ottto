@@ -27,7 +27,9 @@ use ottto_protocol::{
     ClaudeUnresolvedAccountEvidenceKind, CodexAccountSlotCollectionStateV1,
     CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotDiagnosticV1,
     CodexAccountSlotOwnershipV1, CodexAccountSlotQuotaSnapshotV1, CodexAccountSlotRelationshipV1,
-    CodexAccountsStatusV1, SourceKind,
+    CodexAccountTargetCoverageV1, CodexAccountTargetDescriptorV1, CodexAccountTargetDurabilityV1,
+    CodexAccountTargetHealthV1, CodexAccountTargetSetupBlockerV1, CodexAccountsStatusV1,
+    SourceKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -178,7 +180,17 @@ struct CodexSlotCandidate {
     snapshot: AgentStatusSnapshot,
     status: CodexAccountSlotCollectionStatusV1,
     binding: Option<(String, String)>,
+    workspace_targets: Vec<CodexWorkspaceTargetEvidence>,
     quality: u8,
+}
+
+#[derive(Clone)]
+struct CodexWorkspaceTargetEvidence {
+    account_identifier_hash: Option<String>,
+    workspace_identifier_hash: Option<String>,
+    workspace_label: Option<String>,
+    is_default: bool,
+    observed_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -875,6 +887,7 @@ pub(crate) fn annotate_codex_accounts_status(
         collect_codex_slot_candidates(status, &captured_at, &expires_at);
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
+    status.target_coverage = derive_codex_account_target_coverage(&status, &candidates);
     status
 }
 
@@ -886,7 +899,7 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
         .slot_home(slot_id)
         .map_err(|_| "Codex durable connection state is unavailable.".to_string())?;
     let captured_at = crate::current_rfc3339_timestamp();
-    let (snapshot, identity) = collect_codex_status_for_home(
+    let (snapshot, identity, _) = collect_codex_status_for_home(
         captured_at.clone(),
         captured_at,
         &home,
@@ -969,7 +982,7 @@ fn collect_codex_home_candidate(
         CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
         CodexAccountSlotOwnershipV1::Managed => CodexHomeTrust::Managed,
     };
-    let (mut snapshot, _) = collect_codex_status_for_home(
+    let (mut snapshot, _, workspace_targets) = collect_codex_status_for_home(
         captured_at.to_string(),
         expires_at.to_string(),
         &slot.home,
@@ -983,6 +996,7 @@ fn collect_codex_home_candidate(
         snapshot,
         status,
         binding,
+        workspace_targets,
         quality,
     }
 }
@@ -1118,6 +1132,254 @@ fn apply_codex_candidate_statuses(
     }
 }
 
+fn derive_codex_account_target_coverage(
+    status: &CodexAccountsStatusV1,
+    candidates: &[CodexSlotCandidate],
+) -> CodexAccountTargetCoverageV1 {
+    let mut by_target = BTreeMap::<String, CodexAccountTargetDescriptorV1>::new();
+
+    for candidate in candidates.iter().filter(|candidate| {
+        candidate.slot.ownership == CodexAccountSlotOwnershipV1::Managed
+            && candidate.status.relationship
+                != Some(CodexAccountSlotRelationshipV1::DuplicateAnchor)
+    }) {
+        let Some((account_hash, workspace_hash)) = candidate.slot.registered_binding.as_ref()
+        else {
+            continue;
+        };
+        upsert_codex_account_target(
+            &mut by_target,
+            codex_account_target_descriptor(
+                Some(account_hash.clone()),
+                Some(workspace_hash.clone()),
+                None,
+                CodexAccountTargetDurabilityV1::Durable,
+                false,
+                Some(projected_codex_target_health(candidate.status.state)),
+                candidate.status.observed_at.clone(),
+            ),
+        );
+    }
+
+    for candidate in candidates {
+        let from_default_home = candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default;
+        for evidence in &candidate.workspace_targets {
+            let is_current = from_default_home
+                && candidate
+                    .binding
+                    .as_ref()
+                    .map_or(evidence.is_default, |(_, workspace_hash)| {
+                        evidence.workspace_identifier_hash.as_deref()
+                            == Some(workspace_hash.as_str())
+                    });
+            upsert_codex_account_target(
+                &mut by_target,
+                codex_account_target_descriptor(
+                    evidence.account_identifier_hash.clone(),
+                    evidence.workspace_identifier_hash.clone(),
+                    evidence.workspace_label.clone(),
+                    if is_current {
+                        CodexAccountTargetDurabilityV1::Current
+                    } else {
+                        CodexAccountTargetDurabilityV1::ObservedOnly
+                    },
+                    is_current,
+                    is_current.then_some(projected_codex_target_health(candidate.status.state)),
+                    Some(evidence.observed_at.clone()),
+                ),
+            );
+        }
+    }
+
+    if let Some(default) = candidates
+        .iter()
+        .find(|candidate| candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default)
+    {
+        if let Some((account_hash, workspace_hash)) = default.binding.as_ref() {
+            upsert_codex_account_target(
+                &mut by_target,
+                codex_account_target_descriptor(
+                    Some(account_hash.clone()),
+                    Some(workspace_hash.clone()),
+                    None,
+                    CodexAccountTargetDurabilityV1::Current,
+                    true,
+                    Some(projected_codex_target_health(default.status.state)),
+                    default.status.observed_at.clone(),
+                ),
+            );
+        }
+    }
+
+    let mut targets = by_target.into_values().collect::<Vec<_>>();
+    for target in &mut targets {
+        if target.account_identifier_hash.is_none() || target.workspace_identifier_hash.is_none() {
+            target
+                .setup_blockers
+                .push(CodexAccountTargetSetupBlockerV1::IdentityUnconfirmed);
+        }
+        let reuses_setup_slot = status
+            .setup_operation
+            .expected_account_identifier_hash
+            .as_deref()
+            .zip(
+                status
+                    .setup_operation
+                    .expected_workspace_identifier_hash
+                    .as_deref(),
+            )
+            .is_some_and(|(account_hash, workspace_hash)| {
+                target.account_identifier_hash.as_deref() == Some(account_hash)
+                    && target.workspace_identifier_hash.as_deref() == Some(workspace_hash)
+            });
+        if target.durability != CodexAccountTargetDurabilityV1::Durable
+            && status.capacity.remaining_slots == 0
+            && !reuses_setup_slot
+        {
+            target
+                .setup_blockers
+                .push(CodexAccountTargetSetupBlockerV1::CapacityReached);
+        }
+        target.connectable = target.durability != CodexAccountTargetDurabilityV1::Durable
+            && target.setup_blockers.is_empty();
+    }
+    targets.sort_by(|left, right| {
+        right
+            .is_current
+            .cmp(&left.is_current)
+            .then_with(|| {
+                (right.durability == CodexAccountTargetDurabilityV1::Durable)
+                    .cmp(&(left.durability == CodexAccountTargetDurabilityV1::Durable))
+            })
+            .then_with(|| left.workspace_label.cmp(&right.workspace_label))
+            .then_with(|| left.target_id.cmp(&right.target_id))
+    });
+
+    let bounded_count = |predicate: fn(&CodexAccountTargetDescriptorV1) -> bool| {
+        u8::try_from(targets.iter().filter(|target| predicate(target)).count()).unwrap_or(u8::MAX)
+    };
+    CodexAccountTargetCoverageV1 {
+        observed_targets: u8::try_from(targets.len()).unwrap_or(u8::MAX),
+        durable_targets: bounded_count(|target| {
+            target.durability == CodexAccountTargetDurabilityV1::Durable
+        }),
+        current_targets: bounded_count(|target| target.is_current),
+        connectable_targets: bounded_count(|target| target.connectable),
+        blocked_targets: bounded_count(|target| !target.setup_blockers.is_empty()),
+        targets,
+    }
+}
+
+fn codex_account_target_descriptor(
+    account_identifier_hash: Option<String>,
+    workspace_identifier_hash: Option<String>,
+    workspace_label: Option<String>,
+    durability: CodexAccountTargetDurabilityV1,
+    is_current: bool,
+    health: Option<CodexAccountTargetHealthV1>,
+    observed_at: Option<String>,
+) -> CodexAccountTargetDescriptorV1 {
+    let target_id = codex_account_target_id(
+        account_identifier_hash.as_deref(),
+        workspace_identifier_hash.as_deref(),
+        workspace_label.as_deref(),
+    );
+    CodexAccountTargetDescriptorV1 {
+        target_id,
+        account_identifier_hash,
+        workspace_identifier_hash,
+        account_label: "Codex account".to_string(),
+        workspace_label,
+        durability,
+        is_current,
+        connectable: false,
+        health,
+        setup_blockers: Vec::new(),
+        observed_at,
+    }
+}
+
+fn codex_account_target_id(
+    account_identifier_hash: Option<&str>,
+    workspace_identifier_hash: Option<&str>,
+    workspace_label: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:codex-account-target:v1\0");
+    digest.update(account_identifier_hash.unwrap_or_default().as_bytes());
+    digest.update(b"\0");
+    digest.update(workspace_identifier_hash.unwrap_or_default().as_bytes());
+    digest.update(b"\0");
+    if workspace_identifier_hash.is_none() {
+        digest.update(
+            workspace_label
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_bytes(),
+        );
+    }
+    format!("codex_account_target_{:.32x}", digest.finalize())
+}
+
+fn upsert_codex_account_target(
+    targets: &mut BTreeMap<String, CodexAccountTargetDescriptorV1>,
+    incoming: CodexAccountTargetDescriptorV1,
+) {
+    let Some(existing) = targets.get_mut(&incoming.target_id) else {
+        targets.insert(incoming.target_id.clone(), incoming);
+        return;
+    };
+    existing.is_current |= incoming.is_current;
+    existing.account_identifier_hash = existing
+        .account_identifier_hash
+        .take()
+        .or(incoming.account_identifier_hash);
+    existing.workspace_identifier_hash = existing
+        .workspace_identifier_hash
+        .take()
+        .or(incoming.workspace_identifier_hash);
+    existing.workspace_label = existing.workspace_label.take().or(incoming.workspace_label);
+    existing.observed_at = existing.observed_at.take().or(incoming.observed_at);
+    match (existing.durability, incoming.durability) {
+        (CodexAccountTargetDurabilityV1::Durable, _) => {}
+        (_, CodexAccountTargetDurabilityV1::Durable) => {
+            existing.durability = CodexAccountTargetDurabilityV1::Durable;
+            existing.health = incoming.health;
+        }
+        (CodexAccountTargetDurabilityV1::Current, _) => {}
+        (_, CodexAccountTargetDurabilityV1::Current) => {
+            existing.durability = CodexAccountTargetDurabilityV1::Current;
+            existing.health = incoming.health.or(existing.health);
+        }
+        _ => {
+            existing.health = existing.health.or(incoming.health);
+        }
+    }
+}
+
+fn projected_codex_target_health(
+    state: CodexAccountSlotCollectionStateV1,
+) -> CodexAccountTargetHealthV1 {
+    match state {
+        CodexAccountSlotCollectionStateV1::Fresh => CodexAccountTargetHealthV1::Healthy,
+        CodexAccountSlotCollectionStateV1::Unverified => CodexAccountTargetHealthV1::Unverified,
+        CodexAccountSlotCollectionStateV1::NeedsLogin => CodexAccountTargetHealthV1::NeedsLogin,
+        CodexAccountSlotCollectionStateV1::IdentityUnknown => {
+            CodexAccountTargetHealthV1::IdentityUnknown
+        }
+        CodexAccountSlotCollectionStateV1::IdentityMismatch => {
+            CodexAccountTargetHealthV1::IdentityMismatch
+        }
+        CodexAccountSlotCollectionStateV1::ProviderUnavailable => {
+            CodexAccountTargetHealthV1::ProviderUnavailable
+        }
+        CodexAccountSlotCollectionStateV1::DuplicateAccount => {
+            CodexAccountTargetHealthV1::DuplicateAccount
+        }
+    }
+}
+
 fn codex_collection_status_from_snapshot(
     snapshot: &AgentStatusSnapshot,
 ) -> CodexAccountSlotCollectionStatusV1 {
@@ -1198,6 +1460,7 @@ fn empty_codex_accounts_status() -> CodexAccountsStatusV1 {
             collection: Default::default(),
         },
         managed_slots: Vec::new(),
+        target_coverage: CodexAccountTargetCoverageV1::default(),
         capacity: ottto_protocol::CodexAccountCapacityV1 {
             max_slots: ottto_core::MAX_CODEX_ACCOUNT_SLOTS,
             used_slots: 1,
@@ -1231,7 +1494,11 @@ fn collect_codex_status_for_home(
     expires_at: String,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
-) -> (AgentStatusSnapshot, Option<CodexStrongIdentity>) {
+) -> (
+    AgentStatusSnapshot,
+    Option<CodexStrongIdentity>,
+    Vec<CodexWorkspaceTargetEvidence>,
+) {
     let allow_legacy_oauth = home_trust == CodexHomeTrust::ProviderDefault;
     if !executable_exists("codex")
         && !ottto_core::read_codex_config_file_secure(codex_home, home_trust)
@@ -1240,6 +1507,7 @@ fn collect_codex_status_for_home(
         return (
             not_installed_snapshot(SourceKind::Codex, "codex", captured_at, expires_at),
             None,
+            Vec::new(),
         );
     }
 
@@ -1423,11 +1691,12 @@ fn collect_codex_status_for_home(
         snapshot.status = AgentStatusState::Available;
     }
     append_current_plan_observation(&mut snapshot);
-    append_codex_workspace_observations_at(&mut snapshot, codex_home, home_trust);
+    let workspace_targets =
+        append_codex_workspace_observations_at(&mut snapshot, codex_home, home_trust);
     stamp_codex_meter_identity(&mut snapshot);
     snapshot.runtime_defaults =
         build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home, home_trust);
-    (snapshot, strong_identity)
+    (snapshot, strong_identity, workspace_targets)
 }
 
 fn collect_codex_usage_for_home(
@@ -7028,18 +7297,21 @@ fn append_codex_workspace_observations_at(
     snapshot: &mut AgentStatusSnapshot,
     codex_home: &Path,
     home_trust: CodexHomeTrust,
-) {
+) -> Vec<CodexWorkspaceTargetEvidence> {
     let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
         Ok(Some(credentials)) => credentials,
-        Ok(None) => return,
+        Ok(None) => return Vec::new(),
         Err(_) => {
             append_codex_credential_read_failed_diagnostic(snapshot);
-            return;
+            return Vec::new();
         }
     };
     let Some(token) = credentials.id_token.as_deref() else {
-        return;
+        return Vec::new();
     };
+    let workspace_targets =
+        codex_workspace_target_evidence_from_id_token(token, &snapshot.captured_at)
+            .unwrap_or_default();
     let Some(observations) = codex_workspace_observations_from_id_token(
         token,
         &snapshot.captured_at,
@@ -7049,10 +7321,10 @@ fn append_codex_workspace_observations_at(
             .and_then(|model| model.provider.clone())
             .as_deref(),
     ) else {
-        return;
+        return workspace_targets;
     };
     if observations.is_empty() {
-        return;
+        return workspace_targets;
     }
     snapshot.plan_observations.extend(observations);
     snapshot.diagnostics.push(AgentStatusDiagnostic::source(
@@ -7060,6 +7332,7 @@ fn append_codex_workspace_observations_at(
         AgentDiagnosticSeverity::Info,
         "Codex ID token includes additional OpenAI workspaces; plan is shown only when the token explicitly claims it.",
     ));
+    workspace_targets
 }
 
 fn collection_method_key(method: &AgentStatusCollectionMethod) -> &'static str {
@@ -8353,6 +8626,35 @@ struct CodexOrganization {
     label: Option<String>,
     is_default: bool,
     plan_type: Option<String>,
+}
+
+fn codex_workspace_target_evidence_from_id_token(
+    token: &str,
+    observed_at: &str,
+) -> Option<Vec<CodexWorkspaceTargetEvidence>> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let auth_claim = claims.get("https://api.openai.com/auth")?;
+    let account_identifier_hash = first_json_string(auth_claim, &["chatgpt_user_id", "user_id"])
+        .or_else(|| first_json_string(&claims, &["sub"]))
+        .as_deref()
+        .and_then(|value| billing_identity_hash("openai", "account", value));
+    Some(
+        codex_organizations(auth_claim)
+            .into_iter()
+            .map(|organization| CodexWorkspaceTargetEvidence {
+                account_identifier_hash: account_identifier_hash.clone(),
+                workspace_identifier_hash: organization
+                    .id
+                    .as_deref()
+                    .and_then(|value| billing_identity_hash("openai", "workspace", value)),
+                workspace_label: safe_display_label(organization.label.as_deref()),
+                is_default: organization.is_default,
+                observed_at: observed_at.to_string(),
+            })
+            .collect(),
+    )
 }
 
 fn codex_workspace_observations_from_id_token(
@@ -11972,7 +12274,7 @@ for line in sys.stdin:
             "the safe fixture must be readable before collection"
         );
 
-        let (snapshot, identity) = collect_codex_status_for_home(
+        let (snapshot, identity, _) = collect_codex_status_for_home(
             "2026-08-26T00:00:00Z".to_string(),
             "2026-08-26T00:15:00Z".to_string(),
             &home,
@@ -12017,7 +12319,7 @@ for line in sys.stdin:
         let _commands =
             EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
 
-        let (snapshot, identity) = collect_codex_status_for_home(
+        let (snapshot, identity, _) = collect_codex_status_for_home(
             "2026-08-26T00:00:00Z".to_string(),
             "2026-08-26T00:15:00Z".to_string(),
             &home,
@@ -12422,7 +12724,209 @@ for line in sys.stdin:
             snapshot,
             status,
             binding: Some((account_hash.to_string(), workspace_hash.to_string())),
+            workspace_targets: Vec::new(),
             quality,
+        }
+    }
+
+    fn codex_workspace_target_token(organizations: Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "email": "private.person@example.test",
+                "sub": "raw-account-123",
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "raw-account-123",
+                    "chatgpt_account_id": "raw-workspace-default",
+                    "organizations": organizations
+                }
+            })
+            .to_string(),
+        );
+        format!("{header}.{payload}.raw-secret-signature")
+    }
+
+    #[test]
+    fn codex_workspace_target_coverage_exposes_all_id_token_organizations() {
+        let token = codex_workspace_target_token(serde_json::json!([
+            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
+            {"id": "raw-workspace-singular", "title": "Singular", "is_default": false},
+            {"id": "raw-workspace-research", "title": "Research", "is_default": false}
+        ]));
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let default_workspace_hash =
+            billing_identity_hash("openai", "workspace", "raw-workspace-default")
+                .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &default_workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let status = empty_codex_accounts_status();
+        let coverage = derive_codex_account_target_coverage(&status, &[candidate]);
+
+        assert_eq!(coverage.observed_targets, 3);
+        assert_eq!(coverage.current_targets, 1);
+        assert_eq!(coverage.connectable_targets, 3);
+        assert_eq!(coverage.targets.len(), 3);
+        let current = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Personal"))
+            .expect("default workspace target");
+        assert_eq!(current.durability, CodexAccountTargetDurabilityV1::Current);
+        assert!(current.is_current);
+        assert!(current.connectable);
+        for label in ["Singular", "Research"] {
+            let observed = coverage
+                .targets
+                .iter()
+                .find(|target| target.workspace_label.as_deref() == Some(label))
+                .expect("observed workspace target");
+            assert_eq!(
+                observed.durability,
+                CodexAccountTargetDurabilityV1::ObservedOnly
+            );
+            assert!(!observed.is_current);
+            assert!(observed.connectable);
+        }
+        assert_eq!(
+            coverage
+                .targets
+                .iter()
+                .filter_map(|target| target.workspace_identifier_hash.as_deref())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn codex_workspace_target_coverage_collapses_durable_current_composite() {
+        let token = codex_workspace_target_token(serde_json::json!([
+            {"id": "raw-workspace-default", "title": "Personal", "is_default": true}
+        ]));
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
+            .expect("workspace hash");
+        let mut default = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &workspace_hash,
+            5,
+        );
+        default.workspace_targets = evidence;
+        let durable = codex_candidate_for_test(
+            "codex_slot_durable",
+            CodexAccountSlotOwnershipV1::Managed,
+            &account_hash,
+            &workspace_hash,
+            5,
+        );
+        let mut candidates = vec![default, durable];
+        canonicalize_codex_candidates(&mut candidates);
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &candidates);
+
+        assert_eq!(coverage.targets.len(), 1);
+        let target = &coverage.targets[0];
+        assert_eq!(target.durability, CodexAccountTargetDurabilityV1::Durable);
+        assert!(target.is_current);
+        assert!(!target.connectable);
+        assert_eq!(target.health, Some(CodexAccountTargetHealthV1::Healthy));
+        assert_eq!(target.workspace_label.as_deref(), Some("Personal"));
+    }
+
+    #[test]
+    fn codex_workspace_target_coverage_keeps_unconfirmed_identity_blocked() {
+        let token = codex_workspace_target_token(serde_json::json!([
+            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
+            {"title": "Identity pending", "is_default": false}
+        ]));
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
+            .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+
+        let coverage =
+            derive_codex_account_target_coverage(&empty_codex_accounts_status(), &[candidate]);
+        let unconfirmed = coverage
+            .targets
+            .iter()
+            .find(|target| target.workspace_label.as_deref() == Some("Identity pending"))
+            .expect("unconfirmed workspace remains visible");
+
+        assert!(unconfirmed.workspace_identifier_hash.is_none());
+        assert!(!unconfirmed.connectable);
+        assert_eq!(
+            unconfirmed.setup_blockers,
+            vec![CodexAccountTargetSetupBlockerV1::IdentityUnconfirmed]
+        );
+    }
+
+    #[test]
+    fn codex_workspace_target_status_serialization_never_leaks_raw_identity() {
+        let token = codex_workspace_target_token(serde_json::json!([
+            {"id": "raw-workspace-default", "title": "Personal", "is_default": true},
+            {"id": "raw-workspace-singular", "title": "Singular", "is_default": false}
+        ]));
+        let evidence =
+            codex_workspace_target_evidence_from_id_token(&token, "2026-08-27T00:00:00Z")
+                .expect("target evidence");
+        let account_hash =
+            billing_identity_hash("openai", "account", "raw-account-123").expect("account hash");
+        let workspace_hash = billing_identity_hash("openai", "workspace", "raw-workspace-default")
+            .expect("workspace hash");
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            &account_hash,
+            &workspace_hash,
+            5,
+        );
+        candidate.workspace_targets = evidence;
+        let mut status = empty_codex_accounts_status();
+        status.target_coverage = derive_codex_account_target_coverage(&status, &[candidate]);
+
+        let wire = serde_json::to_string(&status).expect("serialize Codex account status");
+        assert!(wire.contains("Personal"));
+        assert!(wire.contains("Singular"));
+        for forbidden in [
+            "raw-account-123",
+            "raw-workspace-default",
+            "raw-workspace-singular",
+            "private.person@example.test",
+            "raw-secret-signature",
+        ] {
+            assert!(
+                !wire.contains(forbidden),
+                "serialized raw identity: {forbidden}"
+            );
         }
     }
 

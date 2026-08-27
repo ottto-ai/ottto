@@ -763,6 +763,18 @@ fn handle_command(
                 expected_workspace_identifier_hash,
             )?)
         }
+        LocalControlCommand::CodexAccountPrepareTarget {
+            schema_version,
+            operation_id,
+            target_id,
+        } => {
+            require_authorized_local_client(daemon, &authorization)?;
+            to_value(prepare_codex_account_target(
+                schema_version,
+                operation_id,
+                target_id,
+            )?)
+        }
         LocalControlCommand::CodexAccountReconnect {
             schema_version,
             operation_id,
@@ -1648,6 +1660,52 @@ fn prepare_codex_account(
             expected_workspace_identifier_hash,
         )
         .map_err(codex_account_slot_settings_error)
+}
+
+fn prepare_codex_account_target(
+    schema_version: u16,
+    operation_id: String,
+    target_id: String,
+) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
+    let current = load_codex_account_settings()?;
+    let (account_hash, workspace_hash) =
+        codex_account_target_binding(&current, target_id.as_str())?;
+    prepare_codex_account(schema_version, operation_id, account_hash, workspace_hash)
+}
+
+fn codex_account_target_binding(
+    current: &ottto_protocol::CodexAccountsStatusV1,
+    target_id: &str,
+) -> Result<(String, String), LocalApiError> {
+    let target = current
+        .target_coverage
+        .targets
+        .iter()
+        .find(|target| target.target_id == target_id)
+        .ok_or_else(|| {
+            LocalApiError::InvalidRequest(
+                "Codex workspace is not a current daemon-selected setup target".to_string(),
+            )
+        })?;
+    if !target.connectable
+        || target.durability == ottto_protocol::CodexAccountTargetDurabilityV1::Durable
+        || !target.setup_blockers.is_empty()
+    {
+        return Err(LocalApiError::InvalidRequest(
+            "Codex workspace target is not currently eligible for durable setup".to_string(),
+        ));
+    }
+    let account_hash = target.account_identifier_hash.clone().ok_or_else(|| {
+        LocalApiError::InvalidRequest(
+            "Codex workspace target does not have a confirmed account identity".to_string(),
+        )
+    })?;
+    let workspace_hash = target.workspace_identifier_hash.clone().ok_or_else(|| {
+        LocalApiError::InvalidRequest(
+            "Codex workspace target does not have a confirmed workspace identity".to_string(),
+        )
+    })?;
+    Ok((account_hash, workspace_hash))
 }
 
 fn reconnect_codex_account(
@@ -14006,6 +14064,56 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_prepare_target_resolves_only_daemon_authored_exact_composite() {
+        let account_hash = "a".repeat(64);
+        let workspace_hash = "b".repeat(64);
+        let status = ottto_protocol::CodexAccountsStatusV1 {
+            schema_version: ottto_protocol::CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+            setup_operation: Default::default(),
+            default_slot: ottto_protocol::CodexAccountSlotDescriptorV1 {
+                slot_id: "default".to_string(),
+                ownership: ottto_protocol::CodexAccountSlotOwnershipV1::Default,
+                collection: Default::default(),
+            },
+            managed_slots: Vec::new(),
+            target_coverage: ottto_protocol::CodexAccountTargetCoverageV1 {
+                targets: vec![ottto_protocol::CodexAccountTargetDescriptorV1 {
+                    target_id: "codex_account_target_exact".to_string(),
+                    account_identifier_hash: Some(account_hash.clone()),
+                    workspace_identifier_hash: Some(workspace_hash.clone()),
+                    account_label: "Codex account".to_string(),
+                    workspace_label: Some("Singular".to_string()),
+                    durability: ottto_protocol::CodexAccountTargetDurabilityV1::ObservedOnly,
+                    is_current: false,
+                    connectable: true,
+                    health: None,
+                    setup_blockers: Vec::new(),
+                    observed_at: Some("2026-08-27T00:00:00Z".to_string()),
+                }],
+                observed_targets: 1,
+                durable_targets: 0,
+                current_targets: 0,
+                connectable_targets: 1,
+                blocked_targets: 0,
+            },
+            capacity: ottto_protocol::CodexAccountCapacityV1 {
+                max_slots: 10,
+                used_slots: 1,
+                remaining_slots: 9,
+            },
+        };
+
+        assert_eq!(
+            super::codex_account_target_binding(&status, "codex_account_target_exact")
+                .expect("exact target binding"),
+            (account_hash, workspace_hash)
+        );
+        assert!(
+            super::codex_account_target_binding(&status, "codex_account_target_forged").is_err()
+        );
+    }
+
     #[test]
     fn backend_body_excerpt_redacts_compact_json_secret_fields() {
         let prior = format!("prior-{}", "value".repeat(4));
