@@ -108,6 +108,11 @@ struct ConfiguredServer {
     name: String,
     transport: Transport,
     disabled: bool,
+    /// Directory of the config file that declared this server. A relative
+    /// `cwd` (and the relative paths a server's own `env` points at) resolve
+    /// against THIS, exactly as the agent resolves them — never against the
+    /// daemon's working directory, which under launchd is `/`.
+    config_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +196,11 @@ fn load_json(path: &Path) -> Option<Value> {
 /// Mirrors `_normalize_claude_server` in harvest.py: an explicit `type: "sse"`
 /// or `type: "http"` (or a bare `url`) is a network transport; everything else
 /// is treated as stdio with `command` + `args`.
-fn normalize_claude_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> {
+fn normalize_claude_server(
+    name: &str,
+    cfg: &Value,
+    config_dir: Option<&Path>,
+) -> Option<ConfiguredServer> {
     let declared = cfg.get("type").and_then(Value::as_str);
     let url = cfg.get("url").and_then(Value::as_str);
     // A server explicitly declared `sse`/`http` is a network transport even if
@@ -216,6 +225,7 @@ fn normalize_claude_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> 
         }
     };
     Some(ConfiguredServer {
+        config_dir: config_dir.map(Path::to_path_buf),
         name: name.to_string(),
         transport,
         disabled: false,
@@ -226,7 +236,11 @@ fn normalize_claude_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> 
 ///
 /// Mirrors `discover_codex` in harvest.py: a `url` is an HTTP transport, else
 /// stdio with `command` + `args`.
-fn normalize_codex_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> {
+fn normalize_codex_server(
+    name: &str,
+    cfg: &Value,
+    config_dir: Option<&Path>,
+) -> Option<ConfiguredServer> {
     let transport = if let Some(url) = cfg.get("url").and_then(Value::as_str) {
         Transport::Http {
             url: url.to_string(),
@@ -242,6 +256,7 @@ fn normalize_codex_server(name: &str, cfg: &Value) -> Option<ConfiguredServer> {
         }
     };
     Some(ConfiguredServer {
+        config_dir: config_dir.map(Path::to_path_buf),
         name: name.to_string(),
         transport,
         disabled: false,
@@ -316,7 +331,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     if let Some(root) = claude_json.as_ref() {
         // Top-level mcpServers.
         for (name, cfg) in mcp_servers_block(root) {
-            if let Some(server) = normalize_claude_server(name, cfg) {
+            if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
                 servers.insert(name.clone(), server);
             }
         }
@@ -324,13 +339,17 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         if let Some(projects) = root.get("projects").and_then(Value::as_object) {
             for (project_dir, project_cfg) in projects {
                 for (name, cfg) in mcp_servers_block(project_cfg) {
-                    if let Some(server) = normalize_claude_server(name, cfg) {
+                    if let Some(server) =
+                        normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
+                    {
                         servers.insert(name.clone(), server);
                     }
                 }
                 if let Some(dot_mcp) = load_json(&Path::new(project_dir).join(".mcp.json")) {
                     for (name, cfg) in mcp_servers_block(&dot_mcp) {
-                        if let Some(server) = normalize_claude_server(name, cfg) {
+                        if let Some(server) =
+                            normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
+                        {
                             servers.insert(name.clone(), server);
                         }
                     }
@@ -350,7 +369,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     ] {
         if let Some(value) = load_json(&settings) {
             for (name, cfg) in mcp_servers_block(&value) {
-                if let Some(server) = normalize_claude_server(name, cfg) {
+                if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
                     servers.insert(name.clone(), server);
                 }
             }
@@ -388,7 +407,8 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
 
 /// Discover Codex MCP servers from `~/.codex/config.toml` `[mcp_servers.*]`.
 fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
-    let path = home.join(".codex").join("config.toml");
+    let codex_dir = home.join(".codex");
+    let path = codex_dir.join("config.toml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -405,7 +425,7 @@ fn discover_codex(home: &Path) -> Vec<ConfiguredServer> {
         let Some(value) = toml_item_to_json(item) else {
             continue;
         };
-        if let Some(server) = normalize_codex_server(name, &value) {
+        if let Some(server) = normalize_codex_server(name, &value, Some(&codex_dir)) {
             servers.insert(name.to_string(), server);
         }
     }
@@ -551,6 +571,28 @@ impl SpawnEnv {
     /// Resolve `command` to an absolute path against the launchd-safe search dirs
     /// (so `npx`/`uvx`/`node` are found) and apply `PATH` + provider env to the
     /// child (so the launched server and its own subprocesses resolve too).
+    /// The working directory to spawn a server in, or `None` to inherit.
+    ///
+    /// An absolute `cwd` is used as-is. A relative one resolves against the
+    /// directory of the config that declared the server, matching how the agent
+    /// itself reads it. A path that does not exist after resolution is ignored
+    /// rather than failing the spawn — the server may still start fine from the
+    /// default directory, and a broken `cwd` should not turn into a phantom
+    /// "unreachable" row.
+    fn resolve_cwd(cwd: Option<&str>, config_dir: Option<&Path>) -> Option<PathBuf> {
+        let raw = cwd?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let candidate = Path::new(raw);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            config_dir?.join(candidate)
+        };
+        resolved.is_dir().then_some(resolved)
+    }
+
     /// Spawn a server with the working directory and environment block its own
     /// config declares.
     ///
@@ -570,6 +612,7 @@ impl SpawnEnv {
         command: &str,
         args: &[String],
         cwd: Option<&str>,
+        config_dir: Option<&Path>,
         server_env: &BTreeMap<String, String>,
     ) -> Command {
         let program = crate::command_env::executable_path(command)
@@ -588,7 +631,14 @@ impl SpawnEnv {
                 cmd.env(key, value);
             }
         }
-        if let Some(dir) = cwd.filter(|dir| Path::new(dir).is_dir()) {
+        // Resolve a RELATIVE cwd against the directory that declared the
+        // server, never against the daemon's own. `cwd: "."` is the common
+        // shape and it passes `is_dir()` unconditionally, so the previous code
+        // silently set the daemon's working directory (`/` under launchd); the
+        // server then could not find its project and the harvest reported it
+        // unreachable with zero tools — indistinguishable on the wire from a
+        // server that genuinely exposes nothing.
+        if let Some(dir) = Self::resolve_cwd(cwd, config_dir) {
             cmd.current_dir(dir);
         }
         cmd
@@ -604,10 +654,11 @@ fn harvest_stdio(
     args: &[String],
     env: &SpawnEnv,
     cwd: Option<&str>,
+    config_dir: Option<&Path>,
     server_env: &BTreeMap<String, String>,
 ) -> Result<Vec<McpToolInput>> {
     let mut child = env
-        .command_in(command, args, cwd, server_env)
+        .command_in(command, args, cwd, config_dir, server_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -798,7 +849,15 @@ fn harvest_server(server: &ConfiguredServer, loading_mode: &str, env: &SpawnEnv)
             args,
             cwd,
             env: server_env,
-        } => harvest_stdio(command, args, env, cwd.as_deref(), server_env).ok(),
+        } => harvest_stdio(
+            command,
+            args,
+            env,
+            cwd.as_deref(),
+            server.config_dir.as_deref(),
+            server_env,
+        )
+        .ok(),
         // TODO(mcp-http-transport): implement Streamable HTTP + SSE handshakes.
         // Until then network servers are reported unreachable (cost zero) rather
         // than fabricating a footprint.
@@ -1523,8 +1582,8 @@ mod tests {
     fn claude_http_server_without_url_is_kept_not_dropped() {
         // A `type:"http"` entry with no `url` must still be discovered (as an
         // unreachable HTTP server), never silently dropped from the inventory.
-        let s =
-            normalize_claude_server("noupstream", &json!({ "type": "http" })).expect("server kept");
+        let s = normalize_claude_server("noupstream", &json!({ "type": "http" }), None)
+            .expect("server kept");
         assert_eq!(s.name, "noupstream");
         assert_eq!(s.transport, Transport::Http { url: String::new() });
         // And it harvests as unreachable (cost zero), not a panic.
@@ -1607,6 +1666,7 @@ enabled = true
     #[test]
     fn network_transports_are_reported_unreachable_with_no_tools() {
         let http = ConfiguredServer {
+            config_dir: None,
             name: "remote".to_string(),
             transport: Transport::Http {
                 url: "https://remote.test/mcp".to_string(),
@@ -1625,6 +1685,7 @@ enabled = true
     #[test]
     fn unreachable_stdio_server_is_marked_unreachable() {
         let server = ConfiguredServer {
+            config_dir: None,
             name: "broken".to_string(),
             transport: Transport::Stdio {
                 command: "/nonexistent/ottto-mcp-binary-xyz".to_string(),
@@ -1656,6 +1717,7 @@ enabled = true
         let cmd = env.command_in(
             "ottto-not-a-real-binary-xyz",
             &["--list".to_string()],
+            None,
             None,
             &BTreeMap::new(),
         );
@@ -1715,6 +1777,85 @@ enabled = true
         let _ = fs::remove_dir_all(&home);
     }
 
+    /// A relative `cwd` must resolve against the config that declared it.
+    ///
+    /// `cwd: "."` is the common shape in a project `.mcp.json`, and it passes
+    /// `is_dir()` unconditionally — so resolving it against the process cwd
+    /// silently pointed the server at the daemon's directory (`/` under
+    /// launchd). The server could not find its project, failed to start, and
+    /// the harvest published it as `reachable: false` with zero tools, which is
+    /// indistinguishable from a server that genuinely exposes nothing. Observed
+    /// in production on `ai-provider-watch`.
+    #[test]
+    fn relative_cwd_resolves_against_the_declaring_config_dir() {
+        let project = test_home("relative-cwd-project");
+        let nested = project.join("workspace");
+        fs::create_dir_all(&nested).expect("create nested project dir");
+
+        // "." -> the config's own directory, not the daemon's.
+        assert_eq!(
+            SpawnEnv::resolve_cwd(Some("."), Some(&project)),
+            Some(project.clone())
+        );
+        // A relative subdirectory resolves beneath it.
+        assert_eq!(
+            SpawnEnv::resolve_cwd(Some("workspace"), Some(&project)),
+            Some(nested.clone())
+        );
+        // An absolute cwd is untouched by the base.
+        assert_eq!(
+            SpawnEnv::resolve_cwd(Some(&nested.to_string_lossy()), Some(&project)),
+            Some(nested)
+        );
+        // A relative cwd with no declaring directory is ignored rather than
+        // silently resolving against the daemon's own working directory.
+        assert_eq!(SpawnEnv::resolve_cwd(Some("."), None), None);
+        // A resolved path that does not exist is ignored, not fatal.
+        assert_eq!(SpawnEnv::resolve_cwd(Some("gone"), Some(&project)), None);
+        // Absent/blank stays absent.
+        assert_eq!(SpawnEnv::resolve_cwd(None, Some(&project)), None);
+        assert_eq!(SpawnEnv::resolve_cwd(Some("   "), Some(&project)), None);
+
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    /// The declaring directory must survive discovery, or the resolution above
+    /// has nothing to resolve against.
+    #[test]
+    fn discovery_records_the_declaring_config_dir() {
+        let home = test_home("cwd-config-dir");
+        let project = home.join("proj");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::write(
+            home.join(".claude.json"),
+            json!({ "projects": { project.to_string_lossy(): {} } }).to_string(),
+        )
+        .expect("write .claude.json");
+        fs::write(
+            project.join(".mcp.json"),
+            json!({
+                "mcpServers": {
+                    "apw": {"command": "uv", "args": ["run", "server"], "cwd": "."}
+                }
+            })
+            .to_string(),
+        )
+        .expect("write .mcp.json");
+
+        let servers = discover_claude_code(&home);
+        let apw = servers
+            .iter()
+            .find(|s| s.name == "apw")
+            .expect("project .mcp.json server discovered");
+        assert_eq!(
+            apw.config_dir.as_deref(),
+            Some(project.as_path()),
+            "a server declared in <project>/.mcp.json must carry that project dir"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn stdio_spawn_applies_configured_cwd_and_env() {
         // A server whose config declares `cwd`/`env` resolves its entrypoint
@@ -1734,7 +1875,7 @@ enabled = true
             path: Some(OsString::from("/opt/homebrew/bin:/usr/bin")),
             provider: BTreeMap::new(),
         };
-        let cmd = env.command_in("true", &[], Some(&dir.to_string_lossy()), &server_env);
+        let cmd = env.command_in("true", &[], Some(&dir.to_string_lossy()), None, &server_env);
 
         assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
         let envs: BTreeMap<_, _> = cmd.get_envs().collect();
@@ -1755,6 +1896,7 @@ enabled = true
             "true",
             &[],
             Some(&missing.to_string_lossy()),
+            None,
             &BTreeMap::new(),
         );
         assert_eq!(cmd.get_current_dir(), None);
@@ -1906,6 +2048,7 @@ enabled = true
         // A deadline already in the past drops every server and flags throttled.
         let configured = vec![
             ConfiguredServer {
+                config_dir: None,
                 name: "a".to_string(),
                 transport: Transport::Stdio {
                     command: "true".to_string(),
@@ -1916,6 +2059,7 @@ enabled = true
                 disabled: false,
             },
             ConfiguredServer {
+                config_dir: None,
                 name: "b".to_string(),
                 transport: Transport::Http {
                     url: "https://x.test".to_string(),
@@ -1936,6 +2080,7 @@ enabled = true
         // harvests them all with no throttle.
         let configured: Vec<ConfiguredServer> = (0..6)
             .map(|i| ConfiguredServer {
+                config_dir: None,
                 disabled: false,
                 name: format!("s{i}"),
                 transport: Transport::Http {
@@ -2057,6 +2202,7 @@ done
             &script.to_string_lossy(),
             &[],
             &test_spawn_env(),
+            None,
             None,
             &std::collections::BTreeMap::new(),
         )
