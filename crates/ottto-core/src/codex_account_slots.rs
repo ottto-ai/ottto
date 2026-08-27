@@ -1,7 +1,8 @@
 use ottto_protocol::{
     CodexAccountCapacityV1, CodexAccountSetupOperationStateV1, CodexAccountSetupOperationV1,
     CodexAccountSlotCollectionStatusV1, CodexAccountSlotDescriptorV1, CodexAccountSlotOwnershipV1,
-    CodexAccountsStatusV1, CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+    CodexAccountTargetCoverageV1, CodexAccountsStatusV1,
+    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -913,6 +914,7 @@ fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsSta
                 collection: CodexAccountSlotCollectionStatusV1::default(),
             })
             .collect(),
+        target_coverage: CodexAccountTargetCoverageV1::default(),
         capacity: CodexAccountCapacityV1 {
             max_slots: MAX_CODEX_ACCOUNT_SLOTS,
             used_slots,

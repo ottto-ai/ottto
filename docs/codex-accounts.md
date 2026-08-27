@@ -12,6 +12,15 @@ subscriptions; two durable connections for the same exact composite are a
 duplicate. A default connection may temporarily shadow a matching durable
 connection without becoming a duplicate registration.
 
+Authenticated local-control protocol v21 exposes every workspace already
+observed in the Codex ID token as a typed `target_coverage.targets` row. Each
+row has a daemon-authored opaque target id, hashed account/workspace identity,
+the provider-supplied workspace title, durability and health, and explicit
+setup blockers. A membership without both hashes remains visible as
+`identity_unconfirmed`; it is never silently omitted or accepted for setup.
+Clients pass the opaque id back through `codex_account_prepare_target` and do
+not send identity hashes selected or reconstructed from UI state.
+
 ## Connecting another subscription
 
 Authenticated local control creates one opaque, owner-only Codex home and

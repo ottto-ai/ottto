@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 340,
-  "content_sha256": "caf4218791813dad78e47f0b777ecfc4de205109a9bad6396b33bdb9111d7b6b",
+  "content_sha256": "b4f5277aa192fb8a6cd73647f96c229c704f50a9967972d29c0e249d8852a8f4",
   "files": [
     {
       "executable": false,
@@ -440,8 +440,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-cli/src/main.rs",
-      "sha256": "5e2c99a74275668105600b6e07c7393fc6de6bea4fa4fc7b591a2cce3c496613",
-      "size_bytes": 158664
+      "sha256": "41c6f0b280dc288b061038a5b0b723a8f774e028e98b700176c2d8a5606a4206",
+      "size_bytes": 158761
     },
     {
       "executable": false,
@@ -517,8 +517,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-core/src/codex_account_slots.rs",
-      "sha256": "455770894265cad14c04d694457a8843230dc944285fd41e4b6ee6b54f5a79a9",
-      "size_bytes": 84387
+      "sha256": "216a97655b57ce0f4e4ced71769084a34e102a4e89ebc6d75cda05653d6ed3de",
+      "size_bytes": 84487
     },
     {
       "executable": false,
@@ -580,8 +580,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-protocol/src/lib.rs",
-      "sha256": "7c1bf7e721a58e3801becc249c46d9ca4dd314d7baa96a2846aeaac2c231c62b",
-      "size_bytes": 240169
+      "sha256": "e4c816b044aabe7c18a8b099159068909ce8c8bad1180231c3a86a23bacdd392",
+      "size_bytes": 245902
     },
     {
       "executable": false,
@@ -650,8 +650,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "ad137a6af493d1dbb794159fb0865d8d8ffd4e6d7070bcd827b7e892c160dde5",
-      "size_bytes": 743520
+      "sha256": "fc93a118d918d02ce87f0f4d320260a31b0c36c375445385785a74a798bd060f",
+      "size_bytes": 764080
     },
     {
       "executable": false,
@@ -734,8 +734,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/control.rs",
-      "sha256": "52dad773f1ce4a7bdeb28d2dddd42d1f7db830ebceaa65bd7368aae3a1fcdf0c",
-      "size_bytes": 1052109
+      "sha256": "fea10ff128311510fcda4581f558401d92ee206457e16067d9d18bc1f22d1f93",
+      "size_bytes": 1056499
     },
     {
       "executable": false,
@@ -930,8 +930,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/codex-accounts.md",
-      "sha256": "d4690b3de226ae6ba25b8274070f017e06e1e6d06471f6f2340923be16d2b23b",
-      "size_bytes": 4961
+      "sha256": "780969e882cd8dc95b9c5dbe4a6f9ca361aeec20d68686558c765afb12dcfa14",
+      "size_bytes": 5555
     },
     {
       "executable": false,
@@ -2383,7 +2383,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-27T06:47:07+00:00",
+  "generated_at": "2026-08-27T20:31:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 341,
   "public_roots": [
@@ -2419,5 +2419,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4103cebf6f79622e14d739e81195d6f5eba358dd"
+  "source_commit": "d4fe2f0ddb5e16fa1f023c259cbffddfc73b6fff"
 }

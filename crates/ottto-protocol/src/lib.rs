@@ -18,9 +18,10 @@ pub const CLAUDE_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 18;
 /// target to an exact account+organization pair.
 pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
 /// Command-scoped version for the machine-local Codex durable-account registry.
-/// The base protocol remains unchanged so older clients continue to use every
-/// unrelated command during a rolling local-runtime upgrade.
-pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 20;
+/// v21 adds daemon-authored workspace targets and target-bound setup. The base
+/// protocol remains unchanged so older clients continue to use every unrelated
+/// command during a rolling local-runtime upgrade.
+pub const CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION: u16 = 21;
 pub const CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION: u16 = 1;
 pub const DIAGNOSTICS_RETENTION_DISCLOSURE: &str =
@@ -2495,6 +2496,7 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         }
         LocalControlCommand::CodexAccountsStatus
         | LocalControlCommand::CodexAccountPrepare { .. }
+        | LocalControlCommand::CodexAccountPrepareTarget { .. }
         | LocalControlCommand::CodexAccountReconnect { .. }
         | LocalControlCommand::CodexAccountCheck { .. }
         | LocalControlCommand::CodexAccountStopWaiting { .. }
@@ -3048,6 +3050,78 @@ pub struct CodexAccountCapacityV1 {
     pub remaining_slots: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetDurabilityV1 {
+    Durable,
+    Current,
+    ObservedOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetHealthV1 {
+    Healthy,
+    Unverified,
+    NeedsLogin,
+    IdentityUnknown,
+    IdentityMismatch,
+    ProviderUnavailable,
+    DuplicateAccount,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAccountTargetSetupBlockerV1 {
+    IdentityUnconfirmed,
+    CapacityReached,
+}
+
+/// One display-safe, daemon-selectable Codex account+workspace identity. Raw
+/// provider identifiers, email addresses, credential material, and local paths
+/// are deliberately absent from this local-control contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountTargetDescriptorV1 {
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identifier_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_identifier_hash: Option<String>,
+    pub account_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_label: Option<String>,
+    pub durability: CodexAccountTargetDurabilityV1,
+    #[serde(default)]
+    pub is_current: bool,
+    #[serde(default)]
+    pub connectable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<CodexAccountTargetHealthV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_blockers: Vec<CodexAccountTargetSetupBlockerV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<Rfc3339Timestamp>,
+}
+
+/// Daemon-owned target-set arithmetic for Codex workspace coverage. Clients
+/// render these rows and pass `target_id` back verbatim; they must not derive
+/// target identity or durability from the slot list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexAccountTargetCoverageV1 {
+    #[serde(default)]
+    pub targets: Vec<CodexAccountTargetDescriptorV1>,
+    #[serde(default)]
+    pub observed_targets: u8,
+    #[serde(default)]
+    pub durable_targets: u8,
+    #[serde(default)]
+    pub current_targets: u8,
+    #[serde(default)]
+    pub connectable_targets: u8,
+    #[serde(default)]
+    pub blocked_targets: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexAccountsStatusV1 {
     pub schema_version: u16,
@@ -3055,6 +3129,8 @@ pub struct CodexAccountsStatusV1 {
     pub default_slot: CodexAccountSlotDescriptorV1,
     #[serde(default)]
     pub managed_slots: Vec<CodexAccountSlotDescriptorV1>,
+    #[serde(default)]
+    pub target_coverage: CodexAccountTargetCoverageV1,
     pub capacity: CodexAccountCapacityV1,
 }
 
@@ -3325,6 +3401,13 @@ pub enum LocalControlCommand {
         operation_id: String,
         expected_account_identifier_hash: String,
         expected_workspace_identifier_hash: String,
+    },
+    /// v21 target-bound prepare. The daemon resolves `target_id` from its own
+    /// current projection and persists the exact composite binding atomically.
+    CodexAccountPrepareTarget {
+        schema_version: u16,
+        operation_id: String,
+        target_id: String,
     },
     /// Reuse one accepted durable home for provider-owned sign-in again.
     CodexAccountReconnect {
@@ -3906,6 +3989,12 @@ mod tests {
                 "expected_workspace_identifier_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }),
             serde_json::json!({
+                "command": "codex_account_prepare_target",
+                "schema_version": 1,
+                "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
+                "target_id": "codex_account_target_0123456789abcdef0123456789abcdef"
+            }),
+            serde_json::json!({
                 "command": "codex_account_reconnect",
                 "schema_version": 1,
                 "operation_id": "codex_setup_0123456789abcdef0123456789abcdef",
@@ -3939,14 +4028,69 @@ mod tests {
     }
 
     #[test]
-    fn codex_account_commands_fail_closed_on_base_protocol_version() {
+    fn codex_account_commands_fail_closed_on_v20_protocol_version() {
         let request = serde_json::json!({
             "request_id": "req_codex_account",
-            "protocol_version": LOCAL_CONTROL_PROTOCOL_VERSION,
+            "protocol_version": 20,
             "client_kind": "companion_app",
             "command": "codex_accounts_status"
         });
-        assert!(serde_json::from_value::<LocalControlRequest>(request).is_err());
+        let error = serde_json::from_value::<LocalControlRequest>(request)
+            .expect_err("v20 client must get an explicit incompatibility signal");
+        assert!(error
+            .to_string()
+            .contains("unsupported local control protocol_version 20; expected 21"));
+        assert_eq!(CODEX_ACCOUNTS_CONTROL_PROTOCOL_VERSION, 21);
+    }
+
+    #[test]
+    fn codex_workspace_target_coverage_is_additive_typed_and_secret_free() {
+        let legacy: CodexAccountsStatusV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "setup_operation": {"state": "idle"},
+            "default_slot": {"slot_id": "default", "ownership": "default"},
+            "capacity": {"max_slots": 10, "used_slots": 1, "remaining_slots": 9}
+        }))
+        .expect("legacy status without target coverage");
+        assert_eq!(
+            legacy.target_coverage,
+            CodexAccountTargetCoverageV1::default()
+        );
+
+        let coverage = CodexAccountTargetCoverageV1 {
+            targets: vec![CodexAccountTargetDescriptorV1 {
+                target_id: "codex_account_target_0123456789abcdef0123456789abcdef".to_string(),
+                account_identifier_hash: Some("a".repeat(64)),
+                workspace_identifier_hash: Some("b".repeat(64)),
+                account_label: "Codex account".to_string(),
+                workspace_label: Some("Singular".to_string()),
+                durability: CodexAccountTargetDurabilityV1::ObservedOnly,
+                is_current: false,
+                connectable: true,
+                health: None,
+                setup_blockers: Vec::new(),
+                observed_at: Some("2026-08-27T00:00:00Z".to_string()),
+            }],
+            observed_targets: 1,
+            durable_targets: 0,
+            current_targets: 0,
+            connectable_targets: 1,
+            blocked_targets: 0,
+        };
+        let wire = serde_json::to_value(coverage).expect("serialize target coverage");
+        assert_eq!(wire["targets"][0]["workspace_label"], "Singular");
+        assert_eq!(wire["targets"][0]["connectable"], true);
+        let encoded = wire.to_string();
+        for forbidden in [
+            "\"account_id\"",
+            "\"workspace_id\"",
+            "\"organization_id\"",
+            "\"email\"",
+            "\"access_token\"",
+            "\"refresh_token\"",
+        ] {
+            assert!(!encoded.contains(forbidden), "coverage leaked {forbidden}");
+        }
     }
 
     #[test]
