@@ -6915,14 +6915,21 @@ impl SnapshotAccumulator {
                 let expected = self.codex_parent_signatures.as_ref();
                 match signature {
                     Some(signature)
-                        if !self.codex_created_thread_start_diverged
-                            && self.codex_parent_signature_index == 0
+                        if self.codex_parent_signature_index == 0
                             && self.codex_trusted_sidecar_boundary
-                            && expected.and_then(|values| values.first()) != Some(&signature) =>
+                            && (self.codex_created_thread_start_diverged
+                                || expected.and_then(|values| values.first())
+                                    != Some(&signature)) =>
                     {
                         let absent_from_parent = expected
                             .is_some_and(|values| !values.iter().any(|value| value == &signature));
-                        if codex_usage_starts_fresh_epoch(value) && absent_from_parent {
+                        if !absent_from_parent {
+                            self.codex_legacy_bootstrap_buffer.clear();
+                            self.codex_legacy_bootstrap_valid = false;
+                            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                            self.note_inherited_codex_record(value);
+                            false
+                        } else if codex_usage_starts_fresh_epoch(value) {
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                             self.codex_owned_record_seen = true;
                             true
@@ -6934,29 +6941,6 @@ impl SnapshotAccumulator {
                             false
                         } else {
                             self.codex_created_thread_start_diverged = true;
-                            self.buffer_codex_boundary_record(value);
-                            self.note_inherited_codex_record(value);
-                            false
-                        }
-                    }
-                    Some(signature)
-                        if self.codex_created_thread_start_diverged
-                            && self.codex_parent_signature_index == 0
-                            && self.codex_trusted_sidecar_boundary =>
-                    {
-                        let absent_from_parent = expected
-                            .is_some_and(|values| !values.iter().any(|value| value == &signature));
-                        if codex_usage_starts_fresh_epoch(value) && absent_from_parent {
-                            self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
-                            self.codex_owned_record_seen = true;
-                            true
-                        } else if codex_total_usage(value).is_some() {
-                            self.codex_legacy_bootstrap_buffer.clear();
-                            self.codex_legacy_bootstrap_valid = false;
-                            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-                            self.note_inherited_codex_record(value);
-                            false
-                        } else {
                             self.buffer_codex_boundary_record(value);
                             self.note_inherited_codex_record(value);
                             false
@@ -32448,6 +32432,53 @@ mod tests {
         let item = parsed.snapshots.into_iter().next().expect("child snapshot");
         assert_eq!((item.input_tokens, item.request_count), (12, 1));
         assert_eq!(item.compaction_count.unwrap_or_default(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_created_thread_post_divergence_parent_signature_fails_closed() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent = vec![
+            json!({"timestamp":"2026-08-02T08:00:00Z","type":"session_meta","payload":{"id":parent_id,"thread_source":"user"}}),
+            json!({"timestamp":"2026-08-02T08:00:01Z","type":"turn_context","payload":{"turn_id":"parent-first-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+            json!({"timestamp":"2026-08-02T08:00:03Z","type":"turn_context","payload":{"turn_id":"parent-second-turn","model":"gpt-5.6-sol"}}),
+        ];
+        let child = vec![
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"fresh-child-turn","model":"gpt-5.6-sol"}}),
+            // This copied parent record arrives after the apparent divergent
+            // child turn. A later fresh usage receipt cannot make this
+            // provably inherited signature child-owned.
+            parent[3].clone(),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                None,
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+
+        let (root, parsed) = parse_trusted_created_thread_test(
+            "codex-created-thread-post-divergence-parent-signature",
+            child_id,
+            parent_id,
+            &child,
+            &parent,
+        );
+        assert!(parsed.snapshots.is_empty());
+        assert!(parsed.zero_snapshot_usage_evidence);
+        assert!(parsed.recognized_usage_drop_count > 0);
+        assert_eq!(
+            parsed.state_only_blocked_session_id.as_deref(),
+            Some(child_id)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
