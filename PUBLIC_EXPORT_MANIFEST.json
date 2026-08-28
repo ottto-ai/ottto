@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 340,
-  "content_sha256": "0fccb65a947e15594e44bdfb5f3b5d75f1af0027b77ddbb616d6af83d1589be2",
+  "candidate_file_count": 341,
+  "content_sha256": "9c886dfd1e6552cf4e7a0049478779b06161faf189f2c5f73dcc664b39dda422",
   "files": [
     {
       "executable": false,
@@ -657,7 +657,7 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "33af90ce629340b746ada5bd0eb9b82c0460432d1ab26bf96559be948d9d9b6a",
+      "sha256": "929b344f5a7d056ec09b4cf72924d1d7ff7289a855057f196126459a36369784",
       "size_bytes": 37421
     },
     {
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "448a0fc8812429651918c5327762353c532eec131bd0dd08bc2ab926f9a23879",
-      "size_bytes": 1449063
+      "sha256": "6073b58167dbf1db60a8f78a5d882a1378ea066276c4515f1c919bdf4e0b6e14",
+      "size_bytes": 1460556
     },
     {
       "executable": false,
@@ -1482,6 +1482,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-08-28-codex-created-thread-fresh-epoch.md",
+      "sha256": "4391c6564a6457d90596ab41f525217bb80c2b62b43a1bf89922ee533a038814",
+      "size_bytes": 2744
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-surfaces.md",
       "sha256": "b49df98bbf9dbdcbcc4a904c35f084019541451e53f46c3134ea5c9ff31920b9",
       "size_bytes": 2026
@@ -1840,21 +1847,21 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-golden.json",
-      "sha256": "6b8561e4f202dd6a854be07eecf27f98ad7c93db0cf83d7454016caf0f259348",
+      "sha256": "ed555126a9d6f5f3000804655f8a1ca7144237695028146c90fa0d7f5cd487cc",
       "size_bytes": 3045
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-manifest.json",
-      "sha256": "e44e6d06ade038cf47d6bcb8d61c79b999d3f91dd6de03161f8b0a62632691c0",
+      "sha256": "e68387428a0d6b24cbda90407eb848471caba68cad36d9969dd46899cd4c9c10",
       "size_bytes": 1767
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/context-curve-v1-max-fractional.json",
-      "sha256": "8bb864304507dde9c7376b6f1985f3234e53bbe09a37e1fbc928f693e7cff445",
+      "sha256": "9af99b0b06568ac37c2437f5c1e9fd1eff8567d38c25c4c0b1c93945cf249729",
       "size_bytes": 65507
     },
     {
@@ -1875,7 +1882,7 @@
       "executable": false,
       "mode": "0644",
       "path": "fixtures/snapshot-audit/semantic-envelope-golden.json",
-      "sha256": "0e0964a55242878d2e4d74f958b08d7243b82a5b9219551e8f822358e2655a77",
+      "sha256": "7c1cd0d7e321b6b277f4daa05ff5a0ea20cac90699f0cf19fa1ebd6529380e83",
       "size_bytes": 218514
     },
     {
@@ -2383,9 +2390,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-27T21:38:22+00:00",
+  "generated_at": "2026-08-28T16:35:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 341,
+  "output_file_count": 342,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -2419,5 +2426,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "92a039196a663a9c90f40e036203d7136072fb9c"
+  "source_commit": "52926a787054f3921164d16bcc545dab5e07f97a"
 }

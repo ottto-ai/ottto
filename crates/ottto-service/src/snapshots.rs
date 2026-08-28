@@ -211,7 +211,11 @@ pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // codex v33 adds the bounded, content-free context-curve derivation and its
 // owned-request indexing. This must remain a distinct parser revision from
 // v32's created-thread lineage import so both derivation changes replay once.
-pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v33";
+// codex v34 admits provider-created child rollouts that begin a fresh
+// cumulative-usage epoch instead of copying their parent's physical prefix.
+// The trusted sidecar edge plus total_token_usage == last_token_usage is the
+// bounded ownership proof; a divergent non-fresh epoch still fails closed.
+pub const CODEX_SNAPSHOT_PARSER_VERSION: &str = "codex_jsonl:v34";
 // claude_code v30: retain the exact response ids for counted transcript usage
 // in local memory. Account attribution can then prove that every billed request
 // appears in one-account local OTLP evidence while safely tolerating auxiliary
@@ -6532,6 +6536,11 @@ struct SnapshotAccumulator {
     codex_parent_signatures: Option<Vec<String>>,
     codex_parent_ledger_identity_used: Option<String>,
     codex_parent_signature_index: usize,
+    // A trusted created-thread rollout can either copy the parent's physical
+    // prefix or start a new cumulative epoch. A first divergent turn signature
+    // is held locally until the following usage record proves the latter via
+    // total_token_usage == last_token_usage.
+    codex_created_thread_start_diverged: bool,
     codex_physical_signatures: Vec<String>,
     codex_physical_signatures_complete: bool,
     codex_ordinal_expected: Option<u64>,
@@ -6683,6 +6692,7 @@ impl SnapshotAccumulator {
             codex_parent_signatures: None,
             codex_parent_ledger_identity_used: None,
             codex_parent_signature_index: 0,
+            codex_created_thread_start_diverged: false,
             codex_physical_signatures: Vec::new(),
             codex_physical_signatures_complete: true,
             codex_ordinal_expected: None,
@@ -6905,6 +6915,50 @@ impl SnapshotAccumulator {
                 let expected = self.codex_parent_signatures.as_ref();
                 match signature {
                     Some(signature)
+                        if !self.codex_created_thread_start_diverged
+                            && self.codex_parent_signature_index == 0
+                            && self.codex_trusted_sidecar_boundary
+                            && expected.and_then(|values| values.first()) != Some(&signature) =>
+                    {
+                        if codex_usage_starts_fresh_epoch(value) {
+                            self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+                            self.codex_owned_record_seen = true;
+                            true
+                        } else if codex_total_usage(value).is_some() {
+                            self.codex_legacy_bootstrap_buffer.clear();
+                            self.codex_legacy_bootstrap_valid = false;
+                            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                            self.note_inherited_codex_record(value);
+                            false
+                        } else {
+                            self.codex_created_thread_start_diverged = true;
+                            self.buffer_codex_boundary_record(value);
+                            self.note_inherited_codex_record(value);
+                            false
+                        }
+                    }
+                    Some(_)
+                        if self.codex_created_thread_start_diverged
+                            && self.codex_parent_signature_index == 0
+                            && self.codex_trusted_sidecar_boundary =>
+                    {
+                        if codex_usage_starts_fresh_epoch(value) {
+                            self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
+                            self.codex_owned_record_seen = true;
+                            true
+                        } else if codex_total_usage(value).is_some() {
+                            self.codex_legacy_bootstrap_buffer.clear();
+                            self.codex_legacy_bootstrap_valid = false;
+                            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                            self.note_inherited_codex_record(value);
+                            false
+                        } else {
+                            self.buffer_codex_boundary_record(value);
+                            self.note_inherited_codex_record(value);
+                            false
+                        }
+                    }
+                    Some(signature)
                         if expected
                             .and_then(|values| values.get(self.codex_parent_signature_index))
                             == Some(&signature) =>
@@ -6935,18 +6989,11 @@ impl SnapshotAccumulator {
                         false
                     }
                     None => {
-                        if self.codex_parent_signature_index > 0 {
-                            const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
-                            if self.codex_legacy_bootstrap_buffer.len()
-                                == MAX_BOUNDARY_BUFFER_RECORDS
-                            {
-                                self.codex_legacy_bootstrap_buffer.clear();
-                                self.codex_legacy_bootstrap_valid = false;
-                                self.codex_ownership_boundary =
-                                    CodexOwnershipBoundary::AmbiguousFork;
-                            } else {
-                                self.codex_legacy_bootstrap_buffer.push(value.clone());
-                            }
+                        if self.codex_parent_signature_index > 0
+                            || (self.codex_trusted_sidecar_boundary
+                                && self.codex_parent_signature_index == 0)
+                        {
+                            self.buffer_codex_boundary_record(value);
                         }
                         self.note_inherited_codex_record(value);
                         false
@@ -6974,6 +7021,17 @@ impl SnapshotAccumulator {
                 self.note_inherited_codex_record(value);
                 false
             }
+        }
+    }
+
+    fn buffer_codex_boundary_record(&mut self, value: &Value) {
+        const MAX_BOUNDARY_BUFFER_RECORDS: usize = 64;
+        if self.codex_legacy_bootstrap_buffer.len() == MAX_BOUNDARY_BUFFER_RECORDS {
+            self.codex_legacy_bootstrap_buffer.clear();
+            self.codex_legacy_bootstrap_valid = false;
+            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+        } else {
+            self.codex_legacy_bootstrap_buffer.push(value.clone());
         }
     }
 
@@ -11919,6 +11977,18 @@ fn codex_last_usage(value: &Value) -> Option<UsageTotals> {
     codex_usage_from_root(root, false)
 }
 
+/// Provider-created child rollouts have existed in two physical layouts: a
+/// copied parent prefix followed by child records, and an all-local file whose
+/// cumulative counter restarts with the child's first response. For the latter,
+/// equality between the first positive cumulative and last-response records is
+/// the provider-native proof that no earlier physical usage belongs to this
+/// file. A missing, zero, or divergent pair is not enough evidence.
+fn codex_usage_starts_fresh_epoch(value: &Value) -> bool {
+    codex_total_usage(value)
+        .zip(codex_last_usage(value))
+        .is_some_and(|(total, last)| !total.is_zero() && total == last)
+}
+
 fn codex_model_context_window(value: &Value) -> Option<u64> {
     raw_value_at(value, &["token_count", "info", "model_context_window"])
         .or_else(|| raw_value_at(value, &["payload", "info", "model_context_window"]))
@@ -16534,6 +16604,7 @@ mod tests {
         let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
         let all_local_child = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
+        let nonfresh_child = "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4";
         let conflicting_child = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
         let conflicting_parent = "01a02590-5e24-7f10-8a93-a0c1968d8a3a";
         let untrusted_child = "01a03eae-2513-78f1-a5cc-b0fc720b3bac";
@@ -16577,6 +16648,17 @@ mod tests {
                 ],
             )
             .expect("seed all-local child");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Non-fresh child', 10, 'agent_created_thread', ?2)",
+                rusqlite::params![
+                    nonfresh_child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Start an ambiguous bounded task.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed non-fresh child");
         database
             .execute(
                 "INSERT INTO threads VALUES (?1, 'Conflicting child', 10, 'agent_created_thread', ?2)",
@@ -16692,6 +16774,28 @@ mod tests {
         )
         .expect("write all-local child rollout");
 
+        let nonfresh_path = sessions_dir.join(format!("rollout-{nonfresh_child}.jsonl"));
+        let nonfresh_values = [
+            json!({"timestamp":"2026-08-26T15:03:00Z","type":"session_meta","payload":{"id":nonfresh_child,"thread_source":"agent_created_thread","source":"vscode"}}),
+            json!({"timestamp":"2026-08-26T15:03:01Z","type":"turn_context","payload":{"turn_id":"ambiguous-child-turn","model":"gpt-5.6"}}),
+            codex_test_token_line(
+                "2026-08-26T15:03:02Z",
+                None,
+                (112, 88, 12, 2),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        fs::write(
+            &nonfresh_path,
+            nonfresh_values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write non-fresh child rollout");
+
         let without_edge = CodexTitleMetadata::default().session_sidecar_fingerprint(child);
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
@@ -16764,10 +16868,32 @@ mod tests {
             vec![(1, 30), (2, 20)],
         );
 
-        let all_local_unresolved =
+        let all_local =
             parse_codex_test_with_metadata_and_ledgers(&all_local_path, &metadata, ledgers.clone());
-        assert!(all_local_unresolved.snapshots.is_empty());
-        assert!(!all_local_unresolved.codex_parent_resolution_pending);
+        assert_eq!(all_local.recognized_usage_drop_count, 0);
+        assert!(!all_local.zero_snapshot_usage_evidence);
+        assert!(!all_local.codex_parent_resolution_pending);
+        let all_local_item = all_local.snapshots.into_iter().next().expect("snapshot");
+        assert_eq!(
+            (
+                all_local_item.input_tokens,
+                all_local_item.cache_read_tokens,
+                all_local_item.output_tokens,
+                all_local_item.request_count,
+            ),
+            (12, 8, 2, 1)
+        );
+        let all_local_curve = all_local_item.context_curve.expect("all-local child curve");
+        assert_eq!(all_local_curve.coverage, "complete");
+        assert_eq!(all_local_curve.total_owned_request_count, 1);
+
+        let nonfresh =
+            parse_codex_test_with_metadata_and_ledgers(&nonfresh_path, &metadata, ledgers.clone());
+        assert!(nonfresh.snapshots.is_empty());
+        assert_eq!(nonfresh.recognized_usage_drop_count, 2);
+        assert_eq!(nonfresh.dropped_usage_record_count, 2);
+        assert!(nonfresh.zero_snapshot_usage_evidence);
+        assert!(!nonfresh.codex_parent_resolution_pending);
 
         let capability_off = parse_codex_test_with_metadata_ledgers_and_curve(
             &all_local_path,
@@ -16785,6 +16911,134 @@ mod tests {
         );
         assert_eq!(capability_off.first_turn_context_tokens, Some(12));
         assert!(capability_off.context_curve.is_none());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_fresh_epoch_created_thread_reaches_clean_census() {
+        let home = temp_dir("codex-created-thread-fresh-epoch-census");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions");
+        let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child = "01a03e97-49cf-7460-9fd7-f7dbfd2f05e4";
+        let database = Connection::open(codex_dir.join("state_5.sqlite")).expect("open state db");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );",
+            )
+            .expect("create threads table");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Parent', 100, 'user', 'ordinary prompt')",
+                rusqlite::params![parent],
+            )
+            .expect("seed parent");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Child', 50, 'agent_created_thread', ?2)",
+                rusqlite::params![
+                    child,
+                    format!(
+                        "<codex_delegation>\n  <source_thread_id>{parent}</source_thread_id>\n  <input>Synthetic task.</input>\n</codex_delegation>"
+                    )
+                ],
+            )
+            .expect("seed child");
+        drop(database);
+
+        let parent_values = [
+            json!({"timestamp":"2026-08-26T15:00:00Z","type":"session_meta","payload":{"id":parent,"thread_source":"user","source":"vscode"}}),
+            json!({"timestamp":"2026-08-26T15:00:01Z","type":"turn_context","payload":{"turn_id":"parent-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-26T15:00:02Z",
+                None,
+                (100, 80, 10, 2),
+                Some((100, 80, 10, 2)),
+            ),
+        ];
+        let child_values = [
+            json!({"timestamp":"2026-08-26T15:01:00Z","type":"session_meta","payload":{"id":child,"thread_source":"agent_created_thread","source":"vscode"}}),
+            json!({"timestamp":"2026-08-26T15:01:01Z","type":"turn_context","payload":{"turn_id":"fresh-child-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-26T15:01:02Z",
+                None,
+                (30, 20, 5, 1),
+                Some((30, 20, 5, 1)),
+            ),
+            codex_test_token_line(
+                "2026-08-26T15:01:03Z",
+                None,
+                (50, 35, 9, 2),
+                Some((20, 15, 4, 1)),
+            ),
+        ];
+        for (session_id, values) in [(parent, &parent_values[..]), (child, &child_values[..])] {
+            fs::write(
+                sessions_dir.join(format!("rollout-{session_id}.jsonl")),
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .expect("write rollout");
+        }
+
+        let mut index = ScanIndex::default();
+        let first = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-28T15:00:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("scan fresh-epoch created thread");
+        assert!(!first.census_complete);
+        assert_eq!(first.recognized_usage_drop_count, 0);
+        assert_eq!(first.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(first.dropped_usage_record_count, 0);
+
+        let scan = scan_source_roots(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&sessions_dir),
+            &mut index,
+            "2026-08-28T15:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+        )
+        .expect("resolve parent ledger and finish clean census");
+
+        assert!(scan.census_complete, "{scan:#?}");
+        assert_eq!(scan.recognized_usage_drop_count, 0);
+        assert_eq!(scan.zero_snapshot_usage_evidence_count, 0);
+        assert_eq!(scan.dropped_usage_record_count, 0);
+        let child_item = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == child)
+            .expect("child snapshot");
+        assert_eq!(
+            (
+                child_item.input_tokens,
+                child_item.cache_read_tokens,
+                child_item.output_tokens,
+                child_item.reasoning_output_tokens,
+                child_item.request_count,
+            ),
+            (50, 35, 9, 2, 2)
+        );
+        assert_eq!(
+            child_item
+                .context_curve
+                .as_ref()
+                .map(|curve| curve.total_owned_request_count),
+            Some(2)
+        );
 
         let _ = fs::remove_dir_all(home);
     }
