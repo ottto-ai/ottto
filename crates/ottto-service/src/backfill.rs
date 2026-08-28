@@ -230,7 +230,7 @@ pub fn current_historical_replay(source: SnapshotSource) -> HistoricalReplayDire
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Codex => HistoricalReplayDirective {
-            revision: "codex_session_exclusive_usage:v4",
+            revision: "codex_session_exclusive_usage:v5",
             policy: HistoricalReplayPolicy::Full,
         },
         SnapshotSource::Pi => HistoricalReplayDirective {
@@ -768,7 +768,7 @@ mod tests {
     fn accepted_log_recovery_replays_are_one_shot_and_source_scoped() {
         let expected = [
             (SnapshotSource::ClaudeCode, "claude_reported_usage_union:v4"),
-            (SnapshotSource::Codex, "codex_session_exclusive_usage:v4"),
+            (SnapshotSource::Codex, "codex_session_exclusive_usage:v5"),
             (SnapshotSource::Pi, "pi_founder_backfill_leg_a:v1"),
         ];
         let mut state = BackfillState::default();

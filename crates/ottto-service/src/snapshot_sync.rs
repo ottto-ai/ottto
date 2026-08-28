@@ -875,6 +875,7 @@ struct SyncCounts {
     invalid_utf8_line_count: u64,
     over_line_cap_count: u64,
     recognized_usage_drop_count: u64,
+    ownership_incomplete_file_count: u64,
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
@@ -909,6 +910,7 @@ impl SyncCounts {
             invalid_utf8_line_count: scan_result.invalid_utf8_line_count as u64,
             over_line_cap_count: scan_result.over_line_cap_count as u64,
             recognized_usage_drop_count: scan_result.recognized_usage_drop_count as u64,
+            ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
             zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
@@ -3247,7 +3249,8 @@ fn report_status(
     let (enabled, disabled_reason, last_error_code, last_error_message, consecutive_failures) =
         match status.state {
             CollectorState::Success
-                if status.counts.zero_snapshot_usage_evidence_count > 0
+                if status.counts.ownership_incomplete_file_count > 0
+                    || status.counts.zero_snapshot_usage_evidence_count > 0
                     || status.counts.dropped_usage_record_count > 0 =>
             {
                 (
@@ -3294,6 +3297,7 @@ fn report_status(
         last_zero_snapshot_confirmed_count: status.counts.zero_snapshot_confirmed_count,
         last_zero_snapshot_usage_evidence_count: status.counts.zero_snapshot_usage_evidence_count,
         last_dropped_usage_record_count: status.counts.dropped_usage_record_count,
+        last_ownership_incomplete_file_count: status.counts.ownership_incomplete_file_count,
         last_backfill_window_days: status.counts.backfill_window_days,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
@@ -3362,6 +3366,7 @@ fn report_checkin_status(
         last_zero_snapshot_confirmed_count: 0,
         last_zero_snapshot_usage_evidence_count: 0,
         last_dropped_usage_record_count: 0,
+        last_ownership_incomplete_file_count: 0,
         last_backfill_window_days: CHECKIN_BACKFILL_WINDOW_DAYS,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
