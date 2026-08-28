@@ -76,7 +76,11 @@ precision, and birth times are within the five-second creation tolerance.
 Created-thread classification is the OR of two independently retained inputs:
 the trusted state-row declaration and the rollout declaration. A trusted state
 declaration cannot be withdrawn by the rollout it governs. The complete input
-product is:
+product is below. Session/thread identity is canonicalized at every state,
+thread-history, spawn-edge, rollout-path/header, blocker, ownership-map, and
+fingerprint boundary: an exactly hyphenated UUID becomes lowercase ASCII, while
+every non-UUID identifier remains byte-exact. Distinct sidecar rows that collapse
+to one UUID key make that census incomplete rather than selecting either row.
 
 | Trusted state row | Rollout `thread_source` | Classification / admission result |
 | --- | --- | --- |
@@ -84,6 +88,7 @@ product is:
 | Declares created thread | Omitted | Created thread plus classification conflict; `AmbiguousFork` |
 | Declares created thread | Other string | Created thread plus classification conflict; `AmbiguousFork` |
 | Declares created thread | Malformed/non-string | Created thread plus classification conflict; `AmbiguousFork` |
+| Semantically matching created row whose raw UUID casing differs from the rollout key | Any rollout value | Canonicalized to the same state-created identity, then handled exactly as the corresponding state-declares-created row above |
 | Does not declare this session | Declares `agent_created_thread` | Created thread from rollout evidence; native admission still requires an independent trusted matching child/parent edge and the complete witness |
 | Does not declare this session | Omitted, malformed, or another value | Not classified as created; ordinary compatibility branches apply |
 
@@ -175,7 +180,12 @@ v35/v5 would be false provenance. The compiled versions remain
 `codex_jsonl:v36` and `codex_session_exclusive_usage:v6` because all of these
 corrections are fix-forwards within the same unmerged DRAFT v36/v6 release
 unit; no released daemon ever ran v36/v6 and no released v36/v6 completion
-exists to distinguish with another revision.
+exists to distinguish with another revision. UUID-key canonicalization does not
+justify another parser/replay revision: shipped Codex state, rollout, and
+thread-history identifiers are consistently lowercase already, so no real
+shipped corpus shape changes admission. The case-alias outcome exists only for
+adversarial/damaged local evidence and remains part of this unreleased DRAFT
+v36/v6 derivation.
 
 Focused regressions run the full matrix with the curve capability present and
 absent, including `history_base`, the no-marker internal parent omission, valid
@@ -183,6 +193,8 @@ native compatibility, the five-second spawn window, path/mtime/byte extent
 checks, projected final-ordinal mismatch, R1/R2/truncated-parent shapes, native
 ordinal/chronology/turn failures, malformed crash tails, ordinary pagination
 non-acquisition, state-loaded absent/conflicting/malformed rollout markers,
-generic-edge/unrelated-row non-acquisition, and the five corpus shapes. Durable
-production replay state is also exercised from recorded v2, v3, v4, and v5
-through persisted v6 completion.
+UUID case aliases in both state-to-rollout directions, canonical-key collision
+failure, non-UUID byte-exact identity, generic-edge/unrelated-row
+non-acquisition, and the five corpus shapes. Durable production replay state is
+also exercised from recorded v2, v3, v4, and v5 through persisted v6
+completion.

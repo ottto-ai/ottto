@@ -5809,7 +5809,7 @@ struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
-    /// Exact session ids whose trusted Codex state row declares
+    /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
     /// classification input, while an edge alone is only lineage evidence.
@@ -5833,7 +5833,7 @@ struct CodexTitleCandidate {
     source: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CodexStateThread {
     title: Option<String>,
     tokens_used: u64,
@@ -5844,7 +5844,7 @@ struct CodexStateThread {
     rollout_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CodexRolloutExtent {
     next_byte_offset: u64,
     next_ordinal: u64,
@@ -6862,7 +6862,8 @@ impl SnapshotAccumulator {
             thread_source.as_deref() == Some("agent_created_thread");
         let state_declares_created_thread = self.codex_sidecar_created_thread;
         let is_created_thread = rollout_declares_created_thread || state_declares_created_thread;
-        let forked_from_id = string_at(meta, &["forked_from_id"]);
+        let forked_from_id =
+            canonical_codex_session_id_option(string_at(meta, &["forked_from_id"]));
         self.codex_parent_session_ref = forked_from_id.clone();
         let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
         let exact_start = u64_at(meta, &["subagent_history_start_ordinal"]);
@@ -6877,15 +6878,16 @@ impl SnapshotAccumulator {
             // file-controlled pagination markers and the legacy parent-prefix
             // state machine can never authorize this shape.
             self.codex_created_thread_native_only = true;
-            let source_session_id =
-                string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"]));
+            let source_session_id = canonical_codex_session_id_option(
+                string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"])),
+            );
             let trusted_parent = self
                 .codex_sidecar_parent
                 .as_ref()
                 .filter(|(child, _)| {
                     source_session_id
                         .as_deref()
-                        .is_some_and(|session_id| session_id.eq_ignore_ascii_case(child))
+                        .is_some_and(|session_id| session_id == child)
                 })
                 .map(|(_, parent)| parent.clone());
             self.codex_parent_session_ref = trusted_parent.clone();
@@ -6901,7 +6903,7 @@ impl SnapshotAccumulator {
                 .as_ref()
                 .zip(forked_from_id.as_ref())
                 .is_some_and(|(sidecar_parent, transcript_parent)| {
-                    !sidecar_parent.eq_ignore_ascii_case(transcript_parent)
+                    sidecar_parent != transcript_parent
                 })
             {
                 self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
@@ -7651,6 +7653,7 @@ impl SnapshotAccumulator {
         let Some(session_id) = session_id else {
             return;
         };
+        let session_id = canonical_codex_session_id(session_id.as_str());
         if let Some((parent, root, depth)) = metadata.family_position(session_id.as_str()) {
             self.origin.thread_source = Some("subagent".to_string());
             self.origin.source_subagent = Some(true);
@@ -7931,6 +7934,11 @@ impl SnapshotAccumulator {
             })
         else {
             return Vec::new();
+        };
+        let source_session_id = if self.source == SnapshotSource::Codex {
+            canonical_codex_session_id(source_session_id.as_str())
+        } else {
+            source_session_id
         };
         if self.source == SnapshotSource::Codex && !self.codex_usage_accounting_complete() {
             return Vec::new();
@@ -8667,18 +8675,33 @@ fn validated_codex_parent_ownership_ledgers(
     frozen_census_paths: &BTreeSet<String>,
 ) -> BTreeMap<String, CodexParentOwnershipLedger> {
     let mut validated = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
     for (session_id, ledger) in &index.codex_parent_ownership_ledgers {
+        let session_id = canonical_codex_session_id(session_id.as_str());
         if !ledger.scan_complete
             || ledger.signatures.is_empty()
             || ledger.opened_object_identity.is_empty()
+            || conflicts.contains(session_id.as_str())
         {
             continue;
         }
-        if current_codex_parent_opened_identity(scan_roots, frozen_census_paths, session_id)
-            .as_deref()
+        if current_codex_parent_opened_identity(
+            scan_roots,
+            frozen_census_paths,
+            session_id.as_str(),
+        )
+        .as_deref()
             == Some(ledger.opened_object_identity.as_str())
         {
-            validated.insert(session_id.clone(), ledger.clone());
+            if validated
+                .get(session_id.as_str())
+                .is_some_and(|existing| existing != ledger)
+            {
+                validated.remove(session_id.as_str());
+                conflicts.insert(session_id);
+            } else {
+                validated.insert(session_id, ledger.clone());
+            }
         }
     }
     validated
@@ -8689,9 +8712,10 @@ fn current_codex_parent_opened_identity(
     frozen_census_paths: &BTreeSet<String>,
     session_id: &str,
 ) -> Option<String> {
+    let session_id = canonical_codex_session_id(session_id);
     let mut matching_paths = frozen_census_paths.iter().filter_map(|key| {
         let path = PathBuf::from(key);
-        (codex_session_id_from_path(&path).as_deref() == Some(session_id)).then_some(path)
+        (codex_session_id_from_path(&path).as_deref() == Some(session_id.as_str())).then_some(path)
     });
     let path = matching_paths.next()?;
     // More than one physical rollout claiming the same source session id is
@@ -9211,26 +9235,28 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
         codex_parent_resolution_retry_required |= parsed_file.codex_parent_resolution_pending;
         let parse_complete = parsed_file.complete();
         if let Some(parent_session_ref) = parsed_file.codex_parent_session_ref.as_ref() {
+            let parent_session_ref = canonical_codex_session_id(parent_session_ref.as_str());
             if index.codex_parent_ownership_refs.len() < MAX_CODEX_PARENT_LEDGER_REFS
                 || index
                     .codex_parent_ownership_refs
-                    .contains(parent_session_ref)
+                    .contains(parent_session_ref.as_str())
             {
-                index
-                    .codex_parent_ownership_refs
-                    .insert(parent_session_ref.clone());
+                index.codex_parent_ownership_refs.insert(parent_session_ref);
             }
         }
         if let Some((session_id, ledger)) = parsed_file.codex_parent_ownership_ledger.as_ref() {
+            let session_id = canonical_codex_session_id(session_id.as_str());
             let ledger_is_unique_current_parent = ledger.scan_complete
                 && current_codex_parent_opened_identity(
                     &codex_parent_validation_roots,
                     &codex_parent_frozen_census_paths,
-                    session_id,
+                    session_id.as_str(),
                 )
                 .as_deref()
                     == Some(ledger.opened_object_identity.as_str());
-            if index.codex_parent_ownership_refs.contains(session_id)
+            if index
+                .codex_parent_ownership_refs
+                .contains(session_id.as_str())
                 && ledger_is_unique_current_parent
             {
                 index
@@ -9244,10 +9270,11 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
             }
         }
         if let Some(session_id) = parsed_file.state_only_blocked_session_id.as_ref() {
+            let session_id = canonical_codex_session_id(session_id.as_str());
             codex_state_only_blocked_session_ids.insert(session_id.clone());
             index
                 .codex_state_only_blocked_session_ids
-                .insert(session_id.clone());
+                .insert(session_id);
         }
         let report = parsed_file.report;
         let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
@@ -9263,9 +9290,9 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
                 if snapshot.usage_accounting_contract.as_deref()
                     == Some("session_exclusive_reported_usage:v1")
                 {
-                    index
-                        .codex_state_only_blocked_session_ids
-                        .remove(snapshot.source_session_id.as_str());
+                    index.codex_state_only_blocked_session_ids.remove(
+                        canonical_codex_session_id(snapshot.source_session_id.as_str()).as_str(),
+                    );
                 }
             }
         }
@@ -9493,7 +9520,8 @@ fn scan_source_roots_with_limit_and_attribution_and_curve(
 }
 
 fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
-    let Some(thread) = metadata.state_threads.get(item.source_session_id.as_str()) else {
+    let source_session_id = canonical_codex_session_id(item.source_session_id.as_str());
+    let Some(thread) = metadata.state_threads.get(source_session_id.as_str()) else {
         return;
     };
     if thread.tokens_used == 0 {
@@ -9513,11 +9541,11 @@ fn append_codex_state_only_snapshots(
 ) -> (usize, usize) {
     let blocked_session_ids = blocked_session_ids
         .union(&index.codex_state_only_blocked_session_ids)
-        .cloned()
+        .map(|session_id| canonical_codex_session_id(session_id.as_str()))
         .collect::<BTreeSet<_>>();
     let covered_session_ids: BTreeSet<String> = snapshots
         .iter()
-        .map(|snapshot| snapshot.source_session_id.clone())
+        .map(|snapshot| canonical_codex_session_id(snapshot.source_session_id.as_str()))
         .collect();
     // Sessions whose rollout was parsed into a snapshot in a PRIOR scan run.
     // The incremental scan skips unchanged rollout files, so they are absent
@@ -10087,10 +10115,10 @@ fn parse_opened_jsonl_file(
     }
     let state_only_blocked_session_id = (codex_ownership_incomplete || accumulator.codex_is_fork)
         .then(|| {
-            accumulator
-                .source_session_id
-                .clone()
-                .or_else(|| codex_session_id_from_path(path))
+            // Classification was seeded from this rollout-path identity. Bind
+            // the durable state-only block to the same canonical key before a
+            // damaged/mismatching header can redirect it to another session.
+            codex_session_id_from_path(path).or_else(|| accumulator.source_session_id.clone())
         })
         .flatten();
     let codex_parent_session_ref = accumulator.codex_parent_session_ref.clone();
@@ -11045,17 +11073,17 @@ fn codex_native_created_thread_header(
     sidecar_created_at_nanos: Option<i128>,
 ) -> Option<i128> {
     let meta = codex_session_meta_payload(value)?;
-    let expected_session_id = expected_session_id?;
+    let expected_session_id = canonical_codex_session_id(expected_session_id?);
     let sidecar_created_at_nanos = sidecar_created_at_nanos?;
-    let id = string_at(meta, &["id"])?;
-    let session_id = string_at(meta, &["session_id"])?;
+    let id = canonical_codex_session_id(string_at(meta, &["id"])?.as_str());
+    let session_id = canonical_codex_session_id(string_at(meta, &["session_id"])?.as_str());
     if !string_eq_at(value, &["type"], "session_meta")
         || u64_at(value, &["ordinal"]) != Some(0)
         || string_at(meta, &["thread_source"]).as_deref() != Some("agent_created_thread")
         || string_at(meta, &["history_mode"]).as_deref() != Some("paginated")
         || u64_at(meta, &["subagent_history_start_ordinal"]).is_some()
-        || !id.eq_ignore_ascii_case(expected_session_id)
-        || !session_id.eq_ignore_ascii_case(expected_session_id)
+        || id != expected_session_id
+        || session_id != expected_session_id
     {
         return None;
     }
@@ -11187,18 +11215,20 @@ fn apply_codex_envelope_line(value: &Value, accumulator: &mut SnapshotAccumulato
     if accumulator.codex_session_meta_seen {
         return;
     }
-    accumulator.source_session_id = string_at(meta, &["id"])
-        .or_else(|| string_at(meta, &["session_id"]))
-        .or_else(|| accumulator.source_session_id.clone());
+    accumulator.source_session_id = canonical_codex_session_id_option(
+        string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"])),
+    )
+    .or_else(|| accumulator.source_session_id.clone());
     accumulator.origin.thread_source = string_at(meta, &["thread_source"]);
     if let Some(src) = meta.get("source") {
         if let Some(text) = src.as_str() {
             accumulator.origin.source = Some(text.to_string());
         } else if src.is_object() {
             accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
-            accumulator.origin.parent_session_ref =
+            accumulator.origin.parent_session_ref = canonical_codex_session_id_option(
                 string_at(src, &["subagent", "thread_spawn", "parent_thread_id"])
-                    .or_else(|| string_at(meta, &["parent_thread_id"]));
+                    .or_else(|| string_at(meta, &["parent_thread_id"])),
+            );
             accumulator.codex_agent_label =
                 string_at(src, &["subagent", "thread_spawn", "agent_path"])
                     .and_then(safe_codex_agent_display_label);
@@ -11229,10 +11259,12 @@ fn apply_codex_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
 
 fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
-        accumulator.source_session_id = string_at(value, &["session_meta", "payload", "id"])
-            .or_else(|| string_at(value, &["payload", "id"]))
-            .or_else(|| string_at(value, &["session_id"]))
-            .or_else(|| string_at(value, &["sessionId"]));
+        accumulator.source_session_id = canonical_codex_session_id_option(
+            string_at(value, &["session_meta", "payload", "id"])
+                .or_else(|| string_at(value, &["payload", "id"]))
+                .or_else(|| string_at(value, &["session_id"]))
+                .or_else(|| string_at(value, &["sessionId"])),
+        );
     }
     // Raw session-origin (siblings of `id` in session_meta.payload). The
     // session_meta line carries these; other lines yield None, so first-seen
@@ -11251,8 +11283,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             } else if src.is_object() {
                 // Codex subagent form: source = { "subagent": { "thread_spawn": .. } }.
                 accumulator.origin.source_subagent = Some(src.get("subagent").is_some());
-                accumulator.origin.parent_session_ref =
-                    string_at(src, &["subagent", "thread_spawn", "parent_thread_id"]);
+                accumulator.origin.parent_session_ref = canonical_codex_session_id_option(
+                    string_at(src, &["subagent", "thread_spawn", "parent_thread_id"]),
+                );
             }
         }
     }
@@ -13096,13 +13129,14 @@ impl BoundedCandidateSelection {
 
 impl CodexTitleMetadata {
     fn family_position(&self, child: &str) -> Option<(String, String, u64)> {
-        if self.spawn_parent_conflicts.contains(child) {
+        let child = canonical_codex_session_id(child);
+        if self.spawn_parent_conflicts.contains(child.as_str()) {
             return None;
         }
-        let parent = self.spawn_parents.get(child)?.clone();
+        let parent = self.spawn_parents.get(child.as_str())?.clone();
         let mut root = parent.clone();
         let mut depth = 1_u64;
-        let mut seen = BTreeSet::from([child.to_string()]);
+        let mut seen = BTreeSet::from([child]);
         while let Some(next) = self.spawn_parents.get(root.as_str()) {
             if self.spawn_parent_conflicts.contains(root.as_str())
                 || !seen.insert(root.clone())
@@ -13117,14 +13151,18 @@ impl CodexTitleMetadata {
     }
 
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
-        let title = self.titles.get(source_session_id);
-        let thread = self.state_threads.get(source_session_id);
-        let extent = self.rollout_extents.get(source_session_id);
-        let family = self.family_position(source_session_id);
+        let source_session_id = canonical_codex_session_id(source_session_id);
+        let title = self.titles.get(source_session_id.as_str());
+        let thread = self.state_threads.get(source_session_id.as_str());
+        let extent = self.rollout_extents.get(source_session_id.as_str());
+        let family = self.family_position(source_session_id.as_str());
         sha256_hex(&[
             "codex_session_sidecar:v4",
-            source_session_id,
-            if self.state_created_threads.contains(source_session_id) {
+            source_session_id.as_str(),
+            if self
+                .state_created_threads
+                .contains(source_session_id.as_str())
+            {
                 "agent_created_thread"
             } else {
                 ""
@@ -13165,7 +13203,10 @@ impl CodexTitleMetadata {
                 .as_ref()
                 .map(|(parent, _, _)| parent.as_str())
                 .unwrap_or_else(|| {
-                    if self.spawn_parent_conflicts.contains(source_session_id) {
+                    if self
+                        .spawn_parent_conflicts
+                        .contains(source_session_id.as_str())
+                    {
                         "conflict"
                     } else {
                         ""
@@ -13382,9 +13423,14 @@ fn load_codex_session_index_titles(
         Err(error) => return Err(error).context("open Codex session index"),
     };
     let mut parsed = BTreeMap::new();
+    let mut raw_ids_by_key = BTreeMap::new();
     let mut invalid_shape = false;
     let report = read_bounded_jsonl_lines(BufReader::new(file), MAX_JSONL_LINE_BYTES, |value| {
         let Some(id) = string_at(value, &["id"]) else {
+            invalid_shape = true;
+            return;
+        };
+        let Ok(id) = canonical_codex_identity_key(&mut raw_ids_by_key, id.as_str()) else {
             invalid_shape = true;
             return;
         };
@@ -13425,8 +13471,10 @@ fn load_codex_sqlite_titles(
     for row in rows {
         loaded.push(row.context("read Codex title census row")?);
     }
-    for row in loaded {
-        insert_codex_sidecar_title(titles, row.0, Some(row.1), "session_index", false);
+    let mut raw_ids_by_key = BTreeMap::new();
+    for (raw_id, title) in loaded {
+        let id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_id.as_str())?;
+        insert_codex_sidecar_title(titles, id, Some(title), "session_index", false);
     }
     Ok(())
 }
@@ -13485,12 +13533,28 @@ fn load_codex_sqlite_state_threads(
         ))
     })?;
     let mut loaded = BTreeMap::new();
+    let mut raw_ids_by_key = BTreeMap::new();
     for row in rows {
-        let (id, thread) = row.context("read Codex state thread census row")?;
-        loaded.insert(id, thread);
+        let (raw_id, thread) = row.context("read Codex state thread census row")?;
+        let id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_id.as_str())?;
+        if loaded
+            .insert(id, thread.clone())
+            .is_some_and(|existing| existing != thread)
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting Codex state rows share one session identity"
+            ));
+        }
     }
     for (id, thread) in loaded {
-        state_threads.insert(id, thread);
+        if state_threads
+            .insert(id, thread.clone())
+            .is_some_and(|existing| existing != thread)
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting Codex state roots share one session identity"
+            ));
+        }
     }
     Ok(())
 }
@@ -13529,21 +13593,37 @@ fn load_codex_rollout_extents(
         Ok((thread_id, next_byte_offset, next_ordinal))
     })?;
     let mut loaded = BTreeMap::new();
+    let mut raw_ids_by_key = BTreeMap::new();
     for row in rows {
-        let (thread_id, next_byte_offset, next_ordinal) =
+        let (raw_thread_id, next_byte_offset, next_ordinal) =
             row.context("read Codex rollout-extent census row")?;
+        let thread_id = canonical_codex_identity_key(&mut raw_ids_by_key, raw_thread_id.as_str())?;
         let next_byte_offset =
             u64::try_from(next_byte_offset).context("negative Codex rollout byte offset")?;
         let next_ordinal = u64::try_from(next_ordinal).context("negative Codex rollout ordinal")?;
-        loaded.insert(
-            thread_id,
-            CodexRolloutExtent {
-                next_byte_offset,
-                next_ordinal,
-            },
-        );
+        let extent = CodexRolloutExtent {
+            next_byte_offset,
+            next_ordinal,
+        };
+        if loaded
+            .insert(thread_id, extent)
+            .is_some_and(|existing| existing != extent)
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting Codex rollout extents share one session identity"
+            ));
+        }
     }
-    rollout_extents.extend(loaded);
+    for (thread_id, extent) in loaded {
+        if rollout_extents
+            .insert(thread_id, extent)
+            .is_some_and(|existing| existing != extent)
+        {
+            return Err(anyhow::anyhow!(
+                "conflicting Codex rollout roots share one session identity"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -13577,9 +13657,12 @@ fn load_codex_sqlite_spawn_edges(
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
+        let mut raw_created_ids_by_key = BTreeMap::new();
         for row in rows {
-            let (child, first_user_message) =
+            let (raw_child, first_user_message) =
                 row.context("read Codex created-thread census row")?;
+            let child =
+                canonical_codex_identity_key(&mut raw_created_ids_by_key, raw_child.as_str())?;
             state_created_threads.insert(child.clone());
             if let Some(parent) = first_user_message
                 .as_deref()
@@ -13605,6 +13688,8 @@ fn load_codex_sqlite_spawn_edges(
         loaded.push(row.context("read Codex spawn-edge census row")?);
     }
     for (parent, child) in loaded {
+        let parent = canonical_codex_session_id(parent.as_str());
+        let child = canonical_codex_session_id(child.as_str());
         if !parent.is_empty() && !child.is_empty() && parent != child {
             record_codex_spawn_parent(spawn_parents, spawn_parent_conflicts, child, parent);
         }
@@ -13618,6 +13703,8 @@ fn record_codex_spawn_parent(
     child: String,
     parent: String,
 ) {
+    let child = canonical_codex_session_id(child.as_str());
+    let parent = canonical_codex_session_id(parent.as_str());
     if spawn_parent_conflicts.contains(child.as_str()) {
         return;
     }
@@ -13651,11 +13738,34 @@ fn codex_created_thread_parent(child: &str, first_user_message: &str) -> Option<
         || input_and_close[..input_and_close.len() - CLOSE.len()].contains(CLOSE)
         || !is_uuid_like(parent)
         || !is_uuid_like(child)
-        || parent.eq_ignore_ascii_case(child)
+        || canonical_codex_session_id(parent) == canonical_codex_session_id(child)
     {
         return None;
     }
-    Some(parent.to_ascii_lowercase())
+    Some(canonical_codex_session_id(parent))
+}
+
+/// Record one raw identifier at a sidecar-ingress boundary and reject two
+/// distinct raw rows that collapse to one canonical UUID key. A single
+/// uppercase/mixed-case row is accepted and normalized; duplicate aliases are
+/// ambiguous database evidence and make that census fail closed.
+fn canonical_codex_identity_key(
+    raw_ids_by_key: &mut BTreeMap<String, String>,
+    raw_id: &str,
+) -> Result<String> {
+    let key = canonical_codex_session_id(raw_id);
+    if raw_ids_by_key
+        .get(key.as_str())
+        .is_some_and(|existing| existing != raw_id)
+    {
+        return Err(anyhow::anyhow!(
+            "distinct Codex sidecar ids collapse to one canonical UUID identity"
+        ));
+    }
+    raw_ids_by_key
+        .entry(key.clone())
+        .or_insert_with(|| raw_id.to_string());
+    Ok(key)
 }
 
 fn sqlite_table_columns(connection: &Connection, table_name: &str) -> Result<BTreeSet<String>> {
@@ -14138,14 +14248,15 @@ fn insert_codex_sidecar_title(
     if id.is_empty() {
         return;
     }
+    let id = canonical_codex_session_id(id);
     let Some(title) = title.and_then(|value| normalize_display_title(value, source)) else {
         return;
     };
-    if !overwrite && titles.contains_key(id) {
+    if !overwrite && titles.contains_key(id.as_str()) {
         return;
     }
     titles.insert(
-        id.to_string(),
+        id,
         CodexTitleCandidate {
             title,
             source: source.to_string(),
@@ -15186,7 +15297,40 @@ fn quarantine_invalid_scan_index(path: &Path) -> Result<ScanIndex> {
     Ok(ScanIndex::default())
 }
 
+fn canonicalize_codex_identity_set(values: &mut BTreeSet<String>) {
+    *values = std::mem::take(values)
+        .into_iter()
+        .map(|value| canonical_codex_session_id(value.as_str()))
+        .collect();
+}
+
+fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T>) -> bool {
+    let mut canonical = BTreeMap::new();
+    for (raw_key, value) in std::mem::take(values) {
+        let key = canonical_codex_session_id(raw_key.as_str());
+        if canonical
+            .get(key.as_str())
+            .is_some_and(|existing| existing != &value)
+        {
+            return false;
+        }
+        canonical.entry(key).or_insert(value);
+    }
+    *values = canonical;
+    true
+}
+
 impl ScanIndex {
+    /// Persisted v36 draft indexes may contain pre-fix raw UUID casing. Treat
+    /// deserialization as an identity ingress: normalize every Codex set/map
+    /// once, and reject conflicting values that collapse to one UUID key.
+    fn canonicalize_codex_identity_keys(&mut self) -> bool {
+        canonicalize_codex_identity_set(&mut self.codex_state_only_blocked_session_ids);
+        canonicalize_codex_identity_set(&mut self.codex_parent_ownership_refs);
+        canonicalize_codex_identity_map(&mut self.codex_state_only_snapshot_fingerprints)
+            && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
+    }
+
     pub fn activate_upload_context(&mut self, fingerprint: String) {
         self.active_upload_context_fingerprint = Some(fingerprint);
     }
@@ -15273,7 +15417,7 @@ impl ScanIndex {
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         match serde_json::from_reader::<_, Self>(file) {
-            Ok(index)
+            Ok(mut index)
                 if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
                     && index
                         .snapshot_activity_at
@@ -15284,7 +15428,11 @@ impl ScanIndex {
                         .values()
                         .all(snapshot_quarantine_deadline_is_bounded) =>
             {
-                Ok(index)
+                if index.canonicalize_codex_identity_keys() {
+                    Ok(index)
+                } else {
+                    quarantine_invalid_scan_index(path)
+                }
             }
             Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
                 quarantine_invalid_scan_index(path)
@@ -16187,12 +16335,30 @@ fn is_uuid_like(value: &str) -> bool {
     true
 }
 
+/// Canonical comparison key for Codex session/thread identities.
+///
+/// Codex UUIDs are ASCII hex and are semantically case-insensitive. Restrict
+/// normalization to the exact hyphenated UUID shape so arbitrary provider or
+/// future non-UUID identifiers remain byte-exact and cannot acquire aliases
+/// through Unicode or general-purpose case folding.
+fn canonical_codex_session_id(value: &str) -> String {
+    if is_uuid_like(value) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+fn canonical_codex_session_id_option(value: Option<String>) -> Option<String> {
+    value.map(|value| canonical_codex_session_id(value.as_str()))
+}
+
 fn codex_session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     if stem.len() >= 36 {
         let suffix = &stem[stem.len() - 36..];
         if is_uuid_like(suffix) {
-            return Some(suffix.to_string());
+            return Some(canonical_codex_session_id(suffix));
         }
     }
     None
@@ -33297,21 +33463,31 @@ mod tests {
         let sessions_dir = codex_dir.join("sessions");
         fs::create_dir_all(&sessions_dir).expect("create Codex sessions fixture");
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let state_parent_id = parent_id.to_ascii_uppercase();
         let cases = [
             (
+                "01A03E99-49CF-7460-9FD7-F7DBFD2F05E4",
                 "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4",
                 "marker-absent",
                 None,
             ),
             (
+                "01A03E9A-49CF-7460-9FD7-F7DBFD2F05E4",
                 "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4",
                 "marker-conflicting",
                 Some(json!("user")),
             ),
             (
+                "01A03E9B-49CF-7460-9FD7-F7DBFD2F05E4",
                 "01a03e9b-49cf-7460-9fd7-f7dbfd2f05e4",
                 "marker-malformed",
                 Some(json!({"forged":"agent_created_thread"})),
+            ),
+            (
+                "01a03e9c-49cf-7460-9fd7-f7dbfd2f05e4",
+                "01A03e9C-49cF-7460-9fD7-f7DbFd2F05e4",
+                "reverse-mixed-case-marker",
+                None,
             ),
         ];
         let database = Connection::open(codex_dir.join("state_5.sqlite"))
@@ -33327,17 +33503,17 @@ mod tests {
         database
             .execute(
                 "INSERT INTO threads VALUES (?1, 'Parent', 10, 'user', 'parent')",
-                [parent_id],
+                [state_parent_id.as_str()],
             )
             .expect("seed classification parent");
-        for (child_id, _, thread_source) in &cases {
+        for (state_child_id, rollout_child_id, _, thread_source) in &cases {
             let wrapper = format!(
-                "<codex_delegation>\n  <source_thread_id>{parent_id}</source_thread_id>\n  <input>Created task.</input>\n</codex_delegation>"
+                "<codex_delegation>\n  <source_thread_id>{state_parent_id}</source_thread_id>\n  <input>Created task.</input>\n</codex_delegation>"
             );
             database
                 .execute(
                     "INSERT INTO threads VALUES (?1, 'Child', 1, 'agent_created_thread', ?2)",
-                    rusqlite::params![child_id, wrapper],
+                    rusqlite::params![state_child_id, wrapper],
                 )
                 .expect("seed state-created child");
 
@@ -33345,8 +33521,8 @@ mod tests {
                 "timestamp":"2026-08-02T08:20:00Z",
                 "type":"session_meta",
                 "payload":{
-                    "id":child_id,
-                    "session_id":child_id,
+                    "id":rollout_child_id,
+                    "session_id":rollout_child_id,
                     "history_mode":"paginated",
                     "history_base":{"cursor":"file-controlled"},
                     "source":"cli"
@@ -33366,7 +33542,7 @@ mod tests {
                 ),
             ];
             fs::write(
-                sessions_dir.join(format!("rollout-{child_id}.jsonl")),
+                sessions_dir.join(format!("rollout-{rollout_child_id}.jsonl")),
                 values
                     .iter()
                     .map(Value::to_string)
@@ -33380,16 +33556,32 @@ mod tests {
 
         let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
         assert!(!metadata.state_census_incomplete);
-        for (child_id, name, _) in &cases {
-            assert!(metadata.state_created_threads.contains(*child_id), "{name}");
+        assert!(!metadata.sidecar_census_incomplete);
+        for (state_child_id, rollout_child_id, name, _) in &cases {
+            let child_id = canonical_codex_session_id(rollout_child_id);
+            assert!(
+                metadata.state_created_threads.contains(child_id.as_str()),
+                "{name}"
+            );
+            if child_id != *state_child_id {
+                assert!(
+                    !metadata.state_created_threads.contains(*state_child_id),
+                    "raw state casing must not survive: {name}"
+                );
+            }
             assert_eq!(
                 metadata
-                    .family_position(child_id)
+                    .family_position(rollout_child_id)
                     .map(|(parent, _, _)| parent),
                 Some(parent_id.to_string()),
                 "{name}"
             );
-            let path = sessions_dir.join(format!("rollout-{child_id}.jsonl"));
+            assert_eq!(
+                metadata.session_sidecar_fingerprint(state_child_id),
+                metadata.session_sidecar_fingerprint(rollout_child_id),
+                "{name}"
+            );
+            let path = sessions_dir.join(format!("rollout-{rollout_child_id}.jsonl"));
             for context_curve_enabled in [true, false] {
                 let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
                     &path,
@@ -33409,13 +33601,151 @@ mod tests {
                 assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
                 assert_eq!(
                     parsed.state_only_blocked_session_id.as_deref(),
-                    Some(*child_id),
+                    Some(child_id.as_str()),
                     "{name}"
                 );
                 assert!(parsed.codex_parent_ledger_identity_used.is_none(), "{name}");
             }
         }
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_uuid_identity_is_canonical_but_non_uuid_identity_remains_byte_exact() {
+        let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let mixed = "01A03e99-49CF-7460-9Fd7-F7dBfD2F05E4";
+        assert_eq!(canonical_codex_session_id(mixed), lowercase);
+
+        let non_uuid = "Provider-Session-Case-Sensitive";
+        let other_non_uuid = "provider-session-case-sensitive";
+        assert_eq!(canonical_codex_session_id(non_uuid), non_uuid);
+        assert_eq!(canonical_codex_session_id(other_non_uuid), other_non_uuid);
+        assert_ne!(
+            canonical_codex_session_id(non_uuid),
+            canonical_codex_session_id(other_non_uuid)
+        );
+
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .spawn_parents
+            .insert(non_uuid.to_string(), "Parent-Exact".to_string());
+        assert_eq!(
+            metadata
+                .family_position(non_uuid)
+                .map(|(parent, _, _)| parent),
+            Some("Parent-Exact".to_string())
+        );
+        assert_eq!(metadata.family_position(other_non_uuid), None);
+        assert_ne!(
+            metadata.session_sidecar_fingerprint(non_uuid),
+            metadata.session_sidecar_fingerprint(other_non_uuid)
+        );
+
+        let header = json!({
+            "timestamp":"2026-08-02T08:20:00.500Z",
+            "ordinal":0,
+            "type":"session_meta",
+            "payload":{
+                "id":other_non_uuid,
+                "session_id":other_non_uuid,
+                "timestamp":"2026-08-02T08:20:00Z",
+                "thread_source":"agent_created_thread",
+                "history_mode":"paginated"
+            }
+        });
+        assert_eq!(
+            codex_native_created_thread_header(
+                &header,
+                Some(non_uuid),
+                rfc3339_unix_nanos("2026-08-02T08:20:00Z")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_sidecar_uuid_alias_collision_marks_the_census_incomplete() {
+        let home = temp_dir("codex-sidecar-uuid-alias-collision");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create collision sessions fixture");
+        let database = Connection::open(codex_dir.join("state_5.sqlite"))
+            .expect("open collision state fixture");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );\
+                INSERT INTO threads VALUES (\
+                    '01a03e99-49cf-7460-9fd7-f7dbfd2f05e4', 'Lower', 1,\
+                    'agent_created_thread', NULL\
+                );\
+                INSERT INTO threads VALUES (\
+                    '01A03E99-49CF-7460-9FD7-F7DBFD2F05E4', 'Upper', 2,\
+                    'agent_created_thread', NULL\
+                );",
+            )
+            .expect("seed colliding state rows");
+        drop(database);
+
+        assert!(load_codex_sqlite_state_threads(
+            &codex_dir.join("state_5.sqlite"),
+            &mut BTreeMap::new()
+        )
+        .is_err());
+        assert!(load_codex_sqlite_spawn_edges(
+            &codex_dir.join("state_5.sqlite"),
+            &mut BTreeSet::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new()
+        )
+        .is_err());
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert!(metadata.state_census_incomplete);
+        assert!(metadata.sidecar_census_incomplete);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_persisted_ownership_maps_canonicalize_uuid_keys_and_reject_conflicts() {
+        let lowercase = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let uppercase = lowercase.to_ascii_uppercase();
+        let mut index = ScanIndex::default();
+        index
+            .codex_state_only_blocked_session_ids
+            .insert(uppercase.clone());
+        index.codex_parent_ownership_refs.insert(uppercase.clone());
+        index
+            .codex_state_only_snapshot_fingerprints
+            .insert(uppercase.clone(), "state-fingerprint".to_string());
+        index.codex_parent_ownership_ledgers.insert(
+            uppercase,
+            CodexParentOwnershipLedger {
+                signatures: vec!["signature".to_string()],
+                scan_complete: true,
+                opened_object_identity: "object".to_string(),
+            },
+        );
+        assert!(index.canonicalize_codex_identity_keys());
+        assert!(index
+            .codex_state_only_blocked_session_ids
+            .contains(lowercase));
+        assert!(index.codex_parent_ownership_refs.contains(lowercase));
+        assert!(index
+            .codex_state_only_snapshot_fingerprints
+            .contains_key(lowercase));
+        assert!(index.codex_parent_ownership_ledgers.contains_key(lowercase));
+
+        let mut conflicting = ScanIndex::default();
+        conflicting
+            .codex_state_only_snapshot_fingerprints
+            .insert(lowercase.to_string(), "lower".to_string());
+        conflicting
+            .codex_state_only_snapshot_fingerprints
+            .insert(lowercase.to_ascii_uppercase(), "upper".to_string());
+        assert!(!conflicting.canonicalize_codex_identity_keys());
     }
 
     #[test]
