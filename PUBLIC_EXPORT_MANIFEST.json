@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 341,
-  "content_sha256": "e5defcd79a7d3429f5b008997e0af2f6984a6aecb6bac2fddb3335e8c8267460",
+  "content_sha256": "b99eaff772ac97598d295d1bb32174bc622f2d0143567e1857bf53a18306c581",
   "files": [
     {
       "executable": false,
@@ -657,8 +657,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "183e3d7e804a0cd43d7a448e907965a86f383f72955b0a7affa32a74df7013dd",
-      "size_bytes": 37421
+      "sha256": "a46273464b0d11f34ada8aa8fdc7cac17f7ede0bfd70c5e0e2135c283d94923e",
+      "size_bytes": 40031
     },
     {
       "executable": false,
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "7bfc50e8d8d30055e3120c5038e5eff929c59513495213d72e7827f26e014c18",
-      "size_bytes": 1502335
+      "sha256": "43a8ec7965b98854b9bd57122b3c7f7b53f08472184bb38aaffa848213fe6387",
+      "size_bytes": 1507338
     },
     {
       "executable": false,
@@ -1483,8 +1483,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-28-codex-created-thread-fresh-epoch.md",
-      "sha256": "0ab0fd4802dbaeaed4002cfb4cbdf7f0a19c4a7b6af95e7328a4c7e4f049280a",
-      "size_bytes": 8600
+      "sha256": "479efb1c71c851ee7a74fe616cd978aa8da1d5f046cecac3c4245dad80dd0c7e",
+      "size_bytes": 12303
     },
     {
       "executable": false,
@@ -2390,7 +2390,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-08-28T19:38:58+00:00",
+  "generated_at": "2026-08-28T20:58:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 342,
   "public_roots": [
@@ -2426,5 +2426,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "65d79c9e9721914e24f3144e057a4832df7ef714"
+  "source_commit": "c7f7d9c581e6b6d0d53d3aaad74d8ea62630fd91"
 }

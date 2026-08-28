@@ -822,6 +822,67 @@ mod tests {
     }
 
     #[test]
+    fn codex_v2_through_v5_replays_persist_v6_completion_for_the_same_destination() {
+        let source = SnapshotSource::Codex;
+        let destination = "destination-v6-replay-test";
+        for prior_revision in [
+            "codex_session_exclusive_usage:v2",
+            "codex_session_exclusive_usage:v3",
+            "codex_session_exclusive_usage:v4",
+            "codex_session_exclusive_usage:v5",
+        ] {
+            let dir = temp_dir(&format!(
+                "codex-v6-completion-{}",
+                prior_revision.rsplit(':').next().unwrap_or("prior")
+            ));
+            let mut state = BackfillState::default();
+            state.completed_parser_versions.insert(
+                source.api_slug().to_string(),
+                CODEX_SNAPSHOT_PARSER_VERSION.to_string(),
+            );
+            state
+                .completed_replay_revisions
+                .insert(source.api_slug().to_string(), prior_revision.to_string());
+            state
+                .completed_destination_namespaces
+                .insert(source.api_slug().to_string(), destination.to_string());
+            save_backfill_state(&dir, &state).expect("persist prior replay state");
+
+            let mut loaded = load_backfill_state(&dir);
+            assert!(
+                pending_backfill_sources_for_destination(&loaded, destination).contains(&source),
+                "{prior_revision} must re-arm v6"
+            );
+
+            // This is the production completion mutation used only after the
+            // sync path has a complete census and fully settled upload.
+            mark_backfill_complete_for_destination(&mut loaded, source, destination);
+            save_backfill_state(&dir, &loaded).expect("persist v6 completion");
+            let completed = load_backfill_state(&dir);
+            assert!(
+                !pending_backfill_sources_for_destination(&completed, destination)
+                    .contains(&source),
+                "{prior_revision} must settle after durable v6 completion"
+            );
+            assert_eq!(
+                completed
+                    .completed_replay_revisions
+                    .get(source.api_slug())
+                    .map(String::as_str),
+                Some("codex_session_exclusive_usage:v6")
+            );
+            assert_eq!(
+                completed
+                    .completed_destination_namespaces
+                    .get(source.api_slug())
+                    .map(String::as_str),
+                Some(destination)
+            );
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
     fn save_then_load_backfill_state_roundtrips() {
         let dir = temp_dir("state");
         let mut state = BackfillState::default();

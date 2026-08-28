@@ -6564,9 +6564,6 @@ struct SnapshotAccumulator {
     // Codex's independently projected EOF ordinal, when thread_history_1 is
     // available. The native stream must end at the same ordinal boundary.
     codex_sidecar_projected_next_ordinal: Option<u64>,
-    // Marks the stricter created-thread prefix path so unsigned records at the
-    // ownership boundary are never replayed as child-owned.
-    codex_trusted_sidecar_boundary: bool,
     codex_parent_session_ref: Option<String>,
     codex_parent_signatures: Option<Vec<String>>,
     codex_parent_ledger_identity_used: Option<String>,
@@ -6728,7 +6725,6 @@ impl SnapshotAccumulator {
             codex_sidecar_parent: None,
             codex_sidecar_child_created_at_nanos: None,
             codex_sidecar_projected_next_ordinal: None,
-            codex_trusted_sidecar_boundary: false,
             codex_parent_session_ref: None,
             codex_parent_signatures: None,
             codex_parent_ledger_identity_used: None,
@@ -6845,12 +6841,10 @@ impl SnapshotAccumulator {
             .and_then(Value::as_object)
             .is_some_and(|source| source.contains_key("subagent"));
         let is_subagent = thread_source.as_deref() == Some("subagent") || source_subagent;
-        // Until exact curve admission is advertised, preserve the established
-        // session parser byte-for-byte: the collector PR must be inert. Once
-        // enabled, created-thread ownership becomes load-bearing for every
-        // posture/curve field and therefore uses the trusted sidecar proof.
-        let is_created_thread =
-            self.context_curve_enabled && thread_source.as_deref() == Some("agent_created_thread");
+        // Capability negotiation controls only whether a context-curve payload
+        // is emitted. Ownership attribution is an integrity boundary and must
+        // never become weaker when that optional payload is unavailable.
+        let is_created_thread = thread_source.as_deref() == Some("agent_created_thread");
         let forked_from_id = string_at(meta, &["forked_from_id"]);
         self.codex_parent_session_ref = forked_from_id.clone();
         let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
@@ -6861,6 +6855,11 @@ impl SnapshotAccumulator {
             || exact_start.is_some();
 
         if is_created_thread {
+            // Every provider-created thread has exactly one admission path:
+            // the complete native creation witness below. In particular,
+            // file-controlled pagination markers and the legacy parent-prefix
+            // state machine can never authorize this shape.
+            self.codex_created_thread_native_only = true;
             let source_session_id =
                 string_at(meta, &["id"]).or_else(|| string_at(meta, &["session_id"]));
             let trusted_parent = self
@@ -6896,34 +6895,11 @@ impl SnapshotAccumulator {
                 self.codex_ownership_boundary = CodexOwnershipBoundary::NativeCreatedThread;
                 return;
             }
-            if has_history_base || exact_start.is_some() {
-                // Created-thread pagination markers are file-controlled and
-                // cannot authorize AllLocal/Ordinal by themselves. This shape
-                // has exactly one admission gate: the complete native witness
-                // above. A malformed native envelope must not fall through to
-                // the legacy copied-prefix state machine.
-                self.codex_created_thread_native_only = true;
-                self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
-                return;
-            }
-            let parent_ledger = trusted_parent.as_deref().and_then(|parent_id| {
-                self.codex_parent_ownership_ledgers
-                    .as_ref()
-                    .and_then(|ledgers| ledgers.lock().ok())
-                    .and_then(|ledgers| ledgers.get(parent_id).cloned())
-                    .filter(|ledger| ledger.scan_complete && !ledger.signatures.is_empty())
-            });
-            self.codex_ownership_boundary = if let Some(parent_ledger) = parent_ledger {
-                self.codex_parent_ledger_identity_used = Some(parent_ledger.opened_object_identity);
-                self.codex_parent_signatures = Some(parent_ledger.signatures);
-                self.codex_trusted_sidecar_boundary = true;
-                CodexOwnershipBoundary::AwaitingParentPrefix
-            } else {
-                // The rollout declares a created-thread successor, but an
-                // exact trusted parent edge/ledger is unavailable. Counting it
-                // as all-local would re-admit a copied predecessor prefix.
-                CodexOwnershipBoundary::AmbiguousFork
-            };
+            // Missing/malformed native evidence fails closed even when a
+            // complete legacy parent ledger is available. The ledger proves
+            // only prefix equality; it cannot prove the provider-created
+            // thread's native origin or the completeness of an omitted prefix.
+            self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
             return;
         }
 
@@ -7006,12 +6982,6 @@ impl SnapshotAccumulator {
                         if expected
                             .is_some_and(|values| self.codex_parent_signature_index < values.len())
                         {
-                            if self.codex_trusted_sidecar_boundary {
-                                // Unsigned records after the final matched
-                                // signature remain ownership-ambiguous and are
-                                // never replayed at the boundary.
-                                self.codex_legacy_bootstrap_buffer.clear();
-                            }
                             self.codex_ownership_boundary = CodexOwnershipBoundary::AllLocal;
                             self.codex_owned_record_seen = true;
                             true
@@ -10013,7 +9983,7 @@ fn parse_opened_jsonl_file(
     accumulator.artifacts_enabled = artifacts_enabled;
     accumulator.codex_turn_traces = codex_turn_traces;
     accumulator.codex_parent_ownership_ledgers = codex_parent_ownership_ledgers;
-    if source == SnapshotSource::Codex && context_curve_enabled {
+    if source == SnapshotSource::Codex {
         if let Some(metadata) = codex_title_metadata {
             let file_metadata = reader
                 .get_ref()
@@ -17158,58 +17128,16 @@ mod tests {
         let unresolved =
             parse_codex_test_with_metadata_and_ledgers(&path, &metadata, BTreeMap::new());
         assert!(unresolved.snapshots.is_empty());
-        assert!(unresolved.codex_parent_resolution_pending);
+        assert!(!unresolved.codex_parent_resolution_pending);
+        assert_eq!(unresolved.ownership_incomplete_file_count, 1);
         assert_eq!(unresolved.codex_parent_session_ref.as_deref(), Some(parent));
-        let item = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers.clone())
-            .snapshots
-            .into_iter()
-            .next()
-            .expect("snapshot");
-
-        let origin = item.origin.as_ref().expect("child origin");
-        assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
-        assert_eq!(origin.parent_session_ref.as_deref(), Some(parent));
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "parent_session_ref" && fact.value == parent));
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "root_session_ref" && fact.value == parent));
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "spawn_depth" && fact.value == "1"));
-        assert!(item
-            .attribution_facts
-            .iter()
-            .any(|fact| fact.field == "agent_kind" && fact.value == "codex_subagent"));
-        assert_eq!(
-            (
-                item.input_tokens,
-                item.cache_read_tokens,
-                item.output_tokens,
-                item.reasoning_output_tokens,
-                item.request_count,
-            ),
-            (50, 35, 9, 2, 2),
-        );
-        assert_eq!(item.first_turn_context_tokens, Some(30));
-        assert_eq!(item.peak_context_fill_tokens, Some(30));
-        assert_eq!(item.compaction_count, Some(1));
-        let curve = item.context_curve.as_ref().expect("created-thread curve");
-        assert_eq!(curve.coverage, "complete");
-        assert_eq!(curve.total_owned_request_count, 2);
-        assert_eq!(curve.total_compaction_boundary_count, 1);
-        assert_eq!(
-            curve
-                .points
-                .iter()
-                .map(|point| (point.owned_request_ordinal, point.effective_input_tokens))
-                .collect::<Vec<_>>(),
-            vec![(1, 30), (2, 20)],
-        );
+        let with_legacy_ledger =
+            parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers.clone());
+        assert!(with_legacy_ledger.snapshots.is_empty());
+        assert_eq!(with_legacy_ledger.ownership_incomplete_file_count, 1);
+        assert!(with_legacy_ledger
+            .codex_parent_ledger_identity_used
+            .is_none());
 
         let all_local =
             parse_codex_test_with_metadata_and_ledgers(&all_local_path, &metadata, ledgers.clone());
@@ -17217,6 +17145,25 @@ mod tests {
         assert!(!all_local.zero_snapshot_usage_evidence);
         assert!(!all_local.codex_parent_resolution_pending);
         let all_local_item = all_local.snapshots.into_iter().next().expect("snapshot");
+        let origin = all_local_item.origin.as_ref().expect("child origin");
+        assert_eq!(origin.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(origin.parent_session_ref.as_deref(), Some(parent));
+        assert!(all_local_item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "parent_session_ref" && fact.value == parent));
+        assert!(all_local_item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "root_session_ref" && fact.value == parent));
+        assert!(all_local_item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "spawn_depth" && fact.value == "1"));
+        assert!(all_local_item
+            .attribution_facts
+            .iter()
+            .any(|fact| fact.field == "agent_kind" && fact.value == "codex_subagent"));
         assert_eq!(
             (
                 all_local_item.input_tokens,
@@ -17248,7 +17195,7 @@ mod tests {
         .snapshots
         .into_iter()
         .next()
-        .expect("capability-off parser remains inert");
+        .expect("capability-off parser keeps native ownership hardening");
         assert_eq!(
             (capability_off.input_tokens, capability_off.request_count),
             (12, 1)
@@ -32141,29 +32088,33 @@ mod tests {
         .expect("parse Codex parent-prefix fixture")
     }
 
-    fn parse_trusted_created_thread_test(
+    fn parse_trusted_created_thread_test_with_curve(
         name: &str,
         child_id: &str,
         parent_id: &str,
         child_values: &[Value],
         parent_values: &[Value],
+        context_curve_enabled: bool,
     ) -> (PathBuf, ParsedJsonlFile) {
-        parse_trusted_created_thread_test_with_extent(
+        parse_trusted_created_thread_test_with_curve_and_extent(
             name,
             child_id,
             parent_id,
             child_values,
             parent_values,
+            context_curve_enabled,
             None,
         )
     }
 
-    fn parse_trusted_created_thread_test_with_extent(
+    #[allow(clippy::too_many_arguments)]
+    fn parse_trusted_created_thread_test_with_curve_and_extent(
         name: &str,
         child_id: &str,
         parent_id: &str,
         child_values: &[Value],
         parent_values: &[Value],
+        context_curve_enabled: bool,
         projected_next_ordinal: Option<u64>,
     ) -> (PathBuf, ParsedJsonlFile) {
         let root = temp_dir(name);
@@ -32214,7 +32165,12 @@ mod tests {
                 opened_object_identity: String::new(),
             },
         )]);
-        let parsed = parse_codex_test_with_metadata_and_ledgers(&path, &metadata, ledgers);
+        let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
+            &path,
+            &metadata,
+            ledgers,
+            context_curve_enabled,
+        );
         (root, parsed)
     }
 
@@ -32707,21 +32663,27 @@ mod tests {
             parent[2].clone(),
         ];
 
-        let (root, parsed) = parse_trusted_created_thread_test(
-            "codex-created-thread-copied-fresh-checkpoint",
-            child_id,
-            parent_id,
-            &child,
-            &parent,
-        );
-        assert!(parsed.snapshots.is_empty());
-        assert!(parsed.zero_snapshot_usage_evidence);
-        assert!(parsed.recognized_usage_drop_count > 0);
-        assert_eq!(
-            parsed.state_only_blocked_session_id.as_deref(),
-            Some(child_id)
-        );
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                "codex-created-thread-copied-fresh-checkpoint",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.snapshots.is_empty(),
+                "capability={context_curve_enabled}"
+            );
+            assert!(parsed.zero_snapshot_usage_evidence);
+            assert!(parsed.recognized_usage_drop_count > 0);
+            assert_eq!(
+                parsed.state_only_blocked_session_id.as_deref(),
+                Some(child_id)
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -32748,28 +32710,39 @@ mod tests {
             parent_usage.clone(),
         ];
 
-        for (name, omit_model) in [("r1-copied-suffix", false), ("r2-model-omitted", true)] {
-            let mut copied_usage = parent_usage.clone();
-            if omit_model {
-                copied_usage
-                    .pointer_mut("/payload/info")
-                    .and_then(Value::as_object_mut)
-                    .expect("usage info")
-                    .remove("model");
+        for context_curve_enabled in [true, false] {
+            for (name, omit_model) in [("r1-copied-suffix", false), ("r2-model-omitted", true)] {
+                let mut copied_usage = parent_usage.clone();
+                if omit_model {
+                    copied_usage
+                        .pointer_mut("/payload/info")
+                        .and_then(Value::as_object_mut)
+                        .expect("usage info")
+                        .remove("model");
+                }
+                let child = vec![
+                    json!({"timestamp":"2026-08-28T10:03:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
+                    parent_turn.clone(),
+                    copied_usage,
+                ];
+                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                    name,
+                    child_id,
+                    parent_id,
+                    &child,
+                    &parent,
+                    context_curve_enabled,
+                );
+                assert!(
+                    parsed.snapshots.is_empty(),
+                    "{name} capability={context_curve_enabled}: {parsed:#?}"
+                );
+                assert!(parsed.zero_snapshot_usage_evidence, "{name}: {parsed:#?}");
+                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
+                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+                let _ = fs::remove_dir_all(root);
             }
-            let child = vec![
-                json!({"timestamp":"2026-08-28T10:03:00Z","type":"session_meta","payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}}),
-                parent_turn.clone(),
-                copied_usage,
-            ];
-            let (root, parsed) =
-                parse_trusted_created_thread_test(name, child_id, parent_id, &child, &parent);
-            assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
-            assert!(parsed.zero_snapshot_usage_evidence, "{name}: {parsed:#?}");
-            assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
-            assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
-            assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
-            let _ = fs::remove_dir_all(root);
         }
     }
 
@@ -32803,19 +32776,25 @@ mod tests {
                 Some((30, 8, 12, 1)),
             ),
         ];
-        let (root, parsed) = parse_trusted_created_thread_test(
-            "r2-clean-parent-ledger-exhaustion",
-            child_id,
-            parent_id,
-            &child,
-            &cleanly_truncated_parent,
-        );
-        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
-        assert!(parsed.zero_snapshot_usage_evidence);
-        assert_eq!(parsed.recognized_usage_drop_count, 2);
-        assert_eq!(parsed.ownership_incomplete_file_count, 1);
-        assert_eq!(parsed.dropped_usage_record_count, 2);
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                "r2-clean-parent-ledger-exhaustion",
+                child_id,
+                parent_id,
+                &child,
+                &cleanly_truncated_parent,
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.snapshots.is_empty(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert!(parsed.zero_snapshot_usage_evidence);
+            assert_eq!(parsed.recognized_usage_drop_count, 2);
+            assert_eq!(parsed.ownership_incomplete_file_count, 1);
+            assert_eq!(parsed.dropped_usage_record_count, 2);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -32838,50 +32817,60 @@ mod tests {
             ("01a03eee-dd5b-7851-a3c6-190c38e68ce8", 16, 59),
             ("01a03f0e-a60a-76e3-9d2b-e612b4488dd8", 17, 139),
         ];
-        let mut admitted_records = 0_u64;
-        for (child_id, first_usage_ordinal, record_count) in shapes {
-            let turn_id = format!("{}-7000-8000-8000-000000000001", &child_id[..8]);
-            let mut child = vec![
-                json!({"timestamp":"2026-08-26T16:37:18.114Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-26T16:37:17.011Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
-                json!({"timestamp":"2026-08-26T16:37:18.115Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_787_762_237_u64}}),
-            ];
-            while child.len() < 7 {
-                let ordinal = child.len() as u64;
-                child.push(json!({"timestamp":"2026-08-26T16:37:19Z","ordinal":ordinal,"type":"response_item","payload":{"type":"message","id":format!("msg-{ordinal}"),"role":"developer","content":[]}}));
+        for context_curve_enabled in [true, false] {
+            let mut admitted_records = 0_u64;
+            for (child_id, first_usage_ordinal, record_count) in shapes {
+                let turn_id = format!("{}-7000-8000-8000-000000000001", &child_id[..8]);
+                let mut child = vec![
+                    json!({"timestamp":"2026-08-26T16:37:18.114Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-26T16:37:17.011Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
+                    json!({"timestamp":"2026-08-26T16:37:18.115Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_787_762_237_u64}}),
+                ];
+                while child.len() < 7 {
+                    let ordinal = child.len() as u64;
+                    child.push(json!({"timestamp":"2026-08-26T16:37:19Z","ordinal":ordinal,"type":"response_item","payload":{"type":"message","id":format!("msg-{ordinal}"),"role":"developer","content":[]}}));
+                }
+                child.push(json!({"timestamp":"2026-08-26T16:37:20Z","ordinal":7,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}));
+                while (child.len() as u64) < first_usage_ordinal {
+                    let ordinal = child.len() as u64;
+                    child.push(json!({"timestamp":"2026-08-26T16:37:21Z","ordinal":ordinal,"type":"event_msg","payload":{"type":"item_completed","turn_id":turn_id}}));
+                }
+                for index in 1..=record_count {
+                    child.push(codex_test_token_line(
+                        "2026-08-26T16:37:22Z",
+                        Some(first_usage_ordinal + index - 1),
+                        (index * 10, index * 8, index * 2, index),
+                        Some((10, 8, 2, 1)),
+                    ));
+                }
+                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                    "codex-five-native-shapes",
+                    child_id,
+                    parent_id,
+                    &child,
+                    &parent,
+                    context_curve_enabled,
+                );
+                assert!(
+                    parsed.complete(),
+                    "{child_id} capability={context_curve_enabled}: {parsed:#?}"
+                );
+                assert_eq!(parsed.snapshots.len(), 1, "{child_id}");
+                assert_eq!(parsed.snapshots[0].input_tokens, record_count * 10);
+                assert_eq!(
+                    parsed.snapshots[0].context_curve.is_some(),
+                    context_curve_enabled
+                );
+                assert_eq!(parsed.recognized_usage_drop_count, 0);
+                assert_eq!(parsed.ownership_incomplete_file_count, 0);
+                admitted_records += record_count;
+                let _ = fs::remove_dir_all(root);
             }
-            child.push(json!({"timestamp":"2026-08-26T16:37:20Z","ordinal":7,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}));
-            while (child.len() as u64) < first_usage_ordinal {
-                let ordinal = child.len() as u64;
-                child.push(json!({"timestamp":"2026-08-26T16:37:21Z","ordinal":ordinal,"type":"event_msg","payload":{"type":"item_completed","turn_id":turn_id}}));
-            }
-            for index in 1..=record_count {
-                child.push(codex_test_token_line(
-                    "2026-08-26T16:37:22Z",
-                    Some(first_usage_ordinal + index - 1),
-                    (index * 10, index * 8, index * 2, index),
-                    Some((10, 8, 2, 1)),
-                ));
-            }
-            let (root, parsed) = parse_trusted_created_thread_test(
-                "codex-five-native-shapes",
-                child_id,
-                parent_id,
-                &child,
-                &parent,
-            );
-            assert!(parsed.complete(), "{child_id}: {parsed:#?}");
-            assert_eq!(parsed.snapshots.len(), 1, "{child_id}");
-            assert_eq!(parsed.snapshots[0].input_tokens, record_count * 10);
-            assert_eq!(parsed.recognized_usage_drop_count, 0);
-            assert_eq!(parsed.ownership_incomplete_file_count, 0);
-            admitted_records += record_count;
-            let _ = fs::remove_dir_all(root);
+            assert_eq!(admitted_records, 1_377);
         }
-        assert_eq!(admitted_records, 1_377);
     }
 
     #[test]
-    fn codex_created_thread_unsigned_preamble_does_not_poison_parent_prefix() {
+    fn codex_created_thread_no_marker_internal_parent_omission_never_uses_legacy_prefix() {
         let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
         let child_id = "01a03e98-49cf-7460-9fd7-f7dbfd2f05e4";
         let parent = vec![
@@ -32901,51 +32890,44 @@ mod tests {
                 Some((50, 35, 8, 1)),
             ),
         ];
-        let mut child = vec![json!({
-            "timestamp":"2026-08-02T08:20:00Z",
-            "type":"session_meta",
-            "payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}
-        })];
-        for sequence in 0..70 {
-            child.push(json!({
-                "timestamp":"2026-08-02T08:20:01Z",
-                "type":"event_msg",
-                "payload":{"type":"task_started","sequence":sequence}
-            }));
-        }
-        child.extend([
+        let child = vec![
+            json!({
+                "timestamp":"2026-08-02T08:20:00Z",
+                "type":"session_meta",
+                "payload":{"id":child_id,"thread_source":"agent_created_thread","source":"vscode"}
+            }),
             parent[1].clone(),
-            parent[2].clone(),
-            json!({"timestamp":"2026-08-02T08:20:02Z","type":"turn_context","payload":{"turn_id":"child-first-turn","model":"gpt-5.6-sol"}}),
-            codex_test_token_line(
-                "2026-08-02T08:20:03Z",
-                None,
-                (130, 100, 15, 3),
-                Some((30, 20, 5, 1)),
-            ),
-        ]);
+            // Omit parent[2], then copy the later parent turn and usage. The
+            // legacy prefix machine used to treat parent[3] as divergence and
+            // admit parent[4] as child-owned while later ledger entries existed.
+            parent[3].clone(),
+            parent[4].clone(),
+        ];
 
-        let (root, parsed) = parse_trusted_created_thread_test(
-            "codex-created-thread-long-unsigned-preamble",
-            child_id,
-            parent_id,
-            &child,
-            &parent,
-        );
-        assert!(parsed.complete(), "{parsed:#?}");
-        assert_eq!(parsed.recognized_usage_drop_count, 0);
-        let item = parsed.snapshots.into_iter().next().expect("child snapshot");
-        assert_eq!(
-            (
-                item.input_tokens,
-                item.cache_read_tokens,
-                item.output_tokens,
-                item.reasoning_output_tokens,
-                item.request_count,
-            ),
-            (30, 20, 5, 1, 1)
-        );
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                "codex-created-thread-internal-parent-omission",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.snapshots.is_empty(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert!(parsed.zero_snapshot_usage_evidence);
+            assert_eq!(parsed.recognized_usage_drop_count, 1);
+            assert_eq!(parsed.ownership_incomplete_file_count, 1);
+            assert_eq!(parsed.dropped_usage_record_count, 1);
+            assert_eq!(
+                parsed.state_only_blocked_session_id.as_deref(),
+                Some(child_id)
+            );
+            assert!(parsed.codex_parent_ledger_identity_used.is_none());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -32975,18 +32957,25 @@ mod tests {
             ),
         ];
 
-        let (root, parsed) = parse_trusted_created_thread_test(
-            "codex-created-thread-native-start",
-            child_id,
-            parent_id,
-            &child,
-            &parent,
-        );
-        assert!(parsed.complete(), "{parsed:#?}");
-        let item = parsed.snapshots.into_iter().next().expect("child snapshot");
-        assert_eq!((item.input_tokens, item.request_count), (12, 1));
-        assert_eq!(item.compaction_count, Some(1));
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                "codex-created-thread-native-start",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.complete(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            let item = parsed.snapshots.into_iter().next().expect("child snapshot");
+            assert_eq!((item.input_tokens, item.request_count), (12, 1));
+            assert_eq!(item.compaction_count, Some(1));
+            assert_eq!(item.context_curve.is_some(), context_curve_enabled);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -33014,19 +33003,25 @@ mod tests {
             ),
         ];
 
-        let (root, parsed) = parse_trusted_created_thread_test(
-            "codex-created-thread-history-base-native-only",
-            child_id,
-            parent_id,
-            &child,
-            &parent,
-        );
-        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
-        assert!(parsed.zero_snapshot_usage_evidence);
-        assert_eq!(parsed.recognized_usage_drop_count, 1);
-        assert_eq!(parsed.ownership_incomplete_file_count, 1);
-        assert_eq!(parsed.dropped_usage_record_count, 1);
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                "codex-created-thread-history-base-native-only",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.snapshots.is_empty(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert!(parsed.zero_snapshot_usage_evidence);
+            assert_eq!(parsed.recognized_usage_drop_count, 1);
+            assert_eq!(parsed.ownership_incomplete_file_count, 1);
+            assert_eq!(parsed.dropped_usage_record_count, 1);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -33056,18 +33051,24 @@ mod tests {
             ),
         ];
 
-        let (root, parsed) = parse_trusted_created_thread_test_with_extent(
-            "codex-created-thread-projected-extent",
-            child_id,
-            parent_id,
-            &child,
-            &parent,
-            Some(5),
-        );
-        assert!(parsed.snapshots.is_empty(), "{parsed:#?}");
-        assert!(parsed.zero_snapshot_usage_evidence);
-        assert_eq!(parsed.ownership_incomplete_file_count, 1);
-        let _ = fs::remove_dir_all(root);
+        for context_curve_enabled in [true, false] {
+            let (root, parsed) = parse_trusted_created_thread_test_with_curve_and_extent(
+                "codex-created-thread-projected-extent",
+                child_id,
+                parent_id,
+                &child,
+                &parent,
+                context_curve_enabled,
+                Some(5),
+            );
+            assert!(
+                parsed.snapshots.is_empty(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert!(parsed.zero_snapshot_usage_evidence);
+            assert_eq!(parsed.ownership_incomplete_file_count, 1);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -33147,30 +33148,142 @@ mod tests {
             ),
         ];
 
-        for (name, mut child) in [
-            ("native-ordinal-gap", valid.clone()),
-            ("native-retrograde-time", valid.clone()),
-            ("native-turn-mismatch", valid.clone()),
-            ("native-spawn-delay", valid.clone()),
-        ] {
-            match name {
-                "native-ordinal-gap" => child[3]["ordinal"] = json!(4),
-                "native-retrograde-time" => child[3]["timestamp"] = json!("2026-08-02T08:19:59Z"),
-                "native-turn-mismatch" => {
-                    child[2]["payload"]["turn_id"] = json!("01a03e99-5000-7000-8000-000000000002")
+        for context_curve_enabled in [true, false] {
+            for (name, mut child) in [
+                ("native-ordinal-gap", valid.clone()),
+                ("native-ordinal-restart", valid.clone()),
+                ("native-retrograde-time", valid.clone()),
+                ("native-turn-mismatch", valid.clone()),
+                ("native-spawn-delay", valid.clone()),
+            ] {
+                match name {
+                    "native-ordinal-gap" => child[3]["ordinal"] = json!(4),
+                    "native-ordinal-restart" => child[3]["ordinal"] = json!(2),
+                    "native-retrograde-time" => {
+                        child[3]["timestamp"] = json!("2026-08-02T08:19:59Z")
+                    }
+                    "native-turn-mismatch" => {
+                        child[2]["payload"]["turn_id"] =
+                            json!("01a03e99-5000-7000-8000-000000000002")
+                    }
+                    "native-spawn-delay" => {
+                        child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z")
+                    }
+                    _ => unreachable!(),
                 }
-                "native-spawn-delay" => child[0]["timestamp"] = json!("2026-08-02T08:20:10.500Z"),
-                _ => unreachable!(),
+                let (root, parsed) = parse_trusted_created_thread_test_with_curve(
+                    name,
+                    child_id,
+                    parent_id,
+                    &child,
+                    &parent,
+                    context_curve_enabled,
+                );
+                assert!(
+                    parsed.snapshots.is_empty(),
+                    "{name} capability={context_curve_enabled}: {parsed:#?}"
+                );
+                assert!(parsed.zero_snapshot_usage_evidence, "{name}");
+                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
+                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+                let _ = fs::remove_dir_all(root);
             }
-            let (root, parsed) =
-                parse_trusted_created_thread_test(name, child_id, parent_id, &child, &parent);
-            assert!(parsed.snapshots.is_empty(), "{name}: {parsed:#?}");
-            assert!(parsed.zero_snapshot_usage_evidence, "{name}");
-            assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
-            assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
-            assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn codex_created_thread_malformed_crash_tail_is_uncommittable_with_or_without_curve() {
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let child_id = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+        let turn_id = "01a03e99-5000-7000-8000-000000000001";
+        let child = [
+            json!({"timestamp":"2026-08-02T08:20:00.500Z","ordinal":0,"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":"2026-08-02T08:20:00Z","thread_source":"agent_created_thread","history_mode":"paginated","source":"vscode"}}),
+            json!({"timestamp":"2026-08-02T08:20:00.501Z","ordinal":1,"type":"event_msg","payload":{"type":"task_started","turn_id":turn_id,"trace_id":"0123456789abcdef0123456789abcdef","started_at":1_785_658_800_u64}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","ordinal":2,"type":"turn_context","payload":{"turn_id":turn_id,"model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:03Z",
+                Some(3),
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+
+        for context_curve_enabled in [true, false] {
+            let root = temp_dir("codex-created-thread-malformed-crash-tail");
+            let path = root.join(format!("rollout-{child_id}.jsonl"));
+            let mut body = child
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            body.push_str("\n{");
+            fs::write(&path, body).expect("write malformed crash-tail fixture");
+
+            let mut metadata = CodexTitleMetadata::default();
+            metadata
+                .spawn_parents
+                .insert(child_id.to_string(), parent_id.to_string());
+            metadata.state_threads.insert(
+                child_id.to_string(),
+                CodexStateThread {
+                    tokens_used: 1,
+                    created_at: Some("2026-08-02T08:20:00Z".to_string()),
+                    ..CodexStateThread::default()
+                },
+            );
+            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
+                &path,
+                &metadata,
+                BTreeMap::new(),
+                context_curve_enabled,
+            );
+            assert!(!parsed.report.complete());
+            assert!(!parsed.complete());
+            assert_eq!(parsed.report.malformed_json_line_count, 1);
+            assert_eq!(
+                parsed.state_only_blocked_session_id.as_deref(),
+                Some(child_id)
+            );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn codex_ordinary_paginated_resume_never_acquires_created_thread_admission() {
+        let path = write_codex_test_values(
+            "codex-ordinary-paginated-resume",
+            &[
+                json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":"ordinary-resume","thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"ordinary-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (12, 8, 2, 1),
+                    Some((12, 8, 2, 1)),
+                ),
+            ],
+        );
+        for context_curve_enabled in [true, false] {
+            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
+                &path,
+                &CodexTitleMetadata::default(),
+                BTreeMap::new(),
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.complete(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert_eq!(parsed.snapshots.len(), 1);
+            assert_eq!(parsed.snapshots[0].source_session_id, "ordinary-resume");
+            assert_eq!(parsed.snapshots[0].input_tokens, 12);
+            assert_eq!(
+                parsed.snapshots[0].context_curve.is_some(),
+                context_curve_enabled
+            );
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]

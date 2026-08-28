@@ -2,18 +2,20 @@
 
 ## Outcome
 
-Parser `codex_jsonl:v36` closes the independent created-thread `history_base`
-authorization bypass and strengthens the v35 native witness with corroboration
-outside the rollout bytes. Replay revision
+Parser `codex_jsonl:v36` closes the independent created-thread `history_base`,
+capability-off, and legacy parent-prefix authorization bypasses and strengthens
+the v35 native witness with corroboration outside the rollout bytes. Replay revision
 `codex_session_exclusive_usage:v6` deliberately revisits settled Codex history;
 v34/v4 and v35/v5 are not active proofs.
 
-For `thread_source=agent_created_thread`, neither `history_base` nor
-`subagent_history_start_ordinal` can transition directly to `AllLocal` or the
-ordinary ordinal boundary. A created-thread file carrying either field is
-admitted only through the complete native witness. If that witness is absent or
-invalid, the shape becomes ownership-incomplete and cannot fall through to the
-legacy copied-prefix state machine or inclusive SQLite usage.
+For `thread_source=agent_created_thread`, neither context-curve capability,
+`history_base`, `subagent_history_start_ordinal`, nor a legacy parent ledger can
+transition directly to `AllLocal`, the ordinary ordinal boundary, or the legacy
+copied-prefix machine. Every created-thread shape is admitted only through the
+complete native witness. If that witness is absent or invalid, the shape becomes
+ownership-incomplete and cannot fall through to inclusive SQLite usage. Backend
+capability controls what optional curve payload the daemon emits, never what it
+requires to attribute usage ownership.
 
 ## Native witness and external corroboration
 
@@ -69,23 +71,47 @@ Their projected byte offsets equal file sizes `44,429,566`, `8,178,205`,
 record counts. State-row update times equal file mtimes at millisecond
 precision, and birth times are within the five-second creation tolerance.
 
+## Exhaustive created-thread admission branches
+
+The first authoritative `session_meta` fixes the ownership state once. For a
+file declaring `thread_source=agent_created_thread`, the complete set of
+admission/fallback branches is:
+
+| Candidate branch | Gate for a created thread | Result |
+| --- | --- | --- |
+| Native JSONL usage, curve capability present | Trusted sidecar child/parent edge, complete native header/task/turn witness, gap-free non-retrograde stream through projected EOF, complete/lossless parse | Usage admitted; curve emitted |
+| Native JSONL usage, curve capability absent | Identical ownership gates to capability-present | Usage admitted; curve omitted |
+| `history_base` marker | Cannot authorize `AllLocal`; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
+| `subagent_history_start_ordinal` marker | Cannot authorize `Ordinal`; the native header rejects this marker | `AmbiguousFork` |
+| No pagination marker with a complete parent ledger | Legacy `AwaitingParentPrefix` is unreachable; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
+| Transcript `forked_from_id` | Must agree with the trusted sidecar parent and still satisfy the complete native witness | Native admission or `AmbiguousFork` |
+| Missing/conflicting sidecar, invalid header, task/turn mismatch, ordinal/time/extent failure, or incomplete parse | No alternative positive gate | Whole file suppressed, ownership/loss or parser-health evidence retained, retry remains pending |
+| Inclusive `state_5.sqlite.tokens_used` fallback | Blocked by the created-thread/fork session id and independently excluded by sidecar family membership | Never admitted for the ambiguous file |
+| Confirmed-empty/index skip | Incomplete ownership or parsing never records the file as confirmed empty; sidecar evidence participates in the candidate fingerprint | Never converts ambiguity into a positive witness |
+
+There is therefore one positive admission branch for this shape:
+`NativeCreatedThread` followed by whole-file finalization. `AllLocal`, `Ordinal`,
+`AwaitingLegacyTrigger`, and `AwaitingParentPrefix` remain compatibility states
+only for explicitly non-created-thread legacy sources.
+
 ## Attack matrix
 
-| Shape | v36 outcome | Signal or compatibility reason |
-| --- | --- | --- |
-| R1 copied parent suffix | Fails closed; no child snapshot | Exact usage-record drops plus one ownership-incomplete file |
-| R2 copied suffix with optional `model` omitted | Fails closed; no child snapshot | Optional representation is not an ownership gate |
-| Clean newline-truncated parent with omitted suffix in child | Fails closed at parent-ledger EOF | Scan-complete EOF is not provider-final extent |
-| Created-thread `history_base` with missing native ordinals/task structure and retrograde copied usage | Fails closed; no child snapshot | One dropped usage record plus one ownership-incomplete file |
-| Native stream with ordinal gap/restart | Whole file fails closed | Final native validation suppresses tentative usage |
-| Native stream with retrograde timestamp | Whole file fails closed | Final native validation suppresses tentative usage |
-| Native first-turn mismatch | Whole file fails closed | Final native validation suppresses tentative usage |
-| First record more than five seconds after sidecar creation | Fails closed before native admission | Bounded external chronology mismatch |
-| Sidecar rollout path/object, mtime/birthtime, byte extent, or final ordinal mismatch | Fails closed when that evidence exists | External witness mismatch |
-| Malformed partial final JSON record / crash mid-write | Whole file remains retryable and unhealthy | Parser incompleteness; never confirmed empty |
-| Ordinary resume/compaction/pagination | Does not enter created-thread native admission solely for being paginated | Existing ordinary ownership paths remain separate |
-| Adjacent equal timestamps | Accepted as non-retrograde | All five real files contain equal pairs; equality cannot honestly be rejected |
-| Five native corpus shapes, including valid native `history_base` | Each admitted exactly once | 1,377 checkpoints; zero loss counters |
+| Shape | Capability present / absent | v36 outcome | Signal or compatibility reason |
+| --- | --- | --- | --- |
+| R1 copied parent suffix | Identical fail-closed result | Fails closed; no child snapshot | Exact usage-record drops plus one ownership-incomplete file |
+| R2 copied suffix with optional `model` omitted | Identical fail-closed result | Fails closed; no child snapshot | Optional representation is not an ownership gate |
+| Clean newline-truncated parent with omitted suffix in child | Identical fail-closed result | Fails closed without consulting legacy prefix admission | Scan-complete EOF is not provider-final extent |
+| No-marker child with matched parent A, omitted parent B, then copied parent C | Identical fail-closed result | Legacy parent-prefix machine is unreachable | One copied usage drop plus one ownership-incomplete file |
+| Created-thread `history_base` with missing native ordinals/task structure and retrograde copied usage | Identical fail-closed result | Fails closed; no child snapshot | One dropped usage record plus one ownership-incomplete file |
+| Native stream with ordinal gap/restart | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
+| Native stream with retrograde timestamp | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
+| Native first-turn mismatch | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
+| First record more than five seconds after sidecar creation | Identical fail-closed result | Fails closed before native admission | Bounded external chronology mismatch |
+| Sidecar rollout path/object, mtime/birthtime, byte extent, or final ordinal mismatch | Identical fail-closed result | Fails closed when that evidence exists | External witness mismatch |
+| Malformed partial final JSON record / crash mid-write | Identical uncommittable result | Whole file remains retryable and unhealthy | Parser incompleteness; never confirmed empty |
+| Ordinary resume/compaction/pagination | Identical legacy classification | Does not enter created-thread native admission solely for being paginated | Existing ordinary ownership paths remain separate |
+| Adjacent equal timestamps | Identical compatibility result | Accepted as non-retrograde | All five real files contain equal pairs; equality cannot honestly be rejected |
+| Five native corpus shapes, including valid native `history_base` | Same ownership totals; curve only present when advertised | Each admitted exactly once | 1,377 checkpoints per capability mode; zero loss counters |
 
 ## Trust model
 
@@ -120,15 +146,23 @@ Codex sidecars and rollout metadata.
 OWNER DECISION REQUIRED: accept this documented boundary or fund a
 cryptographic provenance mechanism (Codex-side signing) as future work.
 
+Owner decision: ACCEPTED for this PR.
+
 ## Version and validation decision
 
-The derivation changed after v35/v5: a formerly admitted `history_base` branch
-now fails closed, and new sidecar/file/extent evidence participates in native
-admission and candidate selection. Therefore keeping v35/v5 would be false
-provenance. The compiled versions are `codex_jsonl:v36` and
-`codex_session_exclusive_usage:v6`.
+The derivation changed after v35/v5: formerly admitted `history_base`,
+capability-off, and no-marker parent-prefix branches now fail closed, and new
+sidecar/file/extent evidence participates in native admission and candidate
+selection. Therefore keeping v35/v5 would be false provenance. The compiled
+versions remain `codex_jsonl:v36` and `codex_session_exclusive_usage:v6` because
+all of these corrections are fix-forwards within the same unmerged DRAFT v36/v6
+release unit; no released v36/v6 completion exists to distinguish with another
+revision.
 
-Focused regressions cover the history-base reproduction, valid native
-history-base compatibility, the five-second spawn window, path/mtime/byte
-extent checks, projected final-ordinal mismatch, the prior R1/R2/truncated-parent
-matrix, native ordinal/chronology/turn failures, and the five corpus shapes.
+Focused regressions run the full matrix with the curve capability present and
+absent, including `history_base`, the no-marker internal parent omission, valid
+native compatibility, the five-second spawn window, path/mtime/byte extent
+checks, projected final-ordinal mismatch, R1/R2/truncated-parent shapes, native
+ordinal/chronology/turn failures, malformed crash tails, ordinary pagination
+non-acquisition, and the five corpus shapes. Durable production replay state is
+also exercised from recorded v2, v3, v4, and v5 through persisted v6 completion.
