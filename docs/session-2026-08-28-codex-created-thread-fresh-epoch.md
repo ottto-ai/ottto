@@ -73,17 +73,32 @@ precision, and birth times are within the five-second creation tolerance.
 
 ## Exhaustive created-thread admission branches
 
-The first authoritative `session_meta` fixes the ownership state once. For a
-file declaring `thread_source=agent_created_thread`, the complete set of
-admission/fallback branches is:
+Created-thread classification is the OR of two independently retained inputs:
+the trusted state-row declaration and the rollout declaration. A trusted state
+declaration cannot be withdrawn by the rollout it governs. The complete input
+product is:
+
+| Trusted state row | Rollout `thread_source` | Classification / admission result |
+| --- | --- | --- |
+| Declares created thread | Declares `agent_created_thread` | Created thread; only the complete native witness can admit it |
+| Declares created thread | Omitted | Created thread plus classification conflict; `AmbiguousFork` |
+| Declares created thread | Other string | Created thread plus classification conflict; `AmbiguousFork` |
+| Declares created thread | Malformed/non-string | Created thread plus classification conflict; `AmbiguousFork` |
+| Does not declare this session | Declares `agent_created_thread` | Created thread from rollout evidence; native admission still requires an independent trusted matching child/parent edge and the complete witness |
+| Does not declare this session | Omitted, malformed, or another value | Not classified as created; ordinary compatibility branches apply |
+
+The state declaration is bound by the rollout path's provider session id;
+created rows for unrelated session ids and generic `thread_spawn_edges` never
+set it. After that classification, the first authoritative `session_meta`
+fixes the ownership state once. The complete admission/fallback enumeration is:
 
 | Candidate branch | Gate for a created thread | Result |
 | --- | --- | --- |
-| Native JSONL usage, curve capability present | Trusted sidecar child/parent edge, complete native header/task/turn witness, gap-free non-retrograde stream through projected EOF, complete/lossless parse | Usage admitted; curve emitted |
+| Native JSONL usage, curve capability present | Rollout declares created thread, any state declaration agrees, and the trusted sidecar child/parent edge plus complete native header/task/turn witness, gap-free non-retrograde stream through projected EOF, and complete/lossless parse all hold | Usage admitted; curve emitted |
 | Native JSONL usage, curve capability absent | Identical ownership gates to capability-present | Usage admitted; curve omitted |
-| `history_base` marker | Cannot authorize `AllLocal`; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
-| `subagent_history_start_ordinal` marker | Cannot authorize `Ordinal`; the native header rejects this marker | `AmbiguousFork` |
-| No pagination marker with a complete parent ledger | Legacy `AwaitingParentPrefix` is unreachable; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
+| State/rollout classification disagreement | State declaration wins classification, while an omitted, malformed, or different rollout marker proves conflict | `AmbiguousFork`; no generic branch is evaluated |
+| `history_base` or `subagent_history_start_ordinal` marker | Cannot authorize `AllLocal` or `Ordinal`; the latter is also rejected by the native header | Native admission or `AmbiguousFork` |
+| No pagination marker with a complete parent ledger | `AwaitingParentPrefix` / `AwaitingLegacyTrigger` are unreachable; must independently satisfy the complete native witness | Native admission or `AmbiguousFork` |
 | Transcript `forked_from_id` | Must agree with the trusted sidecar parent and still satisfy the complete native witness | Native admission or `AmbiguousFork` |
 | Missing/conflicting sidecar, invalid header, task/turn mismatch, ordinal/time/extent failure, or incomplete parse | No alternative positive gate | Whole file suppressed, ownership/loss or parser-health evidence retained, retry remains pending |
 | Inclusive `state_5.sqlite.tokens_used` fallback | Blocked by the created-thread/fork session id and independently excluded by sidecar family membership | Never admitted for the ambiguous file |
@@ -102,6 +117,8 @@ only for explicitly non-created-thread legacy sources.
 | R2 copied suffix with optional `model` omitted | Identical fail-closed result | Fails closed; no child snapshot | Optional representation is not an ownership gate |
 | Clean newline-truncated parent with omitted suffix in child | Identical fail-closed result | Fails closed without consulting legacy prefix admission | Scan-complete EOF is not provider-final extent |
 | No-marker child with matched parent A, omitted parent B, then copied parent C | Identical fail-closed result | Legacy parent-prefix machine is unreachable | One copied usage drop plus one ownership-incomplete file |
+| State-proven created thread with rollout marker absent | Identical fail-closed result | State classification prevents `history_base -> AllLocal` | One copied usage drop plus one ownership-incomplete file |
+| State-proven created thread with conflicting/malformed rollout marker | Identical fail-closed result | Classification conflict is `AmbiguousFork` | One copied usage drop plus one ownership-incomplete file |
 | Created-thread `history_base` with missing native ordinals/task structure and retrograde copied usage | Identical fail-closed result | Fails closed; no child snapshot | One dropped usage record plus one ownership-incomplete file |
 | Native stream with ordinal gap/restart | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
 | Native stream with retrograde timestamp | Identical fail-closed result | Whole file fails closed | Final native validation suppresses tentative usage |
@@ -109,7 +126,7 @@ only for explicitly non-created-thread legacy sources.
 | First record more than five seconds after sidecar creation | Identical fail-closed result | Fails closed before native admission | Bounded external chronology mismatch |
 | Sidecar rollout path/object, mtime/birthtime, byte extent, or final ordinal mismatch | Identical fail-closed result | Fails closed when that evidence exists | External witness mismatch |
 | Malformed partial final JSON record / crash mid-write | Identical uncommittable result | Whole file remains retryable and unhealthy | Parser incompleteness; never confirmed empty |
-| Ordinary resume/compaction/pagination | Identical legacy classification | Does not enter created-thread native admission solely for being paginated | Existing ordinary ownership paths remain separate |
+| Ordinary resume/compaction/pagination with generic edge and unrelated created row | Identical legacy classification | Does not enter created-thread native admission | Generic edges and unrelated state rows cannot set created identity |
 | Adjacent equal timestamps | Identical compatibility result | Accepted as non-retrograde | All five real files contain equal pairs; equality cannot honestly be rejected |
 | Five native corpus shapes, including valid native `history_base` | Same ownership totals; curve only present when advertised | Each admitted exactly once | 1,377 checkpoints per capability mode; zero loss counters |
 
@@ -151,18 +168,21 @@ Owner decision: ACCEPTED for this PR.
 ## Version and validation decision
 
 The derivation changed after v35/v5: formerly admitted `history_base`,
-capability-off, and no-marker parent-prefix branches now fail closed, and new
-sidecar/file/extent evidence participates in native admission and candidate
-selection. Therefore keeping v35/v5 would be false provenance. The compiled
-versions remain `codex_jsonl:v36` and `codex_session_exclusive_usage:v6` because
-all of these corrections are fix-forwards within the same unmerged DRAFT v36/v6
-release unit; no released v36/v6 completion exists to distinguish with another
-revision.
+capability-off, no-marker parent-prefix, and state-proven/rollout-marker-dodge
+branches now fail closed, and new sidecar/file/extent/classification evidence
+participates in native admission and candidate selection. Therefore keeping
+v35/v5 would be false provenance. The compiled versions remain
+`codex_jsonl:v36` and `codex_session_exclusive_usage:v6` because all of these
+corrections are fix-forwards within the same unmerged DRAFT v36/v6 release
+unit; no released daemon ever ran v36/v6 and no released v36/v6 completion
+exists to distinguish with another revision.
 
 Focused regressions run the full matrix with the curve capability present and
 absent, including `history_base`, the no-marker internal parent omission, valid
 native compatibility, the five-second spawn window, path/mtime/byte extent
 checks, projected final-ordinal mismatch, R1/R2/truncated-parent shapes, native
 ordinal/chronology/turn failures, malformed crash tails, ordinary pagination
-non-acquisition, and the five corpus shapes. Durable production replay state is
-also exercised from recorded v2, v3, v4, and v5 through persisted v6 completion.
+non-acquisition, state-loaded absent/conflicting/malformed rollout markers,
+generic-edge/unrelated-row non-acquisition, and the five corpus shapes. Durable
+production replay state is also exercised from recorded v2, v3, v4, and v5
+through persisted v6 completion.

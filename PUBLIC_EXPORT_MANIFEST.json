@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 341,
-  "content_sha256": "b99eaff772ac97598d295d1bb32174bc622f2d0143567e1857bf53a18306c581",
+  "content_sha256": "d2e518182efcd29d8a08956af43c5a62f94141d3723dd8ec0ee5ed21c4638203",
   "files": [
     {
       "executable": false,
@@ -874,8 +874,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "43a8ec7965b98854b9bd57122b3c7f7b53f08472184bb38aaffa848213fe6387",
-      "size_bytes": 1507338
+      "sha256": "f9e6962530411c52c7f4c8eefae3a952902a130ac83bf65f6171282df389b00c",
+      "size_bytes": 1517824
     },
     {
       "executable": false,
@@ -1483,8 +1483,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-08-28-codex-created-thread-fresh-epoch.md",
-      "sha256": "479efb1c71c851ee7a74fe616cd978aa8da1d5f046cecac3c4245dad80dd0c7e",
-      "size_bytes": 12303
+      "sha256": "f10b27a9570b07a0d67296269da1d3aaca32a3c4a99ea7a9c2c41cf492f3a32f",
+      "size_bytes": 14456
     },
     {
       "executable": false,

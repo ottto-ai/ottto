@@ -5809,6 +5809,11 @@ struct CodexTitleMetadata {
     titles: BTreeMap<String, CodexTitleCandidate>,
     state_threads: BTreeMap<String, CodexStateThread>,
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
+    /// Exact session ids whose trusted Codex state row declares
+    /// `thread_source=agent_created_thread`. This is deliberately separate
+    /// from generic spawn edges: the state declaration is an ownership
+    /// classification input, while an edge alone is only lineage evidence.
+    state_created_threads: BTreeSet<String>,
     spawn_parents: BTreeMap<String, String>,
     spawn_parent_conflicts: BTreeSet<String>,
     /// True only when an existing state DB could not be read completely. A
@@ -6553,10 +6558,12 @@ struct SnapshotAccumulator {
     codex_legacy_bootstrap_valid: bool,
     codex_parent_ownership_ledgers:
         Option<Arc<Mutex<BTreeMap<String, CodexParentOwnershipLedger>>>>,
+    // Trusted state-row created-thread classification bound to this opened
+    // rollout by its provider session id. Generic spawn edges cannot set it.
+    codex_sidecar_created_thread: bool,
     // Trusted, content-free child -> parent edge loaded from Codex's local
-    // state DB before the rollout is parsed. It is consulted only when the
-    // rollout's own first header says `agent_created_thread`; ordinary files
-    // and user-authored delegation lookalikes cannot activate it.
+    // state DB before the rollout is parsed. It is lineage evidence for the
+    // native witness, distinct from the classification bit above.
     codex_sidecar_parent: Option<(String, String)>,
     // Provider state-row creation time for the trusted child edge. Fresh-file
     // timestamps must not precede this physical spawn witness.
@@ -6722,6 +6729,7 @@ impl SnapshotAccumulator {
             codex_legacy_trigger_seen: false,
             codex_legacy_bootstrap_valid: true,
             codex_parent_ownership_ledgers: None,
+            codex_sidecar_created_thread: false,
             codex_sidecar_parent: None,
             codex_sidecar_child_created_at_nanos: None,
             codex_sidecar_projected_next_ordinal: None,
@@ -6811,14 +6819,20 @@ impl SnapshotAccumulator {
         let Some(child) = codex_session_id_from_path(path) else {
             return;
         };
-        let Some((parent, _, _)) = metadata.family_position(child.as_str()) else {
-            return;
-        };
+        // Bind the state-row declaration before validating the optional
+        // lineage/file cross-checks. A state-declared created thread whose
+        // sidecar conflicts with the opened rollout is still a created thread
+        // for admission purposes and must fail closed, never fall through to
+        // an ordinary ownership branch.
+        self.codex_sidecar_created_thread = metadata.state_created_threads.contains(child.as_str());
         let thread = metadata.state_threads.get(child.as_str());
         let rollout_extent = metadata.rollout_extents.get(child.as_str()).copied();
         if !codex_sidecar_rollout_file_matches(path, file_metadata, thread, rollout_extent) {
             return;
         }
+        let Some((parent, _, _)) = metadata.family_position(child.as_str()) else {
+            return;
+        };
         self.codex_sidecar_child_created_at_nanos = thread
             .and_then(|thread| thread.created_at.as_deref())
             .and_then(rfc3339_unix_nanos);
@@ -6844,7 +6858,10 @@ impl SnapshotAccumulator {
         // Capability negotiation controls only whether a context-curve payload
         // is emitted. Ownership attribution is an integrity boundary and must
         // never become weaker when that optional payload is unavailable.
-        let is_created_thread = thread_source.as_deref() == Some("agent_created_thread");
+        let rollout_declares_created_thread =
+            thread_source.as_deref() == Some("agent_created_thread");
+        let state_declares_created_thread = self.codex_sidecar_created_thread;
+        let is_created_thread = rollout_declares_created_thread || state_declares_created_thread;
         let forked_from_id = string_at(meta, &["forked_from_id"]);
         self.codex_parent_session_ref = forked_from_id.clone();
         let has_history_base = meta.get("history_base").is_some_and(|base| !base.is_null());
@@ -6872,6 +6889,14 @@ impl SnapshotAccumulator {
                 })
                 .map(|(_, parent)| parent.clone());
             self.codex_parent_session_ref = trusted_parent.clone();
+            // The state row is an independent trusted classification source.
+            // If the rollout omits or contradicts that declaration, the
+            // disagreement is itself damage/tampering evidence. Do not let a
+            // file-controlled marker select an ordinary compatibility branch.
+            if state_declares_created_thread && !rollout_declares_created_thread {
+                self.codex_ownership_boundary = CodexOwnershipBoundary::AmbiguousFork;
+                return;
+            }
             if trusted_parent
                 .as_ref()
                 .zip(forked_from_id.as_ref())
@@ -13097,8 +13122,13 @@ impl CodexTitleMetadata {
         let extent = self.rollout_extents.get(source_session_id);
         let family = self.family_position(source_session_id);
         sha256_hex(&[
-            "codex_session_sidecar:v3",
+            "codex_session_sidecar:v4",
             source_session_id,
+            if self.state_created_threads.contains(source_session_id) {
+                "agent_created_thread"
+            } else {
+                ""
+            },
             title.map(|value| value.title.as_str()).unwrap_or(""),
             title.map(|value| value.source.as_str()).unwrap_or(""),
             thread
@@ -13175,6 +13205,7 @@ impl CodexTitleMetadata {
                 load_codex_sqlite_state_threads(&state_path, &mut metadata.state_threads);
             let spawn_census = load_codex_sqlite_spawn_edges(
                 &state_path,
+                &mut metadata.state_created_threads,
                 &mut metadata.spawn_parents,
                 &mut metadata.spawn_parent_conflicts,
             );
@@ -13518,6 +13549,7 @@ fn load_codex_rollout_extents(
 
 fn load_codex_sqlite_spawn_edges(
     path: &Path,
+    state_created_threads: &mut BTreeSet<String>,
     spawn_parents: &mut BTreeMap<String, String>,
     spawn_parent_conflicts: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -13548,6 +13580,7 @@ fn load_codex_sqlite_spawn_edges(
         for row in rows {
             let (child, first_user_message) =
                 row.context("read Codex created-thread census row")?;
+            state_created_threads.insert(child.clone());
             if let Some(parent) = first_user_message
                 .as_deref()
                 .and_then(|message| codex_created_thread_parent(&child, message))
@@ -17112,6 +17145,10 @@ mod tests {
             .expect("all-local child state row")
             .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
+        assert!(metadata.state_created_threads.contains(child));
+        assert!(metadata.state_created_threads.contains(all_local_child));
+        assert!(metadata.state_created_threads.contains(conflicting_child));
+        assert!(!metadata.state_created_threads.contains(untrusted_child));
         assert_eq!(metadata.family_position(untrusted_child), None);
         assert_eq!(metadata.family_position(conflicting_child), None);
         assert!(metadata.spawn_parent_conflicts.contains(conflicting_child));
@@ -32128,6 +32165,7 @@ mod tests {
         fs::write(&path, body).expect("write trusted created-thread fixture");
 
         let mut metadata = CodexTitleMetadata::default();
+        metadata.state_created_threads.insert(child_id.to_string());
         metadata
             .spawn_parents
             .insert(child_id.to_string(), parent_id.to_string());
@@ -33183,6 +33221,8 @@ mod tests {
                     parsed.snapshots.is_empty(),
                     "{name} capability={context_curve_enabled}: {parsed:#?}"
                 );
+                assert!(parsed.report.complete(), "{name}");
+                assert!(!parsed.complete(), "{name}");
                 assert!(parsed.zero_snapshot_usage_evidence, "{name}");
                 assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
                 assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
@@ -33221,6 +33261,7 @@ mod tests {
             fs::write(&path, body).expect("write malformed crash-tail fixture");
 
             let mut metadata = CodexTitleMetadata::default();
+            metadata.state_created_threads.insert(child_id.to_string());
             metadata
                 .spawn_parents
                 .insert(child_id.to_string(), parent_id.to_string());
@@ -33247,6 +33288,134 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn codex_created_thread_state_classification_dodge_fails_closed() {
+        let home = temp_dir("codex-created-thread-state-classification-dodge");
+        let codex_dir = home.join(".codex");
+        let sessions_dir = codex_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create Codex sessions fixture");
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let cases = [
+            (
+                "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4",
+                "marker-absent",
+                None,
+            ),
+            (
+                "01a03e9a-49cf-7460-9fd7-f7dbfd2f05e4",
+                "marker-conflicting",
+                Some(json!("user")),
+            ),
+            (
+                "01a03e9b-49cf-7460-9fd7-f7dbfd2f05e4",
+                "marker-malformed",
+                Some(json!({"forged":"agent_created_thread"})),
+            ),
+        ];
+        let database = Connection::open(codex_dir.join("state_5.sqlite"))
+            .expect("open state classification fixture");
+        database
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT NOT NULL, title TEXT, tokens_used INTEGER NOT NULL,\
+                    thread_source TEXT, first_user_message TEXT\
+                );",
+            )
+            .expect("create state classification table");
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, 'Parent', 10, 'user', 'parent')",
+                [parent_id],
+            )
+            .expect("seed classification parent");
+        for (child_id, _, thread_source) in &cases {
+            let wrapper = format!(
+                "<codex_delegation>\n  <source_thread_id>{parent_id}</source_thread_id>\n  <input>Created task.</input>\n</codex_delegation>"
+            );
+            database
+                .execute(
+                    "INSERT INTO threads VALUES (?1, 'Child', 1, 'agent_created_thread', ?2)",
+                    rusqlite::params![child_id, wrapper],
+                )
+                .expect("seed state-created child");
+
+            let mut header = json!({
+                "timestamp":"2026-08-02T08:20:00Z",
+                "type":"session_meta",
+                "payload":{
+                    "id":child_id,
+                    "session_id":child_id,
+                    "history_mode":"paginated",
+                    "history_base":{"cursor":"file-controlled"},
+                    "source":"cli"
+                }
+            });
+            if let Some(thread_source) = thread_source.clone() {
+                header["payload"]["thread_source"] = thread_source;
+            }
+            let values = [
+                header,
+                json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"forged-turn","model":"gpt-5.6-sol"}}),
+                codex_test_token_line(
+                    "2026-08-02T08:20:02Z",
+                    None,
+                    (30, 8, 12, 1),
+                    Some((30, 8, 12, 1)),
+                ),
+            ];
+            fs::write(
+                sessions_dir.join(format!("rollout-{child_id}.jsonl")),
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .expect("write classification-dodge rollout");
+        }
+        drop(database);
+
+        let metadata = CodexTitleMetadata::load_from_roots(std::slice::from_ref(&sessions_dir));
+        assert!(!metadata.state_census_incomplete);
+        for (child_id, name, _) in &cases {
+            assert!(metadata.state_created_threads.contains(*child_id), "{name}");
+            assert_eq!(
+                metadata
+                    .family_position(child_id)
+                    .map(|(parent, _, _)| parent),
+                Some(parent_id.to_string()),
+                "{name}"
+            );
+            let path = sessions_dir.join(format!("rollout-{child_id}.jsonl"));
+            for context_curve_enabled in [true, false] {
+                let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
+                    &path,
+                    &metadata,
+                    BTreeMap::new(),
+                    context_curve_enabled,
+                );
+                assert!(
+                    parsed.snapshots.is_empty(),
+                    "{name} capability={context_curve_enabled}: {parsed:#?}"
+                );
+                assert!(parsed.report.complete(), "{name}");
+                assert!(!parsed.complete(), "{name}");
+                assert!(parsed.zero_snapshot_usage_evidence, "{name}");
+                assert_eq!(parsed.recognized_usage_drop_count, 1, "{name}");
+                assert_eq!(parsed.ownership_incomplete_file_count, 1, "{name}");
+                assert_eq!(parsed.dropped_usage_record_count, 1, "{name}");
+                assert_eq!(
+                    parsed.state_only_blocked_session_id.as_deref(),
+                    Some(*child_id),
+                    "{name}"
+                );
+                assert!(parsed.codex_parent_ledger_identity_used.is_none(), "{name}");
+            }
+        }
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -33284,6 +33453,71 @@ mod tests {
             );
         }
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_ordinary_resume_ignores_generic_edge_and_unrelated_created_state_row() {
+        let root = temp_dir("codex-ordinary-resume-unrelated-created-state");
+        let ordinary_id = "01a03e9c-49cf-7460-9fd7-f7dbfd2f05e4";
+        let parent_id = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
+        let unrelated_created_id = "01a03e9d-49cf-7460-9fd7-f7dbfd2f05e4";
+        let path = root.join(format!("rollout-{ordinary_id}.jsonl"));
+        let values = [
+            json!({"timestamp":"2026-08-02T08:20:00Z","type":"session_meta","payload":{"id":ordinary_id,"forked_from_id":parent_id,"thread_source":"user","history_mode":"paginated","history_base":{"cursor":"provider"},"source":"cli"}}),
+            json!({"timestamp":"2026-08-02T08:20:01Z","type":"turn_context","payload":{"turn_id":"ordinary-turn","model":"gpt-5.6-sol"}}),
+            codex_test_token_line(
+                "2026-08-02T08:20:02Z",
+                None,
+                (12, 8, 2, 1),
+                Some((12, 8, 2, 1)),
+            ),
+        ];
+        fs::write(
+            &path,
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write ordinary resume fixture");
+
+        let mut metadata = CodexTitleMetadata::default();
+        metadata
+            .spawn_parents
+            .insert(ordinary_id.to_string(), parent_id.to_string());
+        metadata
+            .state_created_threads
+            .insert(unrelated_created_id.to_string());
+        assert_eq!(
+            metadata
+                .family_position(ordinary_id)
+                .map(|(parent, _, _)| parent),
+            Some(parent_id.to_string())
+        );
+        assert!(!metadata.state_created_threads.contains(ordinary_id));
+
+        for context_curve_enabled in [true, false] {
+            let parsed = parse_codex_test_with_metadata_ledgers_and_curve(
+                &path,
+                &metadata,
+                BTreeMap::new(),
+                context_curve_enabled,
+            );
+            assert!(
+                parsed.complete(),
+                "capability={context_curve_enabled}: {parsed:#?}"
+            );
+            assert_eq!(parsed.snapshots.len(), 1);
+            assert_eq!(parsed.snapshots[0].source_session_id, ordinary_id);
+            assert_eq!(parsed.snapshots[0].input_tokens, 12);
+            assert_eq!(
+                parsed.snapshots[0].context_curve.is_some(),
+                context_curve_enabled
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
