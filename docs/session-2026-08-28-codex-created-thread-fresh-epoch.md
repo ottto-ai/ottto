@@ -51,13 +51,15 @@ The candidate ownership signature must also be absent from the entire complete
 parent signature ledger. This prevents a copied parent's first response—which
 also legitimately has `total_token_usage == last_token_usage`—from being
 mistaken for a fresh child epoch when an earlier copied signature is missing or
-divergent. The equality plus ledger exclusion is the bounded provider-native
-receipt that the child's cumulative counter began with this response, so no
-physical predecessor usage exists in the file. A signature found anywhere in
-the parent ledger, a missing last-response record, a zero checkpoint, a
-divergent cumulative total, an absent or conflicting sidecar edge, an
-incomplete parent ledger, or a post-divergence buffer overflow still fails
-closed.
+divergent. Every other signed record observed while waiting for that receipt
+must likewise be absent from the parent ledger; a provably copied parent turn
+is never replayed merely because a later usage checkpoint starts fresh. The
+equality plus ledger exclusion is the bounded provider-native receipt that the
+child's cumulative counter began with this response, so no physical predecessor
+usage exists in the file. A signature found anywhere in the parent ledger, a
+missing last-response record, a zero checkpoint, a divergent cumulative total,
+an absent or conflicting sidecar edge, an incomplete parent ledger, or a
+post-divergence buffer overflow still fails closed.
 
 ## Replay decision
 
